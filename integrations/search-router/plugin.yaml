@@ -1,0 +1,8 @@
+name: search-router
+version: 1.1.0
+description: "Cost-aware web routing with keyless-first search, quality-gated Perplexity escalation and local browser."
+author: "local"
+capabilities:
+  - tools.override
+provides_tools:
+  - web_search

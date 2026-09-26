@@ -16,6 +16,7 @@ const SCENE_AGENT_IDS = new Set(['majak-hermes', 'majak-codex', 'quantlab-hermes
 const ROLES = { hermes: 'Orchestrace, paměť, nástroje a řízení práce', codex: 'Implementace, testování a technická revize' };
 const STATUS = { idle: 'Čeká', working: 'Pracuje', blocked: 'Blokováno', done: 'Hotovo', unknown: 'Neznámé', offline: 'Odpojeno' };
 const QUEUE_STATUS = { pending: 'Čeká', running: 'Běží', blocked: 'Blokováno', done: 'Hotovo', failed: 'Selhalo' };
+const GITHUB_REPO = 'Bbambaaamm/Autonomous-Quant-Lab';
 const fmt = new Intl.NumberFormat('cs-CZ');
 const compact = new Intl.NumberFormat('cs-CZ', { notation: 'compact', maximumFractionDigits: 1 });
 const escapeHTML = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
@@ -28,6 +29,15 @@ const issueLabel = row => Number.isFinite(row?.issue) ? `#${row.issue}` : 'bez i
 const agentKind = name => name.endsWith('-hermes') ? 'hermes' : 'codex';
 const statusLabel = status => STATUS[status] || STATUS.unknown;
 const toneColor = tone => ({ green: '#6adf9a', red: '#ff7159', muted: '#716d66', amber: '#e49a34' })[tone];
+const providerHistory = (rows, field = 'provider') => {
+  const ordered = rows
+    .filter(row => typeof row[field] === 'string' && Number.isFinite(row.last_used_at))
+    .sort((left, right) => right.last_used_at - left.last_used_at || left[field].localeCompare(right[field]));
+  const currentProvider = ordered[0]?.[field] || null;
+  const historicalProviders = [...new Set(ordered.map(row => row[field]))]
+    .filter(provider => provider !== currentProvider);
+  return { currentProvider, historicalProviders };
+};
 
 /** Bind the read-only snapshot UI to a replaceable, fully geometric 3D renderer. */
 export function mountDashboard(createScene) {
@@ -40,8 +50,15 @@ export function mountDashboard(createScene) {
     costTotal: $('#cost-total'), attention: $('#attention-action'), coordinatorCurrent: $('#coordinator-current'), coordinatorNext: $('#coordinator-next'), demo: $('#demo-panel'),
     demoStates: $('#demo-states'), detail: $('#agent-detail'), backdrop: $('#drawer-backdrop'),
     canvas: $('#machine-scene'), fallback: $('#webgl-fallback'),
+    swarmKpis: $('#swarm-kpis'),
+    kpiActive: $('#kpi-active'), kpiRunning: $('#kpi-running'), kpiWaiting: $('#kpi-waiting'),
+    kpiBlocked: $('#kpi-blocked'), kpiQueue: $('#kpi-queue'), kpiSuccess: $('#kpi-success'),
+    kpiRetries: $('#kpi-retries'), kpiAvgTask: $('#kpi-avg-task'), kpiTokens: $('#kpi-tokens'),
+    kpiCost: $('#kpi-cost'),
+    dagStatus: $('#taskgraph-status'), dagNodes: $('#taskgraph-nodes'),
+    analyticsGrid: $('#swarm-analytics-grid'),
   };
-  let liveData = null, demo = false, demoState = 'idle', view = 'work', selectedAgent = null;
+  let liveData = null, demo = false, demoState = 'idle', view = 'work', selectedAgent = null, selectedTask = null, taskFilter = 'all';
   let reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
   let scene = null, sceneFailed = false, lastFaceState = null, lastDemoKey = '', returnFocus = null;
   let fetchPending = false, loadReason = 'Načítám skutečná data';
@@ -56,6 +73,22 @@ export function mountDashboard(createScene) {
   catch (_) { sceneFailed = true; ui.fallback.hidden = false; }
   ui.canvas.addEventListener('webglcontextlost', event => { event.preventDefault(); failScene(); });
   ui.canvas.addEventListener('scene-unavailable', failScene);
+  ui.canvas.addEventListener('swarm-task-hover', event => {
+    const label = $('#task-hover-label'), detail = event.detail || {}, task = taskById(detail.taskId);
+    if (!label || !task || view !== 'film') { if (label) label.hidden = true; return; }
+    label.textContent = `${issueLabel(task)} · ${QUEUE_STATUS[task.status] || task.status} · ${task.issue_title || task.task_id}`;
+    label.style.left = `${Math.max(12, detail.x + 14)}px`;
+    label.style.top = `${Math.max(72, detail.y + 14)}px`;
+    label.hidden = false;
+  });
+  ui.canvas.addEventListener('swarm-task-focus-position', event => {
+    const badge = $('#task-selected-label'), detail = event.detail || {}, task = taskById(detail.taskId);
+    if (!badge || !task || view !== 'film' || selectedTask !== task.task_id) { if (badge) badge.hidden = true; return; }
+    badge.innerHTML = `<b>${escapeHTML(issueLabel(task))}</b><span>${escapeHTML(QUEUE_STATUS[task.status] || task.status)}</span>`;
+    badge.style.left = `${Math.max(56, detail.x)}px`;
+    badge.style.top = `${Math.max(110, detail.y)}px`;
+    badge.hidden = false;
+  });
 
   function sceneCall(method, ...args) {
     if (!scene || sceneFailed || typeof scene[method] !== 'function') return;
@@ -65,9 +98,17 @@ export function mountDashboard(createScene) {
   function queueSource() { return source('quantlab', 'queue'); }
   function queueTasks() { const value = queueSource(); return value?.status === 'available' ? value.rows : []; }
   function activeQueueTasks() { return queueTasks().filter(row => row.status !== 'done'); }
+  function taskById(taskId) { return queueTasks().find(row => row.task_id === taskId) || null; }
+  const USER_ACTION_BLOCKERS = new Set(['user_action_required', 'agent_interactive_input_required', 'github_write_auth_required']);
+  function userBlockedTasks() { return queueTasks().filter(row => ['blocked', 'failed'].includes(row.status) && USER_ACTION_BLOCKERS.has(row.blocker)); }
+  function technicalBlockedTasks() { return queueTasks().filter(row => ['blocked', 'failed'].includes(row.status) && !USER_ACTION_BLOCKERS.has(row.blocker)); }
   function currentQueueTask(agent = 'quantlab-hermes') { return queueTasks().find(row => row.agent === agent && ['running', 'blocked', 'failed'].includes(row.status)); }
   function nextQueueTask(agent = 'quantlab-hermes') { return queueTasks().filter(row => row.agent === agent && row.status === 'pending').sort((a, b) => (a.not_before ?? Number.MAX_SAFE_INTEGER) - (b.not_before ?? Number.MAX_SAFE_INTEGER) || a.task_id.localeCompare(b.task_id))[0]; }
   function taskDisplay(row) { return row ? `${issueLabel(row)} · ${row.task_id}` : 'Žádná'; }
+  function attemptLabel(row) { return row ? `${number(row.attempts)} / ${number(row.max_attempts)}` : 'Nedostupné'; }
+  function issueUrl(row) { return Number.isFinite(row?.issue) ? `https://github.com/${GITHUB_REPO}/issues/${row.issue}` : null; }
+  function prUrl(row) { return Number.isFinite(row?.pr_number) ? `https://github.com/${GITHUB_REPO}/pull/${row.pr_number}` : null; }
+  function detailLink(url, label) { return url ? `<a href="${escapeHTML(url)}" target="_blank" rel="noopener noreferrer">${escapeHTML(label)}</a>` : ''; }
   function agents() {
     return PROFILES.flatMap(profile => {
       const value = source(profile, 'herdr');
@@ -94,6 +135,7 @@ export function mountDashboard(createScene) {
       return { known, knownRequests, unknownRequests, coverage: requests === 0 ? 100 : Math.round(knownRequests / requests * 100) };
     };
     const input = partial('input_tokens'), output = partial('output_tokens'), cost = partial('cost_microusd');
+    const providerState = providerHistory(rows);
     return {
       requests, input: completeSum('input_tokens'), output: completeSum('output_tokens'), cost: completeSum('cost_microusd'),
       inputKnown: input.known, outputKnown: output.known, costKnown: cost.known,
@@ -102,7 +144,8 @@ export function mountDashboard(createScene) {
       costUnknownRequests: cost.unknownRequests, inputCoverage: input.coverage, outputCoverage: output.coverage, costCoverage: cost.coverage,
       fallbacks: completeSum('fallback_count'),
       models: [...new Set(rows.map(row => row.actual_model).filter(value => typeof value === 'string'))],
-      providers: [...new Set(rows.map(row => row.provider).filter(value => typeof value === 'string'))], rows, router,
+      providers: [...new Set(rows.map(row => row.provider).filter(value => typeof value === 'string'))],
+      ...providerState, rows, router,
     };
   }
   function searchStats(profile) {
@@ -115,6 +158,7 @@ export function mountDashboard(createScene) {
     const maximum = !available ? null : rows.length ? Math.max(...rows.map(row => row.max_duration_ms).filter(Number.isFinite)) : 0;
     const routes = Object.fromEntries(['fast', 'deep', 'browser'].map(mode => [mode,
       available ? rows.filter(row => row.route_mode === mode).reduce((total, row) => total + (Number.isFinite(row.searches) ? row.searches : 0), 0) : null]));
+    const providerState = providerHistory(rows);
     return {
       searches, successful: available ? sumKnown('successful_searches') : null,
       duration, avgLatency: searches == null || duration == null ? null : searches === 0 ? 0 : duration / searches,
@@ -123,7 +167,7 @@ export function mountDashboard(createScene) {
       results: available ? sumKnown('result_count') : null, extracts: available ? sumKnown('extract_count') : null,
       providers: [...new Set(rows.map(row => row.provider).filter(value => typeof value === 'string'))],
       fallbackProviders: [...new Set(rows.map(row => row.fallback_provider).filter(value => typeof value === 'string'))],
-      routes, search,
+      ...providerState, routes, search,
     };
   }
   function codexStats() {
@@ -137,15 +181,169 @@ export function mountDashboard(createScene) {
     const grouped = new Map();
     for (const row of routerRows()) {
       const key = row.actual_model;
-      if (!grouped.has(key)) grouped.set(key, { model: key, requests: 0, fallbacks: 0, successes: 0, durationMs: 0, durationRequests: 0 });
+      if (!grouped.has(key)) grouped.set(key, {
+        model: key, requests: 0, fallbacks: 0, successes: 0, durationMs: 0, durationRequests: 0,
+        inputTokens: 0, outputTokens: 0, tokenKnownRequests: 0, tokenUnknownRequests: 0,
+      });
       const item = grouped.get(key);
       item.requests += row.requests;
       item.fallbacks += row.fallback_count;
       item.successes += row.successful_requests;
       if (Number.isFinite(row.duration_ms)) { item.durationMs += row.duration_ms; item.durationRequests += row.requests; }
+      if (Number.isFinite(row.input_tokens) && Number.isFinite(row.output_tokens)) {
+        item.inputTokens += row.input_tokens; item.outputTokens += row.output_tokens; item.tokenKnownRequests += row.requests;
+      } else item.tokenUnknownRequests += row.requests;
     }
     return [...grouped.values()].sort((a, b) => b.requests - a.requests || a.model.localeCompare(b.model));
   }
+  function swarmMetrics() {
+    const queue = queueTasks();
+    const count = status => queue.filter(row => row.status === status).length;
+    const running = count('running'), waiting = count('pending'), failed = count('failed'), blockedOnly = count('blocked'), done = count('done');
+    const blocked = blockedOnly + failed;
+    const activeAgents = agents().filter(row => row.status === 'working').length;
+    const retries = queue.reduce((sum, row) => sum + (Number.isSafeInteger(row.attempts) ? Math.max(0, row.attempts - 1) : 0), 0);
+    const terminal = done + failed;
+    const success = terminal ? Math.round(done / terminal * 100) : null;
+    const profiles = PROFILES.map(stats);
+    const routersAvailable = profiles.every(value => value.router?.status === 'available');
+    const inputTokens = routersAvailable ? profiles.reduce((sum, value) => sum + (value.inputKnown || 0), 0) : null;
+    const outputTokens = routersAvailable ? profiles.reduce((sum, value) => sum + (value.outputKnown || 0), 0) : null;
+    const tokenUnknownRequests = routersAvailable ? profiles.reduce((sum, value) => sum + (value.inputUnknownRequests || 0) + (value.outputUnknownRequests || 0), 0) : null;
+    const cost = routersAvailable ? profiles.reduce((sum, value) => sum + (value.costKnown || 0), 0) : null;
+    const costUnknownRequests = routersAvailable ? profiles.reduce((sum, value) => sum + (value.costUnknownRequests || 0), 0) : null;
+    const models = modelMetrics();
+    const durationMs = models.reduce((sum, row) => sum + row.durationMs, 0);
+    const durationRequests = models.reduce((sum, row) => sum + row.durationRequests, 0);
+    const requestLatency = durationRequests ? durationMs / durationRequests : null;
+    const fallbacks = profiles.every(value => value.fallbacks != null) ? profiles.reduce((sum, value) => sum + value.fallbacks, 0) : null;
+    return { queue, running, waiting, blocked, blockedOnly, done, failed, activeAgents, retries, success,
+      activeQueue: running + waiting + blocked, inputTokens, outputTokens, tokenUnknownRequests, cost, costUnknownRequests,
+      requestLatency, fallbacks, models };
+  }
+
+  function renderSwarmKpis() {
+    const root = $('#swarm-kpis');
+    if (!root) return;
+    if (!liveData) { root.innerHTML = '<div class="swarm-kpi"><span>Swarm</span><b>—</b><small>telemetrie nedostupná</small></div>'; return; }
+    const m = swarmMetrics();
+    const tokenValue = m.inputTokens == null || m.outputTokens == null ? '—' : compact.format(m.inputTokens + m.outputTokens);
+    const costValue = m.cost == null ? '—' : money(m.cost);
+    const cells = [
+      ['Active', m.activeAgents, 'živí agenti', m.activeAgents ? 'running' : ''],
+      ['Running', m.running, 'běžící tasky', m.running ? 'running' : ''],
+      ['Waiting', m.waiting, 'pending', m.waiting ? 'waiting' : ''],
+      ['Blocked / Failed', `${m.blockedOnly} / ${m.failed}`, 'oddělené stavy', m.blocked ? 'blocked' : ''],
+      ['Queue', m.activeQueue, 'aktivní tasky', ''],
+      ['Terminal success', m.success == null ? '—' : `${m.success} %`, `${m.done} done · ${m.failed} failed`, ''],
+      ['Retries', m.retries, 'opakované pokusy', m.retries ? 'waiting' : ''],
+      ['Avg task', '—', 'duration telemetry chybí', ''],
+      ['Tokens', tokenValue, m.tokenUnknownRequests ? `${m.tokenUnknownRequests} req bez tokenů` : 'known input + output', ''],
+      ['Cost known', costValue, m.costUnknownRequests ? `${m.costUnknownRequests} req unknown` : 'všechny requesty oceněné', ''],
+    ];
+    root.innerHTML = cells.map(([label, value, note, state]) => `<article class="swarm-kpi" data-state="${state}"><span>${escapeHTML(label)}</span><b>${escapeHTML(String(value))}</b><small>${escapeHTML(note)}</small></article>`).join('');
+  }
+
+  function taskSortKey(row) {
+    const order = { running: 0, blocked: 1, failed: 2, pending: 3, done: 4 };
+    return [order[row.status] ?? 9, -(row.updated_at || 0), row.task_id];
+  }
+  function sortedTaskNodes() {
+    return [...queueTasks()].sort((a, b) => {
+      const aa = taskSortKey(a), bb = taskSortKey(b);
+      return aa[0] - bb[0] || aa[1] - bb[1] || String(aa[2]).localeCompare(String(bb[2]));
+    });
+  }
+  function taskMatchesFilter(row) {
+    if (taskFilter === 'all') return true;
+    if (taskFilter === 'blocked') return row.status === 'blocked' || row.status === 'failed';
+    return row.status === taskFilter;
+  }
+
+  function taskNodeHTML(row) {
+    return `<button type="button" class="taskgraph-node" role="option" aria-selected="${String(selectedTask === row.task_id)}" data-task-id="${escapeHTML(row.task_id)}" data-status="${escapeHTML(row.status)}"><b>${escapeHTML(issueLabel(row))} · ${escapeHTML(row.task_id)}</b><span>${escapeHTML(QUEUE_STATUS[row.status] || row.status)}</span><small>${escapeHTML(row.issue_title || row.kind)} · pokus ${escapeHTML(attemptLabel(row))}</small></button>`;
+  }
+  function taskLaneHTML(label, rows, limit) {
+    if (!rows.length) return '';
+    const visible = rows.slice(0, limit);
+    const overflow = rows.length - visible.length;
+    return `<div class="taskgraph-lane" role="group" aria-label="${escapeHTML(label)}"><span class="taskgraph-lane-label">${escapeHTML(label)}</span><div class="taskgraph-lane-track">${visible.map(taskNodeHTML).join('')}${overflow ? `<div class="taskgraph-node taskgraph-cluster" data-status="pending"><b>+${overflow} uzlů</b><span>LOD cluster</span><small>další sanitizované tasky</small></div>` : ''}</div></div>`;
+  }
+
+  function renderTaskGraph() {
+    const root = $('#taskgraph-nodes'), status = $('#taskgraph-status');
+    if (!root || !status) return;
+    const sourceValue = queueSource();
+    if (!sourceValue || sourceValue.status !== 'available') {
+      status.textContent = 'Task telemetry není dostupná.';
+      root.innerHTML = '<div class="obs-empty">TaskGraph nelze zobrazit bez durable queue.</div>';
+      sceneCall('setTasks', []);
+      return;
+    }
+    const allRows = sortedTaskNodes();
+    const rows = allRows.filter(taskMatchesFilter);
+    document.querySelectorAll('[data-task-filter]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.taskFilter === taskFilter)));
+    const filterLabel = taskFilter === 'all' ? 'všechny stavy' : taskFilter === 'pending' ? 'čekající' : taskFilter === 'blocked' ? 'blocked + failed' : taskFilter;
+    status.textContent = `Dependency telemetry není v aktuálním kontraktu · hrany se nevymýšlejí · filtr: ${filterLabel}.`;
+    if (!allRows.length) {
+      root.innerHTML = '<div class="obs-empty">Durable queue je prázdná.</div>';
+      sceneCall('setTasks', []);
+      return;
+    }
+    if (!rows.length) {
+      root.innerHTML = '<div class="obs-empty">Pro zvolený filtr nejsou žádné tasky.</div>';
+      sceneCall('setTasks', allRows.filter(row => row.status !== 'done'));
+      return;
+    }
+    if (taskFilter === 'all') {
+      const priority = rows.filter(row => ['running', 'blocked', 'failed'].includes(row.status));
+      const rest = rows.filter(row => !['running', 'blocked', 'failed'].includes(row.status));
+      root.innerHTML = taskLaneHTML('Aktivní / problémové', priority, 10) + taskLaneHTML('Čekající / hotové', rest, 14);
+    } else {
+      root.innerHTML = taskLaneHTML(filterLabel, rows, 18);
+    }
+    const buttons = [...root.querySelectorAll('[data-task-id]')];
+    buttons.forEach((button, index) => {
+      button.addEventListener('click', () => openTaskDetail(button.dataset.taskId));
+      button.addEventListener('keydown', event => {
+        if (!['ArrowRight','ArrowLeft','ArrowDown','ArrowUp','Home','End','Enter',' '].includes(event.key)) return;
+        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); openTaskDetail(button.dataset.taskId); return; }
+        event.preventDefault();
+        const step = event.key === 'ArrowDown' ? 2 : event.key === 'ArrowUp' ? -2 : event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0;
+        const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1 : Math.max(0, Math.min(buttons.length - 1, index + step));
+        buttons[next]?.focus();
+      });
+    });
+    sceneCall('setTasks', allRows.filter(row => row.status !== 'done'));
+  }
+
+  function renderSwarmAnalytics() {
+    const root = $('#swarm-analytics-grid');
+    if (!root) return;
+    if (!liveData) { root.innerHTML = '<article class="swarm-card"><header><h3>Swarm</h3></header><strong>—</strong><p>Živá telemetrie není dostupná.</p></article>'; return; }
+    const m = swarmMetrics();
+    const queueTotal = m.queue.length || 1;
+    const mini = `<div class="swarm-mini">${['running','pending','blocked','failed','done'].map(status => { const count = m.queue.filter(row => row.status === status).length; return count ? `<i class="${status}" style="width:${(count / queueTotal * 100).toFixed(1)}%" title="${escapeHTML(QUEUE_STATUS[status] || status)}: ${count}"></i>` : ''; }).join('')}</div>`;
+    const tokens = m.inputTokens == null || m.outputTokens == null ? '—' : compact.format(m.inputTokens + m.outputTokens);
+    const cost = m.cost == null ? '—' : money(m.cost);
+    const topModels = m.models.slice(0, 4);
+    const mix = topModels.length ? topModels.map(row => `${escapeHTML(row.model)} ${fmt.format(row.requests)}`).join(' · ') : 'Model telemetry není dostupná.';
+    root.innerHTML = [
+      `<article class="swarm-card"><header><h3>Throughput</h3><span>tasks / time</span></header><strong>—</strong><p>Časová řada dokončených tasků není v autoritativním kontraktu; hodnotu neodhadujeme.</p></article>`,
+      `<article class="swarm-card"><header><h3>Queue depth</h3><span>snapshot</span></header><strong>${fmt.format(m.activeQueue)}</strong>${mini}<p>${m.running} running · ${m.waiting} waiting · ${m.blockedOnly} blocked · ${m.failed} failed · ${m.done} done</p></article>`,
+      `<article class="swarm-card"><header><h3>Latency</h3><span>router request avg</span></header><strong>${escapeHTML(latency(m.requestLatency))}</strong><p>Task queue/review p50+p95 nejsou dostupné; zobrazen je pouze měřený router request průměr.</p></article>`,
+      `<article class="swarm-card"><header><h3>Tokens & cost</h3><span>known telemetry</span></header><strong>${escapeHTML(tokens)}</strong><p>${escapeHTML(cost)} known · ${m.costUnknownRequests || 0} req unknown · ${m.tokenUnknownRequests || 0} token fields unknown.</p></article>`,
+      `<article class="swarm-card"><header><h3>Model mix</h3><span>requests</span></header><strong>${fmt.format(m.models.reduce((sum,row)=>sum+row.requests,0))}</strong><p>${mix}</p></article>`,
+      `<article class="swarm-card"><header><h3>Reliability</h3><span>snapshot</span></header><strong>${fmt.format(m.retries)}</strong><p>true retries · ${m.blockedOnly} blocked · ${m.failed} failed · ${number(m.fallbacks)} model fallbacků.</p></article>`,
+    ].join('');
+  }
+
+  function renderSwarm() {
+    renderSwarmKpis();
+    renderTaskGraph();
+    renderSwarmAnalytics();
+  }
+
   function resetLabel(epoch) {
     if (!Number.isFinite(epoch)) return 'Neznámý';
     return new Date(epoch * 1000).toLocaleString('cs-CZ', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
@@ -192,9 +390,10 @@ export function mountDashboard(createScene) {
     if (demo) return demoState;
     if (!liveData) return 'offline';
     const all = agents(), hermes = all.filter(row => agentKind(row.agent) === 'hermes'), queued = queueTasks();
-    if (all.some(row => row.status === 'blocked') || queued.some(row => ['blocked', 'failed'].includes(row.status))) return 'waiting_user';
+    if (all.some(row => row.status === 'blocked') || userBlockedTasks().length) return 'waiting_user';
     if (liveData.sources.some(row => row.kind === 'herdr' && row.status !== 'available')) return all.length ? 'error' : 'offline';
     if (hermes.some(row => row.status === 'working') || queued.some(row => row.status === 'running')) return 'working';
+    if (technicalBlockedTasks().length) return 'waiting_result';
     if (hermes.some(row => row.status === 'idle')) return 'idle';
     if (hermes.length && hermes.every(row => row.status === 'done')) return 'complete';
     return 'offline';
@@ -207,8 +406,12 @@ export function mountDashboard(createScene) {
     if (state === 'working' || (state === 'idle' && active.length)) return `Pracují: ${active.join(', ')}. Přesný úkol zdroj neposkytuje.`;
     if (state === 'waiting_user') {
       const blockedAgents = agents().filter(row => row.status === 'blocked').map(row => row.agent);
-      const blockedTasks = queueTasks().filter(row => ['blocked', 'failed'].includes(row.status)).map(row => `${issueLabel(row)} ${row.task_id}`);
+      const blockedTasks = userBlockedTasks().map(row => `${issueLabel(row)} ${row.task_id}`);
       return `Zkontrolujte: ${[...blockedAgents, ...blockedTasks].join(', ') || 'blokovanou úlohu'}.`;
+    }
+    if (state === 'waiting_result') {
+      const tasks = technicalBlockedTasks().map(row => `${issueLabel(row)} ${row.blocker || row.task_id}`);
+      return `Čekají technické závislosti: ${tasks.join(', ') || 'interní kontrola'}.`;
     }
     if (state === 'offline') return loadReason;
     if (state === 'error') return liveData.sources.filter(row => row.status === 'unavailable' && row.reason !== 'not_configured')
@@ -230,6 +433,7 @@ export function mountDashboard(createScene) {
       running: queue.filter(row => row.status === 'running').length,
       pending: queue.filter(row => row.status === 'pending').length,
       blocked: queue.filter(row => ['blocked', 'failed'].includes(row.status)).length,
+      userBlocked: userBlockedTasks().length,
       workingAgents: working.length,
       activeAgent: currentTask?.agent || working[0]?.agent || null,
     });
@@ -257,8 +461,11 @@ export function mountDashboard(createScene) {
       $(`#${profile}-agents`).innerHTML = boundRows.map(agentButton).join('') + overflow;
       const rows = actual.length ? actual : boundRows;
       const queued = profile === 'quantlab' ? queueTasks() : [];
-      $(`#${profile}-project-state`).textContent = rows.some(row => row.status === 'blocked') || queued.some(row => ['blocked', 'failed'].includes(row.status)) ? 'zásah'
-        : rows.some(row => row.status === 'working') || queued.some(row => row.status === 'running') ? 'pracuje' : rows.every(row => row.unavailable) ? 'bez dat' : 'klid';
+      const userBlocked = profile === 'quantlab' ? userBlockedTasks().length : 0;
+      const technicalBlocked = profile === 'quantlab' ? technicalBlockedTasks().length : 0;
+      $(`#${profile}-project-state`).textContent = rows.some(row => row.status === 'blocked') || userBlocked ? 'zásah'
+        : rows.some(row => row.status === 'working') || queued.some(row => row.status === 'running') ? 'pracuje'
+          : technicalBlocked ? 'čeká' : rows.every(row => row.unavailable) ? 'bez dat' : 'klid';
       sceneRows.push(...boundRows.map(row => ({ ...row, id: row.agent, role: agentKind(row.agent), visible: !$(`#${profile}-agents`).hidden })));
     }
     ui.film.querySelectorAll('[data-agent]').forEach(button => button.addEventListener('click', () => openDetail(button.dataset.agent)));
@@ -298,6 +505,12 @@ export function mountDashboard(createScene) {
       return;
     }
     const codex = codexStats().row;
+    const routingAvailable = codex?.routing_status === 'available';
+    const routeRows = routingAvailable ? [
+      { label: 'FREE', value: codex.routing_free },
+      { label: 'Sol', value: codex.routing_sol },
+      { label: 'Astra', value: codex.routing_astra },
+    ] : [];
     const profileStats = PROFILES.map(stats);
     const routersAvailable = profileStats.every(value => value.router?.status === 'available');
     const totalRequests = routersAvailable ? profileStats.reduce((sum, value) => sum + value.requests, 0) : null;
@@ -313,7 +526,7 @@ export function mountDashboard(createScene) {
       `<article class="obs-kpi" data-severity="${severity}"><span>Codex allowance · zbývá</span><b>${remaining == null ? '—' : remaining + ' %'}</b><div class="obs-gauge"><i style="--gauge:${codex ? codex.used_percent : 0}%"></i></div><small>${codex ? (codex.ordinary_usage_allowed ? 'Běžné použití povoleno' : 'Limit vyčerpán') : 'Zdroj nedostupný'}</small></article>`,
       `<article class="obs-kpi"><span>Další reset Codex</span><b>${codex ? escapeHTML(resetLabel(codex.resets_at)) : '—'}</b><small>${codex ? escapeHTML(resetDistance(codex.resets_at)) : 'Čas resetu není dostupný'}</small></article>`,
       `<article class="obs-kpi"><span>Codex lifetime tokeny</span><b>${codex?.lifetime_tokens == null ? '—' : escapeHTML(compact.format(codex.lifetime_tokens))}</b><small>Peak/day: ${codex?.peak_daily_tokens == null ? '—' : escapeHTML(compact.format(codex.peak_daily_tokens))}</small></article>`,
-      `<article class="obs-kpi"><span>Router požadavky</span><b>${number(totalRequests)}</b><small>${routersAvailable ? `${fmt.format(profileStats.reduce((s,v)=>s+(v.fallbacks||0),0))} fallbacků` : 'část routerů nedostupná'}</small></article>`,
+      `<article class="obs-kpi"><span>Router požadavky</span><b>${number(totalRequests)}</b><small>${routersAvailable ? `${fmt.format(profileStats.reduce((s,v)=>s+(v.fallbacks||0),0))} fallbacků${routingAvailable ? ` · Astra eskalace ${fmt.format(codex.routing_astra_escalations)}` : ''}` : 'část routerů nedostupná'}</small></article>`,
       `<article class="obs-kpi"><span>Variabilní náklady</span><b>${knownCost == null ? '—' : escapeHTML(money(knownCost))}</b><small>${escapeHTML(costCopy)}</small></article>`,
       `<article class="obs-kpi" data-severity="${activeQueue ? 'warn' : 'ok'}"><span>Aktivní práce</span><b>${fmt.format(activeAgents)} agent · ${fmt.format(activeQueue)} fronta</b><small>${activeQueue ? 'Fronta má rozpracované/čekající úlohy' : 'Durable fronta bez aktivních položek'}</small></article>`,
     ].join('');
@@ -324,6 +537,9 @@ export function mountDashboard(createScene) {
       .sort((a,b) => b.rate - a.rate || b.requests - a.requests).slice(0, 8);
     const latencyRows = models.filter(row => row.durationRequests > 0).map(row => ({ ...row, avg: row.durationMs / row.durationRequests }))
       .sort((a,b) => b.avg - a.avg).slice(0, 8);
+    const tokenRows = models.filter(row => row.tokenKnownRequests > 0)
+      .map(row => ({ ...row, tokens: row.inputTokens + row.outputTokens }))
+      .sort((a,b) => b.tokens - a.tokens || b.requests - a.requests).slice(0, 8);
 
     const totalRouterRequests = profileStats.every(v => v.requests != null) ? profileStats.reduce((s,v)=>s+v.requests,0) : 0;
     const coverageMetric = (knownKey, unknownKey) => {
@@ -348,8 +564,10 @@ export function mountDashboard(createScene) {
 
     grid.innerHTML = [
       `<article class="obs-panel wide"><header><div><h3>Codex tokeny po dnech</h3><span>45 posledních měřených dní</span></div><span>${daily.length ? 'peak '+escapeHTML(compact.format(Math.max(...daily.map(r=>r.tokens)))) : 'bez dat'}</span></header>${lineChart(daily,'tokens',{id:'codexTokensArea'})}<p class="obs-note">Account-wide token activity z Codex app-serveru. Není převáděna na API cenu.</p></article>`,
-      `<article class="obs-panel"><header><div><h3>Codex allowance</h3><span>časová řada využití</span></div><span>${codex ? codex.used_percent+' % použito' : 'nedostupné'}</span></header>${lineChart(history,'used_percent',{id:'codexLimitArea',suffix:' %',maxValue:100})}<p class="obs-note">${history.length < 2 ? 'Historii jsme právě začali sbírat; graf se bude plnit automaticky.' : 'Snapshot každých přibližně 5 minut.'}</p></article>`,
-      `<article class="obs-panel"><header><div><h3>Model traffic</h3><span>počet požadavků</span></div><span>top 8</span></header>${bars(volumeRows,r=>r.requests,v=>fmt.format(v))}</article>`,
+      `<article class="obs-panel"><header><div><h3>Codex allowance</h3><span>časová řada využití</span></div><span>${codex ? codex.used_percent+' % použito' : 'nedostupné'}</span></header>${lineChart(history,'used_percent',{id:'codexLimitArea',suffix:' %',maxValue:100})}<p class="obs-note">${history.length < 2 ? 'Historii jsme právě začali sbírat; graf se bude plnit automaticky.' : 'Snapshot každých přibližně 5 minut.'}${routingAvailable ? ` · Router soft ${fmt.format(codex.routing_soft_limit_pct)} % / hard ${fmt.format(codex.routing_hard_limit_pct)} %.` : ''}</p></article>`,
+      `<article class="obs-panel"><header><div><h3>Cost-aware router</h3><span>FREE / Sol / Astra · task decisions</span></div><span>${routingAvailable ? escapeHTML(codex.routing_policy_version) : 'nedostupné'}</span></header>${bars(routeRows,r=>r.value,v=>fmt.format(v))}<div class="obs-legend"><span>Astra eskalace: ${routingAvailable ? fmt.format(codex.routing_astra_escalations) : '—'}</span><span>Premium blokováno: ${routingAvailable ? fmt.format(codex.routing_premium_denied) : '—'}</span></div><p class="obs-note">${routingAvailable ? `Poslední route: ${escapeHTML(codex.last_route_model || '—')} · ${escapeHTML(codex.last_route_reason || '—')}` : 'Routing telemetry není dostupná.'}</p></article>`,
+      `<article class="obs-panel"><header><div><h3>Model traffic</h3><span>počet skutečných provider requestů</span></div><span>top 8</span></header>${bars(volumeRows,r=>r.requests,v=>fmt.format(v))}</article>`,
+      `<article class="obs-panel"><header><div><h3>Model tokeny</h3><span>skutečně změřené router requesty</span></div><span>top 8</span></header>${bars(tokenRows,r=>r.tokens,v=>compact.format(v))}<p class="obs-note">Per-model tokeny jsou autoritativní pro Hermes router. Codex Sol/Astra zde nejsou odhadovány; jejich account-wide tokeny zůstávají v samostatném grafu.</p></article>`,
       `<article class="obs-panel"><header><div><h3>Fallback pressure</h3><span>fallbacky / požadavky</span></div><span>vyšší = horší</span></header>${bars(fallbackRows,r=>r.rate,v=>v.toFixed(1)+' %',{percent:true,alert:r=>r.rate>=25})}</article>`,
       `<article class="obs-panel"><header><div><h3>Model latency</h3><span>průměr na request</span></div><span>jen známá latence</span></header>${bars(latencyRows,r=>r.avg,v=>latency(v))}</article>`,
       `<article class="obs-panel"><header><div><h3>Data coverage</h3><span>request-weighted completeness</span></div><span>fail-closed</span></header>${coverage.map(([name,pct])=>`<div class="coverage-row"><span>${escapeHTML(name)}</span><div class="coverage-track"><i style="width:${pct}%"></i></div><strong>${pct} %</strong></div>`).join('')}<p class="obs-note">100 % znamená, že každému requestu odpovídá měřená hodnota. Chybějící hodnoty nejsou dopočítány.</p></article>`,
@@ -375,7 +593,8 @@ export function mountDashboard(createScene) {
     list.innerHTML = visible.length ? visible.map(row => {
       const blocker = row.blocker || '—';
       const timing = row.status === 'pending' ? `od ${queueTime(row.not_before)}` : `změna ${queueTime(row.updated_at)}`;
-      return `<article class="queue-task" data-status="${escapeHTML(row.status)}"><div class="queue-task-main"><b>${escapeHTML(issueLabel(row))} · <code>${escapeHTML(row.task_id)}</code></b><small>${escapeHTML(row.kind)} · ${escapeHTML(row.agent)}</small></div><span class="queue-status">${escapeHTML(QUEUE_STATUS[row.status] || row.status)}</span><span class="queue-attempt">Pokus ${number(row.attempts)}</span><time>${escapeHTML(timing)}</time><span class="queue-blocker">${escapeHTML(blocker)}</span></article>`;
+      const title = row.issue_title || row.kind;
+      return `<article class="queue-task" data-status="${escapeHTML(row.status)}"><div class="queue-task-main"><b>${escapeHTML(issueLabel(row))} · <code>${escapeHTML(row.task_id)}</code></b><small>${escapeHTML(title)} · ${escapeHTML(row.kind)} · ${escapeHTML(row.agent)}</small></div><span class="queue-status">${escapeHTML(QUEUE_STATUS[row.status] || row.status)}</span><span class="queue-attempt">Pokus ${escapeHTML(attemptLabel(row))}</span><time>${escapeHTML(timing)}</time><span class="queue-blocker">${escapeHTML(blocker)}</span></article>`;
     }).join('') : '<p class="queue-empty">Fronta je prázdná.</p>';
     if (rows.length > visible.length) list.insertAdjacentHTML('beforeend', `<p class="queue-empty">+${rows.length - visible.length} dalších záznamů v sanitizovaném snapshotu.</p>`);
   }
@@ -389,9 +608,10 @@ export function mountDashboard(createScene) {
       }
       const success = value.searches === 0 ? '—' : value.successful == null || value.searches == null
         ? 'Nedostupné' : `${Math.round(value.successful / value.searches * 100)} %`;
-      const providers = value.providers.join(', ') || 'Zatím bez provozu';
+      const currentProvider = value.currentProvider || 'Zatím bez provozu';
+      const historicalProviders = value.historicalProviders.join(', ') || '—';
       const fallbackProviders = value.fallbackProviders.join(', ') || '—';
-      return `<article class="search-card"><header><div><span>${escapeHTML(profile.toUpperCase())}</span><b>Search Router</b></div><span class="search-health">${number(value.searches)} hledání</span></header><div class="search-metrics"><div><span>Úspěšnost</span><b>${escapeHTML(success)}</b></div><div><span>Latence avg / max</span><b>${escapeHTML(`${latency(value.avgLatency)} / ${latency(value.maxLatency)}`)}</b></div><div><span>Fallbacky</span><b>${number(value.fallbacks)}</b></div><div><span>Náklady</span><b>${escapeHTML(money(value.cost))}</b></div></div><div class="search-routes"><span>FAST <b>${number(value.routes.fast)}</b></span><span>DEEP <b>${number(value.routes.deep)}</b></span><span>BROWSER <b>${number(value.routes.browser)}</b></span></div><p><span>Provider:</span> ${escapeHTML(providers)}</p><p><span>Fallback provider:</span> ${escapeHTML(fallbackProviders)}</p><p><span>Výsledky / extrakce:</span> ${number(value.results)} / ${number(value.extracts)} · data před ${escapeHTML(age(value.search.data_at))}</p></article>`;
+      return `<article class="search-card"><header><div><span>${escapeHTML(profile.toUpperCase())}</span><b>Search Router</b></div><span class="search-health">${number(value.searches)} hledání</span></header><div class="search-metrics"><div><span>Úspěšnost</span><b>${escapeHTML(success)}</b></div><div><span>Latence avg / max</span><b>${escapeHTML(`${latency(value.avgLatency)} / ${latency(value.maxLatency)}`)}</b></div><div><span>Fallbacky</span><b>${number(value.fallbacks)}</b></div><div><span>Náklady</span><b>${escapeHTML(money(value.cost))}</b></div></div><div class="search-routes"><span>FAST <b>${number(value.routes.fast)}</b></span><span>DEEP <b>${number(value.routes.deep)}</b></span><span>BROWSER <b>${number(value.routes.browser)}</b></span></div><p><span>Aktuální provider (poslední běh):</span> ${escapeHTML(currentProvider)}</p><p><span>Historické providery:</span> ${escapeHTML(historicalProviders)}</p><p><span>Pozorované fallback providery:</span> ${escapeHTML(fallbackProviders)}</p><p><span>Výsledky / extrakce:</span> ${number(value.results)} / ${number(value.extracts)} · data před ${escapeHTML(age(value.search.data_at))}</p></article>`;
     }).join('');
   }
 
@@ -401,7 +621,7 @@ export function mountDashboard(createScene) {
       const tokenCoverage = value.inputCoverage == null || value.outputCoverage == null ? null : Math.min(value.inputCoverage, value.outputCoverage);
       const tokenText = value.inputKnown == null ? 'Nedostupné' : `${number(value.inputKnown)} / ${number(value.outputKnown)}${tokenCoverage < 100 ? ` · ${tokenCoverage} % req` : ''}`;
       const costText = value.costKnown == null ? 'Nedostupné' : `${money(value.costKnown)} známé${value.costUnknownRequests ? ` + ${fmt.format(value.costUnknownRequests)} bez ceny` : ''}`;
-      return `<article class="work-project"><h2>${profile.toUpperCase()}</h2>${rows.length ? rows.map(row => `<button class="work-agent" data-agent="${escapeHTML(row.agent)}"><b>${escapeHTML(row.agent)}</b><span>${statusLabel(row.status)}</span><small>${ROLES[agentKind(row.agent)]}</small></button>`).join('') : '<p>Živý stav agentů není dostupný.</p>'}<p class="work-models">Modely profilu: ${escapeHTML(value.models.join(', ') || 'Nedostupné')}</p><div class="work-totals"><div><span>Požadavky</span><b>${number(value.requests)}</b></div><div><span>Tokeny vstup/výstup</span><b>${escapeHTML(tokenText)}</b></div><div><span>Známé náklady / fallbacky</span><b>${escapeHTML(costText)} · ${number(value.fallbacks)}</b></div></div></article>`;
+      return `<article class="work-project"><h2>${profile.toUpperCase()}</h2>${rows.length ? rows.map(row => `<button class="work-agent" data-agent="${escapeHTML(row.agent)}"><b>${escapeHTML(row.agent)}</b><span>${statusLabel(row.status)}</span><small>${ROLES[agentKind(row.agent)]}</small></button>`).join('') : '<p>Živý stav agentů není dostupný.</p>'}<p class="work-models">Modely profilu: ${escapeHTML(value.models.join(', ') || 'Nedostupné')}</p><p class="work-models">Aktuální provider (poslední běh): ${escapeHTML(value.currentProvider || 'Nedostupné')}</p><p class="work-models">Historické providery: ${escapeHTML(value.historicalProviders.join(', ') || '—')}</p><div class="work-totals"><div><span>Požadavky</span><b>${number(value.requests)}</b></div><div><span>Tokeny vstup/výstup</span><b>${escapeHTML(tokenText)}</b></div><div><span>Známé náklady / fallbacky</span><b>${escapeHTML(costText)} · ${number(value.fallbacks)}</b></div></div></article>`;
     }).join('');
     $('#project-grid').querySelectorAll('[data-agent]').forEach(button => button.addEventListener('click', () => openDetail(button.dataset.agent)));
     renderObservability(); renderQueue(); renderSearch();
@@ -409,57 +629,138 @@ export function mountDashboard(createScene) {
       const label = row.kind === 'codex' ? 'CODEX / ÚČET' : `${row.profile} / ${row.kind}`;
       return `<article class="source-card" data-status="${escapeHTML(row.status)}"><b>${escapeHTML(label)}</b><span>${escapeHTML(row.status)} · ${escapeHTML(row.reason)}</span><span>${row.status === 'available' ? `${row.rows.length} záznamů` : 'bez dat'}</span></article>`;
     }).join('');
-    const problems = (liveData?.sources || []).filter(row => row.status === 'unavailable' && row.reason !== 'not_configured');
+    const sourceUserActionReasons = new Set(['user_action_required', 'auth_required', 'credentials_missing', 'permission_required']);
+    const sourceActions = (liveData?.sources || []).filter(row => row.status === 'unavailable' && sourceUserActionReasons.has(row.reason));
     const blocked = agents().filter(row => row.status === 'blocked');
-    const queueAlerts = queueTasks().filter(row => ['blocked', 'failed'].includes(row.status));
+    const queueAlerts = userBlockedTasks();
     const summary = $('#attention-summary');
-    summary.hidden = Boolean(liveData) && !problems.length && !blocked.length && !queueAlerts.length;
-    summary.textContent = !liveData ? loadReason : `Vyžaduje kontrolu: ${[...blocked.map(row => row.agent), ...queueAlerts.map(row => `${issueLabel(row)} ${row.task_id}`), ...problems.map(row => `${row.profile}/${row.kind} (${row.reason})`)].join(', ')}`;
+    summary.hidden = Boolean(liveData) && !sourceActions.length && !blocked.length && !queueAlerts.length;
+    summary.textContent = !liveData ? loadReason : `Vyžaduje váš zásah: ${[...blocked.map(row => row.agent), ...queueAlerts.map(row => `${issueLabel(row)} ${row.task_id}`), ...sourceActions.map(row => `${row.profile}/${row.kind} (${row.reason})`)].join(', ')}`;
     if (!summary.hidden) {
       const action = document.createElement('button'); action.type = 'button'; action.className = 'attention-action';
       action.textContent = blocked.length ? 'Otevřít blokovaného agenta' : queueAlerts.length ? 'Otevřít frontu' : 'Obnovit data';
       action.addEventListener('click', () => blocked.length ? openDetail(blocked[0].agent) : queueAlerts.length ? $('#queue-title').scrollIntoView({ behavior: reduced ? 'auto' : 'smooth' }) : refresh(true)); summary.append(' ', action);
     }
   }
+  function renderTaskDetail() {
+    const task = taskById(selectedTask);
+    $('#detail-profile').textContent = 'SWARM TASK';
+    $('#detail-title').textContent = task ? `${issueLabel(task)} · ${task.task_id}` : selectedTask || 'Task';
+    $('#detail-role').textContent = 'Durable task node · read only';
+    $('#detail-status').textContent = task ? `Stav: ${QUEUE_STATUS[task.status] || task.status}` : 'Task už není v aktuálním snapshotu';
+    $('#detail-links').innerHTML = task ? [
+      detailLink(issueUrl(task), `Otevřít Issue ${issueLabel(task)}`),
+      detailLink(prUrl(task), task.pr_number ? `Otevřít PR #${task.pr_number}` : ''),
+    ].filter(Boolean).join('') : '';
+    const metrics = task ? [
+      ['Task ID', task.task_id],
+      ['Issue / název', `${issueLabel(task)} · ${task.issue_title || task.kind}`],
+      ['Stav / scheduler', `${QUEUE_STATUS[task.status] || task.status} · ${task.scheduler_state || 'nehlášeno'}`],
+      ['Pokus / maximum', attemptLabel(task)],
+      ['Agent', task.agent],
+      ['Typ', task.kind],
+      ['PR', task.pr_number ? `#${task.pr_number}` : 'Není hlášeno'],
+      ['Blocker', task.blocker || '—'],
+      ['Čas', task.status === 'pending' ? `nejdříve ${queueTime(task.not_before)}` : `změna ${queueTime(task.updated_at)}`],
+      ['Dependency edges', 'Nedostupné v telemetry kontraktu · žádná hrana nebyla odvozena'],
+      ['Runtime / queue wait', 'Nedostupné v telemetry kontraktu'],
+      ['Branch / base / result SHA', 'Nedostupné v telemetry kontraktu'],
+      ['Test / reviewer', 'Nedostupné v telemetry kontraktu'],
+    ] : [['Stav', 'Task už není v aktuálním snapshotu']];
+    $('#detail-metrics').innerHTML = metrics.map(([title, content]) => `<div><dt>${escapeHTML(title)}</dt><dd>${escapeHTML(content)}</dd></div>`).join('');
+    const events = task ? [
+      `Durable queue: ${issueLabel(task)} · ${task.task_id} · ${QUEUE_STATUS[task.status] || task.status}`,
+      `Scheduler: ${task.scheduler_state || 'nehlášeno'} · pokus ${attemptLabel(task)}`,
+      task.blocker ? `Blocker: ${task.blocker}` : 'Bez hlášeného blockeru',
+      'Dependency telemetry není součástí aktuálního snapshotu; DAG hrany nejsou odhadovány.',
+      'Prompt, interní myšlenky a raw log nejsou v dashboardu zobrazovány.',
+    ] : ['Task není v aktuálním snapshotu.'];
+    $('#detail-events').innerHTML = events.map(event => `<li>${escapeHTML(event)}</li>`).join('');
+  }
+
   function renderDetail() {
+    if (selectedTask) { renderTaskDetail(); return; }
     if (!selectedAgent) return;
     const row = agents().find(item => item.agent === selectedAgent);
     const profile = row?.profile || (selectedAgent.startsWith('majak-') ? 'majak' : 'quantlab');
     const value = stats(profile), search = searchStats(profile), herdr = source(profile, 'herdr');
-    const task = selectedAgent === 'quantlab-hermes' ? currentQueueTask(selectedAgent) : null;
+    const task = selectedAgent === 'quantlab-hermes'
+      ? currentQueueTask(selectedAgent) || nextQueueTask(selectedAgent) : null;
     const currentTask = selectedAgent === 'quantlab-hermes'
-      ? task ? `${issueLabel(task)} · ${task.task_id} · ${QUEUE_STATUS[task.status] || task.status}` : 'Žádná aktivní úloha v durable queue'
+      ? task ? `${issueLabel(task)} · ${task.task_id} · ${QUEUE_STATUS[task.status] || task.status}` : 'Žádná úloha v durable queue'
       : 'Nedostupné v datovém kontraktu';
+    const taskTitle = task?.issue_title || 'Nedostupné v telemetry kontraktu';
+    const taskState = task
+      ? `${QUEUE_STATUS[task.status] || task.status} · scheduler ${task.scheduler_state || 'nehlášeno'}`
+      : 'Nedostupné v telemetry kontraktu';
+    const taskTiming = task
+      ? `${task.status === 'pending' ? 'nejdříve ' + queueTime(task.not_before) : 'změna ' + queueTime(task.updated_at)}`
+      : 'Nedostupné v telemetry kontraktu';
+    const tokenCoverage = value.inputCoverage == null || value.outputCoverage == null
+      ? null : Math.min(value.inputCoverage, value.outputCoverage);
+    const tokens = value.inputKnown == null ? 'Nedostupné'
+      : `${number(value.inputKnown)} / ${number(value.outputKnown)}${tokenCoverage < 100 ? ` · coverage ${tokenCoverage} % req` : ''}`;
+    const costs = value.costKnown == null ? 'Nedostupné'
+      : `${money(value.costKnown)} známé${value.costUnknownRequests ? ` + ${fmt.format(value.costUnknownRequests)} req bez ceny` : ''}`;
+
     $('#detail-profile').textContent = profile.toUpperCase(); $('#detail-title').textContent = selectedAgent;
     $('#detail-role').textContent = ROLES[agentKind(selectedAgent)];
     $('#detail-status').textContent = `Živý stav: ${row ? statusLabel(row.status) : 'Odpojeno / neznámé'}`;
+    $('#detail-links').innerHTML = [
+      detailLink(issueUrl(task), task ? `Otevřít Issue ${issueLabel(task)}` : ''),
+      detailLink(prUrl(task), task?.pr_number ? `Otevřít PR #${task.pr_number}` : ''),
+    ].filter(Boolean).join('');
+
     const metrics = [
-      ['Aktuální úkol', currentTask], ['Modely profilu', value.models.join(', ') || 'Nedostupné v aktuálním snapshotu'],
-      ['Provider / fallbacky', `${value.providers.join(', ') || 'Nedostupné'} · ${number(value.fallbacks)}`],
-      ['Požadavky / náklady profilu', `${number(value.requests)} · ${value.costKnown == null ? 'Nedostupné' : `${money(value.costKnown)} známé${value.costUnknownRequests ? ` + ${fmt.format(value.costUnknownRequests)} req bez ceny` : ''}`}`],
-      ['Search provider / fallbacky', `${search.providers.join(', ') || 'Nedostupné'} · ${number(search.fallbacks)}`],
-      ['Search hledání / latence / náklady', `${number(search.searches)} · ${latency(search.avgLatency)} · ${money(search.cost)}`],
+      ['Aktuální úkol', currentTask],
+      ['Issue / název', task ? `${issueLabel(task)} · ${taskTitle}` : 'Nedostupné v telemetry kontraktu'],
+      ['Task stav', taskState],
+      ['Pokus / maximum', attemptLabel(task)],
+      ['Čas fronty', taskTiming],
+      ['PR', task?.pr_number ? `#${task.pr_number}` : 'Není hlášeno'],
+      ['Blocker', task?.blocker || '—'],
+      ['Modely profilu', value.models.join(', ') || 'Nedostupné v aktuálním snapshotu'],
+      ['Aktuální model provider / fallbacky', `${value.currentProvider || 'Nedostupné'} · ${number(value.fallbacks)}`],
+      ['Historické model providery', value.historicalProviders.join(', ') || '—'],
+      ['Tokeny vstup / výstup', tokens],
+      ['Známé náklady profilu', costs],
+      ['Aktuální search provider / fallbacky', `${search.currentProvider || 'Nedostupné'} · ${number(search.fallbacks)}`],
+      ['Historické search providery', search.historicalProviders.join(', ') || '—'],
+      ['Search / avg latence', `${number(search.searches)} · ${latency(search.avgLatency)}`],
+      ['Runtime / queue wait', 'Nedostupné v telemetry kontraktu'],
+      ['Branch / base / result SHA', 'Nedostupné v telemetry kontraktu'],
+      ['Test / reviewer', 'Nedostupné v telemetry kontraktu'],
     ];
     $('#detail-metrics').innerHTML = metrics.map(([title, content]) => `<div><dt>${escapeHTML(title)}</dt><dd>${escapeHTML(content)}</dd></div>`).join('');
     const events = [];
     if (row) events.push(`Herdr hlásí stav „${row.status}“ · pozorováno před ${age(herdr?.observed_at)}`);
+    if (task) events.push(`Durable queue: ${issueLabel(task)} · ${task.task_id} · ${QUEUE_STATUS[task.status] || task.status} · pokus ${attemptLabel(task)} · scheduler ${task.scheduler_state || 'nehlášeno'}`);
+    if (task?.blocker) events.push(`Blocker: ${task.blocker}`);
     if (value.router?.status === 'available') events.push(`Router profilu: ${number(value.requests)} požadavků · data před ${age(value.router.data_at)}`);
     if (search.search?.status === 'available') events.push(`Search Router: ${number(search.searches)} hledání · ${latency(search.avgLatency)} průměr · ${number(search.fallbacks)} fallbacků · data před ${age(search.search.data_at)}`);
-    if (task) events.push(`Durable queue: ${issueLabel(task)} · ${task.task_id} · pokus ${task.attempts} · metadata před ${age(queueSource()?.observed_at)}`);
-    events.push('Zdroj neposkytuje prompt, historii nástrojů, interní myšlenky ani logy úlohy.');
+    events.push('Runtime, branch/SHA, test a reviewer data se nezobrazují, dokud je autoritativní telemetry kontrakt neposkytuje.');
+    events.push('Zdroj neposkytuje prompt, historii nástrojů, interní myšlenky ani surové provozní záznamy úlohy.');
     if (demo) events.unshift('DEMO: pohyb 3D scény je syntetický. Tento detail stále zobrazuje skutečný snapshot.');
     $('#detail-events').innerHTML = events.map(event => `<li>${escapeHTML(event)}</li>`).join('');
   }
   function openDetail(name) {
     if (!PROFILES.flatMap(displayedAgents).some(row => row.agent === name)) return;
-    returnFocus = document.activeElement; selectedAgent = name; renderDetail();
+    returnFocus = document.activeElement; selectedTask = null; selectedAgent = name; renderDetail();
     ui.detail.hidden = false; ui.backdrop.hidden = false; document.body.style.overflow = 'hidden';
-    $('#detail-close').focus(); sceneCall('focusAgent', name); if (demo) renderProjects(); renderFace();
+    $('#detail-close').focus(); sceneCall('focusTask', null); sceneCall('focusAgent', name); if (demo) renderProjects(); renderTaskGraph(); renderFace();
+  }
+  function openTaskDetail(taskId) {
+    const task = taskById(taskId); if (!task) return;
+    returnFocus = document.activeElement; selectedAgent = null; selectedTask = taskId; renderTaskDetail();
+    ui.detail.hidden = false; ui.backdrop.hidden = false; document.body.style.overflow = 'hidden';
+    $('#detail-close').focus(); sceneCall('focusAgent', null); sceneCall('focusTask', taskId); renderTaskGraph(); renderFace();
   }
   function closeDetail() {
     ui.detail.hidden = true; ui.backdrop.hidden = true; document.body.style.overflow = '';
     sceneCall('focusAgent', null);
+    sceneCall('focusTask', selectedTask || null);
     if (returnFocus?.isConnected) returnFocus.focus();
+    else if (selectedTask) document.querySelector(`[data-task-id="${CSS.escape(selectedTask)}"]`)?.focus();
     else document.querySelector(`[data-agent="${CSS.escape(selectedAgent || '')}"]`)?.focus();
   }
   function applyView(next) {
@@ -480,7 +781,7 @@ export function mountDashboard(createScene) {
     const color = demo ? '#e49a34' : liveData ? '#6adf9a' : '#ff7159'; ui.liveDot.style.background = color; ui.liveDot.style.color = color;
   }
   function renderAll() {
-    updateHeader(); renderProjects(); renderTelemetry(); renderWork(); renderFace();
+    updateHeader(); renderProjects(); renderTelemetry(); renderSwarm(); renderWork(); renderFace();
     if (!ui.detail.hidden) renderDetail();
   }
   function validateSnapshot(value) {
@@ -489,14 +790,46 @@ export function mountDashboard(createScene) {
     for (const item of value.sources) {
       if (!item || !PROFILES.includes(item.profile) || typeof item.kind !== 'string' || !Array.isArray(item.rows)) throw new Error('invalid');
       if (item.kind === 'herdr' && item.rows.some(row => typeof row.agent !== 'string' || typeof row.status !== 'string')) throw new Error('invalid');
+      if (['router', 'search'].includes(item.kind)
+        && item.rows.some(row => typeof row.provider !== 'string' || !Number.isFinite(row.last_used_at))) throw new Error('invalid');
       if (item.kind === 'queue') {
         if (item.profile !== 'quantlab') throw new Error('invalid');
-        if (item.rows.some(row => typeof row.task_id !== 'string' || typeof row.agent !== 'string' || typeof row.kind !== 'string' || !Object.hasOwn(QUEUE_STATUS, row.status))) throw new Error('invalid');
+        if (item.rows.some(row =>
+          typeof row.task_id !== 'string'
+          || (row.issue != null && (!Number.isSafeInteger(row.issue) || row.issue < 0))
+          || (row.issue_title != null && (typeof row.issue_title !== 'string' || row.issue_title.length > 160))
+          || typeof row.issue_open !== 'boolean'
+          || (row.scheduler_state != null && typeof row.scheduler_state !== 'string')
+          || typeof row.agent !== 'string'
+          || typeof row.kind !== 'string'
+          || !Object.hasOwn(QUEUE_STATUS, row.status)
+          || !Number.isSafeInteger(row.attempts) || row.attempts < 0
+          || !Number.isSafeInteger(row.max_attempts) || row.max_attempts < 0
+          || (row.not_before != null && !Number.isFinite(row.not_before))
+          || !Number.isFinite(row.updated_at)
+          || (row.blocker != null && typeof row.blocker !== 'string')
+          || (row.pr_number != null && (!Number.isSafeInteger(row.pr_number) || row.pr_number < 1))
+        )) throw new Error('invalid');
       }
       if (item.kind === 'codex') {
         if (item.profile !== 'majak' || (item.status === 'available' && item.rows.length !== 1)) throw new Error('invalid');
         if (item.rows.some(row => !Number.isFinite(row.used_percent) || row.used_percent < 0 || row.used_percent > 100
-          || !Array.isArray(row.daily) || !Array.isArray(row.limit_history))) throw new Error('invalid');
+          || !Array.isArray(row.daily) || !Array.isArray(row.limit_history)
+          || !['available', 'unavailable'].includes(row.routing_status))) throw new Error('invalid');
+        for (const row of item.rows) {
+          if (row.routing_status !== 'available') continue;
+          const routingNumbers = ['routing_observed_at', 'routing_soft_limit_pct', 'routing_hard_limit_pct',
+            'routing_decisions', 'routing_free', 'routing_sol', 'routing_astra', 'routing_astra_escalations', 'routing_premium_denied'];
+          if (typeof row.routing_policy_version !== 'string' || row.routing_policy_version.length > 64
+            || routingNumbers.some(key => !Number.isSafeInteger(row[key]) || row[key] < 0)
+            || row.routing_soft_limit_pct >= row.routing_hard_limit_pct || row.routing_hard_limit_pct > 100
+            || row.routing_free + row.routing_sol + row.routing_astra > row.routing_decisions
+            || row.routing_astra_escalations > row.routing_astra
+            || (row.last_route_at != null && !Number.isFinite(row.last_route_at))
+            || (row.last_route_tier != null && !['free', 'sol', 'astra'].includes(row.last_route_tier))
+            || (row.last_route_model != null && typeof row.last_route_model !== 'string')
+            || (row.last_route_reason != null && typeof row.last_route_reason !== 'string')) throw new Error('invalid');
+        }
       }
     }
     return value;
@@ -523,6 +856,7 @@ export function mountDashboard(createScene) {
     }); ui.demoStates.append(button);
   }
   document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click', () => applyView(button.dataset.view)));
+  document.querySelectorAll('[data-task-filter]').forEach(button => button.addEventListener('click', () => { taskFilter = button.dataset.taskFilter || 'all'; renderTaskGraph(); }));
   $('#demo-toggle').addEventListener('click', event => {
     demo = !demo; document.documentElement.dataset.mode = demo ? 'demo' : 'live';
     event.currentTarget.setAttribute('aria-pressed', String(demo)); event.currentTarget.textContent = demo ? 'Ukončit demo' : 'Demo režim'; ui.demo.hidden = !demo;
@@ -553,12 +887,12 @@ export function mountDashboard(createScene) {
     button.setAttribute('aria-expanded', String(!expanded)); list.hidden = expanded; renderProjects();
   }));
   document.addEventListener('visibilitychange', () => { sceneCall('setActive', !document.hidden && view === 'film'); if (!document.hidden) refresh(true); });
-  sceneCall('onSelect', openDetail); updateMotion(); applyView(sceneFailed ? 'work' : 'film'); renderAll(); refresh(true);
+  sceneCall('onSelect', openDetail); sceneCall('onTaskSelect', openTaskDetail); updateMotion(); applyView(sceneFailed ? 'work' : 'film'); renderAll(); refresh(true);
   setInterval(refresh, 30000);
   setInterval(() => {
     if (document.hidden) return;
     if (liveData && Date.now() / 1000 - liveData.generated_at > 90) { liveData = null; loadReason = 'Snapshot je starší než 90 s · obnovte data'; renderAll(); }
     else { renderTelemetry(); updateHeader(); if (!ui.detail.hidden) renderDetail(); }
   }, 1000);
-  return Object.freeze({ diagnostics: () => ({ view, mode: demo ? 'demo' : 'live', state: effectiveState(), reduced, selectedAgent, sceneAvailable: Boolean(scene) && !sceneFailed, freshSnapshot: Boolean(liveData), agentCount: agents().length, queueActive: activeQueueTasks().length }) });
+  return Object.freeze({ diagnostics: () => ({ view, mode: demo ? 'demo' : 'live', state: effectiveState(), reduced, selectedAgent, selectedTask, sceneAvailable: Boolean(scene) && !sceneFailed, freshSnapshot: Boolean(liveData), agentCount: agents().length, queueActive: activeQueueTasks().length }) });
 }

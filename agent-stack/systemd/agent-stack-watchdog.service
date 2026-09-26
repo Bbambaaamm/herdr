@@ -1,0 +1,22 @@
+[Unit]
+Description=Herdr and Hermes agent stack watchdog
+Wants=network-online.target
+After=network-online.target desktop-commander-agentops.service
+
+[Service]
+Type=simple
+User=agentops
+Group=agentops
+WorkingDirectory=/home/agentops
+Environment=HOME=/home/agentops
+Environment=PATH=/home/agentops/.local/node24/bin:/home/agentops/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=LD_LIBRARY_PATH=/home/agentops/.local/playwright-libs/root/usr/lib/x86_64-linux-gnu
+Environment=AGENT_BROWSER_ARGS=--no-sandbox,--disable-dev-shm-usage
+ExecStartPre=/home/agentops/.local/bin/agent-stack-ensure
+ExecStart=/home/agentops/.local/bin/agent-stack-watchdog
+Restart=always
+RestartSec=5
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

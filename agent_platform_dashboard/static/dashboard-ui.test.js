@@ -1,8 +1,11 @@
 /* Contract tests, not a visual/browser acceptance test. Run: node --test dashboard-ui.test.js */
-const test = require('node:test');
-const assert = require('node:assert/strict');
-const { readFileSync } = require('node:fs');
-const { join } = require('node:path');
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const STATES = ['idle', 'receiving', 'working', 'tool', 'delegating', 'waiting_result', 'waiting_user', 'speaking', 'complete', 'error', 'offline'];
 const source = readFileSync(join(__dirname, 'dashboard-ui.js'), 'utf8');
@@ -16,23 +19,27 @@ function fixture() {
     { profile, kind: 'router', status: 'available', reason: 'ok', data_at: now,
       rows: [{ task_id: null, requests: 1, input_tokens: null, output_tokens: 12, cost_microusd: null,
         actual_model: '<img src=x onerror=alert(1)>', provider: 'openai-codex',
-        fallback_count: 0, successful_requests: 1, duration_ms: 100 }] },
+        fallback_count: 0, successful_requests: 1, duration_ms: 100, last_used_at: now }] },
   ]);
   sources.push(
     { profile: 'majak', kind: 'search', status: 'available', reason: 'ok', observed_at: now, data_at: now,
       rows: [{ route_mode: 'fast', provider: 'exa-keyless', fallback_provider: 'exa-keyless', searches: 2,
         successful_searches: 2, duration_ms: 200, max_duration_ms: 120, fallback_count: 1,
-        cost_microusd: 0, result_count: 10, extract_count: 0 }] },
+        cost_microusd: 0, result_count: 10, extract_count: 0, last_used_at: now },
+      { route_mode: 'fast', provider: 'nous-managed', fallback_provider: null, searches: 1,
+        successful_searches: 1, duration_ms: 90, max_duration_ms: 90, fallback_count: 0,
+        cost_microusd: null, result_count: 4, extract_count: 0, last_used_at: now - 60 }] },
     { profile: 'quantlab', kind: 'search', status: 'available', reason: 'ok', observed_at: now, data_at: now,
       rows: [{ route_mode: 'deep', provider: 'nous-managed', fallback_provider: null, searches: 1,
         successful_searches: 1, duration_ms: 300, max_duration_ms: 300, fallback_count: 0,
-        cost_microusd: null, result_count: 8, extract_count: 3 }] },
+        cost_microusd: null, result_count: 8, extract_count: 3, last_used_at: now }] },
   );
   sources.push({
     profile: 'quantlab', kind: 'queue', status: 'available', reason: 'ok', observed_at: now, data_at: now,
-    rows: [{ task_id: 'issue190-prepare-20260926', issue: 190, status: 'pending', attempts: 0,
-      not_before: now + 3600, updated_at: now, agent: 'quantlab-hermes',
-      kind: 'scheduled_acceptance', blocker: null }],
+    rows: [{ task_id: 'issue190-prepare-20260926', issue: 190,
+      issue_title: 'Cílová architektura runtime', issue_open: true, scheduler_state: 'active',
+      status: 'pending', attempts: 0, max_attempts: 8, not_before: now + 3600, updated_at: now,
+      agent: 'quantlab-hermes', kind: 'scheduled_acceptance', blocker: null, pr_number: 240 }],
   });
   sources.push({
     profile: 'majak', kind: 'codex', status: 'available', reason: 'ok', observed_at: now, data_at: now,
@@ -43,6 +50,11 @@ function fixture() {
       current_streak_days: 7, longest_streak_days: 9,
       daily: [{ day: '2026-09-24', tokens: 1000 }, { day: '2026-09-25', tokens: 2000 }],
       limit_history: [{ at: now - 300, used_percent: 80 }, { at: now, used_percent: 82 }],
+      routing_status: 'available', routing_policy_version: 'cost-aware-v1.0', routing_observed_at: now,
+      routing_soft_limit_pct: 70, routing_hard_limit_pct: 90, routing_decisions: 7,
+      routing_free: 5, routing_sol: 2, routing_astra: 0, routing_astra_escalations: 0,
+      routing_premium_denied: 0, last_route_at: now, last_route_tier: 'sol',
+      last_route_model: 'gpt-6-sol', last_route_reason: 'cheap_attempts_exhausted',
     }],
   });
   return { generated_at: now, sources };
@@ -94,6 +106,9 @@ async function harness(t, options = {}) {
     closest(selector) { return selector === '.project' ? this.project : null; }
     replaceChildren(...children) { this.children = children; }
     append(...children) { this.children.push(...children); }
+    insertAdjacentHTML(position, html) {
+      this.innerHTML = position === 'beforeend' ? this.innerHTML + html : html + this.innerHTML;
+    }
     focus() { activeElement = this; }
   }
   function get(selector) {
@@ -101,6 +116,9 @@ async function harness(t, options = {}) {
     return elements.get(selector);
   }
   const viewButtons = ['film', 'work'].map(view => { const node = get(`#view-${view}`); node.dataset.view = view; return node; });
+  const taskFilterButtons = ['all', 'running', 'pending', 'blocked', 'done'].map(filter => {
+    const node = get(`#task-filter-${filter}`); node.dataset.taskFilter = filter; node.attrs['aria-pressed'] = String(filter === 'all'); return node;
+  });
   const projectButtons = ['majak', 'quantlab'].map(profile => {
     const node = get(`#${profile}-title`); node.dataset.projectToggle = profile; node.attrs['aria-expanded'] = 'true';
     node.project = { querySelector: () => get(`#${profile}-agents`) }; return node;
@@ -108,7 +126,11 @@ async function harness(t, options = {}) {
   globalThis.document = {
     hidden: false, body: { style: {} }, documentElement: { dataset: {} },
     get activeElement() { return activeElement; }, querySelector: get,
-    querySelectorAll(selector) { return selector === '[data-view]' ? viewButtons : selector === '[data-project-toggle]' ? projectButtons : []; },
+    querySelectorAll(selector) {
+      return selector === '[data-view]' ? viewButtons
+        : selector === '[data-project-toggle]' ? projectButtons
+          : selector === '[data-task-filter]' ? taskFilterButtons : [];
+    },
     createElement(type) { return new Element(`${type}-${++nodeSequence}`); },
     addEventListener(type, callback) { documentEvents.set(type, callback); },
   };
@@ -117,18 +139,19 @@ async function harness(t, options = {}) {
   globalThis.setInterval = callback => { intervals.push(callback); return intervals.length; };
   let snapshot = fixture(), httpStatus = 200;
   globalThis.fetch = async () => ({ ok: httpStatus === 200, status: httpStatus, json: async () => structuredClone(snapshot) });
-  const calls = { states: [], agents: [], demo: [], reduced: [], active: [], focused: [], activity: [] };
+  const calls = { states: [], agents: [], tasks: [], demo: [], reduced: [], active: [], focused: [], focusedTasks: [], activity: [] };
   const scene = {
     setState: value => calls.states.push(value), setDemo: value => calls.demo.push(value),
-    setAgents: value => calls.agents.push(value), setReduced: value => calls.reduced.push(value), setActivity: value => calls.activity.push(value),
-    setActive: value => calls.active.push(value), focusAgent: value => calls.focused.push(value),
-    onSelect: callback => { calls.select = callback; },
+    setAgents: value => calls.agents.push(value), setTasks: value => calls.tasks.push(value),
+    setReduced: value => calls.reduced.push(value), setActivity: value => calls.activity.push(value),
+    setActive: value => calls.active.push(value), focusAgent: value => calls.focused.push(value), focusTask: value => calls.focusedTasks.push(value),
+    onSelect: callback => { calls.select = callback; }, onTaskSelect: callback => { calls.selectTask = callback; },
   };
   const { mountDashboard } = await modulePromise;
   const ui = mountDashboard(options.factory || (() => scene));
   await new Promise(resolve => setImmediate(resolve));
   return {
-    ui, get, calls, viewButtons, projectButtons, mediaEvents,
+    ui, get, calls, viewButtons, taskFilterButtons, projectButtons, mediaEvents,
     snapshot: () => snapshot, setSnapshot: value => { snapshot = value; }, setHTTP: value => { httpStatus = value; },
     refresh: () => intervals[0](), tickAge: () => intervals[1](),
     click: selector => get(selector).emit('click'), documentEvents,
@@ -143,6 +166,12 @@ test('partial telemetry stays explicit, Codex allowance is live, and snapshot va
   assert.match(h.get('#project-grid').innerHTML, /0 USD známé \+ 1 bez ceny/);
   assert.match(h.get('#observability-kpis').innerHTML, /123,5|123\.5|123/);
   assert.match(h.get('#observability-grid').innerHTML, /Codex tokeny po dnech/);
+  assert.match(h.get('#observability-grid').innerHTML, /Cost-aware router/);
+  assert.match(h.get('#observability-grid').innerHTML, /FREE/);
+  assert.match(h.get('#observability-grid').innerHTML, /Sol/);
+  assert.match(h.get('#observability-grid').innerHTML, /Astra eskalace: 0/);
+  assert.match(h.get('#observability-grid').innerHTML, /Router soft 70 % \/ hard 90 %/);
+  assert.match(h.get('#observability-grid').innerHTML, /Model tokeny/);
   assert.match(h.get('#observability-grid').innerHTML, /Fallback pressure/);
   assert.match(h.get('#project-grid').innerHTML, /&lt;img src=x onerror=alert\(1\)&gt;/);
   assert.doesNotMatch(h.get('#project-grid').innerHTML, /<img src=x/);
@@ -152,16 +181,42 @@ test('partial telemetry stays explicit, Codex allowance is live, and snapshot va
 
 test('search layer shows bounded real telemetry without query text', async t => {
   const h = await harness(t);
-  assert.equal(h.get('#search-count').textContent, '3');
-  assert.equal(h.get('#search-latency').textContent, '167 ms');
+  assert.equal(h.get('#search-count').textContent, '4');
+  assert.equal(h.get('#search-latency').textContent, '148 ms');
   const html = h.get('#search-grid').innerHTML;
   assert.match(html, /MAJÁK|MAJAK/);
   assert.match(html, /exa-keyless/);
   assert.match(html, /nous-managed/);
+  assert.match(html, /Aktuální provider \(poslední běh\):<\/span> exa-keyless/);
+  assert.match(html, /Historické providery:<\/span> nous-managed/);
   assert.match(html, /FAST/);
   assert.match(html, /DEEP/);
   assert.match(html, /1 fallback|Fallbacky/);
   assert.doesNotMatch(html, /query_hash|official OpenAI|prompt/i);
+});
+
+test('model and search provider history cannot replace the most recent provider', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const router = h.snapshot().sources.find(item => item.profile === 'majak' && item.kind === 'router');
+  router.rows.push({ ...router.rows[0], provider: 'legacy-provider', actual_model: 'legacy-model', last_used_at: now - 300 });
+  await h.refresh();
+  assert.match(h.get('#project-grid').innerHTML, /Aktuální provider \(poslední běh\): openai-codex/);
+  assert.match(h.get('#project-grid').innerHTML, /Historické providery: legacy-provider/);
+  h.calls.select('majak-codex');
+  const detail = h.get('#detail-metrics').innerHTML;
+  assert.match(detail, /Aktuální model provider[^]*openai-codex/);
+  assert.match(detail, /Historické model providery[^]*legacy-provider/);
+  assert.doesNotMatch(detail, /Aktuální model provider[^]*legacy-provider[^]*Historické model providery/);
+});
+
+test('provider recency is mandatory in the browser trust boundary', async t => {
+  const h = await harness(t);
+  const router = h.snapshot().sources.find(item => item.kind === 'router');
+  delete router.rows[0].last_used_at;
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().freshSnapshot, false);
+  assert.equal(h.ui.diagnostics().state, 'offline');
 });
 
 test('durable QuantLab queue renders safe metadata and drives coordinator state', async t => {
@@ -191,7 +246,14 @@ test('durable QuantLab queue renders safe metadata and drives coordinator state'
 
   h.calls.select('quantlab-hermes');
   assert.match(h.get('#detail-metrics').innerHTML, /issue190-prepare-20260926/);
+  assert.match(h.get('#detail-metrics').innerHTML, /Cílová architektura runtime/);
+  assert.match(h.get('#detail-metrics').innerHTML, /1 \/ 8/);
+  assert.match(h.get('#detail-metrics').innerHTML, /scheduler active/);
+  assert.match(h.get('#detail-metrics').innerHTML, /#240/);
+  assert.match(h.get('#detail-links').innerHTML, /issues\/190/);
+  assert.match(h.get('#detail-links').innerHTML, /pull\/240/);
   assert.match(h.get('#detail-events').innerHTML, /Durable queue/);
+  assert.match(h.get('#detail-events').innerHTML, /Runtime, branch\/SHA, test a reviewer data/);
   assert.doesNotMatch(h.get('#detail-events').innerHTML, /PRIVATE|tool_args|secret payload|raw log/i);
 });
 
@@ -205,6 +267,27 @@ test('blocked queue task raises attention with sanitized blocker only', async t 
   assert.match(h.get('#attention-summary').textContent, /issue190-prepare-20260926/);
   assert.match(h.get('#queue-list').innerHTML, /github_write_auth_required/);
   assert.doesNotMatch(h.get('#queue-list').innerHTML, /PRIVATE|secret|prompt/i);
+});
+
+test('technical queue blocker does not masquerade as user intervention', async t => {
+  const h = await harness(t);
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue');
+  queue.rows[0].status = 'blocked';
+  queue.rows[0].blocker = 'soak_evidence_pending';
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().state, 'waiting_result');
+  assert.equal(h.get('#attention-summary').hidden, true);
+  assert.match(h.get('#face-task').textContent, /technické závislosti/i);
+  assert.match(h.get('#queue-list').innerHTML, /soak_evidence_pending/);
+});
+
+test('queue v2 browser contract rejects incomplete task metadata', async t => {
+  const h = await harness(t);
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue');
+  delete queue.rows[0].max_attempts;
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().freshSnapshot, false);
+  assert.equal(h.ui.diagnostics().state, 'offline');
 });
 
 test('queue source is QuantLab-only in browser validation', async t => {
@@ -386,4 +469,176 @@ test('additional agents remain accessible without unprojected film labels or inv
   h.calls.select('majak-research-worker');
   assert.equal(h.ui.diagnostics().selectedAgent, 'majak-research-worker');
   assert.match(h.get('#detail-status').textContent, /Pracuje/);
+});
+
+test('TaskGraph is explicit when dependency telemetry is unavailable', async t => {
+  const h = await harness(t);
+  const status = h.get('#taskgraph-status').textContent;
+  assert.match(status, /Dependency telemetry/i);
+  assert.match(h.get('#taskgraph-nodes').innerHTML, /issue190-prepare-20260926/);
+  assert.doesNotMatch(h.get('#taskgraph-nodes').innerHTML, /dependency-edge|<svg/i);
+  assert.equal(h.calls.tasks.at(-1).length, 1);
+});
+
+test('TaskGraph handles an empty queue without invented nodes', async t => {
+  const h = await harness(t);
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue');
+  queue.rows = [];
+  await h.refresh();
+  assert.match(h.get('#taskgraph-nodes').innerHTML, /Durable queue je prázdná/);
+  assert.deepEqual(h.calls.tasks.at(-1), []);
+});
+
+test('TaskGraph uses bounded LOD for more than twenty task records', async t => {
+  const h = await harness(t);
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue');
+  const base = queue.rows[0];
+  queue.rows = Array.from({ length: 25 }, (_, index) => ({
+    ...base,
+    task_id: `task-${String(index).padStart(2, '0')}`,
+    issue: 300 + index,
+    issue_title: `Task ${index}`,
+    status: index === 0 ? 'running' : 'pending',
+    updated_at: base.updated_at + index,
+  }));
+  await h.refresh();
+  const html = h.get('#taskgraph-nodes').innerHTML;
+  assert.match(html, /\+10 uzlů/);
+  assert.match(html, /LOD cluster/);
+  assert.equal(h.calls.tasks.at(-1).length, 25);
+});
+
+test('3D task selection synchronizes with task inspector state', async t => {
+  const h = await harness(t);
+  assert.equal(typeof h.calls.selectTask, 'function');
+  h.calls.selectTask('issue190-prepare-20260926');
+  assert.equal(h.ui.diagnostics().selectedTask, 'issue190-prepare-20260926');
+  assert.equal(h.ui.diagnostics().selectedAgent, null);
+  assert.match(h.get('#detail-title').textContent, /#190/);
+  assert.match(h.get('#detail-metrics').innerHTML, /Dependency edges/);
+  assert.match(h.get('#detail-events').innerHTML, /nejsou odhadovány/i);
+});
+
+test('Swarm KPI strip renders 10 cells from authoritative queue and router data', async t => {
+  const h = await harness(t);
+  const html = h.get('#swarm-kpis').innerHTML;
+  assert.equal((html.match(/class="swarm-kpi"/g) || []).length, 10);
+  assert.match(html, /<span>Active<\/span><b>0<\/b>/);
+  assert.match(html, /<span>Running<\/span><b>0<\/b>/);
+  assert.match(html, /<span>Waiting<\/span><b>1<\/b>/);
+  assert.match(html, /<span>Blocked \/ Failed<\/span><b>0 \/ 0<\/b>/);
+  assert.match(html, /<span>Queue<\/span><b>1<\/b>/);
+  assert.match(html, /<span>Terminal success<\/span><b>—<\/b><small>0 done · 0 failed<\/small>/);
+  assert.match(html, /<span>Retries<\/span><b>0<\/b>/);
+  assert.match(html, /<span>Tokens<\/span><b>24<\/b>/);
+  assert.match(html, /<span>Cost known<\/span><b>0 USD<\/b><small>2 req unknown<\/small>/);
+});
+
+test('Avg task stays explicitly unavailable when duration telemetry is missing', async t => {
+  const h = await harness(t);
+  const html = h.get('#swarm-kpis').innerHTML;
+  assert.match(html, /<span>Avg task<\/span><b>\u2014<\/b><small>duration telemetry chybí<\/small>/);
+  assert.doesNotMatch(html, /<span>Avg task<\/span><b>\d/);
+});
+
+test('Swarm analytics renders six cards with available or unavailable state', async t => {
+  const h = await harness(t);
+  const html = h.get('#swarm-analytics-grid').innerHTML;
+  assert.equal((html.match(/class="swarm-card"/g) || []).length, 6);
+  assert.match(html, /Throughput/);
+  assert.match(html, /Queue depth/);
+  assert.match(html, /Latency/);
+  assert.match(html, /Tokens &/);
+  assert.match(html, /Model mix/);
+  assert.match(html, /Reliability/);
+  assert.match(html, /100 ms/);
+});
+
+test('Stale snapshot clears swarm KPI strip and analytics to unavailable', async t => {
+  const h = await harness(t);
+  h.snapshot().generated_at = Math.floor(Date.now() / 1000) - 100;
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().freshSnapshot, false);
+  assert.match(h.get('#swarm-kpis').innerHTML, /telemetrie nedostupná/i);
+  assert.match(h.get('#swarm-analytics-grid').innerHTML, /telemetrie není dostupná/i);
+  assert.match(h.get('#taskgraph-status').textContent, /není dostupná/i);
+  assert.deepEqual(h.calls.tasks.at(-1), []);
+});
+
+test('KPI Active tracks working agent count through live telemetry', async t => {
+  const h = await harness(t);
+  // Default fixture: 4 agents but none in 'working' status
+  assert.match(h.get('#swarm-kpis').innerHTML, /<span>Active<\/span><b>0<\/b>/);
+  const herdr = h.snapshot().sources.find(s => s.kind === 'herdr' && s.profile === 'quantlab');
+  herdr.rows[0].status = 'working';
+  await h.refresh();
+  assert.match(h.get('#swarm-kpis').innerHTML, /<span>Active<\/span><b>1<\/b>/);
+  assert.equal(h.calls.agents.at(-1).length, 4);
+  assert.equal(h.calls.agents.at(-1).find(a => a.agent === 'quantlab-hermes').status, 'working');
+});
+
+test('TaskGraph task nodes carry aria-selected for keyboard/select sync', async t => {
+  const h = await harness(t);
+  const before = h.get('#taskgraph-nodes').innerHTML;
+  assert.match(before, /role="option"/);
+  assert.match(before, /aria-selected="false"/);
+  assert.match(before, /data-task-id="issue190-prepare-20260926"/);
+  h.calls.selectTask('issue190-prepare-20260926');
+  const after = h.get('#taskgraph-nodes').innerHTML;
+  assert.match(after, /aria-selected="true"/);
+  assert.match(after, /data-task-id="issue190-prepare-20260926"/);
+});
+
+
+test('Retries KPI counts only attempts after the first try', async t => {
+  const h = await harness(t);
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue');
+  queue.rows[0].attempts = 3;
+  await h.refresh();
+  assert.match(h.get('#swarm-kpis').innerHTML, /<span>Retries<\/span><b>2<\/b><small>opakované pokusy<\/small>/);
+});
+
+test('Blocked and failed stay semantically separate in KPI and analytics', async t => {
+  const h = await harness(t);
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue');
+  const base = queue.rows[0];
+  queue.rows = [
+    { ...base, task_id: 'blocked-task', status: 'blocked', blocker: 'soak_evidence_pending' },
+    { ...base, task_id: 'failed-task', status: 'failed', blocker: null },
+  ];
+  await h.refresh();
+  assert.match(h.get('#swarm-kpis').innerHTML, /<span>Blocked \/ Failed<\/span><b>1 \/ 1<\/b>/);
+  assert.match(h.get('#swarm-analytics-grid').innerHTML, /1 blocked · 1 failed/);
+});
+
+test('TaskGraph state filters do not invent or reorder hidden dependencies', async t => {
+  const h = await harness(t);
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue');
+  const base = queue.rows[0];
+  queue.rows = [
+    { ...base, task_id: 'run-1', status: 'running' },
+    { ...base, task_id: 'wait-1', status: 'pending' },
+    { ...base, task_id: 'fail-1', status: 'failed' },
+  ];
+  await h.refresh();
+  const blocked = h.taskFilterButtons.find(button => button.dataset.taskFilter === 'blocked');
+  blocked.emit('click');
+  assert.match(h.get('#taskgraph-nodes').innerHTML, /fail-1/);
+  assert.doesNotMatch(h.get('#taskgraph-nodes').innerHTML, /run-1|wait-1/);
+  assert.match(h.get('#taskgraph-status').textContent, /blocked \+ failed/);
+  assert.equal(blocked.attrs['aria-pressed'], 'true');
+});
+
+
+test('stale telemetry source is technical data health, not a user-intervention banner', async t => {
+  const h = await harness(t);
+  const codex = h.snapshot().sources.find(item => item.kind === 'codex');
+  codex.status = 'unavailable';
+  codex.reason = 'stale';
+  codex.rows = [];
+  await h.refresh();
+  assert.equal(h.get('#attention-summary').hidden, true);
+  assert.doesNotMatch(h.get('#attention-summary').textContent, /stale/i);
+  assert.match(h.get('#source-grid').innerHTML, /CODEX \/ ÚČET/);
+  assert.match(h.get('#source-grid').innerHTML, /unavailable · stale/);
 });

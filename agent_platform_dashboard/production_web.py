@@ -21,6 +21,17 @@ CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'se
        "img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 
 
+def provider_roles(source):
+    if source['kind'] not in ('router', 'search') or source['status'] != 'available':
+        return None
+    ordered = sorted(source['rows'], key=lambda row: (-row['last_used_at'], row['provider']))
+    if not ordered:
+        return None, ()
+    current = ordered[0]['provider']
+    historical = tuple(dict.fromkeys(row['provider'] for row in ordered if row['provider'] != current))
+    return current, historical
+
+
 class Application:
     def __init__(self, snapshot_path, auth, *, now=time.time):
         self.snapshot_path = snapshot_path
@@ -78,9 +89,18 @@ class Application:
             sections = []
             for source in data['sources']:
                 count = str(len(source['rows'])) if source['status'] == 'available' else 'unavailable'
+                roles = provider_roles(source)
+                provider_copy = ''
+                if roles is not None:
+                    current, historical = roles
+                    provider_copy = ('<p><strong>Aktuální provider (poslední běh):</strong> '
+                                     + escape(current or 'zatím bez provozu')
+                                     + '<br><strong>Historické providery:</strong> '
+                                     + escape(', '.join(historical) or '—') + '</p>')
                 sections.append('<section><h3>' + escape(source['profile'] + ' / ' + source['kind']) + '</h3><p>'
                                 + escape(source['status'] + ' · ' + source['reason'] + ' · records ' + count)
-                                + '</p><pre>' + escape(json.dumps(source, sort_keys=True, indent=2)) + '</pre></section>')
+                                + '</p>' + provider_copy + '<pre>'
+                                + escape(json.dumps(source, sort_keys=True, indent=2)) + '</pre></section>')
             marker = '<!--SERVER_FALLBACK-->'
             c.need(template.count(marker) == 1)
             html = template.replace(marker, '<div class="server-fallback">' + ''.join(sections) + '</div>')

@@ -342,81 +342,105 @@ export function createMachineCity({low = false} = {}) {
   group.name = 'machine-city-architecture';
   const random = randomSource(691309);
   const materials = materialSet();
-  materials.armor.color.setHex(0x353837);
-  materials.edge.color.setHex(0x666053);
-  materials.light.emissiveIntensity = 0.95;
+
+  // Quiet server-room palette: the environment should frame agents and core,
+  // never compete with them. Cyan replaces the old window-heavy amber city.
+  materials.black.color.setHex(0x02080d);
+  materials.armor.color.setHex(0x12212a);
+  materials.edge.color.setHex(0x214150);
+  materials.bronze.color.setHex(0x27434d);
+  materials.cable.color.setHex(0x07141b);
+  materials.light.color.setHex(0x2d9fc4);
+  materials.light.emissive.setHex(0x1a8db8);
+  materials.light.emissiveIntensity = 0.42;
+
   const batch = new GeometryBatch(materials);
-  const towers = [];
-  const count = low ? 36 : 68;
+  const racks = [];
+  const count = low ? 18 : 30;
+
   for (let i = 0; i < count; i++) {
     const side = i % 2 ? 1 : -1;
-    const distance = 8 + random() * 16;
-    const x = side * (6.8 + random() * 21);
+    const distance = 13 + random() * 18;
+    const x = side * (8.6 + random() * 17);
     const z = -distance;
-    const width = 0.3 + random() * 1.2;
-    const height = 7 + random() * 18;
-    const y = -8 + height / 2;
-    towers.push({x, z, width, height});
-    batch.box('black', [x, y, z], [width, height, width * 0.79]);
-    const buttresses = low ? 3 : 5;
-    for (let j = 0; j < buttresses; j++) {
-      const bx = x + (j / (buttresses - 1) - 0.5) * width * 1.27;
-      const depth = width * (0.7 + random() * 0.35);
-      batch.box('armor', [bx, y, z + depth * 0.23], [width * 0.11, height * (0.88 + random() * 0.21), depth]);
-      batch.box('edge', [bx, y, z + depth * 0.77], [0.022, height * 0.96, 0.025]);
+    const width = 0.45 + random() * 0.9;
+    const height = 8 + random() * 15;
+    const y = -7.5 + height / 2;
+    racks.push({x, z, width, height});
+
+    batch.box('black', [x, y, z], [width, height, width * 0.92]);
+    const rails = low ? 2 : 3;
+    for (let rail = 0; rail < rails; rail++) {
+      const rx = x + (rail / Math.max(1, rails - 1) - 0.5) * width * 1.12;
+      const depth = width * (0.58 + random() * 0.18);
+      batch.box('armor', [rx, y, z + depth * 0.14], [width * 0.09, height * 0.94, depth]);
+      batch.box('edge', [rx, y, z + depth * 0.67], [0.018, height * 0.9, 0.018]);
     }
-    const floors = Math.floor(height / 0.65);
+
+    const floors = Math.floor(height / 1.18);
     for (let floor = 0; floor < floors; floor++) {
-      const fy = -7.8 + floor * 0.65;
-      batch.box('armor', [x, fy, z + width * 0.15], [width * 1.27, 0.055, width * 1.07]);
-      if (floor % 3 === 0) batch.box('bronze', [x, fy, z + width * 0.74], [width * 0.96, 0.015, 0.022]);
-      const windows = low ? 2 : 4;
-      for (let w = 0; w < windows; w++) {
-        if (random() < 0.4) continue;
-        batch.box('light', [x + ((w + 0.5) / windows - 0.5) * width,
-          fy + 0.12 + random() * 0.14, z + width * 0.704],
-        [0.022 + random() * 0.04, 0.055 + random() * 0.14, 0.015]);
+      const fy = -7.25 + floor * 1.18;
+      batch.box('armor', [x, fy, z + width * 0.12], [width * 1.13, 0.035, width * 0.92]);
+      if (floor % 4 === 0) {
+        batch.box('edge', [x, fy + 0.09, z + width * 0.53], [width * 0.92, 0.015, 0.02]);
+      }
+
+      // Sparse status LEDs only. Dense window noise made agents unreadable.
+      const lamps = low ? 1 : 2;
+      for (let lamp = 0; lamp < lamps; lamp++) {
+        if (random() < 0.68) continue;
+        batch.box('light',
+          [x + ((lamp + 0.5) / lamps - 0.5) * width * 0.72, fy + 0.18, z + width * 0.49],
+          [0.022 + random() * 0.025, 0.045 + random() * 0.06, 0.012]);
       }
     }
-    for (let spire = 0; spire < 3; spire++) {
-      const sx = x + (spire - 1) * width * 0.34;
-      const heightAbove = 0.6 + random() * 2;
-      batch.strut('armor', [sx, height - 8, z], [sx, height - 8 + heightAbove, z], width * 0.055, 5, 0.01);
-    }
   }
-  // Distant gantries give parallax and scale without drawing a graphical "network".
-  for (let i = 0; i < (low ? 6 : 11); i++) {
+
+  // Side rails and ceiling/floor conduits create server-room perspective without
+  // filling the center or implying agent communication.
+  for (let i = 0; i < (low ? 4 : 7); i++) {
     const side = i % 2 ? 1 : -1;
-    const x1 = side * (7 + random() * 2);
-    const x2 = side * (20 + random() * 10);
-    const y = -5 + random() * 15;
-    const z = -12 - random() * 10;
+    const x1 = side * (8.3 + random() * 2.2);
+    const x2 = side * (18 + random() * 8);
+    const y = -4.8 + random() * 12.5;
+    const z = -14 - random() * 10;
     const span = Math.abs(x2 - x1);
     const center = (x1 + x2) / 2;
-    batch.box('armor', [center, y, z], [span, 0.16, 0.5]);
-    batch.box('edge', [center, y + 0.47, z + 0.22], [span, 0.035, 0.035]);
-    batch.box('black', [center, y - 0.35, z - 0.1], [span, 0.15, 0.3]);
-    for (let j = 0; j < span; j++) {
-      const x = Math.min(x1, x2) + j;
-      batch.strut('edge', [x, y - 0.35, z + 0.27], [x + 0.65, y + 0.48, z + 0.27], 0.021);
-      if (j % 2 === 0) batch.box('light', [x, y + 0.18, z + 0.32], [0.045, 0.055, 0.015]);
+    batch.box('black', [center, y, z], [span, 0.11, 0.36]);
+    batch.box('edge', [center, y + 0.34, z + 0.16], [span, 0.022, 0.022]);
+    for (let j = 0; j < Math.floor(span / 2); j++) {
+      const x = Math.min(x1, x2) + j * 2;
+      batch.strut('armor', [x, y - 0.24, z + 0.2], [x + side * 0.55, y + 0.34, z + 0.2], 0.014);
+      if (j % 3 === 0) batch.box('light', [x, y + 0.1, z + 0.25], [0.025, 0.035, 0.01]);
     }
-    batch.cable('cable', [[x1, y + 0.4, z + 0.2], [center, y - 1.4, z], [x2, y + 0.4, z + 0.2]], 0.028, 26);
   }
-  // Hanging power conduits frame the composition; they do not imply agent traffic.
+
   for (const side of [-1, 1]) {
-    for (let i = 0; i < (low ? 6 : 12); i++) {
-      const x = side * (7.5 + random() * 6);
-      const z = -7 - random() * 9;
-      batch.cable('cable', [[x, 15, z], [x + side * 0.6, 6, z + 0.5],
-        [x + side * 1.1, -1, z], [x + side * 1.9, -9, z - 1]], 0.017 + random() * 0.04, 24);
+    for (let i = 0; i < (low ? 3 : 5); i++) {
+      const x = side * (9 + random() * 6);
+      const z = -14 - random() * 10;
+      const offset = side * (0.5 + random() * 0.55);
+      batch.cable('cable',
+        [[x, 13, z], [x + offset * 0.25, 7, z + 0.35],
+          [x + offset * 0.65, 1, z], [x + offset, -7, z - 0.5]],
+        0.012 + random() * 0.018, 18);
     }
   }
+
   const drawCalls = batch.finish(group);
   return {
     group,
-    update() {}, // Buildings and window lights remain still; they are not status lamps.
-    diagnostics() { return {geometryOnly: true, towers: towers.length, staticPieces: batch.count, drawCalls,
-      centerClearance: 6.8, depthRange: [-24, -7]}; },
+    update() {}, // Background architecture is intentionally calm and status-neutral.
+    diagnostics() {
+      return {
+        geometryOnly: true,
+        towers: racks.length,
+        staticPieces: batch.count,
+        drawCalls,
+        centerClearance: 8.0,
+        depthRange: [-31, -13],
+        visualMode: 'quiet-server-room',
+      };
+    },
   };
 }

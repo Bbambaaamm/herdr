@@ -25,6 +25,20 @@
       <canvas id="machine-scene" aria-label="Animované reaktivní kvantové jádro centrálního koordinátora"></canvas>
       <div class="city-vignette" aria-hidden="true"></div>
       <div id="link-layer" class="link-layer" aria-hidden="true"></div>
+      <div id="task-hover-label" class="task-hover-label glass" hidden aria-hidden="true"></div>
+      <div id="task-selected-label" class="task-selected-label glass" hidden aria-live="polite"></div>
+      <nav id="swarm-kpis" class="swarm-kpis glass" aria-label="Swarm KPI">
+        <div class="swarm-kpi" data-state="ok"><span>Aktivní</span><b id="kpi-active">—</b></div>
+        <div class="swarm-kpi" data-state="ok"><span>Běží</span><b id="kpi-running">—</b></div>
+        <div class="swarm-kpi" data-state="ok"><span>Čeká</span><b id="kpi-waiting">—</b></div>
+        <div class="swarm-kpi" data-state="ok"><span>Blokováno</span><b id="kpi-blocked">—</b></div>
+        <div class="swarm-kpi" data-state="ok"><span>Fronta</span><b id="kpi-queue">—</b></div>
+        <div class="swarm-kpi" data-state="ok"><span>Hotovo</span><b id="kpi-success">—</b></div>
+        <div class="swarm-kpi" data-state="ok"><span>Pokusy</span><b id="kpi-retries">—</b></div>
+        <div class="swarm-kpi" data-state="ok"><span>Prům. úloha</span><b id="kpi-avg-task">—</b></div>
+        <div class="swarm-kpi" data-state="ok"><span>Tokeny</span><b id="kpi-tokens">—</b></div>
+        <div class="swarm-kpi" data-state="ok"><span>Náklady</span><b id="kpi-cost">—</b></div>
+      </nav>
 
       <aside class="telemetry-panel glass" aria-label="Provozní stav">
         <div class="eyebrow">SYSTÉM</div>
@@ -86,12 +100,39 @@
           <span>Codex allowance · tokeny · modely · fallbacky · latence · fronta · coverage</span>
         </div>
         <div id="observability-kpis" class="observability-kpis"></div>
-        <div id="observability-grid" class="observability-grid"></div>
+        <details class="ops-details telemetry-details">
+          <summary>Detailní modelová telemetrie</summary>
+          <div id="observability-grid" class="observability-grid"></div>
+        </details>
       </section>
-      <section class="queue-health" aria-labelledby="queue-title"><div class="section-title"><div><div class="eyebrow">HERDR · DURABLE QUEUE</div><h2 id="queue-title">Autonomní fronta QuantLab</h2></div><span>Jen bezpečná provozní metadata · bez promptů a logů.</span></div><div id="queue-summary" class="queue-summary"></div><div id="queue-list" class="queue-list"></div></section>
-      <section class="search-layer" aria-labelledby="search-layer-title"><div class="section-title"><div><div class="eyebrow">WEB · SEARCH ROUTER</div><h2 id="search-layer-title">Vyhledávací vrstva</h2></div><span>Fast · Deep · Browser · telemetrie bez ukládání textu dotazů.</span></div><div id="search-grid" class="search-grid"></div></section>
-      <section class="source-health"><div class="section-title"><h2>Zdroje dat</h2><span>Chybějící data nejsou nahrazena odhadem.</span></div><div id="source-grid" class="source-grid"></div></section>
-      <section class="text-fallback"><details id="server-fallback-details" open><summary>Úplný serverový textový přehled</summary><!--SERVER_FALLBACK--></details></section>
+      <section class="swarm-taskgraph" aria-labelledby="taskgraph-title">
+        <div class="section-title"><div><div class="eyebrow">SWARM · TASKGRAPH</div><h2 id="taskgraph-title">TaskGraph · dependency edges unavailable</h2></div><span id="taskgraph-status">Dependency telemetry se ověřuje.</span></div>
+        <div class="taskgraph-filters" aria-label="Filtr TaskGraphu">
+          <button type="button" data-task-filter="all" aria-pressed="true">Vše</button>
+          <button type="button" data-task-filter="running" aria-pressed="false">Běží</button>
+          <button type="button" data-task-filter="pending" aria-pressed="false">Čeká</button>
+          <button type="button" data-task-filter="blocked" aria-pressed="false">Blokované</button>
+          <button type="button" data-task-filter="done" aria-pressed="false">Hotovo</button>
+        </div>
+        <div id="taskgraph-nodes" class="taskgraph-nodes" role="listbox" aria-label="TaskGraph uzly"></div>
+      </section>
+      <section class="swarm-analytics" aria-labelledby="swarm-analytics-title">
+        <div class="section-title"><div><div class="eyebrow">SWARM · ANALYTICS</div><h2 id="swarm-analytics-title">Výkon a spolehlivost swarmu</h2></div><span>Jen autoritativní data; nedostupné metriky se neodhadují.</span></div>
+        <div id="swarm-analytics-grid" class="swarm-analytics-grid"></div>
+      </section>
+      <details class="ops-details">
+        <summary>Durable Queue · provozní detail</summary>
+        <section class="queue-health" aria-labelledby="queue-title"><div class="section-title"><div><div class="eyebrow">HERDR · DURABLE QUEUE</div><h2 id="queue-title">Autonomní fronta QuantLab</h2></div><span>Jen bezpečná provozní metadata · bez promptů a logů.</span></div><div id="queue-summary" class="queue-summary"></div><div id="queue-list" class="queue-list"></div></section>
+      </details>
+      <details class="ops-details">
+        <summary>Search Router · provozní detail</summary>
+        <section class="search-layer" aria-labelledby="search-layer-title"><div class="section-title"><div><div class="eyebrow">WEB · SEARCH ROUTER</div><h2 id="search-layer-title">Vyhledávací vrstva</h2></div><span>Fast · Deep · Browser · telemetrie bez ukládání textu dotazů.</span></div><div id="search-grid" class="search-grid"></div></section>
+      </details>
+      <details class="ops-details">
+        <summary>Data Sources · health detail</summary>
+        <section class="source-health"><div class="section-title"><h2>Zdroje dat</h2><span>Chybějící data nejsou nahrazena odhadem.</span></div><div id="source-grid" class="source-grid"></div></section>
+      </details>
+      <section class="text-fallback"><details id="server-fallback-details"><summary>Úplný serverový textový přehled</summary><!--SERVER_FALLBACK--></details></section>
     </section>
   </main>
 
@@ -101,6 +142,7 @@
     <h2 id="detail-title">—</h2>
     <p id="detail-role" class="detail-role">—</p>
     <div id="detail-status" class="detail-status">—</div>
+    <nav id="detail-links" class="detail-links" aria-label="Navigace k evidenci"></nav>
     <dl id="detail-metrics" class="detail-metrics"></dl>
     <h3>Poslední dostupné události</h3>
     <ol id="detail-events" class="event-list"></ol>

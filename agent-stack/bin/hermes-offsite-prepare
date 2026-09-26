@@ -1,0 +1,81 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+
+AGENT_HOME="/home/agentops"
+HERMES_BIN="$AGENT_HOME/.local/bin/hermes"
+BACKUP_DIR="$AGENT_HOME/backups/hermes"
+OUT_DIR="$AGENT_HOME/backups/hermes-offsite"
+KEY_FILE="$AGENT_HOME/.config/hermes-offsite.key"
+STAMP="$(date -u +%Y%m%d-%H%M%S)"
+PLAIN="$OUT_DIR/hermes-offsite-full-$STAMP.tar.gz"
+ENCRYPTED="$PLAIN.enc"
+META="$OUT_DIR/hermes-offsite-full-$STAMP.meta"
+
+mkdir -p "$BACKUP_DIR" "$OUT_DIR"
+chmod 700 "$BACKUP_DIR" "$OUT_DIR"
+if [[ ! -s "$KEY_FILE" ]]; then
+  echo "Missing encryption key: $KEY_FILE" >&2
+  exit 2
+fi
+
+LATEST_BACKUP="$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'hermes-backup-auto-*.zip' -printf '%T@\t%p\n' | sort -nr | head -n 1 | cut -f2-)"
+if [[ -z "$LATEST_BACKUP" ]]; then
+  LATEST_BACKUP="$BACKUP_DIR/hermes-backup-auto-$STAMP.zip"
+  "$HERMES_BIN" backup -o "$LATEST_BACKUP" -k 3
+fi
+LATEST_NAME="$(basename "$LATEST_BACKUP")"
+CORE_FILES=(
+  ".config/herdr/session.json"
+  ".local/bin/majak"
+  ".local/bin/quantlab"
+  ".local/bin/agent-stack-ensure"
+  ".local/bin/agent-stack-watchdog"
+  ".local/bin/hermes-maintenance"
+  ".local/bin/hermes-offsite-prepare"
+  ".local/bin/hermes-offsite-sync"
+  ".local/bin/hermes-offsite-connect-drive"
+  ".local/share/agent-stack/agent-stack-watchdog.service"
+  "install-agent-stack-service.sh"
+  "workspaces/majak/AGENTS.md"
+  "workspaces/quantlab/AGENTS.md"
+)
+EXISTING_CORE=()
+for item in "${CORE_FILES[@]}"; do
+  [[ -e "$AGENT_HOME/$item" ]] && EXISTING_CORE+=("$item")
+done
+
+tar -czf "$PLAIN" \
+  -C "$BACKUP_DIR" "$LATEST_NAME" \
+  -C "$AGENT_HOME" "${EXISTING_CORE[@]}"
+
+openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+  -in "$PLAIN" -out "$ENCRYPTED" -pass file:"$KEY_FILE"
+
+SOURCE_SHA="$(sha256sum "$LATEST_BACKUP" | awk '{print $1}')"
+PLAIN_SHA="$(sha256sum "$PLAIN" | awk '{print $1}')"
+ENCRYPTED_SHA="$(sha256sum "$ENCRYPTED" | awk '{print $1}')"
+ENCRYPTED_BYTES="$(stat -c %s "$ENCRYPTED")"
+cat > "$META" <<EOF
+created_utc=$STAMP
+source_backup=$LATEST_NAME
+source_backup_sha256=$SOURCE_SHA
+archive_sha256=$PLAIN_SHA
+encrypted_file=$(basename "$ENCRYPTED")
+encrypted_sha256=$ENCRYPTED_SHA
+encrypted_bytes=$ENCRYPTED_BYTES
+cipher=aes-256-cbc
+kdf=pbkdf2
+iterations=200000
+EOF
+
+chmod 600 "$LATEST_BACKUP" "$ENCRYPTED" "$META"
+rm -f -- "$PLAIN"
+
+mapfile -t OLD_META < <(ls -1t "$OUT_DIR"/hermes-offsite-full-*.meta 2>/dev/null | tail -n +4)
+for old_meta in "${OLD_META[@]}"; do
+  old_base="${old_meta%.meta}"
+  rm -f -- "$old_meta" "$old_base.tar.gz.enc"
+done
+
+cat "$META"

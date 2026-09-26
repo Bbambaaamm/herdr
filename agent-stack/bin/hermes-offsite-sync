@@ -1,0 +1,42 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+
+AGENT_HOME="/home/agentops"
+RCLONE="$AGENT_HOME/.local/bin/rclone"
+OUT_DIR="$AGENT_HOME/backups/hermes-offsite"
+STATE_DIR="$AGENT_HOME/.local/state/agent-stack"
+REMOTE_NAME="${HERMES_OFFSITE_REMOTE_NAME:-hermes-gdrive}"
+REMOTE_DIR="${HERMES_OFFSITE_REMOTE_DIR:-quantlab-staging-01}"
+REMOTE="$REMOTE_NAME:$REMOTE_DIR"
+
+if ! "$RCLONE" listremotes 2>/dev/null | grep -Fxq "$REMOTE_NAME:"; then
+  echo "Remote '$REMOTE_NAME' is not configured." >&2
+  exit 3
+fi
+
+LATEST_META="$(ls -1t "$OUT_DIR"/hermes-offsite-full-*.meta 2>/dev/null | head -n 1)"
+if [[ -z "$LATEST_META" ]]; then
+  echo "No encrypted off-site package found." >&2
+  exit 4
+fi
+ENCRYPTED_NAME="$(awk -F= '$1=="encrypted_file"{print $2}' "$LATEST_META")"
+ENCRYPTED="$OUT_DIR/$ENCRYPTED_NAME"
+META_NAME="$(basename "$LATEST_META")"
+[[ -s "$ENCRYPTED" ]] || { echo "Missing $ENCRYPTED" >&2; exit 5; }
+
+"$RCLONE" copyto "$ENCRYPTED" "$REMOTE/$ENCRYPTED_NAME" \
+  --immutable --transfers 1 --checkers 4
+"$RCLONE" copyto "$LATEST_META" "$REMOTE/$META_NAME" \
+  --immutable --transfers 1 --checkers 4
+
+"$RCLONE" check "$OUT_DIR" "$REMOTE" \
+  --include "$ENCRYPTED_NAME" --include "$META_NAME" \
+  --one-way --size-only
+
+mkdir -p "$STATE_DIR"
+printf 'uploaded_utc=%s\nremote=%s\nencrypted=%s\nmetadata=%s\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$REMOTE" "$ENCRYPTED_NAME" "$META_NAME" \
+  > "$STATE_DIR/offsite-last-upload.txt"
+chmod 600 "$STATE_DIR/offsite-last-upload.txt"
+cat "$STATE_DIR/offsite-last-upload.txt"

@@ -156,12 +156,14 @@ for (const kind of ['hermes', 'codex']) {
 }
 
 for (const low of [false, true]) {
-  test(`city/${low ? 'low' : 'high'}: actual tower volume, central clearance and static geometry`, () => {
+  test(`city/${low ? 'low' : 'high'}: quiet server-room volume, central clearance and static geometry`, () => {
     const city = createMachineCity({low});
     try {
       assertRealFiniteGeometry(city.group);
       const diagnostics = city.diagnostics();
-      assert.equal(diagnostics.towers, low ? 36 : 68);
+      assert.equal(diagnostics.towers, low ? 18 : 30);
+      assert.equal(diagnostics.visualMode, 'quiet-server-room');
+      assert.ok(diagnostics.centerClearance >= 8);
       assert.ok(diagnostics.drawCalls <= 7);
       const bounds = new THREE.Box3().setFromObject(city.group);
       const extent = bounds.getSize(new THREE.Vector3());
