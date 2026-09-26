@@ -1,0 +1,22 @@
+{
+  "format": 1,
+  "source_repository": "Bbambaaamm/Autonomous-Quant-Lab",
+  "runtime_observed_deployed_git_sha": "8f2a5543515eb2d8ce84602e98d6c3d2163e1099",
+  "platform_baseline": {
+    "pull_request": 251,
+    "branch": "q3-production-audit",
+    "commit": "41179635c8654a60c5d9234acccb6e91b2028b72",
+    "relationship_to_deployed": "6 commits ahead, 0 behind"
+  },
+  "search_router": {
+    "pull_request": 250,
+    "branch": "agent/perplexity-cost-routing-v2-20260927",
+    "commit": "3c1dac1c1d96693cf0903b80acdfc169e391a58d",
+    "imported_scope": "ops/agent-platform/search-router only"
+  },
+  "superseded_import_pr": {
+    "pull_request": 239,
+    "commit": "0ac4eb85e4b5e96cbe7481e111f281e5b1785ecf",
+    "relationship_to_deployed": "31 commits behind deployed baseline"
+  }
+}

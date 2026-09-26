@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+import json
+import os
+import selectors
+import subprocess
+import time
+from pathlib import Path
+
+CODEX = "/home/agentops/.local/bin/codex"
+OUTPUT = Path("/var/lib/agent-platform-herdr/codex-usage.json")
+MAX_LINE = 512 * 1024
+HISTORY_LIMIT = 288
+
+ENV = {
+    "HOME": "/home/agentops",
+    "PATH": "/home/agentops/.local/node24/bin:/home/agentops/.local/bin:/usr/local/bin:/usr/bin:/bin",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+}
+
+def read_response(process, wanted_id, timeout=20):
+    deadline = time.monotonic() + timeout
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    try:
+        while time.monotonic() < deadline:
+            if not selector.select(deadline - time.monotonic()):
+                break
+            line = process.stdout.readline(MAX_LINE + 1)
+            if not line or len(line) > MAX_LINE:
+                break
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if value.get("id") == wanted_id:
+                if "error" in value:
+                    raise RuntimeError("codex_app_server_error")
+                return value.get("result")
+    finally:
+        selector.close()
+    raise RuntimeError("codex_app_server_timeout")
+def rpc(process, request_id, method, params=None):
+    payload = {"method": method, "id": request_id}
+    if params is not None:
+        payload["params"] = params
+    process.stdin.write((json.dumps(payload, separators=(",", ":")) + "\n").encode())
+    process.stdin.flush()
+    return read_response(process, request_id)
+
+def bounded_int(value, upper=2**53 - 1):
+    if type(value) is not int or not 0 <= value <= upper:
+        return None
+    return value
+
+def safe_balance(value):
+    if value is None:
+        return None
+    text = str(value)
+    if len(text) > 32 or any(ch not in "0123456789.-" for ch in text):
+        return None
+    return text
+
+def load_history():
+    try:
+        value = json.loads(OUTPUT.read_text(encoding="utf-8"))
+        rows = value.get("limit_history")
+        return rows if isinstance(rows, list) else []
+    except Exception:
+        return []
+def main():
+    now = int(time.time())
+    process = subprocess.Popen(
+        [CODEX, "app-server", "--stdio"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=ENV,
+        start_new_session=True,
+    )
+    try:
+        rpc(process, 1, "initialize", {
+            "clientInfo": {"name": "agent-platform-usage-export", "title": "Agent Platform usage exporter", "version": "1"},
+            "capabilities": {"experimentalApi": True},
+        })
+        limits = rpc(process, 2, "account/rateLimits/read", {"excludeResetCreditDetails": False, "supportsLunaReserve": False})
+        usage = rpc(process, 3, "account/usage/read", {})
+    finally:
+        try:
+            process.terminate()
+            process.wait(timeout=3)
+        except Exception:
+            process.kill()
+            process.wait(timeout=3)
+
+    rate = (limits or {}).get("rateLimits") or {}
+    primary = rate.get("primary") or {}
+    credits = rate.get("credits") or {}
+    reset_credits = (limits or {}).get("rateLimitResetCredits") or {}
+    used = bounded_int(primary.get("usedPercent"), 100)
+    if used is None:
+        raise RuntimeError("codex_usage_missing_limit")
+    summary = (usage or {}).get("summary") or {}
+    daily = []
+    for row in (usage or {}).get("dailyUsageBuckets") or []:
+        day, tokens = row.get("startDate"), bounded_int(row.get("tokens"))
+        if isinstance(day, str) and len(day) == 10 and tokens is not None:
+            daily.append({"day": day, "tokens": tokens})
+    daily = sorted(daily, key=lambda row: row["day"])[-45:]
+
+    history = [
+        row for row in load_history()
+        if isinstance(row, dict)
+        and bounded_int(row.get("at")) is not None
+        and bounded_int(row.get("used_percent"), 100) is not None
+    ]
+    if not history or now - history[-1]["at"] >= 240 or history[-1]["used_percent"] != used:
+        history.append({"at": now, "used_percent": used})
+    history = history[-HISTORY_LIMIT:]
+
+    output = {
+        "version": 1,
+        "observed_at": now,
+        "rate_limit": {
+            "used_percent": used,
+            "window_minutes": bounded_int(primary.get("windowDurationMins")),
+            "resets_at": bounded_int(primary.get("resetsAt")),
+            "ordinary_usage_allowed": bool((limits or {}).get("ordinaryUsageAllowed")),
+            "has_credits": bool(credits.get("hasCredits")),
+            "credits_unlimited": bool(credits.get("unlimited")),
+            "credits_balance": safe_balance(credits.get("balance")),
+            "reset_credits_available": bounded_int(reset_credits.get("availableCount")) or 0,
+        },
+        "usage": {
+            "lifetime_tokens": bounded_int(summary.get("lifetimeTokens")),
+            "peak_daily_tokens": bounded_int(summary.get("peakDailyTokens")),
+            "longest_running_turn_sec": bounded_int(summary.get("longestRunningTurnSec")),
+            "current_streak_days": bounded_int(summary.get("currentStreakDays")),
+            "longest_streak_days": bounded_int(summary.get("longestStreakDays")),
+            "daily": daily,
+        },
+        "limit_history": history,
+    }
+
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+    temporary = OUTPUT.with_name("." + OUTPUT.name + f".{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(output, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    os.chmod(temporary, 0o640)
+    os.replace(temporary, OUTPUT)
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())

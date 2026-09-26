@@ -1,0 +1,22 @@
+# Fail-closed route reservation for upgrades and rollback. Install atomically over
+# /etc/agent-platform/nginx-server.conf, validate nginx -t, then reload.
+location = /agent-platform {
+    recursive_error_pages off;
+    error_page 418 = @agent_platform_unavailable;
+    return 418;
+}
+location ^~ /agent-platform/ {
+    recursive_error_pages off;
+    error_page 418 = @agent_platform_unavailable;
+    return 418;
+}
+location @agent_platform_unavailable {
+    internal;
+    access_log off;
+    error_log /dev/null crit;
+    recursive_error_pages off;
+    default_type application/json;
+    add_header Cache-Control "no-store" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    return 503 '{"error":"maintenance"}';
+}

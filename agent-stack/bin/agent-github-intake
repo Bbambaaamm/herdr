@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+import urllib.request
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path("/home/agentops")
+ROOT = HOME / ".local/state/agent-stack/tasks"
+PENDING = ROOT / "pending"
+RESULTS = ROOT / "results"
+STATE = ROOT / "github-intake-state.json"
+STAMP = ROOT / "github-intake.stamp"
+LOG = HOME / ".local/state/agent-stack/github-intake.log"
+REPO = "Bbambaaamm/Autonomous-Quant-Lab"
+API = f"https://api.github.com/repos/{REPO}/issues?state=open&per_page=100"
+ACTIVE_DIRS = ("pending", "running", "blocked")
+TERMINAL_DIRS = ("done", "failed")
+COOLDOWN_SECONDS = 300
+
+def now() -> datetime:
+    return datetime.now(timezone.utc)
+
+def log(message: str) -> None:
+    with LOG.open("a", encoding="utf-8") as handle:
+        handle.write(f"{now().isoformat(timespec='seconds')} {message}\n")
+
+def load_state() -> dict:
+    if not STATE.exists():
+        return {}
+    try:
+        return json.loads(STATE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def save_state(data: dict) -> None:
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STATE)
+
+def fetch_issues() -> list[dict]:
+    request = urllib.request.Request(
+        API,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "quantlab-herdr-intake/2",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return json.load(response)
+
+def task_index() -> dict[str, list[dict]]:
+    by_issue: dict[str, list[dict]] = defaultdict(list)
+    for state_name in (*ACTIVE_DIRS, *TERMINAL_DIRS):
+        directory = ROOT / state_name
+        for path in directory.glob("*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                issue = data.get("issue")
+                if isinstance(issue, int) or (isinstance(issue, str) and issue.isdigit()):
+                    by_issue[str(issue)].append(
+                        {
+                            "state": state_name,
+                            "path": path,
+                            "task": data,
+                            "mtime": path.stat().st_mtime,
+                        }
+                    )
+            except Exception as exc:
+                log(f"task index skip {path.name}: {exc}")
+    for records in by_issue.values():
+        records.sort(key=lambda item: item["mtime"], reverse=True)
+    return by_issue
+
+def result_for(task_id: str) -> dict:
+    path = RESULTS / f"{task_id}.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def prior_evidence(records: list[dict]) -> str:
+    for record in records:
+        task_id = str(record["task"].get("id") or "")
+        result = result_for(task_id)
+        if result:
+            compact = {
+                "previous_task": task_id,
+                "previous_state": record["state"],
+                "summary": result.get("summary"),
+                "blocker": result.get("blocker"),
+                "next_action": result.get("next_action"),
+            }
+            return json.dumps(compact, ensure_ascii=False)[:5000]
+    return "none"
+
+def issue_priority(issue: dict) -> int:
+    title = str(issue.get("title") or "").strip().lower()
+    if title.startswith("roadmap:"):
+        return 90
+    if "architecture" in title or "architektura" in title:
+        return 50
+    return 60
+
+def queue_issue(issue: dict, records: list[dict]) -> str:
+    number = int(issue["number"])
+    episode = now().strftime("%Y%m%dT%H%M%SZ")
+    task_id = f"github-issue-{number}-{episode}"
+    title = str(issue.get("title") or "")
+    body = str(issue.get("body") or "")
+    url = str(issue.get("html_url") or "")
+    prior = prior_evidence(records)
+    prompt = f"""
+Continue Autonomous Quant Lab GitHub issue #{number} as ONE bounded, dependency-safe work slice.
+Issue: {title}
+URL: {url}
+
+Current issue body:
+{body[:12000]}
+
+Prior durable evidence for this issue:
+{prior}
+
+Before acting, fetch current issue/PR/main state and inspect prior durable results under
+/home/agentops/.local/state/agent-stack/tasks/results so no work is duplicated.
+
+Operating rules:
+- If this is a broad roadmap/epic, choose only the smallest high-value next slice that fits this task timeout. The scheduler will queue another slice while the issue stays open.
+- For code changes, DO NOT modify the dirty primary checkout used by another issue. Fetch current origin/main and use an isolated clean git worktree/branch under /home/agentops/workspaces/quantlab/worktrees/ (or an already clean issue-specific worktree).
+- Preserve PAPER-only trading, PIT/causality, provenance, immutable audit, resource limits, queue/lease semantics and every existing safety guardrail.
+- Do not enable live trading, buy paid services, weaken credentials/approvals, alter branch protection, bypass CI, bypass deploy holds, or bypass safety gates.
+- Do not merge or deploy unless an already-existing protected authorization flow explicitly permits it; this task itself grants no such permission.
+- Prefer tests and evidence over broad refactors. Stop fail-closed on unclear migrations, external credentials, paid-provider requirements, or user-only decisions.
+- If the issue is already satisfied, do not invent changes: produce closure/writeback evidence instead.
+- If GitHub write authorization is the only missing step, preserve the exact local patch/branch/evidence and report blocker=github_write_auth_required; do not repeat implementation.
+"""
+    task = {
+        "id": task_id,
+        "kind": "github_issue_slice",
+        "issue": number,
+        "agent": "quantlab-hermes",
+        "priority": issue_priority(issue),
+        "not_before": now().isoformat(),
+        "timeout_seconds": 1800,
+        "max_attempts": 4,
+        "attempts": 0,
+        "prompt": prompt.strip(),
+    }
+    path = PENDING / f"{task_id}.json"
+    path.write_text(json.dumps(task, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(path, 0o600)
+    log(f"queued issue #{number} as {task_id} priority={task['priority']}")
+    return task_id
+
+def intervention_blocker(records: list[dict]) -> tuple[str, str] | None:
+    if not records:
+        return None
+    latest = records[0]
+    task = latest["task"]
+    task_id = str(task.get("id") or "")
+    result = result_for(task_id)
+    blocker = str(result.get("blocker") or "")
+    if blocker in {"github_write_auth_required", "user_action_required", "agent_interactive_input_required"}:
+        return task_id, blocker
+    if latest["state"] == "failed":
+        return task_id, str(task.get("last_error") or "failed")
+    return None
+
+def main() -> int:
+    force = "--force" in sys.argv
+    if not force and STAMP.exists() and time.time() - STAMP.stat().st_mtime < 300:
+        return 0
+
+    previous_state = load_state()
+    issues = fetch_issues()
+    indexed = task_index()
+    new_state: dict[str, dict] = {}
+    seen_numbers: set[str] = set()
+
+    for issue in issues:
+        if "pull_request" in issue:
+            continue
+        number = str(issue["number"])
+        seen_numbers.add(number)
+        records = indexed.get(number, [])
+        active = [record for record in records if record["state"] in ACTIVE_DIRS]
+        current = {
+            "open": True,
+            "title": str(issue.get("title") or "")[:160],
+            "remote_updated_at": str(issue.get("updated_at") or ""),
+            "seen_at": now().isoformat(),
+        }
+
+        if active:
+            current["scheduler_state"] = "active"
+            current["task_ids"] = [str(r["task"].get("id") or "") for r in active]
+            new_state[number] = current
+            continue
+
+        blocker = intervention_blocker(records)
+        if blocker:
+            current["scheduler_state"] = "blocked"
+            current["task_id"] = blocker[0]
+            current["blocker"] = blocker[1]
+            new_state[number] = current
+            continue
+
+        latest_terminal = next((r for r in records if r["state"] in TERMINAL_DIRS), None)
+        if latest_terminal and time.time() - latest_terminal["mtime"] < COOLDOWN_SECONDS:
+            current["scheduler_state"] = "cooldown"
+            current["task_id"] = str(latest_terminal["task"].get("id") or "")
+            new_state[number] = current
+            continue
+
+        task_id = queue_issue(issue, records)
+        current["scheduler_state"] = "queued"
+        current["task_id"] = task_id
+        new_state[number] = current
+
+    for number, old in previous_state.items():
+        if number not in seen_numbers:
+            new_state[number] = {
+                "open": False,
+                "seen_at": now().isoformat(),
+                "closed_or_missing": True,
+                "previous_task_id": old.get("task_id"),
+            }
+
+    save_state(new_state)
+    STAMP.touch()
+    os.chmod(STAMP, 0o600)
+    return 0
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        log(f"ERROR: {exc}")
+        raise

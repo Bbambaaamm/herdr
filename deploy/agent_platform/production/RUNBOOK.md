@@ -348,12 +348,13 @@ host gates, not proven by unit tests.
 
 ## 7. Rollback — preserve path reservation, never fall through to QuantLab
 
-On any auth/source/isolation/root regression: FIRST install a deny-only content into
-**our** /etc/agent-platform/nginx-server.conf (preserve the one-line shared include).
-Use the reviewed Phase8 exact/prefix/named503 fragment from the same release audit,
-with all its named error handling.
+On any auth/source/isolation/root regression: FIRST atomically install the reviewed
+`nginx-maintenance.conf.in` content over **our**
+`/etc/agent-platform/nginx-server.conf` (preserve the one-line shared include).
+Keep its exact/prefix/named503 handling together; never construct a partial fragment
+at the terminal.
 
-Inherited error handlers MUST also be neutralized: use the full Phase8 fragment
+Inherited error handlers MUST also be neutralized: use the full maintenance fragment
 with its own internal @agent_platform_unavailable and fixed JSON503 response. Check
 no collision for that named location. Validate `sudo nginx -t`, then separately
 `sudo systemctl reload nginx`, confirm both paths denied and QuantLab root200.

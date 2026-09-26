@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+import os
+import re
+import shutil
+import subprocess
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path("/home/agentops")
+STATE = HOME / ".local/state/agent-stack"
+BACKUPS = HOME / "backups/hermes"
+AUDITS = STATE / "audits"
+STAMPS = STATE / "stamps"
+LOG = STATE / "maintenance.log"
+
+ENV = os.environ.copy()
+ENV["HOME"] = str(HOME)
+ENV["PATH"] = f"{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+ENV["LD_LIBRARY_PATH"] = f"{HOME}/.local/playwright-libs/root/usr/lib/x86_64-linux-gnu:" + ENV.get("LD_LIBRARY_PATH", "")
+
+for p in (STATE, BACKUPS, AUDITS, STAMPS):
+    p.mkdir(parents=True, exist_ok=True)
+    os.chmod(p, 0o700)
+os.umask(0o077)
+
+def log(msg):
+    line = f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} {msg}"
+    with LOG.open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+
+def due(name, seconds):
+    p = STAMPS / name
+    return not p.exists() or time.time() - p.stat().st_mtime >= seconds
+
+def mark(name):
+    p = STAMPS / name
+    p.touch()
+    os.chmod(p, 0o600)
+
+def run(args, timeout=180):
+    p = subprocess.run([str(x) for x in args], text=True, capture_output=True,
+                       timeout=timeout, env=ENV)
+    return p.returncode, (p.stdout or "") + (p.stderr or "")
+
+def _vtuple(value):
+    nums = [int(x) for x in re.findall(r"\d+", value)[:3]]
+    return tuple((nums + [0, 0, 0])[:3])
+
+def security_guard():
+    py = HOME / ".hermes/hermes-agent/venv/bin/python"
+    uv = HOME / ".hermes/bin/uv"
+    code = (
+        "import importlib.metadata as m;"
+        "print('|'.join(m.version(x) for x in ('anyio','httpx2','httpcore2')))"
+    )
+    rc, text = run([py, "-c", code], 30)
+    if rc:
+        raise RuntimeError(f"security version check failed: {text[-500:]}")
+    versions = text.strip().split("|")
+    floors = ((4,14,2), (2,13,0), (2,13,0))
+    if len(versions) != 3 or any(_vtuple(v) < floor for v, floor in zip(versions, floors)):
+        rc, text = run([
+            uv, "pip", "install", "--python", py,
+            "anyio>=4.14.2", "httpx2>=2.13.0", "httpcore2>=2.13.0"
+        ], 180)
+        if rc:
+            raise RuntimeError(f"security guard failed: {text[-1000:]}")
+        log("security guard repaired vulnerable dependency floor")
+def codex_usage_snapshot():
+    if not due("codex-usage", 300):
+        return
+    script = HOME / ".local/bin/agent-codex-usage-export"
+    rc, text = run([script], 60)
+    if rc:
+        raise RuntimeError(f"codex usage export failed: {text[-1000:]}")
+    mark("codex-usage")
+    log("codex usage snapshot OK")
+
+
+def daily_backup():
+    if not due("backup", 24 * 3600):
+        return
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    out = BACKUPS / f"hermes-backup-auto-{ts}.zip"
+    rc, text = run([HOME / ".local/bin/hermes", "backup", "-o", out, "-k", "3"], 300)
+    if rc:
+        raise RuntimeError(f"backup failed: {text[-1000:]}")
+    os.chmod(out, 0o600)
+    mark("backup")
+    log(f"backup OK: {out.name}")
+
+def daily_offsite_prepare():
+    if not due("offsite-prepare", 24 * 3600):
+        return
+    script = HOME / ".local/bin/hermes-offsite-prepare"
+    rc, text = run([script], 900)
+    if rc:
+        raise RuntimeError(f"off-site preparation failed: {text[-1000:]}")
+    mark("offsite-prepare")
+    last_line = text.strip().splitlines()[-1] if text.strip() else "complete"
+    log(f"off-site encrypted package OK: {last_line}")
+
+def daily_offsite_sync():
+    if not due("offsite-sync", 24 * 3600):
+        return
+    rclone = HOME / ".local/bin/rclone"
+    remote_name = os.environ.get("HERMES_OFFSITE_REMOTE_NAME", "hermes-gdrive")
+    if not rclone.exists():
+        return
+    rc, remotes = run([rclone, "listremotes"], 30)
+    if rc != 0 or f"{remote_name}:" not in {
+        line.strip() for line in remotes.splitlines()
+    }:
+        return
+    rc, _ = run([rclone, "lsd", f"{remote_name}:", "--max-depth", "1"], 60)
+    if rc != 0:
+        return
+    script = HOME / ".local/bin/hermes-offsite-sync"
+    rc, text = run([script], 1800)
+    if rc:
+        raise RuntimeError(f"off-site upload failed: {text[-1000:]}")
+    mark("offsite-sync")
+    last_line = text.strip().splitlines()[-1] if text.strip() else "complete"
+    log(f"off-site upload OK: {last_line}")
+
+def command_report(wrapper):
+    commands = [
+        ("STATUS", [wrapper, "status"]),
+        ("DOCTOR", [wrapper, "doctor"]),
+        ("SECURITY", [wrapper, "security", "audit"]),
+        ("PROMPT_SIZE", [wrapper, "prompt-size"]),
+        ("FALLBACK", [wrapper, "fallback", "list"]),
+        ("APPROVALS", [wrapper, "config", "get", "approvals", "--json"]),
+        ("SKILLS", [wrapper, "skills", "list"]),
+        ("PLUGINS", [wrapper, "plugins", "list", "--plain", "--no-bundled"]),
+        ("PLUGIN_CAPS", [wrapper, "plugins", "capabilities"]),
+        ("MCP", [wrapper, "mcp", "list"]),
+        ("CRON", [wrapper, "cron", "list"]),
+        ("LOG_WARNINGS", [wrapper, "logs", "--level", "WARNING", "--since", "24h"]),
+    ]
+    parts = []
+    for title, args in commands:
+        rc, text = run(args, 180)
+        parts.append(f"===== {title} rc={rc} =====\n{text.strip()}\n")
+    return "\n".join(parts)
+
+def daily_audit():
+    if not due("audit", 24 * 3600):
+        return None
+    day = datetime.now(timezone.utc).strftime("%Y%m%d")
+    daydir = AUDITS / day
+    daydir.mkdir(parents=True, exist_ok=True)
+    os.chmod(daydir, 0o700)
+    reports = {}
+    for profile in ("majak", "quantlab"):
+        wrapper = HOME / ".local/bin" / profile
+        report = command_report(wrapper)
+        path = daydir / f"{profile}-facts.txt"
+        path.write_text(report, encoding="utf-8")
+        os.chmod(path, 0o600)
+        reports[profile] = path
+    rc, update = run([HOME / ".local/bin/hermes", "update", "--check"], 60)
+    path = daydir / "update-check.txt"
+    path.write_text(f"rc={rc}\n{update}", encoding="utf-8")
+    os.chmod(path, 0o600)
+
+    offsite_dir = HOME / "backups/hermes-offsite"
+    lines = []
+    for label, candidates in (
+        ("full_backup", list(BACKUPS.glob("hermes-backup-auto-*.zip"))),
+        ("encrypted_offsite", list(offsite_dir.glob("hermes-offsite-full-*.tar.gz.enc"))),
+        ("offsite_metadata", list(offsite_dir.glob("hermes-offsite-full-*.meta"))),
+    ):
+        if candidates:
+            item = max(candidates, key=lambda p: p.stat().st_mtime)
+            mode = oct(item.stat().st_mode & 0o777)
+            lines.append(f"{label}={item.name} bytes={item.stat().st_size} mode={mode}")
+        else:
+            lines.append(f"{label}=MISSING")
+    rclone = HOME / ".local/bin/rclone"
+    remote_name = os.environ.get("HERMES_OFFSITE_REMOTE_NAME", "hermes-gdrive")
+    rc, remotes = run([rclone, "listremotes"], 30) if rclone.exists() else (127, "")
+    remote_declared = rc == 0 and f"{remote_name}:" in {
+        line.strip() for line in remotes.splitlines()
+    }
+    if remote_declared:
+        rc, _ = run([rclone, "lsd", f"{remote_name}:", "--max-depth", "1"], 60)
+        rclone_ready = rc == 0
+    else:
+        rclone_ready = False
+    lines.append(f"rclone_remote={remote_name}")
+    lines.append(f"rclone_configured={rclone_ready}")
+    last_upload = STATE / "offsite-last-upload.txt"
+    upload_complete = (
+        rclone_ready and last_upload.exists() and last_upload.stat().st_size > 0
+    )
+    lines.append(f"offsite_upload_completed={upload_complete}")
+    if upload_complete:
+        lines.extend(
+            f"offsite_{line.strip()}"
+            for line in last_upload.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines()
+            if line.strip()
+        )
+    for label, args in (
+        ("watchdog_enabled", ["systemctl", "is-enabled", "agent-stack-watchdog.service"]),
+        ("watchdog_active", ["systemctl", "is-active", "agent-stack-watchdog.service"]),
+    ):
+        rc, output = run(args, 30)
+        lines.append(f"{label}={rc == 0 and output.strip() in ('enabled', 'active')}")
+    lines.append("maintenance_trigger=systemd_watchdog_with_due_stamps")
+    for stamp_name in ("backup", "offsite-prepare", "offsite-sync", "self-review"):
+        stamp_path = STAMPS / stamp_name
+        stamp_value = (
+            datetime.fromtimestamp(stamp_path.stat().st_mtime, timezone.utc).isoformat()
+            if stamp_path.exists() else "MISSING"
+        )
+        lines.append(f"{stamp_name}_stamp={stamp_value}")
+    lines.append(
+        f"audit_generated_utc={datetime.now(timezone.utc).isoformat(timespec='seconds')}"
+    )
+    posture = daydir / "backup-posture.txt"
+    posture.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.chmod(posture, 0o600)
+
+    # Keep 14 daily audit directories.
+    old = sorted([p for p in AUDITS.iterdir() if p.is_dir()])
+    for p in old[:-14]:
+        shutil.rmtree(p, ignore_errors=True)
+
+    mark("audit")
+    log(f"audit OK: {daydir}")
+    return reports
+
+def latest_facts(profile):
+    candidates = sorted(AUDITS.glob(f"*/{profile}-facts.txt"))
+    return candidates[-1] if candidates else None
+
+def weekly_self_review():
+    if not due("self-review", 7 * 24 * 3600):
+        return
+    day = datetime.now(timezone.utc).strftime("%Y%m%d")
+    daydir = AUDITS / day
+    daydir.mkdir(parents=True, exist_ok=True)
+    for profile in ("majak", "quantlab"):
+        facts = latest_facts(profile)
+        if facts is None:
+            continue
+        raw = facts.read_text(encoding="utf-8", errors="replace")
+        posture = daydir / "backup-posture.txt"
+        if posture.exists():
+            raw += "\n===== BACKUP_POSTURE =====\n" + posture.read_text(
+                encoding="utf-8", errors="replace"
+            )
+        # Bound model input while retaining the useful beginning/end of diagnostics.
+        if len(raw) > 30000:
+            raw = raw[:18000] + "\n...TRUNCATED...\n" + raw[-12000:]
+        prompt = (
+            "READ-ONLY SELF-AUDIT. Do not change anything and do not call external tools. "
+            "Using only the verified diagnostics below, separate facts from recommendations. "
+            "Report: critical/high issues, medium issues, low/cleanup items, and what is healthy. "
+            "Do not classify absent optional API keys, OAuth providers, messaging platforms, "
+            "MCP servers, Hermes cron jobs, paid credits, or optional packages as issues unless "
+            "the diagnostics show that the active Majak/QuantLab architecture requires them. "
+            "The agent stack intentionally uses Nous Portal plus OpenAI Codex auth, Herdr chat "
+            "panes, and an external systemd watchdog instead of Hermes Gateway or Hermes cron. "
+            "Treat a local encrypted package as prepared but not off-site until both "
+            "rclone_configured and offsite_upload_completed are true. Mention "
+            "backup/fallback/browser/security/update posture when evidence exists.\n\n" + raw
+        )
+        wrapper = HOME / ".local/bin" / profile
+        rc, text = run([wrapper, "-t", "clarify", "-z", prompt], 180)
+        out = daydir / f"{profile}-self-review.txt"
+        out.write_text(f"rc={rc}\n{text}", encoding="utf-8")
+        os.chmod(out, 0o600)
+    mark("self-review")
+    log(f"self-review OK: {daydir}")
+def agent_task_maintenance():
+    for name in ("agent-github-intake", "agent-task-dispatcher", "agent-task-export"):
+        script = HOME / ".local/bin" / name
+        rc, text = run([script], 30)
+        if rc:
+            log(f"{name} ERROR rc={rc}: {text[-1000:]}")
+    heartbeat = STATE / "task-maintenance-heartbeat"
+    heartbeat.touch()
+    os.chmod(heartbeat, 0o600)
+
+
+def main():
+    security_guard()
+    agent_task_maintenance()
+    codex_usage_snapshot()
+    daily_backup()
+    daily_offsite_prepare()
+    daily_offsite_sync()
+    reports = daily_audit()
+    weekly_self_review()
+    # Harden permissions of every Hermes backup because archives contain credentials.
+    for p in BACKUPS.glob("*.zip"):
+        try:
+            os.chmod(p, 0o600)
+        except OSError:
+            pass
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        log(f"ERROR: {exc}")
+        raise

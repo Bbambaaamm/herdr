@@ -1,6 +1,7 @@
 """Closed production snapshot schema; no I/O or fixture fallback."""
 import hashlib
 import json
+import math
 
 PROFILES = ('majak', 'quantlab')
 KINDS = ('herdr', 'kanban', 'router', 'search', 'git', 'tests', 'queue', 'codex')
@@ -27,6 +28,10 @@ def number(value):
     return type(value) is int and 0 <= value < 2**53
 
 
+def timestamp(value):
+    return type(value) in (int, float) and math.isfinite(value) and 0 <= value < 2**53
+
+
 def hex_id(value, lengths=(64,)):
     return type(value) is str and len(value) in lengths and all(c in '0123456789abcdef' for c in value)
 
@@ -34,6 +39,11 @@ def hex_id(value, lengths=(64,)):
 def identifier(value, limit=128):
     return (value is None or type(value) is str and 0 < len(value) <= limit
             and all(c.isascii() and (c.isalnum() or c in '-_./:') for c in value))
+
+
+def display_text(value, limit=160):
+    return (value is None or type(value) is str and 0 < len(value) <= limit
+            and all(ord(c) >= 32 and ord(c) != 127 for c in value))
 
 
 def identity(profile, value):
@@ -64,15 +74,20 @@ def parse(data, limit=MAX_BYTES):
 def row(kind, value):
     fields = {'herdr': 'agent status', 'kanban': 'task_id run_id status',
               'router': ('task_id actual_model provider requests input_tokens output_tokens '
-                         'cost_microusd fallback_count successful_requests duration_ms'),
+                         'cost_microusd fallback_count successful_requests duration_ms last_used_at'),
               'search': ('route_mode provider fallback_provider searches successful_searches '
-                         'duration_ms max_duration_ms fallback_count cost_microusd result_count extract_count'),
+                         'duration_ms max_duration_ms fallback_count cost_microusd result_count '
+                         'extract_count last_used_at'),
               'git': 'commit dirty', 'tests': 'passed failed artifact_digest',
-              'queue': 'task_id issue status attempts not_before updated_at agent kind blocker',
+              'queue': ('task_id issue issue_title issue_open scheduler_state status attempts '
+                        'max_attempts not_before updated_at agent kind blocker pr_number'),
               'codex': ('used_percent window_minutes resets_at ordinary_usage_allowed has_credits '
                         'credits_unlimited credits_balance reset_credits_available lifetime_tokens '
                         'peak_daily_tokens longest_running_turn_sec current_streak_days '
-                        'longest_streak_days daily limit_history')}
+                        'longest_streak_days daily limit_history routing_status routing_policy_version '
+                        'routing_observed_at routing_soft_limit_pct routing_hard_limit_pct routing_decisions '
+                        'routing_free routing_sol routing_astra routing_astra_escalations routing_premium_denied '
+                        'last_route_at last_route_tier last_route_model last_route_reason')}
     keys(value, fields[kind])
     if kind == 'herdr':
         need(value['agent'] in ('majak-hermes', 'majak-codex', 'quantlab-hermes', 'quantlab-codex'))
@@ -83,13 +98,16 @@ def row(kind, value):
         need(value['status'] in ('todo', 'triage', 'ready', 'running', 'blocked', 'done', 'cancelled', 'unknown'))
     elif kind == 'router':
         need(value['task_id'] is None or hex_id(value['task_id']))
-        need(identifier(value['actual_model']) and identifier(value['provider'], 64))
+        need(type(value['actual_model']) is str and identifier(value['actual_model'])
+             and type(value['provider']) is str and identifier(value['provider'], 64))
         need(number(value['requests']))
+        need(timestamp(value['last_used_at']))
         need(all(v is None or number(v) for k, v in value.items()
-                 if k not in ('task_id', 'actual_model', 'provider', 'requests')))
+                 if k not in ('task_id', 'actual_model', 'provider', 'requests', 'last_used_at')))
     elif kind == 'search':
         need(value['route_mode'] in ('fast', 'deep', 'browser'))
-        need(identifier(value['provider']) and identifier(value['fallback_provider']))
+        need(type(value['provider']) is str and identifier(value['provider'])
+             and (value['fallback_provider'] is None or identifier(value['fallback_provider'])))
         need(number(value['searches']) and number(value['successful_searches'])
              and value['successful_searches'] <= value['searches'])
         need(number(value['duration_ms']) and number(value['max_duration_ms'])
@@ -97,16 +115,21 @@ def row(kind, value):
         need(number(value['fallback_count']) and value['fallback_count'] <= value['searches'])
         need(value['cost_microusd'] is None or number(value['cost_microusd']))
         need(number(value['result_count']) and number(value['extract_count']))
+        need(timestamp(value['last_used_at']))
     elif kind == 'git':
         need(hex_id(value['commit'], (40, 64)) and type(value['dirty']) is bool)
     elif kind == 'queue':
         need(type(value['task_id']) is str and identifier(value['task_id'])
              and (value['issue'] is None or number(value['issue'])))
+        need(display_text(value['issue_title']) and type(value['issue_open']) is bool)
+        need(value['scheduler_state'] is None or identifier(value['scheduler_state'], 64))
         need(value['status'] in ('pending', 'running', 'blocked', 'done', 'failed'))
-        need(number(value['attempts']) and (value['not_before'] is None or number(value['not_before'])))
+        need(number(value['attempts']) and number(value['max_attempts'])
+             and (value['not_before'] is None or number(value['not_before'])))
         need(number(value['updated_at']) and value['agent'] == 'quantlab-hermes')
         need(type(value['kind']) is str and identifier(value['kind'], 64))
         need(value['blocker'] is None or type(value['blocker']) is str and identifier(value['blocker']))
+        need(value['pr_number'] is None or number(value['pr_number']))
     elif kind == 'codex':
         need(number(value['used_percent']) and value['used_percent'] <= 100)
         need(value['window_minutes'] is None or number(value['window_minutes']))
@@ -134,6 +157,27 @@ def row(kind, value):
             need(number(item['at']) and number(item['used_percent']) and item['used_percent'] <= 100)
             need(previous_at < item['at'])
             previous_at = item['at']
+        need(value['routing_status'] in ('available', 'unavailable'))
+        routing_numbers = (
+            'routing_observed_at', 'routing_soft_limit_pct', 'routing_hard_limit_pct',
+            'routing_decisions', 'routing_free', 'routing_sol', 'routing_astra',
+            'routing_astra_escalations', 'routing_premium_denied', 'last_route_at',
+        )
+        if value['routing_status'] == 'available':
+            need(identifier(value['routing_policy_version'], 64))
+            need(all(number(value[name]) for name in routing_numbers[:-1]))
+            need(value['routing_soft_limit_pct'] < value['routing_hard_limit_pct'] <= 100)
+            need(value['routing_free'] + value['routing_sol'] + value['routing_astra']
+                 <= value['routing_decisions'])
+            need(value['routing_astra_escalations'] <= value['routing_astra'])
+            need(value['last_route_at'] is None or number(value['last_route_at']))
+            need(value['last_route_tier'] is None or value['last_route_tier'] in ('free', 'sol', 'astra'))
+            need(identifier(value['last_route_model']) and identifier(value['last_route_reason']))
+        else:
+            need(value['routing_policy_version'] is None)
+            need(all(value[name] is None for name in routing_numbers))
+            need(value['last_route_tier'] is None and value['last_route_model'] is None
+                 and value['last_route_reason'] is None)
     else:
         need(number(value['passed']) and number(value['failed']) and hex_id(value['artifact_digest']))
 

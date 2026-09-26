@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+import json
+import os
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path("/home/agentops")
+ROOT = HOME / ".local/state/agent-stack/tasks"
+OUTPUT = Path("/var/lib/agent-platform-herdr/queue.json")
+INTAKE = ROOT / "github-intake-state.json"
+STATES = ("running", "blocked", "failed", "pending", "done")
+SAFE = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
+PR_RE = re.compile(r"(?:/pull/|PR\s*#)(\d{1,9})", re.IGNORECASE)
+
+def epoch(value):
+    if value in (None, ""):
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return None
+        stamp = int(parsed.astimezone(timezone.utc).timestamp())
+        return stamp if 0 <= stamp < 2**53 else None
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+def safe_text(value, default=None):
+    if isinstance(value, str) and SAFE.fullmatch(value):
+        return value
+    return default
+
+def clean_title(value):
+    if not isinstance(value, str):
+        return None
+    value = " ".join(value.split())
+    if not value or len(value) > 160 or any(ord(ch) < 32 for ch in value):
+        return None
+    return value
+
+def intake_state():
+    if not INTAKE.is_file():
+        return {}
+    try:
+        raw = json.loads(INTAKE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    out = {}
+    for key, value in raw.items():
+        if not str(key).isdigit() or not isinstance(value, dict):
+            continue
+        number = int(key)
+        if not 0 < number < 10**9:
+            continue
+        out[number] = {
+            "open": value.get("open") is True,
+            "title": clean_title(value.get("title")),
+            "scheduler_state": safe_text(value.get("scheduler_state")),
+            "seen_at": epoch(value.get("seen_at")),
+        }
+    return out
+
+def result_info(task_id):
+    path = ROOT / "results" / f"{task_id}.json"
+    if not path.is_file():
+        return None, None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return "details_available", None
+    value = raw.get("blocker")
+    blocker = None if value in (None, "") else safe_text(value, "details_available")
+    chunks = []
+    for key in ("summary", "next_action"):
+        if isinstance(raw.get(key), str):
+            chunks.append(raw[key])
+    evidence = raw.get("evidence")
+    if isinstance(evidence, list):
+        chunks.extend(item for item in evidence if isinstance(item, str))
+    match = PR_RE.search("\n".join(chunks))
+    pr_number = int(match.group(1)) if match else None
+    return blocker, pr_number
+
+def rows():
+    items = []
+    seen = set()
+    issues = intake_state()
+    for state in STATES:
+        folder = ROOT / state
+        for path in sorted(folder.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            if len(items) >= 50:
+                return items
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            task_id = safe_text(raw.get("id"))
+            if not task_id or task_id in seen:
+                continue
+            issue = raw.get("issue")
+            if issue is not None and (type(issue) is not int or not 0 < issue < 10**9):
+                issue = None
+            attempts = raw.get("attempts", 0)
+            if type(attempts) is not int or not 0 <= attempts <= 1000:
+                attempts = 0
+            max_attempts = raw.get("max_attempts", 0)
+            if type(max_attempts) is not int or not 0 <= max_attempts <= 1000:
+                max_attempts = 0
+            agent = safe_text(raw.get("agent"), "quantlab-hermes")
+            if agent != "quantlab-hermes":
+                continue
+            kind = safe_text(raw.get("kind"), "unknown")
+            blocker, pr_number = result_info(task_id)
+            meta = issues.get(issue, {}) if issue is not None else {}
+            items.append({
+                "task_id": task_id,
+                "issue": issue,
+                "issue_title": meta.get("title"),
+                "issue_open": meta.get("open") is True,
+                "scheduler_state": meta.get("scheduler_state"),
+                "status": state,
+                "attempts": attempts,
+                "max_attempts": max_attempts,
+                "not_before": epoch(raw.get("not_before")),
+                "updated_at": int(path.stat().st_mtime),
+                "agent": agent,
+                "kind": kind,
+                "blocker": blocker if state in ("blocked", "failed") else None,
+                "pr_number": pr_number,
+            })
+            seen.add(task_id)
+    return items
+
+def main():
+    now = int(datetime.now(timezone.utc).timestamp())
+    payload = {
+        "version": 2,
+        "profile": "quantlab",
+        "observed_at": now,
+        "tasks": rows(),
+    }
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+    temporary = OUTPUT.with_name(f".{OUTPUT.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(temporary, 0o640)
+    os.replace(temporary, OUTPUT)
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
