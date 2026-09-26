@@ -12,9 +12,13 @@ required = [
     "provenance/source-capture-20260926.txt",
     "provenance/external-runtime-dependency.txt",
     "agent_platform_dashboard",
-    "deploy",
+    "deploy/agent_platform/production/launch.py",
 ]
 missing = [p for p in required if not Path(p).exists()]
+
+launch = Path("deploy/agent_platform/production/launch.py")
+if launch.exists() and launch.parts != ("deploy", "agent_platform", "production", "launch.py"):
+    missing.append("canonical deploy/agent_platform/production layout")
 if missing:
     print("Missing required repository contract paths:", *missing, sep="\n- ")
     sys.exit(1)
