@@ -21,6 +21,7 @@ Machine City is an observability surface over durable state; it is not merge or 
 
 ## Platform modules
 
+- herdr/ — canonical provider- and consumer-neutral orchestration core, starting with the durable TaskGraph contract.
 - agent_platform_dashboard/ — current dashboard, production adapters and Machine City source.
 - deploy/ — production deployment templates/runbook.
 - ops/runtime-observed/ — captured operational runtime for provenance and migration; not the long-term source location.
