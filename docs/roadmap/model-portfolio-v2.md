@@ -17,7 +17,7 @@ Cílem není mít co nejvíce modelů. Každý přidaný model musí mít jasnou
 
 ## 2. Výchozí stav a vazba na Herdr v1
 
-Současná koncepce Herdru používá FREE-first routing a placené modely až jako fallback/escalation. Herdr v1 (#229) současně zavádí durable TaskGraph, dynamické child agenty, izolaci, reviewer gate, jednotnou telemetry a admission control.
+Současná koncepce Herdru používá FREE-first routing a placené modely až jako fallback/escalation. Herdr v1 (#1) současně zavádí durable TaskGraph, dynamické child agenty, izolaci, reviewer gate, jednotnou telemetry a admission control.
 
 Model portfolio v2 na těchto kontraktech staví a **nesmí je obcházet**.
 
@@ -98,7 +98,7 @@ Routing je task-specific: coding, research, document, vision a reviewer role moh
 ## 5. Guardrails
 
 - child nesmí rozšířit model/provider oprávnění nad parent policy;
-- model selection respektuje resource/admission budget z #236;
+- model selection respektuje resource/admission budget z #8;
 - každý task má `max_cost_usd`, `max_attempts`, `max_fallbacks` a timeout;
 - žádné nekonečné fallback řetězení;
 - provider outage vede k auditovanému fallbacku;
