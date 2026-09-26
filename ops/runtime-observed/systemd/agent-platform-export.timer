@@ -1,0 +1,9 @@
+[Unit]
+Description=Agent Platform sanitized snapshot refresh
+[Timer]
+OnBootSec=15s
+OnUnitInactiveSec=30s
+AccuracySec=1s
+Unit=agent-platform-export.service
+[Install]
+WantedBy=timers.target

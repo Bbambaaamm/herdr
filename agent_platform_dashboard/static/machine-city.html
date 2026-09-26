@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="cs" data-motion="full" data-mode="live">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <title>Deus Ex Machina · Agent Platform</title>
+  <link rel="stylesheet" href="/agent-platform/machine-city.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/agent-platform/" aria-label="Agent Platform">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span><b>DEUS EX MACHINA</b><small>ŘÍDICÍ CENTRUM AGENTŮ · READ ONLY</small></span>
+    </a>
+    <nav class="view-switch" aria-label="Režim zobrazení">
+      <button data-view="film" aria-pressed="false">Filmový pohled</button>
+      <button class="is-active" data-view="work" aria-pressed="true">Pracovní přehled</button>
+    </nav>
+    <div class="header-status"><span id="live-dot" class="status-dot"></span><span id="header-status">Načítám skutečná data</span></div>
+  </header>
+
+  <main id="app">
+    <section id="film-view" class="film-view" hidden aria-label="Živé strojové město">
+      <canvas id="machine-scene" aria-label="Animované reaktivní kvantové jádro centrálního koordinátora"></canvas>
+      <div class="city-vignette" aria-hidden="true"></div>
+      <div id="link-layer" class="link-layer" aria-hidden="true"></div>
+
+      <aside class="telemetry-panel glass" aria-label="Provozní stav">
+        <div class="eyebrow">SYSTÉM</div>
+        <div class="metric"><span>Snapshot</span><strong id="snapshot-age">—</strong></div>
+        <div class="metric"><span>Agenti</span><strong id="agent-count">—</strong></div>
+        <div class="metric"><span>Fronta</span><strong id="queue-count">—</strong></div>
+        <div class="metric"><span>Požadavky</span><strong id="request-count">—</strong></div>
+        <div class="metric"><span>Hledání</span><strong id="search-count">—</strong></div>
+        <div class="metric"><span>Search latence</span><strong id="search-latency">—</strong></div>
+        <div class="metric"><span>Codex zbývá</span><strong id="cost-total">—</strong></div>
+        <p id="data-caveat" class="caveat">Neznámé hodnoty zůstávají neznámé.</p>
+      </aside>
+
+      <section class="project project-majak glass" data-project="majak" aria-labelledby="majak-title">
+        <button class="project-title" id="majak-title" data-project-toggle="majak" aria-expanded="true">MAJÁK <span id="majak-project-state">—</span></button>
+        <div class="agent-list" id="majak-agents"></div>
+      </section>
+      <section class="project project-quantlab glass" data-project="quantlab" aria-labelledby="quantlab-title">
+        <button class="project-title" id="quantlab-title" data-project-toggle="quantlab" aria-expanded="true">QUANTLAB <span id="quantlab-project-state">—</span></button>
+        <div class="agent-list" id="quantlab-agents"></div>
+      </section>
+
+      <section class="coordinator-card glass" aria-live="polite">
+        <div class="eyebrow">CENTRÁLNÍ KOORDINÁTOR</div>
+        <div class="coordinator-line"><span id="face-signal" class="status-dot"></span><h1 id="face-state">Načítám</h1></div>
+        <p id="face-task">Čekám na první ověřený snapshot.</p>
+        <div class="coordinator-tasks" aria-label="Živá fronta koordinátora">
+          <div><span>Aktuální úkol</span><strong id="coordinator-current">—</strong></div>
+          <div><span>Další v pořadí</span><strong id="coordinator-next">—</strong></div>
+        </div>
+        <button id="attention-action" class="attention-action" hidden>Zkontrolovat detail</button>
+      </section>
+
+      <div id="webgl-fallback" class="webgl-fallback glass" hidden>
+        <strong>3D scéna není dostupná.</strong>
+        <span>Živý textový přehled zůstává funkční.</span>
+        <button data-view="work">Otevřít pracovní přehled</button>
+      </div>
+
+      <div class="scene-controls glass">
+        <button id="demo-toggle" aria-pressed="false">Demo režim</button>
+        <button id="motion-toggle" aria-pressed="false">Omezit pohyb</button>
+        <button id="inspect-model" aria-label="Prohlédnout kvantové jádro ze tří stran">Prohlédnout jádro</button>
+        <button id="sound-toggle" aria-pressed="false" disabled>Zvuk: vypnuto</button>
+      </div>
+      <div id="demo-panel" class="demo-panel glass" hidden>
+        <div><b>DEMO · SYNTETICKÉ STAVY</b><span>Nemění živá data ani úlohy.</span></div>
+        <div id="demo-states" class="demo-states"></div>
+      </div>
+    </section>
+
+    <section id="work-view" class="work-view" aria-label="Kompaktní pracovní přehled">
+      <header class="work-head"><div><div class="eyebrow">SKUTEČNÁ DATA</div><h1>Pracovní přehled</h1></div><p id="work-freshness">—</p></header>
+      <div id="attention-summary" class="attention-summary" hidden></div>
+      <div id="project-grid" class="project-grid"></div>
+      <section class="observability" aria-labelledby="observability-title">
+        <div class="section-title">
+          <div><div class="eyebrow">OBSERVABILITY · LIVE</div><h2 id="observability-title">Systémová telemetrie</h2></div>
+          <span>Codex allowance · tokeny · modely · fallbacky · latence · fronta · coverage</span>
+        </div>
+        <div id="observability-kpis" class="observability-kpis"></div>
+        <div id="observability-grid" class="observability-grid"></div>
+      </section>
+      <section class="queue-health" aria-labelledby="queue-title"><div class="section-title"><div><div class="eyebrow">HERDR · DURABLE QUEUE</div><h2 id="queue-title">Autonomní fronta QuantLab</h2></div><span>Jen bezpečná provozní metadata · bez promptů a logů.</span></div><div id="queue-summary" class="queue-summary"></div><div id="queue-list" class="queue-list"></div></section>
+      <section class="search-layer" aria-labelledby="search-layer-title"><div class="section-title"><div><div class="eyebrow">WEB · SEARCH ROUTER</div><h2 id="search-layer-title">Vyhledávací vrstva</h2></div><span>Fast · Deep · Browser · telemetrie bez ukládání textu dotazů.</span></div><div id="search-grid" class="search-grid"></div></section>
+      <section class="source-health"><div class="section-title"><h2>Zdroje dat</h2><span>Chybějící data nejsou nahrazena odhadem.</span></div><div id="source-grid" class="source-grid"></div></section>
+      <section class="text-fallback"><details id="server-fallback-details" open><summary>Úplný serverový textový přehled</summary><!--SERVER_FALLBACK--></details></section>
+    </section>
+  </main>
+
+  <aside id="agent-detail" class="detail-drawer" hidden aria-labelledby="detail-title">
+    <button id="detail-close" class="detail-close" aria-label="Zavřít detail">×</button>
+    <div class="eyebrow" id="detail-profile">AGENT</div>
+    <h2 id="detail-title">—</h2>
+    <p id="detail-role" class="detail-role">—</p>
+    <div id="detail-status" class="detail-status">—</div>
+    <dl id="detail-metrics" class="detail-metrics"></dl>
+    <h3>Poslední dostupné události</h3>
+    <ol id="detail-events" class="event-list"></ol>
+    <p class="detail-note">Dashboard je pouze ke čtení. Přesný text úkolu, interní myšlenky a průběh se nezobrazují, pokud je zdroj neposkytuje.</p>
+  </aside>
+  <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
+
+  <noscript><p class="noscript">JavaScript je vypnutý. Použijte serverový textový přehled níže.</p></noscript>
+  <script src="/agent-platform/machine-city.js" defer></script>
+</body>
+</html>

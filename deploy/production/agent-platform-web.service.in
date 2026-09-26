@@ -1,0 +1,38 @@
+[Unit]
+Description=Agent Platform authenticated snapshot-only web
+After=network.target
+[Service]
+Type=simple
+User=agent-platform-web
+Group=agent-platform-read
+SupplementaryGroups=agent-platform-auth
+WorkingDirectory=/opt/agent-platform/release
+ExecStartPre=/usr/bin/python3 -I -B /opt/agent-platform/release/deploy/agent_platform/production/launch.py web --config /etc/agent-platform/web.json --check
+ExecStart=/usr/bin/python3 -I -B /opt/agent-platform/release/deploy/agent_platform/production/launch.py web --config /etc/agent-platform/web.json
+Restart=no
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET
+IPAddressDeny=any
+IPAddressAllow=127.0.0.1/32
+SocketBindDeny=any
+SocketBindAllow=ipv4:tcp:3010
+InaccessiblePaths=-/run/herdr -/tmp/herdr -/sources -/var/lib/agent-platform-herdr
+MemoryMax=128M
+TasksMax=8
+TimeoutStopSec=10
+StandardOutput=null
+StandardError=journal
+[Install]
+WantedBy=multi-user.target

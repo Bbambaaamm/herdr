@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path("/home/agentops")
+HERDR = HOME / ".local/bin/herdr"
+DC = HOME / ".local/desktop-commander/node_modules/.bin/desktop-commander"
+STATE = HOME / ".local/state/agent-stack"
+LOG = STATE / "ensure.log"
+HERDR_BOOT_LOG = STATE / "herdr-autostart.log"
+DC_BOOT_LOG = STATE / "desktop-commander-autostart.log"
+
+ENV = os.environ.copy()
+ENV["HOME"] = str(HOME)
+ENV["PATH"] = f"{HOME}/.local/node24/bin:{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+ENV["LD_LIBRARY_PATH"] = f"{HOME}/.local/playwright-libs/root/usr/lib/x86_64-linux-gnu:" + ENV.get("LD_LIBRARY_PATH", "")
+ENV["AGENT_BROWSER_ARGS"] = "--no-sandbox,--disable-dev-shm-usage"
+
+DESIRED = [
+    {
+        "label": "Majak",
+        "cwd": str(HOME / "workspaces/majak"),
+        "agents": [
+            {"tab": "Codex", "name": "majak-codex", "kind": "codex", "args": []},
+            {"tab": "Hermes", "name": "majak-hermes", "kind": "hermes", "args": ["-p", "majak", "chat"]},
+        ],
+    },
+    {
+        "label": "QuantLab",
+        "cwd": str(HOME / "workspaces/quantlab"),
+        "agents": [
+            {"tab": "Codex", "name": "quantlab-codex", "kind": "codex", "args": []},
+            {"tab": "Hermes", "name": "quantlab-hermes", "kind": "hermes", "args": ["-p", "quantlab", "chat"]},
+        ],
+    },
+]
+
+STATE.mkdir(parents=True, exist_ok=True)
+
+def log(message):
+    line = f"{datetime.now().isoformat(timespec='seconds')} {message}"
+    with LOG.open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+    print(line, flush=True)
+
+def run(args, timeout=30):
+    return subprocess.run(
+        [str(x) for x in args],
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        env=ENV,
+    )
+
+def parse_json_output(proc):
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or "command failed").strip())
+    text = proc.stdout.strip()
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            return json.loads(line)
+    if text.startswith("{"):
+        return json.loads(text)
+    raise RuntimeError(f"no JSON output: {text[-500:]}")
+
+def herdr_json(*args, timeout=30):
+    return parse_json_output(run([HERDR, *args], timeout=timeout))
+
+def process_lines():
+    proc = run(["ps", "-u", str(os.getuid()), "-o", "args="], timeout=10)
+    return proc.stdout.splitlines() if proc.returncode == 0 else []
+
+def ensure_desktop_commander():
+    if any("desktop-commander" in line and " remote" in line for line in process_lines()):
+        log("Desktop Commander: healthy")
+        return
+    if not DC.exists():
+        log(f"Desktop Commander: executable missing at {DC}")
+        return
+    with DC_BOOT_LOG.open("ab") as fh:
+        subprocess.Popen(
+            [str(DC), "remote"],
+            stdout=fh,
+            stderr=subprocess.STDOUT,
+            env=ENV,
+            start_new_session=True,
+        )
+    log("Desktop Commander: start requested")
+
+def herdr_ready():
+    try:
+        herdr_json("workspace", "list", timeout=8)
+        return True
+    except Exception:
+        return False
+
+def ensure_herdr_server():
+    if herdr_ready():
+        log("Herdr server: healthy")
+        return
+    with HERDR_BOOT_LOG.open("ab") as fh:
+        subprocess.Popen(
+            [str(HERDR), "server"],
+            stdout=fh,
+            stderr=subprocess.STDOUT,
+            env=ENV,
+            start_new_session=True,
+        )
+    for _ in range(30):
+        time.sleep(1)
+        if herdr_ready():
+            log("Herdr server: restored")
+            return
+    raise RuntimeError("Herdr server did not become ready")
+
+def list_workspaces():
+    data = herdr_json("workspace", "list")
+    return data["result"]["workspaces"]
+
+def list_tabs():
+    data = herdr_json("tab", "list")
+    return data["result"]["tabs"]
+
+def list_panes(workspace_id):
+    data = herdr_json("pane", "list", "--workspace", workspace_id)
+    return data["result"]["panes"]
+
+def list_agents():
+    data = herdr_json("agent", "list")
+    return data["result"]["agents"]
+
+def ensure_workspace(label, cwd):
+    workspaces = list_workspaces()
+    match = next((w for w in workspaces if w.get("label") == label), None)
+    if match:
+        return match["workspace_id"]
+    proc = run([HERDR, "workspace", "create", "--cwd", cwd, "--label", label, "--no-focus"])
+    data = parse_json_output(proc)
+    wid = data["result"]["workspace"]["workspace_id"]
+    log(f"Workspace {label}: created as {wid}")
+    return wid
+
+def ensure_tabs(workspace_id, cwd):
+    tabs = [t for t in list_tabs() if t.get("workspace_id") == workspace_id]
+    by_label = {t.get("label"): t for t in tabs}
+    if "Codex" not in by_label:
+        if len(tabs) == 1:
+            tid = tabs[0]["tab_id"]
+            proc = run([HERDR, "tab", "rename", tid, "Codex"])
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr or proc.stdout)
+            log(f"{workspace_id}: renamed initial tab to Codex")
+        else:
+            proc = run([HERDR, "tab", "create", "--workspace", workspace_id, "--cwd", cwd, "--label", "Codex", "--no-focus"])
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr or proc.stdout)
+            log(f"{workspace_id}: created Codex tab")
+    tabs = [t for t in list_tabs() if t.get("workspace_id") == workspace_id]
+    by_label = {t.get("label"): t for t in tabs}
+    if "Hermes" not in by_label:
+        proc = run([HERDR, "tab", "create", "--workspace", workspace_id, "--cwd", cwd, "--label", "Hermes", "--no-focus"])
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr or proc.stdout)
+        log(f"{workspace_id}: created Hermes tab")
+
+def healthy_agent_names():
+    healthy_states = {"idle", "done", "working", "blocked"}
+    names = set()
+    for agent in list_agents():
+        if agent.get("name") and agent.get("interactive_ready") and agent.get("agent_status") in healthy_states:
+            names.add(agent["name"])
+    return names
+
+def pane_for_tab(workspace_id, tab_id):
+    panes = [p for p in list_panes(workspace_id) if p.get("tab_id") == tab_id]
+    if not panes:
+        raise RuntimeError(f"No pane found for {tab_id}")
+    return panes[0]["pane_id"]
+
+def ensure_agent(workspace_id, spec):
+    if spec["name"] in healthy_agent_names():
+        log(f"{spec['name']}: healthy")
+        return
+    tabs = [t for t in list_tabs() if t.get("workspace_id") == workspace_id]
+    tab = next((t for t in tabs if t.get("label") == spec["tab"]), None)
+    if not tab:
+        raise RuntimeError(f"Missing tab {spec['tab']} in {workspace_id}")
+    pane = pane_for_tab(workspace_id, tab["tab_id"])
+    cmd = [
+        HERDR, "agent", "start", spec["name"],
+        "--kind", spec["kind"], "--pane", pane, "--timeout", "60000",
+    ]
+    if spec["args"]:
+        cmd += ["--", *spec["args"]]
+    proc = run(cmd, timeout=70)
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout).strip())
+    log(f"{spec['name']}: restored in {pane}")
+
+def main():
+    log("=== ensure start ===")
+    ensure_desktop_commander()
+    ensure_herdr_server()
+    for group in DESIRED:
+        wid = ensure_workspace(group["label"], group["cwd"])
+        ensure_tabs(wid, group["cwd"])
+        for spec in group["agents"]:
+            ensure_agent(wid, spec)
+    names = sorted(a.get("name", "") for a in list_agents())
+    missing = [s["name"] for g in DESIRED for s in g["agents"] if s["name"] not in names]
+    if missing:
+        raise RuntimeError("Missing after ensure: " + ", ".join(missing))
+    log("Stack ready: " + ", ".join(n for n in names if n))
+    log("=== ensure complete ===")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        log(f"ERROR: {exc}")
+        sys.exit(1)

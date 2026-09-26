@@ -1,0 +1,2 @@
+# http context ONLY, unique name. New include, never replace nginx.conf.
+limit_req_zone $binary_remote_addr zone=agent_platform_rate:1m rate=10r/m;

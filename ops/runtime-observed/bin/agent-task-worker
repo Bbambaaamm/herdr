@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import sys
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+HOME = Path("/home/agentops")
+HERDR = HOME / ".local/bin/herdr"
+ROOT = HOME / ".local/state/agent-stack/tasks"
+PENDING = ROOT / "pending"
+DONE = ROOT / "done"
+BLOCKED = ROOT / "blocked"
+FAILED = ROOT / "failed"
+RESULTS = ROOT / "results"
+LOGS = ROOT / "logs"
+LOCK = ROOT / "worker.lock"
+
+ENV = os.environ.copy()
+ENV["HOME"] = str(HOME)
+ENV["PATH"] = f"{HOME}/.local/node24/bin:{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+def write_json(path: Path, data: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+def log(task_id: str, message: str) -> None:
+    line = f"{utcnow().isoformat(timespec='seconds')} {message}"
+    with (LOGS / f"{task_id}.worker.log").open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+
+def move(path: Path, target_dir: Path) -> Path:
+    target = target_dir / path.name
+    os.replace(path, target)
+    return target
+
+def result_path(task_id: str) -> Path:
+    return RESULTS / f"{task_id}.json"
+
+def archive_previous_result(task_id: str, attempt: int) -> None:
+    rp = result_path(task_id)
+    if not rp.exists():
+        return
+    stamp = utcnow().strftime("%Y%m%dT%H%M%SZ")
+    archived = RESULTS / f"{task_id}.attempt{attempt}.previous-{stamp}.json"
+    os.replace(rp, archived)
+    os.chmod(archived, 0o600)
+
+def prompt_text(task: dict) -> str:
+    task_id = str(task["id"])
+    result = result_path(task_id)
+    run_token = str(task["run_token"])
+    base = str(task["prompt"]).strip()
+    contract = f"""
+
+TASK COMPLETION CONTRACT:
+- You are running as quantlab-hermes under Herdr.
+- Work from the issue-specific clean worktree when code changes are needed; do not contaminate another issue's dirty checkout.
+- Use only Nous model routing for this task: Laguna -> LongCat -> Step -> Solar. Do not use OpenAI Codex.
+- Preserve PAPER-only, PIT/causality, provenance, immutable audit and runtime/resource/safety guardrails.
+- Do not bypass protected-branch, CI, deploy-hold, credential, approval, billing, or safety controls.
+- Continue autonomously through ordinary technical decisions within this bounded slice.
+- Before finishing, write UTF-8 JSON to {result}.
+- The JSON MUST contain exactly this task identity: task_id="{task_id}" and run_token="{run_token}".
+- Include keys: task_id, run_token, status, summary, issue, evidence, blocker, next_action, completed_at.
+- status must be one of completed, blocked, failed.
+- If GitHub write authorization is required to complete the slice, set status=blocked and blocker=github_write_auth_required. Preserve exact local branch/patch/evidence and do not redo implementation.
+- If an interactive approval/question is required, do not guess or approve it yourself; leave it blocked with evidence.
+"""
+    return base + contract
+
+def run_prompt(task: dict) -> tuple[int, str]:
+    agent = str(task.get("agent") or "quantlab-hermes")
+    timeout_seconds = int(task.get("timeout_seconds") or 1800)
+    prompt = prompt_text(task)
+    cmd = [
+        str(HERDR), "agent", "prompt", agent, prompt,
+        "--wait", "--timeout", str(timeout_seconds * 1000),
+    ]
+    proc = subprocess.run(
+        cmd,
+        text=True,
+        capture_output=True,
+        timeout=timeout_seconds + 30,
+        env=ENV,
+    )
+    output = (proc.stdout or "") + (proc.stderr or "")
+    return proc.returncode, output
+
+def retry(task_path: Path, task: dict, reason: str) -> None:
+    attempts = int(task.get("attempts") or 0) + 1
+    task["attempts"] = attempts
+    task["last_error"] = reason[-2000:]
+    max_attempts = int(task.get("max_attempts") or 4)
+    if attempts >= max_attempts:
+        task["failed_at"] = utcnow().isoformat()
+        write_json(task_path, task)
+        move(task_path, FAILED)
+        return
+    delay = min(900, 60 * (2 ** max(0, attempts - 1)))
+    task["not_before"] = (utcnow() + timedelta(seconds=delay)).isoformat()
+    write_json(task_path, task)
+    move(task_path, PENDING)
+
+def block_task(task_path: Path, task: dict, blocker: str, summary: str) -> None:
+    task_id = str(task["id"])
+    rp = result_path(task_id)
+    if not rp.exists():
+        write_json(
+            rp,
+            {
+                "task_id": task_id,
+                "run_token": str(task.get("run_token") or ""),
+                "status": "blocked",
+                "summary": summary,
+                "issue": task.get("issue"),
+                "evidence": [str(task.get("last_error") or summary)],
+                "blocker": blocker,
+                "next_action": "Resolve the documented blocker, then requeue the same durable task without duplicating implementation.",
+                "completed_at": utcnow().isoformat(),
+            },
+        )
+    task["last_error"] = summary[-2000:]
+    task["result_status"] = "blocked"
+    task["finished_at"] = utcnow().isoformat()
+    write_json(task_path, task)
+    move(task_path, BLOCKED)
+
+def finish(task_path: Path, task: dict, output: str) -> None:
+    task_id = str(task["id"])
+    rp = result_path(task_id)
+    if not rp.exists():
+        retry(task_path, task, "agent settled without required result JSON")
+        return
+    try:
+        result = json.loads(rp.read_text(encoding="utf-8"))
+    except Exception as exc:
+        retry(task_path, task, f"invalid result JSON: {exc}")
+        return
+
+    if str(result.get("task_id") or "") != task_id:
+        retry(task_path, task, "result task_id does not match durable task")
+        return
+    if str(result.get("run_token") or "") != str(task.get("run_token") or ""):
+        retry(task_path, task, "result run_token does not match current attempt")
+        return
+
+    status = str(result.get("status") or "")
+    blocker = str(result.get("blocker") or "").strip()
+    task["agent_output_tail"] = output[-4000:]
+    task["result_status"] = status
+    task["finished_at"] = utcnow().isoformat()
+    write_json(task_path, task)
+
+    if blocker and blocker.lower() not in {"none", "null"}:
+        move(task_path, BLOCKED)
+    elif status == "completed":
+        move(task_path, DONE)
+    elif status == "blocked":
+        move(task_path, BLOCKED)
+    else:
+        retry(task_path, task, blocker or "agent reported failed")
+
+def main(task_path: Path) -> int:
+    lock_fd = os.open(LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        import fcntl
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+
+        task = json.loads(task_path.read_text(encoding="utf-8"))
+        task_id = str(task["id"])
+        attempt = int(task.get("attempts") or 0)
+        archive_previous_result(task_id, attempt)
+        task["run_token"] = uuid.uuid4().hex
+        task["attempt_started_at"] = utcnow().isoformat()
+        write_json(task_path, task)
+        log(task_id, f"start attempt={attempt} run_token={task['run_token']}")
+
+        try:
+            rc, output = run_prompt(task)
+        except subprocess.TimeoutExpired as exc:
+            retry(task_path, task, f"dispatcher timeout: {exc}")
+            return 1
+
+        log(task_id, f"herdr rc={rc} tail={output[-500:]!r}")
+        lowered = output.lower()
+
+        if "agent_blocked" in lowered or "requires interactive input" in lowered:
+            task["last_error"] = output[-2000:]
+            block_task(
+                task_path,
+                task,
+                "agent_interactive_input_required",
+                "quantlab-hermes is waiting at an interactive approval/question UI",
+            )
+            return 0
+
+        provider_retry = any(
+            marker in lowered
+            for marker in (
+                "usage limit",
+                "rate limit",
+                "http 429",
+                "too many requests",
+                "provider unavailable",
+                "agent_prompt_stalled",
+            )
+        )
+        if provider_retry:
+            retry(task_path, task, output or f"herdr rc={rc}")
+            return 1
+
+        if rc != 0:
+            retry(task_path, task, output or f"herdr rc={rc}")
+            return 1
+
+        finish(task_path, task, output)
+        return 0
+    finally:
+        os.close(lock_fd)
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: agent-task-worker TASK_JSON")
+    raise SystemExit(main(Path(sys.argv[1])))

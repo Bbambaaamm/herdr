@@ -1,0 +1,515 @@
+{
+  "format": 1,
+  "files": [
+    {
+      "path": "PROVENANCE.txt",
+      "size": 478,
+      "sha256": "e41995ac4c0324c9e7d6ab7a1a79ff506bb34fbc3d7d760c76df48af96b6822c"
+    },
+    {
+      "path": "deployed-release/agent_platform_dashboard/README.md",
+      "size": 2593,
+      "sha256": "7c52e4b9a86584cc0431c2577e49c2cf973225919f590320ff7e453d56385250"
+    },
+    {
+      "path": "deployed-release/agent_platform_dashboard/__init__.py",
+      "size": 76,
+      "sha256": "a8d44590bb74ea4b4fa96e3478bcc61cdfb9d8063ec3d44297797d37bb91719b"
+    },
+    {
+      "path": "deployed-release/agent_platform_dashboard/app.py",
+      "size": 4587,
+      "sha256": "cba33bbe00c8287da229c1f609d0a1d026edfa21902426b6be42b4695eb96d12"
+    },
+    {
+      "path": "deployed-release/agent_platform_dashboard/contracts.py",
+      "size": 5003,
+      "sha256": "e498728b45123b9f960b997ec76fa7f8622cc42dd2ffc72c31e123fce0875839"
+    },
+    {
+      "path": "deployed-release/agent_platform_dashboard/demo.py",
+      "size": 730,
+      "sha256": "cc6d394a27cf789af4758fe3d8beb01c2ac4fc155a26b3fe4b059f40e0ac18af"
+    },
+    {
+      "path": "deployed-release/agent_platform_dashboard/fixtures.py",
+      "size": 1458,
+      "sha256": "15a902e47b4301df214a3afd4d153d187435517192385a2a13321b05fc79e8ea"
+    },
+    {
+      "path": "deployed-release/agent_platform_dashboard/frontend.py",
+      "size": 4524,
+      "sha256": "816530fc5b6501fc1116f90ca6823b5ca015eb0203fd1271e727605735fee159"
+    },
+    {
+      "path": "deployed-release/agent_platform_dashboard/production_auth.py",
+      "size": 1272,
+      "sha256": "31ae85b8e901c832a76257a91e378e486fd92370ac9e6fb98593ffc80646e164"
+    },
+    {
+      "path": "deployed-release/agent_platform_dashboard/production_contract.py",
+      "size": 5894,
+      "sha256": "0746ed98b7273009be6e149c0649b78bb05207987c4e96b4d11b7d5aa12e64db"
+    },
+    {
+      "path": "deployed-release/agent_platform_dashboard/production_credentials.py",
+      "size": 4184,
+      "sha256": "9fb7191f12fb4edc9bf991397f30f6a1b85d8522852bf9398f9f21fb241186e1"
+    },
+    {
+      "path": "deployed-release/agent_platform_dashboard/production_export.py",
+      "size": 3610,
+      "sha256": "4a660e83868b1ca33c76183762c5f1ad8286eebf4f92a9b300efa12df9c76d4b"
+    },
+    {
+      "path": "deployed-release/agent_platform_dashboard/production_herdr.py",
+      "size": 2962,
+      "sha256": "b70a4d082381b2ca0efa4b85ede134c263daa1afd91983e585eb83804a9219b4"
+    },
+    {
+      "path": "deployed-release/agent_platform_dashboard/production_io.py",
+      "size": 3225,
+      "sha256": "f4a85fb3629162a8445e8a6e22b9ebc78e07ec5f6cae83072737c473652cab7a"
+    },
+    {
+      "path": "deployed-release/agent_platform_dashboard/production_sources.py",
+      "size": 10883,
+      "sha256": "ff34f6d6ff08907605a5f72218bb7d732fe398e3a2dc6a34ab959e1c068f8cd1"
+    },
+    {
+      "path": "deployed-release/agent_platform_dashboard/production_web.py",
+      "size": 6615,
+      "sha256": "df7ae932f378320f95dba5b397a2f0f031f05cec64c37d792e6c9cfcd45588f7"
+    },
+    {
+      "path": "deployed-release/agent_platform_dashboard/static/machine-city-background.webp",
+      "size": 281968,
+      "sha256": "5cf2036baeb462aae5fcfbccd7fd164751b0c7d0fd33aea72ddc245ceb25c8c3"
+    },
+    {
+      "path": "deployed-release/agent_platform_dashboard/static/machine-city-source.js",
+      "size": 34421,
+      "sha256": "7927a7effde6e51e743de0971ca2a1da45ec5fc45ebe8247a8d52b2adffb3e95"
+    },
+    {
+      "path": "deployed-release/agent_platform_dashboard/static/machine-city.css",
+      "size": 16660,
+      "sha256": "91e6d94c492bf96efe4caed237afdd96ba4b1aa4990652887e058c646299ac31"
+    },
+    {
+      "path": "deployed-release/agent_platform_dashboard/static/machine-city.html",
+      "size": 7137,
+      "sha256": "14e976e0232da1b1bfc1342a7507efb53f8645bf81019ee36f1e417949e8d416"
+    },
+    {
+      "path": "deployed-release/agent_platform_dashboard/static/machine-city.js",
+      "size": 588611,
+      "sha256": "efe2ac8000708408dffd542ae53b6216027d94468051b7921ee9f9638a5202e5"
+    },
+    {
+      "path": "deployed-release/deploy/agent_platform/production/RUNBOOK.md",
+      "size": 20087,
+      "sha256": "39cfe21e0c1edb303920d0ac27826ac708821399b657fd43e6eb6a2240782aae"
+    },
+    {
+      "path": "deployed-release/deploy/agent_platform/production/agent-platform-export.service.in",
+      "size": 1143,
+      "sha256": "4b340de10c9cf44c43197cc6e0cdd7039ad07bfe511a9a35ce11ceb085998d40"
+    },
+    {
+      "path": "deployed-release/deploy/agent_platform/production/agent-platform-export.timer.in",
+      "size": 188,
+      "sha256": "e568c8d2a5fb27f9e968868952d296191e3be30962c0dba1fc415c35c994cf04"
+    },
+    {
+      "path": "deployed-release/deploy/agent_platform/production/agent-platform-herdr.service.in",
+      "size": 811,
+      "sha256": "66a4af1d31d314c137f37f1b0612c7d2598401d3a2affc71802c68e4c456239d"
+    },
+    {
+      "path": "deployed-release/deploy/agent_platform/production/agent-platform-herdr.timer.in",
+      "size": 181,
+      "sha256": "875c7512d5504a0f10cd2b975cffc5ff8116529cc8d147d37c5fee8c83cf8e28"
+    },
+    {
+      "path": "deployed-release/deploy/agent_platform/production/agent-platform-web.service.in",
+      "size": 1156,
+      "sha256": "dd9f29c29cbe45988c47973d2636c5b3707400f9cc22ef739e0aafc975334d1d"
+    },
+    {
+      "path": "deployed-release/deploy/agent_platform/production/herdr.example.json",
+      "size": 96,
+      "sha256": "aa5723b77707c6da08a3151c84bbf7ff7651a16e0d52de1f7f590a8901d90653"
+    },
+    {
+      "path": "deployed-release/deploy/agent_platform/production/launch.py",
+      "size": 804,
+      "sha256": "dd8628206ca09d541ec6ecd3b7cd7f1c8b579da6ce0b0a7e2c4a26234f01d6ef"
+    },
+    {
+      "path": "deployed-release/deploy/agent_platform/production/nginx-http.conf.in",
+      "size": 148,
+      "sha256": "50ee68b69093cd94ce260583d8dfb96424ddc526263f54f27642c1d2a3db45cd"
+    },
+    {
+      "path": "deployed-release/deploy/agent_platform/production/nginx-location-common.conf.in",
+      "size": 1422,
+      "sha256": "257bb38ccaa241e0c3a2e80ffacd87e32807d114025ff2c42424ed1f4a4acf38"
+    },
+    {
+      "path": "deployed-release/deploy/agent_platform/production/nginx-server.conf.in",
+      "size": 956,
+      "sha256": "e1bdc5089c85e9b954812c51a30a88816667310b9fe04662210e9a80346848a9"
+    },
+    {
+      "path": "deployed-release/deploy/agent_platform/production/sources.example.json",
+      "size": 315,
+      "sha256": "c2cda0b58f88062a07766080a101155b91257061e17d27e1916e5aea0f9af1eb"
+    },
+    {
+      "path": "deployed-release/deploy/agent_platform/production/web.example.json",
+      "size": 116,
+      "sha256": "70e6020117a548c011535af372d76f9ee9376ad7f92d95bffecec71d6762283c"
+    },
+    {
+      "path": "runtime/HERDR_DEPENDENCY.txt",
+      "size": 279,
+      "sha256": "4712336fc8ac6254fbd9605d4805bf9ad075edcca1744ee27a9efca6e2252ddd"
+    },
+    {
+      "path": "runtime/systemd/agent-platform-export.service",
+      "size": 1143,
+      "sha256": "4b340de10c9cf44c43197cc6e0cdd7039ad07bfe511a9a35ce11ceb085998d40"
+    },
+    {
+      "path": "runtime/systemd/agent-platform-export.timer",
+      "size": 188,
+      "sha256": "e568c8d2a5fb27f9e968868952d296191e3be30962c0dba1fc415c35c994cf04"
+    },
+    {
+      "path": "runtime/systemd/agent-platform-herdr.service",
+      "size": 811,
+      "sha256": "66a4af1d31d314c137f37f1b0612c7d2598401d3a2affc71802c68e4c456239d"
+    },
+    {
+      "path": "runtime/systemd/agent-platform-herdr.timer",
+      "size": 181,
+      "sha256": "875c7512d5504a0f10cd2b975cffc5ff8116529cc8d147d37c5fee8c83cf8e28"
+    },
+    {
+      "path": "runtime/systemd/agent-platform-web.service",
+      "size": 1156,
+      "sha256": "dd9f29c29cbe45988c47973d2636c5b3707400f9cc22ef739e0aafc975334d1d"
+    },
+    {
+      "path": "runtime/systemd/agent-stack-watchdog.service",
+      "size": 734,
+      "sha256": "685b706531089901d002a403534fef8091844e60fbea21608472cc9e99c682c4"
+    },
+    {
+      "path": "runtime/systemd/hermes-maintenance.service",
+      "size": 368,
+      "sha256": "7e1b74cb0fb9d6d615cf19d9baf70fce0b97942195330edf8a1d9d59f13f2b49"
+    },
+    {
+      "path": "runtime/systemd/hermes-maintenance.timer",
+      "size": 190,
+      "sha256": "bcd1182343126046b329c682c3fbb7868bc39168b9a30b145495e39822a6bb11"
+    },
+    {
+      "path": "runtime/bin/agent-github-intake",
+      "size": 9281,
+      "sha256": "ca7dbb8bcbfbdfc37bc38f21f0c06c46a0527243e0c26942ff5320e9a70e2ecf"
+    },
+    {
+      "path": "runtime/bin/agent-stack-ensure",
+      "size": 7936,
+      "sha256": "ec0e9c1115d030323334baba725dd67a8d297f1307464a8a5f695884a3e7b60e"
+    },
+    {
+      "path": "runtime/bin/agent-stack-watchdog",
+      "size": 543,
+      "sha256": "2b9672bba38807916fe1e6eff7b51358c7b202278ec83dcae27abecf1a9ec7ca"
+    },
+    {
+      "path": "runtime/bin/agent-task-dispatcher",
+      "size": 3996,
+      "sha256": "9cd924d33d98482665bc53412fd9fe4d3c426f5680f359976d7cf0594edbea5e"
+    },
+    {
+      "path": "runtime/bin/agent-task-worker",
+      "size": 8643,
+      "sha256": "241b27d82e0eed047ac4b4c0812a05d96a544f05535fac98ced0b43848723444"
+    },
+    {
+      "path": "development-source/PHASE7_DASHBOARD_DESIGN.md",
+      "size": 4259,
+      "sha256": "d544c3a3d1c5c00da4cc5be149ed1ef3c2764aa022751772987710a3133ae2da"
+    },
+    {
+      "path": "development-source/PHASE7_DASHBOARD_REPORT.md",
+      "size": 8107,
+      "sha256": "ac40779967e5ea09427d536bb5b75fc9c2ef404237f60462757d420a1e8af723"
+    },
+    {
+      "path": "development-source/PHASE8_DEPLOYMENT_BUNDLE_REPORT.md",
+      "size": 9045,
+      "sha256": "ee744d28a1f73921bebc7d704f10203dde172cd0c73fad8fef0839c1144cadef"
+    },
+    {
+      "path": "development-source/PHASE9_DESIGN.md",
+      "size": 3505,
+      "sha256": "90773fbf9bba07eb98fe55edd7dfad480e677194b5994446a663cad49d67c623"
+    },
+    {
+      "path": "development-source/PHASE9_PRODUCTION_READINESS_REPORT.md",
+      "size": 13449,
+      "sha256": "0d50e856f373451e709ccd5c0316e23535b34b5846ca420ca95130590ed7aaf2"
+    },
+    {
+      "path": "development-source/tests/agent_platform_dashboard/test_app.py",
+      "size": 7833,
+      "sha256": "ed76daa8aab0487f79219d92249ea950bba1f35d05e20d0bbd1fd8e0cb0422c5"
+    },
+    {
+      "path": "development-source/tests/agent_platform_dashboard/test_contracts.py",
+      "size": 4271,
+      "sha256": "0534248e36bfa9e5ab6933134b96703fd5493190dc45cfae250aafa6e382091a"
+    },
+    {
+      "path": "development-source/tests/agent_platform_dashboard/test_production.py",
+      "size": 28979,
+      "sha256": "4cadef5741faa5b9469eac0bb3d4e1300aeeb2d19f9e6ad2e5b242d4b8caa694"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/README.md",
+      "size": 2593,
+      "sha256": "7c52e4b9a86584cc0431c2577e49c2cf973225919f590320ff7e453d56385250"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/__init__.py",
+      "size": 76,
+      "sha256": "a8d44590bb74ea4b4fa96e3478bcc61cdfb9d8063ec3d44297797d37bb91719b"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/app.py",
+      "size": 4587,
+      "sha256": "cba33bbe00c8287da229c1f609d0a1d026edfa21902426b6be42b4695eb96d12"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/contracts.py",
+      "size": 5003,
+      "sha256": "e498728b45123b9f960b997ec76fa7f8622cc42dd2ffc72c31e123fce0875839"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/demo.py",
+      "size": 730,
+      "sha256": "cc6d394a27cf789af4758fe3d8beb01c2ac4fc155a26b3fe4b059f40e0ac18af"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/fixtures.py",
+      "size": 1458,
+      "sha256": "15a902e47b4301df214a3afd4d153d187435517192385a2a13321b05fc79e8ea"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/frontend.py",
+      "size": 4524,
+      "sha256": "816530fc5b6501fc1116f90ca6823b5ca015eb0203fd1271e727605735fee159"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/production_auth.py",
+      "size": 1272,
+      "sha256": "31ae85b8e901c832a76257a91e378e486fd92370ac9e6fb98593ffc80646e164"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/production_contract.py",
+      "size": 9927,
+      "sha256": "f4f9380972b6301e23abcaae804acde761338e91a503545590b806876161adee"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/production_credentials.py",
+      "size": 4184,
+      "sha256": "9fb7191f12fb4edc9bf991397f30f6a1b85d8522852bf9398f9f21fb241186e1"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/production_export.py",
+      "size": 4395,
+      "sha256": "d430640c2695b5c7eb247fe8aadd46a5370c8686f8d061d27456f65fab901b7b"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/production_herdr.py",
+      "size": 2962,
+      "sha256": "b70a4d082381b2ca0efa4b85ede134c263daa1afd91983e585eb83804a9219b4"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/production_io.py",
+      "size": 3225,
+      "sha256": "f4a85fb3629162a8445e8a6e22b9ebc78e07ec5f6cae83072737c473652cab7a"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/production_sources.py",
+      "size": 15075,
+      "sha256": "54d30755c3b34f20cda2711be06e20f3976112a1fde28617be4feb906f060a67"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/production_web.py",
+      "size": 6615,
+      "sha256": "df7ae932f378320f95dba5b397a2f0f031f05cec64c37d792e6c9cfcd45588f7"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/static/MACHINE_CITY_3D_REVIEW.md",
+      "size": 3977,
+      "sha256": "c65c57cf3951ef528fe12cd22ea803da8db9705da118ec11f7eae1eb4de4e8bf"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/static/THIRD_PARTY_FACE.md",
+      "size": 1108,
+      "sha256": "cdd37f3a0815852be790d21e53db8ffc6b2a418b0942701fb69a0ac39c35c4f4"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/static/dashboard-ui.js",
+      "size": 50147,
+      "sha256": "5d54c14f36733f4d4aa1bb6e3ef96fdd8cd8839c119557e324980244c467c858"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/static/dashboard-ui.test.js",
+      "size": 21194,
+      "sha256": "38d9f2ab44f9c3807acbf981869e18aa29759c3c92f6eda47a00fae25bd6d270"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/static/face-anatomy-LICENSE.txt",
+      "size": 12331,
+      "sha256": "8707eef0533987efc5b155d64761eeb6e20793f50b9bd1a68dad1cf4719d0ed8"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/static/face-anatomy.js",
+      "size": 23056,
+      "sha256": "f813fdb6df2133d29d21209f3fd0cc9d73aa9955bca97aee3522cd4ebc2d3658"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/static/machine-city-background.webp",
+      "size": 281968,
+      "sha256": "5cf2036baeb462aae5fcfbccd7fd164751b0c7d0fd33aea72ddc245ceb25c8c3"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/static/machine-city-source.js",
+      "size": 344,
+      "sha256": "8bf3b470047b8a8a6cdc9d5a2acf299ec854fcab6f4cb4acfb9b5758b90a553f"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/static/machine-city.css",
+      "size": 21084,
+      "sha256": "5acf1e84d4be3affc47e350b2ec14851c5ae7f2a43a90dedaa17ff18e32329be"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/static/machine-city.html",
+      "size": 7659,
+      "sha256": "1585fd9d6ff244595654053f9f140ab7fecb4155589b11face238c8d72687b52"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/static/machine-city.js",
+      "size": 600362,
+      "sha256": "c41d4be417508366b4bbc7cf9c676e45d1183b56dc7f5c37336700fc5254489e"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/static/machine-core.js",
+      "size": 9686,
+      "sha256": "bbb9b175910f93e31d26aa5fd4b9ab7747d04a433727435febea5a698e0b66ff"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/static/machine-core.test.js",
+      "size": 2835,
+      "sha256": "457e58fb28e8386053e43f31dc487e62d5f431b65d255fa795cf4b2e62f3c9ac"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/static/machine-entities.js",
+      "size": 20033,
+      "sha256": "bcd5ab0a83a92e5ba12171673752e168a3520f7737ed9e6ac404cfca767f6c74"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/static/machine-entities.test.js",
+      "size": 9115,
+      "sha256": "39f096522baf51e1aa52d7b5b461fe040c701c6c8020a9ddb13be78aaf33f23b"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/static/machine-head.js",
+      "size": 27480,
+      "sha256": "8236ab366110b7bb1346d23f6716403af7bee100396e4ea04933360d17ceddc0"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/static/machine-head.test.js",
+      "size": 5497,
+      "sha256": "fa245c4a362d415d3ac7b93a2d16f0d9ef7156d8d883ab0e55ae55e2e9dd2fee"
+    },
+    {
+      "path": "development-source/agent_platform_dashboard/static/machine-scene.js",
+      "size": 13400,
+      "sha256": "74bdcb131633c229a4759669591945f1d3d7deb1a968b1587122aaecf2a2c52f"
+    },
+    {
+      "path": "development-source/deploy/agent_platform/production/RUNBOOK.md",
+      "size": 21118,
+      "sha256": "da26500ebcaaa81aedd935a65bf0d1c7d90e1ab08f56f2bc5b31728894d9dd26"
+    },
+    {
+      "path": "development-source/deploy/agent_platform/production/agent-platform-export.service.in",
+      "size": 1143,
+      "sha256": "4b340de10c9cf44c43197cc6e0cdd7039ad07bfe511a9a35ce11ceb085998d40"
+    },
+    {
+      "path": "development-source/deploy/agent_platform/production/agent-platform-export.timer.in",
+      "size": 188,
+      "sha256": "e568c8d2a5fb27f9e968868952d296191e3be30962c0dba1fc415c35c994cf04"
+    },
+    {
+      "path": "development-source/deploy/agent_platform/production/agent-platform-herdr.service.in",
+      "size": 811,
+      "sha256": "66a4af1d31d314c137f37f1b0612c7d2598401d3a2affc71802c68e4c456239d"
+    },
+    {
+      "path": "development-source/deploy/agent_platform/production/agent-platform-herdr.timer.in",
+      "size": 181,
+      "sha256": "875c7512d5504a0f10cd2b975cffc5ff8116529cc8d147d37c5fee8c83cf8e28"
+    },
+    {
+      "path": "development-source/deploy/agent_platform/production/agent-platform-web.service.in",
+      "size": 1156,
+      "sha256": "dd9f29c29cbe45988c47973d2636c5b3707400f9cc22ef739e0aafc975334d1d"
+    },
+    {
+      "path": "development-source/deploy/agent_platform/production/herdr.example.json",
+      "size": 96,
+      "sha256": "aa5723b77707c6da08a3151c84bbf7ff7651a16e0d52de1f7f590a8901d90653"
+    },
+    {
+      "path": "development-source/deploy/agent_platform/production/launch.py",
+      "size": 804,
+      "sha256": "dd8628206ca09d541ec6ecd3b7cd7f1c8b579da6ce0b0a7e2c4a26234f01d6ef"
+    },
+    {
+      "path": "development-source/deploy/agent_platform/production/nginx-http.conf.in",
+      "size": 148,
+      "sha256": "50ee68b69093cd94ce260583d8dfb96424ddc526263f54f27642c1d2a3db45cd"
+    },
+    {
+      "path": "development-source/deploy/agent_platform/production/nginx-location-common.conf.in",
+      "size": 1422,
+      "sha256": "257bb38ccaa241e0c3a2e80ffacd87e32807d114025ff2c42424ed1f4a4acf38"
+    },
+    {
+      "path": "development-source/deploy/agent_platform/production/nginx-server.conf.in",
+      "size": 956,
+      "sha256": "e1bdc5089c85e9b954812c51a30a88816667310b9fe04662210e9a80346848a9"
+    },
+    {
+      "path": "development-source/deploy/agent_platform/production/sources.example.json",
+      "size": 404,
+      "sha256": "4ff62f543bc7907af93cdcc0b69659e69e9fd0258a99333d164e1162d928fbad"
+    },
+    {
+      "path": "development-source/deploy/agent_platform/production/web.example.json",
+      "size": 116,
+      "sha256": "70e6020117a548c011535af372d76f9ee9376ad7f92d95bffecec71d6762283c"
+    }
+  ]
+}

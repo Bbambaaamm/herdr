@@ -1,0 +1,12 @@
+schema_version: 1
+consumer: quantlab
+repository: Bbambaaamm/Autonomous-Quant-Lab
+policy_profile: quantlab-paper
+hard_invariants:
+  - paper_only
+  - no_live_broker_authority
+inheritance:
+  child_may_expand_parent_permissions: false
+routing:
+  capability_aware: true
+  cost_aware: true

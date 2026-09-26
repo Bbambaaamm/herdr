@@ -1,0 +1,12 @@
+schema_version: 1
+consumer: heating
+repository: Bbambaaamm/heating
+policy_profile: heating-safe-engineering
+hard_invariants:
+  - repository_changes_do_not_imply_runtime_actuation
+  - safety_relevant_production_changes_require_explicit_project_gate
+inheritance:
+  child_may_expand_parent_permissions: false
+routing:
+  capability_aware: true
+  cost_aware: true

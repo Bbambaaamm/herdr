@@ -1,0 +1,9 @@
+[Unit]
+Description=Agent Platform Herdr status refresh
+[Timer]
+OnBootSec=10s
+OnUnitInactiveSec=30s
+AccuracySec=1s
+Unit=agent-platform-herdr.service
+[Install]
+WantedBy=timers.target

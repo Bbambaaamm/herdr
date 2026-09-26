@@ -1,0 +1,6 @@
+herdr 0.9.1
+home=https://herdr.dev
+binary_sha256=2a02fed16beb651ef006e1d43f048f652ca4dc58ad053cd2d44450563d5c54b7
+binary_size=26207464
+binary_path=/home/agentops/.local/bin/herdr
+note=External binary dependency is pinned by version/hash and intentionally not vendored as source.

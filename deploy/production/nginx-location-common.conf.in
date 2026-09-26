@@ -1,0 +1,37 @@
+# Included inside the two reserved locations only.
+auth_basic "Agent Platform";
+auth_basic_user_file /etc/agent-platform/credentials/htpasswd;
+satisfy all;
+limit_except GET { deny all; }
+limit_req zone=agent_platform_rate burst=5 nodelay;
+limit_req_status 429;
+access_log off;
+error_log /dev/null crit;
+server_tokens off;
+client_max_body_size 1k;
+client_body_timeout 5s;
+recursive_error_pages off;
+error_page 401 =401 @agent_platform_auth_required;
+error_page 400 403 404 405 413 429 500 502 503 504 =503 @agent_platform_failed;
+add_header Cache-Control "no-store" always;
+add_header X-Content-Type-Options "nosniff" always;
+add_header X-Frame-Options "DENY" always;
+add_header Referrer-Policy "no-referrer" always;
+add_header Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'" always;
+proxy_pass http://127.0.0.1:3010;
+proxy_http_version 1.1;
+proxy_pass_request_headers off;
+proxy_pass_request_body off;
+proxy_set_header Host 127.0.0.1:3010;
+proxy_set_header Authorization $http_authorization;
+proxy_set_header Content-Length "";
+proxy_set_header Connection "close";
+proxy_intercept_errors on;
+proxy_next_upstream off;
+proxy_cache off;
+proxy_buffering off;
+proxy_request_buffering off;
+proxy_max_temp_file_size 0;
+proxy_connect_timeout 2s;
+proxy_read_timeout 10s;
+proxy_send_timeout 5s;

@@ -1,0 +1,26 @@
+[Unit]
+Description=Agent Platform one-shot sanitized Herdr status bridge
+[Service]
+Type=oneshot
+User=agentops
+Group=agent-platform-read
+WorkingDirectory=/opt/agent-platform/release
+ExecStart=/usr/bin/python3 -I -B /opt/agent-platform/release/deploy/agent_platform/production/launch.py herdr --config /etc/agent-platform/herdr.json
+Restart=no
+TimeoutStartSec=8
+UMask=0027
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=tmpfs
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+ReadWritePaths=/var/lib/agent-platform-herdr
+InaccessiblePaths=-/etc/agent-platform/credentials -/var/lib/agent-platform
+# Explicit binary/socket bind mapping and pane/profile registry required from admin.
+MemoryMax=128M
+TasksMax=8
+StandardOutput=null
+StandardError=journal

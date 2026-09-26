@@ -1,0 +1,27 @@
+# Include once in the explicitly confirmed existing HTTPS server only.
+# QuantLab location / and upstream 127.0.0.1:3000 remain byte-for-byte unchanged.
+location = /agent-platform {
+    include /etc/agent-platform/nginx-location-common.conf;
+}
+location ^~ /agent-platform/ {
+    include /etc/agent-platform/nginx-location-common.conf;
+}
+location @agent_platform_auth_required {
+    internal;
+    access_log off;
+    error_log /dev/null crit;
+    recursive_error_pages off;
+    default_type application/json;
+    add_header WWW-Authenticate 'Basic realm="Agent Platform", charset="UTF-8"' always;
+    add_header Cache-Control "no-store" always;
+    return 401 '{"error":"authentication_required"}';
+}
+location @agent_platform_failed {
+    internal;
+    access_log off;
+    error_log /dev/null crit;
+    recursive_error_pages off;
+    default_type application/json;
+    add_header Cache-Control "no-store" always;
+    return 503 '{"error":"unavailable"}';
+}

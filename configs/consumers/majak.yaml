@@ -1,0 +1,12 @@
+schema_version: 1
+consumer: majak
+repository: Bbambaaamm/dotacni-majak
+policy_profile: grant-research
+hard_invariants:
+  - preserve_source_lineage
+  - no_unverified_eligibility_claim_as_fact
+inheritance:
+  child_may_expand_parent_permissions: false
+routing:
+  capability_aware: true
+  cost_aware: true

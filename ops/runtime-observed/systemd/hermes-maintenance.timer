@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly check for due Hermes maintenance
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=5m
+Unit=hermes-maintenance.service
+
+[Install]
+WantedBy=timers.target
