@@ -1,18 +1,3 @@
-"""Acceptance tests for Herdr v1.1 TaskGraph schema + deterministic planner
-contract (issue #230).
-
-Maps 1:1 to the issue acceptance criteria:
-  [ ] same planner output → same graph hash
-  [ ] invalid DAG fail-closed
-  [ ] restart recovery from durable storage
-  [ ] child node cannot exceed parent policy
-  [ ] task payload contains no secrets
-  [ ] unit + persistence + malformed-input tests
-  [ ] deterministic graph hash (deterministic, repeatable)
-
-Bounded isolated provider- and consumer-neutral orchestration slice.
-"""
-
 from __future__ import annotations
 
 import json
@@ -20,453 +5,272 @@ import json
 import pytest
 
 from herdr.taskgraph import (
-    DEFAULT_MAX_DEPTH,
-    DEFAULT_MAX_FANOUT,
-    DEFAULT_MAX_NODES,
+    GRAPH_VERSION,
     GraphValidationError,
     LifecycleState,
+    NodeRuntimeState,
     PersistentTaskGraph,
     TaskGraph,
     TaskGraphEnvelope,
-    TaskNode,
 )
 
 
-# ---------------------------------------------------------------------------
-# Fixtures / helpers
-# ---------------------------------------------------------------------------
-def _env(tmp_path, spec="spec-v1.0") -> TaskGraphEnvelope:
-    return TaskGraphEnvelope(
-        issue="230",
-        spec_hash="sha256:" + "a" * 64,
-        graph_version="1.1.0",
-        created_at="2026-09-26T14:19:07Z",
-        planner="herdr-planner@1.1.0",
-        max_nodes=DEFAULT_MAX_NODES,
-        max_depth=DEFAULT_MAX_DEPTH,
-        max_fanout=DEFAULT_MAX_FANOUT,
-        policy_profile="default",
-    )
-
-
-def _root_node() -> dict:
-    return {
-        "id": "root",
-        "parent_id": None,
-        "type": "task",
-        "role": "planner",
-        "objective": "Plan alpha research",
-        "inputs": [{"universe": "SPY"}],
-        "expected_outputs": [{"plan": "graph"}],
-        "dependencies": [],
-        "priority": 1,
-        "resource_class": "small",
-        "model_policy": {"model": "gpt-4o-mini"},
-        "tools": ["search", "compute", "review"],
-        "permissions": ["read_data", "write_artifacts"],
+def envelope(**overrides):
+    data = {
+        "issue": "Bbambaaamm/herdr#2",
+        "spec_hash": "sha256:" + "a" * 64,
+        "graph_version": GRAPH_VERSION,
+        "created_at": "2026-09-27T00:00:00+00:00",
+        "planner": "herdr-planner@1.1.0",
+        "max_nodes": 256,
+        "max_depth": 16,
+        "max_fanout": 16,
+        "policy_profile": "quantlab-paper",
     }
+    data.update(overrides)
+    return TaskGraphEnvelope.from_dict(data)
 
 
-def _child_node(parent_id: str = "root", **overrides) -> dict:
-    base = {
-        "id": "child",
+def node(node_id="root", parent_id=None, **overrides):
+    data = {
+        "id": node_id,
         "parent_id": parent_id,
         "type": "task",
-        "role": "worker",
-        "objective": "Execute research step",
-        "inputs": [{"step": 1}],
-        "expected_outputs": [{"result": "data"}],
-        "dependencies": [parent_id],
+        "role": "planner" if parent_id is None else "worker",
+        "objective": f"objective {node_id}",
+        "inputs": [{"artifact_ref": "fixture"}],
+        "expected_outputs": [{"kind": "result"}],
+        "dependencies": [],
         "priority": 1,
         "resource_class": "small",
-        "model_policy": {"model": "gpt-4o-mini"},
-        "tools": ["search"],
-        "permissions": ["read_data"],
+        "model_policy": {"model": "fixture-model"},
+        "tools": ["read", "review"] if parent_id is None else ["read"],
+        "permissions": ["repo:read", "artifact:write"] if parent_id is None else ["repo:read"],
+        "timeout_seconds": 120,
+        "max_attempts": 3,
     }
-    base.update(overrides)
-    return base
+    data.update(overrides)
+    return data
 
 
-# ---------------------------------------------------------------------------
-# Acceptance #1: same planner output → same graph hash (deterministic)
-# ---------------------------------------------------------------------------
-def test_deterministic_graph_hash_same_output_same_hash(tmp_path):
-    """Acceptance #1 + documented hash determinism: identical planner output
-    MUST yield an identical graph hash, across two independent builds."""
-    env = _env(tmp_path)
-    node_dicts = [_root_node(), _child_node()]
-
-    graph_a = TaskGraph.from_planner_output(env, node_dicts)
-    graph_b = TaskGraph.from_planner_output(env, node_dicts)
-
-    assert graph_a.graph_hash() == graph_b.graph_hash()
-    # hash is a stable 64-char hex sha256
-    assert len(graph_a.graph_hash()) == 64
-    assert all(c in "0123456789abcdef" for c in graph_a.graph_hash())
+def graph(nodes=None, env=None):
+    return TaskGraph.from_planner_output(env or envelope(), nodes or [node()])
 
 
-def test_graph_hash_changes_with_topology(tmp_path):
-    """Acceptance #1 (negative): a *different* graph must produce a different
-    hash — proves the hash is structural, not accidental."""
-    env = _env(tmp_path)
-    g_a = TaskGraph.from_planner_output(env, [_root_node(), _child_node()])
-    g_b = TaskGraph.from_planner_output(
-        env, [_root_node(), _child_node(objective="different objective")]
-    )
-    assert g_a.graph_hash() != g_b.graph_hash()
+def test_hash_is_structural_and_order_independent():
+    a = graph([node("root"), node("child", "root", dependencies=["root"])])
+    later = envelope(created_at="2026-09-27T01:00:00+00:00")
+    b = graph([node("child", "root", dependencies=["root"]), node("root")], later)
+    assert a.graph_hash() == b.graph_hash()
 
 
-# ---------------------------------------------------------------------------
-# Acceptance #2: invalid DAG fail-closed
-# ---------------------------------------------------------------------------
-def test_invalid_dag_cycle_fail_closed(tmp_path):
-    """Cycle detection → GraphValidationError (fail-closed)."""
-    env = _env(tmp_path)
-    a = _root_node()
-    b = _child_node(parent_id="a", id="b", dependencies=["a"])
-    a = {**a, "id": "a", "dependencies": ["b"]}
-    with pytest.raises(GraphValidationError, match="cycle"):
-        TaskGraph.from_planner_output(env, [a, b])
+def test_hash_normalizes_set_like_fields():
+    a = graph([node(tools=["read", "review"], permissions=["repo:read", "artifact:write"])])
+    b = graph([node(tools=["review", "read"], permissions=["artifact:write", "repo:read"])])
+    assert a.graph_hash() == b.graph_hash()
 
 
-def test_invalid_dag_unknown_dependency_fail_closed(tmp_path):
-    """Unknown dependency → rejected."""
-    env = _env(tmp_path)
-    root = _root_node()
-    child = _child_node(dependencies=["does-not-exist"])
-    with pytest.raises(GraphValidationError, match="unknown dependency"):
-        TaskGraph.from_planner_output(env, [root, child])
+
+def test_payload_is_deeply_immutable_after_validation():
+    g = graph([node()])
+    before = g.graph_hash()
+    with pytest.raises(TypeError):
+        g.nodes[0].inputs[0]["artifact_ref"] = "changed"
+    with pytest.raises(TypeError):
+        g.nodes[0].model_policy["model"] = "changed"
+    assert g.graph_hash() == before
+
+def test_planner_output_strict_parser():
+    payload = {"envelope": envelope().to_json(), "nodes": [node()]}
+    parsed = TaskGraph.parse_planner_output(payload)
+    assert parsed.envelope.issue == "Bbambaaamm/herdr#2"
+    with pytest.raises(GraphValidationError, match="unknown fields"):
+        TaskGraph.parse_planner_output({**payload, "surprise": True})
+    with pytest.raises(GraphValidationError, match="missing required"):
+        TaskGraph.parse_planner_output({"envelope": payload["envelope"], "nodes": [{"id": "x"}]})
 
 
-def test_invalid_dag_duplicate_node_fail_closed(tmp_path):
-    """Duplicate node id → rejected."""
-    env = _env(tmp_path)
-    root = _root_node()
-    with pytest.raises(GraphValidationError, match="duplicate node id"):
-        TaskGraph.from_planner_output(env, [root, _root_node()])
-
-
-def test_invalid_dag_self_dependency_fail_closed(tmp_path):
-    env = _env(tmp_path)
-    root = {**_root_node(), "dependencies": ["root"]}
-    with pytest.raises(GraphValidationError, match="self-dependency"):
-        TaskGraph.from_planner_output(env, [root])
-
-
-# ---------------------------------------------------------------------------
-# Acceptance #3: restart recovery from durable storage
-# ---------------------------------------------------------------------------
-def test_restart_recovery_reconstructs_state(tmp_path):
-    """Acceptance #3: after persist → crash-simulated-reopen, replay must
-    reconstruct the exact graph (same hash) + current node state."""
-    env = _env(tmp_path)
-    graph = TaskGraph.from_planner_output(env, [_root_node(), _child_node()])
-
-    log = tmp_path / "events.jsonl"
-    store = PersistentTaskGraph(log)
-    store.persist_graph(graph)
-    # simulate state transitions (durable)
-    store.set_node_state("root", LifecycleState.DONE)
-    store.set_node_state("child", LifecycleState.RUNNING)
-
-    # Simulate crash: new store instance reads the same append-only log.
-    store2 = PersistentTaskGraph(log)
-    recovered_graph, recovered_state = store2.replay()
-
-    assert recovered_graph.graph_hash() == graph.graph_hash()
-    assert recovered_state["root"] == LifecycleState.DONE
-    assert recovered_state["child"] == LifecycleState.RUNNING
-    # envelope preserved
-    assert recovered_graph.envelope.spec_hash == env.spec_hash
-    assert recovered_graph.envelope.policy_profile == "default"
-
-
-def test_restart_recovery_durable_cancelled(tmp_path):
-    """Acceptance: cancellation is durable — survives restart."""
-    env = _env(tmp_path)
-    graph = TaskGraph.from_planner_output(env, [_root_node(), _child_node()])
-    log = tmp_path / "events.jsonl"
-    store = PersistentTaskGraph(log)
-    store.persist_graph(graph)
-    store.cancel_node("child", "manual escalation")
-
-    store2 = PersistentTaskGraph(log)
-    _, state = store2.replay()
-    assert state["child"] == LifecycleState.CANCELLED
-
-
-def test_persistent_store_malformed_event_fail_closed(tmp_path):
-    """Malformed input (corrupt event log line) → fail-closed."""
-    log = tmp_path / "events.jsonl"
-    log.write_text("{not valid json}\n", encoding="utf-8")
-    store = PersistentTaskGraph(log)
-    with pytest.raises(GraphValidationError, match="malformed event"):
-        store.replay()
-
-
-# ---------------------------------------------------------------------------
-# Acceptance #4: child node cannot exceed parent policy
-# ---------------------------------------------------------------------------
-def test_child_permission_escalation_fail_closed(tmp_path):
-    """Acceptan #4: child tools/permissions must be a subset of parent's."""
-    env = _env(tmp_path)
-    root = _root_node()  # tools/permissions = parent
-    # child attempts to escalate: extra tool + extra permission
-    child = _child_node(
-        tools=["search", "deploy"],  # 'deploy' not in parent tools
-        permissions=["read_data", "write_live_orders"],  # 'write_live_orders' extra
-    )
-    with pytest.raises(GraphValidationError, match="escalation"):
-        TaskGraph.from_planner_output(env, [root, child])
-
-
-def test_child_subsets_parent_ok(tmp_path):
-    """Positive case: child within parent's allowlist is accepted."""
-    env = _env(tmp_path)
-    root = _root_node()
-    child = _child_node(tools=["search"], permissions=["read_data"])
-    graph = TaskGraph.from_planner_output(env, [root, child])
-    assert len(graph.nodes) == 2
-
-
-# ---------------------------------------------------------------------------
-# Acceptance #5: task payload contains no secrets
-# ---------------------------------------------------------------------------
-def test_task_payload_no_secrets_fail_closed(tmp_path):
-    """Acceptance #5: secret-like keys in payload → rejected (fail-closed)."""
-    env = _env(tmp_path)
-    root = _root_node()
-    bad_node = {
-        **_root_node(),
-        "id": "leaky",
-        "parent_id": "root",
-        "permissions": ["read_data"],
-        "inputs": [{"apikey": "sk-live-..."}],  # secret-like key
-    }
-    with pytest.raises(GraphValidationError, match="secrets detected"):
-        TaskGraph.from_planner_output(env, [root, bad_node])
-
-
-def test_task_payload_secret_scan_method(tmp_path):
-    """Unit test for the secret-scan guard."""
-    node = TaskNode(
-        id="n",
-        parent_id=None,
-        type="task",
-        role="planner",
-        objective="ok",
-        inputs=[{"universe": "SPY"}],
-        expected_outputs=[],
-        dependencies=(),
-        priority=1,
-        resource_class="small",
-        model_policy={"model": "gpt-4o"},
-        tools=("read",),
-        permissions=("read_data",),
-    )
-    assert node.payload_secret_hits() == []
-    # Now mutate into a frozen-dataclass copy with a secret key
-    leaky = TaskNode(
-        id="n",
-        parent_id=None,
-        type="task",
-        role="planner",
-        objective="ok",
-        inputs=[{"secret_token": "x"}],
-        expected_outputs=[],
-        dependencies=(),
-        priority=1,
-        resource_class="small",
-        model_policy={},
-        tools=("read",),
-        permissions=(),
-    )
-    assert leaky.payload_secret_hits()  # non-empty → secret detected
-
-
-# ---------------------------------------------------------------------------
-# Acceptance #6: bounded max nodes/depth/fanout
-# ---------------------------------------------------------------------------
-def test_bounded_max_nodes_rejected(tmp_path):
-    """Planner trying to emit a graph larger than max_nodes → fail-closed."""
-    env = TaskGraphEnvelope(
-        issue="230",
-        spec_hash="s",
-        graph_version="1.1.0",
-        created_at="2026-09-26T00:00:00Z",
-        planner="p",
-        max_nodes=2,
-        max_depth=16,
-        max_fanout=16,
-    )
-    nodes = []
-    for i in range(3):
-        nodes.append(
-            {
-                "id": f"n{i}",
-                "parent_id": None,
-                "type": "task",
-                "role": "planner",
-                "objective": "o",
-                "inputs": [],
-                "expected_outputs": [],
-                "dependencies": [],
-                "priority": 1,
-                "resource_class": "small",
-                "model_policy": {"model": "m"},
-                "tools": ["t"],
-                "permissions": ["p"],
-            }
-        )
+def test_hard_limits_cannot_be_inflated_by_planner():
     with pytest.raises(GraphValidationError, match="max_nodes"):
-        TaskGraph.from_planner_output(env, nodes)
-
-
-def test_bounded_max_depth_rejected(tmp_path):
-    """Depth chain exceeding max_depth → fail-closed."""
-    env = TaskGraphEnvelope(
-        issue="230",
-        spec_hash="s",
-        graph_version="1.1.0",
-        created_at="2026-09-26T00:00:00Z",
-        planner="p",
-        max_nodes=64,
-        max_depth=2,
-        max_fanout=16,
-    )
-    base = {
-        "type": "task",
-        "role": "worker",
-        "objective": "o",
-        "inputs": [],
-        "expected_outputs": [],
-        "dependencies": [],
-        "priority": 1,
-        "resource_class": "small",
-        "model_policy": {"model": "m"},
-        "tools": ["t"],
-        "permissions": ["p"],
-    }
-    nodes = [{**base, "id": "r", "parent_id": None}]
-    nodes.append({**base, "id": "c1", "parent_id": "r"})
-    nodes.append({**base, "id": "c2", "parent_id": "c1"})  # depth 3 > 2
+        envelope(max_nodes=257)
     with pytest.raises(GraphValidationError, match="max_depth"):
-        TaskGraph.from_planner_output(env, nodes)
-
-
-def test_bounded_max_fanout_rejected(tmp_path):
-    """A parent with more children than max_fanout → fail-closed."""
-    env = TaskGraphEnvelope(
-        issue="230",
-        spec_hash="s",
-        graph_version="1.1.0",
-        created_at="2026-09-26T00:00:00Z",
-        planner="p",
-        max_nodes=64,
-        max_depth=16,
-        max_fanout=2,
-    )
-    base = {
-        "type": "task",
-        "role": "worker",
-        "objective": "o",
-        "inputs": [],
-        "expected_outputs": [],
-        "dependencies": [],
-        "priority": 1,
-        "resource_class": "small",
-        "model_policy": {"model": "m"},
-        "tools": ["t"],
-        "permissions": ["p"],
-    }
-    nodes = [{**base, "id": "root", "parent_id": None}]
-    for i in range(3):
-        nodes.append({**base, "id": f"c{i}", "parent_id": "root"})  # 3 > 2
+        envelope(max_depth=17)
     with pytest.raises(GraphValidationError, match="max_fanout"):
-        TaskGraph.from_planner_output(env, nodes)
+        envelope(max_fanout=17)
 
 
-# ---------------------------------------------------------------------------
-# Acceptance #7 (documented JSON schema / typed contract)
-# ---------------------------------------------------------------------------
-def test_graph_hash_is_deterministic_across_process(tmp_path):
-    """Documented contract: the graph hash is a pure function of the
-    canonical (sorted-key) JSON of envelope + nodes.  Verify by re-serializing
-    externally."""
-    env = _env(tmp_path)
-    nodes = [_root_node(), _child_node()]
-    graph = TaskGraph.from_planner_output(env, nodes)
-
-    payload = {
-        "envelope": env.to_canonical_json(),
-        "nodes": [graph._canonical_node_repr(n) for n in graph.nodes],
-    }
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    import hashlib
-
-    expected = hashlib.sha256(canonical.encode()).hexdigest()
-    assert graph.graph_hash() == expected
+def test_unknown_parent_fails_closed_and_cannot_bypass_permissions():
+    with pytest.raises(GraphValidationError, match="unknown parent"):
+        graph([node("child", "ghost", tools=["deploy"], permissions=["admin"])])
 
 
-def test_envelope_policy_profile(tmp_path):
-    """The envelope carries the consumer policy profile in the canonical contract."""
-    env = _env(tmp_path)
-    assert env.policy_profile == "default"
+def test_parent_hierarchy_cycle_fails_closed():
+    with pytest.raises(GraphValidationError, match="hierarchy cycle"):
+        graph([node("a", "b"), node("b", "a")])
 
 
-def test_graph_edges_derived(tmp_path):
-    """Edges (parent→child and dependency) are derived deterministically."""
-    env = _env(tmp_path)
-    graph = TaskGraph.from_planner_output(env, [_root_node(), _child_node()])
-    edges = graph.edges()
-    assert ("root", "child") in edges
+def test_dependency_cycle_fails_closed():
+    with pytest.raises(GraphValidationError, match="dependency cycle"):
+        graph([node("a", dependencies=["b"]), node("b", dependencies=["a"])])
 
 
-# ---------------------------------------------------------------------------
-# Remediation evidence for reviewer BLOCK (fail-closed validation/recovery)
-# ---------------------------------------------------------------------------
+def test_parent_hierarchy_is_not_implicitly_dependency_dag():
+    g = graph([node("parent", dependencies=["child"]), node("child", "parent")])
+    assert g.hierarchy_edges() == (("parent", "child"),)
+    assert g.dependency_edges() == (("child", "parent"),)
 
 
-def test_parent_id_cycle_fail_closed(tmp_path):
-    """Acceptance #2: a parent_id cycle (not a dependencies cycle) must be
-    rejected by _depth_of — infinite recursion / stack-overflow otherwise."""
-    env = _env(tmp_path)
-    a = _root_node()
-    a["id"] = "a"
-    a["parent_id"] = "b"
-    a["dependencies"] = []
-    b = _root_node()
-    b["id"] = "b"
-    b["parent_id"] = "a"
-    b["dependencies"] = []
-    with pytest.raises(GraphValidationError, match="parent_id cycle"):
-        TaskGraph.from_planner_output(env, [a, b])
+def test_child_cannot_escalate_tools_or_permissions():
+    with pytest.raises(GraphValidationError, match="escalation"):
+        graph([node("root"), node("child", "root", tools=["deploy"], permissions=["admin"])])
 
 
-def test_replay_unknown_event_type_fail_closed(tmp_path):
-    """Recovery defect: unknown event types in the log must be rejected
-    (fail-closed), not silently ignored."""
-    env = _env(tmp_path)
-    graph = TaskGraph.from_planner_output(env, [_root_node(), _child_node()])
+def test_depth_and_fanout_are_bounded():
+    env = envelope(max_depth=2, max_fanout=1)
+    with pytest.raises(GraphValidationError, match="max_depth"):
+        graph([node("a"), node("b", "a"), node("c", "b")], env)
+    with pytest.raises(GraphValidationError, match="max_fanout"):
+        graph([node("a"), node("b", "a"), node("c", "a")], env)
+
+
+def test_secret_like_keys_and_values_fail_closed():
+    with pytest.raises(GraphValidationError, match="secret-like"):
+        graph([node(inputs=[{"api_key": "value"}])])
+    with pytest.raises(GraphValidationError, match="secret-like"):
+        graph([node(inputs=[{"value": "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"}])])
+
+
+def test_non_finite_or_non_json_payload_fails_closed():
+    with pytest.raises(GraphValidationError, match="non-finite"):
+        graph([node(inputs=[{"value": float("nan")}])])
+    with pytest.raises(GraphValidationError, match="non-JSON"):
+        graph([node(inputs=[{"value": {1, 2}}])])
+
+
+def test_runtime_metadata_is_typed_and_bounded():
+    g = graph([node(max_attempts=2)])
+    valid = NodeRuntimeState(LifecycleState.RUNNING, attempt=1)
+    valid.validate_for(g.nodes[0])
+    with pytest.raises(GraphValidationError, match="0..2"):
+        NodeRuntimeState(LifecycleState.RUNNING, attempt=3).validate_for(g.nodes[0])
+    with pytest.raises(GraphValidationError, match="set together"):
+        NodeRuntimeState(LifecycleState.RUNNING, attempt=1, lease_id="lease").validate_for(g.nodes[0])
+
+
+def test_persistence_replay_initializes_pending_and_recovers_runtime(tmp_path):
+    g = graph([node("root"), node("child", "root")])
     log = tmp_path / "events.jsonl"
     store = PersistentTaskGraph(log)
-    store.persist_graph(graph)
-    # Append an unknown event type after valid entries
-    with open(log, "a", encoding="utf-8") as f:
-        f.write(json.dumps({"type": "bogus_event", "payload": "test"}) + "\n")
-    store2 = PersistentTaskGraph(log)
-    with pytest.raises(GraphValidationError, match="unknown event type"):
-        store2.replay()
+    store.persist_graph(g)
+    assert store.current_state()["child"].lifecycle is LifecycleState.PENDING
+    store.set_node_runtime(
+        "child",
+        NodeRuntimeState(
+            LifecycleState.RUNNING,
+            attempt=1,
+            lease_id="lease-1",
+            lease_expires_at="2026-09-27T01:00:00+00:00",
+        ),
+    )
+    recovered, state = PersistentTaskGraph(log).replay()
+    assert recovered.graph_hash() == g.graph_hash()
+    assert state["root"].lifecycle is LifecycleState.PENDING
+    assert state["child"].attempt == 1
+    assert state["child"].lease_id == "lease-1"
 
 
-def test_scan_for_secrets_detects_access_key(tmp_path):
-    """Secret-handling: 'access_key' must be detected (was missing from
-    _SECRET_FRAGMENTS)."""
-    env = _env(tmp_path)
-    leaky = {
-        **_root_node(),
-        "id": "leaky",
-        "inputs": [{"access_key": "AKIAIOSFODNN7EXAMPLE"}],
+def test_cancel_updates_materialized_state_immediately_and_after_restart(tmp_path):
+    g = graph([node()])
+    log = tmp_path / "events.jsonl"
+    store = PersistentTaskGraph(log)
+    store.persist_graph(g)
+    store.cancel_node("root", "operator request")
+    assert store.current_state()["root"].lifecycle is LifecycleState.CANCELLED
+    _, state = PersistentTaskGraph(log).replay()
+    assert state["root"].lifecycle is LifecycleState.CANCELLED
+
+
+def test_unknown_node_runtime_event_fails_before_write(tmp_path):
+    store = PersistentTaskGraph(tmp_path / "events.jsonl")
+    store.persist_graph(graph([node()]))
+    with pytest.raises(GraphValidationError, match="unknown node"):
+        store.set_node_state("ghost", LifecycleState.RUNNING)
+
+
+def test_runtime_event_is_bound_to_graph_hash(tmp_path):
+    g = graph([node()])
+    log = tmp_path / "events.jsonl"
+    store = PersistentTaskGraph(log)
+    store.persist_graph(g)
+    event = {
+        "type": "node_runtime",
+        "graph_hash": "0" * 64,
+        "node_id": "root",
+        "runtime": NodeRuntimeState(LifecycleState.RUNNING).to_json(),
+        "ts": "2026-09-27T00:00:00+00:00",
     }
-    with pytest.raises(GraphValidationError, match="secrets detected"):
-        TaskGraph.from_planner_output(env, [leaky])
+    with log.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(event) + "\n")
+    with pytest.raises(GraphValidationError, match="different graph hash"):
+        PersistentTaskGraph(log).replay()
+
+
+def test_multiple_graph_records_fail_closed(tmp_path):
+    g = graph([node()])
+    log = tmp_path / "events.jsonl"
+    store = PersistentTaskGraph(log)
+    store.persist_graph(g)
+    with pytest.raises(GraphValidationError, match="already initialized"):
+        store.persist_graph(g)
+
+
+def test_malformed_complete_event_fails_but_torn_tail_is_ignored(tmp_path):
+    g = graph([node()])
+    log = tmp_path / "events.jsonl"
+    store = PersistentTaskGraph(log)
+    store.persist_graph(g)
+    with log.open("ab") as fh:
+        fh.write(b'{"type":"node_runtime"')
+    recovered, state = PersistentTaskGraph(log).replay()
+    assert recovered.graph_hash() == g.graph_hash()
+    assert state["root"].lifecycle is LifecycleState.PENDING
+
+    clean = tmp_path / "bad.jsonl"
+    store2 = PersistentTaskGraph(clean)
+    store2.persist_graph(g)
+    with clean.open("ab") as fh:
+        fh.write(b'{broken}\n')
+    with pytest.raises(GraphValidationError, match="malformed complete event"):
+        PersistentTaskGraph(clean).replay()
+
+
+def test_duplicate_json_keys_fail_closed(tmp_path):
+    g = graph([node()])
+    log = tmp_path / "events.jsonl"
+    store = PersistentTaskGraph(log)
+    store.persist_graph(g)
+    with log.open("ab") as fh:
+        fh.write(b'{"type":"x","type":"y"}\n')
+    with pytest.raises(GraphValidationError, match="malformed complete event"):
+        PersistentTaskGraph(log).replay()
+
+
+def test_empty_graph_and_string_list_fields_fail_closed():
+    with pytest.raises(GraphValidationError, match="at least one node"):
+        TaskGraph.from_planner_output(envelope(), [])
+    bad = node()
+    bad["tools"] = "read"
+    with pytest.raises(GraphValidationError, match="tools must be an array"):
+        graph([bad])
+
+
+def test_spec_hash_must_be_canonical_lowercase():
+    with pytest.raises(GraphValidationError, match="lowercase"):
+        envelope(spec_hash="sha256:" + "A" * 64)
+
+
+def test_cancel_reason_secret_pattern_is_rejected(tmp_path):
+    store = PersistentTaskGraph(tmp_path / "events.jsonl")
+    store.persist_graph(graph([node()]))
+    with pytest.raises(GraphValidationError, match="secret-like"):
+        store.cancel_node("root", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456")

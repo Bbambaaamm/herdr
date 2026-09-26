@@ -1,36 +1,48 @@
-"""Herdr durable TaskGraph schema and deterministic planner contract.
+"""Herdr v1.1 durable TaskGraph contract.
 
-Provider- and consumer-neutral orchestration primitives: bounded DAG validation,
-secret isolation, descendant permission monotonicity, deterministic graph hashing,
-and append-only persistence/recovery. Consumer-specific safety rules are referenced
-through the envelope policy profile and enforced by admission/runtime policy layers.
+Canonical implementation for Bbambaaamm/herdr#2, migrated from the former
+Autonomous-Quant-Lab#230 prototype after architecture hardening.
+
+This module is deliberately consumer-agnostic. Consumer safety policies (for
+example QuantLab PAPER-only) stay in the consumer repository and are carried
+through tool/permission allowlists rather than hard-coded into Herdr core.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, field
+import math
+import os
+import re
+import threading
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
-
-# ---------------------------------------------------------------------------
-# Bounded graph limits (issue #230: "explicit bounded max nodes/depth/fanout")
-# ---------------------------------------------------------------------------
-# Fail-closed defaults — a planner must not be able to bypass these by simply
-# emitting a larger graph.  The envelope carries the effective limit that was
-# applied, so recovery / Machine City can audit the bound that guarded the run.
-DEFAULT_MAX_NODES = 256
-DEFAULT_MAX_DEPTH = 16
-DEFAULT_MAX_FANOUT = 16
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any, ClassVar
 
 GRAPH_VERSION = "1.1.0"
 
+HARD_MAX_NODES = 256
+HARD_MAX_DEPTH = 16
+HARD_MAX_FANOUT = 16
+HARD_MAX_TIMEOUT_SECONDS = 86_400
+HARD_MAX_ATTEMPTS = 10
 
-# ---------------------------------------------------------------------------
-# Lifecycle
-# ---------------------------------------------------------------------------
+DEFAULT_MAX_NODES = 256
+DEFAULT_MAX_DEPTH = 16
+DEFAULT_MAX_FANOUT = 16
+DEFAULT_TIMEOUT_SECONDS = 1_800
+DEFAULT_MAX_ATTEMPTS = 1
+
+
+class GraphValidationError(ValueError):
+    """Planner/taskgraph data violated the fail-closed contract."""
+
+
 class LifecycleState(StrEnum):
     PENDING = "pending"
     READY = "ready"
@@ -42,17 +54,132 @@ class LifecycleState(StrEnum):
     CANCELLED = "cancelled"
 
     @classmethod
-    def terminal(cls) -> frozenset[str]:
+    def terminal(cls) -> frozenset["LifecycleState"]:
         return frozenset({cls.DONE, cls.FAILED, cls.CANCELLED})
 
 
-# ---------------------------------------------------------------------------
-# Envelope + Node
-# ---------------------------------------------------------------------------
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _require_text(value: Any, field: str, *, max_len: int = 4096) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > max_len:
+        raise GraphValidationError(f"{field} must be a non-empty string <= {max_len} chars")
+    return value
+
+
+def _validate_utc_timestamp(value: Any, field: str) -> str:
+    value = _require_text(value, field, max_len=128)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise GraphValidationError(f"{field} must be ISO-8601") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(parsed):
+        raise GraphValidationError(f"{field} must be UTC with an explicit offset")
+    return value
+
+
+def _validate_spec_hash(value: Any) -> str:
+    value = _require_text(value, "envelope.spec_hash", max_len=80)
+    raw = value.removeprefix("sha256:")
+    if not re.fullmatch(r"[0-9a-f]{64}", raw):
+        raise GraphValidationError("envelope.spec_hash must be lowercase SHA-256 hex")
+    return value
+
+
+def _validate_json(value: Any, path: str) -> None:
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise GraphValidationError(f"{path} contains a non-finite number")
+        return
+    if isinstance(value, list):
+        for idx, item in enumerate(value):
+            _validate_json(item, f"{path}[{idx}]")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise GraphValidationError(f"{path} contains a non-string object key")
+            _validate_json(item, f"{path}.{key}")
+        return
+    raise GraphValidationError(f"{path} contains non-JSON type {type(value).__name__}")
+
+
+_SECRET_KEY_FRAGMENTS = (
+    "secret",
+    "token",
+    "password",
+    "passwd",
+    "apikey",
+    "api_key",
+    "api-key",
+    "access_key",
+    "accesskey",
+    "credential",
+    "private_key",
+    "privatekey",
+)
+
+_SECRET_VALUE_PATTERNS = (
+    re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
+    re.compile(r"\bghp_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b"),
+)
+
+
+def _secret_hits(value: Any, path: str = "payload") -> list[str]:
+    hits: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            child = f"{path}.{key}"
+            normalized = key.lower()
+            if any(fragment in normalized for fragment in _SECRET_KEY_FRAGMENTS):
+                hits.append(child)
+            hits.extend(_secret_hits(item, child))
+    elif isinstance(value, list):
+        for idx, item in enumerate(value):
+            hits.extend(_secret_hits(item, f"{path}[{idx}]"))
+    elif isinstance(value, str):
+        if any(pattern.search(value) for pattern in _SECRET_VALUE_PATTERNS):
+            hits.append(path)
+    return hits
+
+
+def _freeze_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
+def _thaw_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(item) for item in value]
+    return value
+
+
+def _canonical_json(value: Any) -> str:
+    _validate_json(value, "canonical")
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
 @dataclass(frozen=True)
 class TaskGraphEnvelope:
-    """Immutable graph envelope (issue/spec hash + planner identity + version)."""
-
     issue: str
     spec_hash: str
     graph_version: str
@@ -63,7 +190,67 @@ class TaskGraphEnvelope:
     max_fanout: int = DEFAULT_MAX_FANOUT
     policy_profile: str = "default"
 
-    def to_canonical_json(self) -> dict[str, Any]:
+    def __post_init__(self) -> None:
+        _require_text(self.issue, "envelope.issue", max_len=256)
+        _validate_spec_hash(self.spec_hash)
+        if self.graph_version != GRAPH_VERSION:
+            raise GraphValidationError(
+                f"unsupported graph_version {self.graph_version!r}; expected {GRAPH_VERSION!r}"
+            )
+        _validate_utc_timestamp(self.created_at, "envelope.created_at")
+        _require_text(self.planner, "envelope.planner", max_len=256)
+        _require_text(self.policy_profile, "envelope.policy_profile", max_len=128)
+        limits = (
+            ("max_nodes", self.max_nodes, HARD_MAX_NODES),
+            ("max_depth", self.max_depth, HARD_MAX_DEPTH),
+            ("max_fanout", self.max_fanout, HARD_MAX_FANOUT),
+        )
+        for name, value, hard_max in limits:
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= hard_max:
+                raise GraphValidationError(
+                    f"envelope.{name} must be an integer in 1..{hard_max}"
+                )
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "TaskGraphEnvelope":
+        if not isinstance(value, dict):
+            raise GraphValidationError("envelope must be an object")
+        allowed = {
+            "issue",
+            "spec_hash",
+            "graph_version",
+            "created_at",
+            "planner",
+            "max_nodes",
+            "max_depth",
+            "max_fanout",
+            "policy_profile",
+        }
+        unknown = set(value) - allowed
+        if unknown:
+            raise GraphValidationError(f"envelope contains unknown fields: {sorted(unknown)}")
+        required = {"issue", "spec_hash", "graph_version", "created_at", "planner"}
+        missing = required - set(value)
+        if missing:
+            raise GraphValidationError(f"envelope missing required fields: {sorted(missing)}")
+        try:
+            return cls(
+                issue=value["issue"],
+                spec_hash=value["spec_hash"],
+                graph_version=value["graph_version"],
+                created_at=value["created_at"],
+                planner=value["planner"],
+                max_nodes=value.get("max_nodes", DEFAULT_MAX_NODES),
+                max_depth=value.get("max_depth", DEFAULT_MAX_DEPTH),
+                max_fanout=value.get("max_fanout", DEFAULT_MAX_FANOUT),
+                policy_profile=value.get("policy_profile", "default"),
+            )
+        except (TypeError, ValueError) as exc:
+            if isinstance(exc, GraphValidationError):
+                raise
+            raise GraphValidationError(f"invalid envelope: {type(exc).__name__}") from exc
+
+    def to_json(self) -> dict[str, Any]:
         return {
             "issue": self.issue,
             "spec_hash": self.spec_hash,
@@ -76,529 +263,604 @@ class TaskGraphEnvelope:
             "policy_profile": self.policy_profile,
         }
 
+    def to_hash_json(self) -> dict[str, Any]:
+        """Structural envelope. created_at is intentionally operational metadata."""
+        value = self.to_json()
+        value.pop("created_at")
+        return value
+
 
 @dataclass(frozen=True)
 class TaskNode:
-    """A single DAG node.
-
-    Frozen (immutable) so that a constructed node is a faithful, tamper-evident
-    unit.  Permissions/tools are validated against the parent at planner time.
-    """
-
     id: str
     parent_id: str | None
     type: str
     role: str
     objective: str
-    inputs: list[dict[str, Any]]
-    expected_outputs: list[dict[str, Any]]
+    inputs: tuple[Mapping[str, Any], ...] | list[dict[str, Any]]
+    expected_outputs: tuple[Mapping[str, Any], ...] | list[dict[str, Any]]
     dependencies: tuple[str, ...]
     priority: int
     resource_class: str
-    model_policy: dict[str, Any]
+    model_policy: Mapping[str, Any] | dict[str, Any]
     tools: tuple[str, ...]
     permissions: tuple[str, ...]
-    created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS
 
-    # ------------------------------------------------------------------
-    # Secret-isolation guard (issue #230: "task payload neobsahuje secrets")
-    # ------------------------------------------------------------------
-    _SECRET_FRAGMENTS: tuple[str, ...] = (
-        "secret",
-        "token",
-        "password",
-        "passwd",
-        "apikey",
-        "api_key",
-        "api-key",
-        "access_key",
-        "accesskey",
-        "credential",
-        "private_key",
-        "privatekey",
-    )
+    SECRET_KEY_FRAGMENTS: ClassVar[tuple[str, ...]] = _SECRET_KEY_FRAGMENTS
 
-    def _scan_for_secrets(self) -> list[str]:
-        """Linear scan of payload fields for secret-like keys/values.
-
-        Conservative: only key names are inspected (values are never logged),
-        so a false-positive blocks construction.  This is intentional — secrets
-        must never enter a task payload; the planner must keep them out.
-        """
-        hits: list[str] = []
-
-        def _walk(obj: Any, path: str = "") -> None:
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    loc = f"{path}.{k}" if path else k
-                    kn = k.lower()
-                    if any(frag in kn for frag in self._SECRET_FRAGMENTS):
-                        hits.append(loc)
-                    _walk(v, loc)
-            elif isinstance(obj, list):
-                for i, v in enumerate(obj):
-                    _walk(v, f"{path}[{i}]")
-
+    def __post_init__(self) -> None:
+        _require_text(self.id, "node.id", max_len=256)
+        if self.parent_id is not None:
+            _require_text(self.parent_id, "node.parent_id", max_len=256)
+        _require_text(self.type, "node.type", max_len=128)
+        _require_text(self.role, "node.role", max_len=128)
+        _require_text(self.objective, "node.objective", max_len=16_384)
+        _require_text(self.resource_class, "node.resource_class", max_len=128)
+        if isinstance(self.priority, bool) or not isinstance(self.priority, int):
+            raise GraphValidationError("node.priority must be an integer")
+        if (
+            isinstance(self.timeout_seconds, bool)
+            or not isinstance(self.timeout_seconds, int)
+            or not 1 <= self.timeout_seconds <= HARD_MAX_TIMEOUT_SECONDS
+        ):
+            raise GraphValidationError(
+                f"node.timeout_seconds must be an integer in 1..{HARD_MAX_TIMEOUT_SECONDS}"
+            )
+        if (
+            isinstance(self.max_attempts, bool)
+            or not isinstance(self.max_attempts, int)
+            or not 1 <= self.max_attempts <= HARD_MAX_ATTEMPTS
+        ):
+            raise GraphValidationError(
+                f"node.max_attempts must be an integer in 1..{HARD_MAX_ATTEMPTS}"
+            )
+        for name, values in (
+            ("dependencies", self.dependencies),
+            ("tools", self.tools),
+            ("permissions", self.permissions),
+        ):
+            if any(not isinstance(item, str) or not item for item in values):
+                raise GraphValidationError(f"node.{name} must contain non-empty strings")
+            if len(set(values)) != len(values):
+                raise GraphValidationError(f"node.{name} must not contain duplicates")
+        if not isinstance(self.inputs, (list, tuple)) or not all(
+            isinstance(x, Mapping) for x in self.inputs
+        ):
+            raise GraphValidationError("node.inputs must be an array of objects")
+        if not isinstance(self.expected_outputs, (list, tuple)) or not all(
+            isinstance(x, Mapping) for x in self.expected_outputs
+        ):
+            raise GraphValidationError("node.expected_outputs must be an array of objects")
+        if not isinstance(self.model_policy, Mapping):
+            raise GraphValidationError("node.model_policy must be an object")
         payload = {
-            "inputs": self.inputs,
-            "expected_outputs": self.expected_outputs,
-            "model_policy": self.model_policy,
+            "inputs": [dict(item) for item in self.inputs],
+            "expected_outputs": [dict(item) for item in self.expected_outputs],
+            "model_policy": dict(self.model_policy),
         }
-        _walk(payload)
-        return hits
-
-    def payload_secret_hits(self) -> list[str]:
-        return self._scan_for_secrets()
-
-    # ------------------------------------------------------------------
-    # Child-vs-parent permission escalation guard
-    # (issue #230: "child node nemůže získat více oprávnění než parent policy")
-    # ------------------------------------------------------------------
-    def verify_descendant_permissions(
-        self, parent_tools: tuple[str, ...], parent_perms: tuple[str, ...]
-    ) -> list[str]:
-        """Return list of violation messages (empty == OK).
-
-        A child may hold a SUBSET of its parent's tool and permission sets,
-        never a superset.  This is checked by the planner at parse time, but
-        is also re-validated here as a durable guard.
-        """
-        violations: list[str] = []
-        child_tools = set(self.tools)
-        child_perms = set(self.permissions)
-        parent_tool_set = set(parent_tools)
-        parent_perm_set = set(parent_perms)
-
-        extra_tools = child_tools - parent_tool_set
-        extra_perms = child_perms - parent_perm_set
-
-        if extra_tools:
-            violations.append(
-                f"node {self.id!r}: child tool escalation ({sorted(extra_tools)} ⊄ parent tools)"
+        _validate_json(payload, f"node[{self.id}].payload")
+        hits = _secret_hits(payload, f"node[{self.id}].payload")
+        if hits:
+            raise GraphValidationError(
+                f"node {self.id!r}: secret-like material rejected at {sorted(set(hits))}"
             )
-        if extra_perms:
-            violations.append(
-                f"node {self.id!r}: child permission escalation "
-                f"({sorted(extra_perms)} ⊄ parent permissions)"
+        object.__setattr__(self, "inputs", tuple(_freeze_json(item) for item in payload["inputs"]))
+        object.__setattr__(
+            self,
+            "expected_outputs",
+            tuple(_freeze_json(item) for item in payload["expected_outputs"]),
+        )
+        object.__setattr__(self, "model_policy", _freeze_json(payload["model_policy"]))
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "TaskNode":
+        if not isinstance(value, dict):
+            raise GraphValidationError("node must be an object")
+        allowed = {
+            "id",
+            "parent_id",
+            "type",
+            "role",
+            "objective",
+            "inputs",
+            "expected_outputs",
+            "dependencies",
+            "priority",
+            "resource_class",
+            "model_policy",
+            "tools",
+            "permissions",
+            "timeout_seconds",
+            "max_attempts",
+        }
+        unknown = set(value) - allowed
+        if unknown:
+            raise GraphValidationError(
+                f"node {value.get('id', '<unknown>')!r} contains unknown fields: {sorted(unknown)}"
             )
-        return violations
+        required = {
+            "id",
+            "parent_id",
+            "type",
+            "role",
+            "objective",
+            "inputs",
+            "expected_outputs",
+            "dependencies",
+            "priority",
+            "resource_class",
+            "model_policy",
+            "tools",
+            "permissions",
+        }
+        missing = required - set(value)
+        if missing:
+            raise GraphValidationError(
+                f"node {value.get('id', '<unknown>')!r} missing required fields: {sorted(missing)}"
+            )
+        for field_name in ("dependencies", "tools", "permissions"):
+            if not isinstance(value[field_name], list):
+                raise GraphValidationError(f"node.{field_name} must be an array")
+        try:
+            return cls(
+                id=value["id"],
+                parent_id=value["parent_id"],
+                type=value["type"],
+                role=value["role"],
+                objective=value["objective"],
+                inputs=value["inputs"],
+                expected_outputs=value["expected_outputs"],
+                dependencies=tuple(value["dependencies"]),
+                priority=value["priority"],
+                resource_class=value["resource_class"],
+                model_policy=value["model_policy"],
+                tools=tuple(value["tools"]),
+                permissions=tuple(value["permissions"]),
+                timeout_seconds=value.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
+                max_attempts=value.get("max_attempts", DEFAULT_MAX_ATTEMPTS),
+            )
+        except (TypeError, ValueError) as exc:
+            if isinstance(exc, GraphValidationError):
+                raise
+            raise GraphValidationError(
+                f"node {value.get('id', '<unknown>')!r} has malformed field types"
+            ) from exc
+
+    def verify_descendant_permissions(self, parent: "TaskNode") -> None:
+        extra_tools = set(self.tools) - set(parent.tools)
+        extra_permissions = set(self.permissions) - set(parent.permissions)
+        if extra_tools or extra_permissions:
+            details: list[str] = []
+            if extra_tools:
+                details.append(f"tools={sorted(extra_tools)}")
+            if extra_permissions:
+                details.append(f"permissions={sorted(extra_permissions)}")
+            raise GraphValidationError(
+                f"node {self.id!r}: child escalation above parent {parent.id!r}: "
+                + ", ".join(details)
+            )
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "parent_id": self.parent_id,
+            "type": self.type,
+            "role": self.role,
+            "objective": self.objective,
+            "inputs": _thaw_json(self.inputs),
+            "expected_outputs": _thaw_json(self.expected_outputs),
+            "dependencies": list(self.dependencies),
+            "priority": self.priority,
+            "resource_class": self.resource_class,
+            "model_policy": _thaw_json(self.model_policy),
+            "tools": list(self.tools),
+            "permissions": list(self.permissions),
+            "timeout_seconds": self.timeout_seconds,
+            "max_attempts": self.max_attempts,
+        }
+
+    def to_hash_json(self) -> dict[str, Any]:
+        value = self.to_json()
+        value["dependencies"] = sorted(self.dependencies)
+        value["tools"] = sorted(self.tools)
+        value["permissions"] = sorted(self.permissions)
+        return value
 
 
-# ---------------------------------------------------------------------------
-# DAG + deterministic graph hash
-# ---------------------------------------------------------------------------
-class GraphValidationError(Exception):
-    """Raised when a TaskGraph is structurally invalid (fail-closed)."""
+@dataclass(frozen=True)
+class NodeRuntimeState:
+    lifecycle: LifecycleState = LifecycleState.PENDING
+    attempt: int = 0
+    lease_id: str | None = None
+    lease_expires_at: str | None = None
+
+    def validate_for(self, node: TaskNode) -> None:
+        if isinstance(self.attempt, bool) or not isinstance(self.attempt, int):
+            raise GraphValidationError("runtime attempt must be an integer")
+        if not 0 <= self.attempt <= node.max_attempts:
+            raise GraphValidationError(
+                f"runtime attempt for {node.id!r} must be in 0..{node.max_attempts}"
+            )
+        if (self.lease_id is None) != (self.lease_expires_at is None):
+            raise GraphValidationError("lease_id and lease_expires_at must be set together")
+        if self.lease_id is not None:
+            _require_text(self.lease_id, "runtime.lease_id", max_len=256)
+            _validate_utc_timestamp(self.lease_expires_at, "runtime.lease_expires_at")
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "lifecycle": self.lifecycle.value,
+            "attempt": self.attempt,
+            "lease_id": self.lease_id,
+            "lease_expires_at": self.lease_expires_at,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Any, node: TaskNode) -> "NodeRuntimeState":
+        if not isinstance(value, dict):
+            raise GraphValidationError("runtime must be an object")
+        unknown = set(value) - {"lifecycle", "attempt", "lease_id", "lease_expires_at"}
+        if unknown:
+            raise GraphValidationError(f"runtime contains unknown fields: {sorted(unknown)}")
+        try:
+            state = cls(
+                lifecycle=LifecycleState(value["lifecycle"]),
+                attempt=value.get("attempt", 0),
+                lease_id=value.get("lease_id"),
+                lease_expires_at=value.get("lease_expires_at"),
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            raise GraphValidationError(f"invalid runtime state for node {node.id!r}") from exc
+        state.validate_for(node)
+        return state
 
 
 @dataclass
 class TaskGraph:
-    """An in-memory, immutable-ish TaskGraph.
-
-    Constructed from an envelope + a list of TaskNode dicts (planner output).
-    Validation runs eagerly: any structural defect raises GraphValidationError
-    and the graph is rejected (fail-closed).
-
-    The deterministic ``graph_hash`` is a SHA-256 over the canonical
-    serialization of the envelope + nodes + edges — identical planner output
-    always yields the same hash (issue #230 acceptance #1).
-    """
-
     envelope: TaskGraphEnvelope
-    nodes: list[TaskNode] = field(default_factory=list)
-    # edges: list[tuple[str, str]]  # (from, to) — derived from dependencies
+    nodes: tuple[TaskNode, ...]
 
-    # --- construction -------------------------------------------------
+    @classmethod
+    def parse_planner_output(cls, value: Any) -> "TaskGraph":
+        if not isinstance(value, dict):
+            raise GraphValidationError("planner output must be an object")
+        unknown = set(value) - {"envelope", "nodes"}
+        if unknown:
+            raise GraphValidationError(f"planner output contains unknown fields: {sorted(unknown)}")
+        if "envelope" not in value or "nodes" not in value:
+            raise GraphValidationError("planner output requires envelope and nodes")
+        envelope = TaskGraphEnvelope.from_dict(value["envelope"])
+        return cls.from_planner_output(envelope, value["nodes"])
+
     @classmethod
     def from_planner_output(
-        cls,
-        envelope: TaskGraphEnvelope,
-        node_dicts: list[dict[str, Any]],
-    ) -> TaskGraph:
-        """Parse + validate planner output into a TaskGraph.
-
-        Raises GraphValidationError on any structural defect (fail-closed).
-        """
-        nodes: list[TaskNode] = []
-        id_set: set[str] = set()
-        parent_tools_by_id: dict[str, tuple[str, ...]] = {}
-        parent_perms_by_id: dict[str, tuple[str, ...]] = {}
-
-        for nd in node_dicts:
-            nid = nd["id"]
-            if nid in id_set:
-                raise GraphValidationError(f"duplicate node id rejected: {nid!r}")
-            id_set.add(nid)
-
-            node = TaskNode(
-                id=nid,
-                parent_id=nd.get("parent_id"),
-                type=nd["type"],
-                role=nd["role"],
-                objective=nd["objective"],
-                inputs=nd.get("inputs", []),
-                expected_outputs=nd.get("expected_outputs", []),
-                dependencies=tuple(nd.get("dependencies", [])),
-                priority=int(nd.get("priority", 0)),
-                resource_class=nd.get("resource_class", "default"),
-                model_policy=nd.get("model_policy", {}),
-                tools=tuple(nd.get("tools", [])),
-                permissions=tuple(nd.get("permissions", [])),
-                created_at=(nd.get("created_at") or datetime.now(UTC).isoformat()),
+        cls, envelope: TaskGraphEnvelope, node_dicts: Any
+    ) -> "TaskGraph":
+        if not isinstance(node_dicts, list):
+            raise GraphValidationError("nodes must be an array")
+        if not node_dicts:
+            raise GraphValidationError("nodes must contain at least one node")
+        if len(node_dicts) > envelope.max_nodes:
+            raise GraphValidationError(
+                f"max_nodes ({envelope.max_nodes}) exceeded: {len(node_dicts)} nodes"
             )
-
-            # Secret isolation: payload must never contain secrets.
-            secret_hits = node.payload_secret_hits()
-            if secret_hits:
-                raise GraphValidationError(
-                    f"node {nid!r}: secrets detected in payload at "
-                    f"{secret_hits} — rejected (payload may not contain secrets)"
-                )
-
-            nodes.append(node)
-            parent_tools_by_id[nid] = node.tools
-            parent_perms_by_id[nid] = node.permissions
-
+        nodes = tuple(TaskNode.from_dict(value) for value in node_dicts)
         graph = cls(envelope=envelope, nodes=nodes)
-        graph._validate_structure()
-        graph._validate_depth_and_fanout()
-        graph._validate_descendant_permissions(parent_tools_by_id, parent_perms_by_id)
-        graph._validate_bounded_limits()
+        graph._validate()
         return graph
 
-    # --- validation ---------------------------------------------------
-    def _node_index(self) -> dict[str, TaskNode]:
-        return {n.id: n for n in self.nodes}
+    def _index(self) -> dict[str, TaskNode]:
+        result: dict[str, TaskNode] = {}
+        for node in self.nodes:
+            if node.id in result:
+                raise GraphValidationError(f"duplicate node id rejected: {node.id!r}")
+            result[node.id] = node
+        return result
 
-    def _validate_structure(self) -> None:
-        idx = self._node_index()
-
-        # unknown dependency rejection
-        for n in self.nodes:
-            for dep in n.dependencies:
+    def _validate(self) -> None:
+        idx = self._index()
+        for node in self.nodes:
+            if node.parent_id is not None:
+                if node.parent_id == node.id:
+                    raise GraphValidationError(f"node {node.id!r}: self-parent rejected")
+                if node.parent_id not in idx:
+                    raise GraphValidationError(
+                        f"node {node.id!r}: unknown parent {node.parent_id!r} rejected"
+                    )
+            for dep in node.dependencies:
+                if dep == node.id:
+                    raise GraphValidationError(f"node {node.id!r}: self-dependency rejected")
                 if dep not in idx:
                     raise GraphValidationError(
-                        f"node {n.id!r}: unknown dependency {dep!r} rejected"
+                        f"node {node.id!r}: unknown dependency {dep!r} rejected"
                     )
-                if dep == n.id:
-                    raise GraphValidationError(f"node {n.id!r}: self-dependency rejected")
+        self._validate_dependency_dag(idx)
+        self._validate_hierarchy(idx)
+        for node in self.nodes:
+            if node.parent_id is not None:
+                node.verify_descendant_permissions(idx[node.parent_id])
 
-        # root count: exactly one root (parent_id None) OR all parented —
-        # we accept a single root or a forest of roots, but every dependency
-        # must be acyclic.
-        if self._has_cycle():
-            raise GraphValidationError("cycle detected in task graph — rejected")
+    def _validate_dependency_dag(self, idx: dict[str, TaskNode]) -> None:
+        white, gray, black = 0, 1, 2
+        color = {node_id: white for node_id in idx}
 
-        # duplicate node rejection is enforced at parse time (id_set check).
+        def visit(node_id: str) -> None:
+            color[node_id] = gray
+            for dep in idx[node_id].dependencies:
+                if color[dep] == gray:
+                    raise GraphValidationError("dependency cycle detected")
+                if color[dep] == white:
+                    visit(dep)
+            color[node_id] = black
 
-    def _has_cycle(self) -> bool:
-        idx = self._node_index()
-        WHITE, GRAY, BLACK = 0, 1, 2
-        color: dict[str, int] = {n.id: WHITE for n in self.nodes}
+        for node_id in idx:
+            if color[node_id] == white:
+                visit(node_id)
 
-        def visit(nid: str) -> bool:
-            color[nid] = GRAY
-            node = idx[nid]
-            for dep in node.dependencies:
-                c = color[dep]
-                if c == GRAY:
-                    return True  # back edge → cycle
-                if c == WHITE and visit(dep):
-                    return True
-            color[nid] = BLACK
-            return False
-
-        return any(color[nid] == WHITE and visit(nid) for nid in idx)
-
-    def _depth_of(
-        self,
-        nid: str,
-        idx: dict[str, TaskNode],
-        cache: dict[str, int],
-        visiting: set[str] | None = None,
-    ) -> int:
-        if visiting is None:
-            visiting = set()
-        if nid in cache:
-            return cache[nid]
-        if nid in visiting:
-            raise GraphValidationError(f"parent_id cycle detected involving {nid!r}")
-        visiting.add(nid)
-        node = idx[nid]
-        if not node.parent_id or node.parent_id not in idx:
-            cache[nid] = 1
-            visiting.discard(nid)
-            return 1
-        depth = 1 + self._depth_of(node.parent_id, idx, cache, visiting)
-        cache[nid] = depth
-        visiting.discard(nid)
-        return depth
-
-    def _validate_depth_and_fanout(self) -> None:
-        idx = self._node_index()
+    def _validate_hierarchy(self, idx: dict[str, TaskNode]) -> None:
         cache: dict[str, int] = {}
-        depth_exceeded = {
-            n.id for n in self.nodes if self._depth_of(n.id, idx, cache) > self.envelope.max_depth
-        }
-        if depth_exceeded:
-            raise GraphValidationError(
-                f"max_depth ({self.envelope.max_depth}) exceeded by nodes: {sorted(depth_exceeded)}"
-            )
+
+        def depth(node_id: str, visiting: set[str]) -> int:
+            if node_id in cache:
+                return cache[node_id]
+            if node_id in visiting:
+                raise GraphValidationError("parent hierarchy cycle detected")
+            visiting.add(node_id)
+            parent_id = idx[node_id].parent_id
+            result = 1 if parent_id is None else 1 + depth(parent_id, visiting)
+            visiting.remove(node_id)
+            cache[node_id] = result
+            return result
 
         fanout: dict[str, int] = {}
-        for n in self.nodes:
-            if n.parent_id and n.parent_id in idx:
-                fanout[n.parent_id] = fanout.get(n.parent_id, 0) + 1
-        fanout_exceeded = {pid for pid, count in fanout.items() if count > self.envelope.max_fanout}
-        if fanout_exceeded:
-            raise GraphValidationError(
-                f"max_fanout ({self.envelope.max_fanout}) exceeded for parents: "
-                f"{sorted(fanout_exceeded)}"
-            )
-
-    def _validate_descendant_permissions(
-        self,
-        parent_tools_by_id: dict[str, tuple[str, ...]],
-        parent_perms_by_id: dict[str, tuple[str, ...]],
-    ) -> None:
-        idx = self._node_index()
-        violations: list[str] = []
-        for n in self.nodes:
-            if n.parent_id and n.parent_id in idx:
-                violations.extend(
-                    n.verify_descendant_permissions(
-                        parent_tools_by_id[n.parent_id],
-                        parent_perms_by_id[n.parent_id],
-                    )
+        for node in self.nodes:
+            if depth(node.id, set()) > self.envelope.max_depth:
+                raise GraphValidationError(
+                    f"max_depth ({self.envelope.max_depth}) exceeded by node {node.id!r}"
                 )
-        if violations:
+            if node.parent_id is not None:
+                fanout[node.parent_id] = fanout.get(node.parent_id, 0) + 1
+        over = sorted(
+            parent for parent, count in fanout.items() if count > self.envelope.max_fanout
+        )
+        if over:
             raise GraphValidationError(
-                "child permission/tool escalation detected (fail-closed): " + "; ".join(violations)
+                f"max_fanout ({self.envelope.max_fanout}) exceeded for parents: {over}"
             )
-
-    def _validate_bounded_limits(self) -> None:
-        if len(self.nodes) > self.envelope.max_nodes:
-            raise GraphValidationError(
-                f"max_nodes ({self.envelope.max_nodes}) exceeded: {len(self.nodes)} nodes"
-            )
-
-    # --- deterministic hash (issue #230 acceptance #1) ----------------
-    def _canonical_node_repr(self, node: TaskNode) -> dict[str, Any]:
-        """Canonical, deterministic representation of a node (sorted keys)."""
-        return {
-            "id": node.id,
-            "parent_id": node.parent_id,
-            "type": node.type,
-            "role": node.role,
-            "objective": node.objective,
-            "inputs": self._stable(node.inputs),
-            "expected_outputs": self._stable(node.expected_outputs),
-            "dependencies": list(node.dependencies),
-            "priority": node.priority,
-            "resource_class": node.resource_class,
-            "model_policy": self._stable_dict(node.model_policy),
-            "tools": list(node.tools),
-            "permissions": list(node.permissions),
-        }
-
-    @classmethod
-    def _stable(cls, obj: Any) -> Any:
-        """Deep-stable sort of nested dicts/lists for determinism."""
-        if isinstance(obj, dict):
-            return {k: cls._stable(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [cls._stable(v) for v in obj]
-        return obj
-
-    @classmethod
-    def _stable_dict(cls, d: dict[str, Any]) -> dict[str, Any]:
-        return {k: cls._stable(v) for k, v in d.items()}
 
     def graph_hash(self) -> str:
-        """Deterministic SHA-256 over canonical envelope + node serialization.
-
-        Same planner output → same hash (issue #230 acceptance #1).
-        The hash does NOT depend on created_at/time-of-day — only on the
-        structural contract (envelope + nodes + edges).
-        """
         payload = {
-            "envelope": self.envelope.to_canonical_json(),
-            "nodes": [self._canonical_node_repr(n) for n in self.nodes],
+            "envelope": self.envelope.to_hash_json(),
+            "nodes": [node.to_hash_json() for node in sorted(self.nodes, key=lambda n: n.id)],
         }
-        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
-    # --- edges (derived) ----------------------------------------------
-    def edges(self) -> list[tuple[str, str]]:
-        """(parent → child) edges plus dependency edges."""
-        idx = self._node_index()
-        seen: set[tuple[str, str]] = set()
-        edges: list[tuple[str, str]] = []
-        for n in self.nodes:
-            if n.parent_id and n.parent_id in idx:
-                e = (n.parent_id, n.id)
-                if e not in seen:
-                    seen.add(e)
-                    edges.append(e)
-            for dep in n.dependencies:
-                if dep in idx:
-                    e = (dep, n.id)
-                    if e not in seen:
-                        seen.add(e)
-                        edges.append(e)
-        return edges
+    def dependency_edges(self) -> tuple[tuple[str, str], ...]:
+        return tuple(
+            sorted((dep, node.id) for node in self.nodes for dep in node.dependencies)
+        )
+
+    def hierarchy_edges(self) -> tuple[tuple[str, str], ...]:
+        return tuple(
+            sorted(
+                (node.parent_id, node.id)
+                for node in self.nodes
+                if node.parent_id is not None
+            )
+        )
+
+    def to_planner_json(self) -> dict[str, Any]:
+        return {
+            "envelope": self.envelope.to_json(),
+            "nodes": [node.to_json() for node in self.nodes],
+        }
 
 
-# ---------------------------------------------------------------------------
-# Durable store (issue #230: "persistence and restart recovery")
-# ---------------------------------------------------------------------------
+class _DuplicateKey(ValueError):
+    pass
+
+
+def _strict_json_loads(raw: str) -> Any:
+    def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in items:
+            if key in result:
+                raise _DuplicateKey(key)
+            result[key] = value
+        return result
+
+    def bad_constant(value: str) -> None:
+        raise ValueError(value)
+
+    return json.loads(raw, object_pairs_hook=pairs, parse_constant=bad_constant)
+
+
 class PersistentTaskGraph:
-    """Append-only JSONL event log + current-state materialization.
+    """Single-writer append-only JSONL log for one TaskGraph.
 
-    This is the *minimal* durable contract required by issue #230: an immutable,
-    append-only event log from which the current state can be reconstructed
-    after a crash/restart.  It is intentionally small and has no runtime
-    dependencies beyond the stdlib so it remains offline-testable and consumer-neutral.
-
-    Event schema (one JSON object per line):
-        {"type": "graph_persisted", "envelope": {...}, "nodes": [...], "ts": iso}
-        {"type": "node_state", "node_id": id, "state": lifecycle, "ts": iso}
-        {"type": "graph_cancelled", "node_id": id, "reason": str, "ts": iso}
-
-    Restart recovery: a new ``PersistentTaskGraph`` pointed at the same file can
-    ``replay()`` every event to reconstruct the graph hash and the current
-    materialized node-state map — identical to what the crashed process held.
+    Complete events are fsync'd. A final non-newline-terminated fragment is
+    treated as a torn crash-tail and ignored during replay; malformed complete
+    events fail closed. Every runtime event is bound to the graph hash.
     """
 
-    def __init__(self, path: str | Any):
-        self._path = str(path)
-        self._events: list[dict[str, Any]] = []
-        self._replayed = False
+    def __init__(self, path: str | os.PathLike[str]):
+        self._path = Path(path)
+        self._lock = threading.Lock()
         self._graph: TaskGraph | None = None
-        self._state: dict[str, LifecycleState] = {}
+        self._state: dict[str, NodeRuntimeState] = {}
 
-    @staticmethod
-    def _now() -> str:
-        return datetime.now(UTC).isoformat()
-
-    # --- append-only event log (immutable) ---------------------------
     def _append(self, event: dict[str, Any]) -> None:
-        # Append-only: we never truncate or rewrite history.  The log is the
-        # source of truth; materialized state is always derived from it.
-        self._events.append(event)
-        with open(self._path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(event, sort_keys=True) + "\n")
+        payload = (_canonical_json(event) + "\n").encode("utf-8")
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            fd = os.open(self._path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+            try:
+                view = memoryview(payload)
+                while view:
+                    written = os.write(fd, view)
+                    if written <= 0:
+                        raise OSError("short write to taskgraph event log")
+                    view = view[written:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
 
-    # --- write API (caller drives state transitions) -----------------
+    def _require_loaded(self) -> TaskGraph:
+        if self._graph is None:
+            raise RuntimeError("persist_graph() or replay() must be called first")
+        return self._graph
+
     def persist_graph(self, graph: TaskGraph) -> None:
-        """Atomically persist a validated graph to the event log."""
-        envelope_dict = graph.envelope.to_canonical_json()
-        node_dicts = [asdict(n) for n in graph.nodes]  # frozen dataclass → dict
-        # ensure tuples are materialized as lists for JSON determinism
-        for nd in node_dicts:
-            nd["dependencies"] = list(nd["dependencies"])
-            nd["tools"] = list(nd["tools"])
-            nd["permissions"] = list(nd["permissions"])
-            nd["inputs"] = nd["inputs"] or []
-            nd["expected_outputs"] = nd["expected_outputs"] or []
-        self._append(
-            {
-                "type": "graph_persisted",
-                "envelope": envelope_dict,
-                "nodes": node_dicts,
-                "ts": self._now(),
-            }
-        )
+        if self._path.exists() and self._path.stat().st_size:
+            raise GraphValidationError("taskgraph log is already initialized")
+        event = {
+            "type": "graph_persisted",
+            "graph_hash": graph.graph_hash(),
+            "graph": graph.to_planner_json(),
+            "ts": _utc_now(),
+        }
+        self._append(event)
         self._graph = graph
-        self._replayed = True
+        self._state = {node.id: NodeRuntimeState() for node in graph.nodes}
+
+    def set_node_runtime(self, node_id: str, runtime: NodeRuntimeState) -> None:
+        graph = self._require_loaded()
+        idx = graph._index()
+        if node_id not in idx:
+            raise GraphValidationError(f"runtime event references unknown node {node_id!r}")
+        runtime.validate_for(idx[node_id])
+        event = {
+            "type": "node_runtime",
+            "graph_hash": graph.graph_hash(),
+            "node_id": node_id,
+            "runtime": runtime.to_json(),
+            "ts": _utc_now(),
+        }
+        self._append(event)
+        self._state[node_id] = runtime
 
     def set_node_state(self, node_id: str, state: LifecycleState) -> None:
-        if state not in LifecycleState.__members__.values():
-            raise ValueError(f"unknown lifecycle state: {state!r}")
-        self._state[node_id] = state
-        self._append({"type": "node_state", "node_id": node_id, "state": state, "ts": self._now()})
-
-    def cancel_node(self, node_id: str, reason: str) -> None:
-        self._append(
-            {
-                "type": "graph_cancelled",
-                "node_id": node_id,
-                "reason": reason,
-                "ts": self._now(),
-            }
+        graph = self._require_loaded()
+        if node_id not in self._state:
+            raise GraphValidationError(f"runtime event references unknown node {node_id!r}")
+        current = self._state[node_id]
+        self.set_node_runtime(
+            node_id,
+            NodeRuntimeState(
+                lifecycle=state,
+                attempt=current.attempt,
+                lease_id=current.lease_id,
+                lease_expires_at=current.lease_expires_at,
+            ),
         )
 
-    # --- read / restart recovery -------------------------------------
-    def replay(self) -> tuple[TaskGraph, dict[str, LifecycleState]]:
-        """Replay the entire event log → (reconstructed graph, current state).
+    def cancel_node(self, node_id: str, reason: str) -> None:
+        graph = self._require_loaded()
+        if node_id not in self._state:
+            raise GraphValidationError(f"cancel event references unknown node {node_id!r}")
+        _require_text(reason, "cancel.reason", max_len=2048)
+        if _secret_hits(reason, "cancel.reason"):
+            raise GraphValidationError("cancel.reason contains secret-like material")
+        current = self._state[node_id]
+        runtime = NodeRuntimeState(
+            lifecycle=LifecycleState.CANCELLED,
+            attempt=current.attempt,
+            lease_id=None,
+            lease_expires_at=None,
+        )
+        runtime.validate_for(graph._index()[node_id])
+        self._append(
+            {
+                "type": "node_cancelled",
+                "graph_hash": graph.graph_hash(),
+                "node_id": node_id,
+                "runtime": runtime.to_json(),
+                "reason": reason,
+                "ts": _utc_now(),
+            }
+        )
+        self._state[node_id] = runtime
 
-        Raises if the log is missing or contains an unparseable event
-        (fail-closed).  Idempotent: re-replay yields the same result.
-        """
-        import os
-
-        if not os.path.exists(self._path):
+    def replay(self) -> tuple[TaskGraph, dict[str, NodeRuntimeState]]:
+        if not self._path.exists():
             raise FileNotFoundError(f"event log not found: {self._path}")
+        raw = self._path.read_bytes()
+        if not raw:
+            raise GraphValidationError("event log is empty")
+        complete = raw
+        if not raw.endswith(b"\n"):
+            cut = raw.rfind(b"\n")
+            complete = b"" if cut < 0 else raw[: cut + 1]
+        if not complete:
+            raise GraphValidationError("event log contains no complete events")
 
-        envelope: TaskGraphEnvelope | None = None
-        node_dicts: list[dict[str, Any]] = []
-        state: dict[str, LifecycleState] = {}
-        cancelled: set[str] = set()
+        graph: TaskGraph | None = None
+        graph_hash: str | None = None
+        state: dict[str, NodeRuntimeState] = {}
+        graph_seen = False
 
-        with open(self._path, encoding="utf-8") as fh:
-            for lineno, raw in enumerate(fh, 1):
-                raw = raw.strip()
-                if not raw:
-                    continue
-                try:
-                    ev = json.loads(raw)
-                except json.JSONDecodeError as e:
-                    raise GraphValidationError(f"malformed event on line {lineno}: {e}") from e
-                etype = ev.get("type")
-                if etype == "graph_persisted":
-                    env = ev["envelope"]
-                    envelope = TaskGraphEnvelope(
-                        issue=env["issue"],
-                        spec_hash=env["spec_hash"],
-                        graph_version=env["graph_version"],
-                        created_at=env["created_at"],
-                        planner=env["planner"],
-                        max_nodes=env.get("max_nodes", DEFAULT_MAX_NODES),
-                        max_depth=env.get("max_depth", DEFAULT_MAX_DEPTH),
-                        max_fanout=env.get("max_fanout", DEFAULT_MAX_FANOUT),
-                        policy_profile=str(env.get("policy_profile", "default")),
-                    )
-                    node_dicts = ev["nodes"]
-                elif etype == "node_state":
-                    state[ev["node_id"]] = LifecycleState(ev["state"])
-                elif etype == "graph_cancelled":
-                    cancelled.add(ev["node_id"])
-                    # durable cancellation: mark as cancelled in materialized state
-                    state[ev["node_id"]] = LifecycleState.CANCELLED
-                else:
-                    raise GraphValidationError(f"unknown event type {etype!r} on line {lineno}")
+        for lineno, line in enumerate(complete.splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                event = _strict_json_loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, _DuplicateKey) as exc:
+                raise GraphValidationError(f"malformed complete event on line {lineno}") from exc
+            if not isinstance(event, dict):
+                raise GraphValidationError(f"event on line {lineno} must be an object")
+            _validate_utc_timestamp(event.get("ts"), f"event[{lineno}].ts")
+            etype = event.get("type")
+            if etype == "graph_persisted":
+                if graph_seen:
+                    raise GraphValidationError("multiple graph_persisted events in one log")
+                if lineno != 1:
+                    raise GraphValidationError("graph_persisted must be the first event")
+                graph = TaskGraph.parse_planner_output(event.get("graph"))
+                graph_hash = graph.graph_hash()
+                if event.get("graph_hash") != graph_hash:
+                    raise GraphValidationError("persisted graph hash mismatch")
+                state = {node.id: NodeRuntimeState() for node in graph.nodes}
+                graph_seen = True
+                continue
 
-        if envelope is None:
+            if not graph_seen or graph is None or graph_hash is None:
+                raise GraphValidationError("runtime event precedes graph_persisted")
+            if event.get("graph_hash") != graph_hash:
+                raise GraphValidationError(f"event on line {lineno} targets a different graph hash")
+            node_id = event.get("node_id")
+            idx = graph._index()
+            if node_id not in idx:
+                raise GraphValidationError(
+                    f"event on line {lineno} references unknown node {node_id!r}"
+                )
+            if etype == "node_runtime":
+                state[node_id] = NodeRuntimeState.from_dict(event.get("runtime"), idx[node_id])
+            elif etype == "node_cancelled":
+                runtime = NodeRuntimeState.from_dict(event.get("runtime"), idx[node_id])
+                if runtime.lifecycle is not LifecycleState.CANCELLED:
+                    raise GraphValidationError("node_cancelled event must materialize cancelled state")
+                reason = _require_text(event.get("reason"), "cancel.reason", max_len=2048)
+                if _secret_hits(reason, "cancel.reason"):
+                    raise GraphValidationError("cancel.reason contains secret-like material")
+                state[node_id] = runtime
+            else:
+                raise GraphValidationError(f"unknown event type {etype!r} on line {lineno}")
+
+        if graph is None:
             raise GraphValidationError("no graph_persisted event in log")
-
-        graph = TaskGraph.from_planner_output(envelope, node_dicts)
         self._graph = graph
         self._state = state
-        self._replayed = True
-        return graph, state
+        return graph, dict(state)
 
-    def current_state(self) -> dict[str, LifecycleState]:
-        if not self._replayed:
-            raise RuntimeError("call replay() before current_state()")
+    def current_state(self) -> dict[str, NodeRuntimeState]:
+        self._require_loaded()
         return dict(self._state)
 
     @property
     def graph(self) -> TaskGraph:
-        if not self._replayed:
-            raise RuntimeError("call replay() first")
-        return self._graph  # type: ignore[return-value]
+        return self._require_loaded()
 
     def graph_hash(self) -> str:
-        if not self._replayed:
-            raise RuntimeError("call replay() first")
-        return self._graph.graph_hash()  # type: ignore[union-attr]
+        return self._require_loaded().graph_hash()
