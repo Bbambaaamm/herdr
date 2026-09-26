@@ -16,7 +16,7 @@ Consumer repositories pin both a tag and immutable commit SHA in HERDR.lock.
 
 main
 → CI-green immutable commit
-→ signed/pinned release tag
+→ annotated/pinned release tag
 → staging deployment
 → canary consumer(s)
 → soak and telemetry review
