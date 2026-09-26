@@ -1,13 +1,13 @@
 # Herdr Model Portfolio v2 — capability/cost-aware routing roadmap
 
-Status: **PLANNED**  
-Scope: Agent Platform / Herdr  
-Created: 2026-09-27  
-Related epic: #229  
-Runtime prerequisite: #231  
-Telemetry prerequisite: #234  
-Admission/budget prerequisite: #236  
-Rollout prerequisite: #237
+Status: **PLANNED**
+Scope: Agent Platform / Herdr
+Created: 2026-09-27
+Related epic: #1
+Runtime prerequisite: #3
+Telemetry prerequisite: #6
+Admission/budget prerequisite: #8
+Rollout prerequisite: #9
 
 ## 1. Cíl
 
@@ -104,7 +104,7 @@ Routing je task-specific: coding, research, document, vision a reviewer role moh
 - provider outage vede k auditovanému fallbacku;
 - premium model se nepoužije jen proto, že levnější model vrátil stylisticky neideální výsledek;
 - routing nesmí obejít reviewer/CI/merge autoritu;
-- PAPER-only invariant QuantLabu zůstává nedotčený;
+- consumer-specific safety invarianty zůstávají nedotčené (v QuantLabu včetně PAPER-only);
 - secrets nikdy nesmí být v task payloadu, telemetry ani dashboardu.
 
 ## 6. Telemetry a rozhodování
@@ -140,9 +140,9 @@ Preference modelů se mění pouze na základě nasbírané evidence a versionov
 
 ### Phase 0 — contracts
 
-- [ ] dokončit #231 model-router adapter bez hardcodování jednoho modelu;
-- [ ] dokončit #234 jednotnou model/token/cost/fallback telemetry;
-- [ ] dokončit #236 resource/cost admission guardrails;
+- [ ] dokončit #3 model-router adapter bez hardcodování jednoho modelu;
+- [ ] dokončit #6 jednotnou model/token/cost/fallback telemetry;
+- [ ] dokončit #8 resource/cost admission guardrails;
 - [ ] definovat provider-neutral `ModelCapability` + `ModelPolicy` contract;
 - [ ] oddělit logical role od konkrétního provider/model ID.
 
@@ -202,7 +202,7 @@ Preference modelů se mění pouze na základě nasbírané evidence a versionov
 - [ ] Wave A prokáže snížení premium escalation rate nebo cost/success proti baseline;
 - [ ] premium reviewer prokáže měřitelný přínos, jinak se nepoužívá;
 - [ ] rollback vrátí routing na předchozí versioned policy;
-- [ ] žádná změna PAPER-only / merge authority / security invariants.
+- [ ] žádná změna consumer-specific safety invariantů / merge authority / security invariants.
 
 ## 9. Co nyní nedělat
 
@@ -216,9 +216,9 @@ Preference modelů se mění pouze na základě nasbírané evidence a versionov
 ## 10. Doporučené pořadí
 
 ```text
-#231 router adapter
-   + #234 telemetry
-   + #236 budgets
+#3 router adapter
+   + #6 telemetry
+   + #8 budgets
         ↓
 provider-neutral capability contract
         ↓
@@ -234,7 +234,7 @@ DeepSeek experimental lane
         ↓
 adaptive evidence-based policy
         ↓
-#237 E2E staged rollout / soak / rollback
+#9 E2E staged rollout / soak / rollback
 ```
 
 ## 11. Rozhodovací zásada
