@@ -20,4 +20,4 @@ jobs:
       - name: Validate repository contract
         run: python scripts/validate_repo.py
       - name: Compile Python sources
-        run: python -m compileall -q agent_platform_dashboard tests
+        run: python -m compileall -q agent_platform_dashboard deploy tests
