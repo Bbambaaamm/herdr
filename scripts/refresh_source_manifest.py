@@ -3,6 +3,7 @@ from pathlib import Path
 import hashlib
 
 ROOTS = (
+    Path("herdr"),
     Path("agent_platform_dashboard"),
     Path("tests"),
     Path("agent-stack"),
