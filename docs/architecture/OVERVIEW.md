@@ -2,9 +2,11 @@
 
 ## Control plane
 
-GitHub authorization or another approved ingress enters Herdr. Herdr plans a bounded TaskGraph, validates it, schedules ready nodes, admits work under permission/resource/cost policy, and launches isolated child workers.
+GitHub authorization or another approved ingress enters the platform. A persistent Hermes parent provides cognitive orchestration: decomposition intent, delegation and synthesis. Herdr validates the proposed bounded TaskGraph, schedules ready nodes, admits work under permission/resource/cost policy, and launches isolated child workers. The parent identity remains stable; model/cost routing selects bounded node executors rather than replacing the root coordinator.
 
 Every child is subordinate to its parent policy. A child cannot gain tools, filesystem scope, network scope, model/provider scope, resource budget, or project authority that its parent did not have.
+
+See `HERMES_CONTROL_PLANE.md` for the Hermes/Herdr responsibility boundary and `../operations/PROMPT_STALL_RECOVERY.md` for durable delivery/retry semantics.
 
 ## Execution flow
 
