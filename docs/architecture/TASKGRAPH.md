@@ -1,6 +1,6 @@
 # TaskGraph v1.1 contract
 
-`herdr_core.taskgraph` is the canonical durable planner contract for Herdr. It is generic infrastructure: consumer-specific invariants such as QuantLab PAPER-only remain in each consumer policy and are not embedded in the core schema.
+`herdr.taskgraph` is the canonical durable planner contract for Herdr. It is generic infrastructure: consumer-specific invariants such as QuantLab PAPER-only remain in each consumer policy and are not embedded in the core schema.
 
 ## Planner boundary
 
