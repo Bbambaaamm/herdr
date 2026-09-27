@@ -171,6 +171,19 @@ class ObservabilityContractTests(unittest.TestCase):
                 self.assertEqual(row["routing_observed_at"], now - 3600)
                 self.assertEqual(row["last_route_model"], "gpt-6-sol")
                 self.assertEqual(row["last_route_reason"], "cheap_attempts_exhausted")
+
+                v11 = routing_payload(now)
+                v11["policy"]["version"] = "cost-aware-v1.1-hermes-parent"
+                v11["recent"][0].update({
+                    "delivery_reconcile_count": 0,
+                    "coordinator_agent": "quantlab-hermes",
+                    "executor_agent": "quantlab-sol",
+                    "routing_scope": "child_node",
+                })
+                routing.write_text(json.dumps(v11), encoding="utf-8")
+                upgraded, _ = sources.codex(str(codex), "majak")
+                self.assertEqual(upgraded[0]["routing_status"], "available")
+
                 routing_data = routing_payload(now)
                 routing_data["recent"][0]["prompt"] = "PRIVATE"
                 routing.write_text(json.dumps(routing_data), encoding="utf-8")

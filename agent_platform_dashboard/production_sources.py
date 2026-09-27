@@ -301,7 +301,15 @@ def _routing_summary(now):
         c.need(type(recent) is list and len(recent) <= 200)
         last = recent[-1] if recent else None
         if last is not None:
-            c.keys(last, 'at task_id issue attempt tier model selected_agent reason complexity_score codex_used_percent')
+            legacy_keys = set(
+                'at task_id issue attempt tier model selected_agent reason '
+                'complexity_score codex_used_percent'.split()
+            )
+            v11_keys = legacy_keys | {
+                'delivery_reconcile_count', 'coordinator_agent',
+                'executor_agent', 'routing_scope',
+            }
+            c.need(type(last) is dict and set(last) in (legacy_keys, v11_keys))
             c.need(c.number(last['at']) and c.identifier(last['task_id'])
                    and (last['issue'] is None or c.number(last['issue']))
                    and c.number(last['attempt']) and last['tier'] in ('free', 'sol', 'astra')
@@ -311,6 +319,11 @@ def _routing_summary(now):
                    and 0 <= last['complexity_score'] <= 1
                    and (last['codex_used_percent'] is None or c.number(last['codex_used_percent'])
                         and last['codex_used_percent'] <= 100))
+            if set(last) == v11_keys:
+                c.need(c.number(last['delivery_reconcile_count'])
+                       and c.identifier(last['coordinator_agent'])
+                       and c.identifier(last['executor_agent'])
+                       and last['routing_scope'] == 'child_node')
         return {
             'routing_status': 'available', 'routing_policy_version': policy['version'],
             'routing_observed_at': raw['observed_at'], 'routing_soft_limit_pct': policy['soft_limit_pct'],

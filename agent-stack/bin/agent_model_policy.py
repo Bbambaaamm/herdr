@@ -4,7 +4,7 @@ import os
 import time
 from pathlib import Path
 
-POLICY_VERSION = "cost-aware-v1.0"
+POLICY_VERSION = "cost-aware-v1.1-hermes-parent"
 SOFT_LIMIT_PCT = 70
 HARD_LIMIT_PCT = 90
 USAGE_PATH = Path("/var/lib/agent-platform-herdr/codex-usage.json")
@@ -95,6 +95,10 @@ def _provider_failure(task):
 def decide(task):
     requested = str(task.get("agent") or FREE_AGENT)
     profile = str(task.get("safety_profile") or "quantlab")
+    coordinator = str(
+        task.get("coordinator_agent")
+        or (FREE_AGENT if profile == "quantlab" else requested)
+    )
     attempt = int(task.get("attempts") or 0)
     complexity = _complexity(task)
     usage = _usage_state()
@@ -146,9 +150,8 @@ def decide(task):
     elif tier == "sol" and used is not None and used >= SOFT_LIMIT_PCT and attempt < 3:
         tier, reason = "free", "soft_limit_premium_conservation"
 
-    agent = {"free": FREE_AGENT, "sol": SOL_AGENT, "astra": ASTRA_AGENT}[tier]
-    model = {
-
+    executor_agent = {"free": FREE_AGENT, "sol": SOL_AGENT, "astra": ASTRA_AGENT}[tier]
+    executor_model = {
         "free": "nous-adaptive-free",
         "sol": "gpt-6-sol",
         "astra": "gpt-6-astra",
@@ -156,8 +159,11 @@ def decide(task):
     return {
         "policy_version": POLICY_VERSION,
         "tier": tier,
-        "selected_agent": agent,
-        "model": model,
+        "selected_agent": coordinator,
+        "coordinator_agent": coordinator,
+        "executor_agent": executor_agent,
+        "model": executor_model,
+        "routing_scope": "child_node",
         "reason": reason,
         "attempt": attempt,
         "complexity_score": complexity,
@@ -213,9 +219,17 @@ def record(task, decision):
         "task_id": str(task.get("id") or "")[:128],
         "issue": task.get("issue") if isinstance(task.get("issue"), int) else None,
         "attempt": int(decision["attempt"]),
+        "delivery_reconcile_count": int(task.get("delivery_reconcile_count") or 0),
         "tier": tier,
         "model": str(decision["model"]),
         "selected_agent": str(decision["selected_agent"]),
+        "coordinator_agent": str(
+            decision.get("coordinator_agent") or decision["selected_agent"]
+        ),
+        "executor_agent": str(
+            decision.get("executor_agent") or decision["selected_agent"]
+        ),
+        "routing_scope": str(decision.get("routing_scope") or "root"),
         "reason": reason,
         "complexity_score": decision["complexity_score"],
         "codex_used_percent": decision["codex_used_percent"],

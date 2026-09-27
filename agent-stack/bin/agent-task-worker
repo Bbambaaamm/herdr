@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import hashlib
 import json
 import os
 import subprocess
@@ -56,6 +57,28 @@ def archive_previous_result(task_id: str, attempt: int) -> None:
     os.replace(rp, archived)
     os.chmod(archived, 0o600)
 
+
+def prepare_attempt(task: dict) -> None:
+    """Allocate one semantic execution attempt; reconciliation reuses it."""
+    if task.get("attempt_state") == "delivery_uncertain" and task.get("run_token"):
+        return
+    attempt = int(task.get("attempts") or 0)
+    archive_previous_result(str(task["id"]), attempt)
+    task["run_token"] = uuid.uuid4().hex
+    task["attempt_id"] = attempt
+    seed = ":".join(
+        (
+            str(task["id"]),
+            str(attempt),
+            str(task.get("graph_hash") or ""),
+            str(task.get("spec_hash") or ""),
+        )
+    )
+    task["idempotency_key"] = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    task["delivery_reconcile_count"] = 0
+    task["attempt_state"] = "dispatching"
+    task["attempt_started_at"] = utcnow().isoformat()
+
 def prompt_text(task: dict) -> str:
     task_id = str(task["id"])
     result = result_path(task_id)
@@ -64,6 +87,7 @@ def prompt_text(task: dict) -> str:
     profile = str(task.get("safety_profile") or "quantlab")
     routing = task.get("routing") if isinstance(task.get("routing"), dict) else {}
     agent = str(routing.get("selected_agent") or task.get("agent") or "quantlab-hermes")
+    executor_agent = str(routing.get("executor_agent") or agent)
     tier = str(routing.get("tier") or "free")
     model = str(routing.get("model") or "nous-adaptive-free")
     repo = str(task.get("repo") or "Bbambaaamm/Autonomous-Quant-Lab")
@@ -91,14 +115,14 @@ TASK COMPLETION CONTRACT:
 """
     else:
         route_rule = {
-            "free": "- This attempt is on the FREE tier. Use only Nous routing: Laguna -> LongCat -> Step -> Solar. Do not invoke OpenAI Codex.",
-            "sol": "- This is a budgeted SOL escalation after cheaper attempts were insufficient. Stay on the assigned gpt-6-sol model; do not self-escalate to Astra.",
-            "astra": "- This is an explicitly budgeted ASTRA escalation. Use the assigned gpt-6-astra model only for this bounded task.",
-        }.get(tier, "- Follow the assigned model route and do not self-escalate.")
+            "free": f"- Keep {agent} as the root coordinator. Eligible child nodes may use the FREE route via {executor_agent}; do not replace the parent identity.",
+            "sol": f"- Keep {agent} as the root coordinator. The router recommends {executor_agent}/{model} only for bounded child-node capability work; do not replace the parent identity or self-escalate to Astra.",
+            "astra": f"- Keep {agent} as the root coordinator. The router recommends {executor_agent}/{model} only for explicitly budgeted bounded child-node work.",
+        }.get(tier, "- Keep the parent coordinator stable and apply routing only to bounded child nodes.")
         contract = f"""
 
 TASK COMPLETION CONTRACT:
-- You are running as {agent} under Herdr with routed tier={tier} model={model}.
+- You are running as persistent coordinator {agent} under Herdr; routed child-node tier={tier} executor={executor_agent} model={model}.
 - Work from the issue-specific clean worktree when code changes are needed; do not contaminate another issue's dirty checkout.
 {route_rule}
 - Preserve PAPER-only, PIT/causality, provenance, immutable audit and runtime/resource/safety guardrails.
@@ -153,10 +177,119 @@ def wait_for_durable_result(task: dict, timeout_seconds: int) -> bool:
     return False
 
 
+def _swarm_snapshot_evidence(task: dict, spec: dict) -> list[str] | None:
+    path = Path(str(spec.get("path") or ""))
+    if not path.is_absolute() or not path.exists():
+        return None
+    try:
+        snapshot = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(snapshot, dict) or snapshot.get("paper_only") is not True:
+        return None
+    agents = snapshot.get("agents")
+    edges = snapshot.get("edges")
+    if not isinstance(agents, list) or not isinstance(edges, list):
+        return None
+
+    parent_agent = str(spec.get("parent_agent_id") or "")
+    parent_task = str(spec.get("parent_task_id") or "")
+    minimum = int(spec.get("min_children") or 1)
+    parents = [
+        row for row in agents
+        if isinstance(row, dict)
+        and row.get("agent_id") == parent_agent
+        and row.get("task_id") == parent_task
+        and row.get("state") == "done"
+    ]
+    children = [
+        row for row in agents
+        if isinstance(row, dict)
+        and row.get("parent_agent_id") == parent_agent
+        and row.get("parent_task_id") == parent_task
+        and row.get("state") == "done"
+    ]
+    if len(parents) != 1 or len(children) < minimum:
+        return None
+    child_ids = {str(row.get("agent_id") or "") for row in children}
+    tokens = {int(row.get("fencing_token") or 0) for row in children}
+    if "" in child_ids or len(child_ids) != len(children):
+        return None
+    if 0 in tokens or len(tokens) != len(children):
+        return None
+    child_tasks = {str(row.get("task_id") or "") for row in children}
+    parent_edges = {
+        str(row.get("to") or "")
+        for row in edges
+        if isinstance(row, dict)
+        and row.get("kind") == "parent"
+        and row.get("from") == parent_task
+    }
+    if not child_tasks.issubset(parent_edges):
+        return None
+    return [
+        f"trusted swarm snapshot {path}",
+        f"parent={parent_agent}/{parent_task} done",
+        f"children_done={len(children)} distinct_fencing={len(tokens)}",
+    ]
+
+
+def reconcile_completion_evidence(task: dict) -> bool:
+    spec = task.get("completion_evidence")
+    if not isinstance(spec, dict):
+        return False
+    if spec.get("kind") != "herdr_swarm_snapshot":
+        return False
+    evidence = _swarm_snapshot_evidence(task, spec)
+    if evidence is None:
+        return False
+    write_json(
+        result_path(str(task["id"])),
+        {
+            "task_id": str(task["id"]),
+            "run_token": str(task.get("run_token") or ""),
+            "status": "completed",
+            "summary": "Completion reconciled from trusted Herdr durable runtime evidence.",
+            "issue": task.get("issue"),
+            "repo": task.get("repo"),
+            "evidence": evidence,
+            "blocker": None,
+            "next_action": "Continue with the next dependency-safe orchestration slice.",
+            "completed_at": utcnow().isoformat(),
+        },
+    )
+    return True
+
+
+def defer_delivery_reconciliation(task_path: Path, task: dict, reason: str) -> None:
+    count = int(task.get("delivery_reconcile_count") or 0) + 1
+    task["delivery_reconcile_count"] = count
+    task["attempt_state"] = "delivery_uncertain"
+    task["last_error"] = reason[-2000:]
+    maximum = int(task.get("max_delivery_reconciles") or 12)
+    if count >= maximum:
+        block_task(
+            task_path,
+            task,
+            "delivery_uncertain_requires_recovery",
+            "Prompt delivery remains ambiguous after bounded reconciliation; no blind redispatch was performed.",
+        )
+        return
+    delay = min(300, 15 * (2 ** min(count - 1, 4)))
+    task["not_before"] = (utcnow() + timedelta(seconds=delay)).isoformat()
+    write_json(task_path, task)
+    move(task_path, PENDING)
+
+
 def retry(task_path: Path, task: dict, reason: str) -> None:
+    """Start a new semantic execution attempt after the prior one is terminal."""
     attempts = int(task.get("attempts") or 0) + 1
     task["attempts"] = attempts
     task["last_error"] = reason[-2000:]
+    task["attempt_state"] = "retry_scheduled"
+    task.pop("run_token", None)
+    task.pop("attempt_id", None)
+    task.pop("idempotency_key", None)
     max_attempts = int(task.get("max_attempts") or 4)
     if attempts >= max_attempts:
         task["failed_at"] = utcnow().isoformat()
@@ -196,20 +329,30 @@ def block_task(task_path: Path, task: dict, blocker: str, summary: str) -> None:
 def finish(task_path: Path, task: dict, output: str) -> None:
     task_id = str(task["id"])
     rp = result_path(task_id)
+    task["attempt_state"] = "verifying"
     if not rp.exists():
-        retry(task_path, task, "agent settled without required result JSON")
-        return
+        if reconcile_completion_evidence(task):
+            rp = result_path(task_id)
+        else:
+            defer_delivery_reconciliation(
+                task_path, task, "agent settled without required result JSON"
+            )
+            return
     try:
         result = json.loads(rp.read_text(encoding="utf-8"))
     except Exception as exc:
-        retry(task_path, task, f"invalid result JSON: {exc}")
+        defer_delivery_reconciliation(task_path, task, f"invalid result JSON: {exc}")
         return
 
     if str(result.get("task_id") or "") != task_id:
-        retry(task_path, task, "result task_id does not match durable task")
+        defer_delivery_reconciliation(
+            task_path, task, "result task_id does not match durable task"
+        )
         return
     if str(result.get("run_token") or "") != str(task.get("run_token") or ""):
-        retry(task_path, task, "result run_token does not match current attempt")
+        defer_delivery_reconciliation(
+            task_path, task, "result run_token does not match current attempt"
+        )
         return
 
     status = str(result.get("status") or "")
@@ -217,11 +360,14 @@ def finish(task_path: Path, task: dict, output: str) -> None:
     task["agent_output_tail"] = output[-4000:]
     task["result_status"] = status
     task["finished_at"] = utcnow().isoformat()
+    task["attempt_state"] = status if status in {"completed", "blocked", "failed"} else "verifying"
     write_json(task_path, task)
 
     if blocker and blocker.lower() not in {"none", "null"}:
         move(task_path, BLOCKED)
     elif status == "completed":
+        task["attempt_state"] = "done"
+        write_json(task_path, task)
         move(task_path, DONE)
     elif status == "blocked":
         move(task_path, BLOCKED)
@@ -239,10 +385,26 @@ def main(task_path: Path) -> int:
 
         task = json.loads(task_path.read_text(encoding="utf-8"))
         task_id = str(task["id"])
+
+        if task.get("attempt_state") == "delivery_uncertain" and task.get("run_token"):
+            log(
+                task_id,
+                "reconciling ambiguous delivery without redispatch "
+                f"count={task.get('delivery_reconcile_count', 0)} "
+                f"run_token={task['run_token']}",
+            )
+            if wait_for_durable_result(task, 1) or reconcile_completion_evidence(task):
+                finish(task_path, task, "reconciled durable result without redispatch")
+                return 0
+            defer_delivery_reconciliation(
+                task_path,
+                task,
+                str(task.get("last_error") or "delivery remains uncertain"),
+            )
+            return 0
+
+        prepare_attempt(task)
         attempt = int(task.get("attempts") or 0)
-        archive_previous_result(task_id, attempt)
-        task["run_token"] = uuid.uuid4().hex
-        task["attempt_started_at"] = utcnow().isoformat()
         decision = decide_model_route(task)
         task["routing"] = decision
         try:
@@ -254,7 +416,10 @@ def main(task_path: Path) -> int:
                     decision,
                     tier="free",
                     selected_agent="quantlab-hermes",
+                    coordinator_agent="quantlab-hermes",
+                    executor_agent="quantlab-hermes",
                     model="nous-adaptive-free",
+                    routing_scope="child_node",
                     reason="routing_audit_unavailable",
                     astra_escalation=False,
                 )
@@ -271,7 +436,9 @@ def main(task_path: Path) -> int:
         try:
             rc, output = run_prompt(task)
         except subprocess.TimeoutExpired as exc:
-            retry(task_path, task, f"dispatcher timeout: {exc}")
+            defer_delivery_reconciliation(
+                task_path, task, f"dispatcher timeout with unknown delivery state: {exc}"
+            )
             return 1
 
         log(task_id, f"herdr rc={rc} tail={output[-500:]!r}")
@@ -292,15 +459,15 @@ def main(task_path: Path) -> int:
             grace = max(30, min(grace, int(task.get("timeout_seconds") or 1800)))
             log(
                 task_id,
-                f"prompt observation stalled; waiting up to {grace}s for durable result",
+                f"prompt observation stalled; reconciling same attempt for up to {grace}s",
             )
-            if wait_for_durable_result(task, grace):
+            if reconcile_completion_evidence(task) or wait_for_durable_result(task, grace):
                 finish(task_path, task, output)
                 return 0
-            retry(
+            defer_delivery_reconciliation(
                 task_path,
                 task,
-                f"agent_prompt_stalled without durable result after {grace}s: {output}",
+                f"agent_prompt_stalled with ambiguous delivery after {grace}s: {output}",
             )
             return 1
 
@@ -319,9 +486,15 @@ def main(task_path: Path) -> int:
             return 1
 
         if rc != 0:
-            retry(task_path, task, output or f"herdr rc={rc}")
+            defer_delivery_reconciliation(
+                task_path,
+                task,
+                output or f"herdr rc={rc} with unknown delivery state",
+            )
             return 1
 
+        task["attempt_state"] = "accepted"
+        write_json(task_path, task)
         finish(task_path, task, output)
         return 0
     finally:
