@@ -3,6 +3,7 @@ set -u
 
 STATE=/home/agentops/.local/state/agent-stack
 ENSURE=/home/agentops/.local/bin/agent-stack-ensure
+RECOVERY=/home/agentops/.local/bin/agent-stack-recovery
 mkdir -p "$STATE"
 
 exec 9>"$STATE/watchdog.lock"
@@ -15,6 +16,7 @@ echo "$(date -Is) watchdog started" >> "$STATE/watchdog.log"
 while true; do
   /bin/sleep 20
   /usr/bin/flock -n "$STATE/ensure.lock" "$ENSURE" >> "$STATE/watchdog.log" 2>&1 || true
+  /usr/bin/flock -n "$STATE/recovery.lock" "$RECOVERY" >> "$STATE/watchdog.log" 2>&1 || true
   /usr/bin/flock -n "$STATE/maintenance.lock" /home/agentops/.local/bin/hermes-maintenance >> "$STATE/watchdog.log" 2>&1 || true
   /bin/sleep 40
 done

@@ -156,3 +156,24 @@ blocked until its prior task-owned pane has been closed successfully.
 The session name is attempt-scoped: reconciliation of the same semantic attempt preserves the same
 identity, while a genuinely new attempt receives a new run token and therefore a new session. This
 keeps orchestration identity stable without sharing model conversation state between unrelated tasks.
+
+## Watchdog recovery boundary
+
+The watchdog is a safety net, not a second executor.
+
+- A file left in `tasks/running/` is considered orphaned only when its matching
+  `agent-task-worker` process is absent and its execution age exceeds
+  `timeout_seconds + 300s`.
+- A matching durable result may be terminalized into `done/blocked/failed`.
+- Without a matching result, the task is moved to `blocked` with
+  `orphaned_running_unknown_delivery`; it is never blindly requeued.
+- A stale/mismatched result is preserved and a separate watchdog recovery result
+  is written instead of overwriting evidence.
+- Codex self-update prompts are treated as transport/UI stalls. For Codex panes
+  only, the watchdog detects the active three-choice update menu and sends
+  `Esc` to skip it. It never installs an update automatically.
+- A passive update banner displayed above a healthy Codex prompt is not treated
+  as a blocking dialog.
+
+These rules preserve PAPER-only/runtime/resource guardrails and avoid duplicate
+work while allowing the primary dispatcher to remain authoritative.
