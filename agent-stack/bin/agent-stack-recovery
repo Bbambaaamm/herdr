@@ -15,6 +15,7 @@ BLOCKED = ROOT / "blocked"
 FAILED = ROOT / "failed"
 RESULTS = ROOT / "results"
 ORPHAN_GRACE_SECONDS = 300
+TASK_PANE_ENV = "HERDR_DURABLE_TASK_PANE"
 
 ENV = os.environ.copy()
 ENV["HOME"] = str(HOME)
@@ -34,13 +35,18 @@ def write_json(path: Path, payload: dict) -> None:
 
 
 def parse_started(task: dict, path: Path) -> datetime:
-    raw = str(task.get("attempt_started_at") or "").strip()
-    if raw:
+    candidates = [datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)]
+    for key in ("dispatch_claimed_at", "attempt_started_at"):
+        raw = str(task.get(key) or "").strip()
+        if not raw:
+            continue
         try:
-            return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+            candidates.append(
+                datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+            )
         except ValueError:
-            pass
-    return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+            continue
+    return max(candidates)
 
 
 def active_worker_tasks() -> set[Path]:
@@ -77,6 +83,8 @@ def matching_result(task: dict) -> tuple[dict | None, str]:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None, "invalid_json"
+    if not isinstance(payload, dict):
+        return None, "invalid_shape"
     if str(payload.get("task_id") or "") != task_id:
         return None, "task_id_mismatch"
     if str(payload.get("run_token") or "") != run_token:
@@ -91,73 +99,274 @@ def move_task(path: Path, target_dir: Path, task: dict) -> None:
 
 
 def watchdog_result_path(task_id: str) -> Path:
-    canonical = RESULTS / f"{task_id}.json"
-    if not canonical.exists():
-        return canonical
-    stamp = utcnow().strftime("%Y%m%dT%H%M%SZ")
-    return RESULTS / f"{task_id}.watchdog-recovery-{stamp}.json"
+    # Recovery evidence is always sidecar-only. The canonical result path is
+    # owned by the task executor/runtime and must never be overwritten.
+    stamp = utcnow().strftime("%Y%m%dT%H%M%S.%fZ")
+    return RESULTS / f"{task_id}.watchdog-recovery-{stamp}-{os.getpid()}.json"
 
 
-def block_orphan(path: Path, task: dict, *, reason: str, age_seconds: int) -> None:
-    task_id = str(task.get("id") or path.stem)
-    summary = (
-        f"Watchdog found orphaned running task with no matching worker after "
-        f"{age_seconds}s; delivery state is unknown, so no blind redispatch was performed."
+def _herdr_json(args: list[str], timeout: float = 15.0) -> dict | None:
+    try:
+        proc = subprocess.run(
+            [str(HERDR), *args],
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            env=ENV,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    if proc.returncode != 0:
+        return None
+
+    for raw in reversed((proc.stdout or "").splitlines()):
+        candidate = raw.strip()
+        if not candidate.startswith("{"):
+            continue
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+
+    return None
+
+
+def _pane_presence(pane_id: str) -> bool | None:
+    payload = _herdr_json(["pane", "list"], timeout=10.0)
+    if payload is None:
+        return None
+
+    panes = (payload.get("result") or {}).get("panes")
+    if not isinstance(panes, list):
+        return None
+
+    return any(
+        isinstance(row, dict)
+        and str(row.get("pane_id") or "") == pane_id
+        for row in panes
     )
-    result = {
-        "task_id": task_id,
-        "run_token": str(task.get("run_token") or ""),
-        "status": "blocked",
-        "summary": summary,
-        "issue": task.get("issue"),
-        "repo": task.get("repo"),
-        "evidence": [reason],
-        "blocker": "orphaned_running_unknown_delivery",
-        "next_action": "Reconcile durable/GitHub evidence before requeueing this same task.",
-        "completed_at": utcnow().isoformat(),
-    }
-    write_json(watchdog_result_path(task_id), result)
-    task["watchdog_blocker"] = result["blocker"]
+
+
+def _pane_has_marker(pane_id: str, marker: str) -> bool:
+    if not marker:
+        return False
+
+    payload = _herdr_json(
+        ["pane", "process-info", "--pane", pane_id],
+        timeout=10.0,
+    )
+    if payload is None:
+        return False
+
+    process_info = (payload.get("result") or {}).get("process_info")
+    if not isinstance(process_info, dict):
+        return False
+
+    try:
+        shell_pid = int(process_info.get("shell_pid") or 0)
+    except (TypeError, ValueError):
+        return False
+
+    if shell_pid <= 0:
+        return False
+
+    try:
+        environ = Path(
+            f"/proc/{shell_pid}/environ"
+        ).read_bytes().split(b"\0")
+    except OSError:
+        return False
+
+    expected = f"{TASK_PANE_ENV}={marker}".encode("utf-8")
+    return expected in environ
+
+
+def cleanup_task_owned_pane(task: dict) -> bool:
+    session = task.get("execution_session")
+
+    if not isinstance(session, dict) or not session.get("owned_pane"):
+        return True
+
+    if session.get("closed_at"):
+        return True
+
+    pane_id = str(session.get("pane_id") or "")
+    marker = str(session.get("pane_marker") or "")
+    coordinator_pane = str(
+        session.get("coordinator_pane_id") or ""
+    )
+
+    if (
+        not pane_id
+        or not marker
+        or (coordinator_pane and pane_id == coordinator_pane)
+    ):
+        session["cleanup_status"] = "close_unproven"
+        session["cleanup_error"] = (
+            "task pane identity is incomplete or unsafe"
+        )
+        return False
+
+    present = _pane_presence(pane_id)
+
+    # Pane is already gone: cleanup objective is satisfied.
+    if present is False:
+        session["closed_at"] = utcnow().isoformat()
+        session["cleanup_status"] = "already_absent"
+        session.pop("cleanup_error", None)
+        return True
+
+    if present is None:
+        session["cleanup_status"] = "close_unproven"
+        session["cleanup_error"] = (
+            "pane presence could not be verified"
+        )
+        return False
+
+    # Never close a currently existing pane only because an old pane_id
+    # happens to match. Durable task marker must prove ownership.
+    if not _pane_has_marker(pane_id, marker):
+        session["cleanup_status"] = "close_unproven"
+        session["cleanup_error"] = "pane ownership marker mismatch"
+        return False
+
+    try:
+        proc = subprocess.run(
+            [str(HERDR), "pane", "close", pane_id],
+            text=True,
+            capture_output=True,
+            timeout=15,
+            env=ENV,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        session["cleanup_status"] = "close_failed"
+        session["cleanup_error"] = str(exc)[-1000:]
+        return False
+
+    if proc.returncode != 0:
+        session["cleanup_status"] = "close_failed"
+        session["cleanup_error"] = (
+            proc.stderr
+            or proc.stdout
+            or "pane close failed"
+        )[-1000:]
+        return False
+
+    session["closed_at"] = utcnow().isoformat()
+    session["cleanup_status"] = "closed"
+    session.pop("cleanup_error", None)
+    return True
+def block_orphan(path: Path, task: dict, *, reason: str, age_seconds: int) -> None:
+    """Quarantine unknown delivery in-place; never create a false terminal state."""
+    task_id = str(task.get("id") or path.stem)
+    blocker = "orphaned_running_unknown_delivery"
+    if task.get("watchdog_blocker") != blocker:
+        summary = (
+            f"Watchdog found orphaned running task with no matching worker after "
+            f"{age_seconds}s; delivery state is unknown, so no blind redispatch was performed."
+        )
+        result = {
+            "task_id": task_id,
+            "run_token": str(task.get("run_token") or ""),
+            "status": "blocked",
+            "summary": summary,
+            "issue": task.get("issue"),
+            "repo": task.get("repo"),
+            "evidence": [reason],
+            "blocker": blocker,
+            "next_action": "Reconcile durable/GitHub evidence before requeueing this same task.",
+            "completed_at": utcnow().isoformat(),
+        }
+        write_json(watchdog_result_path(task_id), result)
+        task["watchdog_observed_at"] = utcnow().isoformat()
+    task["watchdog_blocker"] = blocker
     task["last_error"] = reason[-2000:]
-    task["result_status"] = "blocked"
-    task["attempt_state"] = "blocked"
-    task["finished_at"] = utcnow().isoformat()
-    move_task(path, BLOCKED, task)
-    print(f"orphan_blocked task={task_id} age={age_seconds}s reason={reason}")
+    task["attempt_state"] = "delivery_uncertain"
+    task.pop("result_status", None)
+    task.pop("finished_at", None)
+    write_json(path, task)
+    print(f"orphan_quarantined task={task_id} age={age_seconds}s reason={reason}")
 
 
-def terminalize_from_result(path: Path, task: dict, result: dict, age_seconds: int) -> None:
+def terminalize_from_result(
+    path: Path,
+    task: dict,
+    result: dict,
+    age_seconds: int,
+) -> None:
     status = str(result.get("status") or "")
     blocker = str(result.get("blocker") or "").strip()
+
+    # An exact task_id + run_token is necessary but not sufficient
+    # terminal evidence. Preserve the task-owned pane while the result
+    # status is incomplete/invalid so recovery can continue fail-closed.
+    if status not in {"completed", "blocked", "failed"}:
+        block_orphan(
+            path,
+            task,
+            reason=(
+                "matching durable result has unsupported "
+                f"status={status!r}"
+            ),
+            age_seconds=age_seconds,
+        )
+        return
+
+    if not cleanup_task_owned_pane(task):
+        task["watchdog_cleanup_blocker"] = (
+            "task_session_cleanup_failed"
+        )
+        task["last_error"] = (
+            "Exact durable result exists, but task-owned pane "
+            "cleanup could not be proven; terminal queue "
+            "transition is deferred."
+        )
+        task["attempt_state"] = "delivery_uncertain"
+
+        # Never expose a terminal-looking result while queue
+        # terminalization is deliberately deferred.
+        task.pop("result_status", None)
+        task.pop("finished_at", None)
+
+        write_json(path, task)
+        print(
+            "orphan_terminal_cleanup_deferred "
+            f"task={task.get('id')}"
+        )
+        return
+
+    task.pop("watchdog_cleanup_blocker", None)
+
     task["result_status"] = status
     task["finished_at"] = utcnow().isoformat()
+
     if blocker and blocker.lower() not in {"none", "null"}:
         task["attempt_state"] = "blocked"
         move_task(path, BLOCKED, task)
         destination = "blocked"
+
     elif status == "completed":
         task["attempt_state"] = "done"
         move_task(path, DONE, task)
         destination = "done"
+
     elif status == "blocked":
         task["attempt_state"] = "blocked"
         move_task(path, BLOCKED, task)
         destination = "blocked"
+
     elif status == "failed":
         task["attempt_state"] = "failed"
         move_task(path, FAILED, task)
         destination = "failed"
-    else:
-        block_orphan(
-            path,
-            task,
-            reason=f"matching durable result has unsupported status={status!r}",
-            age_seconds=age_seconds,
-        )
-        return
-    print(f"orphan_terminalized task={task.get('id')} destination={destination}")
 
-
+    print(
+        f"orphan_terminalized task={task.get('id')} "
+        f"destination={destination}"
+    )
 def recover_orphan_tasks(now: datetime | None = None) -> None:
     now = now or utcnow()
     active = active_worker_tasks()
@@ -178,6 +387,22 @@ def recover_orphan_tasks(now: datetime | None = None) -> None:
                 os.replace(path, BLOCKED / path.name)
                 print(f"orphan_invalid_json_blocked file={path.name} error={exc}")
             continue
+
+        if (
+            task.get("watchdog_cleanup_blocker")
+            == "task_session_cleanup_failed"
+        ):
+            result, _ = matching_result(task)
+            if result is not None:
+                terminalize_from_result(path, task, result, 0)
+            continue
+
+        if task.get("watchdog_blocker") == "orphaned_running_unknown_delivery":
+            result, _ = matching_result(task)
+            if result is not None:
+                terminalize_from_result(path, task, result, 0)
+            continue
+
         timeout = max(30, int(task.get("timeout_seconds") or 1800))
         age = int(max(0, (now - parse_started(task, path)).total_seconds()))
         if age <= timeout + ORPHAN_GRACE_SECONDS:
@@ -186,12 +411,39 @@ def recover_orphan_tasks(now: datetime | None = None) -> None:
         if result is not None:
             terminalize_from_result(path, task, result, age)
             continue
+
+        # Close the dispatcher->worker startup race and the result-publication
+        # race immediately before any watchdog mutation.
+        if resolved in active_worker_tasks():
+            continue
+        result, state = matching_result(task)
+        if result is not None:
+            terminalize_from_result(path, task, result, age)
+            continue
+
         block_orphan(
             path,
             task,
-            reason=f"no matching worker; durable_result={state}",
+            reason=f"no matching worker after double-check; durable_result={state}",
             age_seconds=age,
         )
+
+
+def reconcile_watchdog_blocked_tasks() -> None:
+    """Promote exact late durable results without ever replaying blocked work."""
+    if not BLOCKED.exists():
+        return
+    for path in sorted(BLOCKED.glob("*.json")):
+        try:
+            task = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if task.get("watchdog_blocker") != "orphaned_running_unknown_delivery":
+            continue
+        result, _ = matching_result(task)
+        if result is None:
+            continue
+        terminalize_from_result(path, task, result, 0)
 
 
 def run_herdr(args: list[str], timeout: float = 15.0) -> subprocess.CompletedProcess[str]:
@@ -205,12 +457,26 @@ def run_herdr(args: list[str], timeout: float = 15.0) -> subprocess.CompletedPro
 
 
 def is_codex_update_dialog(text: str) -> bool:
-    last_ready = max(text.rfind("Ask Codex to do anything"), text.rfind("› Ask Codex"))
-    last_menu = max(text.rfind("Update now"), text.rfind("Skip until next version"))
-    if last_menu < 0 or last_menu < last_ready:
+    lines = [line.strip() for line in text.replace("\r", "").splitlines() if line.strip()]
+    if len(lines) < 5:
         return False
-    tail = text[last_menu:]
-    return "Skip until next version" in tail or "enter continue · esc skip" in tail
+
+    # The interactive updater menu must be the current bottom-of-screen UI,
+    # not historical scrollback or text quoted by a task.
+    if lines[-1] != "enter continue · esc skip":
+        return False
+    if not lines[-2].startswith("3. Skip until next version"):
+        return False
+    if lines[-3] != "2. Skip":
+        return False
+    if not lines[-4].startswith("› 1. Update now"):
+        return False
+
+    context = lines[max(0, len(lines) - 10):-4]
+    return any(
+        line.startswith("Update available") or "Update available ·" in line
+        for line in context
+    )
 
 
 def recover_codex_update_dialogs() -> None:
@@ -227,6 +493,14 @@ def recover_codex_update_dialogs() -> None:
     for row in agents:
         if not isinstance(row, dict) or row.get("agent") != "codex":
             continue
+        if row.get("agent_status") != "idle" or row.get("interactive_ready") is not True:
+            continue
+        # The updater is shown before the full Codex TUI takes over the pane.
+        # Detection is intentionally read-only: the watchdog reports the stall
+        # but never injects keys into a TUI that may have transitioned meanwhile.
+        title = str(row.get("terminal_title_stripped") or "")
+        if not title.startswith("agentops@"):
+            continue
         name = str(row.get("name") or "")
         if not name:
             continue
@@ -234,21 +508,15 @@ def recover_codex_update_dialogs() -> None:
         text = (screen.stdout or "") + (screen.stderr or "")
         if screen.returncode != 0 or not is_codex_update_dialog(text):
             continue
-        cleared = run_herdr(["agent", "send-keys", name, "esc"])
-        if cleared.returncode != 0:
-            print(f"codex_update_dialog_skip_failed agent={name} rc={cleared.returncode}")
-            continue
-        time.sleep(0.5)
-        verify = run_herdr(["agent", "read", name])
-        verify_text = (verify.stdout or "") + (verify.stderr or "")
-        if is_codex_update_dialog(verify_text):
-            print(f"codex_update_dialog_still_present agent={name}")
-        else:
-            print(f"codex_update_dialog_cleared agent={name}")
+        print(f"codex_update_dialog_detected agent={name}")
 
 
 def main() -> int:
-    for action in (recover_orphan_tasks, recover_codex_update_dialogs):
+    for action in (
+        recover_orphan_tasks,
+        reconcile_watchdog_blocked_tasks,
+        recover_codex_update_dialogs,
+    ):
         try:
             action()
         except Exception as exc:
