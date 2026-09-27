@@ -82,6 +82,8 @@ def matching_result(task: dict) -> tuple[dict | None, str]:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None, "invalid_json"
+    if not isinstance(payload, dict):
+        return None, "invalid_shape"
     if str(payload.get("task_id") or "") != task_id:
         return None, "task_id_mismatch"
     if str(payload.get("run_token") or "") != run_token:
@@ -100,6 +102,40 @@ def watchdog_result_path(task_id: str) -> Path:
     # owned by the task executor/runtime and must never be overwritten.
     stamp = utcnow().strftime("%Y%m%dT%H%M%S.%fZ")
     return RESULTS / f"{task_id}.watchdog-recovery-{stamp}-{os.getpid()}.json"
+
+
+def cleanup_task_owned_pane(task: dict) -> bool:
+    session = task.get("execution_session")
+    if not isinstance(session, dict) or not session.get("owned_pane"):
+        return True
+    if session.get("closed_at"):
+        return True
+    pane_id = str(session.get("pane_id") or "")
+    coordinator_pane = str(session.get("coordinator_pane_id") or "")
+    if not pane_id or (coordinator_pane and pane_id == coordinator_pane):
+        session["cleanup_status"] = "close_unproven"
+        return False
+    try:
+        proc = subprocess.run(
+            [str(HERDR), "pane", "close", pane_id],
+            text=True,
+            capture_output=True,
+            timeout=15,
+            env=ENV,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        session["cleanup_status"] = "close_failed"
+        session["cleanup_error"] = str(exc)[-1000:]
+        return False
+    if proc.returncode != 0:
+        session["cleanup_status"] = "close_failed"
+        session["cleanup_error"] = (
+            proc.stderr or proc.stdout or "pane close failed"
+        )[-1000:]
+        return False
+    session["closed_at"] = utcnow().isoformat()
+    session["cleanup_status"] = "closed"
+    return True
 
 
 def block_orphan(path: Path, task: dict, *, reason: str, age_seconds: int) -> None:
@@ -138,6 +174,18 @@ def terminalize_from_result(path: Path, task: dict, result: dict, age_seconds: i
     status = str(result.get("status") or "")
     blocker = str(result.get("blocker") or "").strip()
     task["result_status"] = status
+    if not cleanup_task_owned_pane(task):
+        task["watchdog_cleanup_blocker"] = "task_session_cleanup_failed"
+        task["last_error"] = (
+            "Exact durable result exists, but task-owned pane cleanup could not "
+            "be proven; terminal queue transition is deferred."
+        )
+        task["attempt_state"] = "delivery_uncertain"
+        task.pop("finished_at", None)
+        write_json(path, task)
+        print(f"orphan_terminal_cleanup_deferred task={task.get('id')}")
+        return
+    task.pop("watchdog_cleanup_blocker", None)
     task["finished_at"] = utcnow().isoformat()
     if blocker and blocker.lower() not in {"none", "null"}:
         task["attempt_state"] = "blocked"

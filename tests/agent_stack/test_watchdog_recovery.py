@@ -384,3 +384,68 @@ def test_quarantined_orphan_does_not_repeat_sidecar_evidence(tmp_path, monkeypat
 
     assert path.exists()
     assert len(list(recovery.RESULTS.glob("task-1.watchdog-recovery-*.json"))) == 1
+
+
+def test_terminal_result_waits_for_task_pane_cleanup(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    path = recovery.RUNNING / "task-1.json"
+    payload = {
+        "id": "task-1",
+        "run_token": "token-1",
+        "execution_session": {
+            "owned_pane": True,
+            "pane_id": "owned-pane",
+            "coordinator_pane_id": "coordinator-pane",
+        },
+    }
+    write_task(path, payload)
+    result = {
+        "task_id": "task-1",
+        "run_token": "token-1",
+        "status": "completed",
+        "blocker": None,
+    }
+    monkeypatch.setattr(recovery, "cleanup_task_owned_pane", lambda task: False)
+
+    recovery.terminalize_from_result(path, payload, result, 0)
+
+    assert path.exists()
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["attempt_state"] == "delivery_uncertain"
+    assert saved["watchdog_cleanup_blocker"] == "task_session_cleanup_failed"
+    assert not (recovery.DONE / path.name).exists()
+
+    monkeypatch.setattr(recovery, "cleanup_task_owned_pane", lambda task: True)
+    recovery.terminalize_from_result(path, saved, result, 0)
+    assert not path.exists()
+    assert (recovery.DONE / path.name).exists()
+
+
+def test_non_object_result_does_not_abort_recovery_of_later_task(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    now = datetime(2026, 9, 27, 7, 0, tzinfo=timezone.utc)
+    first = recovery.RUNNING / "task-a.json"
+    second = recovery.RUNNING / "task-b.json"
+    write_task(first, task(now, task_id="task-a"))
+    write_task(second, task(now, task_id="task-b"))
+    monkeypatch.setattr(recovery, "active_worker_tasks", lambda: set())
+
+    (recovery.RESULTS / "task-a.json").write_text("[]\n", encoding="utf-8")
+    write_task(
+        recovery.RESULTS / "task-b.json",
+        {
+            "task_id": "task-b",
+            "run_token": "token-1",
+            "status": "completed",
+            "blocker": None,
+        },
+    )
+
+    recovery.recover_orphan_tasks(now)
+
+    assert first.exists()
+    first_saved = json.loads(first.read_text(encoding="utf-8"))
+    assert first_saved["attempt_state"] == "delivery_uncertain"
+    assert "invalid_shape" in first_saved["last_error"]
+    assert not second.exists()
+    assert (recovery.DONE / "task-b.json").exists()
