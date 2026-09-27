@@ -377,6 +377,67 @@ def test_crash_restart_recovery_idempotent(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_child_permission_escalation_has_explicit_deny_reason(tmp_path: Path) -> None:
+    sched = _idle_scheduler(tmp_path)
+    parent = _node(
+        "parent",
+        role="writer",
+        tools=("read_file", "write_file"),
+        permissions=("repo:read",),
+    )
+    _submit(sched, [parent], issue="3")
+    proposal = ChildProposal(
+        parent_role="operator",
+        parent_tools=("read_file", "write_file", "git_push"),
+        child_role="writer",
+        child_tools=("read_file",),
+        child_permissions=("repo:write",),
+    )
+    decision = sched.spawn_child("parent", proposal)
+    assert isinstance(decision, DenyDecision)
+    assert decision.reason == DenyReason.CHILD_PERMISSION_ESCALATION
+
+
+def test_spawn_uses_authoritative_parent_role_and_tools(tmp_path: Path) -> None:
+    sched = _idle_scheduler(tmp_path)
+    parent = _node("parent", role="reader", tools=("read_file",), permissions=())
+    _submit(sched, [parent], issue="3")
+    proposal = ChildProposal(
+        parent_role="operator",
+        parent_tools=("read_file", "write_file", "git_push"),
+        child_role="writer",
+        child_tools=("write_file",),
+    )
+    decision = sched.spawn_child("parent", proposal)
+    assert isinstance(decision, DenyDecision)
+    assert decision.reason in {
+        DenyReason.CHILD_ROLE_ESCALATION,
+        DenyReason.CHILD_TOOL_ESCALATION,
+    }
+
+
+def test_dynamic_spawn_respects_planner_fanout_limit(tmp_path: Path) -> None:
+    sched = _idle_scheduler(tmp_path)
+    graph = TaskGraph(
+        envelope=_envelope(issue="3", max_fanout=1),
+        nodes=(
+            _node("parent", role="writer", tools=("read_file",), permissions=()),
+        ),
+    )
+    sched.submit(graph, repo="repo", issue="3")
+    proposal = ChildProposal(
+        parent_role="writer",
+        parent_tools=("read_file",),
+        child_role="reader",
+        child_tools=("read_file",),
+        child_task="bounded child",
+    )
+    first = sched.spawn_child("parent", proposal)
+    assert isinstance(first, TaskNode)
+    second = sched.spawn_child("parent", proposal)
+    assert isinstance(second, DenyDecision)
+    assert second.reason == DenyReason.DAG_FANOUT_LIMIT
+
 def test_child_permission_escalation_uses_authoritative_parent_policy(
     tmp_path: Path,
 ) -> None:
