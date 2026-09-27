@@ -122,3 +122,37 @@ Only capability/provider failure may contribute to model-tier escalation. `agent
 ## Relationship to roadmap
 
 This remediation is a prerequisite for finishing #3 live child lifecycle and for #9 end-to-end dogfood. It should land before admission-control integration is considered production-ready because admission cannot prevent duplicate work caused by ambiguous redispatch.
+
+
+## 2026-09-27 durable parent session-isolation incident
+
+Issue #190 exposed a second, independent failure mode: the long-lived coordinator chat itself
+can contain unrelated task history. While the #190 worker was active and correctly routed to
+`quantlab-hermes`, `herdr agent read quantlab-hermes` showed the pane reasoning about unrelated
+Herdr issues #3/#8. Earlier history also interleaved #190 and Machine City #235 prompts.
+
+A worker lock serializes Agent Stack workers, but it cannot prevent other control paths or operator
+steers from writing to the same persistent coordinator chat. Therefore **serialization alone is not
+session isolation**.
+
+The persistent coordinator is now treated as control-plane identity only. Every new semantic durable
+attempt must:
+
+1. resolve the persistent coordinator and its pane;
+2. split a new task-owned pane;
+3. start a fresh Hermes process in that pane;
+4. bind it to an opaque named Hermes session derived from `task_id + run_token`;
+5. send the durable task prompt only to that task-scoped agent;
+6. keep the task pane alive through delivery reconciliation for that attempt;
+7. close only the task-owned pane when the worker reaches a terminal/requeue decision.
+
+The worker MUST fail closed if the isolated task session cannot be created. It MUST NOT silently fall
+back to prompting the persistent coordinator chat.
+
+Pane cleanup is also fail closed: a pane ID equal to the persistent coordinator pane is never closed,
+cleanup failures are recorded without masking the durable task state, and a new semantic attempt is
+blocked until its prior task-owned pane has been closed successfully.
+
+The session name is attempt-scoped: reconciliation of the same semantic attempt preserves the same
+identity, while a genuinely new attempt receives a new run token and therefore a new session. This
+keeps orchestration identity stable without sharing model conversation state between unrelated tasks.
