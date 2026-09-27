@@ -14,6 +14,20 @@ ROOTS = (
 )
 FILES = (Path("package.json"), Path("package-lock.json"))
 OUTPUT = Path("provenance/CANONICAL_SOURCE_MANIFEST.sha256")
+TEXT_SUFFIXES = {
+    ".css", ".html", ".in", ".js", ".json", ".md", ".mjs", ".py",
+    ".service", ".sh", ".sha256", ".yaml",
+}
+
+
+def canonical_bytes(path: Path) -> bytes:
+    data = path.read_bytes()
+    if path.suffix in TEXT_SUFFIXES or not path.suffix:
+        data.decode("utf-8")
+        return data.replace(b"\r\n", b"\n")
+    if path.suffix != ".webp":
+        raise ValueError(f"Unclassified manifest file type: {path}")
+    return data
 
 entries: list[tuple[str, str]] = []
 for root in ROOTS:
@@ -24,10 +38,10 @@ for root in ROOTS:
             continue
         if path == OUTPUT:
             continue
-        entries.append((hashlib.sha256(path.read_bytes()).hexdigest(), path.as_posix()))
+        entries.append((hashlib.sha256(canonical_bytes(path)).hexdigest(), path.as_posix()))
 for path in FILES:
-    entries.append((hashlib.sha256(path.read_bytes()).hexdigest(), path.as_posix()))
+    entries.append((hashlib.sha256(canonical_bytes(path)).hexdigest(), path.as_posix()))
 
 OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-OUTPUT.write_text("".join(f"{digest}  {path}\n" for digest, path in sorted(entries)))
+OUTPUT.write_bytes("".join(f"{digest}  {path}\n" for digest, path in sorted(entries)).encode("ascii"))
 print(f"HERDR_SOURCE_MANIFEST_OK files={len(entries)}")

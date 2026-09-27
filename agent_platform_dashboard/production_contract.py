@@ -4,7 +4,8 @@ import json
 import math
 
 PROFILES = ('majak', 'quantlab')
-KINDS = ('herdr', 'kanban', 'router', 'search', 'git', 'tests', 'queue', 'codex', 'admission')
+KINDS = ('herdr', 'kanban', 'router', 'search', 'git', 'tests', 'queue', 'codex',
+         'admission', 'release')
 SOURCE_PAIRS = tuple(
     (profile, kind)
     for profile in PROFILES
@@ -12,6 +13,7 @@ SOURCE_PAIRS = tuple(
     if (kind != 'queue' or profile == 'quantlab')
     and (kind != 'codex' or profile == 'majak')
     and (kind != 'admission' or profile == 'quantlab')
+    and (kind != 'release' or profile == 'quantlab')
 )
 MAX_BYTES = 131072
 
@@ -84,6 +86,7 @@ def row(kind, value):
                         'max_attempts not_before updated_at agent kind blocker pr_number'),
               'admission': ('event reason role repo issue node_count max_depth max_fanout '
                             'child_tools_count agents_after observed_at'),
+              'release': 'tag commit config_sha256 deployed_at',
               'codex': ('used_percent window_minutes resets_at ordinary_usage_allowed has_credits '
                         'credits_unlimited credits_balance reset_credits_available lifetime_tokens '
                         'peak_daily_tokens longest_running_turn_sec current_streak_days '
@@ -146,6 +149,11 @@ def row(kind, value):
             need(value['reason'] is not None and value['agents_after'] is None)
         else:
             need(value['reason'] is None and value['agents_after'] is not None)
+    elif kind == 'release':
+        need(type(value['tag']) is str and identifier(value['tag'], 64)
+             and value['tag'].startswith('v'))
+        need(hex_id(value['commit'], (40,)) and hex_id(value['config_sha256']))
+        need(number(value['deployed_at']))
     elif kind == 'codex':
         need(number(value['used_percent']) and value['used_percent'] <= 100)
         need(value['window_minutes'] is None or number(value['window_minutes']))
@@ -230,6 +238,8 @@ def validate(value):
             if kind == 'queue':
                 need(profile == 'quantlab')
             if kind == 'admission':
+                need(profile == 'quantlab')
+            if kind == 'release':
                 need(profile == 'quantlab')
         need(len({json.dumps(r, sort_keys=True) for r in source['rows']}) == len(source['rows']))
     return value

@@ -53,7 +53,8 @@ def collect(config, now):
     adapters = {'router': sources.router, 'search': sources.search,
                 'kanban': sources.kanban, 'git': sources.git,
                 'tests': sources.tests, 'queue': sources.queue,
-                'codex': sources.codex, 'admission': sources.admission}
+                'codex': sources.codex, 'admission': sources.admission,
+                'release': sources.release}
     for source in snapshot['sources']:
         profile, kind = source['profile'], source['kind']
         if kind == 'herdr':
@@ -64,6 +65,8 @@ def collect(config, now):
             setting = sources.CODEX_USAGE_PATH
         elif kind == 'admission':
             setting = sources.ADMISSION_PATH
+        elif kind == 'release':
+            setting = sources.RELEASE_PATH
         else:
             setting = config['profiles'][profile][kind]
         if setting is None:

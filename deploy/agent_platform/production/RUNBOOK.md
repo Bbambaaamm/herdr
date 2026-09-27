@@ -1,5 +1,10 @@
 # Phase9 quantadmin activation runbook — NOT executed by agentops
 
+This remains the bootstrap and component-hardening reference. Existing legacy
+installations must use `deploy/herdr/cutover/RUNBOOK.md` for subsequent versioned
+releases; do not repeat the fixed `/opt/agent-platform/release` installation as an
+upgrade.
+
 Q1/Q2/Q3 are approved. Actual privileged activation remains ACTIVATION_BLOCKED
 until quantadmin runs these steps on the intended host. No production password
 exists in this repository. Phase8 refusal templates are unchanged; this directory

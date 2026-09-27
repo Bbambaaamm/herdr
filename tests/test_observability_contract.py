@@ -101,13 +101,15 @@ def routing_payload(observed_at):
 
 class ObservabilityContractTests(unittest.TestCase):
     def test_source_matrix_is_closed_and_asymmetric(self):
-        self.assertEqual(len(c.SOURCE_PAIRS), 15)
+        self.assertEqual(len(c.SOURCE_PAIRS), 16)
         self.assertIn(("quantlab", "queue"), c.SOURCE_PAIRS)
         self.assertNotIn(("majak", "queue"), c.SOURCE_PAIRS)
         self.assertIn(("majak", "codex"), c.SOURCE_PAIRS)
         self.assertNotIn(("quantlab", "codex"), c.SOURCE_PAIRS)
         self.assertIn(("quantlab", "admission"), c.SOURCE_PAIRS)
         self.assertNotIn(("majak", "admission"), c.SOURCE_PAIRS)
+        self.assertIn(("quantlab", "release"), c.SOURCE_PAIRS)
+        self.assertNotIn(("majak", "release"), c.SOURCE_PAIRS)
     def test_queue_v2_projection_accepts_only_sanitized_metadata(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "queue.json"
@@ -254,7 +256,7 @@ class ObservabilityContractTests(unittest.TestCase):
                     },
                 }
                 snapshot = collect(config, 100)
-                self.assertEqual(len(snapshot["sources"]), 15)
+                self.assertEqual(len(snapshot["sources"]), 16)
                 q = next(s for s in snapshot["sources"] if s["kind"] == "queue")
                 x = next(s for s in snapshot["sources"] if s["kind"] == "codex")
                 self.assertEqual(q["status"], "available")

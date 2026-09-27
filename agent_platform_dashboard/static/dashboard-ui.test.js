@@ -51,6 +51,10 @@ function fixture() {
     ],
   });
   sources.push({
+    profile: 'quantlab', kind: 'release', status: 'available', reason: 'ok', observed_at: now, data_at: now,
+    rows: [{ tag: 'v0.2.0-rc.2', commit: 'a'.repeat(40), config_sha256: 'b'.repeat(64), deployed_at: now }],
+  });
+  sources.push({
     profile: 'majak', kind: 'codex', status: 'available', reason: 'ok', observed_at: now, data_at: now,
     rows: [{
       used_percent: 82, window_minutes: 10080, resets_at: now + 3600, ordinary_usage_allowed: true,
@@ -170,6 +174,7 @@ async function harness(t, options = {}) {
 test('partial telemetry stays explicit, Codex allowance is live, and snapshot values cannot inject HTML', async t => {
   const h = await harness(t);
   assert.equal(h.ui.diagnostics().freshSnapshot, true);
+  assert.match(h.get('#header-status').textContent, /v0\.2\.0-rc\.2 @ a{12}/);
   assert.equal(h.get('#cost-total').textContent, '18 %');
   assert.match(h.get('#project-grid').innerHTML, /0 \/ 12 · 0 % req/);
   assert.match(h.get('#project-grid').innerHTML, /0 USD známé \+ 1 bez ceny/);
@@ -226,6 +231,15 @@ test('provider recency is mandatory in the browser trust boundary', async t => {
   await h.refresh();
   assert.equal(h.ui.diagnostics().freshSnapshot, false);
   assert.equal(h.ui.diagnostics().state, 'offline');
+});
+
+test('release identity is mandatory and sanitized in the browser trust boundary', async t => {
+  const h = await harness(t);
+  const release = h.snapshot().sources.find(item => item.kind === 'release');
+  release.rows[0].commit = '<script>alert(1)</script>';
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().freshSnapshot, false);
+  assert.doesNotMatch(h.get('#header-status').textContent, /script|alert/i);
 });
 
 test('durable QuantLab queue renders safe metadata and drives coordinator state', async t => {
