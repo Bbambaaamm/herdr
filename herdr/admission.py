@@ -1,13 +1,12 @@
 """Herdr v1.7: Swarm admission control, permissions & resource budgets (#8).
 
-Fail-closed, PAPER-only. stdlib-only so the contract is fully offline-testable.
+Fail-closed and consumer-neutral. stdlib-only so the contract is fully offline-testable.
 
 Invariants enforced by AdmissionControl.check():
   * Planner cannot bypass limits by emitting a larger graph (node/depth/fanout).
   * Child may never escalate tools or permissions beyond parent.
   * Resource pressure blocks a heavy spawn *before* it starts.
-  * Dynamic swarm never receives live-broker / protected-path / secret / network
-    tools (PAPER-only policy hook).
+  * Consumer-specific safety is explicit policy input; missing policy denies.
   * Every denial is durably audited (append-only JSONL) — visible in Machine City.
   * Cancellation is durable: a cancel record is appended and replayable.
 """
@@ -23,57 +22,7 @@ from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
 
-# --------------------------------------------------------------------------- #
-# Policy primitives (PAPER-only, fail-closed). These are intentionally
-# conservative and never loosen the runtime guards in AGENTS.md /
-# docs/runtime-resource-budget.md.
-# --------------------------------------------------------------------------- #
-
-# A dynamic swarm agent may NEVER be admitted with a tool whose name intersects
-# one of these live-trading / broker prefixes. PAPER-only is a hard invariant.
-LIVE_TRADING_TOOL_PREFIXES: tuple[str, ...] = (
-    "alpaca-order",
-    "alpaca-position",
-    "alpaca-sse",
-    "broker",
-    "live-broker",
-    "trade",
-    "execution",
-    "risk-engine",
-    "alpaca",
-    "paperless",
-)
-
-PROTECTED_PATH_PREFIXES: tuple[str, ...] = (
-    "backend/src/quantlab/trading.py",
-    "backend/src/quantlab/phase4.py",
-    "backend/src/quantlab/security.py",
-)
-
-# Tool arguments or names containing any of these indicators are denied
-# (secret isolation / no-credential-leak at admission time).
-SECRET_INDICATORS: tuple[str, ...] = (
-    "api_key",
-    "api_secret",
-    "secret_key",
-    "private_key",
-    "client_secret",
-    "token",
-    "password",
-    "alpaca_key_id",
-    "alpaca_secret_key",
-    "api_admin_token",
-)
-
-# External-network egress by a dynamic swarm is denied unless explicitly
-# allow-listed. (Real egress tooling is governed by network/tool policy #8.)
-EXTERNAL_NETWORK_TOOL_SUFFIXES: tuple[str, ...] = (
-    ".post",
-    ".put",
-    ".patch",
-    ".upload",
-)
-
+# Consumer-specific rules live in herdr.consumer_policies.
 
 # Role-based tool allowlist. A child tool set must be a *subset* of the role
 # allowlist AND a subset of the parent's tool set. Operator-role tools (push,
@@ -158,11 +107,7 @@ class DenyReason(StrEnum):
     TOOL_NOT_IN_ROLE_ALLOWLIST = "tool_not_in_role_allowlist"
     NON_SPAWNABLE_ROLE = "non_spawnable_role"
 
-    # PAPER-only safety hooks.
-    LIVE_TRADING_TOOL = "live_trading_tool"
-    PROTECTED_PATH = "protected_path"
-    SECRET_ACCESS = "secret_access"  # noqa: S105 - denial reason code, not a credential
-    EXTERNAL_NETWORK_POLICY = "external_network_policy"
+    # Consumer policy hook.
     CONSUMER_POLICY = "consumer_policy"
 
 
@@ -340,15 +285,12 @@ class AdmissionControl:
     """Fail-closed swarm admission gate (#8, parent #1)."""
 
     budget: PlanBudget = field(default_factory=PlanBudget)
-    paper_only: bool = True
     audit_log: AuditLog | None = None
     consumer_policy_hook: ConsumerPolicyHook | None = None
 
     def __post_init__(self) -> None:
         if self.audit_log is None:
             raise ValueError("fail-closed admission requires an audit sink")
-        if self.paper_only is not True:
-            raise ValueError("dynamic swarm admission requires literal paper_only=True")
 
     # -- helpers ----------------------------------------------------------- #
     def _deny(
@@ -356,9 +298,6 @@ class AdmissionControl:
     ) -> DenyDecision:
         safe_detail = detail
         safe_ctx = dict(audit_ctx)
-        if reason is DenyReason.SECRET_ACCESS:
-            safe_detail = "tool request denied by secret-isolation policy"
-            safe_ctx.pop("denied_tool", None)
         decision = DenyDecision(denied=True, reason=reason, detail=safe_detail)
         audit_log = self.audit_log
         if audit_log is None:
@@ -392,19 +331,6 @@ class AdmissionControl:
                 }
             )
         return decision
-
-    @staticmethod
-    def _tool_denies(tool: str) -> DenyReason | None:
-        lowered = tool.lower()
-        if any(lowered.startswith(p) for p in LIVE_TRADING_TOOL_PREFIXES):
-            return DenyReason.LIVE_TRADING_TOOL
-        if any(p in lowered for p in PROTECTED_PATH_PREFIXES):
-            return DenyReason.PROTECTED_PATH
-        if any(p in lowered for p in SECRET_INDICATORS):
-            return DenyReason.SECRET_ACCESS
-        if any(lowered.endswith(s) for s in EXTERNAL_NETWORK_TOOL_SUFFIXES):
-            return DenyReason.EXTERNAL_NETWORK_POLICY
-        return None
 
     # -- public API -------------------------------------------------------- #
     def check(
@@ -597,50 +523,34 @@ class AdmissionControl:
                 {**audit_ctx},
             )
 
-        # 5. PAPER-only safety hooks (live broker / protected paths / secrets /
-        #    external network). Denied regardless of role. Must run BEFORE the
-        #    tool allowlist so that policy-violating tools are reported as their
-        #    true policy deny reason, not "not in allowlist".
-        for tool in child_tools:
-            denied = self._tool_denies(tool)
-            if denied is not None:
-                return self._deny(
-                    denied,
-                    f"tool={tool!r} denied by PAPER-only/safety policy ({denied.value})",
-                    {**audit_ctx, "denied_tool": tool},
-                )
-
-        # 6. PAPER-only invariant: swarm may never be spawned when PAPER is off.
-        if identity.paper_only is not True or self.paper_only is not True:
+        # 5. Consumer-specific policy is mandatory and may only tighten admission.
+        #    The hook receives sanitized identity + requested tool names and returns
+        #    a bounded reason code, or None to continue with platform checks.
+        if self.consumer_policy_hook is None:
             return self._deny(
-                DenyReason.LIVE_TRADING_TOOL,
-                "admission requires paper_only=True for dynamic swarm spawns",
-                {**audit_ctx, "identity.paper_only": identity.paper_only},
+                DenyReason.CONSUMER_POLICY,
+                "explicit consumer policy is required",
+                {**audit_ctx, "consumer_reason": "consumer_policy_required"},
+            )
+        consumer_reason = self.consumer_policy_hook(identity, tuple(child_tools))
+        if consumer_reason is not None:
+            safe_reason = (
+                consumer_reason
+                if isinstance(consumer_reason, str)
+                and 0 < len(consumer_reason) <= 64
+                and all(
+                    ch.isascii() and (ch.isalnum() or ch in "-_:/")
+                    for ch in consumer_reason
+                )
+                else "invalid_consumer_policy_reason"
+            )
+            return self._deny(
+                DenyReason.CONSUMER_POLICY,
+                "consumer-specific policy denied dynamic child spawn",
+                {**audit_ctx, "consumer_reason": safe_reason},
             )
 
-        # 7. Consumer-specific policy may only tighten admission. The hook
-        #    receives sanitized identity + requested tool names and returns a
-        #    bounded reason code, or None to defer to platform policy.
-        if self.consumer_policy_hook is not None:
-            consumer_reason = self.consumer_policy_hook(identity, tuple(child_tools))
-            if consumer_reason is not None:
-                safe_reason = (
-                    consumer_reason
-                    if isinstance(consumer_reason, str)
-                    and 0 < len(consumer_reason) <= 64
-                    and all(
-                        ch.isascii() and (ch.isalnum() or ch in "-_:/")
-                        for ch in consumer_reason
-                    )
-                    else "invalid_consumer_policy_reason"
-                )
-                return self._deny(
-                    DenyReason.CONSUMER_POLICY,
-                    "consumer-specific policy denied dynamic child spawn",
-                    {**audit_ctx, "consumer_reason": safe_reason},
-                )
-
-        # 8. Tool allowlist — fail-closed on any unknown / out-of-role tool.
+        # 6. Tool allowlist — fail-closed on any unknown / out-of-role tool.
         role_tools = self.budget.role_tool_allowlist.get(identity.role, frozenset())
         child_set = frozenset(child_tools)
         unknown_to_role = child_set - role_tools
@@ -651,7 +561,7 @@ class AdmissionControl:
                 {**audit_ctx, "unknown_tools": sorted(unknown_to_role)},
             )
 
-        # 8. Child may never escalate tools or permissions beyond parent.
+        # 7. Child may never escalate tools or permissions beyond parent.
         parent_tools = identity.parent_tools_or_empty
         parent_role = identity.parent_role_or_none
         if parent_role is not None:

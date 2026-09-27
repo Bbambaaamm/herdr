@@ -29,6 +29,7 @@ from herdr.admission import (
 )
 from herdr.taskgraph import GRAPH_VERSION, TaskGraphEnvelope
 from herdr.telemetry import TelemetryStore
+from herdr.consumer_policies import policy_for_profile
 from herdr.scheduler import (
     AuditLog,
     DenyDecision,
@@ -390,7 +391,10 @@ class HerdrChildRuntime:
         self.env = dict(env if env is not None else os.environ)
         self.host_guard = host_guard
         self.admission = admission or AdmissionControl(
-            audit_log=AdmissionAuditLog(DEFAULT_ADMISSION_AUDIT)
+            audit_log=AdmissionAuditLog(DEFAULT_ADMISSION_AUDIT),
+            consumer_policy_hook=policy_for_profile(
+                self.env.get("HERDR_PROFILE", DEFAULT_PROFILE)
+            ),
         )
         self.admission_registry = admission_registry or AdmissionRegistry()
         self.resource_usage_factory = resource_usage_factory
