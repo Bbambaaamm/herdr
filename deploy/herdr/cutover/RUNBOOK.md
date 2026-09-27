@@ -62,13 +62,15 @@ The apply operation:
 5. reserves the public dashboard paths with the fail-closed maintenance fragment;
 6. stops the durable watchdog, refuses promotion while any
    `agent-task-worker` remains active, and keeps durable dispatch quiescent through
-   candidate verification and rollback exercise;
+   candidate verification and rollback exercise, snapshotting and restoring
+   the exact previous systemd unit bytes and deployed-release marker;
 7. atomically switches `current`, publishes only bounded tag/SHA/config metadata,
    and verifies the internal health boundary and Herdr sandbox;
 8. switches back to the previous release and verifies it, including restarting
    the watchdog against the previous `/opt/herdr/current`, then promotes the
    candidate again—exercising rollback of both web/export and durable orchestration
-   before public activation;
+   before public activation; the durable watchdog remains stopped throughout all
+   intermediate transitions;
 9. restores the exact authenticated Nginx route and proves the QuantLab root status
    and unauthenticated `401` boundary are unchanged.
 

@@ -139,8 +139,9 @@ for forbidden in (
 for required in (
     "RELEASE.json",
     "MANIFEST.sha256",
-    "agent-stack/bin",
-    "agent-stack/systemd",
+    'TAR_ARGS+=(',
+    '-C "$RELEASE_ROOT"',
+    "COMPLETE immutable Herdr release",
 ):
     if required not in offsite_text:
         print(f"Off-site backup misses immutable runtime evidence: {required}")

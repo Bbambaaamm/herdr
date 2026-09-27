@@ -67,13 +67,12 @@ if (( ${#EXISTING_CORE[@]} > 0 )); then
   )
 fi
 
+# Capture the COMPLETE immutable Herdr release. This makes the
+# included MANIFEST.sha256 independently useful after disaster recovery,
+# rather than shipping a manifest next to only a partial payload.
 TAR_ARGS+=(
   -C "$RELEASE_ROOT"
-  RELEASE.json
-  MANIFEST.sha256
-  agent-stack/bin
-  agent-stack/systemd
-  agent-stack/install-agent-stack-service.sh
+  .
 )
 
 tar -czf "$PLAIN" "${TAR_ARGS[@]}"

@@ -183,6 +183,67 @@ def atomic_write(path: Path, data: bytes, mode: int, uid: int = 0, gid: int = 0)
             pass
 
 
+
+def snapshot_file(path: Path) -> tuple[bytes, int, int, int] | None:
+    if not path.exists() and not path.is_symlink():
+        return None
+    info = os.lstat(path)
+    need(
+        stat.S_ISREG(info.st_mode) and not path.is_symlink(),
+        f"unsafe_snapshot_file:{path}",
+    )
+    return (
+        path.read_bytes(),
+        stat.S_IMODE(info.st_mode),
+        info.st_uid,
+        info.st_gid,
+    )
+
+
+def restore_file(
+    path: Path,
+    snapshot: tuple[bytes, int, int, int] | None,
+) -> None:
+    if snapshot is None:
+        if path.exists() or path.is_symlink():
+            need(
+                path.is_file() and not path.is_symlink(),
+                f"unsafe_restore_destination:{path}",
+            )
+            path.unlink()
+        return
+
+    data, mode, uid, gid = snapshot
+    atomic_write(path, data, mode, uid, gid)
+
+
+def snapshot_units() -> dict[Path, tuple[bytes, int, int, int]]:
+    snapshots = {}
+    for name in UNITS:
+        path = UNIT_DIR / name
+        snapshot = snapshot_file(path)
+        need(snapshot is not None, f"runtime_unit_missing:{name}")
+        snapshots[path] = snapshot
+    return snapshots
+
+
+def restore_units(
+    snapshots: dict[Path, tuple[bytes, int, int, int]],
+) -> None:
+    for path, snapshot in snapshots.items():
+        restore_file(path, snapshot)
+    run("/usr/bin/systemctl", "daemon-reload")
+
+
+def snapshot_unit_hashes(
+    snapshots: dict[Path, tuple[bytes, int, int, int]],
+) -> dict[Path, str]:
+    return {
+        path: sha256(snapshot[0])
+        for path, snapshot in snapshots.items()
+    }
+
+
 def atomic_symlink(target: Path, link: Path) -> None:
     need(target.is_absolute() and target.is_dir() and not target.is_symlink(),
          "invalid_symlink_target")
@@ -335,17 +396,45 @@ def install_consumers(release_root: Path, expected_digest: str) -> str:
     return digest
 
 
-def install_units(release_root: Path, legacy_hashes: dict[Path, str]) -> None:
+def install_units(
+    release_root: Path,
+    legacy_hashes: dict[Path, str],
+    *,
+    previous_hashes: dict[Path, str] | None = None,
+) -> None:
     bundle = release_root / "deploy" / "agent_platform" / "production"
     for name in UNITS:
         source = bundle / f"{name}.in"
         destination = UNIT_DIR / name
-        need(source.is_file() and not source.is_symlink(), f"release_unit_missing:{name}")
+        need(
+            source.is_file() and not source.is_symlink(),
+            f"release_unit_missing:{name}",
+        )
+
         current = digest_file(destination)
         desired = digest_file(source)
-        need(current in (legacy_hashes[destination], desired), f"unit_drift:{name}")
+
+        allowed = {
+            legacy_hashes[destination],
+            desired,
+        }
+
+        if previous_hashes is not None:
+            previous = previous_hashes.get(destination)
+            if previous:
+                allowed.add(previous)
+
+        need(
+            current in allowed,
+            f"unit_drift:{name}",
+        )
+
         if current != desired:
-            atomic_write(destination, source.read_bytes(), 0o644)
+            atomic_write(
+                destination,
+                source.read_bytes(),
+                0o644,
+            )
 
 
 def deployed_document(release: dict[str, object], config_digest: str, deployed_at: int) -> dict[str, object]:
@@ -387,12 +476,10 @@ def assert_no_active_durable_worker() -> None:
 def switch_runtime(
     target: Path,
     document: dict[str, object] | None,
-    *,
-    start_watchdog: bool,
 ) -> None:
-    # Watchdog must remain stopped while /opt/herdr/current changes.
-    # Otherwise maintenance could dispatch work from an intermediate
-    # candidate/rollback release.
+    # Durable orchestration remains stopped for every intermediate
+    # candidate/rollback transition. Dispatch is re-enabled only after
+    # the final candidate is fully committed and externally healthy.
     run(
         "/usr/bin/systemctl",
         "stop",
@@ -426,23 +513,25 @@ def switch_runtime(
         "web_not_active",
     )
 
-    if start_watchdog:
+    assert_hardening()
+
+
+def start_watchdog_service() -> None:
+    run("/usr/bin/systemctl", "daemon-reload")
+    run(
+        "/usr/bin/systemctl",
+        "start",
+        "agent-stack-watchdog.service",
+    )
+    need(
         run(
             "/usr/bin/systemctl",
-            "start",
+            "is-active",
             "agent-stack-watchdog.service",
         )
-        need(
-            run(
-                "/usr/bin/systemctl",
-                "is-active",
-                "agent-stack-watchdog.service",
-            )
-            == "active",
-            "watchdog_not_active",
-        )
-
-    assert_hardening()
+        == "active",
+        "watchdog_not_active",
+    )
 
 
 def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict[str, object]:
@@ -470,25 +559,83 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
     hashes = expected_hashes(candidate / "deploy" / "herdr" / "cutover" /
                              "legacy-quantlab-staging-01.sha256")
     active_route = NGINX_ROUTE.read_bytes()
-    need(sha256(active_route) == hashes[NGINX_ROUTE], "nginx_route_drift")
+    need(
+        sha256(active_route) == hashes[NGINX_ROUTE],
+        "nginx_route_drift",
+    )
+
     root_status = http_status("https://2.28.67.165/")
-    maintenance = (candidate / "deploy" / "agent_platform" / "production" /
-                   "nginx-maintenance.conf.in").read_bytes()
-    document = deployed_document(release, config_digest, int(time.time()))
-    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    maintenance = (
+        candidate
+        / "deploy"
+        / "agent_platform"
+        / "production"
+        / "nginx-maintenance.conf.in"
+    ).read_bytes()
+
+    document = deployed_document(
+        release,
+        config_digest,
+        int(time.time()),
+    )
+
+    # Snapshot exact pre-deployment mutable authority. Rollback restores
+    # these exact bytes, not merely a compatible approximation.
+    unit_snapshots = snapshot_units()
+    previous_unit_hashes = snapshot_unit_hashes(unit_snapshots)
+    public_state_snapshot = snapshot_file(PUBLIC_STATE)
+
+    STATE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+        mode=0o700,
+    )
+
     for directory in (STATE_DIR.parent, STATE_DIR):
         info = directory.stat()
-        need(info.st_uid == 0 and not info.st_mode & 0o077, "unsafe_state_directory")
-    state_path = STATE_DIR / f"{document['deployed_at']}-{identifier}.json"
+        need(
+            info.st_uid == 0
+            and not info.st_mode & 0o077,
+            "unsafe_state_directory",
+        )
+
+    state_path = (
+        STATE_DIR
+        / f"{document['deployed_at']}-{identifier}.json"
+    )
+
+    evidence_archive = (
+        STATE_DIR
+        / f"{document['deployed_at']}-{identifier}.tar.gz"
+    )
+
     switched = False
     timers_stopped = False
     watchdog_stopped = False
+    evidence_moved = False
+
     try:
-        atomic_write(NGINX_ROUTE, maintenance, 0o644)
+        atomic_write(
+            NGINX_ROUTE,
+            maintenance,
+            0o644,
+        )
+
         run("/usr/sbin/nginx", "-t")
         run("/usr/bin/systemctl", "reload", "nginx")
-        wait_http_status("https://2.28.67.165/agent-platform/health", "503")
-        need(http_status("https://2.28.67.165/") == root_status, "public_root_changed")
+
+        wait_http_status(
+            "https://2.28.67.165/agent-platform/health",
+            "503",
+        )
+
+        need(
+            http_status("https://2.28.67.165/")
+            == root_status,
+            "public_root_changed",
+        )
+
         run(
             "/usr/bin/systemctl",
             "stop",
@@ -497,8 +644,6 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
         )
         timers_stopped = True
 
-        # Stop all automatic durable dispatch before changing either
-        # the watchdog unit or /opt/herdr/current.
         run(
             "/usr/bin/systemctl",
             "stop",
@@ -506,40 +651,74 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
         )
         watchdog_stopped = True
 
-        # Never promote a new durable control-plane while an old worker
-        # is still mutating shared queue/result state.
         assert_no_active_durable_worker()
 
-        install_units(candidate, hashes)
+        # --------------------------------------------------------
+        # Candidate #1 — verification, watchdog still stopped.
+        # --------------------------------------------------------
+
+        install_units(
+            candidate,
+            hashes,
+            previous_hashes=previous_unit_hashes,
+        )
 
         switched = True
 
-        # Candidate verification and rollback exercise stay quiescent:
-        # no watchdog/maintenance/dispatcher may run in the middle.
         switch_runtime(
             candidate,
             document,
-            start_watchdog=False,
         )
+
+        # --------------------------------------------------------
+        # Exact rollback exercise.
+        # Restore exact previous systemd unit bytes BEFORE booting
+        # the previous release services.
+        # --------------------------------------------------------
+
+        restore_units(unit_snapshots)
 
         switch_runtime(
             previous,
             None,
-            start_watchdog=False,
+        )
+
+        restore_file(
+            PUBLIC_STATE,
+            public_state_snapshot,
         )
 
         need(
-            http_status("https://2.28.67.165/") == root_status,
+            CURRENT.resolve(strict=True) == previous,
+            "rollback_current_mismatch",
+        )
+
+        for path, digest in previous_unit_hashes.items():
+            need(
+                digest_file(path) == digest,
+                f"rollback_unit_mismatch:{path.name}",
+            )
+
+        need(
+            http_status("https://2.28.67.165/")
+            == root_status,
             "rollback_root_changed",
         )
 
-        # Only the FINAL candidate promotion may restart dispatch.
+        # --------------------------------------------------------
+        # Final candidate promotion — still NO durable dispatch.
+        # --------------------------------------------------------
+
+        install_units(
+            candidate,
+            hashes,
+            previous_hashes=previous_unit_hashes,
+        )
+
         switch_runtime(
             candidate,
             document,
-            start_watchdog=True,
         )
-        watchdog_stopped = False
 
         run(
             "/usr/bin/systemctl",
@@ -548,32 +727,97 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
             "agent-platform-export.timer",
         )
         timers_stopped = False
-        evidence_archive = STATE_DIR / f"{document['deployed_at']}-{identifier}.tar.gz"
-        os.replace(archive, evidence_archive)
+
+        # Preserve immutable deployment evidence before reopening
+        # durable dispatch.
+        os.replace(
+            archive,
+            evidence_archive,
+        )
+        evidence_moved = True
+
         state = {
             **document,
             "release_path": str(candidate),
             "previous_path": str(previous),
             "rollback_exercised": True,
             "public_root_status": root_status,
-            "archive_sha256": digest_file(evidence_archive),
+            "archive_sha256": digest_file(
+                evidence_archive
+            ),
             "archive_path": str(evidence_archive),
         }
-        atomic_write(state_path, canonical_json(state), 0o600)
-        atomic_write(NGINX_ROUTE, active_route, 0o644)
+
+        atomic_write(
+            state_path,
+            canonical_json(state),
+            0o600,
+        )
+
+        # Restore public traffic and prove the final candidate before
+        # allowing maintenance/dispatcher to run.
+        atomic_write(
+            NGINX_ROUTE,
+            active_route,
+            0o644,
+        )
+
         run("/usr/sbin/nginx", "-t")
         run("/usr/bin/systemctl", "reload", "nginx")
-        wait_http_status("https://2.28.67.165/agent-platform/health", "401")
-        need(http_status("https://2.28.67.165/") == root_status, "public_root_changed")
-        return {"status": "success", **state, "state_file": str(state_path)}
+
+        wait_http_status(
+            "https://2.28.67.165/agent-platform/health",
+            "401",
+        )
+
+        need(
+            http_status("https://2.28.67.165/")
+            == root_status,
+            "public_root_changed",
+        )
+
+        need(
+            CURRENT.resolve(strict=True) == candidate,
+            "final_current_mismatch",
+        )
+
+        # This is intentionally the LAST state-changing runtime step.
+        # The watchdog can dispatch only after deployment identity,
+        # route and health evidence are durable.
+        start_watchdog_service()
+        watchdog_stopped = False
+
+        return {
+            "status": "success",
+            **state,
+            "state_file": str(state_path),
+        }
+
     except BaseException:
         try:
+            # Keep durable execution quiescent for rollback.
+            run(
+                "/usr/bin/systemctl",
+                "stop",
+                "agent-stack-watchdog.service",
+                check=False,
+            )
+            watchdog_stopped = True
+
+            # Restore exact pre-deployment units even if install_units()
+            # failed part-way through.
+            restore_units(unit_snapshots)
+
             if switched:
                 switch_runtime(
                     previous,
                     None,
-                    start_watchdog=False,
                 )
+
+            restore_file(
+                PUBLIC_STATE,
+                public_state_snapshot,
+            )
 
             if timers_stopped:
                 run(
@@ -582,27 +826,45 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
                     "agent-platform-herdr.timer",
                     "agent-platform-export.timer",
                 )
+                timers_stopped = False
 
-            if watchdog_stopped:
-                run("/usr/bin/systemctl", "daemon-reload")
-                run(
-                    "/usr/bin/systemctl",
-                    "start",
-                    "agent-stack-watchdog.service",
-                )
-                need(
-                    run(
-                        "/usr/bin/systemctl",
-                        "is-active",
-                        "agent-stack-watchdog.service",
-                    )
-                    == "active",
-                    "rollback_watchdog_not_active",
-                )
+            atomic_write(
+                NGINX_ROUTE,
+                active_route,
+                0o644,
+            )
 
-            atomic_write(NGINX_ROUTE, active_route, 0o644)
             run("/usr/sbin/nginx", "-t")
             run("/usr/bin/systemctl", "reload", "nginx")
+
+            wait_http_status(
+                "https://2.28.67.165/agent-platform/health",
+                "401",
+            )
+
+            # A failed promotion must not leave a success-looking state
+            # document behind.
+            try:
+                state_path.unlink()
+            except FileNotFoundError:
+                pass
+
+            if evidence_moved and evidence_archive.exists():
+                failed_archive = (
+                    STATE_DIR
+                    / (
+                        f"{document['deployed_at']}-"
+                        f"{identifier}.failed.tar.gz"
+                    )
+                )
+                os.replace(
+                    evidence_archive,
+                    failed_archive,
+                )
+
+            start_watchdog_service()
+            watchdog_stopped = False
+
         finally:
             raise
 

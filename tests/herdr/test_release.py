@@ -241,66 +241,7 @@ def test_agent_stack_runtime_chain_is_release_relative():
     assert 'script = BIN / name' in maintenance
 
 
-def test_switch_runtime_restarts_watchdog_across_symlink(monkeypatch, tmp_path):
-    events = []
-
-    def fake_run(*args, check=True):
-        events.append(("run", *args))
-        if (
-            len(args) >= 3
-            and args[0] == "/usr/bin/systemctl"
-            and args[1] == "is-active"
-        ):
-            return "active"
-        return ""
-
-    monkeypatch.setattr(cutover, "run", fake_run)
-    monkeypatch.setattr(
-        cutover,
-        "atomic_symlink",
-        lambda target, link: events.append(
-            ("symlink", str(target), str(link))
-        ),
-    )
-    monkeypatch.setattr(
-        cutover,
-        "wait_http_status",
-        lambda *_args, **_kwargs: "401",
-    )
-    monkeypatch.setattr(cutover, "assert_hardening", lambda: None)
-
-    target = tmp_path / "release"
-    target.mkdir()
-
-    cutover.switch_runtime(
-        target,
-        None,
-        start_watchdog=True,
-    )
-
-    stop = (
-        "run",
-        "/usr/bin/systemctl",
-        "stop",
-        "agent-stack-watchdog.service",
-        "agent-platform-web.service",
-    )
-    link = ("symlink", str(target), str(cutover.CURRENT))
-    start = (
-        "run",
-        "/usr/bin/systemctl",
-        "start",
-        "agent-stack-watchdog.service",
-    )
-
-    assert stop in events
-    assert link in events
-    assert start in events
-    assert events.index(stop) < events.index(link) < events.index(start)
-
-
-
-def test_switch_runtime_can_keep_watchdog_quiescent(
+def test_switch_runtime_keeps_watchdog_quiescent(
     monkeypatch,
     tmp_path,
 ):
@@ -341,8 +282,24 @@ def test_switch_runtime_can_keep_watchdog_quiescent(
     cutover.switch_runtime(
         target,
         None,
-        start_watchdog=False,
     )
+
+    stop = (
+        "run",
+        "/usr/bin/systemctl",
+        "stop",
+        "agent-stack-watchdog.service",
+        "agent-platform-web.service",
+    )
+    link = (
+        "symlink",
+        str(target),
+        str(cutover.CURRENT),
+    )
+
+    assert stop in events
+    assert link in events
+    assert events.index(stop) < events.index(link)
 
     assert not any(
         event[:4]
@@ -354,6 +311,31 @@ def test_switch_runtime_can_keep_watchdog_quiescent(
         )
         for event in events
     )
+
+
+def test_watchdog_start_is_explicit(monkeypatch):
+    events = []
+
+    def fake_run(*args, check=True):
+        events.append(("run", *args))
+        if args[:3] == (
+            "/usr/bin/systemctl",
+            "is-active",
+            "agent-stack-watchdog.service",
+        ):
+            return "active"
+        return ""
+
+    monkeypatch.setattr(cutover, "run", fake_run)
+
+    cutover.start_watchdog_service()
+
+    assert (
+        "run",
+        "/usr/bin/systemctl",
+        "start",
+        "agent-stack-watchdog.service",
+    ) in events
 
 
 def test_active_worker_blocks_control_plane_promotion(monkeypatch):
@@ -381,15 +363,28 @@ def test_apply_keeps_watchdog_quiescent_during_rollback_exercise():
         1,
     )[1]
 
-    assert apply_source.count(
-        "start_watchdog=False"
-    ) >= 3
-
-    assert apply_source.count(
-        "start_watchdog=True"
-    ) == 1
-
     assert "assert_no_active_durable_worker()" in apply_source
+    assert "unit_snapshots = snapshot_units()" in apply_source
+    assert "restore_units(unit_snapshots)" in apply_source
+    assert "public_state_snapshot = snapshot_file(PUBLIC_STATE)" in apply_source
+    assert "restore_file(" in apply_source
+
+    # switch_runtime itself never restarts durable dispatch.
+    switch_source = source.split(
+        "def switch_runtime(",
+        1,
+    )[1].split(
+        "def start_watchdog_service",
+        1,
+    )[0]
+    assert '"start",\n            "agent-stack-watchdog.service"' not in switch_source
+
+    # Success path starts watchdog only after public health proof.
+    assert apply_source.index(
+        'wait_http_status(\n            "https://2.28.67.165/agent-platform/health",\n            "401",'
+    ) < apply_source.index(
+        "start_watchdog_service()"
+    )
 
 
 def test_legacy_watchdog_installer_is_release_relative():
@@ -412,9 +407,38 @@ def test_offsite_backup_captures_immutable_release_control_plane():
 
     assert "RELEASE.json" in text
     assert "MANIFEST.sha256" in text
-    assert "agent-stack/bin" in text
-    assert "agent-stack/systemd" in text
+    assert '-C "$RELEASE_ROOT"' in text
+    assert "COMPLETE immutable Herdr release" in text
 
     assert ".local/bin/agent-stack-watchdog" not in text
     assert ".local/bin/agent-stack-recovery" not in text
     assert ".local/bin/agent-task-dispatcher" not in text
+
+
+
+def test_snapshot_restore_contract_is_exact(monkeypatch, tmp_path):
+    path = tmp_path / "unit.service"
+    path.write_bytes(b"before\n")
+    path.chmod(0o640)
+
+    snapshot = cutover.snapshot_file(path)
+
+    assert snapshot is not None
+    assert snapshot[0] == b"before\n"
+    assert snapshot[1] == 0o640
+
+    writes = []
+
+    monkeypatch.setattr(
+        cutover,
+        "atomic_write",
+        lambda target, data, mode, uid=0, gid=0:
+            writes.append((target, data, mode, uid, gid)),
+    )
+
+    cutover.restore_file(path, snapshot)
+
+    assert writes
+    assert writes[0][0] == path
+    assert writes[0][1] == b"before\n"
+    assert writes[0][2] == 0o640
