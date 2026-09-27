@@ -14,6 +14,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -25,6 +26,7 @@ from herdr.admission import (
     ResourceUsage,
     TaskGraphSpec,
 )
+from herdr.taskgraph import GRAPH_VERSION, TaskGraphEnvelope
 from herdr.scheduler import (
     AuditLog,
     DenyDecision,
@@ -180,7 +182,7 @@ def scheduler_resource_usage(
         if not isinstance(row, Mapping):
             raise HerdrRuntimeError("invalid_scheduler_snapshot", "task row invalid")
         state = row.get("state")
-        if state in {"planned", "ready"}:
+        if state in {"planned", "ready", "pending"}:
             queue_depth += 1
         if state != "running" or row.get("task_id") == current_task_id:
             continue
@@ -290,7 +292,7 @@ class HerdrChildRuntime:
             node = self.scheduler.task_node(lease.task_id)
         except KeyError as exc:
             raise HerdrRuntimeError("unknown_child_task", lease.task_id) from exc
-        parent_id = node.parent_task_id or node.parent_node
+        parent_id = node.parent_id
         if not parent_id:
             raise HerdrRuntimeError("child_parent_required", lease.task_id)
         try:
@@ -298,6 +300,7 @@ class HerdrChildRuntime:
         except KeyError as exc:
             raise HerdrRuntimeError("unknown_child_parent", parent_id) from exc
 
+        context = self.scheduler.task_context(lease.task_id)
         node_count, max_depth, max_fanout = self.scheduler.graph_dimensions()
         usage = self.resource_usage_factory(
             self.scheduler,
@@ -307,11 +310,11 @@ class HerdrChildRuntime:
         decision = self.admission.check(
             AgentIdentity(
                 role=node.role,
-                repo=node.repo,
-                issue=node.issue,
+                repo=context["repo"],
+                issue=context["issue"],
                 parent_role=parent.role,
                 parent_tools=frozenset(parent.tools),
-                paper_only=node.paper_only,
+                paper_only=context["policy_profile"] == "quantlab-paper",
             ),
             TaskGraphSpec(
                 node_count=node_count,
@@ -480,38 +483,51 @@ def build_two_child_canary(
         audit_log=AuditLog(audit_path),
     )
     parent = TaskNode(
-        node_id="runtime-canary-parent",
-        task="coordinate safe read-only child canary",
+        id="runtime-canary-parent",
+        parent_id=None,
+        type="task",
         role="reader",
+        objective="coordinate safe read-only child canary",
+        inputs=[{"artifact_ref": "fixture"}],
+        expected_outputs=[{"kind": "result"}],
+        dependencies=(),
+        priority=1,
+        resource_class="small",
+        model_policy={"model": "laguna", "fallback_model": "longcat"},
         tools=(),
-        max_seconds=1800,
-        paper_only=True,
-        repo="Bbambaaamm/herdr",
-        issue="3",
+        permissions=("repo:read",),
+        timeout_seconds=1800,
+        max_attempts=1,
     )
     scheduler.submit(
         TaskGraph(
+            envelope=TaskGraphEnvelope(
+                issue="Bbambaaamm/herdr#3",
+                spec_hash="sha256:" + "a" * 64,
+                graph_version=GRAPH_VERSION,
+                created_at=datetime.now(UTC).isoformat(),
+                planner="herdr-runtime-canary@1.0",
+                max_nodes=64,
+                max_depth=4,
+                max_fanout=6,
+                policy_profile="quantlab-paper",
+            ),
             nodes=(parent,),
-            name="herdr-runtime-canary",
-            repo=parent.repo,
-            issue=parent.issue,
-        )
+        ),
+        repo="Bbambaaamm/herdr",
+        issue="3",
     )
-
-    parent_lease = scheduler.bind_external_parent(parent.node_id, parent_agent_id)
+    parent_lease = scheduler.bind_external_parent(parent.id, parent_agent_id)
     child_nodes: list[TaskNode] = []
     for label in ("a", "b"):
         child = scheduler.spawn_child(
-            parent.node_id,
+            parent.id,
             SubtaskProposal(
                 parent_role="reader",
                 parent_tools=(),
                 child_role="reader",
                 child_tools=(),
                 child_task=f"safe-read-only-canary-{label}",
-                paper_only=True,
-                repo=parent.repo,
-                issue=parent.issue,
             ),
         )
         if isinstance(child, DenyDecision):
@@ -521,7 +537,7 @@ def build_two_child_canary(
     leases = [
         lease
         for lease in scheduler.dispatch()
-        if lease.task_id in {child.node_id for child in child_nodes}
+        if lease.task_id in {child.id for child in child_nodes}
     ]
     if len(leases) != 2:
         raise HerdrRuntimeError("two_child_dispatch_failed", f"leases={len(leases)}")
