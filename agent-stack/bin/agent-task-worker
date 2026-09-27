@@ -155,7 +155,7 @@ def _pane_has_marker(pane_id: str, marker: str) -> bool:
         return False
     try:
         environ = Path(f"/proc/{shell_pid}/environ").read_bytes().split(b"\0")
-    except (FileNotFoundError, PermissionError, ProcessLookupError):
+    except OSError:
         return False
     expected = f"{TASK_PANE_ENV}={marker}".encode("utf-8")
     return expected in environ
@@ -280,7 +280,11 @@ def create_task_session(task: dict) -> dict:
             ) from exc
         else:
             try:
-                candidates = _find_marked_task_panes(pane_marker, workspace_id)
+                candidates = tuple(
+                    candidate
+                    for candidate in _find_marked_task_panes(pane_marker, workspace_id)
+                    if candidate != coordinator_pane
+                )
             except Exception as reconcile_exc:
                 raise RuntimeError(
                     f"task_session_split_uncertain:{reconcile_exc}"
@@ -356,6 +360,9 @@ def cleanup_task_session_if_safe(task: dict) -> bool:
         path = current_task_path(task)
         if path is not None:
             task["watchdog_blocker"] = "task_session_cleanup_failed"
+            archive_previous_result(
+                str(task["id"]), int(task.get("attempts") or 0)
+            )
             block_task(
                 path,
                 task,
@@ -702,16 +709,10 @@ def main(task_path: Path) -> int:
             and previous_session.get("owned_pane")
             and not previous_session.get("closed_at")
         ):
-            cleanup_task_session(task)
-            if not previous_session.get("closed_at"):
-                task["watchdog_blocker"] = "task_session_cleanup_failed"
-                block_task(
-                    task_path,
-                    task,
-                    "task_session_cleanup_failed",
-                    "The prior task-owned pane could not be safely closed; no new attempt was started.",
-                )
+            if not cleanup_task_session_if_safe(task):
+                persist_current_task(task)
                 return 1
+            persist_current_task(task)
 
         prepare_attempt(task)
         attempt = int(task.get("attempts") or 0)
@@ -755,7 +756,13 @@ def main(task_path: Path) -> int:
                 )
             except Exception as exc:
                 detail = str(exc)
-                if detail.startswith(("task_session_cleanup_failed", "task_session_split_uncertain")):
+                if detail.startswith(
+                    (
+                        "task_session_cleanup_failed",
+                        "task_session_pane_not_isolated",
+                        "task_session_split_uncertain",
+                    )
+                ):
                     block_task(
                         task_path,
                         task,
