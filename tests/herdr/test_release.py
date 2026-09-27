@@ -136,6 +136,26 @@ def test_cutover_helpers_are_atomic_and_never_drop_legacy_files(tmp_path):
         assert (links / "current").resolve() == second
 
 
+def test_http_status_waits_for_reload_convergence(monkeypatch):
+    statuses = iter(("401", "401", "503"))
+    sleeps = []
+    monkeypatch.setattr(cutover, "http_status", lambda _url: next(statuses))
+    monkeypatch.setattr(cutover.time, "sleep", sleeps.append)
+
+    assert cutover.wait_http_status("https://example.test/health", "503",
+                                    attempts=3, delay=0.25) == "503"
+    assert sleeps == [0.25, 0.25]
+
+
+def test_http_status_wait_is_bounded_and_reports_last_status(monkeypatch):
+    monkeypatch.setattr(cutover, "http_status", lambda _url: "401")
+    monkeypatch.setattr(cutover.time, "sleep", lambda _delay: None)
+
+    with pytest.raises(release.ReleaseError, match="http_status_timeout:503:401"):
+        cutover.wait_http_status("https://example.test/health", "503",
+                                 attempts=2, delay=0)
+
+
 def test_runtime_units_use_only_atomic_current_symlink():
     for name in cutover.UNITS:
         template = Path("deploy/agent_platform/production") / f"{name}.in"
