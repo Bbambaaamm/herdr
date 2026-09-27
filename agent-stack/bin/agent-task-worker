@@ -15,6 +15,7 @@ HOME = Path("/home/agentops")
 HERDR = HOME / ".local/bin/herdr"
 ROOT = HOME / ".local/state/agent-stack/tasks"
 PENDING = ROOT / "pending"
+RUNNING = ROOT / "running"
 DONE = ROOT / "done"
 BLOCKED = ROOT / "blocked"
 FAILED = ROOT / "failed"
@@ -226,6 +227,13 @@ def persist_current_task(task: dict) -> None:
         if path.exists():
             write_json(path, task)
             return
+
+
+def cleanup_task_session_if_safe(task: dict) -> None:
+    """Keep a task-owned pane alive while prompt delivery is still ambiguous."""
+    if task.get("attempt_state") == "delivery_uncertain":
+        return
+    cleanup_task_session(task)
 
 
 def prompt_text(task: dict) -> str:
@@ -475,6 +483,7 @@ def block_task(task_path: Path, task: dict, blocker: str, summary: str) -> None:
         )
     task["last_error"] = summary[-2000:]
     task["result_status"] = "blocked"
+    task["attempt_state"] = "blocked"
     task["finished_at"] = utcnow().isoformat()
     write_json(task_path, task)
     move(task_path, BLOCKED)
@@ -548,12 +557,14 @@ def main(task_path: Path) -> int:
             )
             if wait_for_durable_result(task, 1) or reconcile_completion_evidence(task):
                 finish(task_path, task, "reconciled durable result without redispatch")
-                return 0
-            defer_delivery_reconciliation(
-                task_path,
-                task,
-                str(task.get("last_error") or "delivery remains uncertain"),
-            )
+            else:
+                defer_delivery_reconciliation(
+                    task_path,
+                    task,
+                    str(task.get("last_error") or "delivery remains uncertain"),
+                )
+            cleanup_task_session_if_safe(task)
+            persist_current_task(task)
             return 0
 
         prepare_attempt(task)
@@ -669,7 +680,7 @@ def main(task_path: Path) -> int:
             finish(task_path, task, output)
             return 0
         finally:
-            cleanup_task_session(task)
+            cleanup_task_session_if_safe(task)
             persist_current_task(task)
     finally:
         os.close(lock_fd)

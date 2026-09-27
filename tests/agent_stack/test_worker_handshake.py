@@ -328,3 +328,52 @@ def test_new_semantic_attempt_discards_previous_session_metadata(tmp_path):
 
     assert "execution_session" not in task
     assert task["run_token"]
+
+
+def test_persist_current_task_updates_running_task(tmp_path):
+    configure_paths(tmp_path)
+    worker.RUNNING = tmp_path / "running"
+    worker.RUNNING.mkdir()
+    task = base_task()
+    task["attempt_state"] = "accepted"
+    task_path = worker.RUNNING / "task-1.json"
+    task_path.write_text(json.dumps(task), encoding="utf-8")
+
+    task["marker"] = "persisted"
+    worker.persist_current_task(task)
+
+    saved = json.loads(task_path.read_text(encoding="utf-8"))
+    assert saved["marker"] == "persisted"
+
+
+def test_cleanup_preserves_delivery_uncertain_session(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    calls = []
+    monkeypatch.setattr(worker, "cleanup_task_session", lambda task: calls.append(task["attempt_state"]))
+    task = base_task()
+    task["attempt_state"] = "delivery_uncertain"
+
+    worker.cleanup_task_session_if_safe(task)
+    assert calls == []
+
+    task["attempt_state"] = "blocked"
+    worker.cleanup_task_session_if_safe(task)
+    assert calls == ["blocked"]
+
+
+def test_block_task_makes_session_cleanup_safe(tmp_path):
+    configure_paths(tmp_path)
+    running = tmp_path / "running"
+    running.mkdir()
+    task = base_task()
+    worker.prepare_attempt(task)
+    task["attempt_state"] = "delivery_uncertain"
+    task_path = running / "task-1.json"
+    task_path.write_text(json.dumps(task), encoding="utf-8")
+
+    worker.block_task(task_path, task, "bounded_recovery_exhausted", "bounded recovery exhausted")
+
+    blocked = worker.BLOCKED / task_path.name
+    saved = json.loads(blocked.read_text(encoding="utf-8"))
+    assert saved["attempt_state"] == "blocked"
+    assert saved["result_status"] == "blocked"
