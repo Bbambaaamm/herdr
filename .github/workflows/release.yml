@@ -31,9 +31,16 @@ jobs:
           cache-dependency-path: package-lock.json
       - name: Require annotated immutable tag
         run: |
-          test "$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}")" = tag
-          test "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")" = "$GITHUB_SHA"
+          tag_ref="refs/tags/${GITHUB_REF_NAME}"
+          tag_object="$(git ls-remote --refs origin "$tag_ref" | awk 'NR == 1 { print $1 }')"
+          test -n "$tag_object"
+          test "$(git cat-file -t "$tag_object")" = tag
+          test "$(git rev-parse "${tag_object}^{commit}")" = "$GITHUB_SHA"
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          # checkout resolves an annotated tag to its commit and rewrites the
+          # local tag ref. Restore the verified remote object for the builder.
+          git update-ref "$tag_ref" "$tag_object"
+          test "$(git cat-file -t "$tag_ref")" = tag
       - name: Validate full repository contract
         run: |
           python scripts/validate_repo.py
