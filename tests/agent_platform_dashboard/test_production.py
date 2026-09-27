@@ -15,7 +15,7 @@ def test_closed_snapshot_rejects_sensitive_fields():
 
 def test_unavailable_is_not_zero():
     value = decode(json.dumps(unavailable(100)).encode())
-    assert len(value['sources']) == 14
+    assert len(value['sources']) == 15
     assert all(s['status'] == 'unavailable' and s['rows'] == [] for s in value['sources'])
 
 import base64

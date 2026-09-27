@@ -52,7 +52,8 @@ def collect(config, now):
     snapshot = c.unavailable(now)
     adapters = {'router': sources.router, 'search': sources.search,
                 'kanban': sources.kanban, 'git': sources.git,
-                'tests': sources.tests, 'queue': sources.queue, 'codex': sources.codex}
+                'tests': sources.tests, 'queue': sources.queue,
+                'codex': sources.codex, 'admission': sources.admission}
     for source in snapshot['sources']:
         profile, kind = source['profile'], source['kind']
         if kind == 'herdr':
@@ -61,6 +62,8 @@ def collect(config, now):
             setting = sources.QUEUE_PATH
         elif kind == 'codex':
             setting = sources.CODEX_USAGE_PATH
+        elif kind == 'admission':
+            setting = sources.ADMISSION_PATH
         else:
             setting = config['profiles'][profile][kind]
         if setting is None:
@@ -75,7 +78,7 @@ def collect(config, now):
                 source.update(rows=[], data_at=None, status='unavailable', reason='stale')
                 continue
             source.update(rows=rows, data_at=data_at, status='available', reason='ok')
-            if kind in ('herdr', 'queue', 'codex'):
+            if kind in ('herdr', 'queue', 'codex', 'admission'):
                 c.need(data_at is not None)
                 source['observed_at'] = data_at
             if kind == 'tests':

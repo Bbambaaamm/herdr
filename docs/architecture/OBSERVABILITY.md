@@ -11,6 +11,9 @@ sources for Machine City. It is stacked on the Git source-of-truth import from P
 - `search`: route mode, provider/fallback provider, search success, latency,
   fallback count, results/extracts and optional cost.
 - `queue`: sanitized durable Agent Stack queue metadata, schema version 2.
+- `admission`: bounded tail of `/var/lib/agent-platform-herdr/admission.jsonl`,
+  projected to ALLOW/DENY, reason code, role, repo/issue, DAG dimensions,
+  child-tool count and timestamp only. Raw detail/tool arguments are discarded.
 - `codex`: sanitized account allowance/token activity from
   `/var/lib/agent-platform-herdr/codex-usage.json`, enriched with bounded
   cost-aware routing summary from `/var/lib/agent-platform-herdr/model-routing.json`:

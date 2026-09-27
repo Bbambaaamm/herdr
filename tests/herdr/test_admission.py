@@ -425,3 +425,54 @@ def test_nonfinite_resource_telemetry_fails_closed(tmp_path: Path) -> None:
     )
     assert isinstance(decision, DenyDecision)
     assert decision.reason == DenyReason.INVALID_RESOURCE_TELEMETRY
+
+
+def test_consumer_policy_hook_can_only_tighten_admission(tmp_path: Path) -> None:
+    def consumer_policy(identity: AgentIdentity, child_tools) -> str | None:
+        assert identity.repo == "QuantLab"
+        assert tuple(child_tools) == ("read_file",)
+        return "consumer_release_gate"
+
+    ac = AdmissionControl(
+        audit_log=_tmp_audit(tmp_path),
+        consumer_policy_hook=consumer_policy,
+    )
+    child = _writer_identity(
+        role="reader",
+        parent_role="reader",
+        parent_tools=frozenset({"read_file"}),
+    )
+    decision = ac.check(
+        child,
+        TaskGraphSpec(node_count=1, max_depth=1, max_fanout=0),
+        _idle_usage(),
+        ["read_file"],
+    )
+    assert isinstance(decision, DenyDecision)
+    assert decision.reason == DenyReason.CONSUMER_POLICY
+    events = ac.audit_log.replay()  # type: ignore[union-attr]
+    assert events[-1]["reason"] == "consumer_policy"
+    assert events[-1]["admit:consumer_reason"] == "consumer_release_gate"
+
+
+def test_consumer_policy_hook_cannot_bypass_platform_denial(tmp_path: Path) -> None:
+    ac = AdmissionControl(
+        audit_log=_tmp_audit(tmp_path),
+        consumer_policy_hook=lambda _identity, _tools: None,
+    )
+    child = _writer_identity(
+        role="writer",
+        parent_role="writer",
+        parent_tools=frozenset({"read_file"}),
+    )
+    decision = ac.check(
+        child,
+        TaskGraphSpec(node_count=1, max_depth=1, max_fanout=0),
+        _idle_usage(),
+        ["read_file", "git_push"],
+    )
+    assert isinstance(decision, DenyDecision)
+    assert decision.reason in {
+        DenyReason.TOOL_NOT_IN_ROLE_ALLOWLIST,
+        DenyReason.TOOL_ESCALATION,
+    }

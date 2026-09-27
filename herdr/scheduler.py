@@ -625,6 +625,10 @@ class DynamicChildScheduler:
         self._fencing_counter: int = 0
         self._event_seq: int = 0
 
+    def current_time(self) -> float:
+        """Return scheduler time so leases and external registries share one clock."""
+        return self._clock()
+
     def task_node(self, task_id: str) -> TaskNode:
         """Return immutable task metadata for runtime admission or fail closed."""
         record = self._tasks.get(task_id)

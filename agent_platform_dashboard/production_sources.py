@@ -1,5 +1,6 @@
 """Exporter-only fixed read projections. Never imported by the HTTP application."""
 from contextlib import ExitStack, contextmanager
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import selectors
@@ -19,6 +20,7 @@ SAFE_ENV = {'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
 QUEUE_PATH = '/var/lib/agent-platform-herdr/queue.json'
 CODEX_USAGE_PATH = '/var/lib/agent-platform-herdr/codex-usage.json'
 MODEL_ROUTING_PATH = '/var/lib/agent-platform-herdr/model-routing.json'
+ADMISSION_PATH = '/var/lib/agent-platform-herdr/admission.jsonl'
 
 
 def command(argv, *, env=None, limit=65536, timeout=3):
@@ -272,6 +274,61 @@ def queue(path, profile):
         rows.append(item)
     c.need(len({r['task_id'] for r in rows}) == len(rows))
     return rows, raw['observed_at']
+
+
+def _tail_regular(path, limit=65536):
+    with regular(path) as (fd, info):
+        c.need(info.st_size >= 0)
+        start = max(0, info.st_size - limit)
+        data = os.pread(fd, min(limit, info.st_size), start)
+        if start:
+            split = data.find(b'\n')
+            data = b'' if split < 0 else data[split + 1:]
+        if data and not data.endswith(b'\n'):
+            split = data.rfind(b'\n')
+            data = b'' if split < 0 else data[:split + 1]
+        return data, int(info.st_mtime)
+
+
+def _admission_timestamp(value):
+    c.need(type(value) is str and 1 <= len(value) <= 64)
+    try:
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except ValueError:
+        raise ValueError('invalid_metadata') from None
+    c.need(parsed.tzinfo is not None)
+    stamp = int(parsed.astimezone(timezone.utc).timestamp())
+    c.need(c.number(stamp))
+    return stamp
+
+
+def admission(path, profile):
+    c.need(profile == 'quantlab' and path == ADMISSION_PATH)
+    raw, file_mtime = _tail_regular(path)
+    rows = []
+    for line in raw.splitlines():
+        event = c.parse(line, 8192)
+        c.need(type(event) is dict and event.get('event') in ('allow', 'deny', 'cancel'))
+        if event['event'] == 'cancel':
+            continue
+        observed_at = _admission_timestamp(event.get('ts'))
+        row = {
+            'event': event['event'],
+            'reason': event.get('reason') if event['event'] == 'deny' else None,
+            'role': event.get('admit:role'),
+            'repo': event.get('admit:repo'),
+            'issue': event.get('admit:issue'),
+            'node_count': event.get('admit:node_count'),
+            'max_depth': event.get('admit:max_depth'),
+            'max_fanout': event.get('admit:max_fanout'),
+            'child_tools_count': event.get('admit:child_tools_count'),
+            'agents_after': event.get('agents_after') if event['event'] == 'allow' else None,
+            'observed_at': observed_at,
+        }
+        c.row('admission', row)
+        rows.append(row)
+    rows = rows[-50:]
+    return rows, (rows[-1]['observed_at'] if rows else file_mtime)
 
 
 def _routing_summary(now):

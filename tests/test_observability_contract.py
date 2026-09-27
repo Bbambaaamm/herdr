@@ -6,6 +6,8 @@ import time
 import unittest
 from pathlib import Path
 
+import pytest
+
 DASHBOARD = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(DASHBOARD))
 
@@ -99,11 +101,13 @@ def routing_payload(observed_at):
 
 class ObservabilityContractTests(unittest.TestCase):
     def test_source_matrix_is_closed_and_asymmetric(self):
-        self.assertEqual(len(c.SOURCE_PAIRS), 14)
+        self.assertEqual(len(c.SOURCE_PAIRS), 15)
         self.assertIn(("quantlab", "queue"), c.SOURCE_PAIRS)
         self.assertNotIn(("majak", "queue"), c.SOURCE_PAIRS)
         self.assertIn(("majak", "codex"), c.SOURCE_PAIRS)
         self.assertNotIn(("quantlab", "codex"), c.SOURCE_PAIRS)
+        self.assertIn(("quantlab", "admission"), c.SOURCE_PAIRS)
+        self.assertNotIn(("majak", "admission"), c.SOURCE_PAIRS)
     def test_queue_v2_projection_accepts_only_sanitized_metadata(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "queue.json"
@@ -250,7 +254,7 @@ class ObservabilityContractTests(unittest.TestCase):
                     },
                 }
                 snapshot = collect(config, 100)
-                self.assertEqual(len(snapshot["sources"]), 14)
+                self.assertEqual(len(snapshot["sources"]), 15)
                 q = next(s for s in snapshot["sources"] if s["kind"] == "queue")
                 x = next(s for s in snapshot["sources"] if s["kind"] == "codex")
                 self.assertEqual(q["status"], "available")
@@ -267,3 +271,54 @@ class ObservabilityContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _admission_event(event, ts, **overrides):
+    base = {
+        "ts": ts,
+        "event": event,
+        "admit:role": "reader",
+        "admit:repo": "Bbambaaamm/herdr",
+        "admit:issue": "3",
+        "admit:node_count": 3,
+        "admit:max_depth": 2,
+        "admit:max_fanout": 2,
+        "admit:child_tools_count": 0,
+    }
+    if event == "allow":
+        base.update({"agents_after": 2, "utilization": {"agents": 0.25}})
+    else:
+        base.update({"reason": "global_agent_limit", "detail": "PRIVATE TOOL ARGUMENT"})
+    base.update(overrides)
+    return base
+
+
+def test_admission_projection_is_bounded_and_sanitized():
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "admission.jsonl"
+        events = [
+            _admission_event("allow", "2026-09-27T01:00:00+00:00"),
+            _admission_event(
+                "deny",
+                "2026-09-27T01:01:00+00:00",
+                **{"admit:denied_tool": "SECRET_TOOL_PAYLOAD"},
+            ),
+        ]
+        path.write_text(
+            "".join(json.dumps(event) + "\n" for event in events),
+            encoding="utf-8",
+        )
+        original = sources.ADMISSION_PATH
+        sources.ADMISSION_PATH = str(path)
+        try:
+            rows, stamp = sources.admission(str(path), "quantlab")
+            assert stamp > 0
+            assert [row["event"] for row in rows] == ["allow", "deny"]
+            assert rows[-1]["reason"] == "global_agent_limit"
+            rendered = json.dumps(rows)
+            assert "PRIVATE TOOL ARGUMENT" not in rendered
+            assert "SECRET_TOOL_PAYLOAD" not in rendered
+            with pytest.raises(ValueError):
+                sources.admission(str(path), "majak")
+        finally:
+            sources.ADMISSION_PATH = original

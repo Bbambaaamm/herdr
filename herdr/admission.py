@@ -15,7 +15,7 @@ Invariants enforced by AdmissionControl.check():
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -163,6 +163,7 @@ class DenyReason(StrEnum):
     PROTECTED_PATH = "protected_path"
     SECRET_ACCESS = "secret_access"  # noqa: S105 - denial reason code, not a credential
     EXTERNAL_NETWORK_POLICY = "external_network_policy"
+    CONSUMER_POLICY = "consumer_policy"
 
 
 # --------------------------------------------------------------------------- #
@@ -280,6 +281,7 @@ class AllowDecision:
 
 
 Decision = AllowDecision | DenyDecision
+ConsumerPolicyHook = Callable[[AgentIdentity, Sequence[str]], str | None]
 
 
 # --------------------------------------------------------------------------- #
@@ -307,6 +309,7 @@ class AuditLog:
         line = json.dumps(record, sort_keys=True, default=str, allow_nan=False)
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
+        self.path.chmod(0o640)
         return record
 
     def replay(self) -> list[dict[str, object]]:
@@ -339,6 +342,7 @@ class AdmissionControl:
     budget: PlanBudget = field(default_factory=PlanBudget)
     paper_only: bool = True
     audit_log: AuditLog | None = None
+    consumer_policy_hook: ConsumerPolicyHook | None = None
 
     def __post_init__(self) -> None:
         if self.audit_log is None:
@@ -614,7 +618,29 @@ class AdmissionControl:
                 {**audit_ctx, "identity.paper_only": identity.paper_only},
             )
 
-        # 7. Tool allowlist — fail-closed on any unknown / out-of-role tool.
+        # 7. Consumer-specific policy may only tighten admission. The hook
+        #    receives sanitized identity + requested tool names and returns a
+        #    bounded reason code, or None to defer to platform policy.
+        if self.consumer_policy_hook is not None:
+            consumer_reason = self.consumer_policy_hook(identity, tuple(child_tools))
+            if consumer_reason is not None:
+                safe_reason = (
+                    consumer_reason
+                    if isinstance(consumer_reason, str)
+                    and 0 < len(consumer_reason) <= 64
+                    and all(
+                        ch.isascii() and (ch.isalnum() or ch in "-_:/")
+                        for ch in consumer_reason
+                    )
+                    else "invalid_consumer_policy_reason"
+                )
+                return self._deny(
+                    DenyReason.CONSUMER_POLICY,
+                    "consumer-specific policy denied dynamic child spawn",
+                    {**audit_ctx, "consumer_reason": safe_reason},
+                )
+
+        # 8. Tool allowlist — fail-closed on any unknown / out-of-role tool.
         role_tools = self.budget.role_tool_allowlist.get(identity.role, frozenset())
         child_set = frozenset(child_tools)
         unknown_to_role = child_set - role_tools
