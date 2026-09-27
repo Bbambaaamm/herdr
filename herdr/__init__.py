@@ -10,6 +10,17 @@ from .taskgraph import (
     TaskGraphEnvelope,
     TaskNode,
 )
+from .scheduler import (
+    AllowDecision,
+    AuditLog,
+    ChildProposal,
+    DenyDecision,
+    DenyReason,
+    DynamicChildScheduler,
+    SchedulerBudget,
+    SchedulerError,
+    Lease,
+)
 
 __all__ = [
     "GRAPH_VERSION",
@@ -20,5 +31,14 @@ __all__ = [
     "TaskGraph",
     "TaskGraphEnvelope",
     "TaskNode",
+    "AllowDecision",
+    "AuditLog",
+    "ChildProposal",
+    "DenyDecision",
+    "DenyReason",
+    "DynamicChildScheduler",
+    "SchedulerBudget",
+    "SchedulerError",
+    "Lease",
 ]
 __version__ = "0.2.0"

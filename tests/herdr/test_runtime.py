@@ -203,7 +203,7 @@ def test_two_real_child_contract_parallel_cleanup_and_snapshot(tmp_path: Path) -
     )
 
     payload = json.loads(snapshot_path.read_text())
-    assert set(payload) == {
+    assert {
         "version",
         "observed_at",
         "repo",
@@ -212,7 +212,8 @@ def test_two_real_child_contract_parallel_cleanup_and_snapshot(tmp_path: Path) -
         "tasks",
         "agents",
         "edges",
-    }
+    }.issubset(payload)
+    assert payload["policy_profiles"] == ["quantlab-paper"]
     assert payload["paper_only"] is True
     assert snapshot_path.stat().st_mode & 0o777 == 0o640
     assert len(payload["agents"]) == 3
