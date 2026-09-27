@@ -176,3 +176,120 @@ def test_deployed_document_is_closed_and_binds_config():
         cutover.deployed_document(
             {"tag": "v1.2.3", "commit": "a" * 40, "config_contract_sha256": "b" * 64},
             "c" * 64, 100)
+
+
+
+def test_watchdog_unit_is_versioned_and_cutover_managed():
+    source = Path("agent-stack/systemd/agent-stack-watchdog.service").read_text(
+        encoding="utf-8"
+    )
+    template = Path(
+        "deploy/agent_platform/production/agent-stack-watchdog.service.in"
+    ).read_text(encoding="utf-8")
+
+    assert source == template
+    assert "agent-stack-watchdog.service" in cutover.UNITS
+    assert (
+        "ExecStart=/opt/herdr/current/agent-stack/bin/agent-stack-watchdog"
+        in source
+    )
+    assert (
+        "/home/agentops/.local/bin/agent-stack-watchdog"
+        not in source
+    )
+
+    expected = cutover.expected_hashes(
+        Path(
+            "deploy/herdr/cutover/"
+            "legacy-quantlab-staging-01.sha256"
+        )
+    )
+    assert (
+        cutover.UNIT_DIR / "agent-stack-watchdog.service"
+        in expected
+    )
+
+
+def test_agent_stack_runtime_chain_is_release_relative():
+    dispatcher = Path(
+        "agent-stack/bin/agent-task-dispatcher"
+    ).read_text(encoding="utf-8")
+    assert "BIN = Path(__file__).resolve().parent" in dispatcher
+    assert 'WORKER = BIN / "agent-task-worker"' in dispatcher
+    assert ".local/bin/agent-task-worker" not in dispatcher
+
+    watchdog = Path(
+        "agent-stack/bin/agent-stack-watchdog"
+    ).read_text(encoding="utf-8")
+    assert 'BIN_DIR="' in watchdog
+    assert '$BIN_DIR/agent-stack-ensure' in watchdog
+    assert '$BIN_DIR/agent-stack-recovery' in watchdog
+    assert '$BIN_DIR/hermes-maintenance' in watchdog
+    assert "/home/agentops/.local/bin/agent-stack-" not in watchdog
+
+    maintenance = Path(
+        "agent-stack/bin/hermes-maintenance"
+    ).read_text(encoding="utf-8")
+    assert "BIN = Path(__file__).resolve().parent" in maintenance
+    for name in (
+        "agent-codex-usage-export",
+        "hermes-offsite-prepare",
+        "hermes-offsite-sync",
+    ):
+        assert f'BIN / "{name}"' in maintenance
+    assert "wrapper = BIN / profile" in maintenance
+    assert 'script = BIN / name' in maintenance
+
+
+def test_switch_runtime_restarts_watchdog_across_symlink(monkeypatch, tmp_path):
+    events = []
+
+    def fake_run(*args, check=True):
+        events.append(("run", *args))
+        if (
+            len(args) >= 3
+            and args[0] == "/usr/bin/systemctl"
+            and args[1] == "is-active"
+        ):
+            return "active"
+        return ""
+
+    monkeypatch.setattr(cutover, "run", fake_run)
+    monkeypatch.setattr(
+        cutover,
+        "atomic_symlink",
+        lambda target, link: events.append(
+            ("symlink", str(target), str(link))
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "wait_http_status",
+        lambda *_args, **_kwargs: "401",
+    )
+    monkeypatch.setattr(cutover, "assert_hardening", lambda: None)
+
+    target = tmp_path / "release"
+    target.mkdir()
+
+    cutover.switch_runtime(target, None)
+
+    stop = (
+        "run",
+        "/usr/bin/systemctl",
+        "stop",
+        "agent-stack-watchdog.service",
+        "agent-platform-web.service",
+    )
+    link = ("symlink", str(target), str(cutover.CURRENT))
+    start = (
+        "run",
+        "/usr/bin/systemctl",
+        "start",
+        "agent-stack-watchdog.service",
+    )
+
+    assert stop in events
+    assert link in events
+    assert start in events
+    assert events.index(stop) < events.index(link) < events.index(start)

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HOME = Path("/home/agentops")
+BIN = Path(__file__).resolve().parent
 STATE = HOME / ".local/state/agent-stack"
 BACKUPS = HOME / "backups/hermes"
 AUDITS = STATE / "audits"
@@ -70,7 +71,7 @@ def security_guard():
 def codex_usage_snapshot():
     if not due("codex-usage", 300):
         return
-    script = HOME / ".local/bin/agent-codex-usage-export"
+    script = BIN / "agent-codex-usage-export"
     rc, text = run([script], 60)
     if rc:
         raise RuntimeError(f"codex usage export failed: {text[-1000:]}")
@@ -93,7 +94,7 @@ def daily_backup():
 def daily_offsite_prepare():
     if not due("offsite-prepare", 24 * 3600):
         return
-    script = HOME / ".local/bin/hermes-offsite-prepare"
+    script = BIN / "hermes-offsite-prepare"
     rc, text = run([script], 900)
     if rc:
         raise RuntimeError(f"off-site preparation failed: {text[-1000:]}")
@@ -116,7 +117,7 @@ def daily_offsite_sync():
     rc, _ = run([rclone, "lsd", f"{remote_name}:", "--max-depth", "1"], 60)
     if rc != 0:
         return
-    script = HOME / ".local/bin/hermes-offsite-sync"
+    script = BIN / "hermes-offsite-sync"
     rc, text = run([script], 1800)
     if rc:
         raise RuntimeError(f"off-site upload failed: {text[-1000:]}")
@@ -154,7 +155,7 @@ def daily_audit():
     os.chmod(daydir, 0o700)
     reports = {}
     for profile in ("majak", "quantlab"):
-        wrapper = HOME / ".local/bin" / profile
+        wrapper = BIN / profile
         report = command_report(wrapper)
         path = daydir / f"{profile}-facts.txt"
         path.write_text(report, encoding="utf-8")
@@ -270,7 +271,7 @@ def weekly_self_review():
             "rclone_configured and offsite_upload_completed are true. Mention "
             "backup/fallback/browser/security/update posture when evidence exists.\n\n" + raw
         )
-        wrapper = HOME / ".local/bin" / profile
+        wrapper = BIN / profile
         rc, text = run([wrapper, "-t", "clarify", "-z", prompt], 180)
         out = daydir / f"{profile}-self-review.txt"
         out.write_text(f"rc={rc}\n{text}", encoding="utf-8")
@@ -279,7 +280,7 @@ def weekly_self_review():
     log(f"self-review OK: {daydir}")
 def agent_task_maintenance():
     for name in ("agent-github-intake", "agent-task-dispatcher", "agent-task-export"):
-        script = HOME / ".local/bin" / name
+        script = BIN / name
         rc, text = run([script], 30)
         if rc:
             log(f"{name} ERROR rc={rc}: {text[-1000:]}")

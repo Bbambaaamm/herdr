@@ -9,7 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HOME = Path("/home/agentops")
-WORKER = HOME / ".local/bin/agent-task-worker"
+BIN = Path(__file__).resolve().parent
+WORKER = BIN / "agent-task-worker"
 ROOT = HOME / ".local/state/agent-stack/tasks"
 PENDING = ROOT / "pending"
 RUNNING = ROOT / "running"

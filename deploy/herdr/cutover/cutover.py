@@ -52,6 +52,7 @@ UNITS = (
     "agent-platform-herdr.service",
     "agent-platform-export.timer",
     "agent-platform-herdr.timer",
+    "agent-stack-watchdog.service",
 )
 
 
@@ -199,7 +200,11 @@ def atomic_symlink(target: Path, link: Path) -> None:
 
 
 def compare_trees(candidate: Path, legacy: Path) -> dict[str, object]:
-    prefixes = ("agent_platform_dashboard/", "deploy/agent_platform/production/")
+    prefixes = (
+        "agent-stack/",
+        "agent_platform_dashboard/",
+        "deploy/agent_platform/production/",
+    )
     candidate_files = {
         item.relative_to(candidate).as_posix(): sha256(item.read_bytes())
         for item in candidate.rglob("*") if item.is_file()
@@ -254,7 +259,9 @@ def preflight(archive: Path, expected_legacy_commit: str) -> dict[str, object]:
     statuses = {unit: run("/usr/bin/systemctl", "is-active", unit, check=False) for unit in UNITS}
     need(statuses["agent-platform-web.service"] == "active"
          and statuses["agent-platform-export.timer"] == "active"
-         and statuses["agent-platform-herdr.timer"] == "active", "runtime_not_healthy")
+         and statuses["agent-platform-herdr.timer"] == "active"
+         and statuses["agent-stack-watchdog.service"] == "active",
+         "runtime_not_healthy")
     with tempfile.TemporaryDirectory(prefix="herdr-preflight-") as folder:
         candidate = extract_candidate(archive, Path(folder))
         comparison = compare_trees(candidate, LEGACY)
@@ -368,7 +375,15 @@ def assert_hardening() -> None:
 
 
 def switch_runtime(target: Path, document: dict[str, object] | None) -> None:
-    run("/usr/bin/systemctl", "stop", "agent-platform-web.service")
+    # Durable orchestration must move atomically with /opt/herdr/current.
+    # Stop watchdog before switching so no task can be dispatched from
+    # a control-plane version different from the selected immutable release.
+    run(
+        "/usr/bin/systemctl",
+        "stop",
+        "agent-stack-watchdog.service",
+        "agent-platform-web.service",
+    )
     atomic_symlink(target, CURRENT)
     if document is not None:
         write_deployed(document)
@@ -377,8 +392,17 @@ def switch_runtime(target: Path, document: dict[str, object] | None) -> None:
     run("/usr/bin/systemctl", "start", "agent-platform-export.service")
     run("/usr/bin/systemctl", "start", "agent-platform-web.service")
     wait_http_status("http://127.0.0.1:3010/agent-platform/health", "401")
-    need(run("/usr/bin/systemctl", "is-active", "agent-platform-web.service") == "active",
-         "web_not_active")
+    need(
+        run("/usr/bin/systemctl", "is-active", "agent-platform-web.service")
+        == "active",
+        "web_not_active",
+    )
+    run("/usr/bin/systemctl", "start", "agent-stack-watchdog.service")
+    need(
+        run("/usr/bin/systemctl", "is-active", "agent-stack-watchdog.service")
+        == "active",
+        "watchdog_not_active",
+    )
     assert_hardening()
 
 
