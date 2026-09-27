@@ -5,7 +5,7 @@ import math
 
 PROFILES = ('majak', 'quantlab')
 KINDS = ('herdr', 'kanban', 'router', 'search', 'git', 'tests', 'queue', 'codex',
-         'admission', 'release')
+         'admission', 'release', 'swarm')
 SOURCE_PAIRS = tuple(
     (profile, kind)
     for profile in PROFILES
@@ -14,6 +14,7 @@ SOURCE_PAIRS = tuple(
     and (kind != 'codex' or profile == 'majak')
     and (kind != 'admission' or profile == 'quantlab')
     and (kind != 'release' or profile == 'quantlab')
+    and (kind != 'swarm' or profile == 'quantlab')
 )
 MAX_BYTES = 131072
 
@@ -87,6 +88,7 @@ def row(kind, value):
               'admission': ('event reason role repo issue node_count max_depth max_fanout '
                             'child_tools_count agents_after observed_at'),
               'release': 'tag commit config_sha256 deployed_at',
+              'swarm': 'version repo issue paper_only policy_profiles tasks edges',
               'codex': ('used_percent window_minutes resets_at ordinary_usage_allowed has_credits '
                         'credits_unlimited credits_balance reset_credits_available lifetime_tokens '
                         'peak_daily_tokens longest_running_turn_sec current_streak_days '
@@ -154,6 +156,46 @@ def row(kind, value):
              and value['tag'].startswith('v'))
         need(hex_id(value['commit'], (40,)) and hex_id(value['config_sha256']))
         need(number(value['deployed_at']))
+    elif kind == 'swarm':
+        need(value['version'] == 1 and identifier(value['repo'], 160)
+             and identifier(value['issue'], 64))
+        need(type(value['paper_only']) is bool)
+        if value['repo'] == 'Bbambaaamm/Autonomous-Quant-Lab':
+            need(value['paper_only'] is True)
+        need(type(value['policy_profiles']) is list and len(value['policy_profiles']) <= 16
+             and len(set(value['policy_profiles'])) == len(value['policy_profiles'])
+             and all(identifier(item, 64) for item in value['policy_profiles']))
+        need(type(value['tasks']) is list and len(value['tasks']) <= 100)
+        task_ids = set()
+        for task in value['tasks']:
+            keys(task, 'task_id parent_task_id parent_agent_id agent_id state role model fallback_model attempt max_attempts blocker fencing_token dependencies result_sha')
+            need(identifier(task['task_id'], 256) and task['task_id'] not in task_ids)
+            task_ids.add(task['task_id'])
+            need(task['parent_task_id'] is None or identifier(task['parent_task_id'], 256))
+            need(task['parent_agent_id'] is None or identifier(task['parent_agent_id'], 256))
+            need(task['agent_id'] is None or identifier(task['agent_id'], 256))
+            need(task['state'] in ('pending', 'ready', 'running', 'blocked', 'review', 'done', 'failed', 'cancelled'))
+            need(identifier(task['role'], 64))
+            need(task['model'] is None or identifier(task['model'], 128))
+            need(task['fallback_model'] is None or identifier(task['fallback_model'], 128))
+            need(number(task['attempt']) and number(task['max_attempts'])
+                 and task['attempt'] <= task['max_attempts'])
+            need(task['blocker'] is None or identifier(task['blocker'], 128))
+            need(number(task['fencing_token']))
+            need(type(task['dependencies']) is list and len(task['dependencies']) <= 64
+                 and len(set(task['dependencies'])) == len(task['dependencies'])
+                 and all(identifier(dep, 256) for dep in task['dependencies']))
+            need(task['result_sha'] is None or hex_id(task['result_sha']))
+        need(type(value['edges']) is list and len(value['edges']) <= 200)
+        edges = set()
+        for edge in value['edges']:
+            keys(edge, 'from_task to_task kind')
+            need(identifier(edge['from_task'], 256) and identifier(edge['to_task'], 256)
+                 and edge['kind'] in ('parent', 'dependency'))
+            need(edge['from_task'] in task_ids and edge['to_task'] in task_ids)
+            key = (edge['from_task'], edge['to_task'], edge['kind'])
+            need(key not in edges)
+            edges.add(key)
     elif kind == 'codex':
         need(number(value['used_percent']) and value['used_percent'] <= 100)
         need(value['window_minutes'] is None or number(value['window_minutes']))
@@ -240,6 +282,8 @@ def validate(value):
             if kind == 'admission':
                 need(profile == 'quantlab')
             if kind == 'release':
+                need(profile == 'quantlab')
+            if kind == 'swarm':
                 need(profile == 'quantlab')
         need(len({json.dumps(r, sort_keys=True) for r in source['rows']}) == len(source['rows']))
     return value

@@ -16,6 +16,7 @@ const SCENE_AGENT_IDS = new Set(['majak-hermes', 'majak-codex', 'quantlab-hermes
 const ROLES = { hermes: 'Orchestrace, paměť, nástroje a řízení práce', codex: 'Implementace, testování a technická revize' };
 const STATUS = { idle: 'Čeká', working: 'Pracuje', blocked: 'Blokováno', done: 'Hotovo', unknown: 'Neznámé', offline: 'Odpojeno' };
 const QUEUE_STATUS = { pending: 'Čeká', running: 'Běží', blocked: 'Blokováno', done: 'Hotovo', failed: 'Selhalo' };
+const SWARM_STATUS = { pending: 'pending', ready: 'pending', running: 'running', review: 'running', blocked: 'blocked', done: 'done', failed: 'failed', cancelled: 'done' };
 const GITHUB_REPO = 'Bbambaaamm/Autonomous-Quant-Lab';
 const fmt = new Intl.NumberFormat('cs-CZ');
 const compact = new Intl.NumberFormat('cs-CZ', { notation: 'compact', maximumFractionDigits: 1 });
@@ -97,6 +98,42 @@ export function mountDashboard(createScene) {
   function source(profile, kind) { return liveData?.sources.find(item => item.profile === profile && item.kind === kind); }
   function queueSource() { return source('quantlab', 'queue'); }
   function queueTasks() { const value = queueSource(); return value?.status === 'available' ? value.rows : []; }
+  function swarmSource() { return source('quantlab', 'swarm'); }
+  function swarmSnapshot() {
+    const value = swarmSource();
+    return value?.status === 'available' && value.rows.length === 1 ? value.rows[0] : null;
+  }
+  function swarmTasks() {
+    const snapshot = swarmSnapshot(), sourceValue = swarmSource();
+    if (!snapshot) return [];
+    const issue = /^\d+$/.test(snapshot.issue) ? Number(snapshot.issue) : null;
+    const updated = sourceValue?.data_at ?? sourceValue?.observed_at ?? null;
+    return snapshot.tasks.map(row => ({
+      task_id: row.task_id,
+      status: SWARM_STATUS[row.state] || 'blocked',
+      raw_state: row.state,
+      attempts: row.attempt,
+      max_attempts: row.max_attempts,
+      not_before: null,
+      updated_at: updated,
+      agent: row.agent_id || row.parent_agent_id || 'quantlab-hermes',
+      kind: 'herdr_swarm',
+      blocker: row.blocker,
+      pr_number: null,
+      issue,
+      issue_title: `Herdr swarm · ${row.role}`,
+      repo: snapshot.repo,
+      parent_task_id: row.parent_task_id,
+      parent_agent_id: row.parent_agent_id,
+      dependencies: row.dependencies,
+      result_sha: row.result_sha,
+      model: row.model,
+      fallback_model: row.fallback_model,
+      fencing_token: row.fencing_token,
+    }));
+  }
+  function swarmEdges() { return swarmSnapshot()?.edges || []; }
+  function taskRows() { return swarmSnapshot() ? swarmTasks() : queueTasks(); }
   function admissionSource() { return source('quantlab', 'admission'); }
   function admissionRows() { const value = admissionSource(); return value?.status === 'available' ? value.rows : []; }
   function admissionDenials() { return admissionRows().filter(row => row.event === 'deny'); }
@@ -105,7 +142,7 @@ export function mountDashboard(createScene) {
     return value?.status === 'available' && value.rows.length === 1 ? value.rows[0] : null;
   }
   function activeQueueTasks() { return queueTasks().filter(row => row.status !== 'done'); }
-  function taskById(taskId) { return queueTasks().find(row => row.task_id === taskId) || null; }
+  function taskById(taskId) { return taskRows().find(row => row.task_id === taskId) || queueTasks().find(row => row.task_id === taskId) || null; }
   const USER_ACTION_BLOCKERS = new Set(['user_action_required', 'agent_interactive_input_required', 'github_write_auth_required']);
   function userBlockedTasks() { return queueTasks().filter(row => ['blocked', 'failed'].includes(row.status) && USER_ACTION_BLOCKERS.has(row.blocker)); }
   function technicalBlockedTasks() { return queueTasks().filter(row => ['blocked', 'failed'].includes(row.status) && !USER_ACTION_BLOCKERS.has(row.blocker)); }
@@ -113,7 +150,7 @@ export function mountDashboard(createScene) {
   function nextQueueTask(agent = 'quantlab-hermes') { return queueTasks().filter(row => row.agent === agent && row.status === 'pending').sort((a, b) => (a.not_before ?? Number.MAX_SAFE_INTEGER) - (b.not_before ?? Number.MAX_SAFE_INTEGER) || a.task_id.localeCompare(b.task_id))[0]; }
   function taskDisplay(row) { return row ? `${issueLabel(row)} · ${row.task_id}` : 'Žádná'; }
   function attemptLabel(row) { return row ? `${number(row.attempts)} / ${number(row.max_attempts)}` : 'Nedostupné'; }
-  function issueUrl(row) { return Number.isFinite(row?.issue) ? `https://github.com/${GITHUB_REPO}/issues/${row.issue}` : null; }
+  function issueUrl(row) { return Number.isFinite(row?.issue) ? `https://github.com/${row.repo || GITHUB_REPO}/issues/${row.issue}` : null; }
   function prUrl(row) { return Number.isFinite(row?.pr_number) ? `https://github.com/${GITHUB_REPO}/pull/${row.pr_number}` : null; }
   function detailLink(url, label) { return url ? `<a href="${escapeHTML(url)}" target="_blank" rel="noopener noreferrer">${escapeHTML(label)}</a>` : ''; }
   function agents() {
@@ -204,11 +241,13 @@ export function mountDashboard(createScene) {
     return [...grouped.values()].sort((a, b) => b.requests - a.requests || a.model.localeCompare(b.model));
   }
   function swarmMetrics() {
-    const queue = queueTasks();
+    const queue = taskRows();
     const count = status => queue.filter(row => row.status === status).length;
     const running = count('running'), waiting = count('pending'), failed = count('failed'), blockedOnly = count('blocked'), done = count('done');
     const blocked = blockedOnly + failed;
-    const activeAgents = agents().filter(row => row.status === 'working').length;
+    const activeAgents = swarmSnapshot()
+      ? new Set(queue.filter(row => ['running', 'blocked'].includes(row.status)).map(row => row.agent).filter(Boolean)).size
+      : agents().filter(row => row.status === 'working').length;
     const retries = queue.reduce((sum, row) => sum + (Number.isSafeInteger(row.attempts) ? Math.max(0, row.attempts - 1) : 0), 0);
     const terminal = done + failed;
     const success = terminal ? Math.round(done / terminal * 100) : null;
@@ -256,7 +295,7 @@ export function mountDashboard(createScene) {
     return [order[row.status] ?? 9, -(row.updated_at || 0), row.task_id];
   }
   function sortedTaskNodes() {
-    return [...queueTasks()].sort((a, b) => {
+    return [...taskRows()].sort((a, b) => {
       const aa = taskSortKey(a), bb = taskSortKey(b);
       return aa[0] - bb[0] || aa[1] - bb[1] || String(aa[2]).localeCompare(String(bb[2]));
     });
@@ -268,7 +307,8 @@ export function mountDashboard(createScene) {
   }
 
   function taskNodeHTML(row) {
-    return `<button type="button" class="taskgraph-node" role="option" aria-selected="${String(selectedTask === row.task_id)}" data-task-id="${escapeHTML(row.task_id)}" data-status="${escapeHTML(row.status)}"><b>${escapeHTML(issueLabel(row))} · ${escapeHTML(row.task_id)}</b><span>${escapeHTML(QUEUE_STATUS[row.status] || row.status)}</span><small>${escapeHTML(row.issue_title || row.kind)} · pokus ${escapeHTML(attemptLabel(row))}</small></button>`;
+    const state = row.raw_state || QUEUE_STATUS[row.status] || row.status;
+    return `<button type="button" class="taskgraph-node" role="option" aria-selected="${String(selectedTask === row.task_id)}" data-task-id="${escapeHTML(row.task_id)}" data-status="${escapeHTML(row.status)}"><b>${escapeHTML(issueLabel(row))} · ${escapeHTML(row.task_id)}</b><span>${escapeHTML(state)}</span><small>${escapeHTML(row.issue_title || row.kind)} · pokus ${escapeHTML(attemptLabel(row))}</small></button>`;
   }
   function taskLaneHTML(label, rows, limit) {
     if (!rows.length) return '';
@@ -276,11 +316,17 @@ export function mountDashboard(createScene) {
     const overflow = rows.length - visible.length;
     return `<div class="taskgraph-lane" role="group" aria-label="${escapeHTML(label)}"><span class="taskgraph-lane-label">${escapeHTML(label)}</span><div class="taskgraph-lane-track">${visible.map(taskNodeHTML).join('')}${overflow ? `<div class="taskgraph-node taskgraph-cluster" data-status="pending"><b>+${overflow} uzlů</b><span>LOD cluster</span><small>další sanitizované tasky</small></div>` : ''}</div></div>`;
   }
+  function taskEdgeHTML(edges, taskIds) {
+    const visible = edges.filter(edge => taskIds.has(edge.from_task) && taskIds.has(edge.to_task));
+    if (!visible.length) return '';
+    const shown = visible.slice(0, 16), overflow = visible.length - shown.length;
+    return `<div class="taskgraph-edge-strip" aria-label="Autoritativní DAG hrany">${shown.map(edge => `<span class="taskgraph-edge" data-edge-kind="${escapeHTML(edge.kind)}"><b>${escapeHTML(edge.from_task)}</b><i>→</i><b>${escapeHTML(edge.to_task)}</b><small>${escapeHTML(edge.kind)}</small></span>`).join('')}${overflow ? `<span class="taskgraph-edge taskgraph-edge-overflow">+${overflow} hran</span>` : ''}</div>`;
+  }
 
   function renderTaskGraph() {
     const root = $('#taskgraph-nodes'), status = $('#taskgraph-status');
     if (!root || !status) return;
-    const sourceValue = queueSource();
+    const swarmValue = swarmSource(), sourceValue = swarmSnapshot() ? swarmValue : queueSource();
     if (!sourceValue || sourceValue.status !== 'available') {
       status.textContent = 'Task telemetry není dostupná.';
       root.innerHTML = '<div class="obs-empty">TaskGraph nelze zobrazit bez durable queue.</div>';
@@ -291,7 +337,10 @@ export function mountDashboard(createScene) {
     const rows = allRows.filter(taskMatchesFilter);
     document.querySelectorAll('[data-task-filter]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.taskFilter === taskFilter)));
     const filterLabel = taskFilter === 'all' ? 'všechny stavy' : taskFilter === 'pending' ? 'čekající' : taskFilter === 'blocked' ? 'blocked + failed' : taskFilter;
-    status.textContent = `Dependency telemetry není v aktuálním kontraktu · hrany se nevymýšlejí · filtr: ${filterLabel}.`;
+    const authoritativeEdges = swarmEdges();
+    status.textContent = swarmSnapshot()
+      ? `Autoritativní Herdr DAG · ${authoritativeEdges.length} hran · filtr: ${filterLabel}.`
+      : `Dependency telemetry není v aktuálním kontraktu · hrany se nevymýšlejí · filtr: ${filterLabel}.`;
     if (!allRows.length) {
       root.innerHTML = '<div class="obs-empty">Durable queue je prázdná.</div>';
       sceneCall('setTasks', []);
@@ -302,12 +351,13 @@ export function mountDashboard(createScene) {
       sceneCall('setTasks', allRows.filter(row => row.status !== 'done'));
       return;
     }
+    const edgeHTML = swarmSnapshot() ? taskEdgeHTML(authoritativeEdges, new Set(rows.map(row => row.task_id))) : '';
     if (taskFilter === 'all') {
       const priority = rows.filter(row => ['running', 'blocked', 'failed'].includes(row.status));
       const rest = rows.filter(row => !['running', 'blocked', 'failed'].includes(row.status));
-      root.innerHTML = taskLaneHTML('Aktivní / problémové', priority, 10) + taskLaneHTML('Čekající / hotové', rest, 14);
+      root.innerHTML = edgeHTML + taskLaneHTML('Aktivní / problémové', priority, 10) + taskLaneHTML('Čekající / hotové', rest, 14);
     } else {
-      root.innerHTML = taskLaneHTML(filterLabel, rows, 18);
+      root.innerHTML = edgeHTML + taskLaneHTML(filterLabel, rows, 18);
     }
     const buttons = [...root.querySelectorAll('[data-task-id]')];
     buttons.forEach((button, index) => {
@@ -523,7 +573,9 @@ export function mountDashboard(createScene) {
     const totalRequests = routersAvailable ? profileStats.reduce((sum, value) => sum + value.requests, 0) : null;
     const knownCost = routersAvailable ? profileStats.reduce((sum, value) => sum + value.costKnown, 0) : null;
     const unknownCostRequests = routersAvailable ? profileStats.reduce((sum, value) => sum + value.costUnknownRequests, 0) : null;
-    const activeAgents = agents().filter(row => row.status === 'working').length;
+    const activeAgents = swarmSnapshot()
+      ? new Set(taskRows().filter(row => ['running', 'blocked'].includes(row.status)).map(row => row.agent).filter(Boolean)).size
+      : agents().filter(row => row.status === 'working').length;
     const activeQueue = activeQueueTasks().length;
     const remaining = codex ? 100 - codex.used_percent : null;
     const severity = remaining == null ? 'warn' : remaining <= 5 ? 'critical' : remaining <= 25 ? 'warn' : 'ok';
@@ -842,6 +894,35 @@ export function mountDashboard(createScene) {
           || (row.event === 'deny' && (row.reason == null || row.agents_after != null))
           || (row.event === 'allow' && (row.reason != null || row.agents_after == null))
         )) throw new Error('invalid');
+      }
+      if (item.kind === 'swarm') {
+        if (item.profile !== 'quantlab' || (item.status === 'available' && item.rows.length !== 1)) throw new Error('invalid');
+        for (const row of item.rows) {
+          if (row.version !== 1 || typeof row.repo !== 'string' || typeof row.issue !== 'string'
+            || typeof row.paper_only !== 'boolean' || !Array.isArray(row.policy_profiles)
+            || !Array.isArray(row.tasks) || !Array.isArray(row.edges)
+            || (row.repo === 'Bbambaaamm/Autonomous-Quant-Lab' && row.paper_only !== true)) throw new Error('invalid');
+          const taskIds = new Set();
+          for (const task of row.tasks) {
+            if (!task || typeof task.task_id !== 'string' || taskIds.has(task.task_id)
+              || !Object.hasOwn(SWARM_STATUS, task.state) || typeof task.role !== 'string'
+              || !Number.isSafeInteger(task.attempt) || task.attempt < 0
+              || !Number.isSafeInteger(task.max_attempts) || task.max_attempts < task.attempt
+              || !Number.isSafeInteger(task.fencing_token) || task.fencing_token < 0
+              || !Array.isArray(task.dependencies)
+              || task.dependencies.some(dep => typeof dep !== 'string')
+              || (task.parent_task_id != null && typeof task.parent_task_id !== 'string')
+              || (task.parent_agent_id != null && typeof task.parent_agent_id !== 'string')
+              || (task.agent_id != null && typeof task.agent_id !== 'string')
+              || (task.result_sha != null && (typeof task.result_sha !== 'string' || !/^[0-9a-f]{64}$/.test(task.result_sha)))) throw new Error('invalid');
+            taskIds.add(task.task_id);
+          }
+          for (const edge of row.edges) {
+            if (!edge || !['parent', 'dependency'].includes(edge.kind)
+              || typeof edge.from_task !== 'string' || typeof edge.to_task !== 'string'
+              || !taskIds.has(edge.from_task) || !taskIds.has(edge.to_task)) throw new Error('invalid');
+          }
+        }
       }
       if (item.kind === 'release') {
         if (item.profile !== 'quantlab' || (item.status === 'available' && item.rows.length !== 1)) throw new Error('invalid');

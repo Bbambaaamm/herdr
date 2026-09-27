@@ -2,6 +2,7 @@
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 import os
+import math
 from pathlib import Path
 import selectors
 import signal
@@ -22,6 +23,7 @@ CODEX_USAGE_PATH = '/var/lib/agent-platform-herdr/codex-usage.json'
 MODEL_ROUTING_PATH = '/var/lib/agent-platform-herdr/model-routing.json'
 ADMISSION_PATH = '/var/lib/agent-platform-herdr/admission.jsonl'
 RELEASE_PATH = '/var/lib/agent-platform-herdr/deployed-release.json'
+SWARM_PATH = '/var/lib/agent-platform-herdr/swarm.json'
 
 
 def command(argv, *, env=None, limit=65536, timeout=3):
@@ -276,6 +278,130 @@ def queue(path, profile):
     c.need(len({r['task_id'] for r in rows}) == len(rows))
     return rows, raw['observed_at']
 
+
+
+def _swarm_stamp(value):
+    c.need(type(value) in (int, float, str) and type(value) is not bool)
+    try:
+        stamp = float(value)
+    except (TypeError, ValueError):
+        raise ValueError('invalid_metadata') from None
+    c.need(math.isfinite(stamp) and 0 <= stamp < 2**53)
+    return int(stamp)
+
+
+def swarm(path, profile):
+    c.need(profile == 'quantlab' and path == SWARM_PATH)
+    raw = c.parse(read(path, c.MAX_BYTES), c.MAX_BYTES)
+    required = {'tasks', 'edges', 'agents', 'repo', 'issue', 'observed_at', 'version', 'paper_only'}
+    canonical = required | {'policy_profiles', 'graph_latency', 'clock_snapshot', 'ts'}
+    c.need(type(raw) is dict and set(raw) in (required, canonical))
+    c.need((raw['version'] == 1 and set(raw) == required)
+           or (raw['version'] == 'v1.2.0' and set(raw) == canonical))
+    c.need(type(raw['paper_only']) is bool)
+    c.need(type(raw['repo']) is str and c.identifier(raw['repo'], 160))
+    c.need(type(raw['issue']) is str and c.identifier(raw['issue'], 64))
+    if raw['repo'] == 'Bbambaaamm/Autonomous-Quant-Lab':
+        c.need(raw['paper_only'] is True)
+    c.need(type(raw['tasks']) is list and len(raw['tasks']) <= 100)
+    c.need(type(raw['edges']) is list and len(raw['edges']) <= 200)
+    c.need(type(raw['agents']) is list and len(raw['agents']) <= 100)
+    safe_agent_fields = {
+        'agent_id', 'event_ref', 'fallback_model', 'fencing_token', 'holder',
+        'issue', 'lease_until', 'model', 'parent_agent_id', 'parent_task_id',
+        'repo', 'role', 'state', 'task_id',
+    }
+    for agent in raw['agents']:
+        c.need(type(agent) is dict and set(agent) <= safe_agent_fields)
+    allowed_task = {
+        'task_id', 'state', 'role', 'tools', 'permissions', 'timeout_seconds',
+        'max_attempts', 'dependencies', 'parent_task_id', 'parent_agent_id',
+        'agent_id', 'fencing_token', 'model', 'fallback_model', 'attempts',
+        'attempt', 'blocker', 'policy_profile', 'paper_only', 'telemetry', 'ts',
+        'child_ids', 'completed_at', 'created_at', 'event_ref', 'issue',
+        'max_retries', 'repo', 'result_sha', 'updated_at',
+    }
+    tasks = []
+    derived_edges = set()
+    profiles = set()
+    for item in raw['tasks']:
+        c.need(type(item) is dict and {'task_id', 'state', 'role', 'dependencies'} <= set(item)
+               and set(item) <= allowed_task)
+        task_id = item['task_id']
+        c.need(c.identifier(task_id, 256))
+        parent_task_id = item.get('parent_task_id')
+        parent_agent_id = item.get('parent_agent_id')
+        agent_id = item.get('agent_id')
+        dependencies = item.get('dependencies')
+        c.need(type(dependencies) is list and len(dependencies) <= 64)
+        for dep in dependencies:
+            c.need(c.identifier(dep, 256))
+            derived_edges.add((dep, task_id, 'dependency'))
+        if parent_task_id is not None:
+            c.need(c.identifier(parent_task_id, 256))
+            derived_edges.add((parent_task_id, task_id, 'parent'))
+        for optional in (parent_agent_id, agent_id):
+            c.need(optional is None or c.identifier(optional, 256))
+        profile_value = item.get('policy_profile')
+        if profile_value is not None:
+            c.need(c.identifier(profile_value, 64))
+            profiles.add(profile_value)
+        result_sha = item.get('result_sha')
+        c.need(result_sha is None or c.hex_id(result_sha))
+        task = {
+            'task_id': task_id,
+            'parent_task_id': parent_task_id,
+            'parent_agent_id': parent_agent_id,
+            'agent_id': agent_id,
+            'state': item['state'],
+            'role': item['role'],
+            'model': item.get('model'),
+            'fallback_model': item.get('fallback_model'),
+            'attempt': item.get('attempts', item.get('attempt', 0)),
+            'max_attempts': item.get('max_attempts', item.get('max_retries', 1)),
+            'blocker': item.get('blocker'),
+            'fencing_token': item.get('fencing_token', 0),
+            'dependencies': list(dependencies),
+            'result_sha': result_sha,
+        }
+        tasks.append(task)
+    c.need(len({task['task_id'] for task in tasks}) == len(tasks))
+    task_ids = {task['task_id'] for task in tasks}
+    c.need(all(edge[0] in task_ids and edge[1] in task_ids for edge in derived_edges))
+
+    raw_edges = set()
+    for edge in raw['edges']:
+        c.keys(edge, 'from to kind')
+        c.need(c.identifier(edge['from'], 256) and c.identifier(edge['to'], 256)
+               and edge['kind'] in ('parent', 'dependency'))
+        raw_edges.add((edge['from'], edge['to'], edge['kind']))
+    c.need(raw_edges == derived_edges)
+
+    raw_profiles = raw.get('policy_profiles')
+    if raw_profiles is not None:
+        c.need(type(raw_profiles) is list and len(raw_profiles) <= 16)
+        for profile_value in raw_profiles:
+            c.need(c.identifier(profile_value, 64))
+            profiles.add(profile_value)
+    if raw['paper_only'] is True:
+        profiles.add('quantlab-paper')
+
+    repo = raw['repo']
+    issue = raw['issue']
+    snapshot = {
+        'version': 1,
+        'repo': repo,
+        'issue': issue,
+        'paper_only': raw['paper_only'],
+        'policy_profiles': sorted(profiles),
+        'tasks': sorted(tasks, key=lambda item: item['task_id']),
+        'edges': [
+            {'from_task': left, 'to_task': right, 'kind': kind}
+            for left, right, kind in sorted(derived_edges)
+        ],
+    }
+    c.row('swarm', snapshot)
+    return [snapshot], _swarm_stamp(raw['observed_at'])
 
 def _tail_regular(path, limit=65536):
     with regular(path) as (fd, info):
