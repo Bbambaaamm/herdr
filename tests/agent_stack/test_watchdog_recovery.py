@@ -413,6 +413,7 @@ def test_terminal_result_waits_for_task_pane_cleanup(tmp_path, monkeypatch):
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["attempt_state"] == "delivery_uncertain"
     assert saved["watchdog_cleanup_blocker"] == "task_session_cleanup_failed"
+    assert "result_status" not in saved
     assert not (recovery.DONE / path.name).exists()
 
     monkeypatch.setattr(recovery, "cleanup_task_owned_pane", lambda task: True)
@@ -449,3 +450,158 @@ def test_non_object_result_does_not_abort_recovery_of_later_task(tmp_path, monke
     assert "invalid_shape" in first_saved["last_error"]
     assert not second.exists()
     assert (recovery.DONE / "task-b.json").exists()
+
+
+
+def test_cleanup_refuses_existing_pane_without_matching_marker(
+    tmp_path,
+    monkeypatch,
+):
+    configure_paths(tmp_path)
+
+    task_payload = {
+        "id": "task-1",
+        "execution_session": {
+            "owned_pane": True,
+            "pane_id": "w2:p9",
+            "pane_marker": "durable-task-marker",
+            "coordinator_pane_id": "w2:p2",
+        },
+    }
+
+    monkeypatch.setattr(
+        recovery,
+        "_pane_presence",
+        lambda pane_id: True,
+    )
+    monkeypatch.setattr(
+        recovery,
+        "_pane_has_marker",
+        lambda pane_id, marker: False,
+    )
+
+    def must_not_close(*args, **kwargs):
+        raise AssertionError(
+            "unowned pane must never be closed"
+        )
+
+    monkeypatch.setattr(
+        recovery.subprocess,
+        "run",
+        must_not_close,
+    )
+
+    assert recovery.cleanup_task_owned_pane(
+        task_payload
+    ) is False
+
+    session = task_payload["execution_session"]
+
+    assert session["cleanup_status"] == "close_unproven"
+    assert session["cleanup_error"] == (
+        "pane ownership marker mismatch"
+    )
+    assert "closed_at" not in session
+
+
+def test_cleanup_accepts_already_absent_owned_pane(
+    tmp_path,
+    monkeypatch,
+):
+    configure_paths(tmp_path)
+
+    task_payload = {
+        "id": "task-1",
+        "execution_session": {
+            "owned_pane": True,
+            "pane_id": "w2:p9",
+            "pane_marker": "durable-task-marker",
+            "coordinator_pane_id": "w2:p2",
+        },
+    }
+
+    monkeypatch.setattr(
+        recovery,
+        "_pane_presence",
+        lambda pane_id: False,
+    )
+
+    assert recovery.cleanup_task_owned_pane(
+        task_payload
+    ) is True
+
+    session = task_payload["execution_session"]
+
+    assert session["cleanup_status"] == "already_absent"
+    assert session["closed_at"]
+
+
+def test_cleanup_blocker_retries_exact_result_without_timeout_delay(
+    tmp_path,
+    monkeypatch,
+):
+    configure_paths(tmp_path)
+
+    now = datetime(
+        2026,
+        9,
+        27,
+        7,
+        0,
+        tzinfo=timezone.utc,
+    )
+
+    path = recovery.RUNNING / "task-1.json"
+
+    payload = {
+        "id": "task-1",
+        "run_token": "token-1",
+        "timeout_seconds": 1800,
+        "attempt_started_at": now.isoformat(),
+        "watchdog_cleanup_blocker":
+            "task_session_cleanup_failed",
+        "attempt_state": "delivery_uncertain",
+        "execution_session": {
+            "owned_pane": True,
+            "pane_id": "owned-pane",
+            "pane_marker": "durable-task-marker",
+            "coordinator_pane_id": "coordinator-pane",
+        },
+    }
+
+    write_task(path, payload)
+
+    write_task(
+        recovery.RESULTS / "task-1.json",
+        {
+            "task_id": "task-1",
+            "run_token": "token-1",
+            "status": "completed",
+            "blocker": None,
+        },
+    )
+
+    monkeypatch.setattr(
+        recovery,
+        "active_worker_tasks",
+        lambda: set(),
+    )
+    monkeypatch.setattr(
+        recovery,
+        "cleanup_task_owned_pane",
+        lambda task: True,
+    )
+
+    recovery.recover_orphan_tasks(now)
+
+    assert not path.exists()
+
+    done = json.loads(
+        (
+            recovery.DONE / "task-1.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert done["attempt_state"] == "done"
+    assert done["result_status"] == "completed"
+    assert "watchdog_cleanup_blocker" not in done
