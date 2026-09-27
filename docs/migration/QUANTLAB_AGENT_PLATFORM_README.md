@@ -37,6 +37,6 @@ Changes should be reviewed in Git first, then copied/deployed from the reviewed 
 ## Q3 audit
 
 The current hardening, provider-recency semantics, CI evidence, preserved
-read-only/PAPER-only invariants, and remaining live gates are tracked in
-`Q3_FINAL_AUDIT.md`. A source change is not a production claim until those live
-gates and rollback checks pass on the intended host.
+read-only/PAPER-only invariants, completed live gates, and rollback evidence are
+tracked in `Q3_FINAL_AUDIT.md`. Future source changes are not production claims
+until their own live gates and rollback checks pass on the intended host.
