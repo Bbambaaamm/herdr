@@ -124,9 +124,16 @@ def _task_session_identity(task: dict) -> tuple[str, str]:
         routing.get("selected_agent") or task.get("agent") or "quantlab-hermes"
     )
     digest = hashlib.sha256(
-        f"{task['id']}:{run_token}".encode("utf-8")
+        f"{coordinator}:{task['id']}:{run_token}".encode("utf-8")
     ).hexdigest()
-    return f"{coordinator}-task-{digest[:12]}", f"durable-{digest[:20]}"
+    # Herdr agent names are capped at 32 characters. Keep a readable,
+    # coordinator-derived prefix and bind uniqueness to the full coordinator,
+    # task id and run token through a 64-bit digest suffix.
+    prefix = coordinator[:13].rstrip("-_") or "task"
+    agent_name = f"{prefix}-t-{digest[:16]}"
+    if len(agent_name) > 32:
+        raise RuntimeError("task session agent name exceeds Herdr limit")
+    return agent_name, f"durable-{digest[:20]}"
 
 
 def _task_hermes_profile(task: dict) -> str:
