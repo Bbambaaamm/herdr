@@ -34,13 +34,18 @@ def write_json(path: Path, payload: dict) -> None:
 
 
 def parse_started(task: dict, path: Path) -> datetime:
-    raw = str(task.get("attempt_started_at") or "").strip()
-    if raw:
+    candidates = [datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)]
+    for key in ("dispatch_claimed_at", "attempt_started_at"):
+        raw = str(task.get(key) or "").strip()
+        if not raw:
+            continue
         try:
-            return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+            candidates.append(
+                datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+            )
         except ValueError:
-            pass
-    return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+            continue
+    return max(candidates)
 
 
 def active_worker_tasks() -> set[Path]:
@@ -91,11 +96,10 @@ def move_task(path: Path, target_dir: Path, task: dict) -> None:
 
 
 def watchdog_result_path(task_id: str) -> Path:
-    canonical = RESULTS / f"{task_id}.json"
-    if not canonical.exists():
-        return canonical
-    stamp = utcnow().strftime("%Y%m%dT%H%M%SZ")
-    return RESULTS / f"{task_id}.watchdog-recovery-{stamp}.json"
+    # Recovery evidence is always sidecar-only. The canonical result path is
+    # owned by the task executor/runtime and must never be overwritten.
+    stamp = utcnow().strftime("%Y%m%dT%H%M%S.%fZ")
+    return RESULTS / f"{task_id}.watchdog-recovery-{stamp}-{os.getpid()}.json"
 
 
 def block_orphan(path: Path, task: dict, *, reason: str, age_seconds: int) -> None:
@@ -186,10 +190,20 @@ def recover_orphan_tasks(now: datetime | None = None) -> None:
         if result is not None:
             terminalize_from_result(path, task, result, age)
             continue
+
+        # Close the dispatcher->worker startup race and the result-publication
+        # race immediately before any watchdog mutation.
+        if resolved in active_worker_tasks():
+            continue
+        result, state = matching_result(task)
+        if result is not None:
+            terminalize_from_result(path, task, result, age)
+            continue
+
         block_orphan(
             path,
             task,
-            reason=f"no matching worker; durable_result={state}",
+            reason=f"no matching worker after double-check; durable_result={state}",
             age_seconds=age,
         )
 
@@ -205,12 +219,26 @@ def run_herdr(args: list[str], timeout: float = 15.0) -> subprocess.CompletedPro
 
 
 def is_codex_update_dialog(text: str) -> bool:
-    last_ready = max(text.rfind("Ask Codex to do anything"), text.rfind("› Ask Codex"))
-    last_menu = max(text.rfind("Update now"), text.rfind("Skip until next version"))
-    if last_menu < 0 or last_menu < last_ready:
+    lines = [line.strip() for line in text.replace("\r", "").splitlines() if line.strip()]
+    if len(lines) < 5:
         return False
-    tail = text[last_menu:]
-    return "Skip until next version" in tail or "enter continue · esc skip" in tail
+
+    # The interactive updater menu must be the current bottom-of-screen UI,
+    # not historical scrollback or text quoted by a task.
+    if lines[-1] != "enter continue · esc skip":
+        return False
+    if not lines[-2].startswith("3. Skip until next version"):
+        return False
+    if lines[-3] != "2. Skip":
+        return False
+    if not lines[-4].startswith("› 1. Update now"):
+        return False
+
+    context = lines[max(0, len(lines) - 10):-4]
+    return any(
+        line.startswith("Update available") or "Update available ·" in line
+        for line in context
+    )
 
 
 def recover_codex_update_dialogs() -> None:
@@ -226,6 +254,14 @@ def recover_codex_update_dialogs() -> None:
         return
     for row in agents:
         if not isinstance(row, dict) or row.get("agent") != "codex":
+            continue
+        if row.get("agent_status") != "idle" or row.get("interactive_ready") is not True:
+            continue
+        # The updater is shown before the full Codex TUI takes over the pane.
+        # Fail closed unless the pane still has the shell-style title observed
+        # for that bootstrap state; never send Esc into an ordinary Codex UI.
+        title = str(row.get("terminal_title_stripped") or "")
+        if not title.startswith("agentops@"):
             continue
         name = str(row.get("name") or "")
         if not name:

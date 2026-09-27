@@ -25,6 +25,14 @@ def log(message: str) -> None:
     with LOG.open("a", encoding="utf-8") as handle:
         handle.write(line + "\n")
 
+
+def write_json(path: Path, data: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
 def parse_time(value: str | None) -> datetime:
     if not value:
         return datetime.min.replace(tzinfo=timezone.utc)
@@ -79,6 +87,10 @@ def launch(path: Path, dry_run: bool = False) -> int:
         log(f"refuse duplicate running task {task_id}")
         return 1
 
+    # Refresh ownership time before entering running/. Old attempt timestamps
+    # must never make a freshly claimed task look orphaned to the watchdog.
+    task["dispatch_claimed_at"] = datetime.now(timezone.utc).isoformat()
+    write_json(path, task)
     os.replace(path, running)
     log(f"launch {task_id} priority={task.get('priority', 50)}")
     with (ROOT / "logs" / f"{task_id}.launcher.log").open("ab") as handle:
