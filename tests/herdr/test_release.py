@@ -59,11 +59,14 @@ def test_consumer_contract_is_closed_and_permission_monotonic():
 
 def test_release_build_is_deterministic_and_tamper_evident(tmp_path, monkeypatch):
     repo, commit = minimal_repo(tmp_path, monkeypatch)
+    git(repo, "config", "core.autocrlf", "true")
     first, second = tmp_path / "first.tar.gz", tmp_path / "second.tar.gz"
     one = release.build_release(repo, "v1.2.3-rc.1", commit, first)
     two = release.build_release(repo, "v1.2.3-rc.1", commit, second)
     assert first.read_bytes() == second.read_bytes()
     assert one["archive_sha256"] == two["archive_sha256"]
+    assert one["config_contract_sha256"] == release.consumer_digest(
+        {f"{name}.yaml": consumer(name) for name in release.CONSUMERS})
     assert release.verify_archive(first)["commit"] == commit
     damaged = tmp_path / "damaged.tar.gz"
     data = bytearray(first.read_bytes())

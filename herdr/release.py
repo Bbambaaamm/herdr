@@ -278,7 +278,9 @@ def build_release(repo: Path, tag: str, commit: str, output: Path) -> dict[str, 
     _need(_git(repo, "cat-file", "-t", f"refs/tags/{tag}") == "tag", "annotated_tag_required")
     _need(_git(repo, "status", "--porcelain", "--untracked-files=no") == "", "dirty_repository")
     commit_time = int(_git(repo, "show", "-s", "--format=%ct", commit))
-    archive_data = _git(repo, "archive", "--format=tar", commit, "--", *PAYLOAD_PATHS, binary=True)
+    # Archive committed bytes, never platform-specific checkout conversions.
+    archive_data = _git(repo, "-c", "core.autocrlf=false", "archive", "--format=tar",
+                        commit, "--", *PAYLOAD_PATHS, binary=True)
     with tempfile.TemporaryDirectory(prefix="herdr-build-") as folder:
         staging = Path(folder) / identifier
         staging.mkdir()
