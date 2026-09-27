@@ -168,13 +168,33 @@ def test_materialized_replay_is_deterministic_and_aggregated(tmp_path) -> None:
             model_latency_ms=25,
         )
     )
-    store.append(event(state="done", result_sha="a" * 64))
+    store.append(
+        event(
+            state="done",
+            runtime_ms=5_000,
+            queue_wait_ms=2_000,
+            branch="issue-7-live-telemetry",
+            base_sha="b" * 40,
+            result_sha="a" * 64,
+            test_result="pass",
+            reviewer_result="pass",
+        )
+    )
     a = store.materialize().to_json()
     b = materialize(store.read()).to_json()
     assert a == b
     assert a["last_sequence"] == 3
     assert a["tasks"]["task-6"]["state"] == "done"
-    assert a["tasks"]["task-6"]["result_sha"] == "a" * 64
+    task = a["tasks"]["task-6"]
+    assert task["runtime_ms"] == 5_000
+    assert task["queue_wait_ms"] == 2_000
+    assert task["branch"] == "issue-7-live-telemetry"
+    assert task["base_sha"] == "b" * 40
+    assert task["result_sha"] == "a" * 64
+    assert task["test_result"] == "pass"
+    assert task["reviewer_result"] == "pass"
+    assert len(task["last_events"]) == 3
+    assert task["last_events"][-1]["event_type"] == "task_state"
     issue = a["by_issue"]["6"]
     assert issue["events"] == 3
     assert issue["input_tokens"] == 150
@@ -184,6 +204,17 @@ def test_materialized_replay_is_deterministic_and_aggregated(tmp_path) -> None:
     assert issue["fallbacks"] == 1
     assert issue["latency_ms_total"] == 100
     assert issue["latency_samples"] == 2
+
+
+def test_non_billable_lifecycle_does_not_inflate_unknown_cost() -> None:
+    lifecycle = replace(
+        event(),
+        sequence=1,
+        cost_unknown_reason=CostUnknownReason.NON_BILLABLE,
+    )
+    issue = materialize([lifecycle]).to_json()["by_issue"]["6"]
+    assert issue["unknown_cost_events"] == 0
+    assert issue["actual_cost_microusd"] == 0
 
 
 def test_aggregates_split_by_agent_model_and_day() -> None:

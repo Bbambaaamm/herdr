@@ -28,6 +28,7 @@ from herdr.admission import (
     TaskGraphSpec,
 )
 from herdr.taskgraph import GRAPH_VERSION, TaskGraphEnvelope
+from herdr.telemetry import TelemetryStore
 from herdr.scheduler import (
     AuditLog,
     DenyDecision,
@@ -41,6 +42,7 @@ from herdr.scheduler import (
 
 HERDR_CONTEXT_BLOCKER = "herdr_runtime_context_required"
 DEFAULT_SNAPSHOT = Path("/var/lib/agent-platform-herdr/swarm.json")
+DEFAULT_TELEMETRY = Path("/var/lib/agent-platform-herdr/telemetry.jsonl")
 DEFAULT_ADMISSION_AUDIT = Path("/var/lib/agent-platform-herdr/admission.jsonl")
 DEFAULT_ADMISSION_REGISTRY = Path("/var/lib/agent-platform-herdr/admission-registry.json")
 DEFAULT_PROFILE = "quantlab"
@@ -626,6 +628,7 @@ def build_two_child_canary(
     parent_agent_id: str,
     audit_path: Path,
     clock: Callable[[], float],
+    telemetry_store: TelemetryStore | None = None,
 ) -> tuple[DynamicChildScheduler, _Lease, list[_Lease], dict[str, str]]:
     scheduler = DynamicChildScheduler(
         budget=SchedulerBudget(
@@ -639,6 +642,7 @@ def build_two_child_canary(
         ),
         clock=clock,
         audit_log=AuditLog(audit_path),
+        telemetry_store=telemetry_store,
     )
     parent = TaskNode(
         id="runtime-canary-parent",
@@ -713,14 +717,20 @@ def build_two_child_canary(
 
 
 def run_live_two_child_canary(
-    *, parent_agent_id: str, cwd: Path, snapshot_path: Path = DEFAULT_SNAPSHOT
+    *,
+    parent_agent_id: str,
+    cwd: Path,
+    snapshot_path: Path = DEFAULT_SNAPSHOT,
+    telemetry_path: Path = DEFAULT_TELEMETRY,
 ) -> dict[str, object]:
     clock = __import__("time").time
     audit_path = Path.home() / ".local/state/agent-stack/herdr-swarm-canary-events.jsonl"
+    telemetry_store = TelemetryStore(telemetry_path)
     scheduler, parent_lease, leases, prompts = build_two_child_canary(
         parent_agent_id=parent_agent_id,
         audit_path=audit_path,
         clock=clock,
+        telemetry_store=telemetry_store,
     )
     runtime = HerdrChildRuntime(
         scheduler,
@@ -740,6 +750,7 @@ def run_live_two_child_canary(
         "status": "completed",
         "child_results": child_results,
         "snapshot": final_snapshot,
+        "telemetry": str(telemetry_path),
     }
 
 
@@ -750,6 +761,7 @@ def main() -> int:
     parser.add_argument("--parent-agent", default="quantlab-hermes")
     parser.add_argument("--cwd", type=Path, default=Path.cwd())
     parser.add_argument("--snapshot", type=Path, default=DEFAULT_SNAPSHOT)
+    parser.add_argument("--telemetry", type=Path, default=DEFAULT_TELEMETRY)
     args = parser.parse_args()
     if not args.canary:
         parser.error("--canary is required")
@@ -758,6 +770,7 @@ def main() -> int:
             parent_agent_id=args.parent_agent,
             cwd=args.cwd,
             snapshot_path=args.snapshot,
+            telemetry_path=args.telemetry,
         )
     except HerdrRuntimeError as exc:
         print(json.dumps({"status": "blocked", "blocker": exc.code, "detail": exc.detail}))
@@ -773,6 +786,7 @@ def main() -> int:
                 "tasks": len(snapshot["tasks"]),
                 "edges": len(snapshot["edges"]),
                 "snapshot": str(args.snapshot),
+                "telemetry": str(args.telemetry),
             },
             sort_keys=True,
         )
