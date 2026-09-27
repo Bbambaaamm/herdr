@@ -442,3 +442,135 @@ def test_snapshot_restore_contract_is_exact(monkeypatch, tmp_path):
     assert writes[0][0] == path
     assert writes[0][1] == b"before\n"
     assert writes[0][2] == 0o640
+
+
+
+def test_already_deployed_requires_full_coherence(
+    monkeypatch,
+    tmp_path,
+):
+    candidate = tmp_path / "release"
+    unit_dir = tmp_path / "units"
+    consumer_dir = tmp_path / "consumers"
+    public_state = tmp_path / "deployed-release.json"
+
+    bundle = (
+        candidate
+        / "deploy"
+        / "agent_platform"
+        / "production"
+    )
+    bundle.mkdir(parents=True)
+    unit_dir.mkdir()
+    consumer_dir.mkdir()
+
+    for name in cutover.UNITS:
+        data = f"unit={name}\n".encode()
+        (bundle / f"{name}.in").write_bytes(data)
+        (unit_dir / name).write_bytes(data)
+
+    consumer_files = {}
+
+    for name in release.CONSUMERS:
+        data = consumer(name)
+        (
+            candidate
+            / "configs"
+            / "consumers"
+        ).mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        (
+            candidate
+            / "configs"
+            / "consumers"
+            / f"{name}.yaml"
+        ).write_bytes(data)
+        (
+            consumer_dir
+            / f"{name}.yaml"
+        ).write_bytes(data)
+        consumer_files[f"{name}.yaml"] = data
+
+    digest = release.consumer_digest(consumer_files)
+
+    release_doc = {
+        "tag": "v1.2.3-rc.7",
+        "commit": "a" * 40,
+        "config_contract_sha256": digest,
+    }
+
+    public_state.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "tag": release_doc["tag"],
+                "commit": release_doc["commit"],
+                "config_sha256": digest,
+                "deployed_at": 123456789,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        cutover,
+        "UNIT_DIR",
+        unit_dir,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "CONSUMER_DIR",
+        consumer_dir,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "PUBLIC_STATE",
+        public_state,
+    )
+
+    cutover.assert_deployed_coherence(
+        candidate,
+        release_doc,
+    )
+
+    # A matching release symlink with stale units must fail closed.
+    (unit_dir / cutover.UNITS[0]).write_text(
+        "stale\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        release.ReleaseError,
+        match="already_deployed_unit_mismatch",
+    ):
+        cutover.assert_deployed_coherence(
+            candidate,
+            release_doc,
+        )
+
+    # Restore the unit and prove a stale marker also fails closed.
+    source = bundle / f"{cutover.UNITS[0]}.in"
+    (unit_dir / cutover.UNITS[0]).write_bytes(
+        source.read_bytes()
+    )
+
+    marker = json.loads(
+        public_state.read_text(encoding="utf-8")
+    )
+    marker["commit"] = "b" * 40
+
+    public_state.write_text(
+        json.dumps(marker),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        release.ReleaseError,
+        match="already_deployed_public_state_mismatch",
+    ):
+        cutover.assert_deployed_coherence(
+            candidate,
+            release_doc,
+        )

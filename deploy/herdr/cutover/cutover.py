@@ -437,6 +437,102 @@ def install_units(
             )
 
 
+def assert_deployed_coherence(
+    release_root: Path,
+    release: dict[str, object],
+) -> None:
+    # A matching /opt/herdr/current symlink alone is not proof of a
+    # completed deployment. A host/process interruption may happen
+    # between symlink, unit and deployed-marker transitions.
+
+    bundle = release_root / "deploy" / "agent_platform" / "production"
+
+    for name in UNITS:
+        source = bundle / f"{name}.in"
+        destination = UNIT_DIR / name
+
+        need(
+            source.is_file() and not source.is_symlink(),
+            f"already_deployed_release_unit_missing:{name}",
+        )
+        need(
+            destination.is_file() and not destination.is_symlink(),
+            f"already_deployed_unit_missing:{name}",
+        )
+        need(
+            digest_file(destination) == digest_file(source),
+            f"already_deployed_unit_mismatch:{name}",
+        )
+
+    installed: dict[str, bytes] = {}
+
+    for consumer in CONSUMERS:
+        name = f"{consumer}.yaml"
+        source = release_root / "configs" / "consumers" / name
+        destination = CONSUMER_DIR / name
+
+        need(
+            source.is_file() and not source.is_symlink(),
+            f"already_deployed_consumer_source_missing:{consumer}",
+        )
+        need(
+            destination.is_file() and not destination.is_symlink(),
+            f"already_deployed_consumer_missing:{consumer}",
+        )
+
+        data = destination.read_bytes()
+
+        need(
+            data == source.read_bytes(),
+            f"already_deployed_consumer_mismatch:{consumer}",
+        )
+
+        installed[name] = data
+
+    need(
+        consumer_digest(installed)
+        == release["config_contract_sha256"],
+        "already_deployed_consumer_digest_mismatch",
+    )
+
+    need(
+        PUBLIC_STATE.is_file() and not PUBLIC_STATE.is_symlink(),
+        "already_deployed_public_state_missing",
+    )
+
+    try:
+        document = json.loads(
+            PUBLIC_STATE.read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError(
+            "already_deployed_public_state_invalid"
+        ) from exc
+
+    need(
+        set(document)
+        == {
+            "version",
+            "tag",
+            "commit",
+            "config_sha256",
+            "deployed_at",
+        },
+        "already_deployed_public_state_shape",
+    )
+
+    need(
+        document["version"] == 1
+        and document["tag"] == release["tag"]
+        and document["commit"] == release["commit"]
+        and document["config_sha256"]
+        == release["config_contract_sha256"]
+        and isinstance(document["deployed_at"], int)
+        and document["deployed_at"] > 0,
+        "already_deployed_public_state_mismatch",
+    )
+
+
 def deployed_document(release: dict[str, object], config_digest: str, deployed_at: int) -> dict[str, object]:
     need(config_digest == release["config_contract_sha256"], "deployment_config_mismatch")
     return {
@@ -542,9 +638,20 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
     need(confirmation == identifier, "confirmation_mismatch")
     report = preflight(archive, expected_legacy_commit)
     candidate = install_candidate(archive, release)
+
     if CURRENT.is_symlink() and CURRENT.resolve(strict=True) == candidate:
+        # Fail closed unless every mutable production authority proves
+        # the same immutable release identity.
+        assert_deployed_coherence(
+            candidate,
+            release,
+        )
         archive.unlink()
-        return {**report, "status": "already_deployed", "current": str(candidate)}
+        return {
+            **report,
+            "status": "already_deployed",
+            "current": str(candidate),
+        }
     if not CURRENT.exists() and not CURRENT.is_symlink():
         CURRENT.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
         need(not CURRENT.parent.is_symlink(), "current_directory_is_symlink")

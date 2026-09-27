@@ -66,13 +66,17 @@ The apply operation:
    the exact previous systemd unit bytes and deployed-release marker;
 7. atomically switches `current`, publishes only bounded tag/SHA/config metadata,
    and verifies the internal health boundary and Herdr sandbox;
-8. switches back to the previous release and verifies it, including restarting
-   the watchdog against the previous `/opt/herdr/current`, then promotes the
-   candidate again—exercising rollback of both web/export and durable orchestration
-   before public activation; the durable watchdog remains stopped throughout all
+8. switches back to the previous release, restores and verifies the exact
+   previous systemd units and deployed-release marker, then promotes the candidate
+   again—exercising rollback of both web/export and durable orchestration before
+   public activation; the durable watchdog remains stopped throughout all
    intermediate transitions;
 9. restores the exact authenticated Nginx route and proves the QuantLab root status
    and unauthenticated `401` boundary are unchanged.
+
+An `already_deployed` result is accepted only when the current symlink,
+all candidate systemd units, installed consumer policy digest, and bounded
+`deployed-release.json` identify the same immutable release.
 
 Any failure atomically returns `current` to the prior release, restarts the same
 services, and restores the exact prior Nginx fragment. The route remains fail-closed
