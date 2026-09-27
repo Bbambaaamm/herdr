@@ -45,8 +45,11 @@ SWARM_SNAPSHOT_NAME = "swarm.json"
 
 class DenyReason(StrEnum):
     DAG_NODE_LIMIT = "dag_node_limit"
+    DAG_DEPTH_LIMIT = "dag_depth_limit"
+    DAG_FANOUT_LIMIT = "dag_fanout_limit"
     DAG_CYCLE = "dag_cycle"
     CHILD_TOOL_ESCALATION = "child_tool_escalation"
+    CHILD_PERMISSION_ESCALATION = "child_permission_escalation"
     CHILD_ROLE_ESCALATION = "child_role_escalation"
     TOOL_NOT_IN_ROLE_ALLOWLIST = "tool_not_in_role_allowlist"
     NON_SPAWNABLE_ROLE = "non_spawnable_role"
@@ -151,6 +154,12 @@ class _DefaultConsumerPolicy:
                     DenyReason.CHILD_TOOL_ESCALATION,
                     detail=f"child tools above parent: {sorted(outside_parent)}",
                 )
+        outside_permissions = set(proposal.child_permissions) - set(proposal.parent_permissions)
+        if outside_permissions:
+            return DenyDecision(
+                DenyReason.CHILD_PERMISSION_ESCALATION,
+                detail=f"child permissions above parent: {sorted(outside_permissions)}",
+            )
         if self.ROLE_RANK.get(proposal.child_role, 0) > self.ROLE_RANK.get(
             proposal.parent_role, 0
         ):
@@ -193,6 +202,7 @@ class ChildProposal:
     child_task: str = ""
     child_model: str = "laguna"
     child_fallback_model: str = "longcat"
+    parent_permissions: tuple[str, ...] = ()
     child_permissions: tuple[str, ...] = ()
 
 
@@ -333,6 +343,9 @@ class DynamicChildScheduler:
         self._repo_counter: dict[str, int] = defaultdict(int)
         self._repo_counter_lock = threading.Lock()
         self._graph_latency: float = 0.0
+        self._plan_max_nodes = self.budget.max_dag_nodes
+        self._plan_max_depth = self.budget.max_dag_depth
+        self._plan_max_fanout = self.budget.max_dag_fanout
 
     # -- submission ----------------------------------------------------------
 
@@ -348,12 +361,18 @@ class DynamicChildScheduler:
         if not graph.nodes:
             self._deny(DenyReason.RECORD_EMPTY, "graph has no nodes")
             return
-        if len(graph.nodes) > self.budget.max_dag_nodes:
+        effective_max_nodes = min(self.budget.max_dag_nodes, graph.envelope.max_nodes)
+        effective_max_depth = min(self.budget.max_dag_depth, graph.envelope.max_depth)
+        effective_max_fanout = min(self.budget.max_dag_fanout, graph.envelope.max_fanout)
+        if len(graph.nodes) > effective_max_nodes:
             self._deny(
                 DenyReason.DAG_NODE_LIMIT,
-                detail=f"graph has {len(graph.nodes)} nodes; limit is {self.budget.max_dag_nodes}",
+                detail=f"graph has {len(graph.nodes)} nodes; limit is {effective_max_nodes}",
             )
             return
+        self._plan_max_nodes = min(self._plan_max_nodes, effective_max_nodes)
+        self._plan_max_depth = min(self._plan_max_depth, effective_max_depth)
+        self._plan_max_fanout = min(self._plan_max_fanout, effective_max_fanout)
         # Validate graph (catches cycles, unknown deps, etc.)
         try:
             graph._validate()
@@ -436,12 +455,15 @@ class DynamicChildScheduler:
 
     def submit_taskgraph_contract(
         self,
-        contract: Mapping[str, object],
+        contract: TaskGraph | Mapping[str, object],
         *,
         repo: str = "Bbambaaamm/Autonomous-Quant-Lab",
         issue: str = "",
     ) -> None:
-        """Submit from a generic envelope.nodes contract (TaskGraph230 adapter)."""
+        """Submit canonical TaskGraph or a validated envelope.nodes mapping."""
+        if isinstance(contract, TaskGraph):
+            self.submit(contract, repo=repo, issue=issue or contract.envelope.issue)
+            return
         if (
             not isinstance(contract, Mapping)
             or "envelope" not in contract
@@ -465,12 +487,13 @@ class DynamicChildScheduler:
             envelope=TaskGraphEnvelope(
                 issue=envelope_data.get("issue", issue),
                 spec_hash=envelope_data.get("spec_hash", "sha256:" + "0" * 64),
-                graph_version=GRAPH_VERSION,
-                created_at=datetime.now(UTC).isoformat(),
-                planner=envelope_data.get("planner", "herdr-taskgraph230-adapter@1.0"),
-                max_nodes=self.budget.max_dag_nodes,
-                max_depth=self.budget.max_dag_depth,
-                max_fanout=self.budget.max_dag_fanout,
+                graph_version=str(envelope_data.get("graph_version", GRAPH_VERSION)),
+                created_at=str(envelope_data.get("created_at", datetime.now(UTC).isoformat())),
+                planner=str(envelope_data.get("planner", "herdr-taskgraph-adapter@1.0")),
+                max_nodes=int(envelope_data.get("max_nodes", self.budget.max_dag_nodes)),
+                max_depth=int(envelope_data.get("max_depth", self.budget.max_dag_depth)),
+                max_fanout=int(envelope_data.get("max_fanout", self.budget.max_dag_fanout)),
+                policy_profile=str(envelope_data.get("policy_profile", "default")),
             ),
             nodes=tuple(
                 self._tasknode_from_contract(n, repo, issue) for n in nodes_data
@@ -817,13 +840,6 @@ class DynamicChildScheduler:
         parent_id: str,
         proposal: ChildProposal,
     ) -> TaskNode | DenyDecision:
-        decision = self.consumer_policy.evaluate_child_proposal(proposal)
-        if not decision:
-            self._deny(
-                decision.reason,
-                detail=f"child proposal denied for parent {parent_id}: {decision.reason.value}",
-            )
-            return decision
         parent_rec = self._tasks.get(parent_id)
         if parent_rec is None:
             deny = DenyDecision(
@@ -831,6 +847,61 @@ class DynamicChildScheduler:
             )
             self._deny(deny.reason, deny.detail or "")
             return deny
+
+        canonical = replace(
+            proposal,
+            parent_role=parent_rec.node.role,
+            parent_tools=tuple(parent_rec.node.tools),
+            parent_permissions=tuple(parent_rec.node.permissions),
+        )
+        decision = self.consumer_policy.evaluate_child_proposal(canonical)
+        if not decision:
+            self._deny(
+                decision.reason,
+                detail=f"child proposal denied for parent {parent_id}: {decision.reason.value}",
+            )
+            return decision
+
+        if len(self._tasks) >= self._plan_max_nodes:
+            deny = DenyDecision(
+                DenyReason.DAG_NODE_LIMIT,
+                detail=f"dynamic node limit reached: {self._plan_max_nodes}",
+            )
+            self._deny(deny.reason, deny.detail)
+            return deny
+
+        parent_depth = 1
+        cursor = parent_rec.node.parent_id
+        seen = {parent_id}
+        while cursor is not None:
+            if cursor in seen:
+                raise SchedulerError("cycle in parent hierarchy")
+            seen.add(cursor)
+            ancestor = self._tasks.get(cursor)
+            if ancestor is None:
+                raise SchedulerError(f"unknown parent in hierarchy: {cursor}")
+            parent_depth += 1
+            cursor = ancestor.node.parent_id
+        if parent_depth + 1 > self._plan_max_depth:
+            deny = DenyDecision(
+                DenyReason.DAG_DEPTH_LIMIT,
+                detail=f"dynamic child depth exceeds limit: {self._plan_max_depth}",
+            )
+            self._deny(deny.reason, deny.detail)
+            return deny
+
+        current_fanout = sum(
+            1 for record in self._tasks.values() if record.node.parent_id == parent_id
+        )
+        if current_fanout >= self._plan_max_fanout:
+            deny = DenyDecision(
+                DenyReason.DAG_FANOUT_LIMIT,
+                detail=f"dynamic child fanout limit reached: {self._plan_max_fanout}",
+            )
+            self._deny(deny.reason, deny.detail)
+            return deny
+
+        proposal = canonical
         child_id = f"{parent_id}-child-{self._next_agent_id()}"
         child_node = TaskNode(
             id=child_id,
