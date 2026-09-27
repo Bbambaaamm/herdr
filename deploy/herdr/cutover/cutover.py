@@ -139,6 +139,24 @@ def http_status(url: str) -> str:
                "--output", "/dev/null", "--write-out", "%{http_code}", url)
 
 
+def wait_http_status(url: str, expected: str, *, attempts: int = 10,
+                     delay: float = 1.0) -> str:
+    """Wait for an asynchronous service or proxy reload to converge."""
+    need(attempts > 0 and len(expected) == 3 and expected.isdigit(),
+         "invalid_http_status_wait")
+    last = ""
+    for attempt in range(attempts):
+        try:
+            last = http_status(url)
+        except subprocess.SubprocessError:
+            last = ""
+        if last == expected:
+            return last
+        if attempt + 1 < attempts:
+            time.sleep(delay)
+    raise ReleaseError(f"http_status_timeout:{expected}:{last or 'error'}")
+
+
 def atomic_write(path: Path, data: bytes, mode: int, uid: int = 0, gid: int = 0) -> None:
     need(path.is_absolute() and path.parent.is_dir() and not path.parent.is_symlink(),
          "unsafe_atomic_destination")
@@ -358,16 +376,7 @@ def switch_runtime(target: Path, document: dict[str, object] | None) -> None:
     run("/usr/bin/systemctl", "start", "agent-platform-herdr.service")
     run("/usr/bin/systemctl", "start", "agent-platform-export.service")
     run("/usr/bin/systemctl", "start", "agent-platform-web.service")
-    for _ in range(10):
-        try:
-            status = http_status("http://127.0.0.1:3010/agent-platform/health")
-        except subprocess.SubprocessError:
-            status = ""
-        if status == "401":
-            break
-        time.sleep(1)
-    else:
-        raise ReleaseError("direct_health_failed")
+    wait_http_status("http://127.0.0.1:3010/agent-platform/health", "401")
     need(run("/usr/bin/systemctl", "is-active", "agent-platform-web.service") == "active",
          "web_not_active")
     assert_hardening()
@@ -414,8 +423,7 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
         atomic_write(NGINX_ROUTE, maintenance, 0o644)
         run("/usr/sbin/nginx", "-t")
         run("/usr/bin/systemctl", "reload", "nginx")
-        need(http_status("https://2.28.67.165/agent-platform/health") == "503",
-             "maintenance_route_not_fail_closed")
+        wait_http_status("https://2.28.67.165/agent-platform/health", "503")
         need(http_status("https://2.28.67.165/") == root_status, "public_root_changed")
         run("/usr/bin/systemctl", "stop", "agent-platform-export.timer",
             "agent-platform-herdr.timer")
@@ -445,8 +453,7 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
         atomic_write(NGINX_ROUTE, active_route, 0o644)
         run("/usr/sbin/nginx", "-t")
         run("/usr/bin/systemctl", "reload", "nginx")
-        need(http_status("https://2.28.67.165/agent-platform/health") == "401",
-             "public_auth_boundary_failed")
+        wait_http_status("https://2.28.67.165/agent-platform/health", "401")
         need(http_status("https://2.28.67.165/") == root_status, "public_root_changed")
         return {"status": "success", **state, "state_file": str(state_path)}
     except BaseException:
