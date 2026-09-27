@@ -15,7 +15,7 @@ def test_closed_snapshot_rejects_sensitive_fields():
 
 def test_unavailable_is_not_zero():
     value = decode(json.dumps(unavailable(100)).encode())
-    assert len(value['sources']) == 15
+    assert len(value['sources']) == 16
     assert all(s['status'] == 'unavailable' and s['rows'] == [] for s in value['sources'])
 
 import base64
@@ -370,6 +370,23 @@ def config(tmp_path):
                 profiles={p: dict(router=None, search=None, kanban=None, git=None, tests=None) for p in c.PROFILES})
 
 
+def test_release_projection_is_fixed_bounded_and_sanitized(tmp_path, monkeypatch):
+    path = tmp_path / 'deployed-release.json'
+    payload = dict(version=1, tag='v0.2.0-rc.2', commit='a' * 40,
+                   config_sha256='b' * 64, deployed_at=100)
+    path.write_text(json.dumps(payload))
+    monkeypatch.setattr(sources, 'RELEASE_PATH', str(path))
+    rows, stamp = sources.release(str(path), 'quantlab')
+    assert rows == [{key: payload[key] for key in ('tag', 'commit', 'config_sha256', 'deployed_at')}]
+    assert stamp == 100 and 'version' not in rows[0]
+    with pytest.raises(ValueError):
+        sources.release(str(path), 'majak')
+    payload['prompt'] = 'PRIVATE'
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError):
+        sources.release(str(path), 'quantlab')
+
+
 
 def test_export_configuration_accepts_legacy_profile_shape_during_search_rollout(tmp_path):
     cfg = dict(version=1, output=str(tmp_path / 'snapshot.json'), herdr=None,
@@ -656,6 +673,33 @@ def test_startup_requires_fresh_mandatory_profile_sources(auth, monkeypatch):
     monkeypatch.setattr(web.time,'time',lambda:191)
     with pytest.raises(ValueError):
         web.load('/config.json')
+
+
+def test_startup_requires_deployed_release_identity_for_quantlab(auth, monkeypatch):
+    from agent_platform_dashboard import production_web as web
+    value = c.unavailable(100)
+    auth_record = dict(auth[0], profiles=['majak', 'quantlab'])
+    cfg = dict(version=1, snapshot='/snapshot.json', auth='/auth.json')
+    for source in value['sources']:
+        if source['kind'] in ('herdr', 'router'):
+            source.update(status='available', reason='ok')
+            if source['kind'] == 'herdr':
+                source['rows'] = [dict(agent=source['profile'] + '-hermes', status='working')]
+    def reader(path, limit, **kwargs):
+        if path == '/config.json':
+            return json.dumps(cfg).encode()
+        if path == '/auth.json':
+            return json.dumps(auth_record).encode()
+        return c.encode(value)
+    monkeypatch.setattr(web, 'read', reader)
+    monkeypatch.setattr(web.time, 'time', lambda: 100)
+    with pytest.raises(ValueError):
+        web.load('/config.json')
+    release = next(source for source in value['sources'] if source['kind'] == 'release')
+    release.update(status='available', reason='ok', data_at=100,
+                   rows=[dict(tag='v0.2.0-rc.2', commit='a' * 40,
+                              config_sha256='b' * 64, deployed_at=100)])
+    assert isinstance(web.load('/config.json'), Application)
 
 
 def test_machine_city_shell_assets_and_csp(tmp_path, auth):

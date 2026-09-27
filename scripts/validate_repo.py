@@ -29,6 +29,12 @@ required = [
     "package.json",
     "package-lock.json",
     "deploy/agent_platform/production/launch.py",
+    "deploy/herdr/cutover/cutover.py",
+    "deploy/herdr/cutover/RUNBOOK.md",
+    "deploy/herdr/cutover/legacy-quantlab-staging-01.sha256",
+    "herdr/release.py",
+    "scripts/build-herdr-release.py",
+    ".github/workflows/release.yml",
 ]
 missing = [p for p in required if not Path(p).exists()]
 if missing:
@@ -56,6 +62,21 @@ if lineage["search_router"]["commit"] != "3c1dac1c1d96693cf0903b80acdfc169e391a5
 package = json.loads(Path("package.json").read_text())
 if package.get("packageManager") != "npm@11.17.0":
     print("Unexpected npm version contract.")
+    sys.exit(1)
+
+for name in ("agent-platform-web.service", "agent-platform-export.service",
+             "agent-platform-herdr.service"):
+    template = Path("deploy/agent_platform/production") / f"{name}.in"
+    runtime = Path("runtime") / name
+    for path in (template, runtime):
+        text = path.read_text(encoding="utf-8")
+        if "/opt/herdr/current" not in text or "/opt/agent-platform/release" in text:
+            print(f"Runtime unit bypasses atomic Herdr release symlink: {path}")
+            sys.exit(1)
+
+release_workflow = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
+if 'tags: ["v*"]' not in release_workflow or "build-herdr-release.py" not in release_workflow:
+    print("Immutable release workflow contract is incomplete.")
     sys.exit(1)
 
 print("HERDR_REPOSITORY_CONTRACT_OK")

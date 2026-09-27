@@ -119,10 +119,12 @@ def load(filename):
     now = int(time.time())
     c.need(0 <= now - snapshot['generated_at'] <= 90)
     for source in snapshot['sources']:
-        if source['profile'] in auth['profiles'] and source['kind'] in ('router', 'herdr'):
+        if source['profile'] in auth['profiles'] and source['kind'] in ('router', 'herdr', 'release'):
             c.need(source['status'] == 'available' and 0 <= now - source['observed_at'] <= 90)
             if source['kind'] == 'herdr':
                 c.need(bool(source['rows']))
+            if source['kind'] == 'release':
+                c.need(len(source['rows']) == 1)
     return Application(config['snapshot'], auth)
 
 

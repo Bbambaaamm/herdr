@@ -18,6 +18,8 @@ Herdr is intentionally project-agnostic. Project-specific policy remains in the 
 - `agent-stack/` — current task/worker/watchdog operational tooling.
 - `integrations/search-router/` — cost-aware web/search routing integration.
 - `deploy/agent_platform/production/` — reviewed deployment templates and launch entrypoint.
+- `deploy/herdr/cutover/` — deterministic releases, read-only preflight, atomic
+  cutover and exercised rollback for the versioned runtime layout.
 - `runtime/` — current Git-backed runtime unit baseline.
 - `tests/` — Python production/telemetry contracts.
 - `package.json` + `scripts/build.mjs` — deterministic Machine City browser build.

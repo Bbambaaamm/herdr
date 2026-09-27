@@ -37,7 +37,7 @@ jobs:
       - name: Validate Python dashboard and telemetry
         run: |
           python -m pip install --disable-pip-version-check pytest==8.4.2
-          python -m compileall -q herdr agent_platform_dashboard tests integrations/search-router
+          python -m compileall -q herdr deploy agent_platform_dashboard tests integrations/search-router
           python -m pytest -q tests
       - name: Validate deployment and shell entrypoints
         run: |
@@ -48,6 +48,7 @@ jobs:
           bash -n scripts/build-machine-city.sh
           bash -n integrations/search-router/install.sh
           python -m py_compile integrations/search-router/__init__.py
+          python -m py_compile scripts/build-herdr-release.py deploy/herdr/cutover/cutover.py
       - name: Validate deterministic browser bundle
         run: |
           npm install --global "npm@${NPM_VERSION}"

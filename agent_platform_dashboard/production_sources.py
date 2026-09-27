@@ -21,6 +21,7 @@ QUEUE_PATH = '/var/lib/agent-platform-herdr/queue.json'
 CODEX_USAGE_PATH = '/var/lib/agent-platform-herdr/codex-usage.json'
 MODEL_ROUTING_PATH = '/var/lib/agent-platform-herdr/model-routing.json'
 ADMISSION_PATH = '/var/lib/agent-platform-herdr/admission.jsonl'
+RELEASE_PATH = '/var/lib/agent-platform-herdr/deployed-release.json'
 
 
 def command(argv, *, env=None, limit=65536, timeout=3):
@@ -329,6 +330,16 @@ def admission(path, profile):
         rows.append(row)
     rows = rows[-50:]
     return rows, (rows[-1]['observed_at'] if rows else file_mtime)
+
+
+def release(path, profile):
+    c.need(profile == 'quantlab' and path == RELEASE_PATH)
+    value = c.parse(read(path, 4096), 4096)
+    c.keys(value, 'version tag commit config_sha256 deployed_at')
+    c.need(value['version'] == 1)
+    row = {name: value[name] for name in ('tag', 'commit', 'config_sha256', 'deployed_at')}
+    c.row('release', row)
+    return [row], row['deployed_at']
 
 
 def _routing_summary(now):

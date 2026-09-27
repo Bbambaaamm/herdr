@@ -36,6 +36,12 @@ Recommended server layout:
 
 Deployment creates a pre-change backup and supports atomic symlink rollback.
 
+The production cutover implementation and operator gates are defined in
+`deploy/herdr/cutover/RUNBOOK.md`. A release tag triggers a full contract run and a
+deterministic bundle whose payload and policy overlays are hash-bound. The public
+dashboard reports the deployed tag and immutable commit from bounded read-only
+metadata; it never infers deployment identity from floating `main`.
+
 ## Consumer upgrades
 
 Consumer changes and Herdr upgrades are separate pull requests. A consumer may remain on an older compatible Herdr release while another consumer canaries the next release.

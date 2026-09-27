@@ -29,5 +29,5 @@ for path in FILES:
     entries.append((hashlib.sha256(path.read_bytes()).hexdigest(), path.as_posix()))
 
 OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-OUTPUT.write_text("".join(f"{digest}  {path}\n" for digest, path in sorted(entries)))
+OUTPUT.write_bytes("".join(f"{digest}  {path}\n" for digest, path in sorted(entries)).encode("ascii"))
 print(f"HERDR_SOURCE_MANIFEST_OK files={len(entries)}")

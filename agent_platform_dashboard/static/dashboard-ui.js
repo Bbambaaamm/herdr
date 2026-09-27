@@ -100,6 +100,10 @@ export function mountDashboard(createScene) {
   function admissionSource() { return source('quantlab', 'admission'); }
   function admissionRows() { const value = admissionSource(); return value?.status === 'available' ? value.rows : []; }
   function admissionDenials() { return admissionRows().filter(row => row.event === 'deny'); }
+  function releaseInfo() {
+    const value = source('quantlab', 'release');
+    return value?.status === 'available' && value.rows.length === 1 ? value.rows[0] : null;
+  }
   function activeQueueTasks() { return queueTasks().filter(row => row.status !== 'done'); }
   function taskById(taskId) { return queueTasks().find(row => row.task_id === taskId) || null; }
   const USER_ACTION_BLOCKERS = new Set(['user_action_required', 'agent_interactive_input_required', 'github_write_auth_required']);
@@ -788,7 +792,9 @@ export function mountDashboard(createScene) {
     sceneCall('setReduced', reduced); renderFace();
   }
   function updateHeader() {
-    ui.header.textContent = demo ? 'DEMO · scéna syntetická, metriky skutečné' : liveData ? `Živá data · ${age(liveData.generated_at)}` : loadReason;
+    const release = releaseInfo();
+    const identity = release ? ` · ${release.tag} @ ${release.commit.slice(0, 12)}` : '';
+    ui.header.textContent = demo ? 'DEMO · scéna syntetická, metriky skutečné' : liveData ? `Živá data · ${age(liveData.generated_at)}${identity}` : loadReason;
     const color = demo ? '#e49a34' : liveData ? '#6adf9a' : '#ff7159'; ui.liveDot.style.background = color; ui.liveDot.style.color = color;
   }
   function renderAll() {
@@ -836,6 +842,13 @@ export function mountDashboard(createScene) {
           || (row.event === 'deny' && (row.reason == null || row.agents_after != null))
           || (row.event === 'allow' && (row.reason != null || row.agents_after == null))
         )) throw new Error('invalid');
+      }
+      if (item.kind === 'release') {
+        if (item.profile !== 'quantlab' || (item.status === 'available' && item.rows.length !== 1)) throw new Error('invalid');
+        if (item.rows.some(row => typeof row.tag !== 'string' || !/^v[A-Za-z0-9._-]{1,62}$/.test(row.tag)
+          || typeof row.commit !== 'string' || !/^[0-9a-f]{40}$/.test(row.commit)
+          || typeof row.config_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(row.config_sha256)
+          || !Number.isSafeInteger(row.deployed_at) || row.deployed_at < 0)) throw new Error('invalid');
       }
       if (item.kind === 'codex') {
         if (item.profile !== 'majak' || (item.status === 'available' && item.rows.length !== 1)) throw new Error('invalid');
