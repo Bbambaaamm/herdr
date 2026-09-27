@@ -272,7 +272,11 @@ def test_switch_runtime_restarts_watchdog_across_symlink(monkeypatch, tmp_path):
     target = tmp_path / "release"
     target.mkdir()
 
-    cutover.switch_runtime(target, None)
+    cutover.switch_runtime(
+        target,
+        None,
+        start_watchdog=True,
+    )
 
     stop = (
         "run",
@@ -293,3 +297,124 @@ def test_switch_runtime_restarts_watchdog_across_symlink(monkeypatch, tmp_path):
     assert link in events
     assert start in events
     assert events.index(stop) < events.index(link) < events.index(start)
+
+
+
+def test_switch_runtime_can_keep_watchdog_quiescent(
+    monkeypatch,
+    tmp_path,
+):
+    events = []
+
+    def fake_run(*args, check=True):
+        events.append(("run", *args))
+        if (
+            len(args) >= 3
+            and args[0] == "/usr/bin/systemctl"
+            and args[1] == "is-active"
+        ):
+            return "active"
+        return ""
+
+    monkeypatch.setattr(cutover, "run", fake_run)
+    monkeypatch.setattr(
+        cutover,
+        "atomic_symlink",
+        lambda target, link: events.append(
+            ("symlink", str(target), str(link))
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "wait_http_status",
+        lambda *_args, **_kwargs: "401",
+    )
+    monkeypatch.setattr(
+        cutover,
+        "assert_hardening",
+        lambda: None,
+    )
+
+    target = tmp_path / "release"
+    target.mkdir()
+
+    cutover.switch_runtime(
+        target,
+        None,
+        start_watchdog=False,
+    )
+
+    assert not any(
+        event[:4]
+        == (
+            "run",
+            "/usr/bin/systemctl",
+            "start",
+            "agent-stack-watchdog.service",
+        )
+        for event in events
+    )
+
+
+def test_active_worker_blocks_control_plane_promotion(monkeypatch):
+    monkeypatch.setattr(
+        cutover,
+        "run",
+        lambda *args, **kwargs:
+            "123 python3 /opt/herdr/current/agent-stack/bin/agent-task-worker task.json"
+    )
+
+    with pytest.raises(
+        release.ReleaseError,
+        match="durable_worker_active",
+    ):
+        cutover.assert_no_active_durable_worker()
+
+
+def test_apply_keeps_watchdog_quiescent_during_rollback_exercise():
+    source = Path(
+        "deploy/herdr/cutover/cutover.py"
+    ).read_text(encoding="utf-8")
+
+    apply_source = source.split(
+        "def apply(",
+        1,
+    )[1]
+
+    assert apply_source.count(
+        "start_watchdog=False"
+    ) >= 3
+
+    assert apply_source.count(
+        "start_watchdog=True"
+    ) == 1
+
+    assert "assert_no_active_durable_worker()" in apply_source
+
+
+def test_legacy_watchdog_installer_is_release_relative():
+    text = Path(
+        "agent-stack/install-agent-stack-service.sh"
+    ).read_text(encoding="utf-8")
+
+    assert 'SCRIPT_DIR="' in text
+    assert "$SCRIPT_DIR/systemd/agent-stack-watchdog.service" in text
+    assert "/home/agentops/.local/share/agent-stack" not in text
+
+
+def test_offsite_backup_captures_immutable_release_control_plane():
+    text = Path(
+        "agent-stack/bin/hermes-offsite-prepare"
+    ).read_text(encoding="utf-8")
+
+    assert "RELEASE_ROOT=" in text
+    assert "CURRENT_RELEASE=" in text
+
+    assert "RELEASE.json" in text
+    assert "MANIFEST.sha256" in text
+    assert "agent-stack/bin" in text
+    assert "agent-stack/systemd" in text
+
+    assert ".local/bin/agent-stack-watchdog" not in text
+    assert ".local/bin/agent-stack-recovery" not in text
+    assert ".local/bin/agent-task-dispatcher" not in text

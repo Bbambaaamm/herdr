@@ -374,35 +374,74 @@ def assert_hardening() -> None:
     need(values and set(values.values()) == {"yes"}, "herdr_hardening_regressed")
 
 
-def switch_runtime(target: Path, document: dict[str, object] | None) -> None:
-    # Durable orchestration must move atomically with /opt/herdr/current.
-    # Stop watchdog before switching so no task can be dispatched from
-    # a control-plane version different from the selected immutable release.
+def assert_no_active_durable_worker() -> None:
+    workers = run(
+        "/usr/bin/pgrep",
+        "-af",
+        "[a]gent-task-worker",
+        check=False,
+    )
+    need(not workers.strip(), "durable_worker_active")
+
+
+def switch_runtime(
+    target: Path,
+    document: dict[str, object] | None,
+    *,
+    start_watchdog: bool,
+) -> None:
+    # Watchdog must remain stopped while /opt/herdr/current changes.
+    # Otherwise maintenance could dispatch work from an intermediate
+    # candidate/rollback release.
     run(
         "/usr/bin/systemctl",
         "stop",
         "agent-stack-watchdog.service",
         "agent-platform-web.service",
     )
+
     atomic_symlink(target, CURRENT)
+
     if document is not None:
         write_deployed(document)
+
     run("/usr/bin/systemctl", "daemon-reload")
+
     run("/usr/bin/systemctl", "start", "agent-platform-herdr.service")
     run("/usr/bin/systemctl", "start", "agent-platform-export.service")
     run("/usr/bin/systemctl", "start", "agent-platform-web.service")
-    wait_http_status("http://127.0.0.1:3010/agent-platform/health", "401")
+
+    wait_http_status(
+        "http://127.0.0.1:3010/agent-platform/health",
+        "401",
+    )
+
     need(
-        run("/usr/bin/systemctl", "is-active", "agent-platform-web.service")
+        run(
+            "/usr/bin/systemctl",
+            "is-active",
+            "agent-platform-web.service",
+        )
         == "active",
         "web_not_active",
     )
-    run("/usr/bin/systemctl", "start", "agent-stack-watchdog.service")
-    need(
-        run("/usr/bin/systemctl", "is-active", "agent-stack-watchdog.service")
-        == "active",
-        "watchdog_not_active",
-    )
+
+    if start_watchdog:
+        run(
+            "/usr/bin/systemctl",
+            "start",
+            "agent-stack-watchdog.service",
+        )
+        need(
+            run(
+                "/usr/bin/systemctl",
+                "is-active",
+                "agent-stack-watchdog.service",
+            )
+            == "active",
+            "watchdog_not_active",
+        )
+
     assert_hardening()
 
 
@@ -443,24 +482,71 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
     state_path = STATE_DIR / f"{document['deployed_at']}-{identifier}.json"
     switched = False
     timers_stopped = False
+    watchdog_stopped = False
     try:
         atomic_write(NGINX_ROUTE, maintenance, 0o644)
         run("/usr/sbin/nginx", "-t")
         run("/usr/bin/systemctl", "reload", "nginx")
         wait_http_status("https://2.28.67.165/agent-platform/health", "503")
         need(http_status("https://2.28.67.165/") == root_status, "public_root_changed")
-        run("/usr/bin/systemctl", "stop", "agent-platform-export.timer",
-            "agent-platform-herdr.timer")
+        run(
+            "/usr/bin/systemctl",
+            "stop",
+            "agent-platform-export.timer",
+            "agent-platform-herdr.timer",
+        )
         timers_stopped = True
+
+        # Stop all automatic durable dispatch before changing either
+        # the watchdog unit or /opt/herdr/current.
+        run(
+            "/usr/bin/systemctl",
+            "stop",
+            "agent-stack-watchdog.service",
+        )
+        watchdog_stopped = True
+
+        # Never promote a new durable control-plane while an old worker
+        # is still mutating shared queue/result state.
+        assert_no_active_durable_worker()
+
         install_units(candidate, hashes)
+
         switched = True
-        switch_runtime(candidate, document)
-        # Exercise the exact rollback path while the public route remains fail-closed.
-        switch_runtime(previous, None)
-        need(http_status("https://2.28.67.165/") == root_status, "rollback_root_changed")
-        switch_runtime(candidate, document)
-        run("/usr/bin/systemctl", "start", "agent-platform-herdr.timer",
-            "agent-platform-export.timer")
+
+        # Candidate verification and rollback exercise stay quiescent:
+        # no watchdog/maintenance/dispatcher may run in the middle.
+        switch_runtime(
+            candidate,
+            document,
+            start_watchdog=False,
+        )
+
+        switch_runtime(
+            previous,
+            None,
+            start_watchdog=False,
+        )
+
+        need(
+            http_status("https://2.28.67.165/") == root_status,
+            "rollback_root_changed",
+        )
+
+        # Only the FINAL candidate promotion may restart dispatch.
+        switch_runtime(
+            candidate,
+            document,
+            start_watchdog=True,
+        )
+        watchdog_stopped = False
+
+        run(
+            "/usr/bin/systemctl",
+            "start",
+            "agent-platform-herdr.timer",
+            "agent-platform-export.timer",
+        )
         timers_stopped = False
         evidence_archive = STATE_DIR / f"{document['deployed_at']}-{identifier}.tar.gz"
         os.replace(archive, evidence_archive)
@@ -483,10 +569,37 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
     except BaseException:
         try:
             if switched:
-                switch_runtime(previous, None)
+                switch_runtime(
+                    previous,
+                    None,
+                    start_watchdog=False,
+                )
+
             if timers_stopped:
-                run("/usr/bin/systemctl", "start", "agent-platform-herdr.timer",
-                    "agent-platform-export.timer")
+                run(
+                    "/usr/bin/systemctl",
+                    "start",
+                    "agent-platform-herdr.timer",
+                    "agent-platform-export.timer",
+                )
+
+            if watchdog_stopped:
+                run("/usr/bin/systemctl", "daemon-reload")
+                run(
+                    "/usr/bin/systemctl",
+                    "start",
+                    "agent-stack-watchdog.service",
+                )
+                need(
+                    run(
+                        "/usr/bin/systemctl",
+                        "is-active",
+                        "agent-stack-watchdog.service",
+                    )
+                    == "active",
+                    "rollback_watchdog_not_active",
+                )
+
             atomic_write(NGINX_ROUTE, active_route, 0o644)
             run("/usr/sbin/nginx", "-t")
             run("/usr/bin/systemctl", "reload", "nginx")
