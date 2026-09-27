@@ -423,6 +423,47 @@ def test_ambiguous_split_reconciles_and_closes_marked_pane(tmp_path, monkeypatch
     assert closed == ["orphan-pane"]
 
 
+def test_ambiguous_split_never_closes_marked_coordinator(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["workspace"] = str(tmp_path / "workspace")
+    task["routing"] = {"selected_agent": "quantlab-hermes"}
+    task["run_token"] = "isolated-run"
+    closed = []
+
+    def fake_herdr_json(args, *, timeout_seconds=30.0):
+        if args[:2] == ["agent", "get"]:
+            return {
+                "result": {
+                    "agent": {
+                        "agent": "hermes",
+                        "pane_id": "persistent-pane",
+                        "workspace_id": "w2",
+                    }
+                }
+            }
+        if args[:2] == ["pane", "split"]:
+            raise RuntimeError("lost split response")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(worker, "_herdr_json", fake_herdr_json)
+    monkeypatch.setattr(
+        worker,
+        "_find_marked_task_panes",
+        lambda marker, workspace_id: ("persistent-pane", "orphan-pane"),
+    )
+    monkeypatch.setattr(worker, "_close_owned_pane", lambda pane_id: closed.append(pane_id) or True)
+
+    try:
+        worker.create_task_session(task)
+    except RuntimeError as exc:
+        assert str(exc) == "lost split response"
+    else:
+        raise AssertionError("split failure must propagate after safe cleanup")
+
+    assert closed == ["orphan-pane"]
+
+
 def test_unreconciled_split_fails_closed(tmp_path, monkeypatch):
     configure_paths(tmp_path)
     task = base_task()
@@ -513,6 +554,14 @@ def test_cleanup_failure_blocks_even_completed_task(tmp_path, monkeypatch):
     }
     done_path = worker.DONE / "task-1.json"
     done_path.write_text(json.dumps(task), encoding="utf-8")
+    worker.write_json(
+        worker.result_path("task-1"),
+        {
+            "task_id": "task-1",
+            "run_token": "old-token",
+            "status": "completed",
+        },
+    )
     monkeypatch.setattr(worker, "_close_owned_pane", lambda pane_id: False)
 
     assert worker.cleanup_task_session_if_safe(task) is False
@@ -523,6 +572,10 @@ def test_cleanup_failure_blocks_even_completed_task(tmp_path, monkeypatch):
     assert saved["attempt_state"] == "blocked"
     assert saved["watchdog_blocker"] == "task_session_cleanup_failed"
     assert not done_path.exists()
+    result = json.loads(worker.result_path("task-1").read_text(encoding="utf-8"))
+    assert result["status"] == "blocked"
+    assert result["blocker"] == "task_session_cleanup_failed"
+    assert list(worker.RESULTS.glob("task-1.attempt0.previous-*.json"))
 
 
 def test_ambiguous_split_without_marker_never_retries(tmp_path, monkeypatch):
