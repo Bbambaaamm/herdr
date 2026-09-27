@@ -4,13 +4,14 @@ import json
 import math
 
 PROFILES = ('majak', 'quantlab')
-KINDS = ('herdr', 'kanban', 'router', 'search', 'git', 'tests', 'queue', 'codex')
+KINDS = ('herdr', 'kanban', 'router', 'search', 'git', 'tests', 'queue', 'codex', 'admission')
 SOURCE_PAIRS = tuple(
     (profile, kind)
     for profile in PROFILES
     for kind in KINDS
     if (kind != 'queue' or profile == 'quantlab')
     and (kind != 'codex' or profile == 'majak')
+    and (kind != 'admission' or profile == 'quantlab')
 )
 MAX_BYTES = 131072
 
@@ -81,6 +82,8 @@ def row(kind, value):
               'git': 'commit dirty', 'tests': 'passed failed artifact_digest',
               'queue': ('task_id issue issue_title issue_open scheduler_state status attempts '
                         'max_attempts not_before updated_at agent kind blocker pr_number'),
+              'admission': ('event reason role repo issue node_count max_depth max_fanout '
+                            'child_tools_count agents_after observed_at'),
               'codex': ('used_percent window_minutes resets_at ordinary_usage_allowed has_credits '
                         'credits_unlimited credits_balance reset_credits_available lifetime_tokens '
                         'peak_daily_tokens longest_running_turn_sec current_streak_days '
@@ -130,6 +133,19 @@ def row(kind, value):
         need(type(value['kind']) is str and identifier(value['kind'], 64))
         need(value['blocker'] is None or type(value['blocker']) is str and identifier(value['blocker']))
         need(value['pr_number'] is None or number(value['pr_number']))
+    elif kind == 'admission':
+        need(value['event'] in ('allow', 'deny'))
+        need(value['reason'] is None or identifier(value['reason'], 64))
+        need(identifier(value['role'], 32) and identifier(value['repo'], 128)
+             and identifier(value['issue'], 64))
+        for name in ('node_count', 'max_depth', 'max_fanout', 'child_tools_count'):
+            need(number(value[name]))
+        need(value['agents_after'] is None or number(value['agents_after']))
+        need(number(value['observed_at']))
+        if value['event'] == 'deny':
+            need(value['reason'] is not None and value['agents_after'] is None)
+        else:
+            need(value['reason'] is None and value['agents_after'] is not None)
     elif kind == 'codex':
         need(number(value['used_percent']) and value['used_percent'] <= 100)
         need(value['window_minutes'] is None or number(value['window_minutes']))
@@ -212,6 +228,8 @@ def validate(value):
             if kind == 'herdr':
                 need(item['agent'].startswith(profile + '-'))
             if kind == 'queue':
+                need(profile == 'quantlab')
+            if kind == 'admission':
                 need(profile == 'quantlab')
         need(len({json.dumps(r, sort_keys=True) for r in source['rows']}) == len(source['rows']))
     return value

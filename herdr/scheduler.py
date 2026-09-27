@@ -208,7 +208,15 @@ class Lease:
 # Compatibility names retained for the production runtime bridge while the
 # canonical public contract uses ChildProposal and Lease.
 SubtaskProposal = ChildProposal
-_Lease = Lease
+
+@dataclass(frozen=True)
+class _Lease:
+    """Legacy positional lease shape used by older runtime tests/callers."""
+    task_id: str
+    holder: str
+    agent_id: str
+    lease_until: float
+    fencing_token: int
 
 
 class SchedulerError(RuntimeError):
@@ -502,6 +510,10 @@ class DynamicChildScheduler:
             timeout_seconds=int(node_data.get("timeout_seconds", 1800)),
             max_attempts=int(node_data.get("max_attempts", 1)),
         )
+
+    def current_time(self) -> float:
+        """Return scheduler time so leases and external registries share one clock."""
+        return self.clock()
 
     def task_node(self, task_id: str) -> TaskNode:
         record = self._tasks.get(task_id)

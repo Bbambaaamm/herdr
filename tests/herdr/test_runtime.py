@@ -8,9 +8,18 @@ from pathlib import Path
 
 import pytest
 
-from herdr.admission import AdmissionControl, AuditLog as AdmissionAuditLog, ResourceUsage
+from herdr.admission import (
+    AdmissionControl,
+    AgentIdentity,
+    AuditLog as AdmissionAuditLog,
+    PlanBudget,
+    ResourceUsage,
+    TaskGraphSpec,
+)
+from herdr.scheduler import _Lease
 from herdr.runtime import (
     HERDR_CONTEXT_BLOCKER,
+    AdmissionRegistry,
     CommandResult,
     HerdrChildRuntime,
     HerdrRuntimeError,
@@ -73,6 +82,10 @@ def _admission(tmp_path: Path) -> AdmissionControl:
     return AdmissionControl(audit_log=AdmissionAuditLog(tmp_path / "admission.jsonl"))
 
 
+def _registry(tmp_path: Path) -> AdmissionRegistry:
+    return AdmissionRegistry(tmp_path / "admission-registry.json")
+
+
 def _healthy_usage(*_args) -> ResourceUsage:
     return ResourceUsage(
         active_agents=0,
@@ -107,6 +120,7 @@ def test_live_runtime_requires_managed_herdr_context(tmp_path: Path) -> None:
         env={},
         host_guard=lambda: True,
         admission=_admission(tmp_path),
+        admission_registry=_registry(tmp_path),
         resource_usage_factory=_healthy_usage,
     )
     with pytest.raises(HerdrRuntimeError) as exc:
@@ -143,6 +157,7 @@ def test_admission_denial_happens_before_child_process_creation(tmp_path: Path) 
         env={"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1"},
         host_guard=lambda: True,
         admission=_admission(tmp_path),
+        admission_registry=_registry(tmp_path),
         resource_usage_factory=_global_cap_usage,
     )
     with pytest.raises(HerdrRuntimeError) as exc:
@@ -170,6 +185,7 @@ def test_two_real_child_contract_parallel_cleanup_and_snapshot(tmp_path: Path) -
         env={"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1"},
         host_guard=lambda: True,
         admission=_admission(tmp_path),
+        admission_registry=_registry(tmp_path),
         resource_usage_factory=_healthy_usage,
     )
     results = runtime.run_parallel(leases, prompts)
@@ -227,6 +243,8 @@ def test_two_real_child_contract_parallel_cleanup_and_snapshot(tmp_path: Path) -
     assert all(event["admit:max_depth"] == 2 for event in allows)
     assert all(event["admit:max_fanout"] == 2 for event in allows)
     assert all(event["admit:child_tools_count"] == 0 for event in allows)
+    registry_state = json.loads((tmp_path / "admission-registry.json").read_text())
+    assert registry_state["entries"] == []
 
 
 def test_cleanup_never_closes_unowned_parent_pane(tmp_path: Path) -> None:
@@ -240,6 +258,7 @@ def test_cleanup_never_closes_unowned_parent_pane(tmp_path: Path) -> None:
         env={"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1"},
         host_guard=lambda: True,
         admission=_admission(tmp_path),
+        admission_registry=_registry(tmp_path),
         resource_usage_factory=_healthy_usage,
     )
     runtime.run_parallel(leases, prompts)
@@ -260,6 +279,7 @@ def test_blocked_child_is_not_committed_and_owned_panes_are_cleaned(tmp_path: Pa
         env={"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1"},
         host_guard=lambda: True,
         admission=_admission(tmp_path),
+        admission_registry=_registry(tmp_path),
         resource_usage_factory=_healthy_usage,
     )
     with pytest.raises(HerdrRuntimeError) as exc:
@@ -267,3 +287,58 @@ def test_blocked_child_is_not_committed_and_owned_panes_are_cleaned(tmp_path: Pa
     assert exc.value.code == "child_not_settled"
     assert sorted(runner.closed) == sorted(runner.created)
     assert all(scheduler._tasks[lease.task_id].state.value == "running" for lease in leases)
+
+
+def test_admission_registry_enforces_global_limit_across_runtimes(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    admission = AdmissionControl(
+        budget=PlanBudget(max_global_agents=1, max_agents_per_repo=4, max_agents_per_issue=3),
+        audit_log=AdmissionAuditLog(tmp_path / "registry-admission.jsonl"),
+    )
+    identity = AgentIdentity(
+        role="reader",
+        repo="Bbambaaamm/herdr",
+        issue="3",
+        parent_role="reader",
+        parent_tools=frozenset(),
+        paper_only=True,
+    )
+    spec = TaskGraphSpec(node_count=1, max_depth=1, max_fanout=0)
+    first = _Lease("t1", "h1", "q3-a-f1", 1100.0, 1)
+    second = _Lease("t2", "h2", "q3-b-f2", 1100.0, 2)
+
+    registry.reserve(admission, identity, spec, _healthy_usage(), (), first, now=1000.0)
+    with pytest.raises(HerdrRuntimeError) as exc:
+        registry.reserve(admission, identity, spec, _healthy_usage(), (), second, now=1000.0)
+
+    assert exc.value.code == "child_admission_denied"
+    assert exc.value.detail == "global_agent_limit"
+    state = json.loads((tmp_path / "admission-registry.json").read_text())
+    assert [row["agent_id"] for row in state["entries"]] == ["q3-a-f1"]
+
+
+def test_admission_registry_prunes_expired_crash_slot(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    admission = AdmissionControl(
+        budget=PlanBudget(max_global_agents=1, max_agents_per_repo=1, max_agents_per_issue=1),
+        audit_log=AdmissionAuditLog(tmp_path / "registry-expiry.jsonl"),
+    )
+    identity = AgentIdentity(
+        role="reader",
+        repo="Bbambaaamm/herdr",
+        issue="3",
+        parent_role="reader",
+        parent_tools=frozenset(),
+        paper_only=True,
+    )
+    spec = TaskGraphSpec(node_count=1, max_depth=1, max_fanout=0)
+    stale = _Lease("stale", "h1", "q3-stale-f1", 1005.0, 1)
+    fresh = _Lease("fresh", "h2", "q3-fresh-f2", 1200.0, 2)
+
+    registry.reserve(admission, identity, spec, _healthy_usage(), (), stale, now=1000.0)
+    registry.reserve(admission, identity, spec, _healthy_usage(), (), fresh, now=1006.0)
+
+    state = json.loads((tmp_path / "admission-registry.json").read_text())
+    assert [row["agent_id"] for row in state["entries"]] == ["q3-fresh-f2"]
+    registry.release("q3-fresh-f2", now=1006.0)
+    assert json.loads((tmp_path / "admission-registry.json").read_text())["entries"] == []

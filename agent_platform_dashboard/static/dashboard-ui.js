@@ -97,6 +97,9 @@ export function mountDashboard(createScene) {
   function source(profile, kind) { return liveData?.sources.find(item => item.profile === profile && item.kind === kind); }
   function queueSource() { return source('quantlab', 'queue'); }
   function queueTasks() { const value = queueSource(); return value?.status === 'available' ? value.rows : []; }
+  function admissionSource() { return source('quantlab', 'admission'); }
+  function admissionRows() { const value = admissionSource(); return value?.status === 'available' ? value.rows : []; }
+  function admissionDenials() { return admissionRows().filter(row => row.event === 'deny'); }
   function activeQueueTasks() { return queueTasks().filter(row => row.status !== 'done'); }
   function taskById(taskId) { return queueTasks().find(row => row.task_id === taskId) || null; }
   const USER_ACTION_BLOCKERS = new Set(['user_action_required', 'agent_interactive_input_required', 'github_write_auth_required']);
@@ -557,6 +560,13 @@ export function mountDashboard(createScene) {
     const queueRows = queueTasks();
     const queueCounts = Object.fromEntries(Object.keys(QUEUE_STATUS).map(status => [status, queueRows.filter(row => row.status === status).length]));
     const queueTotal = Object.values(queueCounts).reduce((a,b)=>a+b,0);
+    const admission = admissionSource();
+    const admissionRowsNow = admissionRows();
+    const admissionDenies = admissionDenials();
+    const admissionAllows = admissionRowsNow.filter(row => row.event === 'allow');
+    const denialReasons = [...new Map(
+      admissionDenies.slice().reverse().map(row => [row.reason, row])
+    ).values()].slice(0, 6);
     const searches = PROFILES.map(searchStats);
     const searchRoutes = ['fast','deep','browser'].map(mode => ({ label: mode.toUpperCase(), value: searches.every(s=>s.routes[mode]!=null) ? searches.reduce((sum,s)=>sum+s.routes[mode],0) : 0 }));
     const daily = (codex?.daily || []).map(row => ({ day: row.day.slice(5), tokens: row.tokens }));
@@ -572,6 +582,7 @@ export function mountDashboard(createScene) {
       `<article class="obs-panel"><header><div><h3>Model latency</h3><span>průměr na request</span></div><span>jen známá latence</span></header>${bars(latencyRows,r=>r.avg,v=>latency(v))}</article>`,
       `<article class="obs-panel"><header><div><h3>Data coverage</h3><span>request-weighted completeness</span></div><span>fail-closed</span></header>${coverage.map(([name,pct])=>`<div class="coverage-row"><span>${escapeHTML(name)}</span><div class="coverage-track"><i style="width:${pct}%"></i></div><strong>${pct} %</strong></div>`).join('')}<p class="obs-note">100 % znamená, že každému requestu odpovídá měřená hodnota. Chybějící hodnoty nejsou dopočítány.</p></article>`,
       `<article class="obs-panel"><header><div><h3>Durable queue</h3><span>stav práce QuantLab</span></div><span>${queueTotal} záznamů</span></header>${queueTotal ? `<div class="queue-strip">${Object.entries(queueCounts).filter(([,count])=>count).map(([status,count])=>`<i class="${status}" style="width:${(count/queueTotal*100).toFixed(1)}%" title="${escapeHTML(QUEUE_STATUS[status])}: ${count}"></i>`).join('')}</div><div class="obs-legend">${Object.entries(queueCounts).map(([status,count])=>`<span>${escapeHTML(QUEUE_STATUS[status])}: ${count}</span>`).join('')}</div>` : '<div class="obs-empty">Fronta je prázdná.</div>'}</article>`,
+      `<article class="obs-panel"><header><div><h3>Swarm admission</h3><span>ALLOW / DENY před spawnem</span></div><span>${admission?.status === 'available' ? `${admissionAllows.length} / ${admissionDenies.length}` : 'nedostupné'}</span></header>${admission?.status === 'available' ? `<div class="obs-legend"><span>ALLOW: ${admissionAllows.length}</span><span>DENY: ${admissionDenies.length}</span></div>${denialReasons.length ? `<div class="admission-reasons">${denialReasons.map(row => `<span><b>${escapeHTML(row.reason)}</b> · ${escapeHTML(row.repo)} #${escapeHTML(row.issue)} · ${escapeHTML(age(row.observed_at))}</span>`).join('')}</div>` : '<p class="obs-note">V aktuálním bounded tail nejsou žádné denialy.</p>'}<p class="obs-note">Zobrazeny jsou pouze sanitizované reason codes a DAG scope. Prompt, detail toolu ani secrets se neexportují.</p>` : '<div class="obs-empty">Admission audit není v aktuálním snapshotu dostupný.</div>'}</article>`,
       `<article class="obs-panel"><header><div><h3>Search route mix</h3><span>Fast / Deep / Browser</span></div><span>aktuální snapshot</span></header>${bars(searchRoutes,r=>r.value,v=>fmt.format(v))}</article>`,
       `<article class="obs-panel"><header><div><h3>Codex účet</h3><span>read-only stav</span></div><span>data před ${codexStats().source ? escapeHTML(age(codexStats().source.observed_at)) : '—'}</span></header><div class="obs-legend"><span>Kredity: ${codex ? escapeHTML(codex.credits_balance ?? 'neznámé') : '—'}</span><span>Reset kredity: ${codex ? fmt.format(codex.reset_credits_available) : '—'}</span><span>Streak: ${codex?.current_streak_days == null ? '—' : fmt.format(codex.current_streak_days)+' dní'}</span><span>Max streak: ${codex?.longest_streak_days == null ? '—' : fmt.format(codex.longest_streak_days)+' dní'}</span></div><p class="obs-note">USD odhad se zobrazí jen pokud jej billing route skutečně poskytne. Subscription allowance se nepřepočítává na API ceník.</p></article>`,
     ].join('');
@@ -809,6 +820,21 @@ export function mountDashboard(createScene) {
           || !Number.isFinite(row.updated_at)
           || (row.blocker != null && typeof row.blocker !== 'string')
           || (row.pr_number != null && (!Number.isSafeInteger(row.pr_number) || row.pr_number < 1))
+        )) throw new Error('invalid');
+      }
+      if (item.kind === 'admission') {
+        if (item.profile !== 'quantlab') throw new Error('invalid');
+        if (item.rows.some(row => !['allow', 'deny'].includes(row.event)
+          || (row.reason != null && typeof row.reason !== 'string')
+          || typeof row.role !== 'string' || typeof row.repo !== 'string' || typeof row.issue !== 'string'
+          || !Number.isSafeInteger(row.node_count) || row.node_count < 0
+          || !Number.isSafeInteger(row.max_depth) || row.max_depth < 0
+          || !Number.isSafeInteger(row.max_fanout) || row.max_fanout < 0
+          || !Number.isSafeInteger(row.child_tools_count) || row.child_tools_count < 0
+          || (row.agents_after != null && (!Number.isSafeInteger(row.agents_after) || row.agents_after < 0))
+          || !Number.isFinite(row.observed_at)
+          || (row.event === 'deny' && (row.reason == null || row.agents_after != null))
+          || (row.event === 'allow' && (row.reason != null || row.agents_after == null))
         )) throw new Error('invalid');
       }
       if (item.kind === 'codex') {

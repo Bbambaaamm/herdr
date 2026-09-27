@@ -7,6 +7,7 @@ children only, owned panes only, and fail-closed Herdr admission.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import subprocess
@@ -40,7 +41,8 @@ from herdr.scheduler import (
 
 HERDR_CONTEXT_BLOCKER = "herdr_runtime_context_required"
 DEFAULT_SNAPSHOT = Path("/var/lib/agent-platform-herdr/swarm.json")
-DEFAULT_ADMISSION_AUDIT = Path.home() / ".local/state/agent-stack/herdr-admission.jsonl"
+DEFAULT_ADMISSION_AUDIT = Path("/var/lib/agent-platform-herdr/admission.jsonl")
+DEFAULT_ADMISSION_REGISTRY = Path("/var/lib/agent-platform-herdr/admission-registry.json")
 DEFAULT_PROFILE = "quantlab"
 MAX_PROMPT_CHARS = 1200
 
@@ -174,9 +176,6 @@ def scheduler_resource_usage(
     if not isinstance(tasks, list):
         raise HerdrRuntimeError("invalid_scheduler_snapshot", "tasks missing")
 
-    active_agents = 0
-    per_repo: dict[str, int] = {}
-    per_issue: dict[tuple[str, str], int] = {}
     queue_depth = 0
     for row in tasks:
         if not isinstance(row, Mapping):
@@ -184,14 +183,6 @@ def scheduler_resource_usage(
         state = row.get("state")
         if state in {"planned", "ready", "pending"}:
             queue_depth += 1
-        if state != "running" or row.get("task_id") == current_task_id:
-            continue
-        active_agents += 1
-        repo = str(row.get("repo") or "")
-        issue = str(row.get("issue") or "")
-        per_repo[repo] = per_repo.get(repo, 0) + 1
-        key = (repo, issue)
-        per_issue[key] = per_issue.get(key, 0) + 1
 
     try:
         cpus = os.cpu_count() or 0
@@ -213,9 +204,9 @@ def scheduler_resource_usage(
     ram_fraction = min(1.0, max(0.0, 1.0 - (available / total)))
     swap_risk = 0.0 if swap_total <= 0 else min(1.0, max(0.0, 1.0 - swap_free / swap_total))
     return ResourceUsage(
-        active_agents=active_agents,
-        agents_per_repo=per_repo,
-        agents_per_issue=per_issue,
+        active_agents=0,
+        agents_per_repo={},
+        agents_per_issue={},
         cpu=cpu_fraction,
         ram=ram_fraction,
         queue_depth=queue_depth,
@@ -226,6 +217,145 @@ def scheduler_resource_usage(
         total_ram_bytes=total,
         mem_available_bytes=available,
     )
+
+
+@dataclass
+class AdmissionRegistry:
+    """Cross-runtime durable child-slot registry with lease-based crash recovery."""
+
+    path: Path = DEFAULT_ADMISSION_REGISTRY
+
+    def _read(self) -> list[dict[str, object]]:
+        if not self.path.exists():
+            return []
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HerdrRuntimeError("admission_registry_invalid", "cannot read registry") from exc
+        if not isinstance(raw, dict) or raw.get("version") != 1 or not isinstance(raw.get("entries"), list):
+            raise HerdrRuntimeError("admission_registry_invalid", "invalid registry schema")
+        entries: list[dict[str, object]] = []
+        for item in raw["entries"]:
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("agent_id"), str)
+                or not isinstance(item.get("repo"), str)
+                or not isinstance(item.get("issue"), str)
+                or not isinstance(item.get("task_id"), str)
+                or not isinstance(item.get("fencing_token"), int)
+                or not isinstance(item.get("lease_until"), (int, float))
+            ):
+                raise HerdrRuntimeError("admission_registry_invalid", "invalid registry entry")
+            entries.append(dict(item))
+        return entries
+
+    def _write(self, entries: Sequence[Mapping[str, object]]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(
+            json.dumps(
+                {"version": 1, "entries": list(entries)},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        tmp.chmod(0o640)
+        tmp.replace(self.path)
+        self.path.chmod(0o640)
+
+    def _lock_fd(self) -> int:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock = self.path.with_suffix(self.path.suffix + ".lock")
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o640)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+
+    def reserve(
+        self,
+        admission: AdmissionControl,
+        identity: AgentIdentity,
+        spec: TaskGraphSpec,
+        usage: ResourceUsage,
+        child_tools: Sequence[str],
+        lease: _Lease,
+        *,
+        now: float | None = None,
+    ) -> None:
+        moment = time.time() if now is None else now
+        fd = self._lock_fd()
+        try:
+            entries = [
+                entry
+                for entry in self._read()
+                if float(entry["lease_until"]) > moment
+                and entry["agent_id"] != lease.agent_id
+            ]
+            registry_repo: dict[str, int] = {}
+            registry_issue: dict[tuple[str, str], int] = {}
+            for entry in entries:
+                repo = str(entry["repo"])
+                issue = str(entry["issue"])
+                registry_repo[repo] = registry_repo.get(repo, 0) + 1
+                key = (repo, issue)
+                registry_issue[key] = registry_issue.get(key, 0) + 1
+
+            combined = ResourceUsage(
+                active_agents=max(usage.active_agents, len(entries)),
+                agents_per_repo={
+                    **usage.agents_per_repo,
+                    identity.repo: max(
+                        usage.agents_per_repo.get(identity.repo, 0),
+                        registry_repo.get(identity.repo, 0),
+                    ),
+                },
+                agents_per_issue={
+                    **usage.agents_per_issue,
+                    (identity.repo, identity.issue): max(
+                        usage.agents_per_issue.get((identity.repo, identity.issue), 0),
+                        registry_issue.get((identity.repo, identity.issue), 0),
+                    ),
+                },
+                cpu=usage.cpu,
+                ram=usage.ram,
+                queue_depth=usage.queue_depth,
+                elapsed_seconds=usage.elapsed_seconds,
+                swap_risk=usage.swap_risk,
+                load1=usage.load1,
+                logical_cpus=usage.logical_cpus,
+                total_ram_bytes=usage.total_ram_bytes,
+                mem_available_bytes=usage.mem_available_bytes,
+            )
+            decision = admission.check(identity, spec, combined, child_tools)
+            if isinstance(decision, AdmissionDenyDecision):
+                raise HerdrRuntimeError("child_admission_denied", decision.reason.value)
+            entries.append(
+                {
+                    "agent_id": lease.agent_id,
+                    "repo": identity.repo,
+                    "issue": identity.issue,
+                    "task_id": lease.task_id,
+                    "fencing_token": lease.fencing_token,
+                    "lease_until": lease.lease_until,
+                }
+            )
+            self._write(entries)
+        finally:
+            os.close(fd)
+
+    def release(self, agent_id: str, *, now: float | None = None) -> None:
+        moment = time.time() if now is None else now
+        fd = self._lock_fd()
+        try:
+            entries = [
+                entry
+                for entry in self._read()
+                if float(entry["lease_until"]) > moment and entry["agent_id"] != agent_id
+            ]
+            self._write(entries)
+        finally:
+            os.close(fd)
 
 
 @dataclass
@@ -246,6 +376,7 @@ class HerdrChildRuntime:
         env: Mapping[str, str] | None = None,
         host_guard: Callable[[], bool] = host_resources_allow_spawn,
         admission: AdmissionControl | None = None,
+        admission_registry: AdmissionRegistry | None = None,
         resource_usage_factory: Callable[
             [DynamicChildScheduler, float, str], ResourceUsage
         ] = scheduler_resource_usage,
@@ -259,9 +390,12 @@ class HerdrChildRuntime:
         self.admission = admission or AdmissionControl(
             audit_log=AdmissionAuditLog(DEFAULT_ADMISSION_AUDIT)
         )
+        self.admission_registry = admission_registry or AdmissionRegistry()
         self.resource_usage_factory = resource_usage_factory
         self._started_at = time.monotonic()
         self._owned_panes: set[str] = set()
+        self._reserved_agents: set[str] = set()
+        self._reservation_panes: dict[str, str | None] = {}
         self._skill_checked = False
 
     def _require_context(self) -> None:
@@ -307,29 +441,32 @@ class HerdrChildRuntime:
             self._started_at,
             lease.task_id,
         )
-        decision = self.admission.check(
-            AgentIdentity(
-                role=node.role,
-                repo=context["repo"],
-                issue=context["issue"],
-                parent_role=parent.role,
-                parent_tools=frozenset(parent.tools),
-                paper_only=context["policy_profile"] == "quantlab-paper",
-            ),
-            TaskGraphSpec(
-                node_count=node_count,
-                max_depth=max_depth,
-                max_fanout=max_fanout,
-                root_task=parent_id,
-            ),
+        identity = AgentIdentity(
+            role=node.role,
+            repo=context["repo"],
+            issue=context["issue"],
+            parent_role=parent.role,
+            parent_tools=frozenset(parent.tools),
+            paper_only=context["policy_profile"] == "quantlab-paper",
+        )
+        spec = TaskGraphSpec(
+            node_count=node_count,
+            max_depth=max_depth,
+            max_fanout=max_fanout,
+            root_task=parent_id,
+        )
+        self.admission_registry.reserve(
+            self.admission,
+            identity,
+            spec,
+
             usage,
             node.tools,
+            lease,
+            now=self.scheduler.current_time(),
         )
-        if isinstance(decision, AdmissionDenyDecision):
-            raise HerdrRuntimeError(
-                "child_admission_denied",
-                decision.reason.value,
-            )
+        self._reserved_agents.add(lease.agent_id)
+        self._reservation_panes[lease.agent_id] = None
 
     def _create_pane(self, index: int) -> str:
         self._assert_prepared()
@@ -421,13 +558,33 @@ class HerdrChildRuntime:
 
     def cleanup(self) -> None:
         failures: list[str] = []
+        closed: set[str] = set()
         for pane_id in sorted(self._owned_panes, reverse=True):
             result = self.runner.run(["pane", "close", pane_id], timeout_seconds=15.0)
             if result.returncode != 0:
                 failures.append(pane_id)
+            else:
+                closed.add(pane_id)
         self._owned_panes.clear()
-        if failures:
-            raise HerdrRuntimeError("child_cleanup_failed", ",".join(sorted(failures)))
+
+        release_failures: list[str] = []
+        for agent_id in sorted(self._reserved_agents):
+            pane_id = self._reservation_panes.get(agent_id)
+            if pane_id is not None and pane_id not in closed:
+                continue
+            try:
+                self.admission_registry.release(
+                    agent_id,
+                    now=self.scheduler.current_time(),
+                )
+            except HerdrRuntimeError:
+                release_failures.append(agent_id)
+        self._reserved_agents.clear()
+        self._reservation_panes.clear()
+
+        if failures or release_failures:
+            detail = ",".join(sorted(failures + release_failures))
+            raise HerdrRuntimeError("child_cleanup_failed", detail)
 
     def run_parallel(self, leases: Sequence[_Lease], prompts: Mapping[str, str]) -> dict[str, bool]:
         self.prepare()
@@ -443,6 +600,7 @@ class HerdrChildRuntime:
                     raise HerdrRuntimeError("missing_prompt", lease.task_id)
                 self._admit_child(lease)
                 pane_id = self._create_pane(index)
+                self._reservation_panes[lease.agent_id] = pane_id
                 self._start_agent(lease, pane_id)
                 children.append(_OwnedChild(lease, pane_id, prompts[lease.task_id]))
 

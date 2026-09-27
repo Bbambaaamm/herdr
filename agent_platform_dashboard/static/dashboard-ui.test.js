@@ -42,6 +42,15 @@ function fixture() {
       agent: 'quantlab-hermes', kind: 'scheduled_acceptance', blocker: null, pr_number: 240 }],
   });
   sources.push({
+    profile: 'quantlab', kind: 'admission', status: 'available', reason: 'ok', observed_at: now, data_at: now,
+    rows: [
+      { event: 'allow', reason: null, role: 'reader', repo: 'Bbambaaamm/herdr', issue: '3',
+        node_count: 3, max_depth: 2, max_fanout: 2, child_tools_count: 0, agents_after: 2, observed_at: now - 2 },
+      { event: 'deny', reason: 'global_agent_limit', role: 'reader', repo: 'Bbambaaamm/herdr', issue: '3',
+        node_count: 3, max_depth: 2, max_fanout: 2, child_tools_count: 0, agents_after: null, observed_at: now - 1 },
+    ],
+  });
+  sources.push({
     profile: 'majak', kind: 'codex', status: 'available', reason: 'ok', observed_at: now, data_at: now,
     rows: [{
       used_percent: 82, window_minutes: 10080, resets_at: now + 3600, ordinary_usage_allowed: true,
@@ -641,4 +650,24 @@ test('stale telemetry source is technical data health, not a user-intervention b
   assert.doesNotMatch(h.get('#attention-summary').textContent, /stale/i);
   assert.match(h.get('#source-grid').innerHTML, /CODEX \/ ÚČET/);
   assert.match(h.get('#source-grid').innerHTML, /unavailable · stale/);
+});
+
+
+test('admission observability shows sanitized ALLOW/DENY reasons', async t => {
+  const h = await harness(t);
+  const html = h.get('#observability-grid').innerHTML;
+  assert.match(html, /Swarm admission/);
+  assert.match(html, /ALLOW: 1/);
+  assert.match(html, /DENY: 1/);
+  assert.match(html, /global_agent_limit/);
+  assert.match(html, /Bbambaaamm\/herdr #3/);
+  assert.doesNotMatch(html, /PRIVATE TOOL ARGUMENT|SECRET_TOOL_PAYLOAD|admit:denied_tool/);
+});
+
+test('admission browser contract rejects malformed deny rows', async t => {
+  const h = await harness(t);
+  const admission = h.snapshot().sources.find(item => item.kind === 'admission');
+  admission.rows[1].reason = null;
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().freshSnapshot, false);
 });
