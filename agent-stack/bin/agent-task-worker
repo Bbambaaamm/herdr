@@ -127,6 +127,65 @@ def _task_hermes_profile(task: dict) -> str:
     return "majak" if profile == "dotacni-majak" else "quantlab"
 
 
+TASK_PANE_ENV = "HERDR_DURABLE_TASK_PANE"
+
+
+def _pane_has_marker(pane_id: str, marker: str) -> bool:
+    info = _herdr_json(
+        ["pane", "process-info", "--pane", pane_id], timeout_seconds=10.0
+    )
+    process_info = (info.get("result") or {}).get("process_info")
+    if not isinstance(process_info, dict):
+        return False
+    try:
+        shell_pid = int(process_info.get("shell_pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    if shell_pid <= 0:
+        return False
+    try:
+        environ = Path(f"/proc/{shell_pid}/environ").read_bytes().split(b"\0")
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return False
+    expected = f"{TASK_PANE_ENV}={marker}".encode("utf-8")
+    return expected in environ
+
+
+def _find_marked_task_panes(marker: str, workspace_id: str) -> tuple[str, ...]:
+    for attempt in range(3):
+        listed = _herdr_json(["pane", "list"], timeout_seconds=10.0)
+        panes = (listed.get("result") or {}).get("panes")
+        if not isinstance(panes, list):
+            raise RuntimeError("task_session_pane_list_invalid")
+        found = []
+        for pane in panes:
+            if not isinstance(pane, dict):
+                continue
+            pane_id = str(pane.get("pane_id") or "")
+            if (
+                pane_id
+                and str(pane.get("workspace_id") or "") == workspace_id
+                and _pane_has_marker(pane_id, marker)
+            ):
+                found.append(pane_id)
+        if found:
+            return tuple(sorted(set(found)))
+        if attempt < 2:
+            time.sleep(0.2)
+    return ()
+
+
+def _close_owned_pane(pane_id: str) -> bool:
+    proc = subprocess.run(
+        [str(HERDR), "pane", "close", pane_id],
+        text=True,
+        capture_output=True,
+        timeout=15,
+        env=ENV,
+    )
+    return proc.returncode == 0
+
+
 def create_task_session(task: dict) -> dict:
     """Create one fresh Hermes pane/session for exactly one durable attempt."""
     routing = task.get("routing") if isinstance(task.get("routing"), dict) else {}
@@ -145,13 +204,19 @@ def create_task_session(task: dict) -> dict:
         raise RuntimeError("task_session_coordinator_pane_missing")
 
     workspace = str(task.get("workspace") or "/home/agentops/workspaces/quantlab")
+    workspace_id = str(agent_info.get("workspace_id") or "")
+    if not workspace_id:
+        raise RuntimeError("task_session_coordinator_workspace_missing")
     agent_name, session_name = _task_session_identity(task)
+    pane_marker = session_name
+    profile = _task_hermes_profile(task)
     pane_id = ""
     try:
         split = _herdr_json(
             [
                 "pane", "split", "--pane", coordinator_pane,
-                "--direction", "right", "--cwd", workspace, "--no-focus",
+                "--direction", "right", "--cwd", workspace,
+                "--env", f"{TASK_PANE_ENV}={pane_marker}", "--no-focus",
             ],
             timeout_seconds=15.0,
         )
@@ -159,7 +224,18 @@ def create_task_session(task: dict) -> dict:
         if not isinstance(pane, dict) or not pane.get("pane_id"):
             raise RuntimeError("task_session_pane_split_invalid")
         pane_id = str(pane["pane_id"])
-        profile = _task_hermes_profile(task)
+        session = {
+            "agent_name": agent_name,
+            "session_name": session_name,
+            "pane_id": pane_id,
+            "pane_marker": pane_marker,
+            "coordinator_agent": coordinator,
+            "coordinator_pane_id": coordinator_pane,
+            "profile": profile,
+            "owned_pane": True,
+            "created_at": utcnow().isoformat(),
+        }
+        task["execution_session"] = session
         _herdr_json(
             [
                 "agent", "start", agent_name,
@@ -170,70 +246,89 @@ def create_task_session(task: dict) -> dict:
             ],
             timeout_seconds=75.0,
         )
-    except Exception:
+        return session
+    except Exception as exc:
         if pane_id:
-            subprocess.run(
-                [str(HERDR), "pane", "close", pane_id],
-                text=True,
-                capture_output=True,
-                timeout=15,
-                env=ENV,
-            )
+            candidates = (pane_id,)
+        else:
+            try:
+                candidates = _find_marked_task_panes(pane_marker, workspace_id)
+            except Exception as reconcile_exc:
+                raise RuntimeError(
+                    f"task_session_split_uncertain:{reconcile_exc}"
+                ) from exc
+            if not candidates:
+                raise RuntimeError(
+                    "task_session_split_uncertain:no_marked_pane_found"
+                ) from exc
+        cleanup_failed = False
+        for candidate in candidates:
+            if not _close_owned_pane(candidate):
+                cleanup_failed = True
+        if isinstance(task.get("execution_session"), dict):
+            session = task["execution_session"]
+            if cleanup_failed:
+                session["cleanup_status"] = "close_failed"
+                session["cleanup_error"] = str(exc)[-1000:]
+            elif candidates:
+                session["closed_at"] = utcnow().isoformat()
+                session["cleanup_status"] = "closed"
+        if cleanup_failed:
+            raise RuntimeError("task_session_cleanup_failed") from exc
         raise
 
-    session = {
-        "agent_name": agent_name,
-        "session_name": session_name,
-        "pane_id": pane_id,
-        "coordinator_agent": coordinator,
-        "coordinator_pane_id": coordinator_pane,
-        "profile": _task_hermes_profile(task),
-        "owned_pane": True,
-        "created_at": utcnow().isoformat(),
-    }
-    task["execution_session"] = session
-    return session
 
-
-def cleanup_task_session(task: dict) -> None:
+def cleanup_task_session(task: dict) -> bool:
     session = task.get("execution_session")
     if not isinstance(session, dict) or not session.get("owned_pane"):
-        return
+        return True
     if session.get("closed_at"):
-        return
+        return True
     pane_id = str(session.get("pane_id") or "")
     if not pane_id:
-        return
-    proc = subprocess.run(
-        [str(HERDR), "pane", "close", pane_id],
-        text=True,
-        capture_output=True,
-        timeout=15,
-        env=ENV,
-    )
-    if proc.returncode == 0:
+        session["cleanup_status"] = "close_unproven"
+        return False
+    if _close_owned_pane(pane_id):
         session["closed_at"] = utcnow().isoformat()
         session["cleanup_status"] = "closed"
-    else:
-        session["cleanup_status"] = "close_failed"
-        session["cleanup_error"] = (proc.stderr or proc.stdout or "pane close failed")[-1000:]
-        log(str(task.get("id") or "unknown"), f"task session cleanup failed pane={pane_id}")
+        return True
+    session["cleanup_status"] = "close_failed"
+    session["cleanup_error"] = "pane close failed"
+    log(str(task.get("id") or "unknown"), f"task session cleanup failed pane={pane_id}")
+    return False
 
 
-def persist_current_task(task: dict) -> None:
+def current_task_path(task: dict) -> Path | None:
     name = f"{task['id']}.json"
     for directory in (RUNNING, PENDING, DONE, BLOCKED, FAILED):
         path = directory / name
         if path.exists():
-            write_json(path, task)
-            return
+            return path
+    return None
 
 
-def cleanup_task_session_if_safe(task: dict) -> None:
+def persist_current_task(task: dict) -> None:
+    path = current_task_path(task)
+    if path is not None:
+        write_json(path, task)
+
+
+def cleanup_task_session_if_safe(task: dict) -> bool:
     """Keep a task-owned pane alive while prompt delivery is still ambiguous."""
     if task.get("attempt_state") == "delivery_uncertain":
-        return
-    cleanup_task_session(task)
+        return True
+    cleaned = cleanup_task_session(task)
+    if not cleaned:
+        path = current_task_path(task)
+        if path is not None:
+            task["watchdog_blocker"] = "task_session_cleanup_failed"
+            block_task(
+                path,
+                task,
+                "task_session_cleanup_failed",
+                "Old isolated task pane could not be proven closed; further execution is blocked to prevent duplicate work or resource leakage.",
+            )
+    return cleaned
 
 
 def prompt_text(task: dict) -> str:
@@ -448,11 +543,11 @@ def retry(task_path: Path, task: dict, reason: str) -> None:
     task["attempts"] = attempts
     task["last_error"] = reason[-2000:]
     task["attempt_state"] = "retry_scheduled"
-    task.pop("run_token", None)
-    task.pop("attempt_id", None)
-    task.pop("idempotency_key", None)
+    # Keep the prior attempt identity until cleanup succeeds. prepare_attempt()
+    # rotates it only when the next semantic attempt is actually allowed to start.
     max_attempts = int(task.get("max_attempts") or 4)
     if attempts >= max_attempts:
+        task["attempt_state"] = "failed"
         task["failed_at"] = utcnow().isoformat()
         write_json(task_path, task)
         move(task_path, FAILED)
@@ -608,7 +703,16 @@ def main(task_path: Path) -> int:
                     f"session={session['session_name']}",
                 )
             except Exception as exc:
-                retry(task_path, task, f"task_session_isolation_unavailable: {exc}")
+                detail = str(exc)
+                if detail.startswith(("task_session_cleanup_failed", "task_session_split_uncertain")):
+                    block_task(
+                        task_path,
+                        task,
+                        "task_session_isolation_uncertain",
+                        f"Task pane ownership/cleanup could not be proven safe: {detail}",
+                    )
+                    return 1
+                retry(task_path, task, f"task_session_isolation_unavailable: {detail}")
                 return 1
 
             try:

@@ -17,12 +17,13 @@ loader.exec_module(worker)
 def configure_paths(tmp_path):
     worker.ROOT = tmp_path
     worker.PENDING = tmp_path / "pending"
+    worker.RUNNING = tmp_path / "running"
     worker.DONE = tmp_path / "done"
     worker.BLOCKED = tmp_path / "blocked"
     worker.FAILED = tmp_path / "failed"
     worker.RESULTS = tmp_path / "results"
     worker.LOGS = tmp_path / "logs"
-    for path in (worker.PENDING, worker.DONE, worker.BLOCKED, worker.FAILED, worker.RESULTS, worker.LOGS):
+    for path in (worker.PENDING, worker.RUNNING, worker.DONE, worker.BLOCKED, worker.FAILED, worker.RESULTS, worker.LOGS):
         path.mkdir(parents=True, exist_ok=True)
 
 
@@ -55,7 +56,7 @@ def test_prepare_attempt_reuses_identity_during_reconciliation(tmp_path):
 def test_delivery_uncertain_does_not_increment_execution_attempt(tmp_path):
     configure_paths(tmp_path)
     running = tmp_path / "running"
-    running.mkdir()
+    running.mkdir(exist_ok=True)
     task_path = running / "task-1.json"
     task = base_task()
     worker.prepare_attempt(task)
@@ -138,7 +139,7 @@ def test_trusted_swarm_evidence_synthesizes_result(tmp_path):
 def test_finish_uses_trusted_evidence_without_redispatch(tmp_path):
     configure_paths(tmp_path)
     running = tmp_path / "running"
-    running.mkdir()
+    running.mkdir(exist_ok=True)
     snapshot = tmp_path / "swarm.json"
     write_valid_swarm(snapshot)
     task = evidence_task(snapshot)
@@ -158,7 +159,7 @@ def test_finish_uses_trusted_evidence_without_redispatch(tmp_path):
 def test_finish_without_result_defers_same_attempt(tmp_path):
     configure_paths(tmp_path)
     running = tmp_path / "running"
-    running.mkdir()
+    running.mkdir(exist_ok=True)
     task = base_task()
     worker.prepare_attempt(task)
     token = task["run_token"]
@@ -209,6 +210,7 @@ def test_create_task_session_uses_fresh_owned_pane_and_named_chat(tmp_path, monk
                         "agent": "hermes",
                         "name": "quantlab-hermes",
                         "pane_id": "persistent-pane",
+                        "workspace_id": "w2",
                     }
                 }
             }
@@ -227,6 +229,8 @@ def test_create_task_session_uses_fresh_owned_pane_and_named_chat(tmp_path, monk
     assert session["agent_name"] != "quantlab-hermes"
     split = next(call for call in calls if call[:2] == ["pane", "split"])
     assert ["--pane", "persistent-pane"] == split[2:4]
+    assert "--env" in split
+    assert split[split.index("--env") + 1] == f"{worker.TASK_PANE_ENV}={session['session_name']}"
     start = next(call for call in calls if call[:2] == ["agent", "start"])
     assert start[2] == session["agent_name"]
     assert "--continue" in start
@@ -333,7 +337,7 @@ def test_new_semantic_attempt_discards_previous_session_metadata(tmp_path):
 def test_persist_current_task_updates_running_task(tmp_path):
     configure_paths(tmp_path)
     worker.RUNNING = tmp_path / "running"
-    worker.RUNNING.mkdir()
+    worker.RUNNING.mkdir(exist_ok=True)
     task = base_task()
     task["attempt_state"] = "accepted"
     task_path = worker.RUNNING / "task-1.json"
@@ -364,7 +368,7 @@ def test_cleanup_preserves_delivery_uncertain_session(tmp_path, monkeypatch):
 def test_block_task_makes_session_cleanup_safe(tmp_path):
     configure_paths(tmp_path)
     running = tmp_path / "running"
-    running.mkdir()
+    running.mkdir(exist_ok=True)
     task = base_task()
     worker.prepare_attempt(task)
     task["attempt_state"] = "delivery_uncertain"
@@ -377,3 +381,179 @@ def test_block_task_makes_session_cleanup_safe(tmp_path):
     saved = json.loads(blocked.read_text(encoding="utf-8"))
     assert saved["attempt_state"] == "blocked"
     assert saved["result_status"] == "blocked"
+
+
+def test_ambiguous_split_reconciles_and_closes_marked_pane(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["workspace"] = str(tmp_path / "workspace")
+    task["routing"] = {"selected_agent": "quantlab-hermes"}
+    task["run_token"] = "isolated-run"
+    closed = []
+
+    def fake_herdr_json(args, *, timeout_seconds=30.0):
+        if args[:2] == ["agent", "get"]:
+            return {
+                "result": {
+                    "agent": {
+                        "agent": "hermes",
+                        "name": "quantlab-hermes",
+                        "pane_id": "persistent-pane",
+                        "workspace_id": "w2",
+                    }
+                }
+            }
+        if args[:2] == ["pane", "split"]:
+            raise RuntimeError("lost split response")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(worker, "_herdr_json", fake_herdr_json)
+    monkeypatch.setattr(
+        worker, "_find_marked_task_panes", lambda marker, workspace_id: ("orphan-pane",)
+    )
+    monkeypatch.setattr(worker, "_close_owned_pane", lambda pane_id: closed.append(pane_id) or True)
+
+    try:
+        worker.create_task_session(task)
+    except RuntimeError as exc:
+        assert str(exc) == "lost split response"
+    else:
+        raise AssertionError("split failure must propagate after cleanup")
+
+    assert closed == ["orphan-pane"]
+
+
+def test_unreconciled_split_fails_closed(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["routing"] = {"selected_agent": "quantlab-hermes"}
+    task["run_token"] = "isolated-run"
+
+    def fake_herdr_json(args, *, timeout_seconds=30.0):
+        if args[:2] == ["agent", "get"]:
+            return {
+                "result": {
+                    "agent": {
+                        "agent": "hermes",
+                        "pane_id": "persistent-pane",
+                        "workspace_id": "w2",
+                    }
+                }
+            }
+        if args[:2] == ["pane", "split"]:
+            raise RuntimeError("split response unknown")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(worker, "_herdr_json", fake_herdr_json)
+    monkeypatch.setattr(
+        worker,
+        "_find_marked_task_panes",
+        lambda marker, workspace_id: (_ for _ in ()).throw(RuntimeError("pane list unavailable")),
+    )
+
+    try:
+        worker.create_task_session(task)
+    except RuntimeError as exc:
+        assert str(exc).startswith("task_session_split_uncertain:")
+    else:
+        raise AssertionError("unreconciled split must fail closed")
+
+
+def test_cleanup_failure_blocks_retry_and_preserves_attempt_identity(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    task = base_task()
+    worker.prepare_attempt(task)
+    token = task["run_token"]
+    key = task["idempotency_key"]
+    task["attempt_state"] = "retry_scheduled"
+    task["execution_session"] = {
+        "agent_name": "quantlab-hermes-task-deadbeef",
+        "session_name": "durable-deadbeef",
+        "pane_id": "owned-task-pane",
+        "owned_pane": True,
+    }
+    task_path = worker.PENDING / "task-1.json"
+    task_path.write_text(json.dumps(task), encoding="utf-8")
+    monkeypatch.setattr(worker, "_close_owned_pane", lambda pane_id: False)
+
+    assert worker.cleanup_task_session_if_safe(task) is False
+
+    blocked_path = worker.BLOCKED / task_path.name
+    blocked = json.loads(blocked_path.read_text(encoding="utf-8"))
+    assert blocked["attempt_state"] == "blocked"
+    assert blocked["run_token"] == token
+    assert blocked["idempotency_key"] == key
+    result = json.loads(worker.result_path("task-1").read_text(encoding="utf-8"))
+    assert result["blocker"] == "task_session_cleanup_failed"
+    assert result["run_token"] == token
+
+
+def test_cleanup_without_owned_pane_id_fails_closed(tmp_path):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["execution_session"] = {
+        "agent_name": "task-agent",
+        "session_name": "durable-missing-pane",
+        "owned_pane": True,
+    }
+
+    assert worker.cleanup_task_session(task) is False
+    assert task["execution_session"]["cleanup_status"] == "close_unproven"
+
+
+def test_cleanup_failure_blocks_even_completed_task(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["attempt_state"] = "done"
+    task["execution_session"] = {
+        "agent_name": "task-agent",
+        "session_name": "durable-live",
+        "pane_id": "owned-pane",
+        "owned_pane": True,
+    }
+    done_path = worker.DONE / "task-1.json"
+    done_path.write_text(json.dumps(task), encoding="utf-8")
+    monkeypatch.setattr(worker, "_close_owned_pane", lambda pane_id: False)
+
+    assert worker.cleanup_task_session_if_safe(task) is False
+
+    blocked_path = worker.BLOCKED / "task-1.json"
+    assert blocked_path.exists()
+    saved = json.loads(blocked_path.read_text(encoding="utf-8"))
+    assert saved["attempt_state"] == "blocked"
+    assert saved["watchdog_blocker"] == "task_session_cleanup_failed"
+    assert not done_path.exists()
+
+
+def test_ambiguous_split_without_marker_never_retries(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["workspace"] = str(tmp_path / "workspace")
+    task["routing"] = {"selected_agent": "quantlab-hermes"}
+    task["run_token"] = "ambiguous-run"
+
+    def fake_herdr_json(args, *, timeout_seconds=30.0):
+        if args[:2] == ["agent", "get"]:
+            return {
+                "result": {
+                    "agent": {
+                        "agent": "hermes",
+                        "name": "quantlab-hermes",
+                        "pane_id": "persistent-pane",
+                        "workspace_id": "w2",
+                    }
+                }
+            }
+        if args[:2] == ["pane", "split"]:
+            raise RuntimeError("transport_lost")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(worker, "_herdr_json", fake_herdr_json)
+    monkeypatch.setattr(worker, "_find_marked_task_panes", lambda marker, workspace_id: ())
+
+    try:
+        worker.create_task_session(task)
+    except RuntimeError as exc:
+        assert str(exc) == "task_session_split_uncertain:no_marked_pane_found"
+    else:
+        raise AssertionError("ambiguous pane creation must fail closed")
