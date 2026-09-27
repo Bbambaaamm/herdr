@@ -293,12 +293,26 @@ def _swarm_stamp(value):
 def swarm(path, profile):
     c.need(profile == 'quantlab' and path == SWARM_PATH)
     raw = c.parse(read(path, c.MAX_BYTES), c.MAX_BYTES)
-    required = {'tasks', 'edges', 'repo', 'issue', 'observed_at', 'version'}
-    allowed = required | {'agents', 'policy_profiles', 'paper_only', 'graph_latency',
-                          'clock_snapshot', 'ts'}
-    c.need(type(raw) is dict and required <= set(raw) <= allowed)
+    required = {'tasks', 'edges', 'agents', 'repo', 'issue', 'observed_at', 'version', 'paper_only'}
+    canonical = required | {'policy_profiles', 'graph_latency', 'clock_snapshot', 'ts'}
+    c.need(type(raw) is dict and set(raw) in (required, canonical))
+    c.need((raw['version'] == 1 and set(raw) == required)
+           or (raw['version'] == 'v1.2.0' and set(raw) == canonical))
+    c.need(type(raw['paper_only']) is bool)
+    c.need(type(raw['repo']) is str and c.identifier(raw['repo'], 160))
+    c.need(type(raw['issue']) is str and c.identifier(raw['issue'], 64))
+    if raw['repo'] == 'Bbambaaamm/Autonomous-Quant-Lab':
+        c.need(raw['paper_only'] is True)
     c.need(type(raw['tasks']) is list and len(raw['tasks']) <= 100)
     c.need(type(raw['edges']) is list and len(raw['edges']) <= 200)
+    c.need(type(raw['agents']) is list and len(raw['agents']) <= 100)
+    safe_agent_fields = {
+        'agent_id', 'event_ref', 'fallback_model', 'fencing_token', 'holder',
+        'issue', 'lease_until', 'model', 'parent_agent_id', 'parent_task_id',
+        'repo', 'role', 'state', 'task_id',
+    }
+    for agent in raw['agents']:
+        c.need(type(agent) is dict and set(agent) <= safe_agent_fields)
     allowed_task = {
         'task_id', 'state', 'role', 'tools', 'permissions', 'timeout_seconds',
         'max_attempts', 'dependencies', 'parent_task_id', 'parent_agent_id',
@@ -369,15 +383,16 @@ def swarm(path, profile):
         for profile_value in raw_profiles:
             c.need(c.identifier(profile_value, 64))
             profiles.add(profile_value)
-    elif raw.get('paper_only') is True:
+    if raw['paper_only'] is True:
         profiles.add('quantlab-paper')
 
-    repo = str(raw['repo'])
-    issue = str(raw['issue'])
+    repo = raw['repo']
+    issue = raw['issue']
     snapshot = {
         'version': 1,
         'repo': repo,
         'issue': issue,
+        'paper_only': raw['paper_only'],
         'policy_profiles': sorted(profiles),
         'tasks': sorted(tasks, key=lambda item: item['task_id']),
         'edges': [

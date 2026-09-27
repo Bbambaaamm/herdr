@@ -466,6 +466,19 @@ def test_swarm_raw_edge_mismatch_and_sensitive_task_field_fail_closed(tmp_path, 
     with pytest.raises(ValueError):
         sources.swarm(str(path), 'quantlab')
 
+    payload = swarm_payload()
+    payload['repo'] = 'Bbambaaamm/Autonomous-Quant-Lab'
+    payload['paper_only'] = False
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError):
+        sources.swarm(str(path), 'quantlab')
+
+    payload = swarm_payload()
+    del payload['paper_only']
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError):
+        sources.swarm(str(path), 'quantlab')
+
 
 def test_swarm_collect_and_staleness_are_fail_closed(tmp_path, monkeypatch):
     path = tmp_path / 'swarm.json'

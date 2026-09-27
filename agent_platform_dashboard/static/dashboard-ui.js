@@ -895,6 +895,35 @@ export function mountDashboard(createScene) {
           || (row.event === 'allow' && (row.reason != null || row.agents_after == null))
         )) throw new Error('invalid');
       }
+      if (item.kind === 'swarm') {
+        if (item.profile !== 'quantlab' || (item.status === 'available' && item.rows.length !== 1)) throw new Error('invalid');
+        for (const row of item.rows) {
+          if (row.version !== 1 || typeof row.repo !== 'string' || typeof row.issue !== 'string'
+            || typeof row.paper_only !== 'boolean' || !Array.isArray(row.policy_profiles)
+            || !Array.isArray(row.tasks) || !Array.isArray(row.edges)
+            || (row.repo === 'Bbambaaamm/Autonomous-Quant-Lab' && row.paper_only !== true)) throw new Error('invalid');
+          const taskIds = new Set();
+          for (const task of row.tasks) {
+            if (!task || typeof task.task_id !== 'string' || taskIds.has(task.task_id)
+              || !Object.hasOwn(SWARM_STATUS, task.state) || typeof task.role !== 'string'
+              || !Number.isSafeInteger(task.attempt) || task.attempt < 0
+              || !Number.isSafeInteger(task.max_attempts) || task.max_attempts < task.attempt
+              || !Number.isSafeInteger(task.fencing_token) || task.fencing_token < 0
+              || !Array.isArray(task.dependencies)
+              || task.dependencies.some(dep => typeof dep !== 'string')
+              || (task.parent_task_id != null && typeof task.parent_task_id !== 'string')
+              || (task.parent_agent_id != null && typeof task.parent_agent_id !== 'string')
+              || (task.agent_id != null && typeof task.agent_id !== 'string')
+              || (task.result_sha != null && (typeof task.result_sha !== 'string' || !/^[0-9a-f]{64}$/.test(task.result_sha)))) throw new Error('invalid');
+            taskIds.add(task.task_id);
+          }
+          for (const edge of row.edges) {
+            if (!edge || !['parent', 'dependency'].includes(edge.kind)
+              || typeof edge.from_task !== 'string' || typeof edge.to_task !== 'string'
+              || !taskIds.has(edge.from_task) || !taskIds.has(edge.to_task)) throw new Error('invalid');
+          }
+        }
+      }
       if (item.kind === 'release') {
         if (item.profile !== 'quantlab' || (item.status === 'available' && item.rows.length !== 1)) throw new Error('invalid');
         if (item.rows.some(row => typeof row.tag !== 'string' || !/^v[A-Za-z0-9._-]{1,62}$/.test(row.tag)
