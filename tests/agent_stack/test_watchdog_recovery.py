@@ -605,3 +605,70 @@ def test_cleanup_blocker_retries_exact_result_without_timeout_delay(
     assert done["attempt_state"] == "done"
     assert done["result_status"] == "completed"
     assert "watchdog_cleanup_blocker" not in done
+
+
+
+def test_unsupported_exact_result_preserves_task_owned_pane(
+    tmp_path,
+    monkeypatch,
+):
+    configure_paths(tmp_path)
+
+    path = recovery.RUNNING / "task-1.json"
+
+    payload = {
+        "id": "task-1",
+        "run_token": "token-1",
+        "execution_session": {
+            "owned_pane": True,
+            "pane_id": "owned-pane",
+            "pane_marker": "durable-task-marker",
+            "coordinator_pane_id": "coordinator-pane",
+        },
+    }
+
+    write_task(path, payload)
+
+    result = {
+        "task_id": "task-1",
+        "run_token": "token-1",
+        "status": "working",
+        "blocker": None,
+    }
+
+    cleanup_calls = []
+
+    def must_not_cleanup(task):
+        cleanup_calls.append(task)
+        raise AssertionError(
+            "non-terminal result must never trigger pane cleanup"
+        )
+
+    monkeypatch.setattr(
+        recovery,
+        "cleanup_task_owned_pane",
+        must_not_cleanup,
+    )
+
+    recovery.terminalize_from_result(
+        path,
+        payload,
+        result,
+        0,
+    )
+
+    assert cleanup_calls == []
+    assert path.exists()
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+
+    assert saved["attempt_state"] == "delivery_uncertain"
+    assert (
+        saved["watchdog_blocker"]
+        == "orphaned_running_unknown_delivery"
+    )
+    assert "result_status" not in saved
+    assert "finished_at" not in saved
+
+    session = saved["execution_session"]
+    assert "closed_at" not in session

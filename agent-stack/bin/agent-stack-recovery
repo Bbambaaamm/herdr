@@ -300,6 +300,21 @@ def terminalize_from_result(
     status = str(result.get("status") or "")
     blocker = str(result.get("blocker") or "").strip()
 
+    # An exact task_id + run_token is necessary but not sufficient
+    # terminal evidence. Preserve the task-owned pane while the result
+    # status is incomplete/invalid so recovery can continue fail-closed.
+    if status not in {"completed", "blocked", "failed"}:
+        block_orphan(
+            path,
+            task,
+            reason=(
+                "matching durable result has unsupported "
+                f"status={status!r}"
+            ),
+            age_seconds=age_seconds,
+        )
+        return
+
     if not cleanup_task_owned_pane(task):
         task["watchdog_cleanup_blocker"] = (
             "task_session_cleanup_failed"
@@ -347,18 +362,6 @@ def terminalize_from_result(
         task["attempt_state"] = "failed"
         move_task(path, FAILED, task)
         destination = "failed"
-
-    else:
-        block_orphan(
-            path,
-            task,
-            reason=(
-                "matching durable result has unsupported "
-                f"status={status!r}"
-            ),
-            age_seconds=age_seconds,
-        )
-        return
 
     print(
         f"orphan_terminalized task={task.get('id')} "
@@ -441,7 +444,6 @@ def reconcile_watchdog_blocked_tasks() -> None:
         if result is None:
             continue
         terminalize_from_result(path, task, result, 0)
-        print(f"orphan_late_result_reconciled task={task.get('id')}")
 
 
 def run_herdr(args: list[str], timeout: float = 15.0) -> subprocess.CompletedProcess[str]:
