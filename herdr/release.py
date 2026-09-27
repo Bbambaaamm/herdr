@@ -310,7 +310,8 @@ def build_release(repo: Path, tag: str, commit: str, output: Path) -> dict[str, 
         # storing its digest line with the payload_manifest_sha256 field normalized.
         normalized = canonical_json(release)
         entries = []
-        for item in sorted(p for p in staging.rglob("*") if p.is_file()):
+        files = (path for path in staging.rglob("*") if path.is_file())
+        for item in sorted(files, key=lambda path: path.relative_to(staging).as_posix()):
             relative = item.relative_to(staging).as_posix()
             data = normalized if relative == "RELEASE.json" else item.read_bytes()
             entries.append(f"{sha256(data)}  {relative}\n")

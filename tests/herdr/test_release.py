@@ -75,6 +75,9 @@ def test_release_build_is_deterministic_and_tamper_evident(tmp_path, monkeypatch
             member.name for member in members[1:])
         modes = {member.name: member.mode for member in members}
         prefix = f"v1.2.3-rc.1-{commit[:12]}"
+        manifest = archive.extractfile(f"{prefix}/MANIFEST.sha256").read().decode().splitlines()
+        manifest_paths = [line.split("  ", 1)[1] for line in manifest]
+        assert manifest_paths == sorted(manifest_paths)
         assert modes[f"{prefix}/payload.txt"] == 0o555
         assert modes[f"{prefix}/configs/consumers/heating.yaml"] == 0o444
     damaged = tmp_path / "damaged.tar.gz"
