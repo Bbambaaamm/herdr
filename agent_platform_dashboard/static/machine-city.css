@@ -199,3 +199,12 @@ html[data-mode=demo] .coordinator-card{bottom:214px}
 @media(max-height:820px) and (min-width:1001px){
   .coordinator-card{bottom:72px}
 }
+
+.taskgraph-edge-strip{display:flex;gap:6px;overflow-x:auto;padding:0 0 8px;scrollbar-width:thin}
+.taskgraph-edge{display:inline-flex;align-items:center;gap:5px;flex:0 0 auto;padding:5px 8px;border:1px solid rgba(114,201,150,.22);border-radius:7px;background:rgba(10,18,18,.54);font:10px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace;color:#a8bbb4}
+.taskgraph-edge b{font-weight:600;color:#d6e4de;max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.taskgraph-edge i{font-style:normal;color:#73f2df}
+.taskgraph-edge small{color:#7d938a;text-transform:uppercase;letter-spacing:.05em}
+.taskgraph-edge[data-edge-kind="dependency"]{border-style:dashed;border-color:rgba(228,154,52,.28)}
+.taskgraph-edge[data-edge-kind="dependency"] i{color:#e49a34}
+.taskgraph-edge-overflow{color:#9b9387}

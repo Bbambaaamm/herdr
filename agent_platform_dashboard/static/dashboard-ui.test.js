@@ -685,3 +685,44 @@ test('admission browser contract rejects malformed deny rows', async t => {
   await h.refresh();
   assert.equal(h.ui.diagnostics().freshSnapshot, false);
 });
+
+
+test('authoritative swarm snapshot drives real DAG edges and child task lineage', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '7', policy_profiles: ['default'],
+      tasks: [
+        {
+          task_id: 'parent', parent_task_id: null, parent_agent_id: null,
+          agent_id: 'herdr-parent', state: 'running', role: 'planner',
+          model: 'model-a', fallback_model: 'model-b', attempt: 1, max_attempts: 2,
+          blocker: null, fencing_token: 1, dependencies: [], result_sha: null,
+        },
+        {
+          task_id: 'child', parent_task_id: 'parent', parent_agent_id: 'herdr-parent',
+          agent_id: 'herdr-child', state: 'review', role: 'reviewer',
+          model: 'model-a', fallback_model: 'model-b', attempt: 1, max_attempts: 2,
+          blocker: null, fencing_token: 2, dependencies: [], result_sha: 'a'.repeat(64),
+        },
+      ],
+      edges: [{ from_task: 'parent', to_task: 'child', kind: 'parent' }],
+    }],
+  });
+  await h.refresh();
+  assert.match(h.get('#taskgraph-status').textContent, /Autoritativní Herdr DAG · 1 hran/);
+  assert.doesNotMatch(h.get('#taskgraph-status').textContent, /Dependency telemetry/i);
+  const html = h.get('#taskgraph-nodes').innerHTML;
+  assert.match(html, /data-edge-kind="parent"/);
+  assert.match(html, /parent/);
+  assert.match(html, /child/);
+  const tasks = h.calls.tasks.at(-1);
+  assert.equal(tasks.length, 2);
+  const child = tasks.find(row => row.task_id === 'child');
+  assert.equal(child.parent_task_id, 'parent');
+  assert.equal(child.raw_state, 'review');
+  assert.equal(child.status, 'running');
+});

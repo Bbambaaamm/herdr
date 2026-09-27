@@ -15,7 +15,7 @@ def test_closed_snapshot_rejects_sensitive_fields():
 
 def test_unavailable_is_not_zero():
     value = decode(json.dumps(unavailable(100)).encode())
-    assert len(value['sources']) == 16
+    assert len(value['sources']) == 17
     assert all(s['status'] == 'unavailable' and s['rows'] == [] for s in value['sources'])
 
 import base64
@@ -363,6 +363,126 @@ def test_queue_collect_and_staleness_are_fail_closed(tmp_path, monkeypatch):
     queue_source = next(s for s in projected['sources'] if s['kind'] == 'queue')
     assert queue_source['status'] == 'unavailable' and queue_source['reason'] == 'stale'
     assert queue_source['rows'] == []
+
+
+
+def swarm_payload():
+    return {
+        'version': 'v1.2.0',
+        'repo': 'Bbambaaamm/herdr',
+        'issue': '7',
+        'observed_at': '100.5',
+        'paper_only': False,
+        'policy_profiles': ['default'],
+        'graph_latency': 0.1,
+        'clock_snapshot': 100.5,
+        'ts': '100.5',
+        'agents': [],
+        'tasks': [
+            {
+                'task_id': 'root',
+                'state': 'running',
+                'role': 'planner',
+                'tools': ['read_file'],
+                'permissions': ['repo:read'],
+                'timeout_seconds': 30,
+                'max_attempts': 3,
+                'dependencies': [],
+                'parent_task_id': None,
+                'parent_agent_id': None,
+                'agent_id': 'herdr-parent',
+                'fencing_token': 1,
+                'model': 'model-a',
+                'fallback_model': 'model-b',
+                'attempts': 1,
+                'blocker': None,
+                'policy_profile': 'default',
+                'paper_only': False,
+                'telemetry': [],
+                'ts': '100.0',
+            },
+            {
+                'task_id': 'child',
+                'state': 'done',
+                'role': 'reader',
+                'tools': ['read_file'],
+                'permissions': ['repo:read'],
+                'timeout_seconds': 30,
+                'max_attempts': 2,
+                'dependencies': [],
+                'parent_task_id': 'root',
+                'parent_agent_id': 'herdr-parent',
+                'agent_id': 'herdr-child',
+                'fencing_token': 2,
+                'model': 'model-a',
+                'fallback_model': 'model-b',
+                'attempts': 1,
+                'blocker': None,
+                'policy_profile': 'default',
+                'paper_only': False,
+                'telemetry': [],
+                'ts': '100.4',
+                'result_sha': 'a' * 64,
+            },
+        ],
+        'edges': [{'from': 'root', 'to': 'child', 'kind': 'parent'}],
+    }
+
+
+def test_swarm_projection_is_atomic_bounded_and_sanitized(tmp_path, monkeypatch):
+    path = tmp_path / 'swarm.json'
+    payload = swarm_payload()
+    path.write_text(json.dumps(payload))
+    monkeypatch.setattr(sources, 'SWARM_PATH', str(path))
+    rows, stamp = sources.swarm(str(path), 'quantlab')
+    assert stamp == 100 and len(rows) == 1
+    snapshot = rows[0]
+    assert snapshot['repo'] == 'Bbambaaamm/herdr'
+    assert snapshot['issue'] == '7'
+    assert snapshot['policy_profiles'] == ['default']
+    assert snapshot['edges'] == [
+        {'from_task': 'root', 'to_task': 'child', 'kind': 'parent'}
+    ]
+    assert [task['task_id'] for task in snapshot['tasks']] == ['child', 'root']
+    serialized = json.dumps(snapshot)
+    assert 'tools' not in serialized and 'permissions' not in serialized
+    assert 'prompt' not in serialized and 'telemetry' not in serialized
+    with pytest.raises(ValueError):
+        sources.swarm(str(path), 'majak')
+
+
+def test_swarm_raw_edge_mismatch_and_sensitive_task_field_fail_closed(tmp_path, monkeypatch):
+    path = tmp_path / 'swarm.json'
+    monkeypatch.setattr(sources, 'SWARM_PATH', str(path))
+    payload = swarm_payload()
+    payload['edges'] = []
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError):
+        sources.swarm(str(path), 'quantlab')
+
+    payload = swarm_payload()
+    payload['tasks'][1]['prompt'] = 'PRIVATE'
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError):
+        sources.swarm(str(path), 'quantlab')
+
+
+def test_swarm_collect_and_staleness_are_fail_closed(tmp_path, monkeypatch):
+    path = tmp_path / 'swarm.json'
+    path.write_text(json.dumps(swarm_payload()))
+    monkeypatch.setattr(sources, 'SWARM_PATH', str(path))
+    value = collect(config(tmp_path), 101)
+    swarm_source = next(s for s in value['sources'] if s['kind'] == 'swarm')
+    assert swarm_source['profile'] == 'quantlab'
+    assert swarm_source['status'] == 'available'
+    assert swarm_source['observed_at'] == 100
+    assert swarm_source['rows'][0]['tasks'][0]['task_id'] == 'child'
+
+    projected = c.project(value, ('quantlab',), 191)
+    swarm_source = next(s for s in projected['sources'] if s['kind'] == 'swarm')
+    assert swarm_source['status'] == 'unavailable'
+    assert swarm_source['reason'] == 'stale'
+    assert swarm_source['rows'] == []
 
 
 def config(tmp_path):
