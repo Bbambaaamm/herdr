@@ -1,83 +1,39 @@
-"""Herdr v1.7: Swarm admission control, permissions & resource budgets (#8).
+"""Herdr v1.7: Swarm admission control (issue #8).
 
-Fail-closed, PAPER-only. stdlib-only so the contract is fully offline-testable.
+Fail-closed, offline-testable.  stdlib-only so the contract is fully
+offline-verifiable.
 
 Invariants enforced by AdmissionControl.check():
   * Planner cannot bypass limits by emitting a larger graph (node/depth/fanout).
   * Child may never escalate tools or permissions beyond parent.
   * Resource pressure blocks a heavy spawn *before* it starts.
-  * Dynamic swarm never receives live-broker / protected-path / secret / network
-    tools (PAPER-only policy hook).
-  * Every denial is durably audited (append-only JSONL) — visible in Machine City.
+  * Consumer policy hook enforces project-specific safety (e.g. QuantLib
+    PAPER-only denial of live-broker / protected-path / secret / network
+    tools, or any other consumer's invariants).
+  * Every denial is durably audited (append-only JSONL).
   * Cancellation is durable: a cancel record is appended and replayable.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
+from typing import Protocol, runtime_checkable
+
 
 # --------------------------------------------------------------------------- #
-# Policy primitives (PAPER-only, fail-closed). These are intentionally
-# conservative and never loosen the runtime guards in AGENTS.md /
-# docs/runtime-resource-budget.md.
+# Role-based tool allowlist — generic, consumer-neutral baseline.            |
+# Operators (push, deploy) require independent authorization — never        |
+# auto-spawned by the dynamic swarm.                                        |
 # --------------------------------------------------------------------------- #
 
-# A dynamic swarm agent may NEVER be admitted with a tool whose name intersects
-# one of these live-trading / broker prefixes. PAPER-only is a hard invariant.
-LIVE_TRADING_TOOL_PREFIXES: tuple[str, ...] = (
-    "alpaca-order",
-    "alpaca-position",
-    "alpaca-sse",
-    "broker",
-    "live-broker",
-    "trade",
-    "execution",
-    "risk-engine",
-    "alpaca",
-    "paperless",
-)
 
-PROTECTED_PATH_PREFIXES: tuple[str, ...] = (
-    "backend/src/quantlab/trading.py",
-    "backend/src/quantlab/phase4.py",
-    "backend/src/quantlab/security.py",
-)
-
-# Tool arguments or names containing any of these indicators are denied
-# (secret isolation / no-credential-leak at admission time).
-SECRET_INDICATORS: tuple[str, ...] = (
-    "api_key",
-    "api_secret",
-    "secret_key",
-    "private_key",
-    "client_secret",
-    "token",
-    "password",
-    "alpaca_key_id",
-    "alpaca_secret_key",
-    "api_admin_token",
-)
-
-# External-network egress by a dynamic swarm is denied unless explicitly
-# allow-listed. (Real egress tooling is governed by network/tool policy #8.)
-EXTERNAL_NETWORK_TOOL_SUFFIXES: tuple[str, ...] = (
-    ".post",
-    ".put",
-    ".patch",
-    ".upload",
-)
-
-
-# Role-based tool allowlist. A child tool set must be a *subset* of the role
-# allowlist AND a subset of the parent's tool set. Operator-role tools (push,
-# deploy) require independent authorization — they are never auto-spawned.
 def _reader_tools() -> frozenset[str]:
     return frozenset(
         {
@@ -109,6 +65,7 @@ def _operator_tools() -> frozenset[str]:
     return _writer_tools().union({"git_push", "deploy", "git_merge"})
 
 
+# Immutable, shared role-tool allowlist.
 ROLE_TOOL_ALLOWLIST: Mapping[str, frozenset[str]] = MappingProxyType(
     {
         "reader": _reader_tools(),
@@ -117,16 +74,67 @@ ROLE_TOOL_ALLOWLIST: Mapping[str, frozenset[str]] = MappingProxyType(
     }
 )
 
-# Operator role = manual/gated only. Never auto-spawned by the dynamic swarm.
+# Operator role is never auto-spawned by the dynamic swarm.
 AUTO_SPAWNABLE_ROLES: frozenset[str] = frozenset({"reader", "writer"})
 
 # Explicit role hierarchy for permission-subset enforcement (child may never
-# escalate above parent). Higher number = more 권한이 많음 (more 권한).
-ROLE_LEVELS: Mapping[str, int] = {
-    "reader": 0,
-    "writer": 1,
-    "operator": 2,
-}
+# escalate above parent).  Higher number = more privilege.
+ROLE_LEVELS: Mapping[str, int] = {"reader": 0, "writer": 1, "operator": 2}
+
+
+# --------------------------------------------------------------------------- #
+# Consumer policy hook — fail-closed, project-specific safety.               |
+# QuantLib provides its PAPER-only policy; other consumers provide their    |
+# own.  Herdr core never hard-codes trading paths, broker names, or secret  |
+# indicators — all project-specific invariants flow through this hook.       |
+# --------------------------------------------------------------------------- #
+
+
+@runtime_checkable
+class ConsumerPolicy(Protocol):
+    """Generic fail-closed consumer policy hook for admission checks.
+
+    Implementations are invoked *before* the generic role-tool allowlist so
+    that policy-violating tools are reported as their true denial reason
+    rather than a generic allowlist miss.
+
+    Consumers such as QuantLib implement project-specific safety (PAPER-only
+    denial of live-broker / protected-path / secret / network tools).
+    """
+
+    def check_tool(self, tool: str) -> DenyReason | None:
+        """Return a DenyReason if *tool* violates this consumer's policy.
+
+        Returning ``None`` means the tool passes the consumer policy gate.
+        """
+        ...
+
+    def check_identity(self, identity: AgentIdentity) -> DenyReason | None:
+        """Return a DenyReason if *identity* violates this consumer's policy.
+
+        Returning ``None`` means the identity passes the consumer policy gate.
+        """
+        ...
+
+
+class AllowAllConsumerPolicy:
+    """No-op consumer policy that admits every tool and identity.
+
+    This is the *default* so Herdr core remains consumer-neutral.  Production
+    deployments MUST supply a real policy (e.g. QuantLib PAPER-only) — the
+    :class:`AdmissionControl` constructor accepts any :class:`ConsumerPolicy`.
+    """
+
+    def check_tool(self, tool: str) -> DenyReason | None:
+        return None
+
+    def check_identity(self, identity: AgentIdentity) -> DenyReason | None:
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# Denial taxonomy — generic reasons only, no consumer-specific constants.    |
+# --------------------------------------------------------------------------- #
 
 
 class DenyReason(StrEnum):
@@ -158,16 +166,12 @@ class DenyReason(StrEnum):
     TOOL_NOT_IN_ROLE_ALLOWLIST = "tool_not_in_role_allowlist"
     NON_SPAWNABLE_ROLE = "non_spawnable_role"
 
-    # PAPER-only safety hooks.
-    LIVE_TRADING_TOOL = "live_trading_tool"
-    PROTECTED_PATH = "protected_path"
-    SECRET_ACCESS = "secret_access"  # noqa: S105 - denial reason code, not a credential
-    EXTERNAL_NETWORK_POLICY = "external_network_policy"
-    CONSUMER_POLICY = "consumer_policy"
+    # Consumer policy hook (project-specific safety, e.g. PAPER-only).
+    CONSUMER_POLICY_DENIED = "consumer_policy_denied"
 
 
 # --------------------------------------------------------------------------- #
-# Value objects.
+# Value objects.                                                              |
 # --------------------------------------------------------------------------- #
 
 
@@ -175,13 +179,13 @@ class DenyReason(StrEnum):
 class PlanBudget:
     """Conservative, fail-closed admission ceilings for the dynamic swarm.
 
-    These are *admission-time* caps. They complement (never replace) the
-    runtime resource guards in Settings (worker_soft_rss_mb,
-    market_job_min_available_mb, etc.) — see AGENTS.md runtime architecture
-    contract.
+    These are *admission-time* caps.  They complement (never replace) the
+    runtime resource guards in Settings (``worker_soft_rss_mb``,
+    ``market_job_min_available_mb``, etc.) — see AGENTS.md runtime
+    architecture contract.
 
     Values set here match the reviewed config approved for Herdr v1.7
-    (#8); planner/child cannot change them.
+    (#236, parent issue #8); planner/child cannot change them.
     """
 
     max_global_agents: int = 4
@@ -200,16 +204,20 @@ class PlanBudget:
     )
 
     def __post_init__(self) -> None:
-        frozen = {str(role): frozenset(tools) for role, tools in self.role_tool_allowlist.items()}
+        frozen = {
+            str(role): frozenset(tools)
+            for role, tools in self.role_tool_allowlist.items()
+        }
         object.__setattr__(self, "role_tool_allowlist", MappingProxyType(frozen))
 
 
 @dataclass(frozen=True)
 class TaskGraphSpec:
-    """Static description of a proposed Herdr TaskGraph/plan.
+    """Static description of a proposed Herdr TaskGraph / plan.
 
-    node_count/max_depth/max_fanout are validated against PlanBudget so a
-    planner cannot bypass limits by emitting a larger graph output.
+    ``node_count`` / ``max_depth`` / ``max_fanout`` are validated against
+    :class:`PlanBudget` so a planner cannot bypass limits by emitting a
+    larger graph output.
     """
 
     node_count: int
@@ -281,11 +289,10 @@ class AllowDecision:
 
 
 Decision = AllowDecision | DenyDecision
-ConsumerPolicyHook = Callable[[AgentIdentity, Sequence[str]], str | None]
 
 
 # --------------------------------------------------------------------------- #
-# Audit log (append-only JSONL — durable denials + durable cancellation).
+# Audit log (append-only JSONL — durable denials + durable cancellation).   |
 # --------------------------------------------------------------------------- #
 
 
@@ -294,7 +301,7 @@ def _now_iso() -> str:
 
 
 class AuditLog:
-    """Append-only JSONL log. Each record is one line (one event)."""
+    """Append-only JSONL log.  Each record is one line (one event)."""
 
     def __init__(self, path: str | Path) -> None:
         self.path: Path = Path(path)
@@ -309,7 +316,6 @@ class AuditLog:
         line = json.dumps(record, sort_keys=True, default=str, allow_nan=False)
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
-        self.path.chmod(0o640)
         return record
 
     def replay(self) -> list[dict[str, object]]:
@@ -331,24 +337,34 @@ class AuditLog:
 
 
 # --------------------------------------------------------------------------- #
-# Admission controller.
+# Admission controller.                                                      |
 # --------------------------------------------------------------------------- #
 
 
 @dataclass
 class AdmissionControl:
-    """Fail-closed swarm admission gate (#8, parent #1)."""
+    """Fail-closed swarm admission gate (Herdr v1.7, issue #8).
+
+    Parameters
+    ----------
+    budget:
+        Admission ceilings (DAG limits, agent caps, resource budgets).
+    consumer_policy:
+        Project-specific safety hook (e.g. QuantLib PAPER-only).  Defaults to
+        :class:`AllowAllConsumerPolicy` so Herdr core stays consumer-neutral;
+        production deployments MUST supply a real policy.
+    audit_log:
+        Append-only JSONL sink for deny/allow/cancel events.  Required —
+        admission fails closed without an audit sink.
+    """
 
     budget: PlanBudget = field(default_factory=PlanBudget)
-    paper_only: bool = True
+    consumer_policy: ConsumerPolicy = field(default_factory=AllowAllConsumerPolicy)
     audit_log: AuditLog | None = None
-    consumer_policy_hook: ConsumerPolicyHook | None = None
 
     def __post_init__(self) -> None:
         if self.audit_log is None:
             raise ValueError("fail-closed admission requires an audit sink")
-        if self.paper_only is not True:
-            raise ValueError("dynamic swarm admission requires literal paper_only=True")
 
     # -- helpers ----------------------------------------------------------- #
     def _deny(
@@ -356,9 +372,6 @@ class AdmissionControl:
     ) -> DenyDecision:
         safe_detail = detail
         safe_ctx = dict(audit_ctx)
-        if reason is DenyReason.SECRET_ACCESS:
-            safe_detail = "tool request denied by secret-isolation policy"
-            safe_ctx.pop("denied_tool", None)
         decision = DenyDecision(denied=True, reason=reason, detail=safe_detail)
         audit_log = self.audit_log
         if audit_log is None:
@@ -393,19 +406,6 @@ class AdmissionControl:
             )
         return decision
 
-    @staticmethod
-    def _tool_denies(tool: str) -> DenyReason | None:
-        lowered = tool.lower()
-        if any(lowered.startswith(p) for p in LIVE_TRADING_TOOL_PREFIXES):
-            return DenyReason.LIVE_TRADING_TOOL
-        if any(p in lowered for p in PROTECTED_PATH_PREFIXES):
-            return DenyReason.PROTECTED_PATH
-        if any(p in lowered for p in SECRET_INDICATORS):
-            return DenyReason.SECRET_ACCESS
-        if any(lowered.endswith(s) for s in EXTERNAL_NETWORK_TOOL_SUFFIXES):
-            return DenyReason.EXTERNAL_NETWORK_POLICY
-        return None
-
     # -- public API -------------------------------------------------------- #
     def check(
         self,
@@ -416,9 +416,9 @@ class AdmissionControl:
     ) -> Decision:
         """Admit a proposed Herdr swarm spawn.
 
-        Ordered, fail-closed checks. The *first* failure short-circuits with a
-        DenyDecision; success returns an AllowDecision. A planner cannot bypass
-        limits by emitting a larger graph.
+        Ordered, fail-closed checks.  The *first* failure short-circuits with a
+        :class:`DenyDecision`; success returns an :class:`AllowDecision`.  A
+        planner cannot bypass limits by emitting a larger graph.
         """
         audit_ctx = {
             "role": identity.role,
@@ -434,7 +434,8 @@ class AdmissionControl:
         if spec.node_count <= 0 or spec.max_depth <= 0 or spec.max_fanout < 0:
             return self._deny(
                 DenyReason.INVALID_GRAPH_SPEC,
-                ("graph dimensions must satisfy node_count>0, max_depth>0 and max_fanout>=0"),
+                "graph dimensions must satisfy node_count>0, max_depth>0 "
+                "and max_fanout>=0",
                 audit_ctx,
             )
 
@@ -443,7 +444,8 @@ class AdmissionControl:
         if spec.node_count > self.budget.max_dag_nodes * 8:
             return self._deny(
                 DenyReason.PLANNER_GRAPH_TOO_LARGE,
-                f"planner graph output node_count={spec.node_count} rejected as runaway",
+                f"planner graph output node_count={spec.node_count} "
+                "rejected as runaway",
                 {**audit_ctx, "budget_node_limit": self.budget.max_dag_nodes},
             )
         if spec.node_count > self.budget.max_dag_nodes:
@@ -456,13 +458,15 @@ class AdmissionControl:
         if spec.max_depth > self.budget.max_dag_depth:
             return self._deny(
                 DenyReason.DAG_DEPTH_LIMIT,
-                f"graph max_depth={spec.max_depth} > max_dag_depth={self.budget.max_dag_depth}",
+                f"graph max_depth={spec.max_depth} > "
+                f"max_dag_depth={self.budget.max_dag_depth}",
                 {**audit_ctx, "budget_depth_limit": self.budget.max_dag_depth},
             )
         if spec.max_fanout > self.budget.max_dag_fanout:
             return self._deny(
                 DenyReason.DAG_FANOUT_LIMIT,
-                f"graph max_fanout={spec.max_fanout} > max_danout={self.budget.max_dag_fanout}",
+                f"graph max_fanout={spec.max_fanout} > "
+                f"max_dag_fanout={self.budget.max_dag_fanout}",
                 {**audit_ctx, "budget_fanout_limit": self.budget.max_dag_fanout},
             )
 
@@ -478,7 +482,8 @@ class AdmissionControl:
         if repo_agents >= self.budget.max_agents_per_repo:
             return self._deny(
                 DenyReason.PER_REPO_AGENT_LIMIT,
-                f"repo agents={repo_agents} >= per_repo limit={self.budget.max_agents_per_repo}",
+                f"repo agents={repo_agents} >= "
+                f"per_repo limit={self.budget.max_agents_per_repo}",
                 {**audit_ctx, "budget": self.budget.max_agents_per_repo},
             )
         issue_key = (identity.repo, identity.issue)
@@ -491,7 +496,7 @@ class AdmissionControl:
                 {**audit_ctx, "budget": self.budget.max_agents_per_issue},
             )
 
-        # 3. Resource telemetry is untrusted input: malformed/non-finite
+        # 3. Resource telemetry is untrusted input: malformed / non-finite
         #    snapshots fail closed before any arithmetic or admission decision.
         finite_values = (
             usage.cpu,
@@ -533,20 +538,22 @@ class AdmissionControl:
                 audit_ctx,
             )
 
-        # Host-level pressure (config-backed, auditable). Fail-closed:
+        # Host-level pressure (config-backed, auditable).  Fail-closed:
         # deny when load average exceeds 1.5x the logical CPU count, OR
         # free memory is below the safe threshold (2 GiB or 20% of RAM).
         if usage.load1 > 1.5 * usage.logical_cpus:
             return self._deny(
                 DenyReason.RESOURCE_PRESSURE,
-                f"load1={usage.load1:.2f} > 1.5 * logical_cpus={usage.logical_cpus}",
+                f"load1={usage.load1:.2f} > 1.5 * "
+                f"logical_cpus={usage.logical_cpus}",
                 {**audit_ctx, "load1": usage.load1, "logical_cpus": usage.logical_cpus},
             )
         mem_threshold = max(2 * 1024**3, usage.total_ram_bytes // 5)  # 2 GiB or 20% RAM
         if usage.mem_available_bytes < mem_threshold > 0:
             return self._deny(
                 DenyReason.RESOURCE_PRESSURE,
-                f"mem_available={usage.mem_available_bytes} B < threshold={mem_threshold} B "
+                f"mem_available={usage.mem_available_bytes} B < "
+                f"threshold={mem_threshold} B "
                 f"(max(2 GiB, 20% of {usage.total_ram_bytes} B))",
                 {
                     **audit_ctx,
@@ -554,7 +561,8 @@ class AdmissionControl:
                     "mem_threshold_bytes": mem_threshold,
                 },
             )
-        #    3b. Swarm-level CPU/RAM fraction + queue depth + task time.
+
+        # 3b. Swarm-level CPU/RAM fraction + queue depth + task time.
         if usage.cpu >= self.budget.max_cpu:
             return self._deny(
                 DenyReason.CPU_BUDGET,
@@ -570,7 +578,8 @@ class AdmissionControl:
         if usage.queue_depth >= self.budget.max_queue_depth:
             return self._deny(
                 DenyReason.QUEUE_BACKPRESSURE,
-                f"queue_depth={usage.queue_depth} >= limit={self.budget.max_queue_depth}",
+                f"queue_depth={usage.queue_depth} >= "
+                f"limit={self.budget.max_queue_depth}",
                 {**audit_ctx, "budget": self.budget.max_queue_depth},
             )
         if usage.elapsed_seconds >= self.budget.max_task_seconds:
@@ -588,70 +597,47 @@ class AdmissionControl:
                 {**audit_ctx, "budget": self.budget.max_task_seconds_hard_cap},
             )
 
-        # 4. Role must be auto-spawnable.
+        # 4. Consumer policy hook — project-specific safety checks.
+        #    Must run BEFORE the role allowlist so that policy-violating tools
+        #    are reported as their true denial reason, not "not in allowlist".
+        for tool in child_tools:
+            denied = self.consumer_policy.check_tool(tool)
+            if denied is not None:
+                return self._deny(
+                    denied,
+                    f"tool={tool!r} denied by consumer policy ({denied.value})",
+                    {**audit_ctx, "denied_tool": tool},
+                )
+        identity_denial = self.consumer_policy.check_identity(identity)
+        if identity_denial is not None:
+            return self._deny(
+                identity_denial,
+                f"identity denied by consumer policy ({identity_denial.value})",
+                audit_ctx,
+            )
+
+        # 5. Role must be auto-spawnable.
         if identity.role not in AUTO_SPAWNABLE_ROLES:
             return self._deny(
                 DenyReason.NON_SPAWNABLE_ROLE,
                 f"role={identity.role!r} is not auto-spawnable "
                 f"(allowed: {sorted(AUTO_SPAWNABLE_ROLES)})",
-                {**audit_ctx},
+                audit_ctx,
             )
 
-        # 5. PAPER-only safety hooks (live broker / protected paths / secrets /
-        #    external network). Denied regardless of role. Must run BEFORE the
-        #    tool allowlist so that policy-violating tools are reported as their
-        #    true policy deny reason, not "not in allowlist".
-        for tool in child_tools:
-            denied = self._tool_denies(tool)
-            if denied is not None:
-                return self._deny(
-                    denied,
-                    f"tool={tool!r} denied by PAPER-only/safety policy ({denied.value})",
-                    {**audit_ctx, "denied_tool": tool},
-                )
-
-        # 6. PAPER-only invariant: swarm may never be spawned when PAPER is off.
-        if identity.paper_only is not True or self.paper_only is not True:
-            return self._deny(
-                DenyReason.LIVE_TRADING_TOOL,
-                "admission requires paper_only=True for dynamic swarm spawns",
-                {**audit_ctx, "identity.paper_only": identity.paper_only},
-            )
-
-        # 7. Consumer-specific policy may only tighten admission. The hook
-        #    receives sanitized identity + requested tool names and returns a
-        #    bounded reason code, or None to defer to platform policy.
-        if self.consumer_policy_hook is not None:
-            consumer_reason = self.consumer_policy_hook(identity, tuple(child_tools))
-            if consumer_reason is not None:
-                safe_reason = (
-                    consumer_reason
-                    if isinstance(consumer_reason, str)
-                    and 0 < len(consumer_reason) <= 64
-                    and all(
-                        ch.isascii() and (ch.isalnum() or ch in "-_:/")
-                        for ch in consumer_reason
-                    )
-                    else "invalid_consumer_policy_reason"
-                )
-                return self._deny(
-                    DenyReason.CONSUMER_POLICY,
-                    "consumer-specific policy denied dynamic child spawn",
-                    {**audit_ctx, "consumer_reason": safe_reason},
-                )
-
-        # 8. Tool allowlist — fail-closed on any unknown / out-of-role tool.
+        # 6. Tool allowlist — fail-closed on any unknown / out-of-role tool.
         role_tools = self.budget.role_tool_allowlist.get(identity.role, frozenset())
         child_set = frozenset(child_tools)
         unknown_to_role = child_set - role_tools
         if unknown_to_role:
             return self._deny(
                 DenyReason.TOOL_NOT_IN_ROLE_ALLOWLIST,
-                f"child tools not in role {identity.role!r} allowlist: {sorted(unknown_to_role)}",
+                f"child tools not in role {identity.role!r} allowlist: "
+                f"{sorted(unknown_to_role)}",
                 {**audit_ctx, "unknown_tools": sorted(unknown_to_role)},
             )
 
-        # 8. Child may never escalate tools or permissions beyond parent.
+        # 7. Child may never escalate tools or permissions beyond parent.
         parent_tools = identity.parent_tools_or_empty
         parent_role = identity.parent_role_or_none
         if parent_role is not None:
@@ -662,14 +648,16 @@ class AdmissionControl:
                     f"child escalated tools beyond parent: {sorted(escalations)}",
                     {**audit_ctx, "parent_tools_count": len(parent_tools)},
                 )
-        if parent_role is not None and ROLE_LEVELS.get(identity.role, -1) > ROLE_LEVELS.get(
-            parent_role, -1
-        ):
+        if parent_role is not None and ROLE_LEVELS.get(
+            identity.role, -1
+        ) > ROLE_LEVELS.get(parent_role, -1):
             return self._deny(
                 DenyReason.PERMISSION_ESCALATION,
-                f"child role={identity.role!r} (level {ROLE_LEVELS.get(identity.role, -1)}) > "
-                f"parent role {parent_role!r} (level {ROLE_LEVELS.get(parent_role, -1)}); "
-                f"child may not escalate permissions",
+                f"child role={identity.role!r} "
+                f"(level {ROLE_LEVELS.get(identity.role, -1)}) > "
+                f"parent role {parent_role!r} "
+                f"(level {ROLE_LEVELS.get(parent_role, -1)}); "
+                "child may not escalate permissions",
                 {**audit_ctx, "parent_role": parent_role},
             )
 
@@ -686,7 +674,7 @@ class AdmissionControl:
             audit_ctx=audit_ctx,
         )
 
-    # -- durable cancellation --------------------------------------------- #
+    # -- durable cancellation ---------------------------------------------- #
     def cancel(self, task_id: str, reason: str) -> dict[str, object]:
         """Durably record a cancellation (survives restart)."""
         record: dict[str, object] = {

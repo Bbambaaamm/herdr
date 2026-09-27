@@ -1,7 +1,11 @@
-"""Offline, fail-closed contract tests for Herdr v1.7 admission control (#8).
+"""Offline, fail-closed contract tests for Herdr v1.7 admission control (issue #8).
 
-All tests are PAPER-only and use injected ResourceUsage / in-memory AuditLog — no
-live host probe, no network, no live broker, no credential.
+All tests are PAPER-only and use injected ResourceUsage / in-memory AuditLog —
+no live host probe, no network, no live broker, no credential.
+
+The QuantLib PAPER-only safety hook is exercised via a test ConsumerPolicy
+that denies trading/broker/secret tools — proving the consumer-policy hook
+fires *before* process creation and is fully auditable.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ import pytest
 from herdr.admission import (
     AdmissionControl,
     AgentIdentity,
+    AllowAllConsumerPolicy,
     AllowDecision,
     AuditLog,
     DenyDecision,
@@ -72,7 +77,64 @@ def _tmp_audit(tmp_path: Path) -> AuditLog:
     return AuditLog(tmp_path / "admission.jsonl")
 
 
-# --- Acceptance: planner cannot bypass limits via larger graph output ----- #
+# --- Test-specific consumer policy (QuantLib PAPER-only) ------------------- #
+
+
+class PaperOnlyConsumerPolicy:
+    """QuantLib PAPER-only policy: deny live-broker/trading/secret/network tools.
+
+    This mirrors the QuantLib consumer policy that lives outside Herdr core.
+    It is instantiated here only to exercise the consumer-policy hook end-to-end.
+    """
+
+    def __init__(self) -> None:
+        self.denied_tools: set[str] = set()
+
+    def check_tool(self, tool: str) -> DenyReason | None:
+        lowered = tool.lower()
+        if any(
+            lowered.startswith(p)
+            for p in (
+                "alpaca-order",
+                "alpaca-position",
+                "alpaca-sse",
+                "broker",
+                "live-broker",
+                "trade",
+                "execution",
+                "risk-engine",
+                "alpaca",
+                "paperless",
+            )
+        ):
+            return DenyReason.CONSUMER_POLICY_DENIED
+        if any(
+            p in lowered
+            for p in (
+                "api_key",
+                "api_secret",
+                "secret_key",
+                "private_key",
+                "client_secret",
+                "token",
+                "password",
+                "alpaca_key_id",
+                "alpaca_secret_key",
+                "api_admin_token",
+            )
+        ):
+            return DenyReason.CONSUMER_POLICY_DENIED
+        if any(lowered.endswith(s) for s in (".post", ".put", ".patch", ".upload")):
+            return DenyReason.CONSUMER_POLICY_DENIED
+        return None
+
+    def check_identity(self, identity: AgentIdentity) -> DenyReason | None:
+        if identity.paper_only is not True:
+            return DenyReason.CONSUMER_POLICY_DENIED
+        return None
+
+
+# --- Acceptance: planner cannot bypass limits via larger graph output ------ #
 
 
 def test_planner_graph_within_limits_is_admitted(tmp_path: Path) -> None:
@@ -121,7 +183,9 @@ def test_child_can_not_escalate_tools_beyond_parent(tmp_path: Path) -> None:
     spec = TaskGraphSpec(node_count=5, max_depth=2, max_fanout=2)
     child = _writer_identity(parent_tools=parent_tools, parent_role="writer")
     # child wants write_file — NOT in parent's tool set.
-    decision = ac.check(child, spec, _idle_usage(), ["read_file", "search_files", "write_file"])
+    decision = ac.check(
+        child, spec, _idle_usage(), ["read_file", "search_files", "write_file"]
+    )
     assert isinstance(decision, DenyDecision)
     assert decision.reason == DenyReason.TOOL_ESCALATION
 
@@ -159,7 +223,9 @@ def test_child_can_not_escalate_role_above_parent(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "field,value", [("cpu", 0.81), ("cpu", 0.95), ("ram", 0.86), ("ram", 0.99)]
 )
-def test_resource_pressure_blocks_heavy_spawn(field: str, value: float, tmp_path: Path) -> None:
+def test_resource_pressure_blocks_heavy_spawn(
+    field: str, value: float, tmp_path: Path
+) -> None:
     ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
     usage = _idle_usage()
     usage = replace(usage, **{field: value})
@@ -216,7 +282,9 @@ def test_missing_host_telemetry_fails_closed(tmp_path: Path) -> None:
         ("load1", 12.1),
     ],
 )
-def test_host_pressure_blocks_spawn(field: str, value: int | float, tmp_path: Path) -> None:
+def test_host_pressure_blocks_spawn(
+    field: str, value: int | float, tmp_path: Path
+) -> None:
     ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
     usage = replace(_idle_usage(), **{field: value})
     spec = TaskGraphSpec(node_count=5, max_depth=2, max_fanout=2)
@@ -254,20 +322,26 @@ def test_runaway_subtask_plan_is_bounded(tmp_path: Path) -> None:
     usage = _idle_usage()
     decision = ac.check(_writer_identity(), spec, usage, ["read_file"])
     assert isinstance(decision, DenyDecision)
-    assert decision.reason in (DenyReason.PLANNER_GRAPH_TOO_LARGE, DenyReason.DAG_NODE_LIMIT)
+    assert decision.reason in (
+        DenyReason.PLANNER_GRAPH_TOO_LARGE,
+        DenyReason.DAG_NODE_LIMIT,
+    )
 
 
-# --- Acceptance: PAPER-only — no live broker/trading permissions ----------- #
+# --- Acceptance: PAPER-only via consumer policy hook (not in Herdr core) --- #
 
 
-def test_paper_only_blocks_live_trading_tool(tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+def test_consumer_policy_blocks_live_trading_tool(tmp_path: Path) -> None:
+    ac = AdmissionControl(
+        audit_log=_tmp_audit(tmp_path),
+        consumer_policy=PaperOnlyConsumerPolicy(),
+    )
     spec = TaskGraphSpec(node_count=5, max_depth=2, max_fanout=2)
     decision = ac.check(
         _writer_identity(), spec, _idle_usage(), ["read_file", "alpaca-order.submit"]
     )
     assert isinstance(decision, DenyDecision)
-    assert decision.reason == DenyReason.LIVE_TRADING_TOOL
+    assert decision.reason == DenyReason.CONSUMER_POLICY_DENIED
 
 
 @pytest.mark.parametrize("role", ["reader", "writer", "operator"])
@@ -276,45 +350,52 @@ def test_no_live_broker_permissions_in_allowlists(role: str) -> None:
     for tool in allowlist:
         assert not any(
             tool.startswith(p)
-            for p in ("alpaca-order", "alpaca-position", "broker", "live-broker", "trade")
+            for p in (
+                "alpaca-order",
+                "alpaca-position",
+                "broker",
+                "live-broker",
+                "trade",
+            )
         ), tool
 
 
-def test_non_paper_only_spawn_is_denied(tmp_path: Path) -> None:
-    ac = AdmissionControl(paper_only=True, audit_log=_tmp_audit(tmp_path))
+def test_consumer_policy_blocks_non_paper_identity(tmp_path: Path) -> None:
+    ac = AdmissionControl(
+        audit_log=_tmp_audit(tmp_path),
+        consumer_policy=PaperOnlyConsumerPolicy(),
+    )
     spec = TaskGraphSpec(node_count=5, max_depth=2, max_fanout=2)
     identity = _writer_identity(paper_only=False)  # child claims live
     decision = ac.check(identity, spec, _idle_usage(), ["read_file"])
     assert isinstance(decision, DenyDecision)
-    assert decision.reason == DenyReason.LIVE_TRADING_TOOL
+    assert decision.reason == DenyReason.CONSUMER_POLICY_DENIED
 
 
-# --- Acceptance: protected paths / secrets denied ------------------------ #
-
-
-@pytest.mark.parametrize(
-    "tool",
-    [
-        "patch backend/src/quantlab/trading.py",
-        "read backend/src/quantlab/phase4.py",
-        "search_files backend/src/quantlab/security.py",
-    ],
-)
-def test_protected_paths_denied(tool: str, tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+def test_default_consumer_policy_allows_all(tmp_path: Path) -> None:
+    """Herdr core with default AllowAllConsumerPolicy admits PAPER tools."""
+    ac = AdmissionControl(
+        audit_log=_tmp_audit(tmp_path),
+        consumer_policy=AllowAllConsumerPolicy(),
+    )
     spec = TaskGraphSpec(node_count=5, max_depth=2, max_fanout=2)
-    decision = ac.check(_writer_identity(), spec, _idle_usage(), [tool])
-    assert isinstance(decision, DenyDecision)
-    assert decision.reason == DenyReason.PROTECTED_PATH
+    decision = ac.check(_writer_identity(), spec, _idle_usage(), ["read_file"])
+    assert isinstance(decision, AllowDecision)
 
 
-@pytest.mark.parametrize("tool", ["shell export API_KEY=xxx", "patch alpaca_secret_key"])
-def test_secret_access_denied(tool: str, tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+def test_consumer_policy_denial_fires_before_allowlist(tmp_path: Path) -> None:
+    """Consumer-policy check runs BEFORE the role-tool allowlist, so policy
+    violations are reported as CONSUMER_POLICY_DENIED, not TOOL_NOT_IN_ROLE_ALLOWLIST."""
+    ac = AdmissionControl(
+        audit_log=_tmp_audit(tmp_path),
+        consumer_policy=PaperOnlyConsumerPolicy(),
+    )
     spec = TaskGraphSpec(node_count=5, max_depth=2, max_fanout=2)
-    decision = ac.check(_writer_identity(), spec, _idle_usage(), [tool])
+    decision = ac.check(
+        _writer_identity(), spec, _idle_usage(), ["alpaca-order.submit"]
+    )
     assert isinstance(decision, DenyDecision)
-    assert decision.reason == DenyReason.SECRET_ACCESS
+    assert decision.reason == DenyReason.CONSUMER_POLICY_DENIED
 
 
 # --- Acceptance: denial is durably audited (Machine City visible) --------- #
@@ -342,13 +423,15 @@ def test_denial_is_audited_and_visible(tmp_path: Path) -> None:
 
 def test_cancellation_is_durable(tmp_path: Path) -> None:
     ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
-    task_id = "236-test-task-0001"
+    task_id = "8-test-task-0001"
     record = ac.cancel(task_id, "runaway subtask exceeded DAG budget")
     assert record["event"] == "cancel"
     assert record["task_id"] == task_id
     # Replay must surface the cancel record after a "restart" (same log file).
     replayed = ac.audit_log.replay()  # type: ignore[union-attr]
-    cancels = [e for e in replayed if e["event"] == "cancel" and e["task_id"] == task_id]
+    cancels = [
+        e for e in replayed if e["event"] == "cancel" and e["task_id"] == task_id
+    ]
     assert cancels == [record]
 
 
@@ -376,6 +459,7 @@ def test_operator_role_is_not_auto_spawnable(tmp_path: Path) -> None:
 
 
 def test_audit_sink_is_required_fail_closed() -> None:
+    # AdmissionControl requires an audit sink — fails closed without one.
     with pytest.raises(ValueError, match="audit sink"):
         AdmissionControl()
 
@@ -407,7 +491,9 @@ def test_auto_spawn_allowlists_do_not_include_unrestricted_shell() -> None:
         TaskGraphSpec(node_count=1, max_depth=1, max_fanout=-1),
     ],
 )
-def test_malformed_graph_dimensions_fail_closed(spec: TaskGraphSpec, tmp_path: Path) -> None:
+def test_malformed_graph_dimensions_fail_closed(
+    spec: TaskGraphSpec, tmp_path: Path
+) -> None:
     ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
     decision = ac.check(_writer_identity(), spec, _idle_usage(), ["read_file"])
     assert isinstance(decision, DenyDecision)
@@ -425,54 +511,3 @@ def test_nonfinite_resource_telemetry_fails_closed(tmp_path: Path) -> None:
     )
     assert isinstance(decision, DenyDecision)
     assert decision.reason == DenyReason.INVALID_RESOURCE_TELEMETRY
-
-
-def test_consumer_policy_hook_can_only_tighten_admission(tmp_path: Path) -> None:
-    def consumer_policy(identity: AgentIdentity, child_tools) -> str | None:
-        assert identity.repo == "QuantLab"
-        assert tuple(child_tools) == ("read_file",)
-        return "consumer_release_gate"
-
-    ac = AdmissionControl(
-        audit_log=_tmp_audit(tmp_path),
-        consumer_policy_hook=consumer_policy,
-    )
-    child = _writer_identity(
-        role="reader",
-        parent_role="reader",
-        parent_tools=frozenset({"read_file"}),
-    )
-    decision = ac.check(
-        child,
-        TaskGraphSpec(node_count=1, max_depth=1, max_fanout=0),
-        _idle_usage(),
-        ["read_file"],
-    )
-    assert isinstance(decision, DenyDecision)
-    assert decision.reason == DenyReason.CONSUMER_POLICY
-    events = ac.audit_log.replay()  # type: ignore[union-attr]
-    assert events[-1]["reason"] == "consumer_policy"
-    assert events[-1]["admit:consumer_reason"] == "consumer_release_gate"
-
-
-def test_consumer_policy_hook_cannot_bypass_platform_denial(tmp_path: Path) -> None:
-    ac = AdmissionControl(
-        audit_log=_tmp_audit(tmp_path),
-        consumer_policy_hook=lambda _identity, _tools: None,
-    )
-    child = _writer_identity(
-        role="writer",
-        parent_role="writer",
-        parent_tools=frozenset({"read_file"}),
-    )
-    decision = ac.check(
-        child,
-        TaskGraphSpec(node_count=1, max_depth=1, max_fanout=0),
-        _idle_usage(),
-        ["read_file", "git_push"],
-    )
-    assert isinstance(decision, DenyDecision)
-    assert decision.reason in {
-        DenyReason.TOOL_NOT_IN_ROLE_ALLOWLIST,
-        DenyReason.TOOL_ESCALATION,
-    }
