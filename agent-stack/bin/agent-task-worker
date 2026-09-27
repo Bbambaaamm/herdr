@@ -63,6 +63,13 @@ def prepare_attempt(task: dict) -> None:
     """Allocate one semantic execution attempt; reconciliation reuses it."""
     if task.get("attempt_state") == "delivery_uncertain" and task.get("run_token"):
         return
+    session = task.get("execution_session")
+    if (
+        isinstance(session, dict)
+        and session.get("owned_pane")
+        and not session.get("closed_at")
+    ):
+        raise RuntimeError("previous_task_session_not_closed")
     attempt = int(task.get("attempts") or 0)
     archive_previous_result(str(task["id"]), attempt)
     task.pop("execution_session", None)
@@ -88,7 +95,10 @@ def _parse_herdr_json(proc: subprocess.CompletedProcess[str], context: str) -> d
     for line in reversed(text.splitlines()):
         candidate = line.strip()
         if candidate.startswith("{"):
-            payload = json.loads(candidate)
+            try:
+                payload = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
             if isinstance(payload, dict):
                 return payload
     raise RuntimeError(f"{context}: no JSON response")
@@ -145,7 +155,7 @@ def _pane_has_marker(pane_id: str, marker: str) -> bool:
         return False
     try:
         environ = Path(f"/proc/{shell_pid}/environ").read_bytes().split(b"\0")
-    except (FileNotFoundError, PermissionError, ProcessLookupError):
+    except OSError:
         return False
     expected = f"{TASK_PANE_ENV}={marker}".encode("utf-8")
     return expected in environ
@@ -176,13 +186,16 @@ def _find_marked_task_panes(marker: str, workspace_id: str) -> tuple[str, ...]:
 
 
 def _close_owned_pane(pane_id: str) -> bool:
-    proc = subprocess.run(
-        [str(HERDR), "pane", "close", pane_id],
-        text=True,
-        capture_output=True,
-        timeout=15,
-        env=ENV,
-    )
+    try:
+        proc = subprocess.run(
+            [str(HERDR), "pane", "close", pane_id],
+            text=True,
+            capture_output=True,
+            timeout=15,
+            env=ENV,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
     return proc.returncode == 0
 
 
@@ -224,6 +237,8 @@ def create_task_session(task: dict) -> dict:
         if not isinstance(pane, dict) or not pane.get("pane_id"):
             raise RuntimeError("task_session_pane_split_invalid")
         pane_id = str(pane["pane_id"])
+        if pane_id == coordinator_pane:
+            raise RuntimeError("task_session_pane_not_isolated")
         session = {
             "agent_name": agent_name,
             "session_name": session_name,
@@ -236,7 +251,7 @@ def create_task_session(task: dict) -> dict:
             "created_at": utcnow().isoformat(),
         }
         task["execution_session"] = session
-        _herdr_json(
+        started = _herdr_json(
             [
                 "agent", "start", agent_name,
                 "--kind", "hermes", "--pane", pane_id, "--timeout", "60000",
@@ -246,13 +261,26 @@ def create_task_session(task: dict) -> dict:
             ],
             timeout_seconds=75.0,
         )
+        started_agent = (started.get("result") or {}).get("agent")
+        if (
+            not isinstance(started_agent, dict)
+            or str(started_agent.get("name") or "") != agent_name
+        ):
+            raise RuntimeError("task_session_agent_start_invalid")
+        started_pane = str(started_agent.get("pane_id") or "")
+        if started_pane and started_pane != pane_id:
+            raise RuntimeError("task_session_agent_wrong_pane")
         return session
     except Exception as exc:
-        if pane_id:
+        if pane_id and pane_id != coordinator_pane:
             candidates = (pane_id,)
         else:
             try:
-                candidates = _find_marked_task_panes(pane_marker, workspace_id)
+                candidates = tuple(
+                    candidate
+                    for candidate in _find_marked_task_panes(pane_marker, workspace_id)
+                    if candidate != coordinator_pane
+                )
             except Exception as reconcile_exc:
                 raise RuntimeError(
                     f"task_session_split_uncertain:{reconcile_exc}"
@@ -288,6 +316,12 @@ def cleanup_task_session(task: dict) -> bool:
     if not pane_id:
         session["cleanup_status"] = "close_unproven"
         return False
+    coordinator_pane = str(session.get("coordinator_pane_id") or "")
+    if coordinator_pane and pane_id == coordinator_pane:
+        session["cleanup_status"] = "refused"
+        session["cleanup_error"] = "owned pane matches persistent coordinator pane"
+        log(str(task.get("id") or "unknown"), "task session cleanup refused coordinator pane")
+        return False
     if _close_owned_pane(pane_id):
         session["closed_at"] = utcnow().isoformat()
         session["cleanup_status"] = "closed"
@@ -322,6 +356,9 @@ def cleanup_task_session_if_safe(task: dict) -> bool:
         path = current_task_path(task)
         if path is not None:
             task["watchdog_blocker"] = "task_session_cleanup_failed"
+            archive_previous_result(
+                str(task["id"]), int(task.get("attempts") or 0)
+            )
             block_task(
                 path,
                 task,
@@ -662,6 +699,17 @@ def main(task_path: Path) -> int:
             persist_current_task(task)
             return 0
 
+        previous_session = task.get("execution_session")
+        if (
+            isinstance(previous_session, dict)
+            and previous_session.get("owned_pane")
+            and not previous_session.get("closed_at")
+        ):
+            if not cleanup_task_session_if_safe(task):
+                persist_current_task(task)
+                return 1
+            persist_current_task(task)
+
         prepare_attempt(task)
         attempt = int(task.get("attempts") or 0)
         decision = decide_model_route(task)
@@ -704,7 +752,13 @@ def main(task_path: Path) -> int:
                 )
             except Exception as exc:
                 detail = str(exc)
-                if detail.startswith(("task_session_cleanup_failed", "task_session_split_uncertain")):
+                if detail.startswith(
+                    (
+                        "task_session_cleanup_failed",
+                        "task_session_pane_not_isolated",
+                        "task_session_split_uncertain",
+                    )
+                ):
                     block_task(
                         task_path,
                         task,

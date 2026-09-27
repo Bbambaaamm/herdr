@@ -53,6 +53,33 @@ def test_prepare_attempt_reuses_identity_during_reconciliation(tmp_path):
     assert task["attempts"] == 0
 
 
+def test_prepare_attempt_refuses_unclosed_owned_session(tmp_path):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["execution_session"] = {
+        "pane_id": "still-live",
+        "owned_pane": True,
+    }
+
+    try:
+        worker.prepare_attempt(task)
+    except RuntimeError as exc:
+        assert str(exc) == "previous_task_session_not_closed"
+    else:
+        raise AssertionError("a new attempt must not discard a live owned session")
+
+
+def test_parse_herdr_json_skips_malformed_trailing_json():
+    proc = worker.subprocess.CompletedProcess(
+        ["herdr"],
+        0,
+        stdout='{"result": {"ok": true}}\n{not-json}\n',
+        stderr="",
+    )
+
+    assert worker._parse_herdr_json(proc, "test")["result"]["ok"] is True
+
+
 def test_delivery_uncertain_does_not_increment_execution_attempt(tmp_path):
     configure_paths(tmp_path)
     running = tmp_path / "running"
@@ -240,6 +267,80 @@ def test_create_task_session_uses_fresh_owned_pane_and_named_chat(tmp_path, monk
     assert start[start.index("--in") + 1] == task["workspace"]
 
 
+def test_create_task_session_never_closes_reused_coordinator_pane(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["routing"] = {"selected_agent": "quantlab-hermes"}
+    task["run_token"] = "isolated-run"
+    closed = []
+
+    def fake_herdr_json(args, *, timeout_seconds=30.0):
+        if args[:2] == ["agent", "get"]:
+            return {
+                "result": {
+                    "agent": {
+                        "agent": "hermes",
+                        "pane_id": "persistent-pane",
+                        "workspace_id": "w2",
+                    }
+                }
+            }
+        if args[:2] == ["pane", "split"]:
+            return {"result": {"pane": {"pane_id": "persistent-pane"}}}
+        raise AssertionError(args)
+
+    monkeypatch.setattr(worker, "_herdr_json", fake_herdr_json)
+    monkeypatch.setattr(worker, "_find_marked_task_panes", lambda marker, workspace_id: ())
+    monkeypatch.setattr(worker, "_close_owned_pane", lambda pane_id: closed.append(pane_id) or True)
+
+    try:
+        worker.create_task_session(task)
+    except RuntimeError as exc:
+        assert str(exc).startswith("task_session_split_uncertain:")
+    else:
+        raise AssertionError("coordinator pane reuse must fail closed")
+
+    assert closed == []
+
+
+def test_invalid_agent_start_response_closes_only_owned_pane(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["routing"] = {"selected_agent": "quantlab-hermes"}
+    task["run_token"] = "isolated-run"
+    closed = []
+
+    def fake_herdr_json(args, *, timeout_seconds=30.0):
+        if args[:2] == ["agent", "get"]:
+            return {
+                "result": {
+                    "agent": {
+                        "agent": "hermes",
+                        "pane_id": "persistent-pane",
+                        "workspace_id": "w2",
+                    }
+                }
+            }
+        if args[:2] == ["pane", "split"]:
+            return {"result": {"pane": {"pane_id": "owned-pane"}}}
+        if args[:2] == ["agent", "start"]:
+            return {"result": {"agent": {"name": "wrong-agent"}}}
+        raise AssertionError(args)
+
+    monkeypatch.setattr(worker, "_herdr_json", fake_herdr_json)
+    monkeypatch.setattr(worker, "_close_owned_pane", lambda pane_id: closed.append(pane_id) or True)
+
+    try:
+        worker.create_task_session(task)
+    except RuntimeError as exc:
+        assert str(exc) == "task_session_agent_start_invalid"
+    else:
+        raise AssertionError("an unverified agent start must fail closed")
+
+    assert closed == ["owned-pane"]
+    assert task["execution_session"]["cleanup_status"] == "closed"
+
+
 def test_run_prompt_targets_task_session_never_persistent_coordinator(tmp_path, monkeypatch):
     configure_paths(tmp_path)
     task = base_task()
@@ -315,6 +416,40 @@ def test_cleanup_closes_only_owned_task_pane(tmp_path, monkeypatch):
     assert calls == [[str(worker.HERDR), "pane", "close", "owned-task-pane"]]
     assert task["execution_session"]["cleanup_status"] == "closed"
     assert task["execution_session"]["pane_id"] != task["execution_session"]["coordinator_pane_id"]
+
+
+def test_cleanup_refuses_persistent_coordinator_pane(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["execution_session"] = {
+        "pane_id": "persistent-pane",
+        "coordinator_pane_id": "persistent-pane",
+        "owned_pane": True,
+    }
+    closed = []
+    monkeypatch.setattr(worker, "_close_owned_pane", lambda pane_id: closed.append(pane_id) or True)
+
+    assert worker.cleanup_task_session(task) is False
+    assert closed == []
+    assert task["execution_session"]["cleanup_status"] == "refused"
+
+
+def test_close_exception_is_recorded_without_masking_task_state(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["execution_session"] = {
+        "pane_id": "owned-pane",
+        "coordinator_pane_id": "persistent-pane",
+        "owned_pane": True,
+    }
+
+    def fail_close(*args, **kwargs):
+        raise worker.subprocess.TimeoutExpired(args[0], 15)
+
+    monkeypatch.setattr(worker.subprocess, "run", fail_close)
+
+    assert worker.cleanup_task_session(task) is False
+    assert task["execution_session"]["cleanup_status"] == "close_failed"
 
 
 def test_new_semantic_attempt_discards_previous_session_metadata(tmp_path):
@@ -513,6 +648,14 @@ def test_cleanup_failure_blocks_even_completed_task(tmp_path, monkeypatch):
     }
     done_path = worker.DONE / "task-1.json"
     done_path.write_text(json.dumps(task), encoding="utf-8")
+    worker.write_json(
+        worker.result_path("task-1"),
+        {
+            "task_id": "task-1",
+            "run_token": "old-token",
+            "status": "completed",
+        },
+    )
     monkeypatch.setattr(worker, "_close_owned_pane", lambda pane_id: False)
 
     assert worker.cleanup_task_session_if_safe(task) is False
@@ -523,6 +666,10 @@ def test_cleanup_failure_blocks_even_completed_task(tmp_path, monkeypatch):
     assert saved["attempt_state"] == "blocked"
     assert saved["watchdog_blocker"] == "task_session_cleanup_failed"
     assert not done_path.exists()
+    result = json.loads(worker.result_path("task-1").read_text(encoding="utf-8"))
+    assert result["status"] == "blocked"
+    assert result["blocker"] == "task_session_cleanup_failed"
+    assert list(worker.RESULTS.glob("task-1.attempt0.previous-*.json"))
 
 
 def test_ambiguous_split_without_marker_never_retries(tmp_path, monkeypatch):
