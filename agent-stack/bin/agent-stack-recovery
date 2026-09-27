@@ -103,31 +103,35 @@ def watchdog_result_path(task_id: str) -> Path:
 
 
 def block_orphan(path: Path, task: dict, *, reason: str, age_seconds: int) -> None:
+    """Quarantine unknown delivery in-place; never create a false terminal state."""
     task_id = str(task.get("id") or path.stem)
-    summary = (
-        f"Watchdog found orphaned running task with no matching worker after "
-        f"{age_seconds}s; delivery state is unknown, so no blind redispatch was performed."
-    )
-    result = {
-        "task_id": task_id,
-        "run_token": str(task.get("run_token") or ""),
-        "status": "blocked",
-        "summary": summary,
-        "issue": task.get("issue"),
-        "repo": task.get("repo"),
-        "evidence": [reason],
-        "blocker": "orphaned_running_unknown_delivery",
-        "next_action": "Reconcile durable/GitHub evidence before requeueing this same task.",
-        "completed_at": utcnow().isoformat(),
-    }
-    write_json(watchdog_result_path(task_id), result)
-    task["watchdog_blocker"] = result["blocker"]
+    blocker = "orphaned_running_unknown_delivery"
+    if task.get("watchdog_blocker") != blocker:
+        summary = (
+            f"Watchdog found orphaned running task with no matching worker after "
+            f"{age_seconds}s; delivery state is unknown, so no blind redispatch was performed."
+        )
+        result = {
+            "task_id": task_id,
+            "run_token": str(task.get("run_token") or ""),
+            "status": "blocked",
+            "summary": summary,
+            "issue": task.get("issue"),
+            "repo": task.get("repo"),
+            "evidence": [reason],
+            "blocker": blocker,
+            "next_action": "Reconcile durable/GitHub evidence before requeueing this same task.",
+            "completed_at": utcnow().isoformat(),
+        }
+        write_json(watchdog_result_path(task_id), result)
+        task["watchdog_observed_at"] = utcnow().isoformat()
+    task["watchdog_blocker"] = blocker
     task["last_error"] = reason[-2000:]
-    task["result_status"] = "blocked"
-    task["attempt_state"] = "blocked"
-    task["finished_at"] = utcnow().isoformat()
-    move_task(path, BLOCKED, task)
-    print(f"orphan_blocked task={task_id} age={age_seconds}s reason={reason}")
+    task["attempt_state"] = "delivery_uncertain"
+    task.pop("result_status", None)
+    task.pop("finished_at", None)
+    write_json(path, task)
+    print(f"orphan_quarantined task={task_id} age={age_seconds}s reason={reason}")
 
 
 def terminalize_from_result(path: Path, task: dict, result: dict, age_seconds: int) -> None:
@@ -182,6 +186,13 @@ def recover_orphan_tasks(now: datetime | None = None) -> None:
                 os.replace(path, BLOCKED / path.name)
                 print(f"orphan_invalid_json_blocked file={path.name} error={exc}")
             continue
+
+        if task.get("watchdog_blocker") == "orphaned_running_unknown_delivery":
+            result, _ = matching_result(task)
+            if result is not None:
+                terminalize_from_result(path, task, result, 0)
+            continue
+
         timeout = max(30, int(task.get("timeout_seconds") or 1800))
         age = int(max(0, (now - parse_started(task, path)).total_seconds()))
         if age <= timeout + ORPHAN_GRACE_SECONDS:
@@ -206,6 +217,24 @@ def recover_orphan_tasks(now: datetime | None = None) -> None:
             reason=f"no matching worker after double-check; durable_result={state}",
             age_seconds=age,
         )
+
+
+def reconcile_watchdog_blocked_tasks() -> None:
+    """Promote exact late durable results without ever replaying blocked work."""
+    if not BLOCKED.exists():
+        return
+    for path in sorted(BLOCKED.glob("*.json")):
+        try:
+            task = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if task.get("watchdog_blocker") != "orphaned_running_unknown_delivery":
+            continue
+        result, _ = matching_result(task)
+        if result is None:
+            continue
+        terminalize_from_result(path, task, result, 0)
+        print(f"orphan_late_result_reconciled task={task.get('id')}")
 
 
 def run_herdr(args: list[str], timeout: float = 15.0) -> subprocess.CompletedProcess[str]:
@@ -258,8 +287,8 @@ def recover_codex_update_dialogs() -> None:
         if row.get("agent_status") != "idle" or row.get("interactive_ready") is not True:
             continue
         # The updater is shown before the full Codex TUI takes over the pane.
-        # Fail closed unless the pane still has the shell-style title observed
-        # for that bootstrap state; never send Esc into an ordinary Codex UI.
+        # Detection is intentionally read-only: the watchdog reports the stall
+        # but never injects keys into a TUI that may have transitioned meanwhile.
         title = str(row.get("terminal_title_stripped") or "")
         if not title.startswith("agentops@"):
             continue
@@ -270,21 +299,15 @@ def recover_codex_update_dialogs() -> None:
         text = (screen.stdout or "") + (screen.stderr or "")
         if screen.returncode != 0 or not is_codex_update_dialog(text):
             continue
-        cleared = run_herdr(["agent", "send-keys", name, "esc"])
-        if cleared.returncode != 0:
-            print(f"codex_update_dialog_skip_failed agent={name} rc={cleared.returncode}")
-            continue
-        time.sleep(0.5)
-        verify = run_herdr(["agent", "read", name])
-        verify_text = (verify.stdout or "") + (verify.stderr or "")
-        if is_codex_update_dialog(verify_text):
-            print(f"codex_update_dialog_still_present agent={name}")
-        else:
-            print(f"codex_update_dialog_cleared agent={name}")
+        print(f"codex_update_dialog_detected agent={name}")
 
 
 def main() -> int:
-    for action in (recover_orphan_tasks, recover_codex_update_dialogs):
+    for action in (
+        recover_orphan_tasks,
+        reconcile_watchdog_blocked_tasks,
+        recover_codex_update_dialogs,
+    ):
         try:
             action()
         except Exception as exc:

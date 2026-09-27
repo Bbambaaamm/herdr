@@ -169,18 +169,22 @@ The watchdog is a safety net, not a second executor.
   old attempt timestamp cannot make a freshly claimed task look orphaned.
 - Immediately before any orphan mutation, the watchdog re-checks both the worker
   process and exact durable result to close startup/publication races.
-- Without a matching result, the task is moved to `blocked` with
-  `orphaned_running_unknown_delivery`; it is never blindly requeued.
+- Without a matching result, the task stays in `running/` as
+  `delivery_uncertain` with `orphaned_running_unknown_delivery`. This
+  quarantines the exact task identity in place so the dispatcher cannot replay
+  it while a late result may still arrive.
+- A later canonical result matching the same `task_id + run_token` terminalizes
+  that quarantined task normally; watchdog recovery never creates a new attempt.
 - Watchdog-generated recovery evidence is always written to a sidecar result;
   the canonical task result path remains exclusively owned by the executor/runtime.
 - A stale/mismatched canonical result is preserved and never overwritten.
-- Codex self-update prompts are treated as transport/UI stalls. For Codex panes
-  only, the watchdog detects the active three-choice update menu and sends
-  `Esc` to skip it. It never installs an update automatically.
-- Escape is sent only when Herdr reports a Codex agent as both `idle` and
-  `interactive_ready`, and the active menu has no later work/readiness markers.
-- A passive update banner, historical menu, or menu text quoted by live work is
-  not treated as a blocking dialog.
+- Codex self-update prompts are treated as transport/UI stalls. The watchdog
+  detects the exact active three-choice updater menu only for an idle,
+  interactive shell-titled Codex pane and reports
+  `codex_update_dialog_detected`.
+- Update detection is read-only: the watchdog never sends keys into Codex and
+  never installs an update automatically. A passive update banner, historical
+  menu, ordinary Codex TUI, or menu text quoted by live work causes no action.
 
 These rules preserve PAPER-only/runtime/resource guardrails and avoid duplicate
 work while allowing the primary dispatcher to remain authoritative.

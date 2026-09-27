@@ -49,7 +49,7 @@ def write_task(path, payload):
         os.utime(path, (stamp, stamp))
 
 
-def test_stale_orphan_blocks_without_blind_requeue(tmp_path, monkeypatch):
+def test_stale_orphan_is_quarantined_without_blind_requeue(tmp_path, monkeypatch):
     configure_paths(tmp_path)
     now = datetime(2026, 9, 27, 7, 0, tzinfo=timezone.utc)
     path = recovery.RUNNING / "task-1.json"
@@ -58,10 +58,12 @@ def test_stale_orphan_blocks_without_blind_requeue(tmp_path, monkeypatch):
 
     recovery.recover_orphan_tasks(now)
 
-    assert not path.exists()
-    blocked = json.loads((recovery.BLOCKED / path.name).read_text(encoding="utf-8"))
-    assert blocked["watchdog_blocker"] == "orphaned_running_unknown_delivery"
-    assert blocked["attempt_state"] == "blocked"
+    assert path.exists()
+    assert not (recovery.BLOCKED / path.name).exists()
+    quarantined = json.loads(path.read_text(encoding="utf-8"))
+    assert quarantined["watchdog_blocker"] == "orphaned_running_unknown_delivery"
+    assert quarantined["attempt_state"] == "delivery_uncertain"
+    assert "result_status" not in quarantined
     assert not (recovery.RESULTS / "task-1.json").exists()
     sidecars = list(recovery.RESULTS.glob("task-1.watchdog-recovery-*.json"))
     assert len(sidecars) == 1
@@ -298,7 +300,7 @@ Update available · 0.156.1 → 0.157.1
     assert not any(call[:2] == ["agent", "send-keys"] for call in calls)
 
 
-def test_idle_shell_active_update_menu_is_skipped(monkeypatch):
+def test_idle_shell_active_update_menu_is_detected_read_only(monkeypatch, capsys):
     dialog = """
 Update available · 0.156.1 → 0.157.1
 Release notes: https://github.com/openai/codex/releases/latest
@@ -314,7 +316,7 @@ Release notes: https://github.com/openai/codex/releases/latest
 › Ask Codex to do anything
 """
     calls = []
-    reads = iter((dialog, ready))
+    reads = iter((dialog,))
 
     def fake_run(args, timeout=15.0):
         calls.append(list(args))
@@ -333,12 +335,52 @@ Release notes: https://github.com/openai/codex/releases/latest
             return recovery.subprocess.CompletedProcess(args, 0, json.dumps(payload), "")
         if args[:2] == ["agent", "read"]:
             return recovery.subprocess.CompletedProcess(args, 0, next(reads), "")
-        if args[:2] == ["agent", "send-keys"]:
-            return recovery.subprocess.CompletedProcess(args, 0, '{"result":{"type":"ok"}}', "")
         raise AssertionError(args)
 
     monkeypatch.setattr(recovery, "run_herdr", fake_run)
-    monkeypatch.setattr(recovery.time, "sleep", lambda _: None)
     recovery.recover_codex_update_dialogs()
 
-    assert ["agent", "send-keys", "quantlab-sol", "esc"] in calls
+    assert not any(call[:2] == ["agent", "send-keys"] for call in calls)
+    assert "codex_update_dialog_detected agent=quantlab-sol" in capsys.readouterr().out
+
+
+def test_late_result_after_quarantine_terminalizes_on_next_cycle(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    now = datetime(2026, 9, 27, 7, 0, tzinfo=timezone.utc)
+    path = recovery.RUNNING / "task-1.json"
+    write_task(path, task(now))
+    monkeypatch.setattr(recovery, "active_worker_tasks", lambda: set())
+
+    recovery.recover_orphan_tasks(now)
+    sidecars_before = list(recovery.RESULTS.glob("task-1.watchdog-recovery-*.json"))
+    assert len(sidecars_before) == 1
+    assert path.exists()
+
+    write_task(
+        recovery.RESULTS / "task-1.json",
+        {
+            "task_id": "task-1",
+            "run_token": "token-1",
+            "status": "completed",
+            "blocker": None,
+        },
+    )
+    recovery.recover_orphan_tasks(now + timedelta(seconds=60))
+
+    assert not path.exists()
+    assert (recovery.DONE / "task-1.json").exists()
+    assert len(list(recovery.RESULTS.glob("task-1.watchdog-recovery-*.json"))) == 1
+
+
+def test_quarantined_orphan_does_not_repeat_sidecar_evidence(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    now = datetime(2026, 9, 27, 7, 0, tzinfo=timezone.utc)
+    path = recovery.RUNNING / "task-1.json"
+    write_task(path, task(now))
+    monkeypatch.setattr(recovery, "active_worker_tasks", lambda: set())
+
+    recovery.recover_orphan_tasks(now)
+    recovery.recover_orphan_tasks(now + timedelta(seconds=60))
+
+    assert path.exists()
+    assert len(list(recovery.RESULTS.glob("task-1.watchdog-recovery-*.json"))) == 1
