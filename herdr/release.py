@@ -5,7 +5,6 @@ import gzip
 import hashlib
 import io
 import json
-import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
@@ -196,7 +195,8 @@ def safe_extract(archive: tarfile.TarFile, destination: Path) -> None:
 def file_manifest(root: Path, *, exclude: Iterable[str] = ()) -> bytes:
     excluded = set(exclude)
     lines = []
-    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+    files = (path for path in root.rglob("*") if path.is_file())
+    for path in sorted(files, key=lambda item: item.relative_to(root).as_posix()):
         relative = path.relative_to(root).as_posix()
         if relative in excluded:
             continue
@@ -278,6 +278,12 @@ def build_release(repo: Path, tag: str, commit: str, output: Path) -> dict[str, 
     _need(_git(repo, "cat-file", "-t", f"refs/tags/{tag}") == "tag", "annotated_tag_required")
     _need(_git(repo, "status", "--porcelain", "--untracked-files=no") == "", "dirty_repository")
     commit_time = int(_git(repo, "show", "-s", "--format=%ct", commit))
+    tree = _git(repo, "ls-tree", "-r", commit, "--", *PAYLOAD_PATHS)
+    executable_paths = {
+        line.split(maxsplit=3)[3]
+        for line in tree.splitlines()
+        if line.startswith("100755 ")
+    }
     # Archive committed bytes, never platform-specific checkout conversions.
     archive_data = _git(repo, "-c", "core.autocrlf=false", "archive", "--format=tar",
                         commit, "--", *PAYLOAD_PATHS, binary=True)
@@ -316,8 +322,12 @@ def build_release(repo: Path, tag: str, commit: str, output: Path) -> dict[str, 
         with output.open("xb") as raw:
             with gzip.GzipFile(fileobj=raw, mode="wb", filename="", mtime=0) as zipped:
                 with tarfile.open(fileobj=zipped, mode="w", format=tarfile.PAX_FORMAT) as archive:
-                    for item in sorted([staging, *staging.rglob("*")]):
+                    items = [staging, *staging.rglob("*")]
+                    items.sort(key=lambda item: "" if item == staging else
+                               item.relative_to(staging).as_posix())
+                    for item in items:
                         relative = Path(identifier) / item.relative_to(staging)
+                        payload_name = item.relative_to(staging).as_posix()
                         info = archive.gettarinfo(str(item), arcname=relative.as_posix())
                         info.uid = info.gid = 0
                         info.uname = info.gname = "root"
@@ -326,7 +336,7 @@ def build_release(repo: Path, tag: str, commit: str, output: Path) -> dict[str, 
                             info.mode = 0o555
                             archive.addfile(info)
                         else:
-                            info.mode = 0o555 if os.access(item, os.X_OK) else 0o444
+                            info.mode = 0o555 if payload_name in executable_paths else 0o444
                             with item.open("rb") as stream:
                                 archive.addfile(info, stream)
     verified = verify_archive(output)
