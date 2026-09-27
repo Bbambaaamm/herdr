@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from herdr.telemetry import CostUnknownReason, TelemetryStore
 from herdr import (
     AllowDecision,
     AuditLog,
@@ -157,6 +158,53 @@ def test_concurrency_cap_serializes_dispatch(tmp_path: Path) -> None:
     _submit(sched, [_node("a"), _node("b")], issue="230")
     leases = sched.dispatch()
     assert len(leases) == 1  # backpressure: second node waits
+
+
+def test_authoritative_telemetry_emits_real_lifecycle_timing(tmp_path: Path) -> None:
+    now = [1_000.0]
+    store = TelemetryStore(tmp_path / "telemetry.jsonl")
+    sched = DynamicChildScheduler(
+        budget=SchedulerBudget(max_global_concurrency=1),
+        clock=lambda: now[0],
+        audit_log=AuditLog(tmp_path / "events.jsonl"),
+        telemetry_store=store,
+    )
+    _submit(sched, [_node("a"), _node("b")], issue="230")
+    now[0] = 1_002.0
+    leases = sched.dispatch()
+    assert [lease.task_id for lease in leases] == ["a"]
+
+    now[0] = 1_007.0
+    result_sha = "a" * 64
+    lease = leases[0]
+    assert sched.complete(
+        "a",
+        result_sha,
+        agent_id=lease.agent_id,
+        fencing_token=lease.fencing_token,
+    )
+
+    events = store.read()
+    a_events = [event for event in events if event.task_id == "a"]
+    assert [event.state for event in a_events] == ["pending", "running", "done"]
+    assert a_events[1].queue_wait_ms == 2_000
+    assert a_events[2].runtime_ms == 5_000
+    assert a_events[2].result_sha == result_sha
+    assert all(
+        event.cost_unknown_reason is CostUnknownReason.NON_BILLABLE
+        for event in a_events
+    )
+    b_events = [event for event in events if event.task_id == "b"]
+    assert b_events[-1].state == "blocked"
+    assert b_events[-1].blocker == DenyReason.GLOBAL_CONCURRENCY_LIMIT.value
+    task = store.materialize().to_json()["tasks"]["a"]
+    assert task["model"] is None
+    assert task["provider"] is None
+    assert task["queue_wait_ms"] == 2_000
+    assert task["runtime_ms"] == 5_000
+    assert task["result_sha"] == result_sha
+    assert task["cost_unknown_reason"] is None
+    assert (tmp_path / "telemetry.jsonl").stat().st_mode & 0o777 == 0o640
 
 
 # ---------------------------------------------------------------------------

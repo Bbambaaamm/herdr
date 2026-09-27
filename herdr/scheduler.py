@@ -14,6 +14,7 @@ Herdr core.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import threading
 from collections import defaultdict
@@ -24,6 +25,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, ClassVar, Protocol
 
+from herdr.telemetry import CostUnknownReason, EventType, TelemetryStore, new_event
 from herdr.taskgraph import (
     GRAPH_VERSION,
     GraphValidationError,
@@ -296,6 +298,8 @@ class TaskRecord:
     repo: str = "default"
     issue: str = ""
     policy_profile: str = "default"
+    submitted_at: float | None = None
+    started_at: float | None = None
     id: str | None = None  # set from node.id after submit
 
     def __post_init__(self) -> None:
@@ -321,6 +325,7 @@ class DynamicChildScheduler:
         clock: Callable[[], float] | None = None,
         audit_log: AuditLog | None = None,
         consumer_policy: ConsumerPolicy | None = None,
+        telemetry_store: TelemetryStore | None = None,
     ) -> None:
         self.budget = budget or SchedulerBudget(
             max_global_concurrency=4,
@@ -334,6 +339,7 @@ class DynamicChildScheduler:
         self.clock = clock or __import__("time").time
         self.audit_log = audit_log or AuditLog(HERE / EVENT_LOG_NAME)
         self.consumer_policy = consumer_policy or _DefaultConsumerPolicy()
+        self.telemetry_store = telemetry_store
         self._tasks: dict[str, TaskRecord] = {}
         self._claims: dict[str, Lease] = {}
         self._next_agent_id_value: int = 1
@@ -346,6 +352,59 @@ class DynamicChildScheduler:
         self._plan_max_nodes = self.budget.max_dag_nodes
         self._plan_max_depth = self.budget.max_dag_depth
         self._plan_max_fanout = self.budget.max_dag_fanout
+
+    @staticmethod
+    def _safe_telemetry_token(value: str | None, fallback: str) -> str | None:
+        if value is None:
+            return None
+        if re.fullmatch(r"[A-Za-z0-9._:/@+-]{1,256}", value):
+            return value
+        return fallback
+
+    @staticmethod
+    def _telemetry_result_sha(result: str) -> str | None:
+        return result if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", result) else None
+
+    def _emit_task_telemetry(
+        self,
+        rec: TaskRecord,
+        event_type: EventType,
+        *,
+        state: str | None = None,
+        reason: str | None = None,
+        runtime_ms: int | None = None,
+        queue_wait_ms: int | None = None,
+        result_sha: str | None = None,
+        retry_count: int = 0,
+        blocker: str | None = None,
+        moment: float | None = None,
+    ) -> None:
+        if self.telemetry_store is None:
+            return
+        agent_id = rec.agent_id or (rec.lease.agent_id if rec.lease is not None else None)
+        if not rec.issue or agent_id is None:
+            raise SchedulerError("telemetry requires issue and agent identity")
+        observed_at = self.clock() if moment is None else moment
+        self.telemetry_store.append(
+            new_event(
+                event_type=event_type,
+                issue=rec.issue,
+                task_id=rec.node.id,
+                parent_task_id=rec.parent_task_id,
+                agent_id=agent_id,
+                role=rec.node.role,
+                attempt=rec.attempts,
+                timestamp=datetime.fromtimestamp(observed_at, UTC).isoformat(),
+                state=state,
+                reason=self._safe_telemetry_token(reason, "event"),
+                runtime_ms=runtime_ms,
+                queue_wait_ms=queue_wait_ms,
+                result_sha=result_sha,
+                retry_count=retry_count,
+                blocker=self._safe_telemetry_token(blocker, "blocked"),
+                cost_unknown_reason=CostUnknownReason.NON_BILLABLE,
+            )
+        )
 
     # -- submission ----------------------------------------------------------
 
@@ -395,6 +454,7 @@ class DynamicChildScheduler:
                 if isinstance(node.model_policy, Mapping)
                 else None,
             )
+            rec.submitted_at = self.clock()
             self._tasks[node.id] = rec
             agent_id_str = f"agent-{self._next_agent_id()}"
             rec.lease = Lease(
@@ -441,6 +501,12 @@ class DynamicChildScheduler:
                     "policy_profile": graph.envelope.policy_profile,
                     "ts": now,
                 }
+            )
+            self._emit_task_telemetry(
+                rec,
+                EventType.TASK_STATE,
+                state=LifecycleState.PENDING.value,
+                moment=rec.submitted_at,
             )
         self.audit_log.append(
             {
@@ -623,14 +689,26 @@ class DynamicChildScheduler:
                 continue
             if used_global >= self.budget.max_global_concurrency:
                 rec.blocker = DenyReason.GLOBAL_CONCURRENCY_LIMIT.value
+                self._emit_task_telemetry(
+                    rec, EventType.BLOCKER, state=LifecycleState.BLOCKED.value,
+                    blocker=rec.blocker, moment=now,
+                )
                 continue
             repo_ctx = rec.repo
             issue_ctx = rec.issue
             if used_repo[repo_ctx] >= self.budget.max_per_repo:
                 rec.blocker = DenyReason.PER_REPO_LIMIT.value
+                self._emit_task_telemetry(
+                    rec, EventType.BLOCKER, state=LifecycleState.BLOCKED.value,
+                    blocker=rec.blocker, moment=now,
+                )
                 continue
             if issue_ctx and used_issue[issue_ctx] >= self.budget.max_per_issue:
                 rec.blocker = DenyReason.PER_ISSUE_LIMIT.value
+                self._emit_task_telemetry(
+                    rec, EventType.BLOCKER, state=LifecycleState.BLOCKED.value,
+                    blocker=rec.blocker, moment=now,
+                )
                 continue
             if rec.lease is not None:
                 lease = rec.lease
@@ -648,6 +726,8 @@ class DynamicChildScheduler:
                 rec.lease = lease
             rec.state = LifecycleState.RUNNING
             rec.agent_id = lease.agent_id
+            rec.started_at = now
+            rec.blocker = None
             used_global += 1
             used_repo[repo_ctx] += 1
             if issue_ctx:
@@ -662,6 +742,18 @@ class DynamicChildScheduler:
                     "lease_until": lease.lease_until,
                     "ts": datetime.now(UTC).isoformat(),
                 }
+            )
+            queue_wait_ms = (
+                None
+                if rec.submitted_at is None
+                else int(max(0.0, now - rec.submitted_at) * 1000)
+            )
+            self._emit_task_telemetry(
+                rec,
+                EventType.TASK_STATE,
+                state=LifecycleState.RUNNING.value,
+                queue_wait_ms=queue_wait_ms,
+                moment=now,
             )
         return leases
 
@@ -705,6 +797,11 @@ class DynamicChildScheduler:
             LifecycleState.CANCELLED,
         ):
             return False
+        runtime_ms = (
+            None
+            if rec.started_at is None
+            else int(max(0.0, now - rec.started_at) * 1000)
+        )
         rec.state = LifecycleState.DONE
         rec.lease = None
         if agent_id is not None:
@@ -721,6 +818,14 @@ class DynamicChildScheduler:
                 "state": LifecycleState.DONE.value,
                 "ts": datetime.now(UTC).isoformat(),
             }
+        )
+        self._emit_task_telemetry(
+            rec,
+            EventType.TASK_STATE,
+            state=LifecycleState.DONE.value,
+            runtime_ms=runtime_ms,
+            result_sha=self._telemetry_result_sha(result),
+            moment=now,
         )
         self.audit_log.flush()
         self._mark_dependents_done(task_id)
@@ -743,6 +848,12 @@ class DynamicChildScheduler:
         rec = self._tasks.get(task_id)
         if rec is None:
             return
+        now = self.clock()
+        runtime_ms = (
+            None
+            if rec.started_at is None
+            else int(max(0.0, now - rec.started_at) * 1000)
+        )
         rec.state = LifecycleState.FAILED
         rec.attempts += 1
         self.audit_log.append(
@@ -754,6 +865,14 @@ class DynamicChildScheduler:
                 "ts": datetime.now(UTC).isoformat(),
             }
         )
+        self._emit_task_telemetry(
+            rec,
+            EventType.TASK_STATE,
+            state=LifecycleState.FAILED.value,
+            runtime_ms=runtime_ms,
+            retry_count=rec.attempts,
+            moment=now,
+        )
         self.audit_log.flush()
         # Propagate BLOCKED to dependents
         for other_id, other_rec in self._tasks.items():
@@ -763,6 +882,13 @@ class DynamicChildScheduler:
             ):
                 other_rec.state = LifecycleState.BLOCKED
                 other_rec.blocker = f"prereq_failed:{task_id}"
+                self._emit_task_telemetry(
+                    other_rec,
+                    EventType.BLOCKER,
+                    state=LifecycleState.BLOCKED.value,
+                    blocker=other_rec.blocker,
+                    moment=now,
+                )
 
     # -- fencing / reclaim ---------------------------------------------------
 
@@ -799,11 +925,21 @@ class DynamicChildScheduler:
             )
             rec.state = LifecycleState.PENDING
             rec.blocker = None
+            rec.submitted_at = now
+            rec.started_at = None
             rec.telemetry.append(
                 {
                     "event": "reclaim",
                     "ts": datetime.now(UTC).isoformat(),
                 }
+            )
+            self._emit_task_telemetry(
+                rec,
+                EventType.RETRY,
+                state=LifecycleState.PENDING.value,
+                reason="worker_reclaim",
+                retry_count=rec.attempts,
+                moment=now,
             )
         self.audit_log.append(
             {
@@ -819,6 +955,12 @@ class DynamicChildScheduler:
         rec = self._tasks.get(task_id)
         if rec is None:
             return
+        now = self.clock()
+        runtime_ms = (
+            None
+            if rec.started_at is None
+            else int(max(0.0, now - rec.started_at) * 1000)
+        )
         rec.state = LifecycleState.CANCELLED
         rec.lease = None
         rec.blocker = reason
@@ -830,6 +972,14 @@ class DynamicChildScheduler:
                 "state": LifecycleState.CANCELLED.value,
                 "ts": datetime.now(UTC).isoformat(),
             }
+        )
+        self._emit_task_telemetry(
+            rec,
+            EventType.TASK_STATE,
+            state=LifecycleState.CANCELLED.value,
+            runtime_ms=runtime_ms,
+            blocker=reason,
+            moment=now,
         )
         self.audit_log.flush()
 
@@ -933,6 +1083,7 @@ class DynamicChildScheduler:
             model_used=proposal.child_model,
             fallback_used=proposal.child_fallback_model,
         )
+        rec.submitted_at = self.clock()
         self._tasks[child_id] = rec
         child_agent_id = f"agent-{self._next_agent_id()}"
         rec.lease = Lease(
@@ -946,6 +1097,12 @@ class DynamicChildScheduler:
         rec.agent_id = child_agent_id
         rec.fencing_token = rec.lease.fencing_token
         # NOTE: child remains PENDING until dispatched and completed by caller
+        self._emit_task_telemetry(
+            rec,
+            EventType.TASK_STATE,
+            state=LifecycleState.PENDING.value,
+            moment=rec.submitted_at,
+        )
         self.audit_log.append(
             {
                 "event": "spawn_child",
@@ -1306,6 +1463,12 @@ class DynamicChildScheduler:
                 "fencing_token": lease.fencing_token,
                 "ts": datetime.now(UTC).isoformat(),
             }
+        )
+        self._emit_task_telemetry(
+            rec,
+            EventType.TASK_STATE,
+            state=rec.state.value,
+            moment=self.clock(),
         )
         return lease
 

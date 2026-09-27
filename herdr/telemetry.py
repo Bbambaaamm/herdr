@@ -292,7 +292,11 @@ class Aggregate:
             output_tokens=self.output_tokens + (event.output_tokens or 0),
             cached_tokens=self.cached_tokens + (event.cached_tokens or 0),
             actual_cost_microusd=self.actual_cost_microusd + (event.actual_cost_microusd or 0),
-            unknown_cost_events=self.unknown_cost_events + int(event.actual_cost_microusd is None),
+            unknown_cost_events=self.unknown_cost_events
+            + int(
+                event.actual_cost_microusd is None
+                and event.cost_unknown_reason is not CostUnknownReason.NON_BILLABLE
+            ),
             fallbacks=self.fallbacks + int(event.event_type is EventType.MODEL_FALLBACK),
             latency_ms_total=self.latency_ms_total + (latency or 0),
             latency_samples=self.latency_samples + int(latency is not None),
@@ -344,12 +348,27 @@ def materialize(events: Iterable[TelemetryEvent]) -> TelemetryReadModel:
                 "state": None,
                 "model": None,
                 "provider": None,
+                "fallback_chain": [],
+                "runtime_ms": None,
+                "queue_wait_ms": None,
+                "branch": None,
+                "base_sha": None,
+                "result_sha": None,
+                "test_result": None,
+                "reviewer_result": None,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cached_tokens": 0,
+                "actual_cost_microusd": 0,
+                "cost_unknown_reason": None,
+                "currency": "USD",
+                "pricing_version": None,
+                "retry_count": 0,
                 "last_event_type": None,
                 "last_sequence": 0,
                 "last_timestamp": None,
+                "last_events": [],
                 "blocker": None,
-                "reviewer_result": None,
-                "result_sha": None,
             },
         )
         state.update(
@@ -369,12 +388,40 @@ def materialize(events: Iterable[TelemetryEvent]) -> TelemetryReadModel:
             state["model"] = event.model
         if event.provider is not None:
             state["provider"] = event.provider
+        if event.fallback_chain:
+            state["fallback_chain"] = list(event.fallback_chain)
+        for field_name in (
+            "runtime_ms", "queue_wait_ms", "branch", "base_sha", "result_sha",
+            "test_result", "reviewer_result", "pricing_version",
+        ):
+            value = getattr(event, field_name)
+            if value is not None:
+                state[field_name] = value
         if event.blocker is not None:
             state["blocker"] = event.blocker
-        if event.reviewer_result is not None:
-            state["reviewer_result"] = event.reviewer_result
-        if event.result_sha is not None:
-            state["result_sha"] = event.result_sha
+        state["input_tokens"] += event.input_tokens or 0
+        state["output_tokens"] += event.output_tokens or 0
+        state["cached_tokens"] += event.cached_tokens or 0
+        if event.actual_cost_microusd is not None:
+            state["actual_cost_microusd"] += event.actual_cost_microusd
+        elif event.cost_unknown_reason not in (None, CostUnknownReason.NON_BILLABLE):
+            state["cost_unknown_reason"] = event.cost_unknown_reason.value
+        state["retry_count"] = max(state["retry_count"], event.retry_count)
+        recent = list(state["last_events"])
+        recent.append(
+            {
+                "event_id": event.event_id,
+                "sequence": event.sequence,
+                "timestamp": event.timestamp,
+                "event_type": event.event_type.value,
+                "state": event.state,
+                "reason": event.reason,
+                "blocker": event.blocker,
+                "test_result": event.test_result,
+                "reviewer_result": event.reviewer_result,
+            }
+        )
+        state["last_events"] = recent[-5:]
 
         by_issue[event.issue] = by_issue[event.issue].add(event)
         by_agent[event.agent_id] = by_agent[event.agent_id].add(event)
@@ -437,6 +484,7 @@ class TelemetryStore:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
+            os.chmod(self.path, 0o640)
         return assigned
 
     def read_since(self, sequence: int, *, limit: int = 256) -> tuple[TelemetryEvent, ...]:
