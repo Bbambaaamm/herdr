@@ -648,3 +648,123 @@ def test_create_task_session_rejects_wrong_started_agent(tmp_path, monkeypatch):
         raise AssertionError("wrong agent identity must fail closed")
 
     assert closed == ["owned-pane"]
+
+
+def test_prepare_attempt_refuses_unclosed_previous_session(tmp_path):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["execution_session"] = {
+        "pane_id": "old-pane",
+        "owned_pane": True,
+    }
+
+    try:
+        worker.prepare_attempt(task)
+    except RuntimeError as exc:
+        assert str(exc) == "previous_task_session_not_closed"
+    else:
+        raise AssertionError("new attempt must not discard an open prior task pane")
+
+
+def test_parse_herdr_json_skips_malformed_json_lines():
+    proc = worker.subprocess.CompletedProcess(
+        ["herdr"],
+        0,
+        stdout='not-json\n{broken}\n{"result":{"ok":true}}\n',
+        stderr="",
+    )
+
+    parsed = worker._parse_herdr_json(proc, "test")
+    assert parsed == {"result": {"ok": True}}
+
+
+def test_create_task_session_never_closes_persistent_coordinator(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["workspace"] = str(tmp_path / "workspace")
+    task["routing"] = {"selected_agent": "quantlab-hermes"}
+    task["run_token"] = "same-pane-run"
+    closed = []
+
+    def fake_herdr_json(args, *, timeout_seconds=30.0):
+        if args[:2] == ["agent", "get"]:
+            return {
+                "result": {
+                    "agent": {
+                        "agent": "hermes",
+                        "name": "quantlab-hermes",
+                        "pane_id": "persistent-pane",
+                        "workspace_id": "w2",
+                    }
+                }
+            }
+        if args[:2] == ["pane", "split"]:
+            return {"result": {"pane": {"pane_id": "persistent-pane"}}}
+        raise AssertionError(args)
+
+    monkeypatch.setattr(worker, "_herdr_json", fake_herdr_json)
+    monkeypatch.setattr(worker, "_close_owned_pane", lambda pane_id: closed.append(pane_id) or True)
+
+    try:
+        worker.create_task_session(task)
+    except RuntimeError as exc:
+        assert str(exc) == "task_session_split_uncertain:coordinator_pane_reused"
+    else:
+        raise AssertionError("persistent coordinator pane must never become task-owned")
+    assert closed == []
+
+
+def test_cleanup_refuses_persistent_coordinator_pane(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["execution_session"] = {
+        "agent_name": "task-agent",
+        "session_name": "durable-bad",
+        "pane_id": "persistent-pane",
+        "coordinator_pane_id": "persistent-pane",
+        "owned_pane": True,
+    }
+    closed = []
+    monkeypatch.setattr(worker, "_close_owned_pane", lambda pane_id: closed.append(pane_id) or True)
+
+    assert worker.cleanup_task_session(task) is False
+    assert task["execution_session"]["cleanup_status"] == "refused"
+    assert closed == []
+
+
+def test_create_task_session_validates_started_agent_identity(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["workspace"] = str(tmp_path / "workspace")
+    task["routing"] = {"selected_agent": "quantlab-hermes"}
+    task["run_token"] = "wrong-agent-run"
+    closed = []
+
+    def fake_herdr_json(args, *, timeout_seconds=30.0):
+        if args[:2] == ["agent", "get"]:
+            return {
+                "result": {
+                    "agent": {
+                        "agent": "hermes",
+                        "name": "quantlab-hermes",
+                        "pane_id": "persistent-pane",
+                        "workspace_id": "w2",
+                    }
+                }
+            }
+        if args[:2] == ["pane", "split"]:
+            return {"result": {"pane": {"pane_id": "owned-pane"}}}
+        if args[:2] == ["agent", "start"]:
+            return {"result": {"agent": {"name": "unexpected-agent", "pane_id": "owned-pane"}}}
+        raise AssertionError(args)
+
+    monkeypatch.setattr(worker, "_herdr_json", fake_herdr_json)
+    monkeypatch.setattr(worker, "_close_owned_pane", lambda pane_id: closed.append(pane_id) or True)
+
+    try:
+        worker.create_task_session(task)
+    except RuntimeError as exc:
+        assert str(exc) == "task_session_agent_start_invalid"
+    else:
+        raise AssertionError("unexpected started agent identity must fail closed")
+    assert closed == ["owned-pane"]
