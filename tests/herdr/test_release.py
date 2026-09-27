@@ -36,7 +36,9 @@ def minimal_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path,
         "herdr 0.9.1\nhome=https://herdr.dev\nbinary_sha256=" + "a" * 64
         + "\nbinary_size=42\nbinary_path=/external/herdr\n"
         "note=External binary dependency is pinned.\n", encoding="utf-8")
-    (repo / "payload.txt").write_text("bounded payload\n", encoding="utf-8")
+    payload = repo / "payload.txt"
+    payload.write_text("bounded payload\n", encoding="utf-8")
+    payload.chmod(0o755)
     git(repo, "init", "-q")
     git(repo, "add", ".")
     git(repo, "update-index", "--chmod=+x", "payload.txt")
