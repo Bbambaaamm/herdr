@@ -187,7 +187,8 @@ def test_task_session_identity_is_bound_to_run_token(tmp_path):
     first_identity = worker._task_session_identity(first)
     assert first_identity == worker._task_session_identity(first)
     assert first_identity != worker._task_session_identity(second)
-    assert first_identity[0].startswith("quantlab-hermes-task-")
+    assert first_identity[0].startswith("quantlab-herm-t-")
+    assert len(first_identity[0]) <= 32
     assert first_identity[1].startswith("durable-")
     assert "task-1" not in first_identity[1]
 
@@ -701,3 +702,20 @@ def test_create_task_session_rejects_wrong_started_agent(tmp_path, monkeypatch):
         raise AssertionError("wrong agent identity must fail closed")
 
     assert closed == ["owned-pane"]
+
+
+def test_task_session_agent_name_respects_herdr_limit_for_all_coordinators(tmp_path):
+    configure_paths(tmp_path)
+    names = []
+    for coordinator in ("quantlab-hermes", "dotacni-majak-hermes"):
+        task = base_task()
+        task["routing"] = {"selected_agent": coordinator}
+        task["run_token"] = "same-run-token"
+        agent_name, session_name = worker._task_session_identity(task)
+        assert 1 <= len(agent_name) <= 32
+        assert agent_name[0].islower()
+        assert all(ch.islower() or ch.isdigit() or ch in "_-" for ch in agent_name)
+        assert len(session_name) <= 32
+        names.append(agent_name)
+
+    assert names[0] != names[1]
