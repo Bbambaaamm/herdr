@@ -36,9 +36,12 @@ def minimal_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path,
         "herdr 0.9.1\nhome=https://herdr.dev\nbinary_sha256=" + "a" * 64
         + "\nbinary_size=42\nbinary_path=/external/herdr\n"
         "note=External binary dependency is pinned.\n", encoding="utf-8")
-    (repo / "payload.txt").write_text("bounded payload\n", encoding="utf-8")
+    payload = repo / "payload.txt"
+    payload.write_text("bounded payload\n", encoding="utf-8")
+    payload.chmod(0o755)
     git(repo, "init", "-q")
     git(repo, "add", ".")
+    git(repo, "update-index", "--chmod=+x", "payload.txt")
     git(repo, "-c", "user.name=Test", "-c", "user.email=test@localhost",
         "commit", "-qm", "release fixture")
     commit = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
@@ -59,12 +62,26 @@ def test_consumer_contract_is_closed_and_permission_monotonic():
 
 def test_release_build_is_deterministic_and_tamper_evident(tmp_path, monkeypatch):
     repo, commit = minimal_repo(tmp_path, monkeypatch)
+    git(repo, "config", "core.autocrlf", "true")
     first, second = tmp_path / "first.tar.gz", tmp_path / "second.tar.gz"
     one = release.build_release(repo, "v1.2.3-rc.1", commit, first)
     two = release.build_release(repo, "v1.2.3-rc.1", commit, second)
     assert first.read_bytes() == second.read_bytes()
     assert one["archive_sha256"] == two["archive_sha256"]
+    assert one["config_contract_sha256"] == release.consumer_digest(
+        {f"{name}.yaml": consumer(name) for name in release.CONSUMERS})
     assert release.verify_archive(first)["commit"] == commit
+    with tarfile.open(first, "r:gz") as archive:
+        members = archive.getmembers()
+        assert [member.name for member in members[1:]] == sorted(
+            member.name for member in members[1:])
+        modes = {member.name: member.mode for member in members}
+        prefix = f"v1.2.3-rc.1-{commit[:12]}"
+        manifest = archive.extractfile(f"{prefix}/MANIFEST.sha256").read().decode().splitlines()
+        manifest_paths = [line.split("  ", 1)[1] for line in manifest]
+        assert manifest_paths == sorted(manifest_paths)
+        assert modes[f"{prefix}/payload.txt"] == 0o555
+        assert modes[f"{prefix}/configs/consumers/heating.yaml"] == 0o444
     damaged = tmp_path / "damaged.tar.gz"
     data = bytearray(first.read_bytes())
     data[len(data) // 2] ^= 1
