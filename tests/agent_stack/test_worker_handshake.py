@@ -173,3 +173,158 @@ def test_finish_without_result_defers_same_attempt(tmp_path):
     assert saved["attempts"] == 0
     assert saved["run_token"] == token
     assert saved["delivery_reconcile_count"] == 1
+
+
+def test_task_session_identity_is_bound_to_run_token(tmp_path):
+    configure_paths(tmp_path)
+    first = base_task()
+    first["routing"] = {"selected_agent": "quantlab-hermes"}
+    first["run_token"] = "run-a"
+    second = dict(first)
+    second["run_token"] = "run-b"
+
+    first_identity = worker._task_session_identity(first)
+    assert first_identity == worker._task_session_identity(first)
+    assert first_identity != worker._task_session_identity(second)
+    assert first_identity[0].startswith("quantlab-hermes-task-")
+    assert first_identity[1].startswith("durable-")
+    assert "task-1" not in first_identity[1]
+
+
+def test_create_task_session_uses_fresh_owned_pane_and_named_chat(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["workspace"] = str(tmp_path / "workspace")
+    task["routing"] = {"selected_agent": "quantlab-hermes"}
+    task["run_token"] = "isolated-run"
+
+    calls = []
+
+    def fake_herdr_json(args, *, timeout_seconds=30.0):
+        calls.append(list(args))
+        if args[:2] == ["agent", "get"]:
+            return {
+                "result": {
+                    "agent": {
+                        "agent": "hermes",
+                        "name": "quantlab-hermes",
+                        "pane_id": "persistent-pane",
+                    }
+                }
+            }
+        if args[:2] == ["pane", "split"]:
+            return {"result": {"pane": {"pane_id": "owned-task-pane"}}}
+        if args[:2] == ["agent", "start"]:
+            return {"result": {"agent": {"name": args[2]}}}
+        raise AssertionError(args)
+
+    monkeypatch.setattr(worker, "_herdr_json", fake_herdr_json)
+    session = worker.create_task_session(task)
+
+    assert session["coordinator_agent"] == "quantlab-hermes"
+    assert session["coordinator_pane_id"] == "persistent-pane"
+    assert session["pane_id"] == "owned-task-pane"
+    assert session["agent_name"] != "quantlab-hermes"
+    split = next(call for call in calls if call[:2] == ["pane", "split"])
+    assert ["--pane", "persistent-pane"] == split[2:4]
+    start = next(call for call in calls if call[:2] == ["agent", "start"])
+    assert start[2] == session["agent_name"]
+    assert "--continue" in start
+    assert start[start.index("--continue") + 1] == session["session_name"]
+    assert "--create-if-missing" in start
+    assert "--in" in start
+    assert start[start.index("--in") + 1] == task["workspace"]
+
+
+def test_run_prompt_targets_task_session_never_persistent_coordinator(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["run_token"] = "isolated-run"
+    task["routing"] = {
+        "selected_agent": "quantlab-hermes",
+        "executor_agent": "quantlab-hermes",
+        "tier": "free",
+        "model": "nous-adaptive-free",
+    }
+    task["execution_session"] = {
+        "agent_name": "quantlab-hermes-task-deadbeef",
+        "session_name": "durable-deadbeef",
+        "pane_id": "owned-task-pane",
+        "coordinator_agent": "quantlab-hermes",
+        "owned_pane": True,
+    }
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = list(cmd)
+        return worker.subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+    rc, output = worker.run_prompt(task)
+
+    assert rc == 0
+    assert output == "ok"
+    assert seen["cmd"][1:4] == [
+        "agent",
+        "prompt",
+        "quantlab-hermes-task-deadbeef",
+    ]
+    assert "quantlab-hermes" not in seen["cmd"][3:4]
+    prompt = worker.prompt_text(task)
+    assert "isolated durable-task session quantlab-hermes-task-deadbeef" in prompt
+    assert "persistent coordinator chat is control-plane only" in prompt
+
+
+def test_run_prompt_fails_closed_without_isolated_session(tmp_path):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["run_token"] = "missing-session"
+    task["routing"] = {"selected_agent": "quantlab-hermes"}
+
+    try:
+        worker.run_prompt(task)
+    except RuntimeError as exc:
+        assert str(exc) == "task_session_isolation_missing"
+    else:
+        raise AssertionError("run_prompt must not fall back to persistent coordinator")
+
+
+def test_cleanup_closes_only_owned_task_pane(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["execution_session"] = {
+        "agent_name": "quantlab-hermes-task-deadbeef",
+        "session_name": "durable-deadbeef",
+        "pane_id": "owned-task-pane",
+        "coordinator_pane_id": "persistent-pane",
+        "owned_pane": True,
+    }
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return worker.subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+    worker.cleanup_task_session(task)
+
+    assert calls == [[str(worker.HERDR), "pane", "close", "owned-task-pane"]]
+    assert task["execution_session"]["cleanup_status"] == "closed"
+    assert task["execution_session"]["pane_id"] != task["execution_session"]["coordinator_pane_id"]
+
+
+def test_new_semantic_attempt_discards_previous_session_metadata(tmp_path):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["execution_session"] = {
+        "agent_name": "old-task-agent",
+        "session_name": "durable-old",
+        "pane_id": "old-pane",
+        "owned_pane": True,
+        "closed_at": "2026-09-27T00:00:00+00:00",
+    }
+
+    worker.prepare_attempt(task)
+
+    assert "execution_session" not in task
+    assert task["run_token"]

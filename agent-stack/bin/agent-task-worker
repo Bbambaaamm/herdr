@@ -64,6 +64,7 @@ def prepare_attempt(task: dict) -> None:
         return
     attempt = int(task.get("attempts") or 0)
     archive_previous_result(str(task["id"]), attempt)
+    task.pop("execution_session", None)
     task["run_token"] = uuid.uuid4().hex
     task["attempt_id"] = attempt
     seed = ":".join(
@@ -79,6 +80,154 @@ def prepare_attempt(task: dict) -> None:
     task["attempt_state"] = "dispatching"
     task["attempt_started_at"] = utcnow().isoformat()
 
+def _parse_herdr_json(proc: subprocess.CompletedProcess[str], context: str) -> dict:
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or context).strip())
+    text = (proc.stdout or "").strip()
+    for line in reversed(text.splitlines()):
+        candidate = line.strip()
+        if candidate.startswith("{"):
+            payload = json.loads(candidate)
+            if isinstance(payload, dict):
+                return payload
+    raise RuntimeError(f"{context}: no JSON response")
+
+
+def _herdr_json(args: list[str], *, timeout_seconds: float = 30.0) -> dict:
+    proc = subprocess.run(
+        [str(HERDR), *args],
+        text=True,
+        capture_output=True,
+        timeout=timeout_seconds,
+        env=ENV,
+    )
+    return _parse_herdr_json(proc, "herdr " + " ".join(args[:2]))
+
+
+def _task_session_identity(task: dict) -> tuple[str, str]:
+    run_token = str(task.get("run_token") or "")
+    if not run_token:
+        raise RuntimeError("task session requires run_token")
+    routing = task.get("routing") if isinstance(task.get("routing"), dict) else {}
+    coordinator = str(
+        routing.get("selected_agent") or task.get("agent") or "quantlab-hermes"
+    )
+    digest = hashlib.sha256(
+        f"{task['id']}:{run_token}".encode("utf-8")
+    ).hexdigest()
+    return f"{coordinator}-task-{digest[:12]}", f"durable-{digest[:20]}"
+
+
+def _task_hermes_profile(task: dict) -> str:
+    explicit = str(task.get("hermes_profile") or "").strip()
+    if explicit:
+        return explicit
+    profile = str(task.get("safety_profile") or "quantlab")
+    return "majak" if profile == "dotacni-majak" else "quantlab"
+
+
+def create_task_session(task: dict) -> dict:
+    """Create one fresh Hermes pane/session for exactly one durable attempt."""
+    routing = task.get("routing") if isinstance(task.get("routing"), dict) else {}
+    coordinator = str(
+        routing.get("selected_agent") or task.get("agent") or "quantlab-hermes"
+    )
+    info = _herdr_json(["agent", "get", coordinator], timeout_seconds=15.0)
+    agent_info = (info.get("result") or {}).get("agent")
+    if not isinstance(agent_info, dict):
+        raise RuntimeError("task_session_coordinator_not_found")
+    kind = str(agent_info.get("agent") or agent_info.get("kind") or "")
+    if kind != "hermes":
+        raise RuntimeError(f"task_session_requires_hermes_coordinator:{kind or 'unknown'}")
+    coordinator_pane = str(agent_info.get("pane_id") or "")
+    if not coordinator_pane:
+        raise RuntimeError("task_session_coordinator_pane_missing")
+
+    workspace = str(task.get("workspace") or "/home/agentops/workspaces/quantlab")
+    agent_name, session_name = _task_session_identity(task)
+    pane_id = ""
+    try:
+        split = _herdr_json(
+            [
+                "pane", "split", "--pane", coordinator_pane,
+                "--direction", "right", "--cwd", workspace, "--no-focus",
+            ],
+            timeout_seconds=15.0,
+        )
+        pane = (split.get("result") or {}).get("pane")
+        if not isinstance(pane, dict) or not pane.get("pane_id"):
+            raise RuntimeError("task_session_pane_split_invalid")
+        pane_id = str(pane["pane_id"])
+        profile = _task_hermes_profile(task)
+        _herdr_json(
+            [
+                "agent", "start", agent_name,
+                "--kind", "hermes", "--pane", pane_id, "--timeout", "60000",
+                "--", "-p", profile, "chat",
+                "--continue", session_name, "--create-if-missing",
+                "--in", workspace,
+            ],
+            timeout_seconds=75.0,
+        )
+    except Exception:
+        if pane_id:
+            subprocess.run(
+                [str(HERDR), "pane", "close", pane_id],
+                text=True,
+                capture_output=True,
+                timeout=15,
+                env=ENV,
+            )
+        raise
+
+    session = {
+        "agent_name": agent_name,
+        "session_name": session_name,
+        "pane_id": pane_id,
+        "coordinator_agent": coordinator,
+        "coordinator_pane_id": coordinator_pane,
+        "profile": _task_hermes_profile(task),
+        "owned_pane": True,
+        "created_at": utcnow().isoformat(),
+    }
+    task["execution_session"] = session
+    return session
+
+
+def cleanup_task_session(task: dict) -> None:
+    session = task.get("execution_session")
+    if not isinstance(session, dict) or not session.get("owned_pane"):
+        return
+    if session.get("closed_at"):
+        return
+    pane_id = str(session.get("pane_id") or "")
+    if not pane_id:
+        return
+    proc = subprocess.run(
+        [str(HERDR), "pane", "close", pane_id],
+        text=True,
+        capture_output=True,
+        timeout=15,
+        env=ENV,
+    )
+    if proc.returncode == 0:
+        session["closed_at"] = utcnow().isoformat()
+        session["cleanup_status"] = "closed"
+    else:
+        session["cleanup_status"] = "close_failed"
+        session["cleanup_error"] = (proc.stderr or proc.stdout or "pane close failed")[-1000:]
+        log(str(task.get("id") or "unknown"), f"task session cleanup failed pane={pane_id}")
+
+
+def persist_current_task(task: dict) -> None:
+    name = f"{task['id']}.json"
+    for directory in (RUNNING, PENDING, DONE, BLOCKED, FAILED):
+        path = directory / name
+        if path.exists():
+            write_json(path, task)
+            return
+
+
 def prompt_text(task: dict) -> str:
     task_id = str(task["id"])
     result = result_path(task_id)
@@ -87,6 +236,8 @@ def prompt_text(task: dict) -> str:
     profile = str(task.get("safety_profile") or "quantlab")
     routing = task.get("routing") if isinstance(task.get("routing"), dict) else {}
     agent = str(routing.get("selected_agent") or task.get("agent") or "quantlab-hermes")
+    session = task.get("execution_session") if isinstance(task.get("execution_session"), dict) else {}
+    task_agent = str(session.get("agent_name") or agent)
     executor_agent = str(routing.get("executor_agent") or agent)
     tier = str(routing.get("tier") or "free")
     model = str(routing.get("model") or "nous-adaptive-free")
@@ -97,7 +248,7 @@ def prompt_text(task: dict) -> str:
         contract = f"""
 
 TASK COMPLETION CONTRACT:
-- You are running as {agent} under Herdr for GitHub repository {repo}.
+- You are running in isolated durable-task session {task_agent}, derived from coordinator {agent}, under Herdr for GitHub repository {repo}. The persistent coordinator chat is control-plane only and must not receive this task payload.
 - Herdr is the parent authority and backlog/DAG orchestrator. You may delegate bounded implementation, research, testing, or independent review to available Dotační Maják subagents (including dotacni-majak-codex) when useful, but no child may gain permissions or authority beyond this parent task.
 - Work from {workspace}. Before code changes, fetch current origin/main, read docs/AGENT_HANDOFF.md and relevant ADR/spec files, and inspect current issue/PR/main plus prior durable results.
 - For code changes use an isolated clean issue worktree under {workspace}/worktrees/. Never contaminate another issue's checkout.
@@ -122,7 +273,7 @@ TASK COMPLETION CONTRACT:
         contract = f"""
 
 TASK COMPLETION CONTRACT:
-- You are running as persistent coordinator {agent} under Herdr; routed child-node tier={tier} executor={executor_agent} model={model}.
+- You are running in isolated durable-task session {task_agent}, derived from persistent coordinator {agent}; routed child-node tier={tier} executor={executor_agent} model={model}. The persistent coordinator chat is control-plane only and must not receive this task payload.
 - Work from the issue-specific clean worktree when code changes are needed; do not contaminate another issue's dirty checkout.
 {route_rule}
 - Preserve PAPER-only, PIT/causality, provenance, immutable audit and runtime/resource/safety guardrails.
@@ -138,8 +289,10 @@ TASK COMPLETION CONTRACT:
     return base + contract
 
 def run_prompt(task: dict) -> tuple[int, str]:
-    routing = task.get("routing") if isinstance(task.get("routing"), dict) else {}
-    agent = str(routing.get("selected_agent") or task.get("agent") or "quantlab-hermes")
+    session = task.get("execution_session")
+    if not isinstance(session, dict) or not session.get("agent_name"):
+        raise RuntimeError("task_session_isolation_missing")
+    agent = str(session["agent_name"])
     timeout_seconds = int(task.get("timeout_seconds") or 1800)
     prompt = prompt_text(task)
     cmd = [
@@ -434,69 +587,90 @@ def main(task_path: Path) -> int:
         )
 
         try:
-            rc, output = run_prompt(task)
-        except subprocess.TimeoutExpired as exc:
-            defer_delivery_reconciliation(
-                task_path, task, f"dispatcher timeout with unknown delivery state: {exc}"
-            )
-            return 1
+            try:
+                session = create_task_session(task)
+                write_json(task_path, task)
+                log(
+                    task_id,
+                    "isolated task session created "
+                    f"agent={session['agent_name']} pane={session['pane_id']} "
+                    f"session={session['session_name']}",
+                )
+            except Exception as exc:
+                retry(task_path, task, f"task_session_isolation_unavailable: {exc}")
+                return 1
 
-        log(task_id, f"herdr rc={rc} tail={output[-500:]!r}")
-        lowered = output.lower()
+            try:
+                rc, output = run_prompt(task)
+            except subprocess.TimeoutExpired as exc:
+                defer_delivery_reconciliation(
+                    task_path, task, f"dispatcher timeout with unknown delivery state: {exc}"
+                )
+                return 1
 
-        if "agent_blocked" in lowered or "requires interactive input" in lowered:
-            task["last_error"] = output[-2000:]
-            block_task(
-                task_path,
-                task,
-                "agent_interactive_input_required",
-                f"{task.get('routing', {}).get('selected_agent', 'quantlab-hermes')} is waiting at an interactive approval/question UI",
-            )
-            return 0
+            log(task_id, f"herdr rc={rc} tail={output[-500:]!r}")
+            lowered = output.lower()
 
-        if "agent_prompt_stalled" in lowered:
-            grace = int(task.get("stall_grace_seconds") or 600)
-            grace = max(30, min(grace, int(task.get("timeout_seconds") or 1800)))
-            log(
-                task_id,
-                f"prompt observation stalled; reconciling same attempt for up to {grace}s",
-            )
-            if reconcile_completion_evidence(task) or wait_for_durable_result(task, grace):
-                finish(task_path, task, output)
+            if "agent_blocked" in lowered or "requires interactive input" in lowered:
+                task["last_error"] = output[-2000:]
+                task_agent = str(
+                    (task.get("execution_session") or {}).get("agent_name")
+                    or task.get('routing', {}).get('selected_agent', 'quantlab-hermes')
+                )
+                block_task(
+                    task_path,
+                    task,
+                    "agent_interactive_input_required",
+                    f"{task_agent} is waiting at an interactive approval/question UI",
+                )
                 return 0
-            defer_delivery_reconciliation(
-                task_path,
-                task,
-                f"agent_prompt_stalled with ambiguous delivery after {grace}s: {output}",
-            )
-            return 1
 
-        provider_retry = any(
-            marker in lowered
-            for marker in (
-                "usage limit",
-                "rate limit",
-                "http 429",
-                "too many requests",
-                "provider unavailable",
-            )
-        )
-        if provider_retry:
-            retry(task_path, task, output or f"herdr rc={rc}")
-            return 1
+            if "agent_prompt_stalled" in lowered:
+                grace = int(task.get("stall_grace_seconds") or 600)
+                grace = max(30, min(grace, int(task.get("timeout_seconds") or 1800)))
+                log(
+                    task_id,
+                    f"prompt observation stalled; reconciling same attempt for up to {grace}s",
+                )
+                if reconcile_completion_evidence(task) or wait_for_durable_result(task, grace):
+                    finish(task_path, task, output)
+                    return 0
+                defer_delivery_reconciliation(
+                    task_path,
+                    task,
+                    f"agent_prompt_stalled with ambiguous delivery after {grace}s: {output}",
+                )
+                return 1
 
-        if rc != 0:
-            defer_delivery_reconciliation(
-                task_path,
-                task,
-                output or f"herdr rc={rc} with unknown delivery state",
+            provider_retry = any(
+                marker in lowered
+                for marker in (
+                    "usage limit",
+                    "rate limit",
+                    "http 429",
+                    "too many requests",
+                    "provider unavailable",
+                )
             )
-            return 1
+            if provider_retry:
+                retry(task_path, task, output or f"herdr rc={rc}")
+                return 1
 
-        task["attempt_state"] = "accepted"
-        write_json(task_path, task)
-        finish(task_path, task, output)
-        return 0
+            if rc != 0:
+                defer_delivery_reconciliation(
+                    task_path,
+                    task,
+                    output or f"herdr rc={rc} with unknown delivery state",
+                )
+                return 1
+
+            task["attempt_state"] = "accepted"
+            write_json(task_path, task)
+            finish(task_path, task, output)
+            return 0
+        finally:
+            cleanup_task_session(task)
+            persist_current_task(task)
     finally:
         os.close(lock_fd)
 
