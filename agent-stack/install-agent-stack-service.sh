@@ -6,14 +6,19 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-install -o root -g root -m 0644 \
-  /home/agentops/.local/share/agent-stack/agent-stack-watchdog.service \
-  /etc/systemd/system/agent-stack-watchdog.service
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+UNIT="$SCRIPT_DIR/systemd/agent-stack-watchdog.service"
 
-pkill -u agentops -f '^/bin/bash /home/agentops/.local/bin/agent-stack-watchdog$' 2>/dev/null || true
+test -f "$UNIT"
+
+install -o root -g root -m 0644   "$UNIT"   /etc/systemd/system/agent-stack-watchdog.service
+
 systemctl daemon-reload
-systemctl enable --now agent-stack-watchdog.service
+systemctl enable agent-stack-watchdog.service
+systemctl restart agent-stack-watchdog.service
+
 sleep 3
+
 systemctl is-enabled agent-stack-watchdog.service
 systemctl is-active agent-stack-watchdog.service
 systemctl --no-pager --full status agent-stack-watchdog.service

@@ -34,6 +34,13 @@ Recommended server layout:
  /var/lib/herdr/ durable state
  /var/log/herdr/ or structured journal/telemetry sink
 
+The durable agent control-plane (`agent-task-worker`, dispatcher, recovery,
+watchdog, intake/export and maintenance helpers) executes from
+`/opt/herdr/current/agent-stack/bin`. Mutable copies under
+`/home/agentops/.local/bin` are not production authority. External binaries
+such as the pinned `herdr 0.9.1`, Hermes, Codex and rclone remain external
+dependencies.
+
 Deployment creates a pre-change backup and supports atomic symlink rollback.
 
 The production cutover implementation and operator gates are defined in

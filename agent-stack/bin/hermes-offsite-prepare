@@ -3,6 +3,27 @@ set -euo pipefail
 umask 077
 
 AGENT_HOME="/home/agentops"
+BIN_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+RELEASE_ROOT="$(CDPATH= cd -- "$BIN_DIR/../.." && pwd -P)"
+CURRENT_RELEASE="$(readlink -f /opt/herdr/current)"
+
+if [[ "$RELEASE_ROOT" != "$CURRENT_RELEASE" ]]; then
+  echo "Refusing off-site backup from non-current Herdr release: $RELEASE_ROOT" >&2
+  exit 2
+fi
+
+if [[ ! -f "$RELEASE_ROOT/RELEASE.json" || ! -f "$RELEASE_ROOT/MANIFEST.sha256" ]]; then
+  echo "Missing immutable Herdr release metadata: $RELEASE_ROOT" >&2
+  exit 2
+fi
+
+RELEASE_TAG="$(
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tag"])'     "$RELEASE_ROOT/RELEASE.json"
+)"
+RELEASE_COMMIT="$(
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["commit"])'     "$RELEASE_ROOT/RELEASE.json"
+)"
+
 HERMES_BIN="$AGENT_HOME/.local/bin/hermes"
 BACKUP_DIR="$AGENT_HOME/backups/hermes"
 OUT_DIR="$AGENT_HOME/backups/hermes-offsite"
@@ -27,29 +48,34 @@ fi
 LATEST_NAME="$(basename "$LATEST_BACKUP")"
 CORE_FILES=(
   ".config/herdr/session.json"
-  ".local/bin/majak"
-  ".local/bin/quantlab"
-  ".local/bin/agent-stack-ensure"
-  ".local/bin/agent-stack-watchdog"
-  ".local/bin/agent-stack-recovery"
-  ".local/bin/agent-task-dispatcher"
-  ".local/bin/hermes-maintenance"
-  ".local/bin/hermes-offsite-prepare"
-  ".local/bin/hermes-offsite-sync"
-  ".local/bin/hermes-offsite-connect-drive"
-  ".local/share/agent-stack/agent-stack-watchdog.service"
-  "install-agent-stack-service.sh"
   "workspaces/majak/AGENTS.md"
   "workspaces/quantlab/AGENTS.md"
 )
+
 EXISTING_CORE=()
 for item in "${CORE_FILES[@]}"; do
   [[ -e "$AGENT_HOME/$item" ]] && EXISTING_CORE+=("$item")
 done
 
-tar -czf "$PLAIN" \
-  -C "$BACKUP_DIR" "$LATEST_NAME" \
-  -C "$AGENT_HOME" "${EXISTING_CORE[@]}"
+TAR_ARGS=(
+  -C "$BACKUP_DIR" "$LATEST_NAME"
+)
+
+if (( ${#EXISTING_CORE[@]} > 0 )); then
+  TAR_ARGS+=(
+    -C "$AGENT_HOME" "${EXISTING_CORE[@]}"
+  )
+fi
+
+# Capture the COMPLETE immutable Herdr release. This makes the
+# included MANIFEST.sha256 independently useful after disaster recovery,
+# rather than shipping a manifest next to only a partial payload.
+TAR_ARGS+=(
+  -C "$RELEASE_ROOT"
+  .
+)
+
+tar -czf "$PLAIN" "${TAR_ARGS[@]}"
 
 openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
   -in "$PLAIN" -out "$ENCRYPTED" -pass file:"$KEY_FILE"
@@ -60,6 +86,8 @@ ENCRYPTED_SHA="$(sha256sum "$ENCRYPTED" | awk '{print $1}')"
 ENCRYPTED_BYTES="$(stat -c %s "$ENCRYPTED")"
 cat > "$META" <<EOF
 created_utc=$STAMP
+herdr_release_tag=$RELEASE_TAG
+herdr_release_commit=$RELEASE_COMMIT
 source_backup=$LATEST_NAME
 source_backup_sha256=$SOURCE_SHA
 archive_sha256=$PLAIN_SHA

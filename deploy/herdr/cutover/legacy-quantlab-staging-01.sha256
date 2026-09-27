@@ -3,4 +3,5 @@ dd9f29c29cbe45988c47973d2636c5b3707400f9cc22ef739e0aafc975334d1d  /etc/systemd/s
 50b2b2b79d81d24bd7947130dc526c05d9c8f4d8c128314db36352dd287d4b88  /etc/systemd/system/agent-platform-herdr.service
 e568c8d2a5fb27f9e968868952d296191e3be30962c0dba1fc415c35c994cf04  /etc/systemd/system/agent-platform-export.timer
 875c7512d5504a0f10cd2b975cffc5ff8116529cc8d147d37c5fee8c83cf8e28  /etc/systemd/system/agent-platform-herdr.timer
+685b706531089901d002a403534fef8091844e60fbea21608472cc9e99c682c4  /etc/systemd/system/agent-stack-watchdog.service
 e1bdc5089c85e9b954812c51a30a88816667310b9fe04662210e9a80346848a9  /etc/agent-platform/nginx-server.conf

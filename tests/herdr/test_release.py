@@ -176,3 +176,401 @@ def test_deployed_document_is_closed_and_binds_config():
         cutover.deployed_document(
             {"tag": "v1.2.3", "commit": "a" * 40, "config_contract_sha256": "b" * 64},
             "c" * 64, 100)
+
+
+
+def test_watchdog_unit_is_versioned_and_cutover_managed():
+    source = Path("agent-stack/systemd/agent-stack-watchdog.service").read_text(
+        encoding="utf-8"
+    )
+    template = Path(
+        "deploy/agent_platform/production/agent-stack-watchdog.service.in"
+    ).read_text(encoding="utf-8")
+
+    assert source == template
+    assert "agent-stack-watchdog.service" in cutover.UNITS
+    assert (
+        "ExecStart=/opt/herdr/current/agent-stack/bin/agent-stack-watchdog"
+        in source
+    )
+    assert (
+        "/home/agentops/.local/bin/agent-stack-watchdog"
+        not in source
+    )
+
+    expected = cutover.expected_hashes(
+        Path(
+            "deploy/herdr/cutover/"
+            "legacy-quantlab-staging-01.sha256"
+        )
+    )
+    assert (
+        cutover.UNIT_DIR / "agent-stack-watchdog.service"
+        in expected
+    )
+
+
+def test_agent_stack_runtime_chain_is_release_relative():
+    dispatcher = Path(
+        "agent-stack/bin/agent-task-dispatcher"
+    ).read_text(encoding="utf-8")
+    assert "BIN = Path(__file__).resolve().parent" in dispatcher
+    assert 'WORKER = BIN / "agent-task-worker"' in dispatcher
+    assert ".local/bin/agent-task-worker" not in dispatcher
+
+    watchdog = Path(
+        "agent-stack/bin/agent-stack-watchdog"
+    ).read_text(encoding="utf-8")
+    assert 'BIN_DIR="' in watchdog
+    assert '$BIN_DIR/agent-stack-ensure' in watchdog
+    assert '$BIN_DIR/agent-stack-recovery' in watchdog
+    assert '$BIN_DIR/hermes-maintenance' in watchdog
+    assert "/home/agentops/.local/bin/agent-stack-" not in watchdog
+
+    maintenance = Path(
+        "agent-stack/bin/hermes-maintenance"
+    ).read_text(encoding="utf-8")
+    assert "BIN = Path(__file__).resolve().parent" in maintenance
+    for name in (
+        "agent-codex-usage-export",
+        "hermes-offsite-prepare",
+        "hermes-offsite-sync",
+    ):
+        assert f'BIN / "{name}"' in maintenance
+    assert "wrapper = BIN / profile" in maintenance
+    assert 'script = BIN / name' in maintenance
+
+
+def test_switch_runtime_keeps_watchdog_quiescent(
+    monkeypatch,
+    tmp_path,
+):
+    events = []
+
+    def fake_run(*args, check=True):
+        events.append(("run", *args))
+        if (
+            len(args) >= 3
+            and args[0] == "/usr/bin/systemctl"
+            and args[1] == "is-active"
+        ):
+            return "active"
+        return ""
+
+    monkeypatch.setattr(cutover, "run", fake_run)
+    monkeypatch.setattr(
+        cutover,
+        "atomic_symlink",
+        lambda target, link: events.append(
+            ("symlink", str(target), str(link))
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "wait_http_status",
+        lambda *_args, **_kwargs: "401",
+    )
+    monkeypatch.setattr(
+        cutover,
+        "assert_hardening",
+        lambda: None,
+    )
+
+    target = tmp_path / "release"
+    target.mkdir()
+
+    cutover.switch_runtime(
+        target,
+        None,
+    )
+
+    stop = (
+        "run",
+        "/usr/bin/systemctl",
+        "stop",
+        "agent-stack-watchdog.service",
+        "agent-platform-web.service",
+    )
+    link = (
+        "symlink",
+        str(target),
+        str(cutover.CURRENT),
+    )
+
+    assert stop in events
+    assert link in events
+    assert events.index(stop) < events.index(link)
+
+    assert not any(
+        event[:4]
+        == (
+            "run",
+            "/usr/bin/systemctl",
+            "start",
+            "agent-stack-watchdog.service",
+        )
+        for event in events
+    )
+
+
+def test_watchdog_start_is_explicit(monkeypatch):
+    events = []
+
+    def fake_run(*args, check=True):
+        events.append(("run", *args))
+        if args[:3] == (
+            "/usr/bin/systemctl",
+            "is-active",
+            "agent-stack-watchdog.service",
+        ):
+            return "active"
+        return ""
+
+    monkeypatch.setattr(cutover, "run", fake_run)
+
+    cutover.start_watchdog_service()
+
+    assert (
+        "run",
+        "/usr/bin/systemctl",
+        "start",
+        "agent-stack-watchdog.service",
+    ) in events
+
+
+def test_active_worker_blocks_control_plane_promotion(monkeypatch):
+    monkeypatch.setattr(
+        cutover,
+        "run",
+        lambda *args, **kwargs:
+            "123 python3 /opt/herdr/current/agent-stack/bin/agent-task-worker task.json"
+    )
+
+    with pytest.raises(
+        release.ReleaseError,
+        match="durable_worker_active",
+    ):
+        cutover.assert_no_active_durable_worker()
+
+
+def test_apply_keeps_watchdog_quiescent_during_rollback_exercise():
+    source = Path(
+        "deploy/herdr/cutover/cutover.py"
+    ).read_text(encoding="utf-8")
+
+    apply_source = source.split(
+        "def apply(",
+        1,
+    )[1]
+
+    assert "assert_no_active_durable_worker()" in apply_source
+    assert "unit_snapshots = snapshot_units()" in apply_source
+    assert "restore_units(unit_snapshots)" in apply_source
+    assert "public_state_snapshot = snapshot_file(PUBLIC_STATE)" in apply_source
+    assert "restore_file(" in apply_source
+
+    # switch_runtime itself never restarts durable dispatch.
+    switch_source = source.split(
+        "def switch_runtime(",
+        1,
+    )[1].split(
+        "def start_watchdog_service",
+        1,
+    )[0]
+    assert '"start",\n            "agent-stack-watchdog.service"' not in switch_source
+
+    # Success path starts watchdog only after public health proof.
+    assert apply_source.index(
+        'wait_http_status(\n            "https://2.28.67.165/agent-platform/health",\n            "401",'
+    ) < apply_source.index(
+        "start_watchdog_service()"
+    )
+
+
+def test_legacy_watchdog_installer_is_release_relative():
+    text = Path(
+        "agent-stack/install-agent-stack-service.sh"
+    ).read_text(encoding="utf-8")
+
+    assert 'SCRIPT_DIR="' in text
+    assert "$SCRIPT_DIR/systemd/agent-stack-watchdog.service" in text
+    assert "/home/agentops/.local/share/agent-stack" not in text
+
+
+def test_offsite_backup_captures_immutable_release_control_plane():
+    text = Path(
+        "agent-stack/bin/hermes-offsite-prepare"
+    ).read_text(encoding="utf-8")
+
+    assert "RELEASE_ROOT=" in text
+    assert "CURRENT_RELEASE=" in text
+
+    assert "RELEASE.json" in text
+    assert "MANIFEST.sha256" in text
+    assert '-C "$RELEASE_ROOT"' in text
+    assert "COMPLETE immutable Herdr release" in text
+
+    assert ".local/bin/agent-stack-watchdog" not in text
+    assert ".local/bin/agent-stack-recovery" not in text
+    assert ".local/bin/agent-task-dispatcher" not in text
+
+
+
+def test_snapshot_restore_contract_is_exact(monkeypatch, tmp_path):
+    path = tmp_path / "unit.service"
+    path.write_bytes(b"before\n")
+    path.chmod(0o640)
+
+    snapshot = cutover.snapshot_file(path)
+
+    assert snapshot is not None
+    assert snapshot[0] == b"before\n"
+    assert snapshot[1] == 0o640
+
+    writes = []
+
+    monkeypatch.setattr(
+        cutover,
+        "atomic_write",
+        lambda target, data, mode, uid=0, gid=0:
+            writes.append((target, data, mode, uid, gid)),
+    )
+
+    cutover.restore_file(path, snapshot)
+
+    assert writes
+    assert writes[0][0] == path
+    assert writes[0][1] == b"before\n"
+    assert writes[0][2] == 0o640
+
+
+
+def test_already_deployed_requires_full_coherence(
+    monkeypatch,
+    tmp_path,
+):
+    candidate = tmp_path / "release"
+    unit_dir = tmp_path / "units"
+    consumer_dir = tmp_path / "consumers"
+    public_state = tmp_path / "deployed-release.json"
+
+    bundle = (
+        candidate
+        / "deploy"
+        / "agent_platform"
+        / "production"
+    )
+    bundle.mkdir(parents=True)
+    unit_dir.mkdir()
+    consumer_dir.mkdir()
+
+    for name in cutover.UNITS:
+        data = f"unit={name}\n".encode()
+        (bundle / f"{name}.in").write_bytes(data)
+        (unit_dir / name).write_bytes(data)
+
+    consumer_files = {}
+
+    for name in release.CONSUMERS:
+        data = consumer(name)
+        (
+            candidate
+            / "configs"
+            / "consumers"
+        ).mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        (
+            candidate
+            / "configs"
+            / "consumers"
+            / f"{name}.yaml"
+        ).write_bytes(data)
+        (
+            consumer_dir
+            / f"{name}.yaml"
+        ).write_bytes(data)
+        consumer_files[f"{name}.yaml"] = data
+
+    digest = release.consumer_digest(consumer_files)
+
+    release_doc = {
+        "tag": "v1.2.3-rc.7",
+        "commit": "a" * 40,
+        "config_contract_sha256": digest,
+    }
+
+    public_state.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "tag": release_doc["tag"],
+                "commit": release_doc["commit"],
+                "config_sha256": digest,
+                "deployed_at": 123456789,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        cutover,
+        "UNIT_DIR",
+        unit_dir,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "CONSUMER_DIR",
+        consumer_dir,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "PUBLIC_STATE",
+        public_state,
+    )
+
+    cutover.assert_deployed_coherence(
+        candidate,
+        release_doc,
+    )
+
+    # A matching release symlink with stale units must fail closed.
+    (unit_dir / cutover.UNITS[0]).write_text(
+        "stale\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        release.ReleaseError,
+        match="already_deployed_unit_mismatch",
+    ):
+        cutover.assert_deployed_coherence(
+            candidate,
+            release_doc,
+        )
+
+    # Restore the unit and prove a stale marker also fails closed.
+    source = bundle / f"{cutover.UNITS[0]}.in"
+    (unit_dir / cutover.UNITS[0]).write_bytes(
+        source.read_bytes()
+    )
+
+    marker = json.loads(
+        public_state.read_text(encoding="utf-8")
+    )
+    marker["commit"] = "b" * 40
+
+    public_state.write_text(
+        json.dumps(marker),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        release.ReleaseError,
+        match="already_deployed_public_state_mismatch",
+    ):
+        cutover.assert_deployed_coherence(
+            candidate,
+            release_doc,
+        )

@@ -52,6 +52,7 @@ UNITS = (
     "agent-platform-herdr.service",
     "agent-platform-export.timer",
     "agent-platform-herdr.timer",
+    "agent-stack-watchdog.service",
 )
 
 
@@ -182,6 +183,67 @@ def atomic_write(path: Path, data: bytes, mode: int, uid: int = 0, gid: int = 0)
             pass
 
 
+
+def snapshot_file(path: Path) -> tuple[bytes, int, int, int] | None:
+    if not path.exists() and not path.is_symlink():
+        return None
+    info = os.lstat(path)
+    need(
+        stat.S_ISREG(info.st_mode) and not path.is_symlink(),
+        f"unsafe_snapshot_file:{path}",
+    )
+    return (
+        path.read_bytes(),
+        stat.S_IMODE(info.st_mode),
+        info.st_uid,
+        info.st_gid,
+    )
+
+
+def restore_file(
+    path: Path,
+    snapshot: tuple[bytes, int, int, int] | None,
+) -> None:
+    if snapshot is None:
+        if path.exists() or path.is_symlink():
+            need(
+                path.is_file() and not path.is_symlink(),
+                f"unsafe_restore_destination:{path}",
+            )
+            path.unlink()
+        return
+
+    data, mode, uid, gid = snapshot
+    atomic_write(path, data, mode, uid, gid)
+
+
+def snapshot_units() -> dict[Path, tuple[bytes, int, int, int]]:
+    snapshots = {}
+    for name in UNITS:
+        path = UNIT_DIR / name
+        snapshot = snapshot_file(path)
+        need(snapshot is not None, f"runtime_unit_missing:{name}")
+        snapshots[path] = snapshot
+    return snapshots
+
+
+def restore_units(
+    snapshots: dict[Path, tuple[bytes, int, int, int]],
+) -> None:
+    for path, snapshot in snapshots.items():
+        restore_file(path, snapshot)
+    run("/usr/bin/systemctl", "daemon-reload")
+
+
+def snapshot_unit_hashes(
+    snapshots: dict[Path, tuple[bytes, int, int, int]],
+) -> dict[Path, str]:
+    return {
+        path: sha256(snapshot[0])
+        for path, snapshot in snapshots.items()
+    }
+
+
 def atomic_symlink(target: Path, link: Path) -> None:
     need(target.is_absolute() and target.is_dir() and not target.is_symlink(),
          "invalid_symlink_target")
@@ -199,7 +261,11 @@ def atomic_symlink(target: Path, link: Path) -> None:
 
 
 def compare_trees(candidate: Path, legacy: Path) -> dict[str, object]:
-    prefixes = ("agent_platform_dashboard/", "deploy/agent_platform/production/")
+    prefixes = (
+        "agent-stack/",
+        "agent_platform_dashboard/",
+        "deploy/agent_platform/production/",
+    )
     candidate_files = {
         item.relative_to(candidate).as_posix(): sha256(item.read_bytes())
         for item in candidate.rglob("*") if item.is_file()
@@ -254,7 +320,9 @@ def preflight(archive: Path, expected_legacy_commit: str) -> dict[str, object]:
     statuses = {unit: run("/usr/bin/systemctl", "is-active", unit, check=False) for unit in UNITS}
     need(statuses["agent-platform-web.service"] == "active"
          and statuses["agent-platform-export.timer"] == "active"
-         and statuses["agent-platform-herdr.timer"] == "active", "runtime_not_healthy")
+         and statuses["agent-platform-herdr.timer"] == "active"
+         and statuses["agent-stack-watchdog.service"] == "active",
+         "runtime_not_healthy")
     with tempfile.TemporaryDirectory(prefix="herdr-preflight-") as folder:
         candidate = extract_candidate(archive, Path(folder))
         comparison = compare_trees(candidate, LEGACY)
@@ -328,17 +396,141 @@ def install_consumers(release_root: Path, expected_digest: str) -> str:
     return digest
 
 
-def install_units(release_root: Path, legacy_hashes: dict[Path, str]) -> None:
+def install_units(
+    release_root: Path,
+    legacy_hashes: dict[Path, str],
+    *,
+    previous_hashes: dict[Path, str] | None = None,
+) -> None:
     bundle = release_root / "deploy" / "agent_platform" / "production"
     for name in UNITS:
         source = bundle / f"{name}.in"
         destination = UNIT_DIR / name
-        need(source.is_file() and not source.is_symlink(), f"release_unit_missing:{name}")
+        need(
+            source.is_file() and not source.is_symlink(),
+            f"release_unit_missing:{name}",
+        )
+
         current = digest_file(destination)
         desired = digest_file(source)
-        need(current in (legacy_hashes[destination], desired), f"unit_drift:{name}")
+
+        allowed = {
+            legacy_hashes[destination],
+            desired,
+        }
+
+        if previous_hashes is not None:
+            previous = previous_hashes.get(destination)
+            if previous:
+                allowed.add(previous)
+
+        need(
+            current in allowed,
+            f"unit_drift:{name}",
+        )
+
         if current != desired:
-            atomic_write(destination, source.read_bytes(), 0o644)
+            atomic_write(
+                destination,
+                source.read_bytes(),
+                0o644,
+            )
+
+
+def assert_deployed_coherence(
+    release_root: Path,
+    release: dict[str, object],
+) -> None:
+    # A matching /opt/herdr/current symlink alone is not proof of a
+    # completed deployment. A host/process interruption may happen
+    # between symlink, unit and deployed-marker transitions.
+
+    bundle = release_root / "deploy" / "agent_platform" / "production"
+
+    for name in UNITS:
+        source = bundle / f"{name}.in"
+        destination = UNIT_DIR / name
+
+        need(
+            source.is_file() and not source.is_symlink(),
+            f"already_deployed_release_unit_missing:{name}",
+        )
+        need(
+            destination.is_file() and not destination.is_symlink(),
+            f"already_deployed_unit_missing:{name}",
+        )
+        need(
+            digest_file(destination) == digest_file(source),
+            f"already_deployed_unit_mismatch:{name}",
+        )
+
+    installed: dict[str, bytes] = {}
+
+    for consumer in CONSUMERS:
+        name = f"{consumer}.yaml"
+        source = release_root / "configs" / "consumers" / name
+        destination = CONSUMER_DIR / name
+
+        need(
+            source.is_file() and not source.is_symlink(),
+            f"already_deployed_consumer_source_missing:{consumer}",
+        )
+        need(
+            destination.is_file() and not destination.is_symlink(),
+            f"already_deployed_consumer_missing:{consumer}",
+        )
+
+        data = destination.read_bytes()
+
+        need(
+            data == source.read_bytes(),
+            f"already_deployed_consumer_mismatch:{consumer}",
+        )
+
+        installed[name] = data
+
+    need(
+        consumer_digest(installed)
+        == release["config_contract_sha256"],
+        "already_deployed_consumer_digest_mismatch",
+    )
+
+    need(
+        PUBLIC_STATE.is_file() and not PUBLIC_STATE.is_symlink(),
+        "already_deployed_public_state_missing",
+    )
+
+    try:
+        document = json.loads(
+            PUBLIC_STATE.read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError(
+            "already_deployed_public_state_invalid"
+        ) from exc
+
+    need(
+        set(document)
+        == {
+            "version",
+            "tag",
+            "commit",
+            "config_sha256",
+            "deployed_at",
+        },
+        "already_deployed_public_state_shape",
+    )
+
+    need(
+        document["version"] == 1
+        and document["tag"] == release["tag"]
+        and document["commit"] == release["commit"]
+        and document["config_sha256"]
+        == release["config_contract_sha256"]
+        and isinstance(document["deployed_at"], int)
+        and document["deployed_at"] > 0,
+        "already_deployed_public_state_mismatch",
+    )
 
 
 def deployed_document(release: dict[str, object], config_digest: str, deployed_at: int) -> dict[str, object]:
@@ -367,19 +559,75 @@ def assert_hardening() -> None:
     need(values and set(values.values()) == {"yes"}, "herdr_hardening_regressed")
 
 
-def switch_runtime(target: Path, document: dict[str, object] | None) -> None:
-    run("/usr/bin/systemctl", "stop", "agent-platform-web.service")
+def assert_no_active_durable_worker() -> None:
+    workers = run(
+        "/usr/bin/pgrep",
+        "-af",
+        "[a]gent-task-worker",
+        check=False,
+    )
+    need(not workers.strip(), "durable_worker_active")
+
+
+def switch_runtime(
+    target: Path,
+    document: dict[str, object] | None,
+) -> None:
+    # Durable orchestration remains stopped for every intermediate
+    # candidate/rollback transition. Dispatch is re-enabled only after
+    # the final candidate is fully committed and externally healthy.
+    run(
+        "/usr/bin/systemctl",
+        "stop",
+        "agent-stack-watchdog.service",
+        "agent-platform-web.service",
+    )
+
     atomic_symlink(target, CURRENT)
+
     if document is not None:
         write_deployed(document)
+
     run("/usr/bin/systemctl", "daemon-reload")
+
     run("/usr/bin/systemctl", "start", "agent-platform-herdr.service")
     run("/usr/bin/systemctl", "start", "agent-platform-export.service")
     run("/usr/bin/systemctl", "start", "agent-platform-web.service")
-    wait_http_status("http://127.0.0.1:3010/agent-platform/health", "401")
-    need(run("/usr/bin/systemctl", "is-active", "agent-platform-web.service") == "active",
-         "web_not_active")
+
+    wait_http_status(
+        "http://127.0.0.1:3010/agent-platform/health",
+        "401",
+    )
+
+    need(
+        run(
+            "/usr/bin/systemctl",
+            "is-active",
+            "agent-platform-web.service",
+        )
+        == "active",
+        "web_not_active",
+    )
+
     assert_hardening()
+
+
+def start_watchdog_service() -> None:
+    run("/usr/bin/systemctl", "daemon-reload")
+    run(
+        "/usr/bin/systemctl",
+        "start",
+        "agent-stack-watchdog.service",
+    )
+    need(
+        run(
+            "/usr/bin/systemctl",
+            "is-active",
+            "agent-stack-watchdog.service",
+        )
+        == "active",
+        "watchdog_not_active",
+    )
 
 
 def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict[str, object]:
@@ -390,9 +638,20 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
     need(confirmation == identifier, "confirmation_mismatch")
     report = preflight(archive, expected_legacy_commit)
     candidate = install_candidate(archive, release)
+
     if CURRENT.is_symlink() and CURRENT.resolve(strict=True) == candidate:
+        # Fail closed unless every mutable production authority proves
+        # the same immutable release identity.
+        assert_deployed_coherence(
+            candidate,
+            release,
+        )
         archive.unlink()
-        return {**report, "status": "already_deployed", "current": str(candidate)}
+        return {
+            **report,
+            "status": "already_deployed",
+            "current": str(candidate),
+        }
     if not CURRENT.exists() and not CURRENT.is_symlink():
         CURRENT.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
         need(not CURRENT.parent.is_symlink(), "current_directory_is_symlink")
@@ -407,65 +666,312 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
     hashes = expected_hashes(candidate / "deploy" / "herdr" / "cutover" /
                              "legacy-quantlab-staging-01.sha256")
     active_route = NGINX_ROUTE.read_bytes()
-    need(sha256(active_route) == hashes[NGINX_ROUTE], "nginx_route_drift")
+    need(
+        sha256(active_route) == hashes[NGINX_ROUTE],
+        "nginx_route_drift",
+    )
+
     root_status = http_status("https://2.28.67.165/")
-    maintenance = (candidate / "deploy" / "agent_platform" / "production" /
-                   "nginx-maintenance.conf.in").read_bytes()
-    document = deployed_document(release, config_digest, int(time.time()))
-    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    maintenance = (
+        candidate
+        / "deploy"
+        / "agent_platform"
+        / "production"
+        / "nginx-maintenance.conf.in"
+    ).read_bytes()
+
+    document = deployed_document(
+        release,
+        config_digest,
+        int(time.time()),
+    )
+
+    # Snapshot exact pre-deployment mutable authority. Rollback restores
+    # these exact bytes, not merely a compatible approximation.
+    unit_snapshots = snapshot_units()
+    previous_unit_hashes = snapshot_unit_hashes(unit_snapshots)
+    public_state_snapshot = snapshot_file(PUBLIC_STATE)
+
+    STATE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+        mode=0o700,
+    )
+
     for directory in (STATE_DIR.parent, STATE_DIR):
         info = directory.stat()
-        need(info.st_uid == 0 and not info.st_mode & 0o077, "unsafe_state_directory")
-    state_path = STATE_DIR / f"{document['deployed_at']}-{identifier}.json"
+        need(
+            info.st_uid == 0
+            and not info.st_mode & 0o077,
+            "unsafe_state_directory",
+        )
+
+    state_path = (
+        STATE_DIR
+        / f"{document['deployed_at']}-{identifier}.json"
+    )
+
+    evidence_archive = (
+        STATE_DIR
+        / f"{document['deployed_at']}-{identifier}.tar.gz"
+    )
+
     switched = False
     timers_stopped = False
+    watchdog_stopped = False
+    evidence_moved = False
+
     try:
-        atomic_write(NGINX_ROUTE, maintenance, 0o644)
+        atomic_write(
+            NGINX_ROUTE,
+            maintenance,
+            0o644,
+        )
+
         run("/usr/sbin/nginx", "-t")
         run("/usr/bin/systemctl", "reload", "nginx")
-        wait_http_status("https://2.28.67.165/agent-platform/health", "503")
-        need(http_status("https://2.28.67.165/") == root_status, "public_root_changed")
-        run("/usr/bin/systemctl", "stop", "agent-platform-export.timer",
-            "agent-platform-herdr.timer")
+
+        wait_http_status(
+            "https://2.28.67.165/agent-platform/health",
+            "503",
+        )
+
+        need(
+            http_status("https://2.28.67.165/")
+            == root_status,
+            "public_root_changed",
+        )
+
+        run(
+            "/usr/bin/systemctl",
+            "stop",
+            "agent-platform-export.timer",
+            "agent-platform-herdr.timer",
+        )
         timers_stopped = True
-        install_units(candidate, hashes)
+
+        run(
+            "/usr/bin/systemctl",
+            "stop",
+            "agent-stack-watchdog.service",
+        )
+        watchdog_stopped = True
+
+        assert_no_active_durable_worker()
+
+        # --------------------------------------------------------
+        # Candidate #1 — verification, watchdog still stopped.
+        # --------------------------------------------------------
+
+        install_units(
+            candidate,
+            hashes,
+            previous_hashes=previous_unit_hashes,
+        )
+
         switched = True
-        switch_runtime(candidate, document)
-        # Exercise the exact rollback path while the public route remains fail-closed.
-        switch_runtime(previous, None)
-        need(http_status("https://2.28.67.165/") == root_status, "rollback_root_changed")
-        switch_runtime(candidate, document)
-        run("/usr/bin/systemctl", "start", "agent-platform-herdr.timer",
-            "agent-platform-export.timer")
+
+        switch_runtime(
+            candidate,
+            document,
+        )
+
+        # --------------------------------------------------------
+        # Exact rollback exercise.
+        # Restore exact previous systemd unit bytes BEFORE booting
+        # the previous release services.
+        # --------------------------------------------------------
+
+        restore_units(unit_snapshots)
+
+        switch_runtime(
+            previous,
+            None,
+        )
+
+        restore_file(
+            PUBLIC_STATE,
+            public_state_snapshot,
+        )
+
+        need(
+            CURRENT.resolve(strict=True) == previous,
+            "rollback_current_mismatch",
+        )
+
+        for path, digest in previous_unit_hashes.items():
+            need(
+                digest_file(path) == digest,
+                f"rollback_unit_mismatch:{path.name}",
+            )
+
+        need(
+            http_status("https://2.28.67.165/")
+            == root_status,
+            "rollback_root_changed",
+        )
+
+        # --------------------------------------------------------
+        # Final candidate promotion — still NO durable dispatch.
+        # --------------------------------------------------------
+
+        install_units(
+            candidate,
+            hashes,
+            previous_hashes=previous_unit_hashes,
+        )
+
+        switch_runtime(
+            candidate,
+            document,
+        )
+
+        run(
+            "/usr/bin/systemctl",
+            "start",
+            "agent-platform-herdr.timer",
+            "agent-platform-export.timer",
+        )
         timers_stopped = False
-        evidence_archive = STATE_DIR / f"{document['deployed_at']}-{identifier}.tar.gz"
-        os.replace(archive, evidence_archive)
+
+        # Preserve immutable deployment evidence before reopening
+        # durable dispatch.
+        os.replace(
+            archive,
+            evidence_archive,
+        )
+        evidence_moved = True
+
         state = {
             **document,
             "release_path": str(candidate),
             "previous_path": str(previous),
             "rollback_exercised": True,
             "public_root_status": root_status,
-            "archive_sha256": digest_file(evidence_archive),
+            "archive_sha256": digest_file(
+                evidence_archive
+            ),
             "archive_path": str(evidence_archive),
         }
-        atomic_write(state_path, canonical_json(state), 0o600)
-        atomic_write(NGINX_ROUTE, active_route, 0o644)
+
+        atomic_write(
+            state_path,
+            canonical_json(state),
+            0o600,
+        )
+
+        # Restore public traffic and prove the final candidate before
+        # allowing maintenance/dispatcher to run.
+        atomic_write(
+            NGINX_ROUTE,
+            active_route,
+            0o644,
+        )
+
         run("/usr/sbin/nginx", "-t")
         run("/usr/bin/systemctl", "reload", "nginx")
-        wait_http_status("https://2.28.67.165/agent-platform/health", "401")
-        need(http_status("https://2.28.67.165/") == root_status, "public_root_changed")
-        return {"status": "success", **state, "state_file": str(state_path)}
+
+        wait_http_status(
+            "https://2.28.67.165/agent-platform/health",
+            "401",
+        )
+
+        need(
+            http_status("https://2.28.67.165/")
+            == root_status,
+            "public_root_changed",
+        )
+
+        need(
+            CURRENT.resolve(strict=True) == candidate,
+            "final_current_mismatch",
+        )
+
+        # This is intentionally the LAST state-changing runtime step.
+        # The watchdog can dispatch only after deployment identity,
+        # route and health evidence are durable.
+        start_watchdog_service()
+        watchdog_stopped = False
+
+        return {
+            "status": "success",
+            **state,
+            "state_file": str(state_path),
+        }
+
     except BaseException:
         try:
+            # Keep durable execution quiescent for rollback.
+            run(
+                "/usr/bin/systemctl",
+                "stop",
+                "agent-stack-watchdog.service",
+                check=False,
+            )
+            watchdog_stopped = True
+
+            # Restore exact pre-deployment units even if install_units()
+            # failed part-way through.
+            restore_units(unit_snapshots)
+
             if switched:
-                switch_runtime(previous, None)
+                switch_runtime(
+                    previous,
+                    None,
+                )
+
+            restore_file(
+                PUBLIC_STATE,
+                public_state_snapshot,
+            )
+
             if timers_stopped:
-                run("/usr/bin/systemctl", "start", "agent-platform-herdr.timer",
-                    "agent-platform-export.timer")
-            atomic_write(NGINX_ROUTE, active_route, 0o644)
+                run(
+                    "/usr/bin/systemctl",
+                    "start",
+                    "agent-platform-herdr.timer",
+                    "agent-platform-export.timer",
+                )
+                timers_stopped = False
+
+            atomic_write(
+                NGINX_ROUTE,
+                active_route,
+                0o644,
+            )
+
             run("/usr/sbin/nginx", "-t")
             run("/usr/bin/systemctl", "reload", "nginx")
+
+            wait_http_status(
+                "https://2.28.67.165/agent-platform/health",
+                "401",
+            )
+
+            # A failed promotion must not leave a success-looking state
+            # document behind.
+            try:
+                state_path.unlink()
+            except FileNotFoundError:
+                pass
+
+            if evidence_moved and evidence_archive.exists():
+                failed_archive = (
+                    STATE_DIR
+                    / (
+                        f"{document['deployed_at']}-"
+                        f"{identifier}.failed.tar.gz"
+                    )
+                )
+                os.replace(
+                    evidence_archive,
+                    failed_archive,
+                )
+
+            start_watchdog_service()
+            watchdog_stopped = False
+
         finally:
             raise
 

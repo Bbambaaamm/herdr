@@ -56,15 +56,27 @@ The apply operation:
 2. installs an immutable `/opt/herdr/releases/<tag>-<sha12>` directory;
 3. installs the exact policy overlays under `/etc/herdr/consumers` only when absent,
    refusing any mismatch on repeat;
-4. changes the three Agent Platform services to execute through
-   `/opt/herdr/current` while preserving all drop-ins and read-only mounts;
+4. changes the Agent Platform services and the durable agent-stack watchdog
+   to execute through `/opt/herdr/current`, with dispatcher/worker/recovery/
+   maintenance helpers resolved from that same immutable release;
 5. reserves the public dashboard paths with the fail-closed maintenance fragment;
-6. atomically switches `current`, publishes only bounded tag/SHA/config metadata,
+6. stops the durable watchdog, refuses promotion while any
+   `agent-task-worker` remains active, and keeps durable dispatch quiescent through
+   candidate verification and rollback exercise, snapshotting and restoring
+   the exact previous systemd unit bytes and deployed-release marker;
+7. atomically switches `current`, publishes only bounded tag/SHA/config metadata,
    and verifies the internal health boundary and Herdr sandbox;
-7. switches back to the legacy release and verifies it, then promotes the candidate
-   again—exercising rollback before public activation;
-8. restores the exact authenticated Nginx route and proves the QuantLab root status
+8. switches back to the previous release, restores and verifies the exact
+   previous systemd units and deployed-release marker, then promotes the candidate
+   again—exercising rollback of both web/export and durable orchestration before
+   public activation; the durable watchdog remains stopped throughout all
+   intermediate transitions;
+9. restores the exact authenticated Nginx route and proves the QuantLab root status
    and unauthenticated `401` boundary are unchanged.
+
+An `already_deployed` result is accepted only when the current symlink,
+all candidate systemd units, installed consumer policy digest, and bounded
+`deployed-release.json` identify the same immutable release.
 
 Any failure atomically returns `current` to the prior release, restarts the same
 services, and restores the exact prior Nginx fragment. The route remains fail-closed
@@ -78,7 +90,9 @@ previous release, root HTTP status, and rollback exercise are recorded root-only
 under `/var/lib/herdr/deployments`. A bounded copy containing only tag, commit,
 config digest, and deployment time is exposed to the read-only dashboard snapshot.
 
-After cutover, require a soak with active/enabled Agent Platform services, fresh
+After cutover, first verify that `agent-stack-watchdog.service` executes through
+`/opt/herdr/current` and that dispatcher resolves `agent-task-worker` from the same
+immutable release. Then require a soak with active/enabled Agent Platform services, fresh
 Model Router/Search Router/Herdr telemetry for both profiles, no queue/lease or
 routing regression, current-versus-historical provider semantics intact, and all
 consumer invariants unchanged. QuantLab remains PAPER-only; Heating actuation stays

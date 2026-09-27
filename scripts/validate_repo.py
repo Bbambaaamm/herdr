@@ -74,6 +74,79 @@ for name in ("agent-platform-web.service", "agent-platform-export.service",
             print(f"Runtime unit bypasses atomic Herdr release symlink: {path}")
             sys.exit(1)
 
+watchdog_source = Path("agent-stack/systemd/agent-stack-watchdog.service")
+watchdog_template = Path(
+    "deploy/agent_platform/production/agent-stack-watchdog.service.in"
+)
+watchdog_text = watchdog_source.read_text(encoding="utf-8")
+if watchdog_text != watchdog_template.read_text(encoding="utf-8"):
+    print("Watchdog source/template drift.")
+    sys.exit(1)
+for forbidden in (
+    "/home/agentops/.local/bin/agent-stack-watchdog",
+    "/home/agentops/.local/bin/agent-stack-ensure",
+):
+    if forbidden in watchdog_text:
+        print(f"Watchdog bypasses atomic Herdr release: {forbidden}")
+        sys.exit(1)
+if "/opt/herdr/current/agent-stack/bin/agent-stack-watchdog" not in watchdog_text:
+    print("Watchdog does not execute through /opt/herdr/current.")
+    sys.exit(1)
+
+installer_text = Path(
+    "agent-stack/install-agent-stack-service.sh"
+).read_text(encoding="utf-8")
+if "/home/agentops/.local/share/agent-stack" in installer_text:
+    print("Legacy installer can restore mutable watchdog ownership.")
+    sys.exit(1)
+if 'SCRIPT_DIR=' not in installer_text:
+    print("Watchdog installer is not release-relative.")
+    sys.exit(1)
+
+dispatcher_text = Path(
+    "agent-stack/bin/agent-task-dispatcher"
+).read_text(encoding="utf-8")
+if "/home/agentops/.local/bin/agent-task-worker" in dispatcher_text:
+    print("Dispatcher bypasses immutable worker.")
+    sys.exit(1)
+
+maintenance_text = Path(
+    "agent-stack/bin/hermes-maintenance"
+).read_text(encoding="utf-8")
+for forbidden in (
+    '.local/bin/agent-codex-usage-export',
+    '.local/bin/agent-task-dispatcher',
+    '.local/bin/agent-task-export',
+    '.local/bin/agent-github-intake',
+    '.local/bin/hermes-offsite-prepare',
+    '.local/bin/hermes-offsite-sync',
+):
+    if forbidden in maintenance_text:
+        print(f"Maintenance bypasses immutable helper: {forbidden}")
+        sys.exit(1)
+
+offsite_text = Path(
+    "agent-stack/bin/hermes-offsite-prepare"
+).read_text(encoding="utf-8")
+for forbidden in (
+    '.local/bin/agent-stack-watchdog',
+    '.local/bin/agent-stack-recovery',
+    '.local/bin/agent-task-dispatcher',
+):
+    if forbidden in offsite_text:
+        print(f"Off-site backup captures stale mutable runtime: {forbidden}")
+        sys.exit(1)
+for required in (
+    "RELEASE.json",
+    "MANIFEST.sha256",
+    'TAR_ARGS+=(',
+    '-C "$RELEASE_ROOT"',
+    "COMPLETE immutable Herdr release",
+):
+    if required not in offsite_text:
+        print(f"Off-site backup misses immutable runtime evidence: {required}")
+        sys.exit(1)
+
 release_workflow = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
 if 'tags: ["v*"]' not in release_workflow or "build-herdr-release.py" not in release_workflow:
     print("Immutable release workflow contract is incomplete.")
