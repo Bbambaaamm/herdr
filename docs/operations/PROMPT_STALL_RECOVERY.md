@@ -149,6 +149,10 @@ attempt must:
 The worker MUST fail closed if the isolated task session cannot be created. It MUST NOT silently fall
 back to prompting the persistent coordinator chat.
 
+Pane cleanup is also fail closed: a pane ID equal to the persistent coordinator pane is never closed,
+cleanup failures are recorded without masking the durable task state, and a new semantic attempt is
+blocked until its prior task-owned pane has been closed successfully.
+
 The session name is attempt-scoped: reconciliation of the same semantic attempt preserves the same
 identity, while a genuinely new attempt receives a new run token and therefore a new session. This
 keeps orchestration identity stable without sharing model conversation state between unrelated tasks.
