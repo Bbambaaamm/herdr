@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -42,6 +43,10 @@ def task(now, *, task_id="task-1", timeout=1800):
 
 def write_task(path, payload):
     path.write_text(json.dumps(payload), encoding="utf-8")
+    raw = str(payload.get("attempt_started_at") or "")
+    if raw:
+        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+        os.utime(path, (stamp, stamp))
 
 
 def test_stale_orphan_blocks_without_blind_requeue(tmp_path, monkeypatch):
@@ -57,7 +62,10 @@ def test_stale_orphan_blocks_without_blind_requeue(tmp_path, monkeypatch):
     blocked = json.loads((recovery.BLOCKED / path.name).read_text(encoding="utf-8"))
     assert blocked["watchdog_blocker"] == "orphaned_running_unknown_delivery"
     assert blocked["attempt_state"] == "blocked"
-    result = json.loads((recovery.RESULTS / "task-1.json").read_text(encoding="utf-8"))
+    assert not (recovery.RESULTS / "task-1.json").exists()
+    sidecars = list(recovery.RESULTS.glob("task-1.watchdog-recovery-*.json"))
+    assert len(sidecars) == 1
+    result = json.loads(sidecars[0].read_text(encoding="utf-8"))
     assert result["status"] == "blocked"
     assert result["blocker"] == "orphaned_running_unknown_delivery"
 
@@ -147,3 +155,97 @@ Run npm install -g @openai/codex to update.
 › Ask Codex to do anything
 """
     assert recovery.is_codex_update_dialog(banner) is False
+
+
+def test_recent_dispatch_claim_beats_old_attempt_timestamp(tmp_path):
+    configure_paths(tmp_path)
+    now = datetime(2026, 9, 27, 7, 0, tzinfo=timezone.utc)
+    payload = task(now)
+    payload["dispatch_claimed_at"] = (now - timedelta(seconds=10)).isoformat()
+    path = recovery.RUNNING / "task-1.json"
+    write_task(path, payload)
+    old = (now - timedelta(hours=2)).timestamp()
+    os.utime(path, (old, old))
+
+    assert recovery.parse_started(payload, path) == now - timedelta(seconds=10)
+
+
+def test_worker_appearing_on_second_check_prevents_orphan_block(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    now = datetime(2026, 9, 27, 7, 0, tzinfo=timezone.utc)
+    path = recovery.RUNNING / "task-1.json"
+    write_task(path, task(now))
+    calls = iter((set(), {path.resolve()}))
+    monkeypatch.setattr(recovery, "active_worker_tasks", lambda: next(calls))
+
+    recovery.recover_orphan_tasks(now)
+
+    assert path.exists()
+    assert not (recovery.BLOCKED / path.name).exists()
+
+
+def test_result_appearing_on_second_check_terminalizes_instead_of_block(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    now = datetime(2026, 9, 27, 7, 0, tzinfo=timezone.utc)
+    path = recovery.RUNNING / "task-1.json"
+    write_task(path, task(now))
+    monkeypatch.setattr(recovery, "active_worker_tasks", lambda: set())
+    completed = {
+        "task_id": "task-1",
+        "run_token": "token-1",
+        "status": "completed",
+        "blocker": None,
+    }
+    calls = iter(((None, "missing"), (completed, "matched")))
+    monkeypatch.setattr(recovery, "matching_result", lambda task: next(calls))
+
+    recovery.recover_orphan_tasks(now)
+
+    assert (recovery.DONE / path.name).exists()
+    assert not (recovery.BLOCKED / path.name).exists()
+
+
+def test_historical_dialog_followed_by_work_is_not_active():
+    text = """
+› 1. Update now
+  2. Skip
+  3. Skip until next version
+  enter continue · esc skip
+• Ran git status
+• Working (5s)
+"""
+    assert recovery.is_codex_update_dialog(text) is False
+
+
+def test_working_codex_with_quoted_menu_never_receives_escape(monkeypatch):
+    quoted = """
+User asked about:
+› 1. Update now
+  2. Skip
+  3. Skip until next version
+  enter continue · esc skip
+"""
+    calls = []
+
+    def fake_run(args, timeout=15.0):
+        calls.append(list(args))
+        if args == ["agent", "list"]:
+            payload = {
+                "result": {
+                    "agents": [{
+                        "agent": "codex",
+                        "name": "quantlab-sol",
+                        "agent_status": "working",
+                        "interactive_ready": True,
+                    }]
+                }
+            }
+            return recovery.subprocess.CompletedProcess(args, 0, json.dumps(payload), "")
+        if args[:2] == ["agent", "read"]:
+            return recovery.subprocess.CompletedProcess(args, 0, quoted, "")
+        return recovery.subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(recovery, "run_herdr", fake_run)
+    recovery.recover_codex_update_dialogs()
+
+    assert not any(call[:2] == ["agent", "send-keys"] for call in calls)

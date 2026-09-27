@@ -32,6 +32,7 @@ CORE_FILES=(
   ".local/bin/agent-stack-ensure"
   ".local/bin/agent-stack-watchdog"
   ".local/bin/agent-stack-recovery"
+  ".local/bin/agent-task-dispatcher"
   ".local/bin/hermes-maintenance"
   ".local/bin/hermes-offsite-prepare"
   ".local/bin/hermes-offsite-sync"
