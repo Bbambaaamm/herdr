@@ -12,6 +12,13 @@ from pathlib import Path
 
 import pytest
 
+from herdr.consumer_policies import (
+    allow_all_consumer_policy,
+    base_consumer_policy,
+    policy_for_profile,
+    quantlab_paper_policy,
+)
+
 from herdr.admission import (
     AdmissionControl,
     AgentIdentity,
@@ -72,11 +79,18 @@ def _tmp_audit(tmp_path: Path) -> AuditLog:
     return AuditLog(tmp_path / "admission.jsonl")
 
 
+def _admission(tmp_path: Path, policy=allow_all_consumer_policy) -> AdmissionControl:
+    return AdmissionControl(
+        audit_log=_tmp_audit(tmp_path),
+        consumer_policy_hook=policy,
+    )
+
+
 # --- Acceptance: planner cannot bypass limits via larger graph output ----- #
 
 
 def test_planner_graph_within_limits_is_admitted(tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path)
     spec = TaskGraphSpec(node_count=10, max_depth=3, max_fanout=2)
     decision = ac.check(_writer_identity(), spec, _idle_usage(), ["read_file"])
     assert isinstance(decision, AllowDecision)
@@ -84,7 +98,7 @@ def test_planner_graph_within_limits_is_admitted(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("node_count", [65, 128, 1000])
 def test_planner_runaway_graph_is_denied(node_count: int, tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path)
     spec = TaskGraphSpec(node_count=node_count, max_depth=4, max_fanout=6)
     decision = ac.check(_writer_identity(), spec, _idle_usage(), ["read_file"])
     assert isinstance(decision, DenyDecision)
@@ -96,7 +110,7 @@ def test_planner_runaway_graph_is_denied(node_count: int, tmp_path: Path) -> Non
 
 @pytest.mark.parametrize("depth", [9, 50])
 def test_planner_deep_graph_is_denied(depth: int, tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path)
     spec = TaskGraphSpec(node_count=10, max_depth=depth, max_fanout=2)
     decision = ac.check(_writer_identity(), spec, _idle_usage(), ["read_file"])
     assert isinstance(decision, DenyDecision)
@@ -105,7 +119,7 @@ def test_planner_deep_graph_is_denied(depth: int, tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("fanout", [7, 100])
 def test_planner_wide_graph_is_denied(fanout: int, tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path)
     spec = TaskGraphSpec(node_count=10, max_depth=2, max_fanout=fanout)
     decision = ac.check(_writer_identity(), spec, _idle_usage(), ["read_file"])
     assert isinstance(decision, DenyDecision)
@@ -116,7 +130,7 @@ def test_planner_wide_graph_is_denied(fanout: int, tmp_path: Path) -> None:
 
 
 def test_child_can_not_escalate_tools_beyond_parent(tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path)
     parent_tools = frozenset({"read_file", "search_files"})
     spec = TaskGraphSpec(node_count=5, max_depth=2, max_fanout=2)
     child = _writer_identity(parent_tools=parent_tools, parent_role="writer")
@@ -127,7 +141,7 @@ def test_child_can_not_escalate_tools_beyond_parent(tmp_path: Path) -> None:
 
 
 def test_child_can_not_use_tool_outside_role_allowlist(tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path)
     spec = TaskGraphSpec(node_count=5, max_depth=2, max_fanout=2)
     writer = _writer_identity(role="writer", parent_tools=frozenset({"read_file"}))
     # `git_push` is an operator tool — a writer cannot escalate into operator.
@@ -140,7 +154,7 @@ def test_child_can_not_use_tool_outside_role_allowlist(tmp_path: Path) -> None:
 
 
 def test_child_can_not_escalate_role_above_parent(tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path)
     spec = TaskGraphSpec(node_count=5, max_depth=2, max_fanout=2)
     # parent is reader; child claims writer while keeping the same read-only tool.
     child = _writer_identity(
@@ -160,7 +174,7 @@ def test_child_can_not_escalate_role_above_parent(tmp_path: Path) -> None:
     "field,value", [("cpu", 0.81), ("cpu", 0.95), ("ram", 0.86), ("ram", 0.99)]
 )
 def test_resource_pressure_blocks_heavy_spawn(field: str, value: float, tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path)
     usage = _idle_usage()
     usage = replace(usage, **{field: value})
     spec = TaskGraphSpec(node_count=5, max_depth=2, max_fanout=2)
@@ -174,7 +188,7 @@ def test_resource_pressure_blocks_heavy_spawn(field: str, value: float, tmp_path
 
 
 def test_queue_backpressure_blocks_spawn(tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path)
     usage = replace(_idle_usage(), queue_depth=65)
     spec = TaskGraphSpec(node_count=5, max_depth=2, max_fanout=2)
     decision = ac.check(_writer_identity(), spec, usage, ["read_file"])
@@ -183,7 +197,7 @@ def test_queue_backpressure_blocks_spawn(tmp_path: Path) -> None:
 
 
 def test_task_time_budget_blocks_long_running(tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path)
     usage = replace(_idle_usage(), elapsed_seconds=1801)
     spec = TaskGraphSpec(node_count=5, max_depth=2, max_fanout=2)
     decision = ac.check(_writer_identity(), spec, usage, ["read_file"])
@@ -192,7 +206,7 @@ def test_task_time_budget_blocks_long_running(tmp_path: Path) -> None:
 
 
 def test_global_agent_cap_blocks_spawn(tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path)
     usage = replace(_idle_usage(), active_agents=5)
     spec = TaskGraphSpec(node_count=5, max_depth=2, max_fanout=2)
     decision = ac.check(_writer_identity(), spec, usage, ["read_file"])
@@ -201,7 +215,7 @@ def test_global_agent_cap_blocks_spawn(tmp_path: Path) -> None:
 
 
 def test_missing_host_telemetry_fails_closed(tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path)
     usage = ResourceUsage(cpu=0.10, ram=0.20)
     spec = TaskGraphSpec(node_count=5, max_depth=2, max_fanout=2)
     decision = ac.check(_writer_identity(), spec, usage, ["read_file"])
@@ -217,7 +231,7 @@ def test_missing_host_telemetry_fails_closed(tmp_path: Path) -> None:
     ],
 )
 def test_host_pressure_blocks_spawn(field: str, value: int | float, tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path)
     usage = replace(_idle_usage(), **{field: value})
     spec = TaskGraphSpec(node_count=5, max_depth=2, max_fanout=2)
     decision = ac.check(_writer_identity(), spec, usage, ["read_file"])
@@ -226,7 +240,7 @@ def test_host_pressure_blocks_spawn(field: str, value: int | float, tmp_path: Pa
 
 
 def test_per_repo_agent_cap_blocks_spawn(tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path)
     usage = replace(_idle_usage(), agents_per_repo={"QuantLab": 4})
     spec = TaskGraphSpec(node_count=5, max_depth=2, max_fanout=2)
     decision = ac.check(_writer_identity(), spec, usage, ["read_file"])
@@ -235,7 +249,7 @@ def test_per_repo_agent_cap_blocks_spawn(tmp_path: Path) -> None:
 
 
 def test_per_issue_agent_cap_blocks_spawn(tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path)
     usage = replace(_idle_usage(), agents_per_issue={("QuantLab", "187"): 3})
     spec = TaskGraphSpec(node_count=5, max_depth=2, max_fanout=2)
     decision = ac.check(_writer_identity(), spec, usage, ["read_file"])
@@ -247,7 +261,7 @@ def test_per_issue_agent_cap_blocks_spawn(tmp_path: Path) -> None:
 
 
 def test_runaway_subtask_plan_is_bounded(tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path)
     # A planner emitting a maximal, deep, fanning graph is still bounded by
     # the approved v1.7 ceilings (64 nodes, depth 4, fanout 6).
     spec = TaskGraphSpec(node_count=1_000_000, max_depth=1_000, max_fanout=1_000)
@@ -261,13 +275,13 @@ def test_runaway_subtask_plan_is_bounded(tmp_path: Path) -> None:
 
 
 def test_paper_only_blocks_live_trading_tool(tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path, quantlab_paper_policy)
     spec = TaskGraphSpec(node_count=5, max_depth=2, max_fanout=2)
     decision = ac.check(
         _writer_identity(), spec, _idle_usage(), ["read_file", "alpaca-order.submit"]
     )
     assert isinstance(decision, DenyDecision)
-    assert decision.reason == DenyReason.LIVE_TRADING_TOOL
+    assert decision.reason == DenyReason.CONSUMER_POLICY
 
 
 @pytest.mark.parametrize("role", ["reader", "writer", "operator"])
@@ -281,12 +295,12 @@ def test_no_live_broker_permissions_in_allowlists(role: str) -> None:
 
 
 def test_non_paper_only_spawn_is_denied(tmp_path: Path) -> None:
-    ac = AdmissionControl(paper_only=True, audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path, quantlab_paper_policy)
     spec = TaskGraphSpec(node_count=5, max_depth=2, max_fanout=2)
     identity = _writer_identity(paper_only=False)  # child claims live
     decision = ac.check(identity, spec, _idle_usage(), ["read_file"])
     assert isinstance(decision, DenyDecision)
-    assert decision.reason == DenyReason.LIVE_TRADING_TOOL
+    assert decision.reason == DenyReason.CONSUMER_POLICY
 
 
 # --- Acceptance: protected paths / secrets denied ------------------------ #
@@ -301,27 +315,27 @@ def test_non_paper_only_spawn_is_denied(tmp_path: Path) -> None:
     ],
 )
 def test_protected_paths_denied(tool: str, tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path, quantlab_paper_policy)
     spec = TaskGraphSpec(node_count=5, max_depth=2, max_fanout=2)
     decision = ac.check(_writer_identity(), spec, _idle_usage(), [tool])
     assert isinstance(decision, DenyDecision)
-    assert decision.reason == DenyReason.PROTECTED_PATH
+    assert decision.reason == DenyReason.CONSUMER_POLICY
 
 
 @pytest.mark.parametrize("tool", ["shell export API_KEY=xxx", "patch alpaca_secret_key"])
 def test_secret_access_denied(tool: str, tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path, quantlab_paper_policy)
     spec = TaskGraphSpec(node_count=5, max_depth=2, max_fanout=2)
     decision = ac.check(_writer_identity(), spec, _idle_usage(), [tool])
     assert isinstance(decision, DenyDecision)
-    assert decision.reason == DenyReason.SECRET_ACCESS
+    assert decision.reason == DenyReason.CONSUMER_POLICY
 
 
 # --- Acceptance: denial is durably audited (Machine City visible) --------- #
 
 
 def test_denial_is_audited_and_visible(tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path)
     spec = TaskGraphSpec(node_count=1_000_000, max_depth=2, max_fanout=2)
     decision = ac.check(_writer_identity(), spec, _idle_usage(), ["read_file"])
     assert isinstance(decision, DenyDecision)
@@ -341,7 +355,7 @@ def test_denial_is_audited_and_visible(tmp_path: Path) -> None:
 
 
 def test_cancellation_is_durable(tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path)
     task_id = "236-test-task-0001"
     record = ac.cancel(task_id, "runaway subtask exceeded DAG budget")
     assert record["event"] == "cancel"
@@ -365,7 +379,7 @@ def test_audit_log_rejects_corrupt_line_as_tamper_evident(tmp_path: Path) -> Non
 
 
 def test_operator_role_is_not_auto_spawnable(tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path)
     spec = TaskGraphSpec(node_count=5, max_depth=2, max_fanout=2)
     child = _writer_identity(
         role="operator", parent_role="writer", parent_tools=frozenset({"read_file"})
@@ -381,7 +395,7 @@ def test_audit_sink_is_required_fail_closed() -> None:
 
 
 def test_empty_parent_toolset_denies_child_tools(tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path)
     child = _writer_identity(parent_role="writer", parent_tools=frozenset())
     decision = ac.check(
         child,
@@ -408,14 +422,14 @@ def test_auto_spawn_allowlists_do_not_include_unrestricted_shell() -> None:
     ],
 )
 def test_malformed_graph_dimensions_fail_closed(spec: TaskGraphSpec, tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path)
     decision = ac.check(_writer_identity(), spec, _idle_usage(), ["read_file"])
     assert isinstance(decision, DenyDecision)
     assert decision.reason == DenyReason.INVALID_GRAPH_SPEC
 
 
 def test_nonfinite_resource_telemetry_fails_closed(tmp_path: Path) -> None:
-    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    ac = _admission(tmp_path)
     usage = replace(_idle_usage(), cpu=float("nan"))
     decision = ac.check(
         _writer_identity(),
@@ -425,6 +439,30 @@ def test_nonfinite_resource_telemetry_fails_closed(tmp_path: Path) -> None:
     )
     assert isinstance(decision, DenyDecision)
     assert decision.reason == DenyReason.INVALID_RESOURCE_TELEMETRY
+
+
+
+def test_missing_consumer_policy_fails_closed(tmp_path: Path) -> None:
+    ac = AdmissionControl(audit_log=_tmp_audit(tmp_path))
+    decision = ac.check(
+        _writer_identity(role="reader"),
+        TaskGraphSpec(node_count=1, max_depth=1, max_fanout=0),
+        _idle_usage(),
+        ["read_file"],
+    )
+    assert isinstance(decision, DenyDecision)
+    assert decision.reason == DenyReason.CONSUMER_POLICY
+    events = ac.audit_log.replay()  # type: ignore[union-attr]
+    assert events[-1]["admit:consumer_reason"] == "consumer_policy_required"
+
+
+def test_quantlab_policy_and_other_profiles_are_separate() -> None:
+    identity = _writer_identity(paper_only=False)
+    assert quantlab_paper_policy(identity, ("read_file",)) == "paper_only_required"
+    assert base_consumer_policy(identity, ("read_file",)) is None
+    assert policy_for_profile("majak")(identity, ("read_file",)) is None
+    assert policy_for_profile("heating")(identity, ("read_file",)) is None
+    assert policy_for_profile("unknown")(identity, ("read_file",)) == "unknown_consumer_profile"
 
 
 def test_consumer_policy_hook_can_only_tighten_admission(tmp_path: Path) -> None:

@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from herdr.consumer_policies import allow_all_consumer_policy, quantlab_paper_policy
+
 from herdr.admission import (
     AdmissionControl,
     AgentIdentity,
@@ -79,7 +81,10 @@ def _canary(tmp_path: Path):
 
 
 def _admission(tmp_path: Path) -> AdmissionControl:
-    return AdmissionControl(audit_log=AdmissionAuditLog(tmp_path / "admission.jsonl"))
+    return AdmissionControl(
+        audit_log=AdmissionAuditLog(tmp_path / "admission.jsonl"),
+        consumer_policy_hook=quantlab_paper_policy,
+    )
 
 
 def _registry(tmp_path: Path) -> AdmissionRegistry:
@@ -294,6 +299,7 @@ def test_admission_registry_enforces_global_limit_across_runtimes(tmp_path: Path
     admission = AdmissionControl(
         budget=PlanBudget(max_global_agents=1, max_agents_per_repo=4, max_agents_per_issue=3),
         audit_log=AdmissionAuditLog(tmp_path / "registry-admission.jsonl"),
+        consumer_policy_hook=allow_all_consumer_policy,
     )
     identity = AgentIdentity(
         role="reader",
@@ -322,6 +328,7 @@ def test_admission_registry_prunes_expired_crash_slot(tmp_path: Path) -> None:
     admission = AdmissionControl(
         budget=PlanBudget(max_global_agents=1, max_agents_per_repo=1, max_agents_per_issue=1),
         audit_log=AdmissionAuditLog(tmp_path / "registry-expiry.jsonl"),
+        consumer_policy_hook=allow_all_consumer_policy,
     )
     identity = AgentIdentity(
         role="reader",
