@@ -313,6 +313,118 @@ def test_switch_runtime_keeps_watchdog_quiescent(
     )
 
 
+
+def test_switch_runtime_resets_rate_limit_and_starts_herdr_once_via_export(
+    monkeypatch,
+    tmp_path,
+):
+    events = []
+
+    def fake_run(*args, check=True):
+        events.append(("run", *args))
+
+        if args[:2] == (
+            "/usr/bin/systemctl",
+            "is-active",
+        ):
+            return "active"
+
+        return ""
+
+    monkeypatch.setattr(
+        cutover,
+        "run",
+        fake_run,
+    )
+
+    monkeypatch.setattr(
+        cutover,
+        "atomic_symlink",
+        lambda target, link: None,
+    )
+
+    monkeypatch.setattr(
+        cutover,
+        "wait_http_status",
+        lambda *_args, **_kwargs: "401",
+    )
+
+    monkeypatch.setattr(
+        cutover,
+        "assert_hardening",
+        lambda: None,
+    )
+
+    target = tmp_path / "release"
+    target.mkdir()
+
+    cutover.switch_runtime(
+        target,
+        None,
+    )
+
+    assert (
+        "run",
+        "/usr/bin/systemctl",
+        "reset-failed",
+        "agent-platform-herdr.service",
+        "agent-platform-export.service",
+        "agent-platform-web.service",
+    ) in events
+
+    assert (
+        "run",
+        "/usr/bin/systemctl",
+        "start",
+        "agent-platform-export.service",
+    ) in events
+
+    assert not any(
+        event
+        == (
+            "run",
+            "/usr/bin/systemctl",
+            "start",
+            "agent-platform-herdr.service",
+        )
+        for event in events
+    )
+
+
+def test_rollback_steps_continue_after_individual_failure():
+    events = []
+
+    def first():
+        events.append("first")
+
+    def broken():
+        events.append("broken")
+        raise RuntimeError("boom")
+
+    def last():
+        events.append("last")
+
+    errors = cutover.run_rollback_steps(
+        [
+            ("first", first),
+            ("broken", broken),
+            ("last", last),
+        ]
+    )
+
+    assert events == [
+        "first",
+        "broken",
+        "last",
+    ]
+
+    assert len(errors) == 1
+    assert errors[0].startswith(
+        "broken:RuntimeError:boom"
+    )
+
+
+
 def test_watchdog_start_is_explicit(monkeypatch):
     events = []
 
@@ -368,6 +480,10 @@ def test_apply_keeps_watchdog_quiescent_during_rollback_exercise():
     assert "restore_units(unit_snapshots)" in apply_source
     assert "public_state_snapshot = snapshot_file(PUBLIC_STATE)" in apply_source
     assert "restore_file(" in apply_source
+    assert "run_rollback_steps(" in apply_source
+    assert "rollback_incomplete:" in apply_source
+    assert "fail_closed_route" in apply_source
+    assert '"restore_current"' in apply_source
 
     # switch_runtime itself never restarts durable dispatch.
     switch_source = source.split(

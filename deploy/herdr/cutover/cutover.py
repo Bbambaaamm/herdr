@@ -569,6 +569,22 @@ def assert_no_active_durable_worker() -> None:
     need(not workers.strip(), "durable_worker_active")
 
 
+
+def run_rollback_steps(steps):
+    """Run every rollback step and retain bounded failure evidence."""
+    errors = []
+
+    for name, action in steps:
+        try:
+            action()
+        except BaseException as exc:
+            errors.append(
+                f"{name}:{type(exc).__name__}:{exc}"
+            )
+
+    return errors
+
+
 def switch_runtime(
     target: Path,
     document: dict[str, object] | None,
@@ -590,9 +606,27 @@ def switch_runtime(
 
     run("/usr/bin/systemctl", "daemon-reload")
 
-    run("/usr/bin/systemctl", "start", "agent-platform-herdr.service")
-    run("/usr/bin/systemctl", "start", "agent-platform-export.service")
-    run("/usr/bin/systemctl", "start", "agent-platform-web.service")
+    # candidate -> rollback -> candidate performs several bounded
+    # transitions in a short interval. Reset systemd's rate limiter
+    # before every transition and start the Herdr oneshot only once,
+    # through agent-platform-export.service's dependency graph.
+    run(
+        "/usr/bin/systemctl",
+        "reset-failed",
+        "agent-platform-herdr.service",
+        "agent-platform-export.service",
+        "agent-platform-web.service",
+    )
+    run(
+        "/usr/bin/systemctl",
+        "start",
+        "agent-platform-export.service",
+    )
+    run(
+        "/usr/bin/systemctl",
+        "start",
+        "agent-platform-web.service",
+    )
 
     wait_http_status(
         "http://127.0.0.1:3010/agent-platform/health",
@@ -900,80 +934,361 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
             "state_file": str(state_path),
         }
 
-    except BaseException:
-        try:
-            # Keep durable execution quiescent for rollback.
+    except BaseException as original_error:
+        # Durable execution stays quiescent for the whole recovery.
+        run(
+            "/usr/bin/systemctl",
+            "stop",
+            "agent-stack-watchdog.service",
+            check=False,
+        )
+        watchdog_stopped = True
+
+        rollback_steps = [
+            (
+                "restore_units",
+                lambda: restore_units(unit_snapshots),
+            ),
+        ]
+
+        if switched:
+            rollback_steps.append(
+                (
+                    "restore_current",
+                    lambda: atomic_symlink(
+                        previous,
+                        CURRENT,
+                    ),
+                )
+            )
+
+        rollback_steps.extend(
+            [
+                (
+                    "restore_public_state",
+                    lambda: restore_file(
+                        PUBLIC_STATE,
+                        public_state_snapshot,
+                    ),
+                ),
+                (
+                    "daemon_reload",
+                    lambda: run(
+                        "/usr/bin/systemctl",
+                        "daemon-reload",
+                    ),
+                ),
+                (
+                    "reset_previous_rate_limits",
+                    lambda: run(
+                        "/usr/bin/systemctl",
+                        "reset-failed",
+                        "agent-platform-herdr.service",
+                        "agent-platform-export.service",
+                        "agent-platform-web.service",
+                    ),
+                ),
+                (
+                    "start_previous_export",
+                    lambda: run(
+                        "/usr/bin/systemctl",
+                        "start",
+                        "agent-platform-export.service",
+                    ),
+                ),
+                (
+                    "start_previous_web",
+                    lambda: run(
+                        "/usr/bin/systemctl",
+                        "start",
+                        "agent-platform-web.service",
+                    ),
+                ),
+            ]
+        )
+
+        if timers_stopped:
+            rollback_steps.append(
+                (
+                    "restart_timers",
+                    lambda: run(
+                        "/usr/bin/systemctl",
+                        "start",
+                        "agent-platform-herdr.timer",
+                        "agent-platform-export.timer",
+                    ),
+                )
+            )
+
+        rollback_steps.extend(
+            [
+                (
+                    "local_health",
+                    lambda: wait_http_status(
+                        "http://127.0.0.1:3010/"
+                        "agent-platform/health",
+                        "401",
+                    ),
+                ),
+                (
+                    "restore_nginx_route",
+                    lambda: atomic_write(
+                        NGINX_ROUTE,
+                        active_route,
+                        0o644,
+                    ),
+                ),
+                (
+                    "nginx_config_test",
+                    lambda: run(
+                        "/usr/sbin/nginx",
+                        "-t",
+                    ),
+                ),
+                (
+                    "nginx_reload",
+                    lambda: run(
+                        "/usr/bin/systemctl",
+                        "reload",
+                        "nginx",
+                    ),
+                ),
+                (
+                    "public_health",
+                    lambda: wait_http_status(
+                        "https://2.28.67.165/"
+                        "agent-platform/health",
+                        "401",
+                    ),
+                ),
+            ]
+        )
+
+        rollback_errors = run_rollback_steps(
+            rollback_steps
+        )
+
+        def verify_rollback():
+            need(
+                CURRENT.is_symlink()
+                and CURRENT.resolve(strict=True)
+                == previous,
+                "rollback_current_mismatch",
+            )
+
+            for path, digest in previous_unit_hashes.items():
+                need(
+                    digest_file(path) == digest,
+                    f"rollback_unit_mismatch:{path.name}",
+                )
+
+            need(
+                snapshot_file(PUBLIC_STATE)
+                == public_state_snapshot,
+                "rollback_public_state_mismatch",
+            )
+
+            need(
+                digest_file(NGINX_ROUTE)
+                == sha256(active_route),
+                "rollback_nginx_route_mismatch",
+            )
+
+            need(
+                run(
+                    "/usr/bin/systemctl",
+                    "is-active",
+                    "agent-platform-web.service",
+                )
+                == "active",
+                "rollback_web_not_active",
+            )
+
+            for timer in (
+                "agent-platform-herdr.timer",
+                "agent-platform-export.timer",
+            ):
+                need(
+                    run(
+                        "/usr/bin/systemctl",
+                        "is-active",
+                        timer,
+                    )
+                    == "active",
+                    f"rollback_timer_not_active:{timer}",
+                )
+
+            need(
+                http_status(
+                    "http://127.0.0.1:3010/"
+                    "agent-platform/health"
+                )
+                == "401",
+                "rollback_local_health_failed",
+            )
+
+            need(
+                http_status(
+                    "https://2.28.67.165/"
+                    "agent-platform/health"
+                )
+                == "401",
+                "rollback_public_health_failed",
+            )
+
+            need(
+                http_status("https://2.28.67.165/")
+                == root_status,
+                "rollback_root_changed",
+            )
+
+        rollback_errors.extend(
+            run_rollback_steps(
+                [
+                    (
+                        "verify_rollback",
+                        verify_rollback,
+                    )
+                ]
+            )
+        )
+
+        def remove_success_state():
+            try:
+                state_path.unlink()
+            except FileNotFoundError:
+                pass
+
+        rollback_errors.extend(
+            run_rollback_steps(
+                [
+                    (
+                        "remove_success_state",
+                        remove_success_state,
+                    )
+                ]
+            )
+        )
+
+        def preserve_failed_archive():
+            source = (
+                evidence_archive
+                if evidence_moved
+                else archive
+            )
+
+            if not source.exists():
+                return
+
+            failed_archive = (
+                STATE_DIR
+                / (
+                    f"{document['deployed_at']}-"
+                    f"{identifier}.failed.tar.gz"
+                )
+            )
+
+            if failed_archive.exists():
+                failed_archive = (
+                    STATE_DIR
+                    / (
+                        f"{document['deployed_at']}-"
+                        f"{identifier}.failed-"
+                        f"{os.getpid()}.tar.gz"
+                    )
+                )
+
+            os.replace(
+                source,
+                failed_archive,
+            )
+
+        rollback_errors.extend(
+            run_rollback_steps(
+                [
+                    (
+                        "preserve_failed_archive",
+                        preserve_failed_archive,
+                    )
+                ]
+            )
+        )
+
+        if rollback_errors:
+            # Recovery is not proven coherent. Keep the public Agent
+            # Platform route fail-closed and never reopen dispatch.
+            fail_closed_errors = run_rollback_steps(
+                [
+                    (
+                        "fail_closed_route",
+                        lambda: atomic_write(
+                            NGINX_ROUTE,
+                            maintenance,
+                            0o644,
+                        ),
+                    ),
+                    (
+                        "fail_closed_nginx_test",
+                        lambda: run(
+                            "/usr/sbin/nginx",
+                            "-t",
+                        ),
+                    ),
+                    (
+                        "fail_closed_nginx_reload",
+                        lambda: run(
+                            "/usr/bin/systemctl",
+                            "reload",
+                            "nginx",
+                        ),
+                    ),
+                ]
+            )
+
             run(
                 "/usr/bin/systemctl",
                 "stop",
                 "agent-stack-watchdog.service",
                 check=False,
             )
-            watchdog_stopped = True
 
-            # Restore exact pre-deployment units even if install_units()
-            # failed part-way through.
-            restore_units(unit_snapshots)
-
-            if switched:
-                switch_runtime(
-                    previous,
-                    None,
+            raise ReleaseError(
+                "deployment_failed:"
+                f"{type(original_error).__name__}:"
+                f"{original_error};"
+                "rollback_incomplete:"
+                + "|".join(
+                    rollback_errors
+                    + fail_closed_errors
                 )
+            ) from original_error
 
-            restore_file(
-                PUBLIC_STATE,
-                public_state_snapshot,
+        watchdog_errors = run_rollback_steps(
+            [
+                (
+                    "start_watchdog",
+                    start_watchdog_service,
+                )
+            ]
+        )
+
+        if watchdog_errors:
+            run(
+                "/usr/bin/systemctl",
+                "stop",
+                "agent-stack-watchdog.service",
+                check=False,
             )
 
-            if timers_stopped:
-                run(
-                    "/usr/bin/systemctl",
-                    "start",
-                    "agent-platform-herdr.timer",
-                    "agent-platform-export.timer",
-                )
-                timers_stopped = False
+            raise ReleaseError(
+                "deployment_failed:"
+                f"{type(original_error).__name__}:"
+                f"{original_error};"
+                "rollback_watchdog_incomplete:"
+                + "|".join(watchdog_errors)
+            ) from original_error
 
-            atomic_write(
-                NGINX_ROUTE,
-                active_route,
-                0o644,
-            )
-
-            run("/usr/sbin/nginx", "-t")
-            run("/usr/bin/systemctl", "reload", "nginx")
-
-            wait_http_status(
-                "https://2.28.67.165/agent-platform/health",
-                "401",
-            )
-
-            # A failed promotion must not leave a success-looking state
-            # document behind.
-            try:
-                state_path.unlink()
-            except FileNotFoundError:
-                pass
-
-            if evidence_moved and evidence_archive.exists():
-                failed_archive = (
-                    STATE_DIR
-                    / (
-                        f"{document['deployed_at']}-"
-                        f"{identifier}.failed.tar.gz"
-                    )
-                )
-                os.replace(
-                    evidence_archive,
-                    failed_archive,
-                )
-
-            start_watchdog_service()
-            watchdog_stopped = False
-
-        finally:
-            raise
+        raise
 
 
 def main() -> int:
