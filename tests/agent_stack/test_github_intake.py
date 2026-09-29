@@ -247,5 +247,89 @@ class GitHubIntakeTests(unittest.TestCase):
         )
 
 
+    def _root_issue(self):
+        return {
+            "number": 662,
+            "state": "open",
+            "title": "HERDR CONTROL",
+            "html_url": "https://github.com/Bbambaaamm/dotacni-majak/issues/662",
+            "body": "root",
+            "updated_at": "2026-09-29T06:00:00Z",
+        }
+
+    def _run_main_with_majak(self):
+        self.write_config([self.majak_consumer()])
+        self.intake.fetch_issues = lambda _consumer: [self._root_issue()]
+        original_argv = list(self.intake.sys.argv)
+        try:
+            self.intake.sys.argv = ["agent-github-intake", "--force"]
+            return self.intake.main()
+        finally:
+            self.intake.sys.argv = original_argv
+
+    def test_main_does_not_duplicate_active_majak_root(self):
+        running = self.intake.ROOT / "running" / "root-active.json"
+        running.write_text(
+            json.dumps({
+                "id": "root-active",
+                "issue": 662,
+                "repo": "Bbambaaamm/dotacni-majak",
+                "agent": "dotacni-majak-hermes",
+            }),
+            encoding="utf-8",
+        )
+        self.assertEqual(self._run_main_with_majak(), 0)
+        self.assertEqual(list(self.intake.PENDING.glob("*.json")), [])
+        state = json.loads(self.intake.STATE.read_text(encoding="utf-8"))
+        row = state["Bbambaaamm/dotacni-majak#662"]
+        self.assertEqual(row["scheduler_state"], "active")
+        self.assertEqual(row["task_ids"], ["root-active"])
+
+    def test_main_respects_cooldown_for_completed_majak_root(self):
+        done = self.intake.ROOT / "done" / "root-done.json"
+        done.write_text(
+            json.dumps({
+                "id": "root-done",
+                "issue": 662,
+                "repo": "Bbambaaamm/dotacni-majak",
+                "agent": "dotacni-majak-hermes",
+            }),
+            encoding="utf-8",
+        )
+        self.assertEqual(self._run_main_with_majak(), 0)
+        self.assertEqual(list(self.intake.PENDING.glob("*.json")), [])
+        state = json.loads(self.intake.STATE.read_text(encoding="utf-8"))
+        self.assertEqual(
+            state["Bbambaaamm/dotacni-majak#662"]["scheduler_state"],
+            "cooldown",
+        )
+
+    def test_main_requeues_old_technical_failure_for_majak_root(self):
+        failed = self.intake.ROOT / "failed" / "root-old-failed.json"
+        failed.write_text(
+            json.dumps({
+                "id": "root-old-failed",
+                "issue": 662,
+                "repo": "Bbambaaamm/dotacni-majak",
+                "agent": "dotacni-majak-hermes",
+                "last_error": "executor crashed",
+            }),
+            encoding="utf-8",
+        )
+        old = time.time() - self.intake.COOLDOWN_SECONDS - 10
+        import os
+        os.utime(failed, (old, old))
+        self.assertEqual(self._run_main_with_majak(), 0)
+        pending = list(self.intake.PENDING.glob("github-majak-issue-662-*.json"))
+        self.assertEqual(len(pending), 1)
+        task = json.loads(pending[0].read_text(encoding="utf-8"))
+        self.assertEqual(task["agent"], "dotacni-majak-hermes")
+        state = json.loads(self.intake.STATE.read_text(encoding="utf-8"))
+        self.assertEqual(
+            state["Bbambaaamm/dotacni-majak#662"]["scheduler_state"],
+            "queued",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
