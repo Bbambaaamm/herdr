@@ -38,8 +38,12 @@ def epoch(value):
         return None
 
 
-def safe_text(value, default=None):
-    if isinstance(value, str) and SAFE.fullmatch(value):
+def safe_text(value, default=None, limit=128):
+    if (
+        isinstance(value, str)
+        and 0 < len(value) <= limit
+        and SAFE.fullmatch(value)
+    ):
         return value
     return default
 
@@ -134,10 +138,11 @@ def rows():
                 raw = json.loads(path.read_text(encoding="utf-8"))
             except Exception:
                 continue
-            task_id = safe_text(raw.get("id"))
+            task_id = safe_text(raw.get("id"), limit=128)
             if not task_id or task_id in seen:
                 continue
-            repo = safe_text(raw.get("repo"), LEGACY_REPO)
+            raw_repo = raw.get("repo", LEGACY_REPO)
+            repo = safe_text(raw_repo, limit=160)
             profile = REPO_PROFILES.get(repo)
             if profile is None or counts[profile] >= PROFILE_LIMIT:
                 continue
@@ -156,7 +161,7 @@ def rows():
             max_attempts = raw.get("max_attempts", 0)
             if type(max_attempts) is not int or not 0 <= max_attempts <= 1000:
                 max_attempts = 0
-            kind = safe_text(raw.get("kind"), "unknown")
+            kind = safe_text(raw.get("kind"), "unknown", limit=64)
             blocker, pr_number = result_info(task_id)
             meta = issues.get((repo, issue), {}) if issue is not None else {}
             items.append(
