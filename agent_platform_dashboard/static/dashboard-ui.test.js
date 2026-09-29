@@ -695,6 +695,10 @@ test('authoritative swarm snapshot drives real DAG edges and child task lineage'
     observed_at: now, data_at: now,
     rows: [{
       version: 1, repo: 'Bbambaaamm/herdr', issue: '7', paper_only: false, policy_profiles: ['default'],
+      agents: [{
+        agent_id: 'herdr-parent', task_id: 'parent', state: 'running',
+        parent_task_id: null, parent_agent_id: null, fencing_token: 1,
+      }],
       tasks: [
         {
           task_id: 'parent', parent_task_id: null, parent_agent_id: null,
@@ -735,7 +739,7 @@ test('QuantLab swarm browser boundary rejects non-PAPER snapshots', async t => {
     observed_at: now, data_at: now,
     rows: [{
       version: 1, repo: 'Bbambaaamm/Autonomous-Quant-Lab', issue: '231',
-      paper_only: false, policy_profiles: [], tasks: [], edges: [],
+      paper_only: false, policy_profiles: [], agents: [], tasks: [], edges: [],
     }],
   });
   await h.refresh();
