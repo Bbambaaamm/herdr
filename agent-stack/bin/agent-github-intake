@@ -206,7 +206,8 @@ def result_for(task_id: str) -> dict:
 
 def prior_evidence(records: list[dict]) -> str:
     for record in records:
-        task_id = str(record["task"].get("id") or "")
+        task = record["task"]
+        task_id = str(task.get("id") or "")
         result = result_for(task_id)
         if result:
             compact = {
@@ -217,6 +218,18 @@ def prior_evidence(records: list[dict]) -> str:
                 "next_action": result.get("next_action"),
             }
             return json.dumps(compact, ensure_ascii=False)[:5000]
+        if record["state"] == "failed":
+            last_error = task.get("last_error")
+            if isinstance(last_error, str) and last_error.strip():
+                compact = {
+                    "previous_task": task_id,
+                    "previous_state": "failed",
+                    "summary": None,
+                    "blocker": None,
+                    "next_action": None,
+                    "last_error": last_error.strip()[:2000],
+                }
+                return json.dumps(compact, ensure_ascii=False)[:5000]
     return "none"
 
 
