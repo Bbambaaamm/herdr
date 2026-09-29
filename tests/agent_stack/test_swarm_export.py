@@ -175,7 +175,7 @@ class SwarmExportTests(unittest.TestCase):
                 "paper_only": False,
             },
         )
-        with self.assertRaisesRegex(ValueError, "quantlab_non_paper"):
+        with self.assertRaisesRegex(ValueError, "explicit_non_paper"):
             self.exporter.load_records()
 
     def test_pr46_quantlab_safety_profile_maps_to_paper_policy(self):
