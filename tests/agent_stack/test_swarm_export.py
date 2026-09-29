@@ -149,7 +149,7 @@ class SwarmExportTests(unittest.TestCase):
         task = self.herdr_task("duplicate")
         self.write_task("running", task)
         self.write_task("blocked", task)
-        with self.assertRaisesRegex(ValueError, "duplicate_task_id"):
+        with self.assertRaisesRegex(ValueError, "unstable_snapshot"):
             self.exporter.main()
         self.assertEqual(self.output.read_bytes(), sentinel)
 
@@ -164,6 +164,62 @@ class SwarmExportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dangling_dependency"):
             self.exporter.main()
         self.assertEqual(self.output.read_bytes(), sentinel)
+
+    def test_done_task_drops_obsolete_watchdog_blocker(self):
+        self.write_task(
+            "done",
+            self.herdr_task(
+                "reconciled-done",
+                watchdog_blocker="orphaned_running_unknown_delivery",
+            ),
+        )
+        payload = self.exporter.materialize(self.exporter.load_records(), observed_at=100)
+        self.assertEqual(payload["tasks"][0]["state"], "done")
+        self.assertNotIn("blocker", payload["tasks"][0])
+
+    def test_snapshot_scan_retries_task_move_between_state_directories(self):
+        running = self.write_task("running", self.herdr_task("moving"))
+        blocked = self.root / "blocked" / running.name
+        original = self.exporter.read_json
+        moved = {"value": False}
+
+        def move_after_read(path):
+            raw = original(path)
+            if path == running and not moved["value"]:
+                running.replace(blocked)
+                moved["value"] = True
+            return raw
+
+        self.exporter.read_json = move_after_read
+        try:
+            records = self.exporter.load_records()
+        finally:
+            self.exporter.read_json = original
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["state"], "blocked")
+        self.assertEqual(records[0]["task_id"], "moving")
+
+    def test_snapshot_scan_retries_disappearing_source_path(self):
+        running = self.write_task("running", self.herdr_task("vanishing"))
+        blocked = self.root / "blocked" / running.name
+        original = self.exporter.read_json
+        moved = {"value": False}
+
+        def move_before_read(path):
+            if path == running and not moved["value"]:
+                running.replace(blocked)
+                moved["value"] = True
+                raise FileNotFoundError(path)
+            return original(path)
+
+        self.exporter.read_json = move_before_read
+        try:
+            records = self.exporter.load_records()
+        finally:
+            self.exporter.read_json = original
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["state"], "blocked")
+        self.assertEqual(records[0]["task_id"], "vanishing")
 
     def test_non_paper_quantlab_is_rejected(self):
         self.write_task(

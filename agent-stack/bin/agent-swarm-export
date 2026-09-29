@@ -20,6 +20,11 @@ HEX_ID = re.compile(r"^[0-9a-f]{64}$")
 MAX_TASKS = 100
 MAX_EDGES = 200
 MAX_BYTES = 131072
+SNAPSHOT_RETRIES = 3
+
+
+class SnapshotRace(RuntimeError):
+    pass
 
 def now_epoch():
     return int(datetime.now(timezone.utc).timestamp())
@@ -146,7 +151,21 @@ def optional_task_id(value):
         raise ValueError("invalid_task_id")
     return value
 
-def load_records():
+def stable_task_json(path):
+    try:
+        before = path.stat()
+        raw = read_json(path)
+        after = path.stat()
+    except FileNotFoundError as exc:
+        raise SnapshotRace("task_moved_during_scan") from exc
+    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    if identity_before != identity_after:
+        raise SnapshotRace("task_changed_during_scan")
+    return raw
+
+
+def _load_records_once():
     records = []
     seen = set()
     for state in STATES:
@@ -154,7 +173,7 @@ def load_records():
         if not folder.is_dir():
             continue
         for path in sorted(folder.glob("*.json")):
-            raw = read_json(path)
+            raw = stable_task_json(path)
             repo = raw.get("repo")
             if repo not in ALLOWED_REPOS:
                 continue
@@ -164,7 +183,7 @@ def load_records():
             issue = issue_text(raw.get("issue"))
             identity = (repo, issue, task_id)
             if identity in seen:
-                raise ValueError("duplicate_task_id")
+                raise SnapshotRace("task_moved_during_scan")
             seen.add(identity)
             policy_metadata(raw, repo)
             records.append({
@@ -176,6 +195,16 @@ def load_records():
                 "stamp": task_stamp(raw),
             })
     return records
+
+
+def load_records():
+    last_race = None
+    for _attempt in range(SNAPSHOT_RETRIES):
+        try:
+            return _load_records_once()
+        except SnapshotRace as exc:
+            last_race = exc
+    raise ValueError("unstable_snapshot") from last_race
 
 def select_group(records):
     if not records:
@@ -190,7 +219,9 @@ def select_group(records):
         return (rank, stamp, key[0], key[1])
     return max(groups.items(), key=score)
 
-def sanitized_blocker(raw, result):
+def sanitized_blocker(raw, result, state):
+    if state == "done":
+        return None
     for value in (raw.get("watchdog_blocker"), raw.get("blocker"), result.get("blocker")):
         if isinstance(value, str) and ident(value, 128):
             return value
@@ -274,7 +305,7 @@ def materialize(records, observed_at=None):
             ("agent_id", agent_id),
             ("model", model),
             ("fallback_model", fallback),
-            ("blocker", sanitized_blocker(raw, result)),
+            ("blocker", sanitized_blocker(raw, result, record["state"])),
         ):
             if value is not None:
                 task[key] = value

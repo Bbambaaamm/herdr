@@ -731,6 +731,29 @@ test('authoritative swarm snapshot drives real DAG edges and child task lineage'
   assert.equal(child.status, 'running');
 });
 
+test('observability active work uses authoritative running agents only', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '48', paper_only: false, policy_profiles: ['default'],
+      agents: [],
+      tasks: [{
+        task_id: 'blocked-history', parent_task_id: null, parent_agent_id: null,
+        agent_id: 'historic-agent', state: 'blocked', role: 'worker',
+        model: 'model-a', fallback_model: null, attempt: 1, max_attempts: 2,
+        blocker: 'dependency_wait', fencing_token: 9, dependencies: [], result_sha: null,
+      }],
+      edges: [],
+    }],
+  });
+  await h.refresh();
+  assert.match(h.get('#swarm-kpis').innerHTML, /<span>Active<\/span><b>0<\/b>/);
+  assert.match(h.get('#observability-kpis').innerHTML, /<span>Aktivní práce<\/span><b>0 agent ·/);
+});
+
 test('QuantLab swarm browser boundary rejects non-PAPER snapshots', async t => {
   const h = await harness(t);
   const now = Math.floor(Date.now() / 1000);

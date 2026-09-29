@@ -577,7 +577,7 @@ export function mountDashboard(createScene) {
     const knownCost = routersAvailable ? profileStats.reduce((sum, value) => sum + value.costKnown, 0) : null;
     const unknownCostRequests = routersAvailable ? profileStats.reduce((sum, value) => sum + value.costUnknownRequests, 0) : null;
     const activeAgents = swarmSnapshot()
-      ? new Set(taskRows().filter(row => ['running', 'blocked'].includes(row.status)).map(row => row.agent).filter(Boolean)).size
+      ? swarmAgents().length
       : agents().filter(row => row.status === 'working').length;
     const activeQueue = activeQueueTasks().length;
     const remaining = codex ? 100 - codex.used_percent : null;
