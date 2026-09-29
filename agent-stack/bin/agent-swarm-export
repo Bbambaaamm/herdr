@@ -219,6 +219,61 @@ def select_group(records):
         return (rank, stamp, key[0], key[1])
     return max(groups.items(), key=score)
 
+def bounded_history(records):
+    if len(records) <= MAX_TASKS:
+        return records
+    by_id = {record["task_id"]: record for record in records}
+    neighbors = {task_id: set() for task_id in by_id}
+    for record in records:
+        raw = record["raw"]
+        refs = []
+        parent = raw.get("parent_task_id")
+        if isinstance(parent, str):
+            refs.append(parent)
+        dependencies = raw.get("dependencies")
+        if isinstance(dependencies, list):
+            refs.extend(dep for dep in dependencies if isinstance(dep, str))
+        for ref in refs:
+            if ref in by_id:
+                neighbors[record["task_id"]].add(ref)
+                neighbors[ref].add(record["task_id"])
+
+    components = []
+    unseen = set(by_id)
+    while unseen:
+        seed = min(unseen)
+        stack = [seed]
+        component_ids = set()
+        while stack:
+            task_id = stack.pop()
+            if task_id in component_ids:
+                continue
+            component_ids.add(task_id)
+            unseen.discard(task_id)
+            stack.extend(sorted(neighbors[task_id] - component_ids, reverse=True))
+        components.append([by_id[task_id] for task_id in sorted(component_ids)])
+
+    def score(component):
+        return (
+            max(STATE_RANK[row["state"]] for row in component),
+            max(row["stamp"] for row in component),
+            max(row["task_id"] for row in component),
+        )
+
+    retained = []
+    for component in sorted(components, key=score, reverse=True):
+        if len(component) > MAX_TASKS:
+            if not retained:
+                raise ValueError("current_graph_too_large")
+            break
+        if len(retained) + len(component) > MAX_TASKS:
+            break
+        retained.extend(component)
+    if not retained:
+        raise ValueError("no_materializable_tasks")
+    return retained
+
+
 def sanitized_blocker(raw, result, state):
     if state == "done":
         return None
@@ -263,11 +318,11 @@ def ensure_acyclic(task_ids, edge_keys):
 
 def materialize(records, observed_at=None):
     (repo, issue), selected = select_group(records)
-    if len(selected) > MAX_TASKS:
-        raise ValueError("too_many_tasks")
+    selected = bounded_history(selected)
     ids = {row["task_id"] for row in selected}
     tasks = []
     agents = []
+    agent_ids = set()
     edge_keys = set()
     paper_flags = []
     for record in sorted(selected, key=lambda row: row["task_id"]):
@@ -328,6 +383,9 @@ def materialize(records, observed_at=None):
         for dep in deps:
             edge_keys.add((dep, record["task_id"], "dependency"))
         if record["state"] == "running" and agent_id is not None:
+            if agent_id in agent_ids:
+                raise ValueError("duplicate_agent_id")
+            agent_ids.add(agent_id)
             agent = {"agent_id": agent_id, "task_id": record["task_id"], "state": "running"}
             if parent_agent is not None:
                 agent["parent_agent_id"] = parent_agent

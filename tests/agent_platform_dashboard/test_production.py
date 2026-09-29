@@ -526,6 +526,47 @@ def test_swarm_agents_must_match_running_task_identity(tmp_path, monkeypatch):
     with pytest.raises(ValueError):
         sources.swarm(str(path), 'quantlab')
 
+def test_collect_marks_only_swarm_unavailable_when_full_snapshot_budget_would_overflow(tmp_path, monkeypatch):
+    large_tasks = []
+    for index in range(100):
+        suffix = f"{index:03d}"
+        large_tasks.append({
+            'task_id': ('task-' + suffix + '-' + 'x' * 240)[:256],
+            'parent_task_id': None,
+            'parent_agent_id': None,
+            'agent_id': None,
+            'state': 'done',
+            'role': 'r' * 64,
+            'model': 'm' * 128,
+            'fallback_model': 'f' * 128,
+            'attempt': 1,
+            'max_attempts': 1,
+            'blocker': 'b' * 128,
+            'fencing_token': 0,
+            'dependencies': [],
+            'result_sha': 'a' * 64,
+        })
+    large_swarm = {
+        'version': 1,
+        'repo': 'Bbambaaamm/herdr',
+        'issue': '48',
+        'paper_only': False,
+        'policy_profiles': ['default'],
+        'agents': [],
+        'tasks': large_tasks,
+        'edges': [],
+    }
+    c.row('swarm', large_swarm)
+    monkeypatch.setattr(sources, 'swarm', lambda path, profile: ([large_swarm], 100))
+    snapshot = collect(config(tmp_path), 100)
+    swarm_source = next(source for source in snapshot['sources'] if source['kind'] == 'swarm')
+    assert swarm_source['status'] == 'unavailable'
+    assert swarm_source['reason'] == 'source_failed'
+    assert swarm_source['rows'] == []
+    encoded = c.encode(snapshot)
+    assert len(encoded) <= c.MAX_BYTES
+
+
 def test_swarm_collect_and_staleness_are_fail_closed(tmp_path, monkeypatch):
     path = tmp_path / 'swarm.json'
     path.write_text(json.dumps(swarm_payload()))

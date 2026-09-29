@@ -347,6 +347,65 @@ class SwarmExportTests(unittest.TestCase):
         self.assertEqual(payload["issue"], "48")
         self.assertEqual([task["task_id"] for task in payload["tasks"]], ["root"])
 
+    def test_duplicate_running_agent_identity_fails_before_publish(self):
+        sentinel = b'{"previous":"valid"}\n'
+        self.output.write_bytes(sentinel)
+        self.write_task("running", self.herdr_task("one", agent_id="shared-agent"))
+        self.write_task("running", self.herdr_task("two", agent_id="shared-agent"))
+        with self.assertRaisesRegex(ValueError, "duplicate_agent_id"):
+            self.exporter.main()
+        self.assertEqual(self.output.read_bytes(), sentinel)
+
+    def test_long_lived_issue_retains_newest_closed_graph_components(self):
+        for index in range(self.exporter.MAX_TASKS + 1):
+            self.write_task(
+                "done",
+                self.herdr_task(
+                    f"slice-{index:03d}",
+                    created_at=f"2026-09-29T10:{index // 60:02d}:{index % 60:02d}+00:00",
+                ),
+            )
+        payload = self.exporter.materialize(self.exporter.load_records(), observed_at=100)
+        task_ids = {task["task_id"] for task in payload["tasks"]}
+        self.assertEqual(len(task_ids), self.exporter.MAX_TASKS)
+        self.assertNotIn("slice-000", task_ids)
+        self.assertIn(f"slice-{self.exporter.MAX_TASKS:03d}", task_ids)
+
+    def test_bounded_history_never_cuts_a_connected_graph(self):
+        for index in range(self.exporter.MAX_TASKS):
+            self.write_task(
+                "done",
+                self.herdr_task(
+                    f"old-{index:03d}",
+                    created_at=f"2026-09-28T10:{index // 60:02d}:{index % 60:02d}+00:00",
+                ),
+            )
+        self.write_task(
+            "running",
+            self.herdr_task(
+                "current-parent",
+                agent_id="current-agent",
+                created_at="2026-09-29T10:00:00+00:00",
+            ),
+        )
+        self.write_task(
+            "pending",
+            self.herdr_task(
+                "current-child",
+                parent_task_id="current-parent",
+                created_at="2026-09-29T10:00:01+00:00",
+            ),
+        )
+        payload = self.exporter.materialize(self.exporter.load_records(), observed_at=100)
+        task_ids = {task["task_id"] for task in payload["tasks"]}
+        self.assertIn("current-parent", task_ids)
+        self.assertIn("current-child", task_ids)
+        self.assertLessEqual(len(task_ids), self.exporter.MAX_TASKS)
+        self.assertEqual(
+            payload["edges"],
+            [{"from": "current-parent", "to": "current-child", "kind": "parent"}],
+        )
+
     def test_parent_and_dependency_cycles_fail_closed(self):
         self.write_task("pending", self.herdr_task("a", parent_task_id="b"))
         self.write_task("pending", self.herdr_task("b", parent_task_id="a"))
