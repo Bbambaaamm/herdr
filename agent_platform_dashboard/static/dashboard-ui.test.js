@@ -350,6 +350,17 @@ test('Majak durable queue is accepted, visible, and bound to dotacni-majak-herme
   assert.match(h.get('#detail-links').innerHTML, /dotacni-majak\/issues\/662/);
 });
 
+test('single-profile authorized snapshot reports its available queue as complete', async t => {
+  const h = await harness(t);
+  h.setSnapshot({
+    ...h.snapshot(),
+    sources: h.snapshot().sources.filter(item => item.profile === 'quantlab'),
+  });
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().freshSnapshot, true);
+  assert.equal(h.get('#queue-count').textContent, '1');
+});
+
 test('running queue task outranks retained blocked or failed rows across profiles', async t => {
   const h = await harness(t);
   const now = Math.floor(Date.now() / 1000);
