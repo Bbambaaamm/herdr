@@ -114,6 +114,35 @@ class TaskExportTests(unittest.TestCase):
         self.assertEqual(rows["majak-45"]["repo"], "Bbambaaamm/dotacni-majak")
         self.assertEqual(rows["majak-45"]["agent"], "dotacni-majak-hermes")
 
+    def test_majak_missing_or_malformed_coordinator_fails_closed_but_legacy_quantlab_defaults(self):
+        self.exporter.INTAKE.write_text("{}", encoding="utf-8")
+        tasks = [
+            {
+                "id": "legacy-quant-no-agent",
+                "issue": 9,
+            },
+            {
+                "id": "majak-no-agent",
+                "repo": "Bbambaaamm/dotacni-majak",
+                "issue": 662,
+            },
+            {
+                "id": "majak-malformed-agent",
+                "repo": "Bbambaaamm/dotacni-majak",
+                "issue": 662,
+                "agent": "bad agent with spaces",
+            },
+        ]
+        for task in tasks:
+            (self.root / "pending" / f"{task['id']}.json").write_text(
+                json.dumps(task), encoding="utf-8"
+            )
+        rows = {row["task_id"]: row for row in self.exporter.rows()}
+        self.assertIn("legacy-quant-no-agent", rows)
+        self.assertEqual(rows["legacy-quant-no-agent"]["agent"], "quantlab-hermes")
+        self.assertNotIn("majak-no-agent", rows)
+        self.assertNotIn("majak-malformed-agent", rows)
+
     def test_unknown_repo_or_wrong_coordinator_is_fail_closed(self):
         self.exporter.INTAKE.write_text("{}", encoding="utf-8")
         bad = [
