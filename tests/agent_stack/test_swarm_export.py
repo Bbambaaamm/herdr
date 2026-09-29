@@ -251,6 +251,53 @@ class SwarmExportTests(unittest.TestCase):
         self.assertEqual(self.exporter.main(), 0)
         self.assertEqual(self.output.read_bytes(), sentinel)
 
+    def test_result_identity_must_match_current_run_token(self):
+        task = self.herdr_task("current", run_token="a" * 32)
+        self.write_task("running", task)
+        (self.root / "results" / "current.json").write_text(
+            json.dumps({"task_id": "current", "run_token": "b" * 32, "blocker": "stale"}),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "result_run_token_mismatch"):
+            self.exporter.materialize(self.exporter.load_records(), observed_at=100)
+
+    def test_result_lookup_cannot_escape_results_directory(self):
+        with self.assertRaisesRegex(ValueError, "invalid_task_id"):
+            self.exporter.result_for("../../private", {"run_token": "a" * 32})
+
+    def test_uppercase_result_sha_is_rejected_before_publish(self):
+        self.write_task("done", self.herdr_task("upper", result_sha="A" * 64))
+        with self.assertRaisesRegex(ValueError, "invalid_result_sha"):
+            self.exporter.materialize(self.exporter.load_records(), observed_at=100)
+
+    def test_duplicate_task_ids_are_scoped_to_repo_and_issue(self):
+        self.write_task("running", self.herdr_task("root", issue=48))
+        self.write_task("blocked", self.herdr_task("root", issue=49))
+        payload = self.exporter.materialize(self.exporter.load_records(), observed_at=100)
+        self.assertEqual(payload["issue"], "48")
+        self.assertEqual([task["task_id"] for task in payload["tasks"]], ["root"])
+
+    def test_parent_and_dependency_cycles_fail_closed(self):
+        self.write_task("pending", self.herdr_task("a", parent_task_id="b"))
+        self.write_task("pending", self.herdr_task("b", parent_task_id="a"))
+        with self.assertRaisesRegex(ValueError, "cyclic_graph"):
+            self.exporter.materialize(self.exporter.load_records(), observed_at=100)
+
+    def test_explicit_false_cannot_be_overridden_by_policy_label(self):
+        self.write_task(
+            "pending",
+            self.herdr_task("contradictory", policy_profile="quantlab-paper", paper_only=False),
+        )
+        with self.assertRaisesRegex(ValueError, "explicit_non_paper"):
+            self.exporter.load_records()
+
+    def test_oversized_snapshot_preserves_previous_file(self):
+        sentinel = b'{"previous":"valid"}\n'
+        self.output.write_bytes(sentinel)
+        with self.assertRaisesRegex(ValueError, "snapshot_too_large"):
+            self.exporter.publish({"padding": "x" * self.exporter.MAX_BYTES})
+        self.assertEqual(self.output.read_bytes(), sentinel)
+
 
 if __name__ == "__main__":
     unittest.main()

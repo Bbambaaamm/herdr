@@ -15,15 +15,21 @@ ALLOWED_REPOS = {"Bbambaaamm/herdr", "Bbambaaamm/Autonomous-Quant-Lab"}
 AQL_REPO = "Bbambaaamm/Autonomous-Quant-Lab"
 ALLOWED_POLICY_PROFILES = {"default", "quantlab-paper"}
 IDENTIFIER = re.compile(r"^[A-Za-z0-9._/:-]{1,256}$")
-HEX_ID = re.compile(r"^[0-9a-fA-F]{64}$")
+TASK_IDENTIFIER = re.compile(r"^[A-Za-z0-9._:-]{1,256}$")
+HEX_ID = re.compile(r"^[0-9a-f]{64}$")
 MAX_TASKS = 100
 MAX_EDGES = 200
+MAX_BYTES = 131072
 
 def now_epoch():
     return int(datetime.now(timezone.utc).timestamp())
 
 def ident(value, limit=256):
     return isinstance(value, str) and 0 < len(value) <= limit and bool(IDENTIFIER.fullmatch(value))
+
+
+def task_ident(value):
+    return isinstance(value, str) and bool(TASK_IDENTIFIER.fullmatch(value))
 
 def issue_text(value):
     if type(value) is int and 0 < value < 10**9:
@@ -64,14 +70,29 @@ def read_json(path):
         raise ValueError("task_not_object")
     return raw
 
-def result_for(task_id):
+def result_for(task_id, task):
+    if not task_ident(task_id):
+        raise ValueError("invalid_task_id")
     path = RESULTS / f"{task_id}.json"
-    if not path.is_file():
+    if not path.exists() and not path.is_symlink():
         return {}
-    raw = read_json(path)
-    if raw.get("task_id") not in (None, task_id):
+    if path.is_symlink():
+        raise ValueError("result_path_escape")
+    try:
+        root = RESULTS.resolve(strict=True)
+        resolved = path.resolve(strict=True)
+    except (FileNotFoundError, RuntimeError):
+        raise ValueError("invalid_result_path") from None
+    if resolved.parent != root:
+        raise ValueError("result_path_escape")
+    raw = read_json(resolved)
+    if raw.get("task_id") != task_id:
         raise ValueError("result_task_mismatch")
+    run_token = task.get("run_token")
+    if not ident(run_token, 128) or raw.get("run_token") != run_token:
+        raise ValueError("result_run_token_mismatch")
     return raw
+
 
 def policy_metadata(raw, repo):
     profile = raw.get("policy_profile")
@@ -79,6 +100,8 @@ def policy_metadata(raw, repo):
     paper = raw.get("paper_only")
     if paper not in (None, True, False):
         raise ValueError("invalid_paper_only")
+    if paper is False:
+        raise ValueError("explicit_non_paper")
     if profile not in (None, ""):
         if profile not in ALLOWED_POLICY_PROFILES:
             raise ValueError("unknown_policy_profile")
@@ -113,6 +136,14 @@ def optional_ident(value, limit=256):
         raise ValueError("invalid_identifier")
     return value
 
+
+def optional_task_id(value):
+    if value in (None, ""):
+        return None
+    if not task_ident(value):
+        raise ValueError("invalid_task_id")
+    return value
+
 def load_records():
     records = []
     seen = set()
@@ -126,12 +157,13 @@ def load_records():
             if repo not in ALLOWED_REPOS:
                 continue
             task_id = raw.get("id")
-            if not ident(task_id):
+            if not task_ident(task_id):
                 raise ValueError("invalid_task_id")
-            if task_id in seen:
-                raise ValueError("duplicate_task_id")
-            seen.add(task_id)
             issue = issue_text(raw.get("issue"))
+            identity = (repo, issue, task_id)
+            if identity in seen:
+                raise ValueError("duplicate_task_id")
+            seen.add(identity)
             policy_metadata(raw, repo)
             records.append({
                 "state": state,
@@ -173,6 +205,29 @@ def model_fields(raw):
         fallback if isinstance(fallback, str) and ident(fallback, 128) else None,
     )
 
+def ensure_acyclic(task_ids, edge_keys):
+    adjacency = {task_id: set() for task_id in task_ids}
+    indegree = {task_id: 0 for task_id in task_ids}
+    for left, right, _kind in edge_keys:
+        if left == right:
+            raise ValueError("cyclic_graph")
+        if right not in adjacency[left]:
+            adjacency[left].add(right)
+            indegree[right] += 1
+    ready = sorted(task_id for task_id, degree in indegree.items() if degree == 0)
+    visited = 0
+    while ready:
+        current = ready.pop(0)
+        visited += 1
+        for child in sorted(adjacency[current]):
+            indegree[child] -= 1
+            if indegree[child] == 0:
+                ready.append(child)
+                ready.sort()
+    if visited != len(task_ids):
+        raise ValueError("cyclic_graph")
+
+
 def materialize(records, observed_at=None):
     (repo, issue), selected = select_group(records)
     if len(selected) > MAX_TASKS:
@@ -184,13 +239,13 @@ def materialize(records, observed_at=None):
     paper_flags = []
     for record in sorted(selected, key=lambda row: row["task_id"]):
         raw = record["raw"]
-        result = result_for(record["task_id"])
+        result = result_for(record["task_id"], raw)
         deps = raw.get("dependencies", [])
         if not isinstance(deps, list) or len(deps) > 64 or len(set(deps)) != len(deps):
             raise ValueError("invalid_dependencies")
-        if not all(ident(dep) and dep in ids for dep in deps):
+        if not all(task_ident(dep) and dep in ids for dep in deps):
             raise ValueError("dangling_dependency")
-        parent_task = optional_ident(raw.get("parent_task_id"))
+        parent_task = optional_task_id(raw.get("parent_task_id"))
         if parent_task is not None and parent_task not in ids:
             raise ValueError("dangling_parent")
         parent_agent = optional_ident(raw.get("parent_agent_id"))
@@ -250,6 +305,7 @@ def materialize(records, observed_at=None):
             agents.append(agent)
     if len(edge_keys) > MAX_EDGES:
         raise ValueError("too_many_edges")
+    ensure_acyclic(ids, edge_keys)
     edges = [{"from": left, "to": right, "kind": kind} for left, right, kind in sorted(edge_keys)]
     return {
         "version": 1,
@@ -264,15 +320,18 @@ def materialize(records, observed_at=None):
 
 def publish(payload):
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    if len(encoded) > MAX_BYTES:
+        raise ValueError("snapshot_too_large")
     temporary = OUTPUT.with_name(f".{OUTPUT.name}.{os.getpid()}.tmp")
     try:
-        temporary.write_text(encoded, encoding="utf-8")
+        temporary.write_bytes(encoded)
         os.chmod(temporary, 0o640)
         os.replace(temporary, OUTPUT)
     finally:
         if temporary.exists():
             temporary.unlink()
+
 
 def main():
     records = load_records()

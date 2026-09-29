@@ -377,7 +377,14 @@ def swarm_payload():
         'graph_latency': 0.1,
         'clock_snapshot': 100.5,
         'ts': '100.5',
-        'agents': [],
+        'agents': [{
+            'agent_id': 'herdr-parent',
+            'task_id': 'root',
+            'state': 'running',
+            'parent_task_id': None,
+            'parent_agent_id': None,
+            'fencing_token': 1,
+        }],
         'tasks': [
             {
                 'task_id': 'root',
@@ -440,6 +447,14 @@ def test_swarm_projection_is_atomic_bounded_and_sanitized(tmp_path, monkeypatch)
     assert snapshot['repo'] == 'Bbambaaamm/herdr'
     assert snapshot['issue'] == '7'
     assert snapshot['policy_profiles'] == ['default']
+    assert snapshot['agents'] == [{
+        'agent_id': 'herdr-parent',
+        'task_id': 'root',
+        'state': 'running',
+        'parent_task_id': None,
+        'parent_agent_id': None,
+        'fencing_token': 1,
+    }]
     assert snapshot['edges'] == [
         {'from_task': 'root', 'to_task': 'child', 'kind': 'parent'}
     ]
@@ -479,6 +494,16 @@ def test_swarm_raw_edge_mismatch_and_sensitive_task_field_fail_closed(tmp_path, 
     with pytest.raises(ValueError):
         sources.swarm(str(path), 'quantlab')
 
+
+
+def test_swarm_agents_must_match_running_task_identity(tmp_path, monkeypatch):
+    path = tmp_path / 'swarm.json'
+    monkeypatch.setattr(sources, 'SWARM_PATH', str(path))
+    payload = swarm_payload()
+    payload['agents'][0]['task_id'] = 'child'
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError):
+        sources.swarm(str(path), 'quantlab')
 
 def test_swarm_collect_and_staleness_are_fail_closed(tmp_path, monkeypatch):
     path = tmp_path / 'swarm.json'
