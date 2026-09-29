@@ -111,7 +111,6 @@ def collect(config, now):
             source.update(
                 rows=[],
                 data_at=None,
-                observed_at=None,
                 status='unavailable',
                 reason='source_failed',
             )
