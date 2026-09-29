@@ -101,9 +101,9 @@ def routing_payload(observed_at):
 
 class ObservabilityContractTests(unittest.TestCase):
     def test_source_matrix_is_closed_and_asymmetric(self):
-        self.assertEqual(len(c.SOURCE_PAIRS), 17)
+        self.assertEqual(len(c.SOURCE_PAIRS), 18)
         self.assertIn(("quantlab", "queue"), c.SOURCE_PAIRS)
-        self.assertNotIn(("majak", "queue"), c.SOURCE_PAIRS)
+        self.assertIn(("majak", "queue"), c.SOURCE_PAIRS)
         self.assertIn(("majak", "codex"), c.SOURCE_PAIRS)
         self.assertNotIn(("quantlab", "codex"), c.SOURCE_PAIRS)
         self.assertIn(("quantlab", "admission"), c.SOURCE_PAIRS)
@@ -112,29 +112,51 @@ class ObservabilityContractTests(unittest.TestCase):
         self.assertNotIn(("majak", "swarm"), c.SOURCE_PAIRS)
         self.assertIn(("quantlab", "release"), c.SOURCE_PAIRS)
         self.assertNotIn(("majak", "release"), c.SOURCE_PAIRS)
-    def test_queue_v2_projection_accepts_only_sanitized_metadata(self):
+    def test_queue_v2_legacy_and_v3_multi_consumer_projection(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "queue.json"
-            payload = {
+            legacy = {
                 "version": 2,
                 "profile": "quantlab",
                 "observed_at": 100,
                 "tasks": [queue_row()],
             }
-            path.write_text(json.dumps(payload), encoding="utf-8")
+            path.write_text(json.dumps(legacy), encoding="utf-8")
             original = sources.QUEUE_PATH
             sources.QUEUE_PATH = str(path)
             try:
                 rows, stamp = sources.queue(str(path), "quantlab")
                 self.assertEqual(stamp, 100)
-                self.assertEqual(rows, [payload["tasks"][0]])
-                self.assertNotIn("prompt", json.dumps(rows))
+                self.assertEqual(rows, legacy["tasks"])
                 with self.assertRaises(ValueError):
                     sources.queue(str(path), "majak")
-                payload["tasks"][0]["prompt"] = "PRIVATE"
-                path.write_text(json.dumps(payload), encoding="utf-8")
+
+                quant = queue_row(repo="Bbambaaamm/Autonomous-Quant-Lab")
+                majak = queue_row(
+                    task_id="github-majak-issue-662-test",
+                    repo="Bbambaaamm/dotacni-majak",
+                    issue=662,
+                    issue_title="HERDR CONTROL",
+                    agent="dotacni-majak-hermes",
+                    kind="github_root_orchestration",
+                )
+                current = {
+                    "version": 3,
+                    "observed_at": 101,
+                    "tasks": [quant, majak],
+                }
+                path.write_text(json.dumps(current), encoding="utf-8")
+                quant_rows, stamp = sources.queue(str(path), "quantlab")
+                majak_rows, _ = sources.queue(str(path), "majak")
+                self.assertEqual(stamp, 101)
+                self.assertEqual(quant_rows, [quant])
+                self.assertEqual(majak_rows, [majak])
+                self.assertNotIn("prompt", json.dumps(quant_rows + majak_rows))
+
+                current["tasks"][1]["prompt"] = "PRIVATE"
+                path.write_text(json.dumps(current), encoding="utf-8")
                 with self.assertRaises(ValueError):
-                    sources.queue(str(path), "quantlab")
+                    sources.queue(str(path), "majak")
             finally:
                 sources.QUEUE_PATH = original
 
@@ -258,7 +280,7 @@ class ObservabilityContractTests(unittest.TestCase):
                     },
                 }
                 snapshot = collect(config, 100)
-                self.assertEqual(len(snapshot["sources"]), 17)
+                self.assertEqual(len(snapshot["sources"]), 18)
                 q = next(s for s in snapshot["sources"] if s["kind"] == "queue")
                 x = next(s for s in snapshot["sources"] if s["kind"] == "codex")
                 self.assertEqual(q["status"], "available")
