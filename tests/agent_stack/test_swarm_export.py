@@ -54,7 +54,7 @@ class SwarmExportTests(unittest.TestCase):
         return task
 
     def test_terminal_only_is_fresh_and_has_zero_active_agents(self):
-        self.write_task("done", self.herdr_task(result_sha="a" * 40))
+        self.write_task("done", self.herdr_task(result_sha="a" * 64))
         records = self.exporter.load_records()
         payload = self.exporter.materialize(records, observed_at=100)
         self.assertEqual(payload["observed_at"], 100)
