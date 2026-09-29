@@ -102,6 +102,8 @@ export function mountDashboard(createScene) {
     return values.flatMap(value => value?.status === 'available' ? value.rows : []);
   }
   function taskProfile(row) { return row?.repo === 'Bbambaaamm/dotacni-majak' ? 'majak' : 'quantlab'; }
+  function durableAgent(agent) { return agent === 'majak-hermes' ? 'dotacni-majak-hermes' : agent; }
+  function sceneAgent(agent) { return agent === 'dotacni-majak-hermes' ? 'majak-hermes' : agent; }
   function swarmSource() { return source('quantlab', 'swarm'); }
   function swarmSnapshot() {
     const value = swarmSource();
@@ -507,7 +509,7 @@ export function mountDashboard(createScene) {
       blocked: queue.filter(row => ['blocked', 'failed'].includes(row.status)).length,
       userBlocked: userBlockedTasks().length,
       workingAgents: working.length,
-      activeAgent: currentTask?.agent || working[0]?.agent || null,
+      activeAgent: sceneAgent(currentTask?.agent) || working[0]?.agent || null,
     });
     const target = demoTarget();
     const key = `${demo}:${demoState}:${target}`;
@@ -767,7 +769,8 @@ export function mountDashboard(createScene) {
     const profile = row?.profile || (selectedAgent.startsWith('majak-') ? 'majak' : 'quantlab');
     const value = stats(profile), search = searchStats(profile), herdr = source(profile, 'herdr');
     const hasQueue = selectedAgent.endsWith('-hermes');
-    const task = hasQueue ? currentQueueTask(selectedAgent) || nextQueueTask(selectedAgent) : null;
+    const queueAgent = durableAgent(selectedAgent);
+    const task = hasQueue ? currentQueueTask(queueAgent) || nextQueueTask(queueAgent) : null;
     const currentTask = hasQueue
       ? task ? `${issueLabel(task)} · ${task.task_id} · ${QUEUE_STATUS[task.status] || task.status}` : 'Žádná úloha v durable queue'
       : 'Nedostupné v datovém kontraktu';
