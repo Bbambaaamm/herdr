@@ -10,8 +10,7 @@ SOURCE_PAIRS = tuple(
     (profile, kind)
     for profile in PROFILES
     for kind in KINDS
-    if (kind != 'queue' or profile == 'quantlab')
-    and (kind != 'codex' or profile == 'majak')
+    if (kind != 'codex' or profile == 'majak')
     and (kind != 'admission' or profile == 'quantlab')
     and (kind != 'release' or profile == 'quantlab')
     and (kind != 'swarm' or profile == 'quantlab')
@@ -83,7 +82,7 @@ def row(kind, value):
                          'duration_ms max_duration_ms fallback_count cost_microusd result_count '
                          'extract_count last_used_at'),
               'git': 'commit dirty', 'tests': 'passed failed artifact_digest',
-              'queue': ('task_id issue issue_title issue_open scheduler_state status attempts '
+              'queue': ('task_id repo issue issue_title issue_open scheduler_state status attempts '
                         'max_attempts not_before updated_at agent kind blocker pr_number'),
               'admission': ('event reason role repo issue node_count max_depth max_fanout '
                             'child_tools_count agents_after observed_at'),
@@ -96,7 +95,12 @@ def row(kind, value):
                         'routing_observed_at routing_soft_limit_pct routing_hard_limit_pct routing_decisions '
                         'routing_free routing_sol routing_astra routing_astra_escalations routing_premium_denied '
                         'last_route_at last_route_tier last_route_model last_route_reason')}
-    keys(value, fields[kind])
+    if kind == 'queue':
+        legacy = set(fields[kind].replace(' repo', '').split())
+        current = set(fields[kind].split())
+        need(type(value) is dict and set(value) in (legacy, current))
+    else:
+        keys(value, fields[kind])
     if kind == 'herdr':
         need(value['agent'] in ('majak-hermes', 'majak-codex', 'quantlab-hermes', 'quantlab-codex'))
         need(value['status'] in ('idle', 'working', 'blocked', 'done', 'unknown'))
@@ -129,12 +133,20 @@ def row(kind, value):
     elif kind == 'queue':
         need(type(value['task_id']) is str and identifier(value['task_id'])
              and (value['issue'] is None or number(value['issue'])))
+        repo = value.get('repo')
+        need(repo is None or identifier(repo, 160))
+        expected_agent = {
+            None: 'quantlab-hermes',
+            'Bbambaaamm/Autonomous-Quant-Lab': 'quantlab-hermes',
+            'Bbambaaamm/dotacni-majak': 'dotacni-majak-hermes',
+        }.get(repo)
+        need(expected_agent is not None)
         need(display_text(value['issue_title']) and type(value['issue_open']) is bool)
         need(value['scheduler_state'] is None or identifier(value['scheduler_state'], 64))
         need(value['status'] in ('pending', 'running', 'blocked', 'done', 'failed'))
         need(number(value['attempts']) and number(value['max_attempts'])
              and (value['not_before'] is None or number(value['not_before'])))
-        need(number(value['updated_at']) and value['agent'] == 'quantlab-hermes')
+        need(number(value['updated_at']) and value['agent'] == expected_agent)
         need(type(value['kind']) is str and identifier(value['kind'], 64))
         need(value['blocker'] is None or type(value['blocker']) is str and identifier(value['blocker']))
         need(value['pr_number'] is None or number(value['pr_number']))
@@ -278,7 +290,11 @@ def validate(value):
             if kind == 'herdr':
                 need(item['agent'].startswith(profile + '-'))
             if kind == 'queue':
-                need(profile == 'quantlab')
+                repo = item.get('repo')
+                if profile == 'quantlab':
+                    need(repo in (None, 'Bbambaaamm/Autonomous-Quant-Lab'))
+                else:
+                    need(repo == 'Bbambaaamm/dotacni-majak')
             if kind == 'admission':
                 need(profile == 'quantlab')
             if kind == 'release':
