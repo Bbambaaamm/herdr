@@ -248,7 +248,7 @@ test('release identity is mandatory and sanitized in the browser trust boundary'
 
 test('durable QuantLab queue renders safe metadata and drives coordinator state', async t => {
   const h = await harness(t);
-  assert.equal(h.get('#queue-count').textContent, '1');
+  assert.equal(h.get('#queue-count').textContent, 'Nedostupné');
   assert.equal(h.ui.diagnostics().queueActive, 1);
   assert.match(h.get('#queue-list').innerHTML, /issue190-prepare-20260926/);
   assert.match(h.get('#queue-list').innerHTML, /#190/);
@@ -348,6 +348,49 @@ test('Majak durable queue is accepted, visible, and bound to dotacni-majak-herme
   h.calls.select('majak-hermes');
   assert.match(h.get('#detail-metrics').innerHTML, /github-majak-issue-662-test/);
   assert.match(h.get('#detail-links').innerHTML, /dotacni-majak\/issues\/662/);
+});
+
+test('running queue task outranks retained blocked or failed rows across profiles', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const majak = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'majak');
+  majak.status = 'available'; majak.reason = 'ok'; majak.data_at = now;
+  majak.rows = [{
+    task_id: 'majak-retained-failure',
+    repo: 'Bbambaaamm/dotacni-majak',
+    issue: 662,
+    issue_title: 'retained failure',
+    issue_open: true,
+    scheduler_state: 'active',
+    status: 'failed',
+    attempts: 4,
+    max_attempts: 4,
+    not_before: null,
+    updated_at: now + 100,
+    agent: 'dotacni-majak-hermes',
+    kind: 'github_root_orchestration',
+    blocker: 'provider_startup_failed',
+    pr_number: null,
+  }];
+  const quant = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
+  quant.rows[0].status = 'running';
+  quant.rows[0].updated_at = now;
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().state, 'working');
+  assert.match(h.get('#face-task').textContent, /QuantLab #190/);
+  assert.match(h.get('#coordinator-current').textContent, /issue190-prepare-20260926/);
+  assert.equal(h.calls.activity.at(-1).activeAgent, 'quantlab-hermes');
+});
+
+test('queue headline is unavailable when only one consumer projection is available', async t => {
+  const h = await harness(t);
+  assert.equal(h.get('#queue-count').textContent, 'Nedostupné');
+  const majak = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'majak');
+  const now = Math.floor(Date.now() / 1000);
+  majak.status = 'available'; majak.reason = 'ok'; majak.data_at = now;
+  majak.rows = [];
+  await h.refresh();
+  assert.equal(h.get('#queue-count').textContent, '1');
 });
 
 test('Majak queue rejects wrong repo or coordinator identity', async t => {
