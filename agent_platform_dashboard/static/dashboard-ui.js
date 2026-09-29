@@ -153,7 +153,12 @@ export function mountDashboard(createScene) {
   function userBlockedTasks(profile = null) { return queueTasks(profile).filter(row => ['blocked', 'failed'].includes(row.status) && USER_ACTION_BLOCKERS.has(row.blocker)); }
   function technicalBlockedTasks(profile = null) { return queueTasks(profile).filter(row => ['blocked', 'failed'].includes(row.status) && !USER_ACTION_BLOCKERS.has(row.blocker)); }
   function currentQueueTask(agent = null) {
-    return queueTasks().find(row => (!agent || row.agent === agent) && ['running', 'blocked', 'failed'].includes(row.status));
+    const priority = { running: 0, blocked: 1, failed: 2 };
+    return queueTasks()
+      .filter(row => (!agent || row.agent === agent) && Object.hasOwn(priority, row.status))
+      .sort((a, b) => priority[a.status] - priority[b.status]
+        || (b.updated_at || 0) - (a.updated_at || 0)
+        || a.task_id.localeCompare(b.task_id))[0];
   }
   function nextQueueTask(agent = null) {
     return queueTasks().filter(row => (!agent || row.agent === agent) && row.status === 'pending')
@@ -563,7 +568,10 @@ export function mountDashboard(createScene) {
     ui.snapshotAge.textContent = age(liveData.generated_at);
     const complete = PROFILES.every(profile => source(profile, 'herdr')?.status === 'available');
     ui.agentCount.textContent = complete ? String(agents().length) : `${agents().length} ověřeno · část nedostupná`;
-    ui.queueCount.textContent = queueSources().some(value => value.status === 'available') ? String(activeQueueTasks().length) : 'Nedostupné';
+    const queueValues = queueSources();
+    const queueComplete = queueValues.length === PROFILES.length
+      && queueValues.every(value => value.status === 'available');
+    ui.queueCount.textContent = queueComplete ? String(activeQueueTasks().length) : 'Nedostupné';
     ui.requestCount.textContent = number(total('requests')); ui.searchCount.textContent = number(searchCount);
     ui.searchLatency.textContent = latency(searchCount == null || searchDuration == null ? null : searchCount === 0 ? 0 : searchDuration / searchCount);
     const codex = codexStats().row;
