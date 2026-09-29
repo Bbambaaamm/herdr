@@ -96,8 +96,8 @@ export function mountDashboard(createScene) {
     try { return scene[method](...args); } catch (_) { failScene(); }
   }
   function source(profile, kind) { return liveData?.sources.find(item => item.profile === profile && item.kind === kind); }
-  function queueSource() { return source('quantlab', 'queue'); }
-  function queueTasks() { const value = queueSource(); return value?.status === 'available' ? value.rows : []; }
+  function queueSources() { return PROFILES.map(profile => source(profile, 'queue')).filter(Boolean); }
+  function queueTasks() { return queueSources().flatMap(value => value?.status === 'available' ? value.rows : []); }
   function swarmSource() { return source('quantlab', 'swarm'); }
   function swarmSnapshot() {
     const value = swarmSource();
@@ -146,12 +146,17 @@ export function mountDashboard(createScene) {
   const USER_ACTION_BLOCKERS = new Set(['user_action_required', 'agent_interactive_input_required', 'github_write_auth_required']);
   function userBlockedTasks() { return queueTasks().filter(row => ['blocked', 'failed'].includes(row.status) && USER_ACTION_BLOCKERS.has(row.blocker)); }
   function technicalBlockedTasks() { return queueTasks().filter(row => ['blocked', 'failed'].includes(row.status) && !USER_ACTION_BLOCKERS.has(row.blocker)); }
-  function currentQueueTask(agent = 'quantlab-hermes') { return queueTasks().find(row => row.agent === agent && ['running', 'blocked', 'failed'].includes(row.status)); }
-  function nextQueueTask(agent = 'quantlab-hermes') { return queueTasks().filter(row => row.agent === agent && row.status === 'pending').sort((a, b) => (a.not_before ?? Number.MAX_SAFE_INTEGER) - (b.not_before ?? Number.MAX_SAFE_INTEGER) || a.task_id.localeCompare(b.task_id))[0]; }
+  function currentQueueTask(agent = null) {
+    return queueTasks().find(row => (!agent || row.agent === agent) && ['running', 'blocked', 'failed'].includes(row.status));
+  }
+  function nextQueueTask(agent = null) {
+    return queueTasks().filter(row => (!agent || row.agent === agent) && row.status === 'pending')
+      .sort((a, b) => (a.not_before ?? Number.MAX_SAFE_INTEGER) - (b.not_before ?? Number.MAX_SAFE_INTEGER) || a.task_id.localeCompare(b.task_id))[0];
+  }
   function taskDisplay(row) { return row ? `${issueLabel(row)} · ${row.task_id}` : 'Žádná'; }
   function attemptLabel(row) { return row ? `${number(row.attempts)} / ${number(row.max_attempts)}` : 'Nedostupné'; }
   function issueUrl(row) { return Number.isFinite(row?.issue) ? `https://github.com/${row.repo || GITHUB_REPO}/issues/${row.issue}` : null; }
-  function prUrl(row) { return Number.isFinite(row?.pr_number) ? `https://github.com/${GITHUB_REPO}/pull/${row.pr_number}` : null; }
+  function prUrl(row) { return Number.isFinite(row?.pr_number) ? `https://github.com/${row.repo || GITHUB_REPO}/pull/${row.pr_number}` : null; }
   function detailLink(url, label) { return url ? `<a href="${escapeHTML(url)}" target="_blank" rel="noopener noreferrer">${escapeHTML(label)}</a>` : ''; }
   function agents() {
     return PROFILES.flatMap(profile => {
@@ -459,7 +464,10 @@ export function mountDashboard(createScene) {
   function faceCopy(state) {
     if (demo) return `DEMO · ${STATE_META[state].copy}`;
     const active = agents().filter(row => row.status === 'working').map(row => row.agent), task = currentQueueTask();
-    if (state === 'working' && task) return `QuantLab ${issueLabel(task)} · ${task.task_id} · ${QUEUE_STATUS[task.status]}.`;
+    if (state === 'working' && task) {
+      const project = task.repo === 'Bbambaaamm/dotacni-majak' ? 'Maják' : 'QuantLab';
+      return `${project} ${issueLabel(task)} · ${task.task_id} · ${QUEUE_STATUS[task.status]}.`;
+    }
     if (state === 'working' || (state === 'idle' && active.length)) return `Pracují: ${active.join(', ')}. Přesný úkol zdroj neposkytuje.`;
     if (state === 'waiting_user') {
       const blockedAgents = agents().filter(row => row.status === 'blocked').map(row => row.agent);
@@ -751,9 +759,9 @@ export function mountDashboard(createScene) {
     const row = agents().find(item => item.agent === selectedAgent);
     const profile = row?.profile || (selectedAgent.startsWith('majak-') ? 'majak' : 'quantlab');
     const value = stats(profile), search = searchStats(profile), herdr = source(profile, 'herdr');
-    const task = selectedAgent === 'quantlab-hermes'
-      ? currentQueueTask(selectedAgent) || nextQueueTask(selectedAgent) : null;
-    const currentTask = selectedAgent === 'quantlab-hermes'
+    const hasQueue = selectedAgent.endsWith('-hermes');
+    const task = hasQueue ? currentQueueTask(selectedAgent) || nextQueueTask(selectedAgent) : null;
+    const currentTask = hasQueue
       ? task ? `${issueLabel(task)} · ${task.task_id} · ${QUEUE_STATUS[task.status] || task.status}` : 'Žádná úloha v durable queue'
       : 'Nedostupné v datovém kontraktu';
     const taskTitle = task?.issue_title || 'Nedostupné v telemetry kontraktu';
@@ -862,14 +870,19 @@ export function mountDashboard(createScene) {
       if (['router', 'search'].includes(item.kind)
         && item.rows.some(row => typeof row.provider !== 'string' || !Number.isFinite(row.last_used_at))) throw new Error('invalid');
       if (item.kind === 'queue') {
-        if (item.profile !== 'quantlab') throw new Error('invalid');
+        const expected = item.profile === 'majak'
+          ? { repo: 'Bbambaaamm/dotacni-majak', agent: 'dotacni-majak-hermes' }
+          : { repo: 'Bbambaaamm/Autonomous-Quant-Lab', agent: 'quantlab-hermes' };
         if (item.rows.some(row =>
           typeof row.task_id !== 'string'
+          || (row.repo != null && typeof row.repo !== 'string')
+          || (item.profile === 'majak' && row.repo !== expected.repo)
+          || (item.profile === 'quantlab' && row.repo != null && row.repo !== expected.repo)
           || (row.issue != null && (!Number.isSafeInteger(row.issue) || row.issue < 0))
           || (row.issue_title != null && (typeof row.issue_title !== 'string' || row.issue_title.length > 160))
           || typeof row.issue_open !== 'boolean'
           || (row.scheduler_state != null && typeof row.scheduler_state !== 'string')
-          || typeof row.agent !== 'string'
+          || row.agent !== expected.agent
           || typeof row.kind !== 'string'
           || !Object.hasOwn(QUEUE_STATUS, row.status)
           || !Number.isSafeInteger(row.attempts) || row.attempts < 0
