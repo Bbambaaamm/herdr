@@ -95,6 +95,28 @@ def collect(config, now):
             source.update(rows=[], data_at=None, status='unavailable', reason='not_configured', board_id=None, source_epoch=None)
         except Exception:
             source.update(rows=[], data_at=None, status='unavailable', reason='source_failed', board_id=None, source_epoch=None)
+    # Queue input has its own bounded parser, but the final JSON encoding may expand
+    # non-ASCII display text. Enforce the real publication bound end-to-end so a
+    # valid near-limit queue cannot suppress the entire production snapshot.
+    try:
+        c.encode(snapshot)
+    except ValueError:
+        queue_sources = [
+            source for source in snapshot['sources']
+            if source['kind'] == 'queue' and source['status'] == 'available'
+        ]
+        if not queue_sources:
+            raise
+        for source in queue_sources:
+            source.update(
+                rows=[],
+                data_at=None,
+                observed_at=None,
+                status='unavailable',
+                reason='source_failed',
+            )
+        c.validate(snapshot)
+        c.encode(snapshot)
     return snapshot
 
 
