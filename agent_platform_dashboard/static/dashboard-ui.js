@@ -568,9 +568,10 @@ export function mountDashboard(createScene) {
     ui.snapshotAge.textContent = age(liveData.generated_at);
     const complete = PROFILES.every(profile => source(profile, 'herdr')?.status === 'available');
     ui.agentCount.textContent = complete ? String(agents().length) : `${agents().length} ověřeno · část nedostupná`;
+    const visibleProfiles = [...new Set(liveData.sources.map(value => value.profile))];
     const queueValues = queueSources();
-    const queueComplete = queueValues.length === PROFILES.length
-      && queueValues.every(value => value.status === 'available');
+    const queueComplete = visibleProfiles.length > 0
+      && visibleProfiles.every(profile => source(profile, 'queue')?.status === 'available');
     ui.queueCount.textContent = queueComplete ? String(activeQueueTasks().length) : 'Nedostupné';
     ui.requestCount.textContent = number(total('requests')); ui.searchCount.textContent = number(searchCount);
     ui.searchLatency.textContent = latency(searchCount == null || searchDuration == null ? null : searchCount === 0 ? 0 : searchDuration / searchCount);
