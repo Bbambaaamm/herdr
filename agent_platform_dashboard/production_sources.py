@@ -267,7 +267,7 @@ def tests(path, profile):
 
 def queue(path, profile):
     c.need(profile in c.PROFILES and path == QUEUE_PATH)
-    raw = c.parse(read(path, 65536), 65536)
+    raw = c.parse(read(path, c.MAX_BYTES), c.MAX_BYTES)
     version = raw.get('version') if type(raw) is dict else None
     if version == 2:
         c.keys(raw, 'version profile observed_at tasks')
