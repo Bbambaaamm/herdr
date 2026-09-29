@@ -194,35 +194,34 @@ class ObservabilityContractTests(unittest.TestCase):
             finally:
                 sources.QUEUE_PATH = original
 
-    def test_collect_fails_queue_closed_when_final_snapshot_would_exceed_budget(self):
-        original_queue = sources.queue
+    def test_collect_reads_shared_queue_once_and_fails_it_closed_if_final_snapshot_exceeds_budget(self):
+        original_loader = sources.queue_payload
+        calls = 0
         try:
-            def huge_queue(_path, profile):
-                repo = (
-                    "Bbambaaamm/dotacni-majak"
-                    if profile == "majak"
-                    else "Bbambaaamm/Autonomous-Quant-Lab"
-                )
-                agent = (
-                    "dotacni-majak-hermes"
-                    if profile == "majak"
-                    else "quantlab-hermes"
-                )
-                rows = []
+            tasks = []
+            for profile, repo, agent, base in (
+                ("quantlab", "Bbambaaamm/Autonomous-Quant-Lab", "quantlab-hermes", 5000),
+                ("majak", "Bbambaaamm/dotacni-majak", "dotacni-majak-hermes", 6000),
+            ):
                 for index in range(50):
-                    rows.append(queue_row(
+                    tasks.append(queue_row(
                         task_id=(f"{profile}-{index:02d}-" + "x" * 120)[:128],
                         repo=repo,
-                        issue=5000 + index,
+                        issue=base + index,
                         issue_title="Ž" * 160,
                         scheduler_state="s" * 64,
                         agent=agent,
                         kind="k" * 64,
                         blocker="b" * 128,
                     ))
-                return rows, 100
+            payload = {"version": 3, "observed_at": 100, "tasks": tasks}
 
-            sources.queue = huge_queue
+            def load_once(_path):
+                nonlocal calls
+                calls += 1
+                return payload
+
+            sources.queue_payload = load_once
             config = {
                 "version": 1,
                 "output": "/tmp/snapshot.json",
@@ -239,6 +238,7 @@ class ObservabilityContractTests(unittest.TestCase):
                 },
             }
             snapshot = collect(config, 100)
+            self.assertEqual(calls, 1)
             queue_sources = [
                 source for source in snapshot["sources"]
                 if source["kind"] == "queue"
@@ -249,7 +249,7 @@ class ObservabilityContractTests(unittest.TestCase):
             self.assertTrue(all(source["rows"] == [] for source in queue_sources))
             self.assertLessEqual(len(c.encode(snapshot)), c.MAX_BYTES)
         finally:
-            sources.queue = original_queue
+            sources.queue_payload = original_loader
 
     def test_codex_usage_projection_exposes_allowance_without_identity(self):
         with tempfile.TemporaryDirectory() as folder:
