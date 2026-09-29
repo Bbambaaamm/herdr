@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "consumers": [
+    {
+      "consumer": "quantlab",
+      "enabled": true,
+      "repository": "Bbambaaamm/Autonomous-Quant-Lab",
+      "mode": "all_open",
+      "coordinator_agent": "quantlab-hermes",
+      "workspace": "/home/agentops/workspaces/quantlab",
+      "safety_profile": "quantlab",
+      "hermes_profile": "quantlab",
+      "priority_default": 60,
+      "priority_architecture": 50
+    },
+    {
+      "consumer": "majak",
+      "enabled": true,
+      "repository": "Bbambaaamm/dotacni-majak",
+      "mode": "root_only",
+      "root_issue": 662,
+      "coordinator_agent": "dotacni-majak-hermes",
+      "workspace": "/home/agentops/workspaces/dotacni-majak",
+      "safety_profile": "dotacni-majak",
+      "hermes_profile": "majak",
+      "priority_default": 10,
+      "priority_architecture": 10
+    },
+    {
+      "consumer": "heating",
+      "enabled": false,
+      "repository": "Bbambaaamm/heating",
+      "mode": "all_open",
+      "coordinator_agent": "heating-hermes",
+      "workspace": "/home/agentops/workspaces/heating",
+      "safety_profile": "heating-safe-engineering",
+      "hermes_profile": "heating",
+      "priority_default": 60,
+      "priority_architecture": 50,
+      "disabled_reason": "Enable only after the Heating coordinator and worker safety contract are deployed."
+    }
+  ]
+}
