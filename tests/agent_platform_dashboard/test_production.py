@@ -377,14 +377,24 @@ def swarm_payload():
         'graph_latency': 0.1,
         'clock_snapshot': 100.5,
         'ts': '100.5',
-        'agents': [{
-            'agent_id': 'herdr-parent',
-            'task_id': 'root',
-            'state': 'running',
-            'parent_task_id': None,
-            'parent_agent_id': None,
-            'fencing_token': 1,
-        }],
+        'agents': [
+            {
+                'agent_id': 'herdr-parent',
+                'task_id': 'root',
+                'state': 'running',
+                'parent_task_id': None,
+                'parent_agent_id': None,
+                'fencing_token': 1,
+            },
+            {
+                'agent_id': 'herdr-child',
+                'task_id': 'child',
+                'state': 'done',
+                'parent_task_id': 'root',
+                'parent_agent_id': 'herdr-parent',
+                'fencing_token': 2,
+            },
+        ],
         'tasks': [
             {
                 'task_id': 'root',
@@ -444,6 +454,7 @@ def test_swarm_projection_is_atomic_bounded_and_sanitized(tmp_path, monkeypatch)
     rows, stamp = sources.swarm(str(path), 'quantlab')
     assert stamp == 100 and len(rows) == 1
     snapshot = rows[0]
+    assert len(payload['agents']) == 2
     assert snapshot['repo'] == 'Bbambaaamm/herdr'
     assert snapshot['issue'] == '7'
     assert snapshot['policy_profiles'] == ['default']
@@ -494,6 +505,16 @@ def test_swarm_raw_edge_mismatch_and_sensitive_task_field_fail_closed(tmp_path, 
     with pytest.raises(ValueError):
         sources.swarm(str(path), 'quantlab')
 
+
+
+def test_scheduler_historical_agent_state_must_match_task(tmp_path, monkeypatch):
+    path = tmp_path / 'swarm.json'
+    monkeypatch.setattr(sources, 'SWARM_PATH', str(path))
+    payload = swarm_payload()
+    payload['agents'][1]['state'] = 'running'
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError):
+        sources.swarm(str(path), 'quantlab')
 
 
 def test_swarm_agents_must_match_running_task_identity(tmp_path, monkeypatch):

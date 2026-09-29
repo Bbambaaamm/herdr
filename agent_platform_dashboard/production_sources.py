@@ -377,15 +377,17 @@ def swarm(path, profile):
         'issue', 'lease_until', 'model', 'parent_agent_id', 'parent_task_id',
         'repo', 'role', 'state', 'task_id',
     }
+    scheduler_snapshot = raw['version'] == 'v1.2.0'
     agents = []
     seen_agent_ids = set()
     seen_agent_tasks = set()
+    running_agent_tasks = set()
     for item in raw['agents']:
         c.need(type(item) is dict and set(item) <= safe_agent_fields)
         agent_id = item.get('agent_id')
         task_id = item.get('task_id')
-        c.need(c.identifier(agent_id, 256) and c.identifier(task_id, 256)
-               and item.get('state') == 'running')
+        agent_state = item.get('state')
+        c.need(c.identifier(agent_id, 256) and c.identifier(task_id, 256))
         c.need(agent_id not in seen_agent_ids and task_id not in seen_agent_tasks)
         seen_agent_ids.add(agent_id)
         seen_agent_tasks.add(task_id)
@@ -396,22 +398,36 @@ def swarm(path, profile):
         fencing_token = item.get('fencing_token', 0)
         c.need(c.number(fencing_token))
         task = tasks_by_id.get(task_id)
-        c.need(task is not None and task['state'] == 'running' and task['agent_id'] == agent_id)
+        c.need(task is not None and task['agent_id'] == agent_id)
         c.need(task['parent_task_id'] == parent_task_id and task['parent_agent_id'] == parent_agent_id)
         c.need(task['fencing_token'] == fencing_token)
-        agents.append({
-            'agent_id': agent_id,
-            'task_id': task_id,
-            'state': 'running',
-            'parent_task_id': parent_task_id,
-            'parent_agent_id': parent_agent_id,
-            'fencing_token': fencing_token,
-        })
+        if scheduler_snapshot:
+            c.need(agent_state == task['state'])
+        else:
+            c.need(agent_state == 'running' and task['state'] == 'running')
+        if agent_state == 'running':
+            c.need(task['state'] == 'running')
+            running_agent_tasks.add(task_id)
+            agents.append({
+                'agent_id': agent_id,
+                'task_id': task_id,
+                'state': 'running',
+                'parent_task_id': parent_task_id,
+                'parent_agent_id': parent_agent_id,
+                'fencing_token': fencing_token,
+            })
     expected_agent_tasks = {
         task['task_id'] for task in tasks
         if task['state'] == 'running' and task['agent_id'] is not None
     }
-    c.need(seen_agent_tasks == expected_agent_tasks)
+    c.need(running_agent_tasks == expected_agent_tasks)
+    if scheduler_snapshot:
+        expected_raw_agents = {
+            task['task_id'] for task in tasks if task['agent_id'] is not None
+        }
+        c.need(seen_agent_tasks == expected_raw_agents)
+    else:
+        c.need(seen_agent_tasks == expected_agent_tasks)
 
     raw_profiles = raw.get('policy_profiles')
     if raw_profiles is not None:

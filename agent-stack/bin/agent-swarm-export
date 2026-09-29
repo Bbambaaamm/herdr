@@ -106,13 +106,13 @@ def policy_metadata(raw, repo):
     if paper not in (None, True, False):
         raise ValueError("invalid_paper_only")
     if paper is False:
+        if repo == AQL_REPO:
+            raise ValueError("quantlab_non_paper")
         raise ValueError("explicit_non_paper")
     if profile not in (None, ""):
         if profile not in ALLOWED_POLICY_PROFILES:
             raise ValueError("unknown_policy_profile")
     if repo == AQL_REPO:
-        if paper is False:
-            raise ValueError("quantlab_non_paper")
         if profile not in (None, "", "quantlab-paper"):
             raise ValueError("quantlab_non_paper")
         if safety not in (None, "", "quantlab"):
