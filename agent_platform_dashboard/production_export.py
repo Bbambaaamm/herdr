@@ -52,9 +52,12 @@ def collect(config, now):
     snapshot = c.unavailable(now)
     adapters = {'router': sources.router, 'search': sources.search,
                 'kanban': sources.kanban, 'git': sources.git,
-                'tests': sources.tests, 'queue': sources.queue,
+                'tests': sources.tests,
                 'codex': sources.codex, 'admission': sources.admission,
                 'release': sources.release, 'swarm': sources.swarm}
+    queue_payload = None
+    queue_loaded = False
+    queue_load_failed = False
     for source in snapshot['sources']:
         profile, kind = source['profile'], source['kind']
         if kind == 'herdr':
@@ -76,6 +79,16 @@ def collect(config, now):
         try:
             if kind == 'herdr':
                 rows, data_at = sources.herdr(setting, profile, now)
+            elif kind == 'queue':
+                if not queue_loaded:
+                    queue_loaded = True
+                    try:
+                        queue_payload = sources.queue_payload(setting)
+                    except Exception:
+                        queue_load_failed = True
+                if queue_load_failed:
+                    raise ValueError('invalid_metadata')
+                rows, data_at = sources.queue_from_payload(queue_payload, profile)
             else:
                 rows, data_at = adapters[kind](setting, profile)
             c.need(data_at is None or data_at <= now)
