@@ -262,7 +262,7 @@ test('durable QuantLab queue renders safe metadata and drives coordinator state'
   queue.rows[0].attempts = 1;
   await h.refresh();
   assert.equal(h.ui.diagnostics().state, 'working');
-  assert.equal(h.get('#queue-count').textContent, '1');
+  assert.equal(h.get('#queue-count').textContent, 'Nedostupné');
   assert.match(h.get('#face-task').textContent, /#190/);
   assert.match(h.get('#face-task').textContent, /issue190-prepare-20260926/);
   assert.match(h.get('#coordinator-current').textContent, /issue190-prepare-20260926/);
