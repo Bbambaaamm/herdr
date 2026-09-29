@@ -221,6 +221,20 @@ class SwarmExportTests(unittest.TestCase):
         self.assertEqual(records[0]["state"], "blocked")
         self.assertEqual(records[0]["task_id"], "vanishing")
 
+    def test_paper_only_requires_exact_boolean_type(self):
+        for malformed in (0, 1, 0.0, 1.0):
+            with self.subTest(paper_only=malformed):
+                path = self.write_task(
+                    "pending",
+                    self.herdr_task(
+                        f"bad-paper-{str(malformed).replace('.', '-')}",
+                        paper_only=malformed,
+                    ),
+                )
+                with self.assertRaisesRegex(ValueError, "invalid_paper_only"):
+                    self.exporter.load_records()
+                path.unlink()
+
     def test_non_paper_quantlab_is_rejected(self):
         self.write_task(
             "pending",

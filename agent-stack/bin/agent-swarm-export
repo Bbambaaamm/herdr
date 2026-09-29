@@ -103,7 +103,7 @@ def policy_metadata(raw, repo):
     profile = raw.get("policy_profile")
     safety = raw.get("safety_profile")
     paper = raw.get("paper_only")
-    if paper not in (None, True, False):
+    if paper is not None and type(paper) is not bool:
         raise ValueError("invalid_paper_only")
     if paper is False:
         if repo == AQL_REPO:
