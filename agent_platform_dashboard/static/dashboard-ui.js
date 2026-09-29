@@ -139,7 +139,7 @@ export function mountDashboard(createScene) {
     }));
   }
   function swarmEdges() { return swarmSnapshot()?.edges || []; }
-  function taskRows() { return swarmSnapshot() ? swarmTasks() : queueTasks(); }
+  function taskRows() { return swarmSnapshot() ? [...swarmTasks(), ...queueTasks('majak')] : queueTasks(); }
   function admissionSource() { return source('quantlab', 'admission'); }
   function admissionRows() { const value = admissionSource(); return value?.status === 'available' ? value.rows : []; }
   function admissionDenials() { return admissionRows().filter(row => row.event === 'deny'); }
