@@ -115,6 +115,8 @@ def policy_metadata(raw, repo):
         if not (paper is True or profile == "quantlab-paper" or safety == "quantlab"):
             raise ValueError("quantlab_non_paper")
         return "quantlab-paper", True
+    if safety not in (None, "", "quantlab"):
+        raise ValueError("non_quantlab_safety_profile")
     return (profile or None), paper is True or profile == "quantlab-paper"
 
 def explicit_agent_id(raw):

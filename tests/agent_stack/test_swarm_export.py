@@ -193,6 +193,20 @@ class SwarmExportTests(unittest.TestCase):
         self.assertEqual(payload["tasks"][0]["policy_profile"], "quantlab-paper")
         self.assertTrue(payload["tasks"][0]["paper_only"])
 
+    def test_non_quantlab_safety_profile_is_excluded_from_quantlab_swarm(self):
+        for safety_profile in ("dotacni-majak", "heating"):
+            with self.subTest(safety_profile=safety_profile):
+                path = self.write_task(
+                    "pending",
+                    self.herdr_task(
+                        f"foreign-{safety_profile}",
+                        safety_profile=safety_profile,
+                    ),
+                )
+                with self.assertRaisesRegex(ValueError, "non_quantlab_safety_profile"):
+                    self.exporter.load_records()
+                path.unlink()
+
     def test_sensitive_fields_never_leave_durable_store(self):
         task = self.herdr_task(
             "private",
