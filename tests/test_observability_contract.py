@@ -170,7 +170,7 @@ class ObservabilityContractTests(unittest.TestCase):
             ):
                 for index in range(50):
                     tasks.append(queue_row(
-                        task_id=(f"{profile}-{index:02d}-" + "x" * 100)[:128],
+                        task_id=(f"{profile}-{index:02d}-" + "x" * 120)[:128],
                         repo=repo,
                         issue=base + index,
                         issue_title="T" * 160,
