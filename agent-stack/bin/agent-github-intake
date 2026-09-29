@@ -340,7 +340,9 @@ def queue_issue(consumer: dict, issue: dict, records: list[dict]) -> str:
     return task_id
 
 
-def intervention_blocker(records: list[dict]) -> tuple[str, str] | None:
+def intervention_blocker(
+    records: list[dict], *, allow_failed_replan: bool = False
+) -> tuple[str, str] | None:
     if not records:
         return None
     latest = records[0]
@@ -354,7 +356,7 @@ def intervention_blocker(records: list[dict]) -> tuple[str, str] | None:
         "agent_interactive_input_required",
     }:
         return task_id, blocker
-    if latest["state"] == "failed":
+    if latest["state"] == "failed" and not allow_failed_replan:
         return task_id, str(task.get("last_error") or "failed")
     return None
 
@@ -397,7 +399,9 @@ def main() -> int:
                 new_state[key] = current
                 continue
 
-            blocker = intervention_blocker(records)
+            blocker = intervention_blocker(
+                records, allow_failed_replan=consumer.get("mode") == "root_only"
+            )
             if blocker:
                 current["scheduler_state"] = "blocked"
                 current["task_id"] = blocker[0]
