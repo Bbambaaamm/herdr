@@ -281,9 +281,17 @@ class ObservabilityContractTests(unittest.TestCase):
                 }
                 snapshot = collect(config, 100)
                 self.assertEqual(len(snapshot["sources"]), 18)
-                q = next(s for s in snapshot["sources"] if s["kind"] == "queue")
+                q = next(
+                    s for s in snapshot["sources"]
+                    if s["kind"] == "queue" and s["profile"] == "quantlab"
+                )
+                mq = next(
+                    s for s in snapshot["sources"]
+                    if s["kind"] == "queue" and s["profile"] == "majak"
+                )
                 x = next(s for s in snapshot["sources"] if s["kind"] == "codex")
                 self.assertEqual(q["status"], "available")
+                self.assertEqual(mq["status"], "unavailable")
                 self.assertEqual(x["status"], "available")
                 self.assertEqual(x["rows"][0]["used_percent"], 82)
 
