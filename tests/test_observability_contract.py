@@ -160,6 +160,40 @@ class ObservabilityContractTests(unittest.TestCase):
             finally:
                 sources.QUEUE_PATH = original
 
+    def test_queue_v3_accepts_maximum_bounded_multi_consumer_payload(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "queue.json"
+            tasks = []
+            for profile, repo, agent, base in (
+                ("quantlab", "Bbambaaamm/Autonomous-Quant-Lab", "quantlab-hermes", 1000),
+                ("majak", "Bbambaaamm/dotacni-majak", "dotacni-majak-hermes", 2000),
+            ):
+                for index in range(50):
+                    tasks.append(queue_row(
+                        task_id=(f"{profile}-{index:02d}-" + "x" * 100)[:128],
+                        repo=repo,
+                        issue=base + index,
+                        issue_title="T" * 160,
+                        scheduler_state="active",
+                        agent=agent,
+                        kind="k" * 64,
+                    ))
+            payload = {"version": 3, "observed_at": 100, "tasks": tasks}
+            encoded = json.dumps(payload)
+            self.assertGreater(len(encoded.encode("utf-8")), 65536)
+            self.assertLessEqual(len(encoded.encode("utf-8")), c.MAX_BYTES)
+            path.write_text(encoded, encoding="utf-8")
+            original = sources.QUEUE_PATH
+            sources.QUEUE_PATH = str(path)
+            try:
+                quant, stamp = sources.queue(str(path), "quantlab")
+                majak, _ = sources.queue(str(path), "majak")
+                self.assertEqual(stamp, 100)
+                self.assertEqual(len(quant), 50)
+                self.assertEqual(len(majak), 50)
+            finally:
+                sources.QUEUE_PATH = original
+
     def test_codex_usage_projection_exposes_allowance_without_identity(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "codex.json"
