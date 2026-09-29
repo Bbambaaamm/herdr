@@ -15,7 +15,7 @@ def test_closed_snapshot_rejects_sensitive_fields():
 
 def test_unavailable_is_not_zero():
     value = decode(json.dumps(unavailable(100)).encode())
-    assert len(value['sources']) == 17
+    assert len(value['sources']) == 18
     assert all(s['status'] == 'unavailable' and s['rows'] == [] for s in value['sources'])
 
 import base64
@@ -78,7 +78,7 @@ def test_authenticated_snapshot_only_scope_and_no_collectors(tmp_path, auth, mon
     status, _, body = request(app, auth[1], '/agent-platform/api/v1/overview')
     assert status == '200 OK'
     data = json.loads(body)
-    assert len(data['sources']) == 7 and {s['profile'] for s in data['sources']} == {'majak'}
+    assert len(data['sources']) == 8 and {s['profile'] for s in data['sources']} == {'majak'}
     assert 'fixture' not in data
     assert request(app, auth[1])[0] == '200 OK'
     assert request(app, auth[1], method='POST')[0].startswith('405')
