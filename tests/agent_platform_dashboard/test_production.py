@@ -356,11 +356,11 @@ def test_queue_collect_and_staleness_are_fail_closed(tmp_path, monkeypatch):
     path.write_text(json.dumps(dict(version=2, profile='quantlab', observed_at=100, tasks=[row])))
     monkeypatch.setattr(sources, 'QUEUE_PATH', str(path))
     value = collect(config(tmp_path), 191)
-    queue_source = next(s for s in value['sources'] if s['kind'] == 'queue')
+    queue_source = next(s for s in value['sources'] if s['kind'] == 'queue' and s['profile'] == 'quantlab')
     assert queue_source['profile'] == 'quantlab' and queue_source['status'] == 'available'
     assert queue_source['observed_at'] == 100 and queue_source['rows'] == [row]
     projected = c.project(value, ('quantlab',), 191)
-    queue_source = next(s for s in projected['sources'] if s['kind'] == 'queue')
+    queue_source = next(s for s in projected['sources'] if s['kind'] == 'queue' and s['profile'] == 'quantlab')
     assert queue_source['status'] == 'unavailable' and queue_source['reason'] == 'stale'
     assert queue_source['rows'] == []
 
