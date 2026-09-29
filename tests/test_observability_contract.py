@@ -194,6 +194,63 @@ class ObservabilityContractTests(unittest.TestCase):
             finally:
                 sources.QUEUE_PATH = original
 
+    def test_collect_fails_queue_closed_when_final_snapshot_would_exceed_budget(self):
+        original_queue = sources.queue
+        try:
+            def huge_queue(_path, profile):
+                repo = (
+                    "Bbambaaamm/dotacni-majak"
+                    if profile == "majak"
+                    else "Bbambaaamm/Autonomous-Quant-Lab"
+                )
+                agent = (
+                    "dotacni-majak-hermes"
+                    if profile == "majak"
+                    else "quantlab-hermes"
+                )
+                rows = []
+                for index in range(50):
+                    rows.append(queue_row(
+                        task_id=(f"{profile}-{index:02d}-" + "x" * 120)[:128],
+                        repo=repo,
+                        issue=5000 + index,
+                        issue_title="Ž" * 160,
+                        scheduler_state="s" * 64,
+                        agent=agent,
+                        kind="k" * 64,
+                        blocker="b" * 128,
+                    ))
+                return rows, 100
+
+            sources.queue = huge_queue
+            config = {
+                "version": 1,
+                "output": "/tmp/snapshot.json",
+                "herdr": None,
+                "profiles": {
+                    profile: {
+                        "router": None,
+                        "search": None,
+                        "kanban": None,
+                        "git": None,
+                        "tests": None,
+                    }
+                    for profile in c.PROFILES
+                },
+            }
+            snapshot = collect(config, 100)
+            queue_sources = [
+                source for source in snapshot["sources"]
+                if source["kind"] == "queue"
+            ]
+            self.assertEqual(len(queue_sources), 2)
+            self.assertTrue(all(source["status"] == "unavailable" for source in queue_sources))
+            self.assertTrue(all(source["reason"] == "source_failed" for source in queue_sources))
+            self.assertTrue(all(source["rows"] == [] for source in queue_sources))
+            self.assertLessEqual(len(c.encode(snapshot)), c.MAX_BYTES)
+        finally:
+            sources.queue = original_queue
+
     def test_codex_usage_projection_exposes_allowance_without_identity(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "codex.json"
