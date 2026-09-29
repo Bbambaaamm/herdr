@@ -97,7 +97,11 @@ export function mountDashboard(createScene) {
   }
   function source(profile, kind) { return liveData?.sources.find(item => item.profile === profile && item.kind === kind); }
   function queueSources() { return PROFILES.map(profile => source(profile, 'queue')).filter(Boolean); }
-  function queueTasks() { return queueSources().flatMap(value => value?.status === 'available' ? value.rows : []); }
+  function queueTasks(profile = null) {
+    const values = profile ? [source(profile, 'queue')].filter(Boolean) : queueSources();
+    return values.flatMap(value => value?.status === 'available' ? value.rows : []);
+  }
+  function taskProfile(row) { return row?.repo === 'Bbambaaamm/dotacni-majak' ? 'majak' : 'quantlab'; }
   function swarmSource() { return source('quantlab', 'swarm'); }
   function swarmSnapshot() {
     const value = swarmSource();
@@ -144,8 +148,8 @@ export function mountDashboard(createScene) {
   function activeQueueTasks() { return queueTasks().filter(row => row.status !== 'done'); }
   function taskById(taskId) { return taskRows().find(row => row.task_id === taskId) || queueTasks().find(row => row.task_id === taskId) || null; }
   const USER_ACTION_BLOCKERS = new Set(['user_action_required', 'agent_interactive_input_required', 'github_write_auth_required']);
-  function userBlockedTasks() { return queueTasks().filter(row => ['blocked', 'failed'].includes(row.status) && USER_ACTION_BLOCKERS.has(row.blocker)); }
-  function technicalBlockedTasks() { return queueTasks().filter(row => ['blocked', 'failed'].includes(row.status) && !USER_ACTION_BLOCKERS.has(row.blocker)); }
+  function userBlockedTasks(profile = null) { return queueTasks(profile).filter(row => ['blocked', 'failed'].includes(row.status) && USER_ACTION_BLOCKERS.has(row.blocker)); }
+  function technicalBlockedTasks(profile = null) { return queueTasks(profile).filter(row => ['blocked', 'failed'].includes(row.status) && !USER_ACTION_BLOCKERS.has(row.blocker)); }
   function currentQueueTask(agent = null) {
     return queueTasks().find(row => (!agent || row.agent === agent) && ['running', 'blocked', 'failed'].includes(row.status));
   }
@@ -331,7 +335,10 @@ export function mountDashboard(createScene) {
   function renderTaskGraph() {
     const root = $('#taskgraph-nodes'), status = $('#taskgraph-status');
     if (!root || !status) return;
-    const swarmValue = swarmSource(), sourceValue = swarmSnapshot() ? swarmValue : queueSource();
+    const swarmValue = swarmSource(), queueValues = queueSources().filter(value => value.status === 'available');
+    const sourceValue = swarmSnapshot()
+      ? swarmValue
+      : queueValues.length ? { status: 'available', observed_at: Math.max(...queueValues.map(value => value.observed_at || 0)) } : null;
     if (!sourceValue || sourceValue.status !== 'available') {
       status.textContent = 'Task telemetry není dostupná.';
       root.innerHTML = '<div class="obs-empty">TaskGraph nelze zobrazit bez durable queue.</div>';
@@ -485,7 +492,7 @@ export function mountDashboard(createScene) {
   }
   function renderFace() {
     const state = effectiveState(), meta = STATE_META[state], color = toneColor(meta.tone);
-    const currentTask = currentQueueTask(), nextTask = nextQueueTask(currentTask?.agent || 'quantlab-hermes');
+    const currentTask = currentQueueTask(), nextTask = nextQueueTask(currentTask?.agent || null);
     ui.faceState.textContent = meta.label; ui.faceTask.textContent = faceCopy(state);
     ui.coordinatorCurrent.textContent = demo ? `DEMO · ${STATE_META[state].label}` : taskDisplay(currentTask);
     ui.coordinatorNext.textContent = demo ? `DEMO · ${demoTarget()}` : taskDisplay(nextTask);
@@ -525,9 +532,9 @@ export function mountDashboard(createScene) {
       const overflow = extras.length ? `<button type="button" class="scene-overflow" data-overflow-profile="${profile}">+${extras.length} dalších agentů — pracovní přehled</button>` : '';
       $(`#${profile}-agents`).innerHTML = boundRows.map(agentButton).join('') + overflow;
       const rows = actual.length ? actual : boundRows;
-      const queued = profile === 'quantlab' ? queueTasks() : [];
-      const userBlocked = profile === 'quantlab' ? userBlockedTasks().length : 0;
-      const technicalBlocked = profile === 'quantlab' ? technicalBlockedTasks().length : 0;
+      const queued = queueTasks(profile);
+      const userBlocked = userBlockedTasks(profile).length;
+      const technicalBlocked = technicalBlockedTasks(profile).length;
       $(`#${profile}-project-state`).textContent = rows.some(row => row.status === 'blocked') || userBlocked ? 'zásah'
         : rows.some(row => row.status === 'working') || queued.some(row => row.status === 'running') ? 'pracuje'
           : technicalBlocked ? 'čeká' : rows.every(row => row.unavailable) ? 'bez dat' : 'klid';
@@ -554,7 +561,7 @@ export function mountDashboard(createScene) {
     ui.snapshotAge.textContent = age(liveData.generated_at);
     const complete = PROFILES.every(profile => source(profile, 'herdr')?.status === 'available');
     ui.agentCount.textContent = complete ? String(agents().length) : `${agents().length} ověřeno · část nedostupná`;
-    ui.queueCount.textContent = queueSource()?.status === 'available' ? String(activeQueueTasks().length) : 'Nedostupné';
+    ui.queueCount.textContent = queueSources().some(value => value.status === 'available') ? String(activeQueueTasks().length) : 'Nedostupné';
     ui.requestCount.textContent = number(total('requests')); ui.searchCount.textContent = number(searchCount);
     ui.searchLatency.textContent = latency(searchCount == null || searchDuration == null ? null : searchCount === 0 ? 0 : searchDuration / searchCount);
     const codex = codexStats().row;
@@ -653,8 +660,8 @@ export function mountDashboard(createScene) {
   }
 
   function renderQueue() {
-    const value = queueSource(), summary = $('#queue-summary'), list = $('#queue-list');
-    if (!value || value.status !== 'available') {
+    const values = queueSources(), summary = $('#queue-summary'), list = $('#queue-list');
+    if (!values.some(value => value.status === 'available')) {
       summary.innerHTML = '';
       list.innerHTML = '<p class="queue-empty">Stav durable fronty není v aktuálním snapshotu dostupný.</p>';
       return;
