@@ -782,6 +782,63 @@ test('authoritative swarm snapshot drives real DAG edges and child task lineage'
   assert.equal(child.status, 'running');
 });
 
+test('Majak root remains visible alongside authoritative QuantLab swarm tasks', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const majakQueue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'majak');
+  majakQueue.status = 'available'; majakQueue.reason = 'ok'; majakQueue.data_at = now;
+  majakQueue.rows = [{
+    task_id: 'github-majak-issue-662-swarm-test',
+    repo: 'Bbambaaamm/dotacni-majak',
+    issue: 662,
+    issue_title: 'HERDR CONTROL',
+    issue_open: true,
+    scheduler_state: 'active',
+    status: 'running',
+    attempts: 1,
+    max_attempts: 4,
+    not_before: null,
+    updated_at: now,
+    agent: 'dotacni-majak-hermes',
+    kind: 'github_root_orchestration',
+    blocker: null,
+    pr_number: null,
+  }];
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '7', paper_only: false, policy_profiles: ['default'],
+      tasks: [
+        {
+          task_id: 'parent', parent_task_id: null, parent_agent_id: null,
+          agent_id: 'herdr-parent', state: 'running', role: 'planner',
+          model: 'model-a', fallback_model: null, attempt: 1, max_attempts: 2,
+          blocker: null, fencing_token: 1, dependencies: [], result_sha: null,
+        },
+        {
+          task_id: 'child', parent_task_id: 'parent', parent_agent_id: 'herdr-parent',
+          agent_id: 'herdr-child', state: 'ready', role: 'worker',
+          model: 'model-a', fallback_model: null, attempt: 0, max_attempts: 2,
+          blocker: null, fencing_token: 2, dependencies: [], result_sha: null,
+        },
+      ],
+      edges: [{ from_task: 'parent', to_task: 'child', kind: 'parent' }],
+    }],
+  });
+  await h.refresh();
+  const html = h.get('#taskgraph-nodes').innerHTML;
+  assert.match(html, /github-majak-issue-662-swarm-test/);
+  assert.match(html, /parent/);
+  assert.match(html, /child/);
+  assert.match(html, /data-edge-kind="parent"/);
+  const tasks = h.calls.tasks.at(-1);
+  assert.equal(tasks.length, 3);
+  assert(tasks.some(row => row.task_id === 'github-majak-issue-662-swarm-test'));
+  assert(tasks.some(row => row.task_id === 'parent'));
+  assert(tasks.some(row => row.task_id === 'child'));
+});
+
 test('QuantLab swarm browser boundary rejects non-PAPER snapshots', async t => {
   const h = await harness(t);
   const now = Math.floor(Date.now() / 1000);
