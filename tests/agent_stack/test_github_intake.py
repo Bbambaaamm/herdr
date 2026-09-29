@@ -205,5 +205,47 @@ class GitHubIntakeTests(unittest.TestCase):
         self.assertNotIn("quant evidence", mprior)
 
 
+    def test_root_orchestrator_replans_after_noninteractive_failed_task(self):
+        failed_path = self.intake.ROOT / "failed" / "root-failed.json"
+        failed_path.write_text(
+            json.dumps({
+                "id": "root-failed",
+                "issue": 662,
+                "repo": "Bbambaaamm/dotacni-majak",
+                "last_error": "executor crashed",
+            }),
+            encoding="utf-8",
+        )
+        records = self.intake.task_index()["Bbambaaamm/dotacni-majak#662"]
+        self.assertIsNone(
+            self.intake.intervention_blocker(records, allow_failed_replan=True)
+        )
+        task_id, blocker = self.intake.intervention_blocker(
+            records, allow_failed_replan=False
+        )
+        self.assertEqual(task_id, "root-failed")
+        self.assertEqual(blocker, "executor crashed")
+
+    def test_root_orchestrator_still_stops_on_human_blocker(self):
+        blocked_path = self.intake.ROOT / "blocked" / "root-human.json"
+        blocked_path.write_text(
+            json.dumps({
+                "id": "root-human",
+                "issue": 662,
+                "repo": "Bbambaaamm/dotacni-majak",
+            }),
+            encoding="utf-8",
+        )
+        (self.intake.RESULTS / "root-human.json").write_text(
+            json.dumps({"blocker": "user_action_required"}),
+            encoding="utf-8",
+        )
+        records = self.intake.task_index()["Bbambaaamm/dotacni-majak#662"]
+        self.assertEqual(
+            self.intake.intervention_blocker(records, allow_failed_replan=True),
+            ("root-human", "user_action_required"),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
