@@ -147,7 +147,11 @@ def rows():
             if profile is None or counts[profile] >= PROFILE_LIMIT:
                 continue
             expected_agent = PROFILE_AGENTS[profile]
-            agent = safe_text(raw.get("agent"), expected_agent)
+            raw_agent = raw.get("agent")
+            if profile == "quantlab" and raw_agent is None:
+                agent = expected_agent  # legacy QuantLab task compatibility
+            else:
+                agent = safe_text(raw_agent, limit=128)
             if agent != expected_agent:
                 continue
             issue = raw.get("issue")
