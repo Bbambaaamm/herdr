@@ -149,12 +149,15 @@ def fetch_issues(consumer: dict) -> list[dict]:
     if mode == "root_only":
         number = int(consumer["root_issue"])
         issue = fetch_json(f"https://api.github.com/repos/{repo}/issues/{number}")
-        if (
-            not isinstance(issue, dict)
-            or issue.get("state") != "open"
-            or "pull_request" in issue
-        ):
+        if not isinstance(issue, dict):
+            raise RuntimeError(f"invalid root issue response for {repo}#{number}")
+        if issue.get("number") != number or "pull_request" in issue:
+            raise RuntimeError(f"mismatched root issue response for {repo}#{number}")
+        state = issue.get("state")
+        if state == "closed":
             return []
+        if state != "open":
+            raise RuntimeError(f"invalid root issue state for {repo}#{number}")
         return [issue]
 
     issues = fetch_json(f"https://api.github.com/repos/{repo}/issues?state=open&per_page=100")
