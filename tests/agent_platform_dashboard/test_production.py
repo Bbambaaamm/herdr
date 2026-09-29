@@ -533,8 +533,8 @@ def test_collect_marks_only_swarm_unavailable_when_full_snapshot_budget_would_ov
         large_tasks.append({
             'task_id': ('task-' + suffix + '-' + 'x' * 240)[:256],
             'parent_task_id': None,
-            'parent_agent_id': None,
-            'agent_id': None,
+            'parent_agent_id': 'p' * 256,
+            'agent_id': ('agent-' + suffix + '-' + 'y' * 240)[:256],
             'state': 'done',
             'role': 'r' * 64,
             'model': 'm' * 128,
