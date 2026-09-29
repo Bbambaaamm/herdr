@@ -150,6 +150,19 @@ class GitHubIntakeTests(unittest.TestCase):
         self.intake.fetch_json = lambda _url: {"number": 662, "state": "closed"}
         self.assertEqual(self.intake.fetch_issues(self.majak_consumer()), [])
 
+    def test_majak_root_rejects_malformed_mismatched_or_pr_responses(self):
+        bad = [
+            {},
+            {"number": 663, "state": "open"},
+            {"number": 662, "state": "mystery"},
+            {"number": 662, "state": "open", "pull_request": {}},
+        ]
+        for payload in bad:
+            with self.subTest(payload=payload):
+                self.intake.fetch_json = lambda _url, value=payload: value
+                with self.assertRaises(RuntimeError):
+                    self.intake.fetch_issues(self.majak_consumer())
+
     def test_queue_majak_root_carries_explicit_consumer_identity(self):
         issue = {
             "number": 662,
