@@ -205,6 +205,23 @@ class GitHubIntakeTests(unittest.TestCase):
         self.assertNotIn("quant evidence", mprior)
 
 
+    def test_prior_evidence_preserves_latest_failed_task_error_without_result(self):
+        failed_path = self.intake.ROOT / "failed" / "root-failed-evidence.json"
+        failed_path.write_text(
+            json.dumps({
+                "id": "root-failed-evidence",
+                "issue": 662,
+                "repo": "Bbambaaamm/dotacni-majak",
+                "last_error": "provider startup failed",
+            }),
+            encoding="utf-8",
+        )
+        records = self.intake.task_index()["Bbambaaamm/dotacni-majak#662"]
+        prior = json.loads(self.intake.prior_evidence(records))
+        self.assertEqual(prior["previous_task"], "root-failed-evidence")
+        self.assertEqual(prior["previous_state"], "failed")
+        self.assertEqual(prior["last_error"], "provider startup failed")
+
     def test_root_orchestrator_replans_after_noninteractive_failed_task(self):
         failed_path = self.intake.ROOT / "failed" / "root-failed.json"
         failed_path.write_text(
