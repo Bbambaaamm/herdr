@@ -265,9 +265,13 @@ def tests(path, profile):
     return [item], raw['observed_at']
 
 
-def queue(path, profile):
-    c.need(profile in c.PROFILES and path == QUEUE_PATH)
-    raw = c.parse(read(path, c.MAX_BYTES), c.MAX_BYTES)
+def queue_payload(path):
+    c.need(path == QUEUE_PATH)
+    return c.parse(read(path, c.MAX_BYTES), c.MAX_BYTES)
+
+
+def queue_from_payload(raw, profile):
+    c.need(profile in c.PROFILES)
     version = raw.get('version') if type(raw) is dict else None
     if version == 2:
         c.keys(raw, 'version profile observed_at tasks')
@@ -291,6 +295,10 @@ def queue(path, profile):
         c.row('queue', item)
     c.need(len({r['task_id'] for r in raw['tasks']}) == len(raw['tasks']))
     return rows, raw['observed_at']
+
+
+def queue(path, profile):
+    return queue_from_payload(queue_payload(path), profile)
 
 
 
