@@ -178,6 +178,21 @@ class SwarmExportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "quantlab_non_paper"):
             self.exporter.load_records()
 
+    def test_pr46_quantlab_safety_profile_maps_to_paper_policy(self):
+        self.write_task(
+            "pending",
+            {
+                **self.herdr_task("quantlab-pr46"),
+                "repo": "Bbambaaamm/Autonomous-Quant-Lab",
+                "issue": 230,
+                "safety_profile": "quantlab",
+            },
+        )
+        payload = self.exporter.materialize(self.exporter.load_records(), observed_at=100)
+        self.assertTrue(payload["paper_only"])
+        self.assertEqual(payload["tasks"][0]["policy_profile"], "quantlab-paper")
+        self.assertTrue(payload["tasks"][0]["paper_only"])
+
     def test_sensitive_fields_never_leave_durable_store(self):
         task = self.herdr_task(
             "private",
