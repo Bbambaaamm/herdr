@@ -930,7 +930,7 @@ test('QuantLab swarm browser boundary rejects non-PAPER snapshots', async t => {
     observed_at: now, data_at: now,
     rows: [{
       version: 1, repo: 'Bbambaaamm/Autonomous-Quant-Lab', issue: '231',
-      paper_only: false, policy_profiles: [], tasks: [], edges: [],
+      paper_only: false, policy_profiles: [], agents: [], tasks: [], edges: [],
     }],
   });
   await h.refresh();
