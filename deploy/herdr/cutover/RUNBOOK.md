@@ -97,3 +97,38 @@ Model Router/Search Router/Herdr telemetry for both profiles, no queue/lease or
 routing regression, current-versus-historical provider semantics intact, and all
 consumer invariants unchanged. QuantLab remains PAPER-only; Heating actuation stays
 disabled; Maják provenance rules remain authoritative.
+
+
+## Degraded RC8 recovery
+
+The normal `apply` path remains strict and requires a healthy authenticated
+previous runtime plus an exercised healthy rollback boot.
+
+A separate `recovery-preflight` / `recovery-apply` path exists only for the
+one known staging recovery state where exact RC8
+`d58283bc4bf98490bb96bd9bffd58b293b451061` is fail-closed because its router
+adapter returns unavailable once the last 1000 requests exceed 50 distinct
+task/model/provider groups.
+
+Recovery authorization is intentionally narrow:
+
+- current must resolve to that exact immutable RC8 release;
+- installed RC8 units must already satisfy the reviewed bootstrap hashes;
+- the candidate must carry the reviewed deterministic top-50 router adapter;
+- Herdr socket must be a live Unix socket;
+- both Herdr profile sources and the RC8 release source must be fresh/available;
+- both router sources must be fresh `source_failed` with empty rows;
+- both telemetry timers must be active, web must be failed/inactive, and durable
+  watchdog must be inactive;
+- public Agent Platform health must remain fail-closed (502/503).
+
+Because the previous release is known unable to perform a healthy web boot,
+`recovery-apply` does **not** claim a healthy rollback exercise. It records
+`rollback_exercised=false` and
+`rollback_mode=skipped_known_degraded_previous`. On any candidate failure it
+restores the exact previous symlink, systemd unit bytes and deployed marker,
+keeps the Agent Platform route on the reviewed maintenance 503 fragment, keeps
+the durable watchdog stopped, and preserves the failed archive for audit.
+
+After a successful recovery promotion, the normal cutover path is authoritative
+again for subsequent releases.
