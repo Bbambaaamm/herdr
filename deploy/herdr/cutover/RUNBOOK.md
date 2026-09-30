@@ -92,19 +92,25 @@ boundary before public activation.
 
 This is not a generic rollback bypass. Any previous release other than the exact RC8
 bootstrap path still requires the full web restart and local `401` rollback proof.
-If a later deployment fails and must remain on RC8, the exact active Nginx route is
-restored and the unauthenticated `401` boundary is re-proved, while RC8 web may
-remain unavailable for authenticated traffic; the operator must treat that as a
-degraded fail-closed rollback state, not as successful application availability.
+If a later deployment fails and must remain on RC8, cutover first verifies the exact
+RC8 symlink/unit/marker rollback and re-proves the restored unauthenticated `401`
+Nginx boundary. Because the RC8 application itself cannot be claimed healthy, the
+rollback is then explicitly recorded root-only as
+`rollback_degraded_rc8_web_unavailable`, the Agent Platform route is returned to
+maintenance `503`, the watchdog remains stopped, and the command exits with that
+degraded rollback reason. Operators must never interpret this state as successful
+application availability.
 
 An `already_deployed` result is accepted only when the current symlink,
 all candidate systemd units, installed consumer policy digest, and bounded
 `deployed-release.json` identify the same immutable release.
 
-Any failure atomically returns `current` to the prior release, restarts the same
-services, and restores the exact prior Nginx fragment. The route remains fail-closed
-during the operation. No database, credential, consumer state, shared vhost, or
-legacy release is deleted.
+Any failure normally returns `current` to the prior release, restarts the same
+services, and restores the exact prior Nginx fragment. The exact RC8 degraded
+rollback exception above deliberately keeps its web service and watchdog stopped
+and leaves Agent Platform on maintenance `503` after recording the degraded state.
+The route remains fail-closed during the operation. No database, credential,
+consumer state, shared vhost, or legacy release is deleted.
 
 ## Evidence and soak
 
