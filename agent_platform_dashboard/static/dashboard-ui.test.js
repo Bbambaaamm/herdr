@@ -954,6 +954,110 @@ test('Majak working state remains globally visible with terminal or blocked swar
   assert.match(h.get('#face-task').textContent, /Maják #662/);
 });
 
+test('swarm does not mask Majak herdr source failure', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const majakHerdr = h.snapshot().sources.find(item => item.kind === 'herdr' && item.profile === 'majak');
+  majakHerdr.status = 'unavailable';
+  majakHerdr.reason = 'stale';
+  majakHerdr.rows = [];
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '48', paper_only: false,
+      policy_profiles: ['default'], agents: [], tasks: [{
+        task_id: 'terminal-swarm', parent_task_id: null, parent_agent_id: null,
+        agent_id: null, state: 'done', role: 'worker',
+        model: 'model-a', fallback_model: null, attempt: 1, max_attempts: 2,
+        blocker: null, fencing_token: 0, dependencies: [], result_sha: 'a'.repeat(64),
+      }], edges: [],
+    }],
+  });
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().state, 'error');
+  assert.match(h.get('#face-task').textContent, /majak\/herdr.*stale/i);
+});
+
+test('swarm active counts include concurrently working Majak agent', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const majakHerdr = h.snapshot().sources.find(item => item.kind === 'herdr' && item.profile === 'majak');
+  majakHerdr.rows[0].status = 'working';
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '48', paper_only: false,
+      policy_profiles: ['default'],
+      agents: [{
+        agent_id: 'herdr-parent', task_id: 'parent', state: 'running',
+        parent_task_id: null, parent_agent_id: null, fencing_token: 1,
+      }],
+      tasks: [{
+        task_id: 'parent', parent_task_id: null, parent_agent_id: null,
+        agent_id: 'herdr-parent', state: 'running', role: 'planner',
+        model: 'model-a', fallback_model: null, attempt: 1, max_attempts: 2,
+        blocker: null, fencing_token: 1, dependencies: [], result_sha: null,
+      }],
+      edges: [],
+    }],
+  });
+  await h.refresh();
+  assert.match(h.get('#swarm-kpis').innerHTML, /<span>Active<\/span><b>2<\/b>/);
+  assert.equal(h.calls.activity.at(-1).workingAgents, 2);
+});
+
+test('AQL user blocker outside selected swarm remains global attention', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const quantQueue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
+  quantQueue.status = 'available';
+  quantQueue.reason = 'ok';
+  quantQueue.data_at = now;
+  quantQueue.rows = [{
+    task_id: 'aql-human-blocked',
+    repo: 'Bbambaaamm/Autonomous-Quant-Lab',
+    issue: 190,
+    issue_title: 'Needs GitHub write',
+    issue_open: true,
+    scheduler_state: 'blocked',
+    status: 'blocked',
+    attempts: 1,
+    max_attempts: 4,
+    not_before: null,
+    updated_at: now,
+    agent: 'quantlab-hermes',
+    kind: 'github_issue_slice',
+    blocker: 'github_write_auth_required',
+    pr_number: null,
+  }];
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '48', paper_only: false,
+      policy_profiles: ['default'],
+      agents: [{
+        agent_id: 'herdr-parent', task_id: 'parent', state: 'running',
+        parent_task_id: null, parent_agent_id: null, fencing_token: 1,
+      }],
+      tasks: [{
+        task_id: 'parent', parent_task_id: null, parent_agent_id: null,
+        agent_id: 'herdr-parent', state: 'running', role: 'planner',
+        model: 'model-a', fallback_model: null, attempt: 1, max_attempts: 2,
+        blocker: null, fencing_token: 1, dependencies: [], result_sha: null,
+      }],
+      edges: [],
+    }],
+  });
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().state, 'waiting_user');
+  assert.match(h.get('#face-task').textContent, /aql-human-blocked/);
+  assert.equal(h.get('#attention-summary').hidden, false);
+  assert.match(h.get('#attention-summary').textContent, /aql-human-blocked/);
+});
+
 test('observability active work uses authoritative running agents only', async t => {
   const h = await harness(t);
   const now = Math.floor(Date.now() / 1000);
