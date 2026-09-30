@@ -27,6 +27,19 @@
       "priority_architecture": 10
     },
     {
+      "consumer": "herdr",
+      "enabled": true,
+      "repository": "Bbambaaamm/herdr",
+      "mode": "root_only",
+      "root_issue": 53,
+      "coordinator_agent": "quantlab-hermes",
+      "workspace": "/home/agentops/workspaces/quantlab",
+      "safety_profile": "herdr",
+      "hermes_profile": "quantlab",
+      "priority_default": 20,
+      "priority_architecture": 20
+    },
+    {
       "consumer": "heating",
       "enabled": false,
       "repository": "Bbambaaamm/heating",
