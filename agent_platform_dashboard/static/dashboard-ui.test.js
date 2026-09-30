@@ -904,6 +904,56 @@ test('Majak root remains visible alongside authoritative QuantLab swarm tasks', 
   assert(tasks.some(row => row.task_id === 'child'));
 });
 
+test('Majak working state remains globally visible with terminal or blocked swarm', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const majakHerdr = h.snapshot().sources.find(item => item.kind === 'herdr' && item.profile === 'majak');
+  majakHerdr.rows[0].status = 'working';
+  const majakQueue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'majak');
+  majakQueue.status = 'available'; majakQueue.reason = 'ok'; majakQueue.data_at = now;
+  majakQueue.rows = [{
+    task_id: 'github-majak-issue-662-global-state',
+    repo: 'Bbambaaamm/dotacni-majak',
+    issue: 662,
+    issue_title: 'HERDR CONTROL',
+    issue_open: true,
+    scheduler_state: 'active',
+    status: 'running',
+    attempts: 1,
+    max_attempts: 4,
+    not_before: null,
+    updated_at: now,
+    agent: 'dotacni-majak-hermes',
+    kind: 'github_root_orchestration',
+    blocker: null,
+    pr_number: null,
+  }];
+  const task = {
+    task_id: 'terminal-swarm', parent_task_id: null, parent_agent_id: null,
+    agent_id: null, state: 'done', role: 'worker',
+    model: 'model-a', fallback_model: null, attempt: 1, max_attempts: 2,
+    blocker: null, fencing_token: 0, dependencies: [], result_sha: 'a'.repeat(64),
+  };
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '48', paper_only: false,
+      policy_profiles: ['default'], agents: [], tasks: [task], edges: [],
+    }],
+  });
+
+  await h.refresh();
+  assert.equal(h.calls.states.at(-1), 'working');
+  assert.match(h.get('#face-task').textContent, /Maják #662/);
+
+  task.state = 'blocked';
+  task.blocker = 'test_failed';
+  await h.refresh();
+  assert.equal(h.calls.states.at(-1), 'working');
+  assert.match(h.get('#face-task').textContent, /Maják #662/);
+});
+
 test('observability active work uses authoritative running agents only', async t => {
   const h = await harness(t);
   const now = Math.floor(Date.now() / 1000);
