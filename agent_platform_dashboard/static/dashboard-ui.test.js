@@ -829,6 +829,7 @@ test('authoritative swarm snapshot drives real DAG edges and child task lineage'
   assert.match(h.get('#taskgraph-status').textContent, /Autoritativní Herdr DAG · 1 hran/);
   assert.equal(h.ui.diagnostics().state, 'working');
   assert.match(h.get('#face-state').textContent, /Zpracovává úlohu/);
+  assert.match(h.get('#face-task').textContent, /^Herdr #7/);
   assert.doesNotMatch(h.get('#taskgraph-status').textContent, /Dependency telemetry/i);
   const html = h.get('#taskgraph-nodes').innerHTML;
   assert.match(html, /data-edge-kind="parent"/);
