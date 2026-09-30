@@ -13,7 +13,7 @@ import os
 import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -383,6 +383,7 @@ class HerdrChildRuntime:
         resource_usage_factory: Callable[
             [DynamicChildScheduler, float, str], ResourceUsage
         ] = scheduler_resource_usage,
+        snapshot_heartbeat_seconds: float = 30.0,
     ) -> None:
         self.scheduler = scheduler
         self.runner = runner
@@ -398,6 +399,9 @@ class HerdrChildRuntime:
         )
         self.admission_registry = admission_registry or AdmissionRegistry()
         self.resource_usage_factory = resource_usage_factory
+        if snapshot_heartbeat_seconds <= 0:
+            raise ValueError("snapshot_heartbeat_seconds must be positive")
+        self.snapshot_heartbeat_seconds = float(snapshot_heartbeat_seconds)
         self._started_at = time.monotonic()
         self._owned_panes: set[str] = set()
         self._reserved_agents: set[str] = set()
@@ -618,9 +622,21 @@ class HerdrChildRuntime:
                 future_map = {
                     executor.submit(self._prompt_and_complete, child): child for child in children
                 }
-                for future in as_completed(future_map):
-                    task_id, committed = future.result()
-                    results[task_id] = committed
+                pending = set(future_map)
+                while pending:
+                    completed, pending = wait(
+                        pending,
+                        timeout=self.snapshot_heartbeat_seconds,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    # Keep the runtime-owned snapshot fresh while real children
+                    # still exist. The periodic Agent Stack materializer must
+                    # never become authoritative merely because a long prompt
+                    # outlives the dashboard freshness window.
+                    self.scheduler.export_snapshot(self.snapshot_path)
+                    for future in completed:
+                        task_id, committed = future.result()
+                        results[task_id] = committed
             self.scheduler.export_snapshot(self.snapshot_path)
             return results
         finally:
