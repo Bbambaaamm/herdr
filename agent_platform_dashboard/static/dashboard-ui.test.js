@@ -804,6 +804,10 @@ test('authoritative swarm snapshot drives real DAG edges and child task lineage'
     observed_at: now, data_at: now,
     rows: [{
       version: 1, repo: 'Bbambaaamm/herdr', issue: '7', paper_only: false, policy_profiles: ['default'],
+      agents: [{
+        agent_id: 'herdr-parent', task_id: 'parent', state: 'running',
+        parent_task_id: null, parent_agent_id: null, fencing_token: 1,
+      }],
       tasks: [
         {
           task_id: 'parent', parent_task_id: null, parent_agent_id: null,
@@ -823,6 +827,8 @@ test('authoritative swarm snapshot drives real DAG edges and child task lineage'
   });
   await h.refresh();
   assert.match(h.get('#taskgraph-status').textContent, /Autoritativní Herdr DAG · 1 hran/);
+  assert.equal(h.ui.diagnostics().state, 'working');
+  assert.match(h.get('#face-state').textContent, /Zpracovává úlohu/);
   assert.doesNotMatch(h.get('#taskgraph-status').textContent, /Dependency telemetry/i);
   const html = h.get('#taskgraph-nodes').innerHTML;
   assert.match(html, /data-edge-kind="parent"/);
