@@ -171,14 +171,26 @@ def test_runtime_units_use_only_atomic_current_symlink():
 
 def test_deployed_document_is_closed_and_binds_config():
     value = cutover.deployed_document(
-        {"tag": "v1.2.3", "commit": "a" * 40, "config_contract_sha256": "b" * 64},
+        {
+            "tag": "v1.2.3",
+            "commit": "a" * 40,
+            "config_contract_sha256": "b" * 64,
+            "payload_manifest_sha256": "d" * 64,
+        },
         "b" * 64, 100)
     assert json.dumps(value, sort_keys=True) == json.dumps({
         "version": 1, "tag": "v1.2.3", "commit": "a" * 40,
-        "config_sha256": "b" * 64, "deployed_at": 100}, sort_keys=True)
+        "config_sha256": "b" * 64,
+        "payload_manifest_sha256": "d" * 64,
+        "deployed_at": 100}, sort_keys=True)
     with pytest.raises(release.ReleaseError, match="deployment_config_mismatch"):
         cutover.deployed_document(
-            {"tag": "v1.2.3", "commit": "a" * 40, "config_contract_sha256": "b" * 64},
+            {
+                "tag": "v1.2.3",
+                "commit": "a" * 40,
+                "config_contract_sha256": "b" * 64,
+                "payload_manifest_sha256": "d" * 64,
+            },
             "c" * 64, 100)
 
 
@@ -269,6 +281,7 @@ def _versioned_current_release_fixture(monkeypatch, tmp_path):
             "tag": tag,
             "commit": commit,
             "config_sha256": document["config_contract_sha256"],
+            "payload_manifest_sha256": document["payload_manifest_sha256"],
             "deployed_at": 1,
         }),
         encoding="utf-8",
@@ -338,6 +351,49 @@ def test_versioned_upgrade_rejects_public_marker_identity_mismatch(
     with pytest.raises(
         release.ReleaseError,
         match="current_release_public_state_mismatch",
+    ):
+        cutover.current_release_unit_hashes()
+
+
+def test_rc8_bootstrap_accepts_only_explicit_reviewed_unit_hashes(
+    monkeypatch,
+    tmp_path,
+):
+    current, expected = _versioned_current_release_fixture(
+        monkeypatch,
+        tmp_path,
+    )
+    document = json.loads(
+        (current / "RELEASE.json").read_text(encoding="utf-8")
+    )
+    marker = json.loads(
+        cutover.PUBLIC_STATE.read_text(encoding="utf-8")
+    )
+    marker.pop("payload_manifest_sha256")
+    cutover.PUBLIC_STATE.write_text(
+        json.dumps(marker),
+        encoding="utf-8",
+    )
+    identity = (document["tag"], document["commit"])
+    reviewed = {
+        name: expected[cutover.UNIT_DIR / name]
+        for name in cutover.UNITS
+    }
+    monkeypatch.setattr(
+        cutover,
+        "BOOTSTRAP_VERSIONED_UNIT_HASHES",
+        {identity: reviewed},
+    )
+    assert cutover.current_release_unit_hashes() == expected
+
+    monkeypatch.setattr(
+        cutover,
+        "BOOTSTRAP_VERSIONED_UNIT_HASHES",
+        {},
+    )
+    with pytest.raises(
+        release.ReleaseError,
+        match="current_release_manifest_evidence_missing",
     ):
         cutover.current_release_unit_hashes()
 
@@ -747,6 +803,7 @@ def test_already_deployed_requires_full_coherence(
         "tag": "v1.2.3-rc.7",
         "commit": "a" * 40,
         "config_contract_sha256": digest,
+        "payload_manifest_sha256": "d" * 64,
     }
 
     public_state.write_text(
@@ -756,6 +813,7 @@ def test_already_deployed_requires_full_coherence(
                 "tag": release_doc["tag"],
                 "commit": release_doc["commit"],
                 "config_sha256": digest,
+                "payload_manifest_sha256": release_doc["payload_manifest_sha256"],
                 "deployed_at": 123456789,
             }
         ),
