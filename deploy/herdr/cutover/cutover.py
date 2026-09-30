@@ -210,7 +210,12 @@ def current_release_unit_hashes() -> dict[Path, str]:
             expected = baseline[name]
             need(digest_file(source) == expected,
                  f"current_release_unit_baseline_mismatch:{name}")
-            hashes[UNIT_DIR / name] = expected
+            installed = UNIT_DIR / name
+            need(installed.is_file() and not installed.is_symlink(),
+                 f"runtime_unit_missing:{name}")
+            need(digest_file(installed) == expected,
+                 f"runtime_unit_bootstrap_mismatch:{name}")
+            hashes[installed] = expected
         return hashes
 
     need(PUBLIC_STATE.is_file() and not PUBLIC_STATE.is_symlink(),
