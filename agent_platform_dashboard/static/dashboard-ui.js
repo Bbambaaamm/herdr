@@ -488,19 +488,29 @@ export function mountDashboard(createScene) {
   function demoTarget() { return SCENE_AGENT_IDS.has(selectedAgent) ? selectedAgent : 'majak-codex'; }
   function faceCopy(state) {
     if (demo) return `DEMO · ${STATE_META[state].copy}`;
-    const active = agents().filter(row => row.status === 'working').map(row => row.agent), task = currentQueueTask();
+    const swarm = swarmSnapshot();
+    const active = swarm
+      ? swarmAgents().map(row => row.agent_id).filter(Boolean)
+      : agents().filter(row => row.status === 'working').map(row => row.agent);
+    const task = swarm
+      ? swarmTasks().find(row => row.status === 'running') || null
+      : currentQueueTask();
     if (state === 'working' && task) {
       const project = task.repo === 'Bbambaaamm/dotacni-majak' ? 'Maják' : 'QuantLab';
       return `${project} ${issueLabel(task)} · ${task.task_id} · ${QUEUE_STATUS[task.status]}.`;
     }
     if (state === 'working' || (state === 'idle' && active.length)) return `Pracují: ${active.join(', ')}. Přesný úkol zdroj neposkytuje.`;
     if (state === 'waiting_user') {
-      const blockedAgents = agents().filter(row => row.status === 'blocked').map(row => row.agent);
-      const blockedTasks = userBlockedTasks().map(row => `${issueLabel(row)} ${row.task_id}`);
+      const blockedAgents = swarm ? [] : agents().filter(row => row.status === 'blocked').map(row => row.agent);
+      const blockedTasks = (swarm ? swarmTasks() : userBlockedTasks())
+        .filter(row => ['blocked', 'failed'].includes(row.status) && USER_ACTION_BLOCKERS.has(row.blocker))
+        .map(row => `${issueLabel(row)} ${row.task_id}`);
       return `Zkontrolujte: ${[...blockedAgents, ...blockedTasks].join(', ') || 'blokovanou úlohu'}.`;
     }
     if (state === 'waiting_result') {
-      const tasks = technicalBlockedTasks().map(row => `${issueLabel(row)} ${row.blocker || row.task_id}`);
+      const tasks = (swarm ? swarmTasks() : technicalBlockedTasks())
+        .filter(row => ['blocked', 'failed'].includes(row.status) && !USER_ACTION_BLOCKERS.has(row.blocker))
+        .map(row => `${issueLabel(row)} ${row.blocker || row.task_id}`);
       return `Čekají technické závislosti: ${tasks.join(', ') || 'interní kontrola'}.`;
     }
     if (state === 'offline') return loadReason;
