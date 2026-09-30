@@ -96,8 +96,14 @@ export function mountDashboard(createScene) {
     try { return scene[method](...args); } catch (_) { failScene(); }
   }
   function source(profile, kind) { return liveData?.sources.find(item => item.profile === profile && item.kind === kind); }
-  function queueSource() { return source('quantlab', 'queue'); }
-  function queueTasks() { const value = queueSource(); return value?.status === 'available' ? value.rows : []; }
+  function queueSources() { return PROFILES.map(profile => source(profile, 'queue')).filter(Boolean); }
+  function queueTasks(profile = null) {
+    const values = profile ? [source(profile, 'queue')].filter(Boolean) : queueSources();
+    return values.flatMap(value => value?.status === 'available' ? value.rows : []);
+  }
+  function taskProfile(row) { return row?.repo === 'Bbambaaamm/dotacni-majak' ? 'majak' : 'quantlab'; }
+  function durableAgent(agent) { return agent === 'majak-hermes' ? 'dotacni-majak-hermes' : agent; }
+  function sceneAgent(agent) { return agent === 'dotacni-majak-hermes' ? 'majak-hermes' : agent; }
   function swarmSource() { return source('quantlab', 'swarm'); }
   function swarmSnapshot() {
     const value = swarmSource();
@@ -133,7 +139,7 @@ export function mountDashboard(createScene) {
     }));
   }
   function swarmEdges() { return swarmSnapshot()?.edges || []; }
-  function taskRows() { return swarmSnapshot() ? swarmTasks() : queueTasks(); }
+  function taskRows() { return swarmSnapshot() ? [...swarmTasks(), ...queueTasks('majak')] : queueTasks(); }
   function admissionSource() { return source('quantlab', 'admission'); }
   function admissionRows() { const value = admissionSource(); return value?.status === 'available' ? value.rows : []; }
   function admissionDenials() { return admissionRows().filter(row => row.event === 'deny'); }
@@ -144,14 +150,24 @@ export function mountDashboard(createScene) {
   function activeQueueTasks() { return queueTasks().filter(row => row.status !== 'done'); }
   function taskById(taskId) { return taskRows().find(row => row.task_id === taskId) || queueTasks().find(row => row.task_id === taskId) || null; }
   const USER_ACTION_BLOCKERS = new Set(['user_action_required', 'agent_interactive_input_required', 'github_write_auth_required']);
-  function userBlockedTasks() { return queueTasks().filter(row => ['blocked', 'failed'].includes(row.status) && USER_ACTION_BLOCKERS.has(row.blocker)); }
-  function technicalBlockedTasks() { return queueTasks().filter(row => ['blocked', 'failed'].includes(row.status) && !USER_ACTION_BLOCKERS.has(row.blocker)); }
-  function currentQueueTask(agent = 'quantlab-hermes') { return queueTasks().find(row => row.agent === agent && ['running', 'blocked', 'failed'].includes(row.status)); }
-  function nextQueueTask(agent = 'quantlab-hermes') { return queueTasks().filter(row => row.agent === agent && row.status === 'pending').sort((a, b) => (a.not_before ?? Number.MAX_SAFE_INTEGER) - (b.not_before ?? Number.MAX_SAFE_INTEGER) || a.task_id.localeCompare(b.task_id))[0]; }
+  function userBlockedTasks(profile = null) { return queueTasks(profile).filter(row => ['blocked', 'failed'].includes(row.status) && USER_ACTION_BLOCKERS.has(row.blocker)); }
+  function technicalBlockedTasks(profile = null) { return queueTasks(profile).filter(row => ['blocked', 'failed'].includes(row.status) && !USER_ACTION_BLOCKERS.has(row.blocker)); }
+  function currentQueueTask(agent = null) {
+    const priority = { running: 0, blocked: 1, failed: 2 };
+    return queueTasks()
+      .filter(row => (!agent || row.agent === agent) && Object.hasOwn(priority, row.status))
+      .sort((a, b) => priority[a.status] - priority[b.status]
+        || (b.updated_at || 0) - (a.updated_at || 0)
+        || a.task_id.localeCompare(b.task_id))[0];
+  }
+  function nextQueueTask(agent = null) {
+    return queueTasks().filter(row => (!agent || row.agent === agent) && row.status === 'pending')
+      .sort((a, b) => (a.not_before ?? Number.MAX_SAFE_INTEGER) - (b.not_before ?? Number.MAX_SAFE_INTEGER) || a.task_id.localeCompare(b.task_id))[0];
+  }
   function taskDisplay(row) { return row ? `${issueLabel(row)} · ${row.task_id}` : 'Žádná'; }
   function attemptLabel(row) { return row ? `${number(row.attempts)} / ${number(row.max_attempts)}` : 'Nedostupné'; }
   function issueUrl(row) { return Number.isFinite(row?.issue) ? `https://github.com/${row.repo || GITHUB_REPO}/issues/${row.issue}` : null; }
-  function prUrl(row) { return Number.isFinite(row?.pr_number) ? `https://github.com/${GITHUB_REPO}/pull/${row.pr_number}` : null; }
+  function prUrl(row) { return Number.isFinite(row?.pr_number) ? `https://github.com/${row.repo || GITHUB_REPO}/pull/${row.pr_number}` : null; }
   function detailLink(url, label) { return url ? `<a href="${escapeHTML(url)}" target="_blank" rel="noopener noreferrer">${escapeHTML(label)}</a>` : ''; }
   function agents() {
     return PROFILES.flatMap(profile => {
@@ -326,7 +342,10 @@ export function mountDashboard(createScene) {
   function renderTaskGraph() {
     const root = $('#taskgraph-nodes'), status = $('#taskgraph-status');
     if (!root || !status) return;
-    const swarmValue = swarmSource(), sourceValue = swarmSnapshot() ? swarmValue : queueSource();
+    const swarmValue = swarmSource(), queueValues = queueSources().filter(value => value.status === 'available');
+    const sourceValue = swarmSnapshot()
+      ? swarmValue
+      : queueValues.length ? { status: 'available', observed_at: Math.max(...queueValues.map(value => value.observed_at || 0)) } : null;
     if (!sourceValue || sourceValue.status !== 'available') {
       status.textContent = 'Task telemetry není dostupná.';
       root.innerHTML = '<div class="obs-empty">TaskGraph nelze zobrazit bez durable queue.</div>';
@@ -459,7 +478,10 @@ export function mountDashboard(createScene) {
   function faceCopy(state) {
     if (demo) return `DEMO · ${STATE_META[state].copy}`;
     const active = agents().filter(row => row.status === 'working').map(row => row.agent), task = currentQueueTask();
-    if (state === 'working' && task) return `QuantLab ${issueLabel(task)} · ${task.task_id} · ${QUEUE_STATUS[task.status]}.`;
+    if (state === 'working' && task) {
+      const project = task.repo === 'Bbambaaamm/dotacni-majak' ? 'Maják' : 'QuantLab';
+      return `${project} ${issueLabel(task)} · ${task.task_id} · ${QUEUE_STATUS[task.status]}.`;
+    }
     if (state === 'working' || (state === 'idle' && active.length)) return `Pracují: ${active.join(', ')}. Přesný úkol zdroj neposkytuje.`;
     if (state === 'waiting_user') {
       const blockedAgents = agents().filter(row => row.status === 'blocked').map(row => row.agent);
@@ -477,7 +499,7 @@ export function mountDashboard(createScene) {
   }
   function renderFace() {
     const state = effectiveState(), meta = STATE_META[state], color = toneColor(meta.tone);
-    const currentTask = currentQueueTask(), nextTask = nextQueueTask(currentTask?.agent || 'quantlab-hermes');
+    const currentTask = currentQueueTask(), nextTask = nextQueueTask(currentTask?.agent || null);
     ui.faceState.textContent = meta.label; ui.faceTask.textContent = faceCopy(state);
     ui.coordinatorCurrent.textContent = demo ? `DEMO · ${STATE_META[state].label}` : taskDisplay(currentTask);
     ui.coordinatorNext.textContent = demo ? `DEMO · ${demoTarget()}` : taskDisplay(nextTask);
@@ -492,7 +514,7 @@ export function mountDashboard(createScene) {
       blocked: queue.filter(row => ['blocked', 'failed'].includes(row.status)).length,
       userBlocked: userBlockedTasks().length,
       workingAgents: working.length,
-      activeAgent: currentTask?.agent || working[0]?.agent || null,
+      activeAgent: sceneAgent(currentTask?.agent) || working[0]?.agent || null,
     });
     const target = demoTarget();
     const key = `${demo}:${demoState}:${target}`;
@@ -517,9 +539,9 @@ export function mountDashboard(createScene) {
       const overflow = extras.length ? `<button type="button" class="scene-overflow" data-overflow-profile="${profile}">+${extras.length} dalších agentů — pracovní přehled</button>` : '';
       $(`#${profile}-agents`).innerHTML = boundRows.map(agentButton).join('') + overflow;
       const rows = actual.length ? actual : boundRows;
-      const queued = profile === 'quantlab' ? queueTasks() : [];
-      const userBlocked = profile === 'quantlab' ? userBlockedTasks().length : 0;
-      const technicalBlocked = profile === 'quantlab' ? technicalBlockedTasks().length : 0;
+      const queued = queueTasks(profile);
+      const userBlocked = userBlockedTasks(profile).length;
+      const technicalBlocked = technicalBlockedTasks(profile).length;
       $(`#${profile}-project-state`).textContent = rows.some(row => row.status === 'blocked') || userBlocked ? 'zásah'
         : rows.some(row => row.status === 'working') || queued.some(row => row.status === 'running') ? 'pracuje'
           : technicalBlocked ? 'čeká' : rows.every(row => row.unavailable) ? 'bez dat' : 'klid';
@@ -546,7 +568,11 @@ export function mountDashboard(createScene) {
     ui.snapshotAge.textContent = age(liveData.generated_at);
     const complete = PROFILES.every(profile => source(profile, 'herdr')?.status === 'available');
     ui.agentCount.textContent = complete ? String(agents().length) : `${agents().length} ověřeno · část nedostupná`;
-    ui.queueCount.textContent = queueSource()?.status === 'available' ? String(activeQueueTasks().length) : 'Nedostupné';
+    const visibleProfiles = [...new Set(liveData.sources.map(value => value.profile))];
+    const queueValues = queueSources();
+    const queueComplete = visibleProfiles.length > 0
+      && visibleProfiles.every(profile => source(profile, 'queue')?.status === 'available');
+    ui.queueCount.textContent = queueComplete ? String(activeQueueTasks().length) : 'Nedostupné';
     ui.requestCount.textContent = number(total('requests')); ui.searchCount.textContent = number(searchCount);
     ui.searchLatency.textContent = latency(searchCount == null || searchDuration == null ? null : searchCount === 0 ? 0 : searchDuration / searchCount);
     const codex = codexStats().row;
@@ -645,8 +671,8 @@ export function mountDashboard(createScene) {
   }
 
   function renderQueue() {
-    const value = queueSource(), summary = $('#queue-summary'), list = $('#queue-list');
-    if (!value || value.status !== 'available') {
+    const values = queueSources(), summary = $('#queue-summary'), list = $('#queue-list');
+    if (!values.some(value => value.status === 'available')) {
       summary.innerHTML = '';
       list.innerHTML = '<p class="queue-empty">Stav durable fronty není v aktuálním snapshotu dostupný.</p>';
       return;
@@ -751,9 +777,10 @@ export function mountDashboard(createScene) {
     const row = agents().find(item => item.agent === selectedAgent);
     const profile = row?.profile || (selectedAgent.startsWith('majak-') ? 'majak' : 'quantlab');
     const value = stats(profile), search = searchStats(profile), herdr = source(profile, 'herdr');
-    const task = selectedAgent === 'quantlab-hermes'
-      ? currentQueueTask(selectedAgent) || nextQueueTask(selectedAgent) : null;
-    const currentTask = selectedAgent === 'quantlab-hermes'
+    const hasQueue = selectedAgent.endsWith('-hermes');
+    const queueAgent = durableAgent(selectedAgent);
+    const task = hasQueue ? currentQueueTask(queueAgent) || nextQueueTask(queueAgent) : null;
+    const currentTask = hasQueue
       ? task ? `${issueLabel(task)} · ${task.task_id} · ${QUEUE_STATUS[task.status] || task.status}` : 'Žádná úloha v durable queue'
       : 'Nedostupné v datovém kontraktu';
     const taskTitle = task?.issue_title || 'Nedostupné v telemetry kontraktu';
@@ -862,14 +889,19 @@ export function mountDashboard(createScene) {
       if (['router', 'search'].includes(item.kind)
         && item.rows.some(row => typeof row.provider !== 'string' || !Number.isFinite(row.last_used_at))) throw new Error('invalid');
       if (item.kind === 'queue') {
-        if (item.profile !== 'quantlab') throw new Error('invalid');
+        const expected = item.profile === 'majak'
+          ? { repo: 'Bbambaaamm/dotacni-majak', agent: 'dotacni-majak-hermes' }
+          : { repo: 'Bbambaaamm/Autonomous-Quant-Lab', agent: 'quantlab-hermes' };
         if (item.rows.some(row =>
           typeof row.task_id !== 'string'
+          || (row.repo != null && typeof row.repo !== 'string')
+          || (item.profile === 'majak' && row.repo !== expected.repo)
+          || (item.profile === 'quantlab' && row.repo != null && row.repo !== expected.repo)
           || (row.issue != null && (!Number.isSafeInteger(row.issue) || row.issue < 0))
           || (row.issue_title != null && (typeof row.issue_title !== 'string' || row.issue_title.length > 160))
           || typeof row.issue_open !== 'boolean'
           || (row.scheduler_state != null && typeof row.scheduler_state !== 'string')
-          || typeof row.agent !== 'string'
+          || row.agent !== expected.agent
           || typeof row.kind !== 'string'
           || !Object.hasOwn(QUEUE_STATUS, row.status)
           || !Number.isSafeInteger(row.attempts) || row.attempts < 0

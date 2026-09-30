@@ -265,18 +265,40 @@ def tests(path, profile):
     return [item], raw['observed_at']
 
 
-def queue(path, profile):
-    c.need(profile == 'quantlab' and path == QUEUE_PATH)
-    raw = c.parse(read(path, 32768), 32768)
-    c.keys(raw, 'version profile observed_at tasks')
-    c.need(type(raw['version']) is int and raw['version'] == 2 and raw['profile'] == profile
-           and c.number(raw['observed_at']) and type(raw['tasks']) is list and len(raw['tasks']) <= 50)
-    rows = []
+def queue_payload(path):
+    c.need(path == QUEUE_PATH)
+    return c.parse(read(path, c.MAX_BYTES), c.MAX_BYTES)
+
+
+def queue_from_payload(raw, profile):
+    c.need(profile in c.PROFILES)
+    version = raw.get('version') if type(raw) is dict else None
+    if version == 2:
+        c.keys(raw, 'version profile observed_at tasks')
+        c.need(raw['profile'] == 'quantlab' and profile == 'quantlab'
+               and c.number(raw['observed_at']) and type(raw['tasks']) is list
+               and len(raw['tasks']) <= 50)
+        rows = list(raw['tasks'])
+    elif version == 3:
+        c.keys(raw, 'version observed_at tasks')
+        c.need(c.number(raw['observed_at']) and type(raw['tasks']) is list
+               and len(raw['tasks']) <= 100)
+        target_repo = {
+            'quantlab': 'Bbambaaamm/Autonomous-Quant-Lab',
+            'majak': 'Bbambaaamm/dotacni-majak',
+        }[profile]
+        rows = [item for item in raw['tasks'] if item.get('repo') == target_repo]
+        c.need(len(rows) <= 50)
+    else:
+        raise ValueError('invalid_metadata')
     for item in raw['tasks']:
         c.row('queue', item)
-        rows.append(item)
-    c.need(len({r['task_id'] for r in rows}) == len(rows))
+    c.need(len({r['task_id'] for r in raw['tasks']}) == len(raw['tasks']))
     return rows, raw['observed_at']
+
+
+def queue(path, profile):
+    return queue_from_payload(queue_payload(path), profile)
 
 
 

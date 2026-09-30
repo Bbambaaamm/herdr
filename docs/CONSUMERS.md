@@ -16,6 +16,17 @@ Repository: Bbambaaamm/dotacni-majak
 Primary roles: web research, source verification, grant matching, document/workflow generation, coding and review.
 Domain data, eligibility logic and source-quality rules remain in Maják.
 
+### GitHub intake / completion root
+
+Maják uses root-only autonomous intake. Herdr queues only consumer issue `#662`; the stable
+`dotacni-majak-hermes` parent reads the live backlog/readiness state, selects the nearest
+dependency-safe slice, delegates bounded child work, verifies consumer merge gates and replans.
+Individual Maják product issues are not flattened into independent intake tasks.
+
+Runtime GitHub intake consumers are declared in
+`agent-stack/config/github-intake-consumers.json`. Durable intake/task identity is scoped by
+`repository#issue` so issue numbers cannot collide across consumers.
+
 ## Heating
 
 Repository: Bbambaaamm/heating

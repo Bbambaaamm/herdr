@@ -35,6 +35,10 @@ function fixture() {
         cost_microusd: null, result_count: 8, extract_count: 3, last_used_at: now }] },
   );
   sources.push({
+    profile: 'majak', kind: 'queue', status: 'unavailable', reason: 'not_configured', observed_at: now, data_at: null,
+    rows: [],
+  });
+  sources.push({
     profile: 'quantlab', kind: 'queue', status: 'available', reason: 'ok', observed_at: now, data_at: now,
     rows: [{ task_id: 'issue190-prepare-20260926', issue: 190,
       issue_title: 'Cílová architektura runtime', issue_open: true, scheduler_state: 'active',
@@ -244,7 +248,7 @@ test('release identity is mandatory and sanitized in the browser trust boundary'
 
 test('durable QuantLab queue renders safe metadata and drives coordinator state', async t => {
   const h = await harness(t);
-  assert.equal(h.get('#queue-count').textContent, '1');
+  assert.equal(h.get('#queue-count').textContent, 'Nedostupné');
   assert.equal(h.ui.diagnostics().queueActive, 1);
   assert.match(h.get('#queue-list').innerHTML, /issue190-prepare-20260926/);
   assert.match(h.get('#queue-list').innerHTML, /#190/);
@@ -253,12 +257,12 @@ test('durable QuantLab queue renders safe metadata and drives coordinator state'
   assert.equal(h.get('#coordinator-current').textContent, 'Žádná');
   assert.doesNotMatch(h.get('#queue-list').innerHTML, /prompt|PRIVATE|tool_args|log/i);
 
-  const queue = h.snapshot().sources.find(item => item.kind === 'queue');
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
   queue.rows[0].status = 'running';
   queue.rows[0].attempts = 1;
   await h.refresh();
   assert.equal(h.ui.diagnostics().state, 'working');
-  assert.equal(h.get('#queue-count').textContent, '1');
+  assert.equal(h.get('#queue-count').textContent, 'Nedostupné');
   assert.match(h.get('#face-task').textContent, /#190/);
   assert.match(h.get('#face-task').textContent, /issue190-prepare-20260926/);
   assert.match(h.get('#coordinator-current').textContent, /issue190-prepare-20260926/);
@@ -282,7 +286,7 @@ test('durable QuantLab queue renders safe metadata and drives coordinator state'
 
 test('blocked queue task raises attention with sanitized blocker only', async t => {
   const h = await harness(t);
-  const queue = h.snapshot().sources.find(item => item.kind === 'queue');
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
   queue.rows[0].status = 'blocked';
   queue.rows[0].blocker = 'github_write_auth_required';
   await h.refresh();
@@ -294,7 +298,7 @@ test('blocked queue task raises attention with sanitized blocker only', async t 
 
 test('technical queue blocker does not masquerade as user intervention', async t => {
   const h = await harness(t);
-  const queue = h.snapshot().sources.find(item => item.kind === 'queue');
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
   queue.rows[0].status = 'blocked';
   queue.rows[0].blocker = 'soak_evidence_pending';
   await h.refresh();
@@ -306,17 +310,122 @@ test('technical queue blocker does not masquerade as user intervention', async t
 
 test('queue v2 browser contract rejects incomplete task metadata', async t => {
   const h = await harness(t);
-  const queue = h.snapshot().sources.find(item => item.kind === 'queue');
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
   delete queue.rows[0].max_attempts;
   await h.refresh();
   assert.equal(h.ui.diagnostics().freshSnapshot, false);
   assert.equal(h.ui.diagnostics().state, 'offline');
 });
 
-test('queue source is QuantLab-only in browser validation', async t => {
+test('Majak durable queue is accepted, visible, and bound to dotacni-majak-hermes', async t => {
   const h = await harness(t);
-  const queue = h.snapshot().sources.find(item => item.kind === 'queue');
-  queue.profile = 'majak';
+  const now = Math.floor(Date.now() / 1000);
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'majak');
+  queue.status = 'available'; queue.reason = 'ok'; queue.data_at = now;
+  queue.rows = [{
+    task_id: 'github-majak-issue-662-test',
+    repo: 'Bbambaaamm/dotacni-majak',
+    issue: 662,
+    issue_title: 'HERDR CONTROL · Dotační maják completion program',
+    issue_open: true,
+    scheduler_state: 'active',
+    status: 'running',
+    attempts: 1,
+    max_attempts: 4,
+    not_before: null,
+    updated_at: now,
+    agent: 'dotacni-majak-hermes',
+    kind: 'github_root_orchestration',
+    blocker: null,
+    pr_number: null,
+  }];
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().freshSnapshot, true);
+  assert.equal(h.ui.diagnostics().queueActive, 2);
+  assert.match(h.get('#queue-list').innerHTML, /github-majak-issue-662-test/);
+  assert.match(h.get('#queue-list').innerHTML, /#662/);
+  assert.match(h.get('#face-task').textContent, /Maják #662/);
+  h.calls.select('majak-hermes');
+  assert.match(h.get('#detail-metrics').innerHTML, /github-majak-issue-662-test/);
+  assert.match(h.get('#detail-links').innerHTML, /dotacni-majak\/issues\/662/);
+});
+
+test('single-profile authorized snapshot reports its available queue as complete', async t => {
+  const h = await harness(t);
+  h.setSnapshot({
+    ...h.snapshot(),
+    sources: h.snapshot().sources.filter(item => item.profile === 'quantlab'),
+  });
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().freshSnapshot, true);
+  assert.equal(h.get('#queue-count').textContent, '1');
+});
+
+test('running queue task outranks retained blocked or failed rows across profiles', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const majak = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'majak');
+  majak.status = 'available'; majak.reason = 'ok'; majak.data_at = now;
+  majak.rows = [{
+    task_id: 'majak-retained-failure',
+    repo: 'Bbambaaamm/dotacni-majak',
+    issue: 662,
+    issue_title: 'retained failure',
+    issue_open: true,
+    scheduler_state: 'active',
+    status: 'failed',
+    attempts: 4,
+    max_attempts: 4,
+    not_before: null,
+    updated_at: now + 100,
+    agent: 'dotacni-majak-hermes',
+    kind: 'github_root_orchestration',
+    blocker: 'provider_startup_failed',
+    pr_number: null,
+  }];
+  const quant = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
+  quant.rows[0].status = 'running';
+  quant.rows[0].updated_at = now;
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().state, 'working');
+  assert.match(h.get('#face-task').textContent, /QuantLab #190/);
+  assert.match(h.get('#coordinator-current').textContent, /issue190-prepare-20260926/);
+  assert.equal(h.calls.activity.at(-1).activeAgent, 'quantlab-hermes');
+});
+
+test('queue headline is unavailable when only one consumer projection is available', async t => {
+  const h = await harness(t);
+  assert.equal(h.get('#queue-count').textContent, 'Nedostupné');
+  const majak = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'majak');
+  const now = Math.floor(Date.now() / 1000);
+  majak.status = 'available'; majak.reason = 'ok'; majak.data_at = now;
+  majak.rows = [];
+  await h.refresh();
+  assert.equal(h.get('#queue-count').textContent, '1');
+});
+
+test('Majak queue rejects wrong repo or coordinator identity', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'majak');
+  queue.status = 'available'; queue.reason = 'ok'; queue.data_at = now;
+  queue.rows = [{
+    task_id: 'bad-majak-task',
+    repo: 'Bbambaaamm/Autonomous-Quant-Lab',
+    issue: 662,
+    issue_title: 'bad',
+    issue_open: true,
+    scheduler_state: 'active',
+    status: 'running',
+    attempts: 0,
+    max_attempts: 4,
+    not_before: null,
+    updated_at: now,
+    agent: 'quantlab-hermes',
+    kind: 'github_root_orchestration',
+    blocker: null,
+    pr_number: null,
+  }];
   await h.refresh();
   assert.equal(h.ui.diagnostics().freshSnapshot, false);
   assert.equal(h.ui.diagnostics().state, 'offline');
@@ -505,7 +614,7 @@ test('TaskGraph is explicit when dependency telemetry is unavailable', async t =
 
 test('TaskGraph handles an empty queue without invented nodes', async t => {
   const h = await harness(t);
-  const queue = h.snapshot().sources.find(item => item.kind === 'queue');
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
   queue.rows = [];
   await h.refresh();
   assert.match(h.get('#taskgraph-nodes').innerHTML, /Durable queue je prázdná/);
@@ -514,7 +623,7 @@ test('TaskGraph handles an empty queue without invented nodes', async t => {
 
 test('TaskGraph uses bounded LOD for more than twenty task records', async t => {
   const h = await harness(t);
-  const queue = h.snapshot().sources.find(item => item.kind === 'queue');
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
   const base = queue.rows[0];
   queue.rows = Array.from({ length: 25 }, (_, index) => ({
     ...base,
@@ -615,7 +724,7 @@ test('TaskGraph task nodes carry aria-selected for keyboard/select sync', async 
 
 test('Retries KPI counts only attempts after the first try', async t => {
   const h = await harness(t);
-  const queue = h.snapshot().sources.find(item => item.kind === 'queue');
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
   queue.rows[0].attempts = 3;
   await h.refresh();
   assert.match(h.get('#swarm-kpis').innerHTML, /<span>Retries<\/span><b>2<\/b><small>opakované pokusy<\/small>/);
@@ -623,7 +732,7 @@ test('Retries KPI counts only attempts after the first try', async t => {
 
 test('Blocked and failed stay semantically separate in KPI and analytics', async t => {
   const h = await harness(t);
-  const queue = h.snapshot().sources.find(item => item.kind === 'queue');
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
   const base = queue.rows[0];
   queue.rows = [
     { ...base, task_id: 'blocked-task', status: 'blocked', blocker: 'soak_evidence_pending' },
@@ -636,7 +745,7 @@ test('Blocked and failed stay semantically separate in KPI and analytics', async
 
 test('TaskGraph state filters do not invent or reorder hidden dependencies', async t => {
   const h = await harness(t);
-  const queue = h.snapshot().sources.find(item => item.kind === 'queue');
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
   const base = queue.rows[0];
   queue.rows = [
     { ...base, task_id: 'run-1', status: 'running' },
@@ -725,6 +834,63 @@ test('authoritative swarm snapshot drives real DAG edges and child task lineage'
   assert.equal(child.parent_task_id, 'parent');
   assert.equal(child.raw_state, 'review');
   assert.equal(child.status, 'running');
+});
+
+test('Majak root remains visible alongside authoritative QuantLab swarm tasks', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const majakQueue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'majak');
+  majakQueue.status = 'available'; majakQueue.reason = 'ok'; majakQueue.data_at = now;
+  majakQueue.rows = [{
+    task_id: 'github-majak-issue-662-swarm-test',
+    repo: 'Bbambaaamm/dotacni-majak',
+    issue: 662,
+    issue_title: 'HERDR CONTROL',
+    issue_open: true,
+    scheduler_state: 'active',
+    status: 'running',
+    attempts: 1,
+    max_attempts: 4,
+    not_before: null,
+    updated_at: now,
+    agent: 'dotacni-majak-hermes',
+    kind: 'github_root_orchestration',
+    blocker: null,
+    pr_number: null,
+  }];
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '7', paper_only: false, policy_profiles: ['default'],
+      tasks: [
+        {
+          task_id: 'parent', parent_task_id: null, parent_agent_id: null,
+          agent_id: 'herdr-parent', state: 'running', role: 'planner',
+          model: 'model-a', fallback_model: null, attempt: 1, max_attempts: 2,
+          blocker: null, fencing_token: 1, dependencies: [], result_sha: null,
+        },
+        {
+          task_id: 'child', parent_task_id: 'parent', parent_agent_id: 'herdr-parent',
+          agent_id: 'herdr-child', state: 'ready', role: 'worker',
+          model: 'model-a', fallback_model: null, attempt: 0, max_attempts: 2,
+          blocker: null, fencing_token: 2, dependencies: [], result_sha: null,
+        },
+      ],
+      edges: [{ from_task: 'parent', to_task: 'child', kind: 'parent' }],
+    }],
+  });
+  await h.refresh();
+  const html = h.get('#taskgraph-nodes').innerHTML;
+  assert.match(html, /github-majak-issue-662-swarm-test/);
+  assert.match(html, /parent/);
+  assert.match(html, /child/);
+  assert.match(html, /data-edge-kind="parent"/);
+  const tasks = h.calls.tasks.at(-1);
+  assert.equal(tasks.length, 3);
+  assert(tasks.some(row => row.task_id === 'github-majak-issue-662-swarm-test'));
+  assert(tasks.some(row => row.task_id === 'parent'));
+  assert(tasks.some(row => row.task_id === 'child'));
 });
 
 test('QuantLab swarm browser boundary rejects non-PAPER snapshots', async t => {

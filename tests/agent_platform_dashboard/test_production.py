@@ -15,7 +15,7 @@ def test_closed_snapshot_rejects_sensitive_fields():
 
 def test_unavailable_is_not_zero():
     value = decode(json.dumps(unavailable(100)).encode())
-    assert len(value['sources']) == 17
+    assert len(value['sources']) == 18
     assert all(s['status'] == 'unavailable' and s['rows'] == [] for s in value['sources'])
 
 import base64
@@ -78,7 +78,7 @@ def test_authenticated_snapshot_only_scope_and_no_collectors(tmp_path, auth, mon
     status, _, body = request(app, auth[1], '/agent-platform/api/v1/overview')
     assert status == '200 OK'
     data = json.loads(body)
-    assert len(data['sources']) == 7 and {s['profile'] for s in data['sources']} == {'majak'}
+    assert len(data['sources']) == 8 and {s['profile'] for s in data['sources']} == {'majak'}
     assert 'fixture' not in data
     assert request(app, auth[1])[0] == '200 OK'
     assert request(app, auth[1], method='POST')[0].startswith('405')
@@ -356,11 +356,11 @@ def test_queue_collect_and_staleness_are_fail_closed(tmp_path, monkeypatch):
     path.write_text(json.dumps(dict(version=2, profile='quantlab', observed_at=100, tasks=[row])))
     monkeypatch.setattr(sources, 'QUEUE_PATH', str(path))
     value = collect(config(tmp_path), 191)
-    queue_source = next(s for s in value['sources'] if s['kind'] == 'queue')
+    queue_source = next(s for s in value['sources'] if s['kind'] == 'queue' and s['profile'] == 'quantlab')
     assert queue_source['profile'] == 'quantlab' and queue_source['status'] == 'available'
     assert queue_source['observed_at'] == 100 and queue_source['rows'] == [row]
     projected = c.project(value, ('quantlab',), 191)
-    queue_source = next(s for s in projected['sources'] if s['kind'] == 'queue')
+    queue_source = next(s for s in projected['sources'] if s['kind'] == 'queue' and s['profile'] == 'quantlab')
     assert queue_source['status'] == 'unavailable' and queue_source['reason'] == 'stale'
     assert queue_source['rows'] == []
 

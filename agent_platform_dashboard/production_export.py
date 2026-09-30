@@ -52,9 +52,12 @@ def collect(config, now):
     snapshot = c.unavailable(now)
     adapters = {'router': sources.router, 'search': sources.search,
                 'kanban': sources.kanban, 'git': sources.git,
-                'tests': sources.tests, 'queue': sources.queue,
+                'tests': sources.tests,
                 'codex': sources.codex, 'admission': sources.admission,
                 'release': sources.release, 'swarm': sources.swarm}
+    queue_payload = None
+    queue_loaded = False
+    queue_load_failed = False
     for source in snapshot['sources']:
         profile, kind = source['profile'], source['kind']
         if kind == 'herdr':
@@ -76,6 +79,16 @@ def collect(config, now):
         try:
             if kind == 'herdr':
                 rows, data_at = sources.herdr(setting, profile, now)
+            elif kind == 'queue':
+                if not queue_loaded:
+                    queue_loaded = True
+                    try:
+                        queue_payload = sources.queue_payload(setting)
+                    except Exception:
+                        queue_load_failed = True
+                if queue_load_failed:
+                    raise ValueError('invalid_metadata')
+                rows, data_at = sources.queue_from_payload(queue_payload, profile)
             else:
                 rows, data_at = adapters[kind](setting, profile)
             c.need(data_at is None or data_at <= now)
@@ -95,6 +108,27 @@ def collect(config, now):
             source.update(rows=[], data_at=None, status='unavailable', reason='not_configured', board_id=None, source_epoch=None)
         except Exception:
             source.update(rows=[], data_at=None, status='unavailable', reason='source_failed', board_id=None, source_epoch=None)
+    # Queue input has its own bounded parser, but the final JSON encoding may expand
+    # non-ASCII display text. Enforce the real publication bound end-to-end so a
+    # valid near-limit queue cannot suppress the entire production snapshot.
+    try:
+        c.encode(snapshot)
+    except ValueError:
+        queue_sources = [
+            source for source in snapshot['sources']
+            if source['kind'] == 'queue' and source['status'] == 'available'
+        ]
+        if not queue_sources:
+            raise
+        for source in queue_sources:
+            source.update(
+                rows=[],
+                data_at=None,
+                status='unavailable',
+                reason='source_failed',
+            )
+        c.validate(snapshot)
+        c.encode(snapshot)
     return snapshot
 
 

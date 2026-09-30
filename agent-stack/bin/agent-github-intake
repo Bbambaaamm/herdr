@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import sys
 import time
+import urllib.error
 import urllib.request
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -15,26 +17,64 @@ RESULTS = ROOT / "results"
 STATE = ROOT / "github-intake-state.json"
 STAMP = ROOT / "github-intake.stamp"
 LOG = HOME / ".local/state/agent-stack/github-intake.log"
-REPO = "Bbambaaamm/Autonomous-Quant-Lab"
-API = f"https://api.github.com/repos/{REPO}/issues?state=open&per_page=100"
+CONFIG = Path(
+    os.environ.get(
+        "HERDR_GITHUB_INTAKE_CONFIG",
+        str(Path(__file__).resolve().parents[1] / "config/github-intake-consumers.json"),
+    )
+)
+LEGACY_REPO = "Bbambaaamm/Autonomous-Quant-Lab"
 ACTIVE_DIRS = ("pending", "running", "blocked")
 TERMINAL_DIRS = ("done", "failed")
 COOLDOWN_SECONDS = 300
+SAFE_CONSUMER = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+
 
 def now() -> datetime:
     return datetime.now(timezone.utc)
+
 
 def log(message: str) -> None:
     with LOG.open("a", encoding="utf-8") as handle:
         handle.write(f"{now().isoformat(timespec='seconds')} {message}\n")
 
+
+def state_key(repo: str, issue: int | str) -> str:
+    return f"{repo}#{int(issue)}"
+
+
+def task_repo(task: dict) -> str:
+    repo = task.get("repo")
+    if isinstance(repo, str) and repo.count("/") == 1:
+        return repo
+    return LEGACY_REPO
+
+
 def load_state() -> dict:
     if not STATE.exists():
         return {}
     try:
-        return json.loads(STATE.read_text(encoding="utf-8"))
+        raw = json.loads(STATE.read_text(encoding="utf-8"))
     except Exception:
         return {}
+    if not isinstance(raw, dict):
+        return {}
+
+    normalized: dict[str, dict] = {}
+    for key, value in raw.items():
+        if not isinstance(value, dict):
+            continue
+        text_key = str(key)
+        if "#" in text_key:
+            normalized[text_key] = value
+            continue
+        if text_key.isdigit():
+            migrated = dict(value)
+            migrated.setdefault("repo", LEGACY_REPO)
+            migrated.setdefault("issue", int(text_key))
+            normalized[state_key(LEGACY_REPO, text_key)] = migrated
+    return normalized
+
 
 def save_state(data: dict) -> None:
     tmp = STATE.with_suffix(".tmp")
@@ -42,27 +82,107 @@ def save_state(data: dict) -> None:
     os.chmod(tmp, 0o600)
     os.replace(tmp, STATE)
 
-def fetch_issues() -> list[dict]:
-    request = urllib.request.Request(
-        API,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "quantlab-herdr-intake/2",
-        },
-    )
+
+def load_consumers() -> list[dict]:
+    raw = json.loads(CONFIG.read_text(encoding="utf-8"))
+    if raw.get("schema_version") != 1 or not isinstance(raw.get("consumers"), list):
+        raise RuntimeError("invalid GitHub intake consumer registry")
+
+    enabled: list[dict] = []
+    seen_repos: set[str] = set()
+    for entry in raw["consumers"]:
+        if not isinstance(entry, dict):
+            raise RuntimeError("invalid consumer registry row")
+        consumer = str(entry.get("consumer") or "")
+        repo = str(entry.get("repository") or "")
+        mode = str(entry.get("mode") or "")
+        if not SAFE_CONSUMER.fullmatch(consumer):
+            raise RuntimeError(f"invalid consumer id: {consumer!r}")
+        if repo.count("/") != 1:
+            raise RuntimeError(f"invalid repository for {consumer}")
+        if repo in seen_repos:
+            raise RuntimeError(f"duplicate repository in intake registry: {repo}")
+        seen_repos.add(repo)
+        if mode not in {"all_open", "root_only"}:
+            raise RuntimeError(f"unsupported intake mode for {consumer}: {mode}")
+        if mode == "root_only":
+            root_issue = entry.get("root_issue")
+            if type(root_issue) is not int or root_issue <= 0:
+                raise RuntimeError(f"invalid root issue for {consumer}")
+        if entry.get("enabled") is not True:
+            continue
+        for field in (
+            "coordinator_agent",
+            "workspace",
+            "safety_profile",
+            "hermes_profile",
+        ):
+            if not str(entry.get(field) or "").strip():
+                raise RuntimeError(f"missing {field} for enabled consumer {consumer}")
+        enabled.append(entry)
+    if not enabled:
+        raise RuntimeError("no enabled GitHub intake consumers")
+    return enabled
+
+
+def request_headers() -> dict[str, str]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "herdr-github-intake/3",
+    }
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+        headers["X-GitHub-Api-Version"] = "2022-11-28"
+    return headers
+
+
+def fetch_json(url: str):
+    request = urllib.request.Request(url, headers=request_headers())
     with urllib.request.urlopen(request, timeout=15) as response:
         return json.load(response)
 
+
+def fetch_issues(consumer: dict) -> list[dict]:
+    repo = consumer["repository"]
+    mode = consumer["mode"]
+    if mode == "root_only":
+        number = int(consumer["root_issue"])
+        issue = fetch_json(f"https://api.github.com/repos/{repo}/issues/{number}")
+        if not isinstance(issue, dict):
+            raise RuntimeError(f"invalid root issue response for {repo}#{number}")
+        if issue.get("number") != number or "pull_request" in issue:
+            raise RuntimeError(f"mismatched root issue response for {repo}#{number}")
+        state = issue.get("state")
+        if state == "closed":
+            return []
+        if state != "open":
+            raise RuntimeError(f"invalid root issue state for {repo}#{number}")
+        return [issue]
+
+    issues = fetch_json(f"https://api.github.com/repos/{repo}/issues?state=open&per_page=100")
+    if not isinstance(issues, list):
+        raise RuntimeError(f"invalid GitHub issue response for {repo}")
+    return [
+        issue
+        for issue in issues
+        if isinstance(issue, dict) and "pull_request" not in issue
+    ]
+
+
 def task_index() -> dict[str, list[dict]]:
-    by_issue: dict[str, list[dict]] = defaultdict(list)
+    by_identity: dict[str, list[dict]] = defaultdict(list)
     for state_name in (*ACTIVE_DIRS, *TERMINAL_DIRS):
         directory = ROOT / state_name
         for path in directory.glob("*.json"):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 issue = data.get("issue")
-                if isinstance(issue, int) or (isinstance(issue, str) and issue.isdigit()):
-                    by_issue[str(issue)].append(
+                if isinstance(issue, int) or (
+                    isinstance(issue, str) and issue.isdigit()
+                ):
+                    key = state_key(task_repo(data), issue)
+                    by_identity[key].append(
                         {
                             "state": state_name,
                             "path": path,
@@ -72,9 +192,10 @@ def task_index() -> dict[str, list[dict]]:
                     )
             except Exception as exc:
                 log(f"task index skip {path.name}: {exc}")
-    for records in by_issue.values():
+    for records in by_identity.values():
         records.sort(key=lambda item: item["mtime"], reverse=True)
-    return by_issue
+    return by_identity
+
 
 def result_for(task_id: str) -> dict:
     path = RESULTS / f"{task_id}.json"
@@ -85,9 +206,11 @@ def result_for(task_id: str) -> dict:
     except Exception:
         return {}
 
+
 def prior_evidence(records: list[dict]) -> str:
     for record in records:
-        task_id = str(record["task"].get("id") or "")
+        task = record["task"]
+        task_id = str(task.get("id") or "")
         result = result_for(task_id)
         if result:
             compact = {
@@ -98,25 +221,77 @@ def prior_evidence(records: list[dict]) -> str:
                 "next_action": result.get("next_action"),
             }
             return json.dumps(compact, ensure_ascii=False)[:5000]
+        if record["state"] == "failed":
+            last_error = task.get("last_error")
+            if isinstance(last_error, str) and last_error.strip():
+                compact = {
+                    "previous_task": task_id,
+                    "previous_state": "failed",
+                    "summary": None,
+                    "blocker": None,
+                    "next_action": None,
+                    "last_error": last_error.strip()[:2000],
+                }
+                return json.dumps(compact, ensure_ascii=False)[:5000]
     return "none"
 
-def issue_priority(issue: dict) -> int:
+
+def issue_priority(consumer: dict, issue: dict) -> int:
+    default = int(consumer.get("priority_default", 60))
+    if consumer.get("mode") == "root_only":
+        return default
     title = str(issue.get("title") or "").strip().lower()
     if title.startswith("roadmap:"):
-        return 90
+        return max(default, 90)
     if "architecture" in title or "architektura" in title:
-        return 50
-    return 60
+        return int(consumer.get("priority_architecture", 50))
+    return default
 
-def queue_issue(issue: dict, records: list[dict]) -> str:
+
+def prompt_for(consumer: dict, issue: dict, prior: str) -> str:
     number = int(issue["number"])
-    episode = now().strftime("%Y%m%dT%H%M%SZ")
-    task_id = f"github-issue-{number}-{episode}"
     title = str(issue.get("title") or "")
     body = str(issue.get("body") or "")
     url = str(issue.get("html_url") or "")
-    prior = prior_evidence(records)
-    prompt = f"""
+    name = consumer["consumer"]
+    repo = consumer["repository"]
+
+    if name == "majak":
+        return f"""
+Continue Dotační maják root orchestration issue #{number} as ONE dependency-safe orchestration cycle.
+Issue: {title}
+URL: {url}
+
+Current root issue body:
+{body[:12000]}
+
+Prior durable evidence for this root:
+{prior}
+
+This is a control-plane root, not an ordinary flat implementation issue.
+Before acting:
+- fetch current origin/main, open PRs, open issues, docs/AGENT_HANDOFF.md, readiness/roadmap and prior durable results;
+- identify any already-running task/branch/PR so work is never duplicated;
+- choose the nearest dependency-safe critical slice based on evidence, not newest issue number.
+
+Operating model:
+- dotacni-majak-hermes is the stable cognitive parent/coordinator;
+- Herdr is the deterministic TaskGraph/admission/scheduling/recovery authority;
+- delegate bounded research/code/test/review nodes to available child agents when useful;
+- child permissions must remain a subset of this parent and consumer policy;
+- code changes use isolated clean worktrees under /home/agentops/workspaces/dotacni-majak/worktrees/;
+- preserve official-source truth, provenance, UNKNOWN != FAIL, relevance != eligibility, deterministic eligibility/finance, RAW-first ingestion, immutable versioning and fail-closed source/parser behavior;
+- merge only after tests, green consumer CI/security/dependency checks and independent review PASS on the exact unchanged PR head SHA;
+- after each merge verify the target issue is actually satisfied, update durable evidence, then replan immediately;
+- keep root #{number} open until the documented MVP, Public Beta and v1.0 completion gates are truly satisfied;
+- do not fabricate manual usability/accessibility/security evidence or GO/NO-GO decisions.
+
+Stop only for an explicit human release gate, new credential/secret, billing/paid-service decision, production deploy/irreversible action, or a blocker that bounded recovery/replan cannot safely resolve.
+Do not flatten or independently queue the full Maják backlog from this root cycle.
+""".strip()
+
+    if name == "quantlab":
+        return f"""
 Continue Autonomous Quant Lab GitHub issue #{number} as ONE bounded, dependency-safe work slice.
 Issue: {title}
 URL: {url}
@@ -139,26 +314,51 @@ Operating rules:
 - Prefer tests and evidence over broad refactors. Stop fail-closed on unclear migrations, external credentials, paid-provider requirements, or user-only decisions.
 - If the issue is already satisfied, do not invent changes: produce closure/writeback evidence instead.
 - If GitHub write authorization is the only missing step, preserve the exact local patch/branch/evidence and report blocker=github_write_auth_required; do not repeat implementation.
-"""
+""".strip()
+
+    raise RuntimeError(f"enabled consumer has no safe prompt contract: {name}")
+
+
+def queue_issue(consumer: dict, issue: dict, records: list[dict]) -> str:
+    number = int(issue["number"])
+    episode = now().strftime("%Y%m%dT%H%M%SZ")
+    task_id = f"github-{consumer['consumer']}-issue-{number}-{episode}"
+    prior = prior_evidence(records)
     task = {
         "id": task_id,
-        "kind": "github_issue_slice",
+        "kind": (
+            "github_root_orchestration"
+            if consumer.get("mode") == "root_only"
+            else "github_issue_slice"
+        ),
+        "consumer": consumer["consumer"],
         "issue": number,
-        "agent": "quantlab-hermes",
-        "priority": issue_priority(issue),
+        "repo": consumer["repository"],
+        "workspace": consumer["workspace"],
+        "safety_profile": consumer["safety_profile"],
+        "hermes_profile": consumer["hermes_profile"],
+        "coordinator_agent": consumer["coordinator_agent"],
+        "agent": consumer["coordinator_agent"],
+        "priority": issue_priority(consumer, issue),
         "not_before": now().isoformat(),
         "timeout_seconds": 1800,
         "max_attempts": 4,
         "attempts": 0,
-        "prompt": prompt.strip(),
+        "prompt": prompt_for(consumer, issue, prior),
     }
     path = PENDING / f"{task_id}.json"
     path.write_text(json.dumps(task, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.chmod(path, 0o600)
-    log(f"queued issue #{number} as {task_id} priority={task['priority']}")
+    log(
+        f"queued {consumer['repository']}#{number} as {task_id} "
+        f"priority={task['priority']} coordinator={task['agent']}"
+    )
     return task_id
 
-def intervention_blocker(records: list[dict]) -> tuple[str, str] | None:
+
+def intervention_blocker(
+    records: list[dict], *, allow_failed_replan: bool = False
+) -> tuple[str, str] | None:
     if not records:
         return None
     latest = records[0]
@@ -166,76 +366,102 @@ def intervention_blocker(records: list[dict]) -> tuple[str, str] | None:
     task_id = str(task.get("id") or "")
     result = result_for(task_id)
     blocker = str(result.get("blocker") or "")
-    if blocker in {"github_write_auth_required", "user_action_required", "agent_interactive_input_required"}:
+    if blocker in {
+        "github_write_auth_required",
+        "user_action_required",
+        "agent_interactive_input_required",
+    }:
         return task_id, blocker
-    if latest["state"] == "failed":
+    if latest["state"] == "failed" and not allow_failed_replan:
         return task_id, str(task.get("last_error") or "failed")
     return None
+
 
 def main() -> int:
     force = "--force" in sys.argv
     if not force and STAMP.exists() and time.time() - STAMP.stat().st_mtime < 300:
         return 0
 
+    consumers = load_consumers()
     previous_state = load_state()
-    issues = fetch_issues()
     indexed = task_index()
     new_state: dict[str, dict] = {}
-    seen_numbers: set[str] = set()
+    seen_keys: set[str] = set()
 
-    for issue in issues:
-        if "pull_request" in issue:
-            continue
-        number = str(issue["number"])
-        seen_numbers.add(number)
-        records = indexed.get(number, [])
-        active = [record for record in records if record["state"] in ACTIVE_DIRS]
-        current = {
-            "open": True,
-            "title": str(issue.get("title") or "")[:160],
-            "remote_updated_at": str(issue.get("updated_at") or ""),
-            "seen_at": now().isoformat(),
-        }
-
-        if active:
-            current["scheduler_state"] = "active"
-            current["task_ids"] = [str(r["task"].get("id") or "") for r in active]
-            new_state[number] = current
-            continue
-
-        blocker = intervention_blocker(records)
-        if blocker:
-            current["scheduler_state"] = "blocked"
-            current["task_id"] = blocker[0]
-            current["blocker"] = blocker[1]
-            new_state[number] = current
-            continue
-
-        latest_terminal = next((r for r in records if r["state"] in TERMINAL_DIRS), None)
-        if latest_terminal and time.time() - latest_terminal["mtime"] < COOLDOWN_SECONDS:
-            current["scheduler_state"] = "cooldown"
-            current["task_id"] = str(latest_terminal["task"].get("id") or "")
-            new_state[number] = current
-            continue
-
-        task_id = queue_issue(issue, records)
-        current["scheduler_state"] = "queued"
-        current["task_id"] = task_id
-        new_state[number] = current
-
-    for number, old in previous_state.items():
-        if number not in seen_numbers:
-            new_state[number] = {
-                "open": False,
+    for consumer in consumers:
+        issues = fetch_issues(consumer)
+        for issue in issues:
+            number = int(issue["number"])
+            repo = consumer["repository"]
+            key = state_key(repo, number)
+            seen_keys.add(key)
+            records = indexed.get(key, [])
+            active = [record for record in records if record["state"] in ACTIVE_DIRS]
+            current = {
+                "open": True,
+                "consumer": consumer["consumer"],
+                "repo": repo,
+                "issue": number,
+                "title": str(issue.get("title") or "")[:160],
+                "remote_updated_at": str(issue.get("updated_at") or ""),
                 "seen_at": now().isoformat(),
-                "closed_or_missing": True,
-                "previous_task_id": old.get("task_id"),
             }
+
+            if active:
+                current["scheduler_state"] = "active"
+                current["task_ids"] = [
+                    str(record["task"].get("id") or "") for record in active
+                ]
+                new_state[key] = current
+                continue
+
+            blocker = intervention_blocker(
+                records, allow_failed_replan=consumer.get("mode") == "root_only"
+            )
+            if blocker:
+                current["scheduler_state"] = "blocked"
+                current["task_id"] = blocker[0]
+                current["blocker"] = blocker[1]
+                new_state[key] = current
+                continue
+
+            latest_terminal = next(
+                (record for record in records if record["state"] in TERMINAL_DIRS),
+                None,
+            )
+            if (
+                latest_terminal
+                and time.time() - latest_terminal["mtime"] < COOLDOWN_SECONDS
+            ):
+                current["scheduler_state"] = "cooldown"
+                current["task_id"] = str(
+                    latest_terminal["task"].get("id") or ""
+                )
+                new_state[key] = current
+                continue
+
+            task_id = queue_issue(consumer, issue, records)
+            current["scheduler_state"] = "queued"
+            current["task_id"] = task_id
+            new_state[key] = current
+
+    for key, old in previous_state.items():
+        if key not in seen_keys:
+            closed = dict(old)
+            closed["open"] = False
+            closed["seen_at"] = now().isoformat()
+            closed["closed_or_missing"] = True
+            closed["previous_task_id"] = old.get("task_id")
+            closed.pop("task_id", None)
+            closed.pop("task_ids", None)
+            closed["scheduler_state"] = "closed"
+            new_state[key] = closed
 
     save_state(new_state)
     STAMP.touch()
     os.chmod(STAMP, 0o600)
     return 0
+
 
 if __name__ == "__main__":
     try:
