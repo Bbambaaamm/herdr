@@ -290,6 +290,47 @@ Stop only for an explicit human release gate, new credential/secret, billing/pai
 Do not flatten or independently queue the full Maják backlog from this root cycle.
 """.strip()
 
+    if name == "herdr":
+        return f"""
+Continue Herdr control-plane root issue #{number} as ONE autonomous backlog-drain orchestration cycle.
+Issue: {title}
+URL: {url}
+
+Current root issue body:
+{body[:12000]}
+
+Prior durable evidence for this root:
+{prior}
+
+This is a control-plane root for repository-wide completion, not an ordinary flat implementation issue.
+Before acting:
+- fetch the live Bbambaaamm/herdr origin/main, open PRs, open issues, CI/reviews and prior durable results;
+- identify any already-running durable task, branch or PR so work is never duplicated;
+- derive the current dependency/gate view from issue bodies, acceptance criteria and repository evidence;
+- finish or reconcile an existing dependency-safe PR before opening duplicate implementation work.
+
+Operating model:
+- quantlab-hermes is the currently deployed stable Hermes transport/coordinator for this root; repository identity and durable state remain explicitly Bbambaaamm/herdr-scoped;
+- Herdr remains the deterministic TaskGraph/admission/lease/fencing/scheduling/recovery authority;
+- execute only dependency-ready work; independent branches may be delegated concurrently only within admission/resource limits;
+- the configured task cwd is transport-only: for Herdr code, use or safely create a dedicated clean clone/worktree under /home/agentops/workspaces/herdr; never modify or repurpose the QuantLab checkout;
+- prefer the critical path and high-value blockers over newest issue number;
+- ordinary implementation choices, tests, CI fixes, review feedback and bounded replanning are autonomous work, not human gates;
+- #9 elapsed-time/soak acceptance must not globally block unrelated dependency-safe work;
+- #10 may advance provider-neutral contracts, dry-run/shadow evaluation and other no-cost scaffolding, but never activate paid services, billing or new credentials without explicit authorization;
+- for external-runtime/licensing work such as #12, prefer reversible, reproducible, fail-closed boundaries and stop only when a real external or human decision is unavoidable;
+- merge only after required tests/CI are green and independent review is valid for the exact unchanged PR head; never bypass branch/ruleset authority;
+- after merge, verify the target issue acceptance is actually satisfied before closing it, then immediately re-read the backlog and replan;
+- keep root #{number} open until all agent-compatible Herdr issues are satisfied or only genuine HUMAN/CREDENTIAL/PRIVILEGE/EXTERNAL/ACCEPTANCE gates remain.
+
+Result behavior:
+- recover/replan bounded technical failures instead of escalating them to the user;
+- if a time-based acceptance gate is the only remaining blocker, complete this orchestration cycle with precise next_action/evidence and leave the root open for a later recheck rather than fabricating PASS;
+- use a durable blocked result only for a genuine interactive authorization/credential/privilege/external blocker that cannot be safely progressed.
+
+Do not flatten all Herdr issues into independent intake tasks. The root coordinator owns dependency-safe backlog drain.
+""".strip()
+
     if name == "quantlab":
         return f"""
 Continue Autonomous Quant Lab GitHub issue #{number} as ONE bounded, dependency-safe work slice.
