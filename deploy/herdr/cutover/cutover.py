@@ -60,6 +60,13 @@ UNITS = (
 # immutable source evidence from commit d58283bc4bf98490bb96bd9bffd58b293b451061.
 # Once staging is on a marker that carries payload_manifest_sha256, upgrades use
 # the generic manifest-bound path below.
+RECOVERY_RC8_TAG = "v0.3.0-rc.8"
+RECOVERY_RC8_COMMIT = "d58283bc4bf98490bb96bd9bffd58b293b451061"
+RECOVERY_ROUTER_SOURCE_SHA256 = "a170ec52925b0631972d57ad48fe0ba51009fabc25d034915ac15fd5f6fc27a8"
+SNAPSHOT = Path("/var/lib/agent-platform/snapshot.json")
+HERDR_SOCKET = Path("/home/agentops/.config/herdr/herdr.sock")
+
+
 BOOTSTRAP_VERSIONED_UNIT_HASHES = {
     (
         "v0.3.0-rc.8",
@@ -441,7 +448,87 @@ def extract_candidate(archive: Path, destination: Path) -> Path:
     return roots[0]
 
 
-def preflight(archive: Path, expected_legacy_commit: str) -> dict[str, object]:
+def rc8_router_recovery_evidence(statuses: dict[str, str]) -> bool:
+    """Recognize only the exact fail-closed RC8 router-overflow recovery state."""
+    if not CURRENT.is_symlink():
+        return False
+    expected = RELEASES / f"{RECOVERY_RC8_TAG}-{RECOVERY_RC8_COMMIT[:12]}"
+    if CURRENT.resolve(strict=True) != expected:
+        return False
+    source = ROOT / "agent_platform_dashboard" / "production_sources.py"
+    if not source.is_file() or digest_file(source) != RECOVERY_ROUTER_SOURCE_SHA256:
+        return False
+    if statuses.get("agent-platform-web.service") not in {"failed", "inactive"}:
+        return False
+    if statuses.get("agent-platform-export.timer") != "active":
+        return False
+    if statuses.get("agent-platform-herdr.timer") != "active":
+        return False
+    if statuses.get("agent-stack-watchdog.service") != "inactive":
+        return False
+    if not HERDR_SOCKET.exists() or HERDR_SOCKET.is_symlink():
+        return False
+    try:
+        if not stat.S_ISSOCK(HERDR_SOCKET.stat().st_mode):
+            return False
+        info = os.lstat(SNAPSHOT)
+        if not stat.S_ISREG(info.st_mode) or SNAPSHOT.is_symlink() or info.st_size > 131072:
+            return False
+        snapshot = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if type(snapshot) is not dict or snapshot.get("version") != 1:
+        return False
+    generated_at = snapshot.get("generated_at")
+    if type(generated_at) not in (int, float) or type(generated_at) is bool:
+        return False
+    if not 0 <= time.time() - generated_at <= 90:
+        return False
+    sources = snapshot.get("sources")
+    if type(sources) is not list:
+        return False
+    pairs = {
+        (item.get("profile"), item.get("kind")): item
+        for item in sources
+        if type(item) is dict
+    }
+    for profile in ("majak", "quantlab"):
+        router = pairs.get((profile, "router"), {})
+        if not (
+            router.get("status") == "unavailable"
+            and router.get("reason") == "source_failed"
+            and router.get("rows") == []
+        ):
+            return False
+        herdr = pairs.get((profile, "herdr"), {})
+        if not (
+            herdr.get("status") == "available"
+            and herdr.get("reason") == "ok"
+            and type(herdr.get("rows")) is list
+            and bool(herdr["rows"])
+        ):
+            return False
+    release_source = pairs.get(("quantlab", "release"), {})
+    if not (
+        release_source.get("status") == "available"
+        and release_source.get("reason") == "ok"
+        and type(release_source.get("rows")) is list
+        and len(release_source["rows"]) == 1
+    ):
+        return False
+    row = release_source["rows"][0]
+    return (
+        row.get("tag") == RECOVERY_RC8_TAG
+        and row.get("commit") == RECOVERY_RC8_COMMIT
+    )
+
+
+def preflight(
+    archive: Path,
+    expected_legacy_commit: str,
+    *,
+    allow_degraded_rc8: bool = False,
+) -> dict[str, object]:
     release = verify_archive(archive)
     need((ROOT / "RELEASE.json").is_file() and verify_tree(ROOT) == release,
          "cutover_tool_release_mismatch")
@@ -466,11 +553,17 @@ def preflight(archive: Path, expected_legacy_commit: str) -> dict[str, object]:
         else:
             need(digest_file(path) == digest, f"unexpected_runtime_drift:{path}")
     statuses = {unit: run("/usr/bin/systemctl", "is-active", unit, check=False) for unit in UNITS}
-    need(statuses["agent-platform-web.service"] == "active"
-         and statuses["agent-platform-export.timer"] == "active"
-         and statuses["agent-platform-herdr.timer"] == "active"
-         and statuses["agent-stack-watchdog.service"] == "active",
-         "runtime_not_healthy")
+    recovery_mode = (
+        allow_degraded_rc8
+        and os.geteuid() == 0
+        and rc8_router_recovery_evidence(statuses)
+    )
+    if not recovery_mode:
+        need(statuses["agent-platform-web.service"] == "active"
+             and statuses["agent-platform-export.timer"] == "active"
+             and statuses["agent-platform-herdr.timer"] == "active"
+             and statuses["agent-stack-watchdog.service"] == "active",
+             "runtime_not_healthy")
     with tempfile.TemporaryDirectory(prefix="herdr-preflight-") as folder:
         candidate = extract_candidate(archive, Path(folder))
         comparison = compare_trees(candidate, LEGACY)
@@ -478,9 +571,14 @@ def preflight(archive: Path, expected_legacy_commit: str) -> dict[str, object]:
     if CURRENT.exists() or CURRENT.is_symlink():
         need(CURRENT.is_symlink(), "current_is_not_symlink")
         current = str(CURRENT.resolve(strict=True))
-    direct_health = http_status("http://127.0.0.1:3010/agent-platform/health")
-    public_health = http_status("https://2.28.67.165/agent-platform/health")
-    need(direct_health == "401" and public_health == "401", "auth_boundary_regressed")
+    if recovery_mode:
+        direct_health = "unavailable"
+        public_health = http_status("https://2.28.67.165/agent-platform/health")
+        need(public_health in {"502", "503"}, "recovery_public_boundary_not_fail_closed")
+    else:
+        direct_health = http_status("http://127.0.0.1:3010/agent-platform/health")
+        public_health = http_status("https://2.28.67.165/agent-platform/health")
+        need(direct_health == "401" and public_health == "401", "auth_boundary_regressed")
     return {
         "status": "preflight_ok",
         "release": release,
@@ -492,6 +590,7 @@ def preflight(archive: Path, expected_legacy_commit: str) -> dict[str, object]:
         "direct_health": direct_health,
         "public_health": public_health,
         "public_root": http_status("https://2.28.67.165/"),
+        "recovery_mode": "rc8_router_overflow" if recovery_mode else None,
     }
 
 
@@ -1448,9 +1547,224 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
         raise
 
 
+def recovery_apply(
+    archive: Path,
+    expected_legacy_commit: str,
+    confirmation: str,
+) -> dict[str, object]:
+    """Promote a reviewed candidate from the exact known-degraded RC8 state.
+
+    This mode never pretends the degraded previous release can pass a healthy
+    rollback boot. On failure it restores previous immutable authority and
+    deliberately leaves the public Agent Platform route in maintenance mode.
+    """
+    need(os.geteuid() == 0, "root_required")
+    archive = pin_archive(archive)
+    release = verify_archive(archive)
+    identifier = f"{release['tag']}-{release['commit'][:12]}"
+    need(confirmation == identifier, "confirmation_mismatch")
+    report = preflight(
+        archive,
+        expected_legacy_commit,
+        allow_degraded_rc8=True,
+    )
+    need(report.get("recovery_mode") == "rc8_router_overflow",
+         "recovery_mode_not_authorized")
+    candidate = install_candidate(archive, release)
+    need(CURRENT.is_symlink(), "current_is_not_symlink")
+    previous = CURRENT.resolve(strict=True)
+    expected_previous = RELEASES / f"{RECOVERY_RC8_TAG}-{RECOVERY_RC8_COMMIT[:12]}"
+    need(previous == expected_previous, "unexpected_recovery_previous_release")
+
+    config_digest = install_consumers(candidate, release["config_contract_sha256"])
+    hashes = expected_hashes(
+        candidate / "deploy" / "herdr" / "cutover" /
+        "legacy-quantlab-staging-01.sha256"
+    )
+    active_route = NGINX_ROUTE.read_bytes()
+    need(sha256(active_route) == hashes[NGINX_ROUTE], "nginx_route_drift")
+    root_status = http_status("https://2.28.67.165/")
+    maintenance = (
+        candidate / "deploy" / "agent_platform" / "production" /
+        "nginx-maintenance.conf.in"
+    ).read_bytes()
+    document = deployed_document(release, config_digest, int(time.time()))
+    unit_snapshots = snapshot_units()
+    previous_unit_hashes = snapshot_unit_hashes(unit_snapshots)
+    public_state_snapshot = snapshot_file(PUBLIC_STATE)
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for directory in (STATE_DIR.parent, STATE_DIR):
+        info = directory.stat()
+        need(info.st_uid == 0 and not info.st_mode & 0o077,
+             "unsafe_state_directory")
+    state_path = STATE_DIR / f"{document['deployed_at']}-{identifier}.json"
+    evidence_archive = STATE_DIR / f"{document['deployed_at']}-{identifier}.tar.gz"
+
+    switched = False
+    evidence_moved = False
+    try:
+        atomic_write(NGINX_ROUTE, maintenance, 0o644)
+        run("/usr/sbin/nginx", "-t")
+        run("/usr/bin/systemctl", "reload", "nginx")
+        wait_http_status(
+            "https://2.28.67.165/agent-platform/health",
+            "503",
+        )
+        need(http_status("https://2.28.67.165/") == root_status,
+             "public_root_changed")
+
+        run(
+            "/usr/bin/systemctl",
+            "stop",
+            "agent-platform-export.timer",
+            "agent-platform-herdr.timer",
+            "agent-stack-watchdog.service",
+            "agent-platform-web.service",
+            check=False,
+        )
+        assert_no_active_durable_worker()
+
+        install_units(
+            candidate,
+            hashes,
+            previous_hashes=previous_unit_hashes,
+        )
+        switched = True
+        switch_runtime(candidate, document)
+
+        run(
+            "/usr/bin/systemctl",
+            "start",
+            "agent-platform-herdr.timer",
+            "agent-platform-export.timer",
+        )
+
+        os.replace(archive, evidence_archive)
+        evidence_moved = True
+        state = {
+            **document,
+            "release_path": str(candidate),
+            "previous_path": str(previous),
+            "rollback_exercised": False,
+            "rollback_mode": "skipped_known_degraded_previous",
+            "recovery_mode": "rc8_router_overflow",
+            "public_root_status": root_status,
+            "archive_sha256": digest_file(evidence_archive),
+            "archive_path": str(evidence_archive),
+        }
+        atomic_write(state_path, canonical_json(state), 0o600)
+
+        atomic_write(NGINX_ROUTE, active_route, 0o644)
+        run("/usr/sbin/nginx", "-t")
+        run("/usr/bin/systemctl", "reload", "nginx")
+        wait_http_status(
+            "https://2.28.67.165/agent-platform/health",
+            "401",
+        )
+        need(http_status("https://2.28.67.165/") == root_status,
+             "public_root_changed")
+        need(CURRENT.resolve(strict=True) == candidate,
+             "final_current_mismatch")
+        start_watchdog_service()
+        return {
+            "status": "success",
+            **state,
+            "state_file": str(state_path),
+        }
+    except BaseException as original_error:
+        run(
+            "/usr/bin/systemctl",
+            "stop",
+            "agent-stack-watchdog.service",
+            "agent-platform-web.service",
+            check=False,
+        )
+        errors = run_rollback_steps([
+            ("restore_units", lambda: restore_units(unit_snapshots)),
+            (
+                "restore_current",
+                lambda: atomic_symlink(previous, CURRENT)
+                if switched else None,
+            ),
+            (
+                "restore_public_state",
+                lambda: restore_file(PUBLIC_STATE, public_state_snapshot),
+            ),
+            (
+                "daemon_reload",
+                lambda: run("/usr/bin/systemctl", "daemon-reload"),
+            ),
+            (
+                "restart_timers",
+                lambda: run(
+                    "/usr/bin/systemctl",
+                    "start",
+                    "agent-platform-herdr.timer",
+                    "agent-platform-export.timer",
+                ),
+            ),
+            (
+                "fail_closed_route",
+                lambda: atomic_write(NGINX_ROUTE, maintenance, 0o644),
+            ),
+            ("nginx_config_test", lambda: run("/usr/sbin/nginx", "-t")),
+            ("nginx_reload", lambda: run("/usr/bin/systemctl", "reload", "nginx")),
+            (
+                "public_maintenance",
+                lambda: wait_http_status(
+                    "https://2.28.67.165/agent-platform/health",
+                    "503",
+                ),
+            ),
+        ])
+        try:
+            need(CURRENT.resolve(strict=True) == previous,
+                 "recovery_rollback_current_mismatch")
+            for path, digest in previous_unit_hashes.items():
+                need(digest_file(path) == digest,
+                     f"recovery_rollback_unit_mismatch:{path.name}")
+            need(snapshot_file(PUBLIC_STATE) == public_state_snapshot,
+                 "recovery_rollback_public_state_mismatch")
+            need(digest_file(NGINX_ROUTE) == sha256(maintenance),
+                 "recovery_rollback_route_not_fail_closed")
+            need(http_status("https://2.28.67.165/") == root_status,
+                 "recovery_rollback_root_changed")
+        except BaseException as verify_error:
+            errors.append(
+                "verify_recovery_rollback:"
+                f"{type(verify_error).__name__}:{verify_error}"
+            )
+        source = evidence_archive if evidence_moved else archive
+        if source.exists():
+            failed_archive = STATE_DIR / (
+                f"{document['deployed_at']}-{identifier}.failed.tar.gz"
+            )
+            if failed_archive.exists():
+                failed_archive = STATE_DIR / (
+                    f"{document['deployed_at']}-{identifier}.failed-"
+                    f"{os.getpid()}.tar.gz"
+                )
+            os.replace(source, failed_archive)
+        if errors:
+            raise ReleaseError(
+                "recovery_deployment_failed:"
+                f"{type(original_error).__name__}:{original_error};"
+                "rollback_incomplete:" + "|".join(errors)
+            ) from original_error
+        raise ReleaseError(
+            "recovery_deployment_failed:"
+            f"{type(original_error).__name__}:{original_error};"
+            "previous_restored_fail_closed"
+        ) from original_error
+
+
 def main() -> int:
     parser = ArgumentParser()
-    parser.add_argument("mode", choices=("preflight", "apply"))
+    parser.add_argument(
+        "mode",
+        choices=("preflight", "apply", "recovery-preflight", "recovery-apply"),
+    )
     parser.add_argument("--archive", type=Path, required=True)
     parser.add_argument("--expected-legacy-commit", required=True)
     parser.add_argument("--confirm")
@@ -1459,6 +1773,21 @@ def main() -> int:
         archive = args.archive.resolve(strict=True)
         if args.mode == "preflight":
             result = preflight(archive, args.expected_legacy_commit)
+        elif args.mode == "recovery-preflight":
+            need(os.geteuid() == 0, "recovery_preflight_root_required")
+            result = preflight(
+                archive,
+                args.expected_legacy_commit,
+                allow_degraded_rc8=True,
+            )
+            need(result.get("recovery_mode") == "rc8_router_overflow",
+                 "recovery_mode_not_authorized")
+        elif args.mode == "recovery-apply":
+            result = recovery_apply(
+                archive,
+                args.expected_legacy_commit,
+                args.confirm or "",
+            )
         else:
             result = apply(archive, args.expected_legacy_commit, args.confirm or "")
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
