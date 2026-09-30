@@ -7,7 +7,7 @@ from pathlib import Path
 
 HOME = Path("/home/agentops")
 ROOT = HOME / ".local/state/agent-stack/tasks"
-OUTPUT = Path("/var/lib/agent-platform-herdr/swarm.json")
+OUTPUT = Path("/var/lib/agent-platform-herdr/agent-stack-swarm.json")
 RESULTS = ROOT / "results"
 STATES = ("running", "pending", "blocked", "failed", "done")
 STATE_RANK = {"running": 5, "pending": 4, "blocked": 3, "failed": 2, "done": 1}
