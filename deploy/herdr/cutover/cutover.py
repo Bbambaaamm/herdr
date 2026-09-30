@@ -129,6 +129,11 @@ def expected_hashes(path: Path) -> dict[Path, str]:
     return values
 
 
+def root_owned_readonly(path: Path) -> bool:
+    info = path.stat()
+    return info.st_uid == 0 and not info.st_mode & 0o022
+
+
 def current_release_unit_hashes() -> dict[Path, str]:
     """Return unit hashes bound to the currently deployed immutable release.
 
@@ -145,9 +150,7 @@ def current_release_unit_hashes() -> dict[Path, str]:
     if current == LEGACY:
         return {}
     need(current.parent == RELEASES, "unexpected_current_release")
-    current_info = current.stat()
-    need(current_info.st_uid == 0 and not current_info.st_mode & 0o022,
-         "unsafe_current_release")
+    need(root_owned_readonly(current), "unsafe_current_release")
 
     release_path = current / "RELEASE.json"
     manifest_path = current / "MANIFEST.sha256"
@@ -156,8 +159,7 @@ def current_release_unit_hashes() -> dict[Path, str]:
         (manifest_path, "unsafe_current_release_manifest"),
     ):
         need(path.is_file() and not path.is_symlink(), code)
-        info = path.stat()
-        need(info.st_uid == 0 and not info.st_mode & 0o022, code)
+        need(root_owned_readonly(path), code)
 
     try:
         document = json.loads(release_path.read_text(encoding="utf-8"))
@@ -172,6 +174,8 @@ def current_release_unit_hashes() -> dict[Path, str]:
 
     need(PUBLIC_STATE.is_file() and not PUBLIC_STATE.is_symlink(),
          "current_release_public_state_missing")
+    need(root_owned_readonly(PUBLIC_STATE),
+         "unsafe_current_release_public_state")
     try:
         public = json.loads(PUBLIC_STATE.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -190,8 +194,13 @@ def current_release_unit_hashes() -> dict[Path, str]:
          and sha256(manifest_data) == manifest_digest,
          "current_release_manifest_mismatch")
 
+    try:
+        manifest_lines = manifest_data.decode("ascii").splitlines()
+    except UnicodeError as exc:
+        raise ReleaseError("current_release_manifest_invalid") from exc
+
     bound: dict[str, str] = {}
-    for line in manifest_data.decode("ascii").splitlines():
+    for line in manifest_lines:
         digest, separator, name = line.partition("  ")
         need(bool(separator)
              and len(digest) == 64
@@ -207,8 +216,7 @@ def current_release_unit_hashes() -> dict[Path, str]:
         need(relative in bound, f"current_release_unit_unbound:{name}")
         need(source.is_file() and not source.is_symlink(),
              f"current_release_unit_missing:{name}")
-        info = source.stat()
-        need(info.st_uid == 0 and not info.st_mode & 0o022,
+        need(root_owned_readonly(source),
              f"unsafe_current_release_unit:{name}")
         need(digest_file(source) == bound[relative],
              f"current_release_unit_manifest_mismatch:{name}")
