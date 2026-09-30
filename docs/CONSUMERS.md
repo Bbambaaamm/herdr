@@ -27,6 +27,27 @@ Runtime GitHub intake consumers are declared in
 `agent-stack/config/github-intake-consumers.json`. Durable intake/task identity is scoped by
 `repository#issue` so issue numbers cannot collide across consumers.
 
+## Herdr self-hosted control root
+
+Repository: Bbambaaamm/herdr
+
+Herdr may consume its own repository backlog only through the root-only control issue `#53`.
+The root is repo-scoped durable work and must not flatten every open Herdr issue into an
+independent scheduler task. The stable coordinator reads live issues/PRs/CI/review state,
+derives the current dependency/gate view, completes the nearest dependency-safe slice and
+replans after every merge.
+
+The initial deployment reuses the already-provisioned `quantlab-hermes` Hermes transport
+with `safety_profile=herdr` and explicit `repo=Bbambaaamm/herdr` identity. Code work must
+use a dedicated Herdr clone/worktree; the QuantLab checkout is transport-only and must never
+be repurposed. A future dedicated Herdr Hermes profile may replace the transport without
+changing the root-orchestration contract.
+
+The #9 elapsed-time soak is an acceptance gate for its own dependency path, not a global
+stop signal: unrelated dependency-safe Herdr work continues while that evidence matures.
+Paid-provider activation, new credentials, production deployment and other irreversible
+external actions remain explicit gates.
+
 ## Heating
 
 Repository: Bbambaaamm/heating
