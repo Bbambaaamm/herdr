@@ -27,13 +27,6 @@ const latency = value => value == null ? 'Nedostupné' : value < 1000 ? `${fmt.f
 const age = value => Number.isFinite(value) ? `${Math.max(0, Math.floor(Date.now() / 1000 - value))} s` : 'Nedostupné';
 const queueTime = value => Number.isFinite(value) ? new Date(value * 1000).toLocaleString('cs-CZ', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—';
 const issueLabel = row => Number.isFinite(row?.issue) ? `#${row.issue}` : 'bez issue';
-const projectLabel = repo => repo === 'Bbambaaamm/dotacni-majak'
-  ? 'Maják'
-  : repo === 'Bbambaaamm/herdr'
-    ? 'Herdr'
-    : repo === GITHUB_REPO
-      ? 'QuantLab'
-      : 'Projekt';
 const agentKind = name => name.endsWith('-hermes') ? 'hermes' : 'codex';
 const statusLabel = status => STATUS[status] || STATUS.unknown;
 const toneColor = tone => ({ green: '#6adf9a', red: '#ff7159', muted: '#716d66', amber: '#e49a34' })[tone];
@@ -503,7 +496,10 @@ export function mountDashboard(createScene) {
       ? swarmTasks().find(row => row.status === 'running') || null
       : currentQueueTask();
     if (state === 'working' && task) {
-      return `${projectLabel(task.repo)} ${issueLabel(task)} · ${task.task_id} · ${QUEUE_STATUS[task.status]}.`;
+      const project = task.repo === 'Bbambaaamm/dotacni-majak' ? 'Maják'
+        : task.repo === 'Bbambaaamm/herdr' ? 'Herdr'
+        : 'QuantLab';
+      return `${project} ${issueLabel(task)} · ${task.task_id} · ${QUEUE_STATUS[task.status]}.`;
     }
     if (state === 'working' || (state === 'idle' && active.length)) return `Pracují: ${active.join(', ')}. Přesný úkol zdroj neposkytuje.`;
     if (state === 'waiting_user') {
