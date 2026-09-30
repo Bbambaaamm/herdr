@@ -263,7 +263,7 @@ export function mountDashboard(createScene) {
     const running = count('running'), waiting = count('pending'), failed = count('failed'), blockedOnly = count('blocked'), done = count('done');
     const blocked = blockedOnly + failed;
     const activeAgents = swarmSnapshot()
-      ? swarmAgents().length
+      ? swarmAgents().length + agents().filter(row => row.profile === 'majak' && row.status === 'working').length
       : agents().filter(row => row.status === 'working').length;
     const retries = queue.reduce((sum, row) => sum + (Number.isSafeInteger(row.attempts) ? Math.max(0, row.attempts - 1) : 0), 0);
     const terminal = done + failed;
@@ -473,10 +473,13 @@ export function mountDashboard(createScene) {
       const blocked = tasks.filter(row => ['blocked', 'failed'].includes(row.status));
       const majakAgents = all.filter(row => row.profile === 'majak');
       const majakQueue = queueTasks('majak');
+      const majakHerdr = source('majak', 'herdr');
       const userAttention = blocked.some(row => USER_ACTION_BLOCKERS.has(row.blocker))
         || majakAgents.some(row => row.status === 'blocked')
+        || userBlockedTasks('quantlab').length
         || userBlockedTasks('majak').length;
       if (userAttention) return 'waiting_user';
+      if (!majakHerdr || majakHerdr.status !== 'available') return tasks.length || all.length ? 'error' : 'offline';
       const working = swarmAgents().length
         || tasks.some(row => row.status === 'running')
         || majakAgents.some(row => row.status === 'working')
@@ -521,8 +524,13 @@ export function mountDashboard(createScene) {
     }
     if (state === 'working' || (state === 'idle' && active.length)) return `Pracují: ${active.join(', ')}. Přesný úkol zdroj neposkytuje.`;
     if (state === 'waiting_user') {
-      const blockedAgents = swarm ? [] : agents().filter(row => row.status === 'blocked').map(row => row.agent);
-      const blockedTasks = (swarm ? swarmTasks() : userBlockedTasks())
+      const blockedAgents = agents()
+        .filter(row => row.status === 'blocked' && (!swarm || row.profile === 'majak'))
+        .map(row => row.agent);
+      const blockerRows = swarm
+        ? [...swarmTasks(), ...userBlockedTasks()]
+        : userBlockedTasks();
+      const blockedTasks = [...new Map(blockerRows.map(row => [row.task_id, row])).values()]
         .filter(row => ['blocked', 'failed'].includes(row.status) && USER_ACTION_BLOCKERS.has(row.blocker))
         .map(row => `${issueLabel(row)} ${row.task_id}`);
       return `Zkontrolujte: ${[...blockedAgents, ...blockedTasks].join(', ') || 'blokovanou úlohu'}.`;
@@ -550,14 +558,17 @@ export function mountDashboard(createScene) {
     if (state !== lastFaceState) { sceneCall('setState', state); lastFaceState = state; }
     const liveSwarm = swarmSnapshot(), queue = liveSwarm ? taskRows() : queueTasks();
     const working = agents().filter(row => row.status === 'working');
+    const majakWorking = working.filter(row => row.profile === 'majak');
     const liveAgents = liveSwarm ? swarmAgents() : null;
     sceneCall('setActivity', {
       running: queue.filter(row => row.status === 'running').length,
       pending: queue.filter(row => row.status === 'pending').length,
       blocked: queue.filter(row => ['blocked', 'failed'].includes(row.status)).length,
       userBlocked: userBlockedTasks().length,
-      workingAgents: liveAgents ? liveAgents.length : working.length,
-      activeAgent: liveAgents ? (liveAgents[0]?.agent_id || null) : (sceneAgent(currentTask?.agent) || working[0]?.agent || null),
+      workingAgents: liveAgents ? liveAgents.length + majakWorking.length : working.length,
+      activeAgent: liveAgents
+        ? (liveAgents[0]?.agent_id || majakWorking[0]?.agent || null)
+        : (sceneAgent(currentTask?.agent) || working[0]?.agent || null),
     });
     const target = demoTarget();
     const key = `${demo}:${demoState}:${target}`;
