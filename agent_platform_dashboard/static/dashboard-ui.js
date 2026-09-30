@@ -466,6 +466,16 @@ export function mountDashboard(createScene) {
   function effectiveState() {
     if (demo) return demoState;
     if (!liveData) return 'offline';
+    const swarm = swarmSnapshot();
+    if (swarm) {
+      const tasks = swarmTasks();
+      const blocked = tasks.filter(row => ['blocked', 'failed'].includes(row.status));
+      if (blocked.some(row => USER_ACTION_BLOCKERS.has(row.blocker))) return 'waiting_user';
+      if (swarmAgents().length || tasks.some(row => row.status === 'running')) return 'working';
+      if (blocked.length) return 'waiting_result';
+      if (tasks.length && tasks.every(row => row.status === 'done')) return 'complete';
+      return 'idle';
+    }
     const all = agents(), hermes = all.filter(row => agentKind(row.agent) === 'hermes'), queued = queueTasks();
     if (all.some(row => row.status === 'blocked') || userBlockedTasks().length) return 'waiting_user';
     if (liveData.sources.some(row => row.kind === 'herdr' && row.status !== 'available')) return all.length ? 'error' : 'offline';
