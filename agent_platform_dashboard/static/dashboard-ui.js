@@ -528,14 +528,16 @@ export function mountDashboard(createScene) {
     ui.faceSignal.style.background = color; ui.faceSignal.style.color = color;
     ui.faceSignal.style.boxShadow = reduced ? 'none' : `0 0 13px ${color}`;
     if (state !== lastFaceState) { sceneCall('setState', state); lastFaceState = state; }
-    const queue = queueTasks(), working = agents().filter(row => row.status === 'working');
+    const liveSwarm = swarmSnapshot(), queue = liveSwarm ? taskRows() : queueTasks();
+    const working = agents().filter(row => row.status === 'working');
+    const liveAgents = liveSwarm ? swarmAgents() : null;
     sceneCall('setActivity', {
       running: queue.filter(row => row.status === 'running').length,
       pending: queue.filter(row => row.status === 'pending').length,
       blocked: queue.filter(row => ['blocked', 'failed'].includes(row.status)).length,
       userBlocked: userBlockedTasks().length,
-      workingAgents: working.length,
-      activeAgent: sceneAgent(currentTask?.agent) || working[0]?.agent || null,
+      workingAgents: liveAgents ? liveAgents.length : working.length,
+      activeAgent: liveAgents ? (liveAgents[0]?.agent_id || null) : (sceneAgent(currentTask?.agent) || working[0]?.agent || null),
     });
     const target = demoTarget();
     const key = `${demo}:${demoState}:${target}`;
