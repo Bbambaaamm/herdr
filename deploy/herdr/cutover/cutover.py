@@ -190,6 +190,34 @@ def current_release_unit_hashes() -> dict[Path, str]:
          and current.name == f"{document['tag']}-{document['commit'][:12]}",
          "current_release_identity_mismatch")
 
+    identity = (document["tag"], document["commit"])
+
+    # RC8 predates independently persisted manifest evidence and its public
+    # deployed marker may not be readable by the unprivileged operator running
+    # preflight. Permit this one exact bootstrap identity only through reviewed
+    # immutable unit hashes embedded in the incoming release. No other release
+    # may use this path.
+    baseline = BOOTSTRAP_VERSIONED_UNIT_HASHES.get(identity)
+    if baseline is not None:
+        need(set(baseline) == set(UNITS), "invalid_bootstrap_unit_baseline")
+        hashes: dict[Path, str] = {}
+        for name in UNITS:
+            source = current / "deploy" / "agent_platform" / "production" / f"{name}.in"
+            need(source.is_file() and not source.is_symlink(),
+                 f"current_release_unit_missing:{name}")
+            need(root_owned_readonly(source),
+                 f"unsafe_current_release_unit:{name}")
+            expected = baseline[name]
+            need(digest_file(source) == expected,
+                 f"current_release_unit_baseline_mismatch:{name}")
+            installed = UNIT_DIR / name
+            need(installed.is_file() and not installed.is_symlink(),
+                 f"runtime_unit_missing:{name}")
+            need(digest_file(installed) == expected,
+                 f"runtime_unit_bootstrap_mismatch:{name}")
+            hashes[installed] = expected
+        return hashes
+
     need(PUBLIC_STATE.is_file() and not PUBLIC_STATE.is_symlink(),
          "current_release_public_state_missing")
     need(root_owned_readonly(PUBLIC_STATE),
@@ -205,28 +233,7 @@ def current_release_unit_hashes() -> dict[Path, str]:
          and public.get("config_sha256") == document.get("config_contract_sha256"),
          "current_release_public_state_mismatch")
 
-    identity = (document["tag"], document["commit"])
     evidence_digest = public.get("payload_manifest_sha256")
-
-    # RC8 predates manifest identity in the deployed marker. Permit only the
-    # exact reviewed RC8 unit hashes embedded in this incoming immutable release.
-    if evidence_digest is None:
-        baseline = BOOTSTRAP_VERSIONED_UNIT_HASHES.get(identity)
-        need(baseline is not None, "current_release_manifest_evidence_missing")
-        need(set(baseline) == set(UNITS), "invalid_bootstrap_unit_baseline")
-        hashes: dict[Path, str] = {}
-        for name in UNITS:
-            source = current / "deploy" / "agent_platform" / "production" / f"{name}.in"
-            need(source.is_file() and not source.is_symlink(),
-                 f"current_release_unit_missing:{name}")
-            need(root_owned_readonly(source),
-                 f"unsafe_current_release_unit:{name}")
-            expected = baseline[name]
-            need(digest_file(source) == expected,
-                 f"current_release_unit_baseline_mismatch:{name}")
-            hashes[UNIT_DIR / name] = expected
-        return hashes
-
     need(isinstance(evidence_digest, str)
          and len(evidence_digest) == 64
          and all(ch in "0123456789abcdef" for ch in evidence_digest)
