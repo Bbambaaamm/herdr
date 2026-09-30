@@ -474,12 +474,15 @@ export function mountDashboard(createScene) {
       const majakAgents = all.filter(row => row.profile === 'majak');
       const majakQueue = queueTasks('majak');
       const majakHerdr = source('majak', 'herdr');
+      const majakProjected = liveData.sources.some(row => row.profile === 'majak');
       const userAttention = blocked.some(row => USER_ACTION_BLOCKERS.has(row.blocker))
         || majakAgents.some(row => row.status === 'blocked')
         || userBlockedTasks('quantlab').length
         || userBlockedTasks('majak').length;
       if (userAttention) return 'waiting_user';
-      if (!majakHerdr || majakHerdr.status !== 'available') return tasks.length || all.length ? 'error' : 'offline';
+      if (majakProjected && (!majakHerdr || majakHerdr.status !== 'available')) {
+        return tasks.length || all.length ? 'error' : 'offline';
+      }
       const working = swarmAgents().length
         || tasks.some(row => row.status === 'running')
         || majakAgents.some(row => row.status === 'working')
@@ -487,7 +490,7 @@ export function mountDashboard(createScene) {
       if (working) return 'working';
       if (blocked.length || technicalBlockedTasks('majak').length) return 'waiting_result';
       const majakOpen = majakQueue.some(row => row.status !== 'done');
-      if (tasks.length && tasks.every(row => row.status === 'done') && !majakOpen) return 'complete';
+      if (tasks.length && tasks.every(row => row.raw_state === 'done') && !majakOpen) return 'complete';
       if (majakAgents.some(row => row.status === 'idle')) return 'idle';
       return 'idle';
     }
@@ -653,9 +656,7 @@ export function mountDashboard(createScene) {
     const totalRequests = routersAvailable ? profileStats.reduce((sum, value) => sum + value.requests, 0) : null;
     const knownCost = routersAvailable ? profileStats.reduce((sum, value) => sum + value.costKnown, 0) : null;
     const unknownCostRequests = routersAvailable ? profileStats.reduce((sum, value) => sum + value.costUnknownRequests, 0) : null;
-    const activeAgents = swarmSnapshot()
-      ? swarmAgents().length
-      : agents().filter(row => row.status === 'working').length;
+    const activeAgents = swarmMetrics().activeAgents;
     const activeQueue = activeQueueTasks().length;
     const remaining = codex ? 100 - codex.used_percent : null;
     const severity = remaining == null ? 'warn' : remaining <= 5 ? 'critical' : remaining <= 25 ? 'warn' : 'ok';
