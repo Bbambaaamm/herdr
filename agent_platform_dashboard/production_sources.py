@@ -407,8 +407,8 @@ def swarm(path, profile):
     }
     scheduler_snapshot = raw['version'] == 'v1.2.0'
     agents = []
-    seen_agent_ids = set()
     seen_agent_tasks = set()
+    running_agent_ids = set()
     running_agent_tasks = set()
     for item in raw['agents']:
         c.need(type(item) is dict and set(item) <= safe_agent_fields)
@@ -416,8 +416,7 @@ def swarm(path, profile):
         task_id = item.get('task_id')
         agent_state = item.get('state')
         c.need(c.identifier(agent_id, 256) and c.identifier(task_id, 256))
-        c.need(agent_id not in seen_agent_ids and task_id not in seen_agent_tasks)
-        seen_agent_ids.add(agent_id)
+        c.need(task_id not in seen_agent_tasks)
         seen_agent_tasks.add(task_id)
         parent_task_id = item.get('parent_task_id')
         parent_agent_id = item.get('parent_agent_id')
@@ -434,7 +433,8 @@ def swarm(path, profile):
         else:
             c.need(agent_state == 'running' and task['state'] == 'running')
         if agent_state == 'running':
-            c.need(task['state'] == 'running')
+            c.need(task['state'] == 'running' and agent_id not in running_agent_ids)
+            running_agent_ids.add(agent_id)
             running_agent_tasks.add(task_id)
             agents.append({
                 'agent_id': agent_id,
