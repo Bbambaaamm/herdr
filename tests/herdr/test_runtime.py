@@ -252,6 +252,37 @@ def test_two_real_child_contract_parallel_cleanup_and_snapshot(tmp_path: Path) -
     assert registry_state["entries"] == []
 
 
+def test_long_running_children_refresh_runtime_snapshot(tmp_path: Path, monkeypatch) -> None:
+    scheduler, _, leases, prompts = _canary(tmp_path)
+    runner = FakeHerdrRunner()
+    snapshot_path = tmp_path / "swarm.json"
+    calls = []
+    original_export = scheduler.export_snapshot
+
+    def counted_export(path):
+        calls.append(time.monotonic())
+        return original_export(path)
+
+    monkeypatch.setattr(scheduler, "export_snapshot", counted_export)
+    runtime = HerdrChildRuntime(
+        scheduler,
+        runner,
+        cwd=tmp_path,
+        snapshot_path=snapshot_path,
+        env={"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1"},
+        host_guard=lambda: True,
+        admission=_admission(tmp_path),
+        admission_registry=_registry(tmp_path),
+        resource_usage_factory=_healthy_usage,
+        snapshot_heartbeat_seconds=0.01,
+    )
+    runtime.run_parallel(leases, prompts)
+
+    # Initial live snapshot + at least one in-flight heartbeat + final snapshot.
+    assert len(calls) >= 3
+    assert snapshot_path.exists()
+
+
 def test_cleanup_never_closes_unowned_parent_pane(tmp_path: Path) -> None:
     scheduler, _, leases, prompts = _canary(tmp_path)
     runner = FakeHerdrRunner()
