@@ -366,14 +366,9 @@ def test_rc8_bootstrap_accepts_only_explicit_reviewed_unit_hashes(
     document = json.loads(
         (current / "RELEASE.json").read_text(encoding="utf-8")
     )
-    marker = json.loads(
-        cutover.PUBLIC_STATE.read_text(encoding="utf-8")
-    )
-    marker.pop("payload_manifest_sha256")
-    cutover.PUBLIC_STATE.write_text(
-        json.dumps(marker),
-        encoding="utf-8",
-    )
+    # Bootstrap must work even when the unprivileged preflight operator cannot
+    # access the legacy RC8 deployed marker.
+    cutover.PUBLIC_STATE.unlink()
     identity = (document["tag"], document["commit"])
     reviewed = {
         name: expected[cutover.UNIT_DIR / name]
@@ -393,7 +388,7 @@ def test_rc8_bootstrap_accepts_only_explicit_reviewed_unit_hashes(
     )
     with pytest.raises(
         release.ReleaseError,
-        match="current_release_manifest_evidence_missing",
+        match="current_release_public_state_missing",
     ):
         cutover.current_release_unit_hashes()
 
