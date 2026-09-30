@@ -567,6 +567,48 @@ def test_collect_marks_only_swarm_unavailable_when_full_snapshot_budget_would_ov
     assert len(encoded) <= c.MAX_BYTES
 
 
+def test_swarm_runtime_snapshot_owns_primary_and_fallback_is_secondary(tmp_path, monkeypatch):
+    primary = tmp_path / 'swarm.json'
+    fallback = tmp_path / 'agent-stack-swarm.json'
+    primary_payload = swarm_payload()
+    primary_payload['observed_at'] = '195'
+    primary_payload['issue'] = '7'
+    fallback_payload = swarm_payload()
+    fallback_payload['observed_at'] = '199'
+    fallback_payload['issue'] = '48'
+    primary.write_text(json.dumps(primary_payload))
+    fallback.write_text(json.dumps(fallback_payload))
+    monkeypatch.setattr(sources, 'SWARM_PATH', str(primary))
+    monkeypatch.setattr(sources, 'SWARM_FALLBACK_PATH', str(fallback))
+
+    value = collect(config(tmp_path), 200)
+    swarm_source = next(s for s in value['sources'] if s['kind'] == 'swarm')
+    assert swarm_source['status'] == 'available'
+    assert swarm_source['observed_at'] == 195
+    assert swarm_source['rows'][0]['issue'] == '7'
+
+
+def test_swarm_fallback_is_used_only_after_runtime_primary_is_stale(tmp_path, monkeypatch):
+    primary = tmp_path / 'swarm.json'
+    fallback = tmp_path / 'agent-stack-swarm.json'
+    primary_payload = swarm_payload()
+    primary_payload['observed_at'] = '100'
+    primary_payload['issue'] = '7'
+    fallback_payload = swarm_payload()
+    fallback_payload['observed_at'] = '195'
+    fallback_payload['issue'] = '48'
+    primary.write_text(json.dumps(primary_payload))
+    fallback.write_text(json.dumps(fallback_payload))
+    monkeypatch.setattr(sources, 'SWARM_PATH', str(primary))
+    monkeypatch.setattr(sources, 'SWARM_FALLBACK_PATH', str(fallback))
+
+    value = collect(config(tmp_path), 200)
+    swarm_source = next(s for s in value['sources'] if s['kind'] == 'swarm')
+    assert swarm_source['status'] == 'available'
+    assert swarm_source['observed_at'] == 195
+    assert swarm_source['rows'][0]['issue'] == '48'
+
+
 def test_swarm_collect_and_staleness_are_fail_closed(tmp_path, monkeypatch):
     path = tmp_path / 'swarm.json'
     path.write_text(json.dumps(swarm_payload()))
@@ -580,6 +622,12 @@ def test_swarm_collect_and_staleness_are_fail_closed(tmp_path, monkeypatch):
 
     projected = c.project(value, ('quantlab',), 191)
     swarm_source = next(s for s in projected['sources'] if s['kind'] == 'swarm')
+    assert swarm_source['status'] == 'unavailable'
+    assert swarm_source['reason'] == 'stale'
+    assert swarm_source['rows'] == []
+
+    direct = collect(config(tmp_path), 191)
+    swarm_source = next(s for s in direct['sources'] if s['kind'] == 'swarm')
     assert swarm_source['status'] == 'unavailable'
     assert swarm_source['reason'] == 'stale'
     assert swarm_source['rows'] == []
