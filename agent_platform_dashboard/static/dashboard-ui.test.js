@@ -869,6 +869,10 @@ test('Majak root remains visible alongside authoritative QuantLab swarm tasks', 
     observed_at: now, data_at: now,
     rows: [{
       version: 1, repo: 'Bbambaaamm/herdr', issue: '7', paper_only: false, policy_profiles: ['default'],
+      agents: [{
+        agent_id: 'herdr-parent', task_id: 'parent', state: 'running',
+        parent_task_id: null, parent_agent_id: null, fencing_token: 1,
+      }],
       tasks: [
         {
           task_id: 'parent', parent_task_id: null, parent_agent_id: null,
