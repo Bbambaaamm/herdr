@@ -1490,18 +1490,20 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
                 "agent-stack-watchdog.service",
                 check=False,
             )
-            raise ReleaseError(
-                "deployment_failed:"
-                f"{type(original_error).__name__}:"
-                f"{original_error};"
-                "rollback_degraded_rc8_web_unavailable"
-                + (
-                    ";fail_closed_errors:"
-                    + "|".join(degraded_errors)
-                    if degraded_errors
-                    else ""
+            if degraded_errors:
+                rollback_errors.extend(
+                    [
+                        "rollback_degraded_rc8_web_unavailable",
+                        *degraded_errors,
+                    ]
                 )
-            ) from original_error
+            else:
+                raise ReleaseError(
+                    "deployment_failed:"
+                    f"{type(original_error).__name__}:"
+                    f"{original_error};"
+                    "rollback_degraded_rc8_web_unavailable"
+                ) from original_error
 
         if rollback_errors:
             # Recovery is not proven coherent. Keep the public Agent
