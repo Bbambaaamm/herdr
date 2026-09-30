@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+import json
+import os
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path("/home/agentops")
+ROOT = HOME / ".local/state/agent-stack/tasks"
+OUTPUT = Path("/var/lib/agent-platform-herdr/swarm.json")
+RESULTS = ROOT / "results"
+STATES = ("running", "pending", "blocked", "failed", "done")
+STATE_RANK = {"running": 5, "pending": 4, "blocked": 3, "failed": 2, "done": 1}
+ALLOWED_REPOS = {"Bbambaaamm/herdr", "Bbambaaamm/Autonomous-Quant-Lab"}
+AQL_REPO = "Bbambaaamm/Autonomous-Quant-Lab"
+ALLOWED_POLICY_PROFILES = {"default", "quantlab-paper"}
+IDENTIFIER = re.compile(r"^[A-Za-z0-9._/:-]{1,256}$")
+TASK_IDENTIFIER = re.compile(r"^[A-Za-z0-9._:-]{1,256}$")
+HEX_ID = re.compile(r"^[0-9a-f]{64}$")
+MAX_TASKS = 100
+MAX_EDGES = 200
+MAX_BYTES = 131072
+SNAPSHOT_RETRIES = 3
+
+
+class SnapshotRace(RuntimeError):
+    pass
+
+def now_epoch():
+    return int(datetime.now(timezone.utc).timestamp())
+
+def ident(value, limit=256):
+    return isinstance(value, str) and 0 < len(value) <= limit and bool(IDENTIFIER.fullmatch(value))
+
+
+def task_ident(value):
+    return isinstance(value, str) and bool(TASK_IDENTIFIER.fullmatch(value))
+
+def issue_text(value):
+    if type(value) is int and 0 < value < 10**9:
+        return str(value)
+    if isinstance(value, str) and ident(value, 64):
+        return value
+    raise ValueError("invalid_issue")
+
+def nonnegative_int(value, default=None):
+    if type(value) is int and 0 <= value < 2**53:
+        return value
+    if default is not None:
+        return default
+    raise ValueError("invalid_integer")
+
+def parse_stamp(value):
+    if type(value) in (int, float) and type(value) is not bool:
+        return float(value) if 0 <= float(value) < 2**53 else 0.0
+    if not isinstance(value, str) or not value:
+        return 0.0
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if parsed.tzinfo is None:
+        return 0.0
+    return parsed.astimezone(timezone.utc).timestamp()
+
+def task_stamp(raw):
+    return max(
+        parse_stamp(raw.get(key))
+        for key in ("finished_at", "completed_at", "updated_at", "attempt_started_at", "created_at", "not_before")
+    )
+
+def read_json(path):
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("task_not_object")
+    return raw
+
+def result_for(task_id, task):
+    if not task_ident(task_id):
+        raise ValueError("invalid_task_id")
+    path = RESULTS / f"{task_id}.json"
+    if not path.exists() and not path.is_symlink():
+        return {}
+    if path.is_symlink():
+        raise ValueError("result_path_escape")
+    try:
+        root = RESULTS.resolve(strict=True)
+        resolved = path.resolve(strict=True)
+    except (FileNotFoundError, RuntimeError):
+        raise ValueError("invalid_result_path") from None
+    if resolved.parent != root:
+        raise ValueError("result_path_escape")
+    raw = read_json(resolved)
+    if raw.get("task_id") != task_id:
+        raise ValueError("result_task_mismatch")
+    run_token = task.get("run_token")
+    if not ident(run_token, 128) or raw.get("run_token") != run_token:
+        raise ValueError("result_run_token_mismatch")
+    return raw
+
+
+def policy_metadata(raw, repo):
+    profile = raw.get("policy_profile")
+    safety = raw.get("safety_profile")
+    paper = raw.get("paper_only")
+    if paper is not None and type(paper) is not bool:
+        raise ValueError("invalid_paper_only")
+    if paper is False:
+        if repo == AQL_REPO:
+            raise ValueError("quantlab_non_paper")
+        raise ValueError("explicit_non_paper")
+    if profile not in (None, ""):
+        if profile not in ALLOWED_POLICY_PROFILES:
+            raise ValueError("unknown_policy_profile")
+    if repo == AQL_REPO:
+        if profile not in (None, "", "quantlab-paper"):
+            raise ValueError("quantlab_non_paper")
+        if safety not in (None, "", "quantlab"):
+            raise ValueError("quantlab_unknown_safety_profile")
+        if not (paper is True or profile == "quantlab-paper" or safety == "quantlab"):
+            raise ValueError("quantlab_non_paper")
+        return "quantlab-paper", True
+    if safety not in (None, "", "quantlab"):
+        raise ValueError("non_quantlab_safety_profile")
+    return (profile or None), paper is True or profile == "quantlab-paper"
+
+def explicit_agent_id(raw):
+    value = raw.get("agent_id")
+    if value is None:
+        session = raw.get("execution_session")
+        if isinstance(session, dict):
+            value = session.get("agent_name")
+    if value is None:
+        return None
+    if not ident(value):
+        raise ValueError("invalid_agent_id")
+    return value
+
+def optional_ident(value, limit=256):
+    if value in (None, ""):
+        return None
+    if not ident(value, limit):
+        raise ValueError("invalid_identifier")
+    return value
+
+
+def optional_task_id(value):
+    if value in (None, ""):
+        return None
+    if not task_ident(value):
+        raise ValueError("invalid_task_id")
+    return value
+
+def stable_task_json(path):
+    try:
+        before = path.stat()
+        raw = read_json(path)
+        after = path.stat()
+    except FileNotFoundError as exc:
+        raise SnapshotRace("task_moved_during_scan") from exc
+    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    if identity_before != identity_after:
+        raise SnapshotRace("task_changed_during_scan")
+    return raw
+
+
+def state_inventory():
+    inventory = {}
+    for state in STATES:
+        folder = ROOT / state
+        if not folder.is_dir():
+            inventory[state] = ()
+            continue
+        inventory[state] = tuple(sorted(path.name for path in folder.glob("*.json")))
+    return inventory
+
+
+def _load_records_once():
+    before_inventory = state_inventory()
+    records = []
+    seen = set()
+    for state in STATES:
+        folder = ROOT / state
+        if not folder.is_dir():
+            continue
+        for path in sorted(folder.glob("*.json")):
+            raw = stable_task_json(path)
+            repo = raw.get("repo")
+            if repo not in ALLOWED_REPOS:
+                continue
+            task_id = raw.get("id")
+            if not task_ident(task_id):
+                raise ValueError("invalid_task_id")
+            issue = issue_text(raw.get("issue"))
+            identity = (repo, issue, task_id)
+            if identity in seen:
+                raise SnapshotRace("task_moved_during_scan")
+            seen.add(identity)
+            policy_metadata(raw, repo)
+            records.append({
+                "state": state,
+                "raw": raw,
+                "task_id": task_id,
+                "repo": repo,
+                "issue": issue,
+                "stamp": task_stamp(raw),
+            })
+    if state_inventory() != before_inventory:
+        raise SnapshotRace("task_directory_changed_during_scan")
+    return records
+
+
+def load_records():
+    last_race = None
+    for _attempt in range(SNAPSHOT_RETRIES):
+        try:
+            return _load_records_once()
+        except SnapshotRace as exc:
+            last_race = exc
+    raise ValueError("unstable_snapshot") from last_race
+
+def select_group(records):
+    if not records:
+        raise ValueError("no_materializable_tasks")
+    groups = {}
+    for record in records:
+        groups.setdefault((record["repo"], record["issue"]), []).append(record)
+    def score(item):
+        key, rows = item
+        rank = max(STATE_RANK[row["state"]] for row in rows)
+        stamp = max(row["stamp"] for row in rows)
+        return (rank, stamp, key[0], key[1])
+    return max(groups.items(), key=score)
+
+def bounded_history(records):
+    if len(records) <= MAX_TASKS:
+        return records
+    by_id = {record["task_id"]: record for record in records}
+    neighbors = {task_id: set() for task_id in by_id}
+    for record in records:
+        raw = record["raw"]
+        refs = []
+        parent = raw.get("parent_task_id")
+        if isinstance(parent, str):
+            refs.append(parent)
+        dependencies = raw.get("dependencies")
+        if isinstance(dependencies, list):
+            refs.extend(dep for dep in dependencies if isinstance(dep, str))
+        for ref in refs:
+            if ref in by_id:
+                neighbors[record["task_id"]].add(ref)
+                neighbors[ref].add(record["task_id"])
+
+    components = []
+    unseen = set(by_id)
+    while unseen:
+        seed = min(unseen)
+        stack = [seed]
+        component_ids = set()
+        while stack:
+            task_id = stack.pop()
+            if task_id in component_ids:
+                continue
+            component_ids.add(task_id)
+            unseen.discard(task_id)
+            stack.extend(sorted(neighbors[task_id] - component_ids, reverse=True))
+        components.append([by_id[task_id] for task_id in sorted(component_ids)])
+
+    def score(component):
+        return (
+            max(STATE_RANK[row["state"]] for row in component),
+            max(row["stamp"] for row in component),
+            max(row["task_id"] for row in component),
+        )
+
+    retained = []
+    for component in sorted(components, key=score, reverse=True):
+        if len(component) > MAX_TASKS:
+            if not retained:
+                raise ValueError("current_graph_too_large")
+            break
+        if len(retained) + len(component) > MAX_TASKS:
+            break
+        retained.extend(component)
+    if not retained:
+        raise ValueError("no_materializable_tasks")
+    return retained
+
+
+def sanitized_blocker(raw, result, state):
+    if state == "done":
+        return None
+    values = (
+        (result.get("blocker"), raw.get("blocker"), raw.get("watchdog_blocker"))
+        if state in ("blocked", "failed")
+        else (raw.get("watchdog_blocker"), raw.get("blocker"), result.get("blocker"))
+    )
+    for value in values:
+        if isinstance(value, str) and ident(value, 128):
+            return value
+    return None
+
+def model_fields(raw):
+    routing = raw.get("routing")
+    if not isinstance(routing, dict):
+        return None, None
+    model = routing.get("model")
+    fallback = routing.get("fallback_model")
+    return (
+        model if isinstance(model, str) and ident(model, 128) else None,
+        fallback if isinstance(fallback, str) and ident(fallback, 128) else None,
+    )
+
+def ensure_acyclic(task_ids, edge_keys):
+    adjacency = {task_id: set() for task_id in task_ids}
+    indegree = {task_id: 0 for task_id in task_ids}
+    for left, right, _kind in edge_keys:
+        if left == right:
+            raise ValueError("cyclic_graph")
+        if right not in adjacency[left]:
+            adjacency[left].add(right)
+            indegree[right] += 1
+    ready = sorted(task_id for task_id, degree in indegree.items() if degree == 0)
+    visited = 0
+    while ready:
+        current = ready.pop(0)
+        visited += 1
+        for child in sorted(adjacency[current]):
+            indegree[child] -= 1
+            if indegree[child] == 0:
+                ready.append(child)
+                ready.sort()
+    if visited != len(task_ids):
+        raise ValueError("cyclic_graph")
+
+
+def materialize(records, observed_at=None):
+    (repo, issue), selected = select_group(records)
+    selected = bounded_history(selected)
+    ids = {row["task_id"] for row in selected}
+    tasks = []
+    agents = []
+    agent_ids = set()
+    edge_keys = set()
+    paper_flags = []
+    for record in sorted(selected, key=lambda row: row["task_id"]):
+        raw = record["raw"]
+        result = result_for(record["task_id"], raw)
+        deps = raw.get("dependencies", [])
+        if not isinstance(deps, list) or len(deps) > 64 or len(set(deps)) != len(deps):
+            raise ValueError("invalid_dependencies")
+        if not all(task_ident(dep) and dep in ids for dep in deps):
+            raise ValueError("dangling_dependency")
+        parent_task = optional_task_id(raw.get("parent_task_id"))
+        if parent_task is not None and parent_task not in ids:
+            raise ValueError("dangling_parent")
+        parent_agent = optional_ident(raw.get("parent_agent_id"))
+        agent_id = explicit_agent_id(raw)
+        role = raw.get("role") or raw.get("kind") or "task"
+        if not ident(role, 64):
+            role = "task"
+        attempts = nonnegative_int(raw.get("attempts", 0), 0)
+        max_attempts = nonnegative_int(raw.get("max_attempts", 1), 1)
+        if attempts > max_attempts:
+            raise ValueError("attempts_exceed_max")
+        model, fallback = model_fields(raw)
+        task = {
+            "task_id": record["task_id"],
+            "state": record["state"],
+            "role": role,
+            "dependencies": list(deps),
+            "attempts": attempts,
+            "max_attempts": max_attempts,
+        }
+        for key, value in (
+            ("parent_task_id", parent_task),
+            ("parent_agent_id", parent_agent),
+            ("agent_id", agent_id),
+            ("model", model),
+            ("fallback_model", fallback),
+            ("blocker", sanitized_blocker(raw, result, record["state"])),
+        ):
+            if value is not None:
+                task[key] = value
+        token = raw.get("fencing_token")
+        if type(token) is int and 0 <= token < 2**53:
+            task["fencing_token"] = token
+        result_sha = raw.get("result_sha", result.get("result_sha"))
+        if result_sha not in (None, ""):
+            if not isinstance(result_sha, str) or not HEX_ID.fullmatch(result_sha):
+                raise ValueError("invalid_result_sha")
+            task["result_sha"] = result_sha
+        profile, task_paper = policy_metadata(raw, repo)
+        if profile is not None:
+            task["policy_profile"] = profile
+        task["paper_only"] = task_paper
+        paper_flags.append(task_paper)
+        tasks.append(task)
+        if parent_task is not None:
+            edge_keys.add((parent_task, record["task_id"], "parent"))
+        for dep in deps:
+            edge_keys.add((dep, record["task_id"], "dependency"))
+        if record["state"] == "running" and agent_id is not None:
+            if agent_id in agent_ids:
+                raise ValueError("duplicate_agent_id")
+            agent_ids.add(agent_id)
+            agent = {"agent_id": agent_id, "task_id": record["task_id"], "state": "running"}
+            if parent_agent is not None:
+                agent["parent_agent_id"] = parent_agent
+            if parent_task is not None:
+                agent["parent_task_id"] = parent_task
+            if "fencing_token" in task:
+                agent["fencing_token"] = task["fencing_token"]
+            agents.append(agent)
+    if len(edge_keys) > MAX_EDGES:
+        raise ValueError("too_many_edges")
+    ensure_acyclic(ids, edge_keys)
+    edges = [{"from": left, "to": right, "kind": kind} for left, right, kind in sorted(edge_keys)]
+    return {
+        "version": 1,
+        "repo": repo,
+        "issue": issue,
+        "observed_at": now_epoch() if observed_at is None else nonnegative_int(observed_at),
+        "paper_only": bool(tasks) and all(paper_flags),
+        "agents": agents,
+        "tasks": tasks,
+        "edges": edges,
+    }
+
+def publish(payload):
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+    encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    if len(encoded) > MAX_BYTES:
+        raise ValueError("snapshot_too_large")
+    temporary = OUTPUT.with_name(f".{OUTPUT.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_bytes(encoded)
+        os.chmod(temporary, 0o640)
+        os.replace(temporary, OUTPUT)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def main():
+    records = load_records()
+    if not records:
+        return 0
+    payload = materialize(records)
+    publish(payload)
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
