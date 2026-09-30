@@ -53,6 +53,11 @@ class SwarmExportTests(unittest.TestCase):
         task.update(overrides)
         return task
 
+    def test_default_materializer_output_never_aliases_runtime_scheduler_snapshot(self):
+        fresh = load_module()
+        self.assertEqual(fresh.OUTPUT, Path(sources.SWARM_FALLBACK_PATH))
+        self.assertNotEqual(fresh.OUTPUT, Path(sources.SWARM_PATH))
+
     def test_terminal_only_is_fresh_and_has_zero_active_agents(self):
         self.write_task("done", self.herdr_task(result_sha="a" * 64))
         records = self.exporter.load_records()
