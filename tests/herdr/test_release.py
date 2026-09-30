@@ -426,6 +426,123 @@ def test_rc8_bootstrap_rejects_installed_unit_not_matching_baseline(
         cutover.current_release_unit_hashes()
 
 
+def test_rc8_router_recovery_evidence_is_exact_and_fail_closed(
+    monkeypatch,
+    tmp_path,
+):
+    releases = tmp_path / "releases"
+    releases.mkdir()
+    previous = releases / (
+        f"{cutover.RECOVERY_RC8_TAG}-"
+        f"{cutover.RECOVERY_RC8_COMMIT[:12]}"
+    )
+    previous.mkdir()
+    current = tmp_path / "current"
+    current.symlink_to(previous)
+
+    root = tmp_path / "candidate"
+    source = root / "agent_platform_dashboard" / "production_sources.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("reviewed top50 adapter\n", encoding="utf-8")
+
+    snapshot = tmp_path / "snapshot.json"
+    now = int(cutover.time.time())
+    sources = []
+    for profile in ("majak", "quantlab"):
+        sources.append({
+            "profile": profile,
+            "kind": "router",
+            "status": "unavailable",
+            "reason": "source_failed",
+            "rows": [],
+        })
+        sources.append({
+            "profile": profile,
+            "kind": "herdr",
+            "status": "available",
+            "reason": "ok",
+            "rows": [{"agent": f"{profile}-hermes", "status": "idle"}],
+        })
+    sources.append({
+        "profile": "quantlab",
+        "kind": "release",
+        "status": "available",
+        "reason": "ok",
+        "rows": [{
+            "tag": cutover.RECOVERY_RC8_TAG,
+            "commit": cutover.RECOVERY_RC8_COMMIT,
+        }],
+    })
+    snapshot.write_text(
+        json.dumps({
+            "version": 1,
+            "generated_at": now,
+            "sources": sources,
+        }),
+        encoding="utf-8",
+    )
+
+    socket_path = tmp_path / "herdr.sock"
+    import socket as socket_module
+    sock = socket_module.socket(socket_module.AF_UNIX)
+    sock.bind(str(socket_path))
+
+    monkeypatch.setattr(cutover, "RELEASES", releases)
+    monkeypatch.setattr(cutover, "CURRENT", current)
+    monkeypatch.setattr(cutover, "ROOT", root)
+    monkeypatch.setattr(cutover, "SNAPSHOT", snapshot)
+    monkeypatch.setattr(cutover, "HERDR_SOCKET", socket_path)
+    original_digest = cutover.digest_file
+    monkeypatch.setattr(
+        cutover,
+        "digest_file",
+        lambda path: (
+            cutover.RECOVERY_ROUTER_SOURCE_SHA256
+            if path == source
+            else original_digest(path)
+        ),
+    )
+
+    statuses = {
+        "agent-platform-web.service": "failed",
+        "agent-platform-export.timer": "active",
+        "agent-platform-herdr.timer": "active",
+        "agent-stack-watchdog.service": "inactive",
+    }
+
+    try:
+        assert cutover.rc8_router_recovery_evidence(statuses)
+        bad = dict(statuses)
+        bad["agent-stack-watchdog.service"] = "active"
+        assert not cutover.rc8_router_recovery_evidence(bad)
+
+        document = json.loads(snapshot.read_text(encoding="utf-8"))
+        document["sources"][0]["reason"] = "stale"
+        snapshot.write_text(json.dumps(document), encoding="utf-8")
+        assert not cutover.rc8_router_recovery_evidence(statuses)
+    finally:
+        sock.close()
+
+
+def test_recovery_apply_is_explicit_and_never_claims_rollback_exercise():
+    source = Path("deploy/herdr/cutover/cutover.py").read_text(
+        encoding="utf-8"
+    )
+    recovery = source.split("def recovery_apply(", 1)[1].split(
+        "def main()",
+        1,
+    )[0]
+
+    assert '"rollback_exercised": False' in recovery
+    assert '"rollback_mode": "skipped_known_degraded_previous"' in recovery
+    assert '"recovery_mode": "rc8_router_overflow"' in recovery
+    assert '"fail_closed_route"' in recovery
+    assert "start_watchdog_service()" in recovery
+    assert recovery.index(
+        'wait_http_status(\n            "https://2.28.67.165/agent-platform/health",\n            "401",'
+    ) < recovery.index("start_watchdog_service()")
+
+
 def test_agent_stack_runtime_chain_is_release_relative():
     dispatcher = Path(
         "agent-stack/bin/agent-task-dispatcher"
