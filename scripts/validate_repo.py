@@ -11,6 +11,7 @@ required = [
     "configs/consumers/quantlab.yaml",
     "configs/consumers/majak.yaml",
     "configs/consumers/heating.yaml",
+    "configs/consumers/herdr.yaml",
     "provenance/source-capture-20260926.txt",
     "provenance/external-runtime-dependency.txt",
     "provenance/quantlab-lineage/LINEAGE.json",

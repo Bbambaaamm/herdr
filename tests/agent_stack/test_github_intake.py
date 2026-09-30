@@ -71,8 +71,24 @@ class GitHubIntakeTests(unittest.TestCase):
             "workspace": "/home/agentops/workspaces/dotacni-majak",
             "safety_profile": "dotacni-majak",
             "hermes_profile": "majak",
-            "priority_default": 10,
-            "priority_architecture": 10,
+            "priority_default": 60,
+            "priority_architecture": 60,
+        }
+
+    @staticmethod
+    def herdr_consumer():
+        return {
+            "consumer": "herdr",
+            "enabled": True,
+            "repository": "Bbambaaamm/herdr",
+            "mode": "root_only",
+            "root_issue": 53,
+            "coordinator_agent": "herdr-hermes",
+            "workspace": "/home/agentops/workspaces/herdr",
+            "safety_profile": "herdr-core",
+            "hermes_profile": "quantlab",
+            "priority_default": 60,
+            "priority_architecture": 60,
         }
 
     def test_load_state_migrates_legacy_quantlab_keys(self):
@@ -105,7 +121,7 @@ class GitHubIntakeTests(unittest.TestCase):
         self.assertEqual(len(indexed["Bbambaaamm/Autonomous-Quant-Lab#45"]), 1)
         self.assertEqual(len(indexed["Bbambaaamm/dotacni-majak#45"]), 1)
 
-    def test_registry_enables_quantlab_and_majak_but_not_disabled_heating(self):
+    def test_registry_enables_quantlab_majak_and_herdr_but_not_disabled_heating(self):
         heating = {
             "consumer": "heating",
             "enabled": False,
@@ -116,9 +132,25 @@ class GitHubIntakeTests(unittest.TestCase):
             "safety_profile": "heating-safe-engineering",
             "hermes_profile": "heating",
         }
-        self.write_config([self.quantlab_consumer(), self.majak_consumer(), heating])
+        self.write_config(
+            [self.quantlab_consumer(), self.majak_consumer(), self.herdr_consumer(), heating]
+        )
         consumers = self.intake.load_consumers()
-        self.assertEqual([row["consumer"] for row in consumers], ["quantlab", "majak"])
+        self.assertEqual(
+            [row["consumer"] for row in consumers], ["quantlab", "majak", "herdr"]
+        )
+
+    def test_root_consumers_do_not_outrank_quantlab_default_work(self):
+        quant = self.quantlab_consumer()
+        for root in (self.majak_consumer(), self.herdr_consumer()):
+            self.assertGreaterEqual(
+                root["priority_default"],
+                quant["priority_default"],
+            )
+            self.assertGreaterEqual(
+                root["priority_architecture"],
+                quant["priority_default"],
+            )
 
     def test_registry_fails_closed_on_duplicate_repository(self):
         duplicate = self.majak_consumer()
@@ -163,6 +195,51 @@ class GitHubIntakeTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     self.intake.fetch_issues(self.majak_consumer())
 
+    def test_herdr_root_fetch_targets_only_53(self):
+        seen = []
+
+        def fake_fetch(url):
+            seen.append(url)
+            return {
+                "number": 53,
+                "state": "open",
+                "title": "HERDR CONTROL: autonomous backlog drain",
+                "html_url": "https://github.com/Bbambaaamm/herdr/issues/53",
+                "body": "root",
+            }
+
+        self.intake.fetch_json = fake_fetch
+        issues = self.intake.fetch_issues(self.herdr_consumer())
+        self.assertEqual([row["number"] for row in issues], [53])
+        self.assertEqual(
+            seen,
+            ["https://api.github.com/repos/Bbambaaamm/herdr/issues/53"],
+        )
+
+    def test_queue_herdr_root_carries_backlog_drain_contract(self):
+        issue = {
+            "number": 53,
+            "title": "HERDR CONTROL: autonomous backlog drain",
+            "body": "Drain Herdr safely",
+            "html_url": "https://github.com/Bbambaaamm/herdr/issues/53",
+        }
+        task_id = self.intake.queue_issue(self.herdr_consumer(), issue, [])
+        task = json.loads((self.intake.PENDING / f"{task_id}.json").read_text())
+        self.assertTrue(task_id.startswith("github-herdr-issue-53-"))
+        self.assertEqual(task["kind"], "github_root_orchestration")
+        self.assertEqual(task["repo"], "Bbambaaamm/herdr")
+        self.assertEqual(task["workspace"], "/home/agentops/workspaces/herdr")
+        self.assertEqual(task["safety_profile"], "herdr-core")
+        self.assertEqual(task["hermes_profile"], "quantlab")
+        self.assertEqual(task["agent"], "herdr-hermes")
+        self.assertEqual(task["coordinator_agent"], "herdr-hermes")
+        self.assertEqual(task["priority"], 60)
+        self.assertIn("autonomous backlog-drain", task["prompt"])
+        self.assertIn("ACCEPTANCE_GATE", task["prompt"])
+        self.assertIn("Do not flatten", task["prompt"])
+        self.assertIn("/home/agentops/worktrees/herdr/", task["prompt"])
+        self.assertNotIn("/home/agentops/workspaces/herdr/worktrees/", task["prompt"])
+
     def test_queue_majak_root_carries_explicit_consumer_identity(self):
         issue = {
             "number": 662,
@@ -180,7 +257,7 @@ class GitHubIntakeTests(unittest.TestCase):
         self.assertEqual(task["hermes_profile"], "majak")
         self.assertEqual(task["agent"], "dotacni-majak-hermes")
         self.assertEqual(task["coordinator_agent"], "dotacni-majak-hermes")
-        self.assertEqual(task["priority"], 10)
+        self.assertEqual(task["priority"], 60)
         self.assertIn("control-plane root", task["prompt"])
         self.assertIn("Do not flatten", task["prompt"])
 

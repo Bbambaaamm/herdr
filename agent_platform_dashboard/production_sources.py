@@ -322,9 +322,10 @@ def swarm(path, profile):
     c.need(profile == 'quantlab' and path in (SWARM_PATH, SWARM_FALLBACK_PATH))
     raw = c.parse(read(path, c.MAX_BYTES), c.MAX_BYTES)
     required = {'tasks', 'edges', 'agents', 'repo', 'issue', 'observed_at', 'version', 'paper_only'}
-    canonical = required | {'policy_profiles', 'graph_latency', 'clock_snapshot', 'ts'}
-    c.need(type(raw) is dict and set(raw) in (required, canonical))
-    c.need((raw['version'] == 1 and set(raw) == required)
+    fallback_with_policy = required | {'policy_profiles'}
+    canonical = fallback_with_policy | {'graph_latency', 'clock_snapshot', 'ts'}
+    c.need(type(raw) is dict and set(raw) in (required, fallback_with_policy, canonical))
+    c.need((raw['version'] == 1 and set(raw) in (required, fallback_with_policy))
            or (raw['version'] == 'v1.2.0' and set(raw) == canonical))
     c.need(type(raw['paper_only']) is bool)
     c.need(type(raw['repo']) is str and c.identifier(raw['repo'], 160))

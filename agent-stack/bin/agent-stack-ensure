@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -14,6 +15,8 @@ STATE = HOME / ".local/state/agent-stack"
 LOG = STATE / "ensure.log"
 HERDR_BOOT_LOG = STATE / "herdr-autostart.log"
 DC_BOOT_LOG = STATE / "desktop-commander-autostart.log"
+CHECKOUT_CLONE_TIMEOUT_SECONDS = 60
+AGENT_START_TIMEOUT_SECONDS = 70
 
 ENV = os.environ.copy()
 ENV["HOME"] = str(HOME)
@@ -48,9 +51,19 @@ DESIRED = [
             {"tab": "Hermes", "name": "dotacni-majak-hermes", "kind": "hermes", "args": ["-p", "majak", "chat"]},
         ],
     },
+    {
+        "label": "Herdr",
+        "cwd": str(HOME / "workspaces/herdr"),
+        "repository": "Bbambaaamm/herdr",
+        "repo_url": "https://github.com/Bbambaaamm/herdr.git",
+        "agents": [
+            {"tab": "Codex", "name": "herdr-codex", "kind": "codex", "args": []},
+            # Runtime-compatible Hermes model/tool wiring; repository authority
+            # is supplied independently by the herdr-core task policy.
+            {"tab": "Hermes", "name": "herdr-hermes", "kind": "hermes", "args": ["-p", "quantlab", "chat"]},
+        ],
+    },
 ]
-
-STATE.mkdir(parents=True, exist_ok=True)
 
 def log(message):
     line = f"{datetime.now().isoformat(timespec='seconds')} {message}"
@@ -66,6 +79,93 @@ def run(args, timeout=30):
         timeout=timeout,
         env=ENV,
     )
+
+def _normalized_origin(value):
+    value = str(value or "").strip().rstrip("/")
+    return value[:-4] if value.endswith(".git") else value
+
+
+def _origin_allowed(origin, repository, repo_url):
+    expected = {
+        _normalized_origin(repo_url),
+        _normalized_origin(f"https://github.com/{repository}"),
+        _normalized_origin(f"git@github.com:{repository}"),
+        _normalized_origin(f"ssh://git@github.com/{repository}"),
+    }
+    return _normalized_origin(origin) in expected
+
+
+def _verify_repo_checkout(path, repository, repo_url):
+    inside = run(
+        ["/usr/bin/git", "-C", path, "rev-parse", "--is-inside-work-tree"],
+        timeout=10,
+    )
+    fetch_proc = run(
+        ["/usr/bin/git", "-C", path, "remote", "get-url", "--all", "origin"],
+        timeout=10,
+    )
+    push_proc = run(
+        ["/usr/bin/git", "-C", path, "remote", "get-url", "--push", "--all", "origin"],
+        timeout=10,
+    )
+    head = run(
+        ["/usr/bin/git", "-C", path, "rev-parse", "--verify", "HEAD"],
+        timeout=10,
+    )
+    fetch_urls = [line.strip() for line in (fetch_proc.stdout or "").splitlines() if line.strip()]
+    push_urls = [line.strip() for line in (push_proc.stdout or "").splitlines() if line.strip()]
+    urls_ok = (
+        bool(fetch_urls)
+        and bool(push_urls)
+        and all(_origin_allowed(url, repository, repo_url) for url in fetch_urls)
+        and all(_origin_allowed(url, repository, repo_url) for url in push_urls)
+    )
+    if (
+        inside.returncode != 0
+        or (inside.stdout or "").strip() != "true"
+        or fetch_proc.returncode != 0
+        or push_proc.returncode != 0
+        or not urls_ok
+        or head.returncode != 0
+    ):
+        reported = ",".join(fetch_urls + push_urls) or "unavailable"
+        raise RuntimeError(
+            f"Workspace {path} checkout invalid or origin mismatch: {reported}"
+        )
+
+
+def ensure_repo_checkout(cwd, repository, repo_url):
+    path = Path(cwd)
+    git_dir = path / ".git"
+    if git_dir.exists():
+        _verify_repo_checkout(path, repository, repo_url)
+        log(f"Workspace checkout {repository}: present")
+        return
+
+    if path.exists() and any(path.iterdir()):
+        raise RuntimeError(f"Workspace {path} is non-empty but is not a git checkout")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / f".{path.name}.clone-{os.getpid()}"
+    shutil.rmtree(temporary, ignore_errors=True)
+    try:
+        proc = run(
+            [
+                "/usr/bin/git", "clone", "--depth", "1", "--no-tags",
+                "--origin", "origin", "--", repo_url, temporary,
+            ],
+            timeout=CHECKOUT_CLONE_TIMEOUT_SECONDS,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout or "git clone failed").strip())
+        _verify_repo_checkout(temporary, repository, repo_url)
+        if path.exists():
+            path.rmdir()
+        os.replace(temporary, path)
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+    log(f"Workspace checkout {repository}: cloned")
+
 
 def parse_json_output(proc):
     if proc.returncode != 0:
@@ -212,16 +312,19 @@ def ensure_agent(workspace_id, spec):
     ]
     if spec["args"]:
         cmd += ["--", *spec["args"]]
-    proc = run(cmd, timeout=70)
+    proc = run(cmd, timeout=AGENT_START_TIMEOUT_SECONDS)
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or proc.stdout).strip())
     log(f"{spec['name']}: restored in {pane}")
 
 def main():
+    STATE.mkdir(parents=True, exist_ok=True)
     log("=== ensure start ===")
     ensure_desktop_commander()
     ensure_herdr_server()
     for group in DESIRED:
+        if group.get("repository"):
+            ensure_repo_checkout(group["cwd"], group["repository"], group["repo_url"])
         wid = ensure_workspace(group["label"], group["cwd"])
         ensure_tabs(wid, group["cwd"], [spec["tab"] for spec in group["agents"]])
         for spec in group["agents"]:

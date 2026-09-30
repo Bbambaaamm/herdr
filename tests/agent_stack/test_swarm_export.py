@@ -282,6 +282,24 @@ class SwarmExportTests(unittest.TestCase):
         self.assertEqual(payload["tasks"][0]["policy_profile"], "quantlab-paper")
         self.assertTrue(payload["tasks"][0]["paper_only"])
 
+    def test_herdr_core_safety_profile_is_materialized_as_non_paper(self):
+        self.write_task(
+            "pending",
+            self.herdr_task(
+                "herdr-root",
+                safety_profile="herdr-core",
+                paper_only=False,
+            ),
+        )
+        payload = self.exporter.materialize(
+            self.exporter.load_records(),
+            observed_at=100,
+        )
+        self.assertFalse(payload["paper_only"])
+        self.assertEqual(payload["policy_profiles"], ["herdr-core"])
+        self.assertEqual(payload["tasks"][0]["policy_profile"], "herdr-core")
+        self.assertFalse(payload["tasks"][0]["paper_only"])
+
     def test_non_quantlab_safety_profile_is_excluded_from_quantlab_swarm(self):
         for safety_profile in ("dotacni-majak", "heating"):
             with self.subTest(safety_profile=safety_profile):

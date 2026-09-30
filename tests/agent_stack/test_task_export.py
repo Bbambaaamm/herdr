@@ -114,6 +114,38 @@ class TaskExportTests(unittest.TestCase):
         self.assertEqual(rows["majak-45"]["repo"], "Bbambaaamm/dotacni-majak")
         self.assertEqual(rows["majak-45"]["agent"], "dotacni-majak-hermes")
 
+    def test_herdr_root_is_exported_with_repo_scoped_identity(self):
+        self.exporter.INTAKE.write_text(
+            json.dumps({
+                "Bbambaaamm/herdr#53": {
+                    "open": True,
+                    "repo": "Bbambaaamm/herdr",
+                    "issue": 53,
+                    "title": "HERDR CONTROL: autonomous backlog drain",
+                    "scheduler_state": "active",
+                }
+            }),
+            encoding="utf-8",
+        )
+        task = {
+            "id": "github-herdr-issue-53-test",
+            "repo": "Bbambaaamm/herdr",
+            "issue": 53,
+            "agent": "herdr-hermes",
+            "kind": "github_root_orchestration",
+            "attempts": 0,
+            "max_attempts": 4,
+        }
+        (self.root / "pending" / f"{task['id']}.json").write_text(
+            json.dumps(task), encoding="utf-8"
+        )
+        rows = {row["task_id"]: row for row in self.exporter.rows()}
+        row = rows["github-herdr-issue-53-test"]
+        self.assertEqual(row["repo"], "Bbambaaamm/herdr")
+        self.assertEqual(row["agent"], "herdr-hermes")
+        self.assertEqual(row["issue_title"], "HERDR CONTROL: autonomous backlog drain")
+        self.assertEqual(row["scheduler_state"], "active")
+
     def test_majak_missing_or_malformed_coordinator_fails_closed_but_legacy_quantlab_defaults(self):
         self.exporter.INTAKE.write_text("{}", encoding="utf-8")
         tasks = [
