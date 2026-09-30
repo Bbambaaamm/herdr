@@ -24,6 +24,12 @@ MODEL_ROUTING_PATH = '/var/lib/agent-platform-herdr/model-routing.json'
 ADMISSION_PATH = '/var/lib/agent-platform-herdr/admission.jsonl'
 RELEASE_PATH = '/var/lib/agent-platform-herdr/deployed-release.json'
 SWARM_PATH = '/var/lib/agent-platform-herdr/swarm.json'
+SWARM_FALLBACK_PATH = '/var/lib/agent-platform-herdr/agent-stack-swarm.json'
+SWARM_FRESH_SECONDS = 90
+
+
+class StaleSource(ValueError):
+    pass
 
 
 def command(argv, *, env=None, limit=65536, timeout=3):
@@ -313,7 +319,7 @@ def _swarm_stamp(value):
 
 
 def swarm(path, profile):
-    c.need(profile == 'quantlab' and path == SWARM_PATH)
+    c.need(profile == 'quantlab' and path in (SWARM_PATH, SWARM_FALLBACK_PATH))
     raw = c.parse(read(path, c.MAX_BYTES), c.MAX_BYTES)
     required = {'tasks', 'edges', 'agents', 'repo', 'issue', 'observed_at', 'version', 'paper_only'}
     canonical = required | {'policy_profiles', 'graph_latency', 'clock_snapshot', 'ts'}
@@ -477,6 +483,27 @@ def swarm(path, profile):
     }
     c.row('swarm', snapshot)
     return [snapshot], _swarm_stamp(raw['observed_at'])
+
+def live_swarm(profile, now, max_age=SWARM_FRESH_SECONDS):
+    c.need(profile == 'quantlab' and c.number(now) and c.number(max_age) and max_age >= 0)
+    stale = False
+    # Scheduler/runtime owns SWARM_PATH. Prefer it whenever it is fresh so a
+    # live TaskGraph cannot be masked by the periodic Agent Stack fallback.
+    # The fallback is a separate file and is considered only after the primary
+    # becomes stale/unavailable.
+    for path in dict.fromkeys((SWARM_PATH, SWARM_FALLBACK_PATH)):
+        try:
+            rows, stamp = swarm(path, profile)
+        except (OSError, ValueError):
+            continue
+        if stamp > now:
+            continue
+        if now - stamp <= max_age:
+            return rows, stamp
+        stale = True
+    if stale:
+        raise StaleSource('stale')
+    raise ValueError('swarm_unavailable')
 
 def _tail_regular(path, limit=65536):
     with regular(path) as (fd, info):
