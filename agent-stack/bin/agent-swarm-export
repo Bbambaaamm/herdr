@@ -95,7 +95,11 @@ def result_for(task_id, task):
         raise ValueError("result_task_mismatch")
     run_token = task.get("run_token")
     if not ident(run_token, 128) or raw.get("run_token") != run_token:
-        raise ValueError("result_run_token_mismatch")
+        # A durable result from an older attempt is not evidence for the
+        # current run. Ignore it exactly like agent-task-export does; the
+        # current task record remains authoritative and no stale blocker/result
+        # metadata may leak into the fallback swarm snapshot.
+        return {}
     return raw
 
 
