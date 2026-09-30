@@ -170,7 +170,7 @@ def rows():
             if type(max_attempts) is not int or not 0 <= max_attempts <= 1000:
                 max_attempts = 0
             kind = safe_text(raw.get("kind"), "unknown", limit=64)
-            blocker, pr_number = result_info(task_id)
+            blocker, pr_number = result_info(task_id, raw.get("run_token"))
             meta = issues.get((repo, issue), {}) if issue is not None else {}
             items.append(
                 {
