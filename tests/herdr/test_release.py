@@ -530,6 +530,86 @@ def test_switch_runtime_keeps_watchdog_quiescent(
 
 
 
+def test_switch_runtime_can_keep_exact_legacy_web_fail_closed(
+    monkeypatch,
+    tmp_path,
+):
+    events = []
+    waits = []
+
+    def fake_run(*args, check=True):
+        events.append(("run", *args))
+        if args[:3] == (
+            "/usr/bin/systemctl",
+            "is-active",
+            "agent-platform-web.service",
+        ):
+            return "inactive"
+        return ""
+
+    monkeypatch.setattr(cutover, "run", fake_run)
+    monkeypatch.setattr(
+        cutover,
+        "atomic_symlink",
+        lambda target, link: events.append(
+            ("symlink", str(target), str(link))
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "wait_http_status",
+        lambda *args, **kwargs: waits.append((args, kwargs)),
+    )
+    monkeypatch.setattr(cutover, "assert_hardening", lambda: None)
+
+    target = tmp_path / "release"
+    target.mkdir()
+
+    cutover.switch_runtime(
+        target,
+        None,
+        require_web=False,
+    )
+
+    assert (
+        "run",
+        "/usr/bin/systemctl",
+        "start",
+        "agent-platform-export.service",
+    ) in events
+    assert (
+        "run",
+        "/usr/bin/systemctl",
+        "start",
+        "agent-platform-web.service",
+    ) not in events
+    assert waits == []
+
+
+def test_rc8_fail_closed_rollback_exception_is_exactly_pinned():
+    assert cutover.RC8_BOOTSTRAP_RELEASE == (
+        cutover.RELEASES
+        / "v0.3.0-rc.8-d58283bc4bf9"
+    )
+
+    source = Path(
+        "deploy/herdr/cutover/cutover.py"
+    ).read_text(encoding="utf-8")
+
+    apply_source = source.split(
+        "def apply(",
+        1,
+    )[1]
+
+    assert (
+        "previous_requires_web = previous != RC8_BOOTSTRAP_RELEASE"
+        in apply_source
+    )
+    assert "require_web=previous_requires_web" in apply_source
+    assert "fail_closed_rc8_observability" in apply_source
+    assert "legacy_rollback_web_unexpectedly_active" in apply_source
+
+
 def test_switch_runtime_resets_rate_limit_and_starts_herdr_once_via_export(
     monkeypatch,
     tmp_path,
