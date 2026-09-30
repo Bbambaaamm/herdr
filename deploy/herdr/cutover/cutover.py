@@ -80,6 +80,10 @@ BOOTSTRAP_VERSIONED_UNIT_HASHES = {
     },
 }
 
+RC8_BOOTSTRAP_RELEASE = (
+    RELEASES / "v0.3.0-rc.8-d58283bc4bf9"
+)
+
 
 def need(value: bool, message: str) -> None:
     if not value:
@@ -745,6 +749,8 @@ def run_rollback_steps(steps):
 def switch_runtime(
     target: Path,
     document: dict[str, object] | None,
+    *,
+    require_web: bool = True,
 ) -> None:
     # Durable orchestration remains stopped for every intermediate
     # candidate/rollback transition. Dispatch is re-enabled only after
@@ -779,26 +785,38 @@ def switch_runtime(
         "start",
         "agent-platform-export.service",
     )
-    run(
-        "/usr/bin/systemctl",
-        "start",
-        "agent-platform-web.service",
-    )
-
-    wait_http_status(
-        "http://127.0.0.1:3010/agent-platform/health",
-        "401",
-    )
-
-    need(
+    if require_web:
         run(
             "/usr/bin/systemctl",
-            "is-active",
+            "start",
             "agent-platform-web.service",
         )
-        == "active",
-        "web_not_active",
-    )
+
+        wait_http_status(
+            "http://127.0.0.1:3010/agent-platform/health",
+            "401",
+        )
+
+        need(
+            run(
+                "/usr/bin/systemctl",
+                "is-active",
+                "agent-platform-web.service",
+            )
+            == "active",
+            "web_not_active",
+        )
+    else:
+        need(
+            run(
+                "/usr/bin/systemctl",
+                "is-active",
+                "agent-platform-web.service",
+                check=False,
+            )
+            != "active",
+            "legacy_web_active_during_fail_closed_rollback",
+        )
 
     assert_hardening()
 
@@ -853,6 +871,7 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
     need(CURRENT.is_symlink(), "current_is_not_symlink")
     previous = CURRENT.resolve(strict=True)
     need(previous == LEGACY or previous.parent == RELEASES, "unexpected_previous_release")
+    previous_requires_web = previous != RC8_BOOTSTRAP_RELEASE
     config_digest = install_consumers(candidate, release["config_contract_sha256"])
     hashes = expected_hashes(candidate / "deploy" / "herdr" / "cutover" /
                              "legacy-quantlab-staging-01.sha256")
@@ -979,12 +998,29 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
         switch_runtime(
             previous,
             None,
+            require_web=previous_requires_web,
         )
 
         restore_file(
             PUBLIC_STATE,
             public_state_snapshot,
         )
+
+        if not previous_requires_web:
+            wait_http_status(
+                "https://2.28.67.165/agent-platform/health",
+                "503",
+            )
+            need(
+                run(
+                    "/usr/bin/systemctl",
+                    "is-active",
+                    "agent-platform-web.service",
+                    check=False,
+                )
+                != "active",
+                "legacy_rollback_web_unexpectedly_active",
+            )
 
         need(
             CURRENT.resolve(strict=True) == previous,
@@ -1039,6 +1075,11 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
             "release_path": str(candidate),
             "previous_path": str(previous),
             "rollback_exercised": True,
+            "rollback_mode": (
+                "full_web"
+                if previous_requires_web
+                else "fail_closed_rc8_observability"
+            ),
             "public_root_status": root_status,
             "archive_sha256": digest_file(
                 evidence_archive
@@ -1153,6 +1194,11 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
                         "agent-platform-export.service",
                     ),
                 ),
+            ]
+        )
+
+        if previous_requires_web:
+            rollback_steps.append(
                 (
                     "start_previous_web",
                     lambda: run(
@@ -1160,9 +1206,8 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
                         "start",
                         "agent-platform-web.service",
                     ),
-                ),
-            ]
-        )
+                )
+            )
 
         if timers_stopped:
             rollback_steps.append(
@@ -1177,8 +1222,8 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
                 )
             )
 
-        rollback_steps.extend(
-            [
+        if previous_requires_web:
+            rollback_steps.append(
                 (
                     "local_health",
                     lambda: wait_http_status(
@@ -1186,7 +1231,11 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
                         "agent-platform/health",
                         "401",
                     ),
-                ),
+                )
+            )
+
+        rollback_steps.extend(
+            [
                 (
                     "restore_nginx_route",
                     lambda: atomic_write(
@@ -1251,15 +1300,19 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
                 "rollback_nginx_route_mismatch",
             )
 
-            need(
-                run(
-                    "/usr/bin/systemctl",
-                    "is-active",
-                    "agent-platform-web.service",
-                )
-                == "active",
-                "rollback_web_not_active",
+            web_state = run(
+                "/usr/bin/systemctl",
+                "is-active",
+                "agent-platform-web.service",
+                check=False,
             )
+            if previous_requires_web:
+                need(web_state == "active", "rollback_web_not_active")
+            else:
+                need(
+                    web_state != "active",
+                    "legacy_rollback_web_unexpectedly_active",
+                )
 
             for timer in (
                 "agent-platform-herdr.timer",
@@ -1275,14 +1328,15 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
                     f"rollback_timer_not_active:{timer}",
                 )
 
-            need(
-                http_status(
-                    "http://127.0.0.1:3010/"
-                    "agent-platform/health"
+            if previous_requires_web:
+                need(
+                    http_status(
+                        "http://127.0.0.1:3010/"
+                        "agent-platform/health"
+                    )
+                    == "401",
+                    "rollback_local_health_failed",
                 )
-                == "401",
-                "rollback_local_health_failed",
-            )
 
             need(
                 http_status(
