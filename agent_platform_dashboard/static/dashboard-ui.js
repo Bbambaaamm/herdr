@@ -955,7 +955,7 @@ export function mountDashboard(createScene) {
         for (const row of item.rows) {
           if (row.version !== 1 || typeof row.repo !== 'string' || typeof row.issue !== 'string'
             || typeof row.paper_only !== 'boolean' || !Array.isArray(row.policy_profiles)
-            || !Array.isArray(row.tasks) || !Array.isArray(row.edges)
+            || !Array.isArray(row.agents) || !Array.isArray(row.tasks) || !Array.isArray(row.edges)
             || (row.repo === 'Bbambaaamm/Autonomous-Quant-Lab' && row.paper_only !== true)) throw new Error('invalid');
           const taskIds = new Set();
           for (const task of row.tasks) {
@@ -972,6 +972,24 @@ export function mountDashboard(createScene) {
               || (task.result_sha != null && (typeof task.result_sha !== 'string' || !/^[0-9a-f]{64}$/.test(task.result_sha)))) throw new Error('invalid');
             taskIds.add(task.task_id);
           }
+          const tasksById = new Map(row.tasks.map(task => [task.task_id, task]));
+          const agentIds = new Set(), agentTaskIds = new Set();
+          for (const agent of row.agents) {
+            if (!agent || typeof agent.agent_id !== 'string' || agentIds.has(agent.agent_id)
+              || typeof agent.task_id !== 'string' || agentTaskIds.has(agent.task_id)
+              || agent.state !== 'running'
+              || (agent.parent_task_id != null && typeof agent.parent_task_id !== 'string')
+              || (agent.parent_agent_id != null && typeof agent.parent_agent_id !== 'string')
+              || !Number.isSafeInteger(agent.fencing_token) || agent.fencing_token < 0) throw new Error('invalid');
+            const task = tasksById.get(agent.task_id);
+            if (!task || task.state !== 'running' || task.agent_id !== agent.agent_id
+              || task.parent_task_id !== agent.parent_task_id
+              || task.parent_agent_id !== agent.parent_agent_id
+              || task.fencing_token !== agent.fencing_token) throw new Error('invalid');
+            agentIds.add(agent.agent_id); agentTaskIds.add(agent.task_id);
+          }
+          const expectedAgentTasks = new Set(row.tasks.filter(task => task.state === 'running' && task.agent_id != null).map(task => task.task_id));
+          if (expectedAgentTasks.size !== agentTaskIds.size || [...expectedAgentTasks].some(taskId => !agentTaskIds.has(taskId))) throw new Error('invalid');
           for (const edge of row.edges) {
             if (!edge || !['parent', 'dependency'].includes(edge.kind)
               || typeof edge.from_task !== 'string' || typeof edge.to_task !== 'string'
