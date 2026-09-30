@@ -354,15 +354,28 @@ class SwarmExportTests(unittest.TestCase):
         self.assertEqual(self.exporter.main(), 0)
         self.assertEqual(self.output.read_bytes(), sentinel)
 
-    def test_result_identity_must_match_current_run_token(self):
-        task = self.herdr_task("current", run_token="a" * 32)
-        self.write_task("running", task)
+    def test_stale_result_run_token_is_ignored_for_current_attempt(self):
+        task = self.herdr_task(
+            "current",
+            run_token="a" * 32,
+            blocker="current_blocker",
+        )
+        self.write_task("blocked", task)
         (self.root / "results" / "current.json").write_text(
-            json.dumps({"task_id": "current", "run_token": "b" * 32, "blocker": "stale"}),
+            json.dumps({
+                "task_id": "current",
+                "run_token": "b" * 32,
+                "blocker": "stale_blocker",
+                "result_sha": "f" * 64,
+            }),
             encoding="utf-8",
         )
-        with self.assertRaisesRegex(ValueError, "result_run_token_mismatch"):
-            self.exporter.materialize(self.exporter.load_records(), observed_at=100)
+        payload = self.exporter.materialize(
+            self.exporter.load_records(),
+            observed_at=100,
+        )
+        self.assertEqual(payload["tasks"][0]["blocker"], "current_blocker")
+        self.assertNotIn("result_sha", payload["tasks"][0])
 
     def test_result_lookup_cannot_escape_results_directory(self):
         with self.assertRaisesRegex(ValueError, "invalid_task_id"):
