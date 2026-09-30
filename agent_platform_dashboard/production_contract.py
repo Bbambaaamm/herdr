@@ -87,7 +87,7 @@ def row(kind, value):
               'admission': ('event reason role repo issue node_count max_depth max_fanout '
                             'child_tools_count agents_after observed_at'),
               'release': 'tag commit config_sha256 deployed_at',
-              'swarm': 'version repo issue paper_only policy_profiles tasks edges',
+              'swarm': 'version repo issue paper_only policy_profiles agents tasks edges',
               'codex': ('used_percent window_minutes resets_at ordinary_usage_allowed has_credits '
                         'credits_unlimited credits_balance reset_credits_available lifetime_tokens '
                         'peak_daily_tokens longest_running_turn_sec current_streak_days '
@@ -179,10 +179,12 @@ def row(kind, value):
              and all(identifier(item, 64) for item in value['policy_profiles']))
         need(type(value['tasks']) is list and len(value['tasks']) <= 100)
         task_ids = set()
+        tasks_by_id = {}
         for task in value['tasks']:
             keys(task, 'task_id parent_task_id parent_agent_id agent_id state role model fallback_model attempt max_attempts blocker fencing_token dependencies result_sha')
             need(identifier(task['task_id'], 256) and task['task_id'] not in task_ids)
             task_ids.add(task['task_id'])
+            tasks_by_id[task['task_id']] = task
             need(task['parent_task_id'] is None or identifier(task['parent_task_id'], 256))
             need(task['parent_agent_id'] is None or identifier(task['parent_agent_id'], 256))
             need(task['agent_id'] is None or identifier(task['agent_id'], 256))
@@ -198,6 +200,32 @@ def row(kind, value):
                  and len(set(task['dependencies'])) == len(task['dependencies'])
                  and all(identifier(dep, 256) for dep in task['dependencies']))
             need(task['result_sha'] is None or hex_id(task['result_sha']))
+
+        need(type(value['agents']) is list and len(value['agents']) <= 100)
+        agent_ids = set()
+        agent_tasks = set()
+        for agent in value['agents']:
+            keys(agent, 'agent_id task_id state parent_task_id parent_agent_id fencing_token')
+            need(identifier(agent['agent_id'], 256) and agent['agent_id'] not in agent_ids)
+            need(identifier(agent['task_id'], 256) and agent['task_id'] not in agent_tasks)
+            agent_ids.add(agent['agent_id'])
+            agent_tasks.add(agent['task_id'])
+            need(agent['state'] == 'running')
+            need(agent['parent_task_id'] is None or identifier(agent['parent_task_id'], 256))
+            need(agent['parent_agent_id'] is None or identifier(agent['parent_agent_id'], 256))
+            need(number(agent['fencing_token']))
+            task = tasks_by_id.get(agent['task_id'])
+            need(task is not None and task['state'] == 'running'
+                 and task['agent_id'] == agent['agent_id']
+                 and task['parent_task_id'] == agent['parent_task_id']
+                 and task['parent_agent_id'] == agent['parent_agent_id']
+                 and task['fencing_token'] == agent['fencing_token'])
+        expected_agent_tasks = {
+            task['task_id'] for task in value['tasks']
+            if task['state'] == 'running' and task['agent_id'] is not None
+        }
+        need(agent_tasks == expected_agent_tasks)
+
         need(type(value['edges']) is list and len(value['edges']) <= 200)
         edges = set()
         for edge in value['edges']:

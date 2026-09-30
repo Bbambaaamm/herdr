@@ -804,6 +804,10 @@ test('authoritative swarm snapshot drives real DAG edges and child task lineage'
     observed_at: now, data_at: now,
     rows: [{
       version: 1, repo: 'Bbambaaamm/herdr', issue: '7', paper_only: false, policy_profiles: ['default'],
+      agents: [{
+        agent_id: 'herdr-parent', task_id: 'parent', state: 'running',
+        parent_task_id: null, parent_agent_id: null, fencing_token: 1,
+      }],
       tasks: [
         {
           task_id: 'parent', parent_task_id: null, parent_agent_id: null,
@@ -823,6 +827,9 @@ test('authoritative swarm snapshot drives real DAG edges and child task lineage'
   });
   await h.refresh();
   assert.match(h.get('#taskgraph-status').textContent, /Autoritativní Herdr DAG · 1 hran/);
+  assert.equal(h.ui.diagnostics().state, 'working');
+  assert.match(h.get('#face-state').textContent, /Zpracovává úlohu/);
+  assert.match(h.get('#face-task').textContent, /^Herdr #7/);
   assert.doesNotMatch(h.get('#taskgraph-status').textContent, /Dependency telemetry/i);
   const html = h.get('#taskgraph-nodes').innerHTML;
   assert.match(html, /data-edge-kind="parent"/);
@@ -863,6 +870,10 @@ test('Majak root remains visible alongside authoritative QuantLab swarm tasks', 
     observed_at: now, data_at: now,
     rows: [{
       version: 1, repo: 'Bbambaaamm/herdr', issue: '7', paper_only: false, policy_profiles: ['default'],
+      agents: [{
+        agent_id: 'herdr-parent', task_id: 'parent', state: 'running',
+        parent_task_id: null, parent_agent_id: null, fencing_token: 1,
+      }],
       tasks: [
         {
           task_id: 'parent', parent_task_id: null, parent_agent_id: null,
@@ -893,6 +904,233 @@ test('Majak root remains visible alongside authoritative QuantLab swarm tasks', 
   assert(tasks.some(row => row.task_id === 'child'));
 });
 
+test('Majak working state remains globally visible with terminal or blocked swarm', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const majakHerdr = h.snapshot().sources.find(item => item.kind === 'herdr' && item.profile === 'majak');
+  majakHerdr.rows[0].status = 'working';
+  const majakQueue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'majak');
+  majakQueue.status = 'available'; majakQueue.reason = 'ok'; majakQueue.data_at = now;
+  majakQueue.rows = [{
+    task_id: 'github-majak-issue-662-global-state',
+    repo: 'Bbambaaamm/dotacni-majak',
+    issue: 662,
+    issue_title: 'HERDR CONTROL',
+    issue_open: true,
+    scheduler_state: 'active',
+    status: 'running',
+    attempts: 1,
+    max_attempts: 4,
+    not_before: null,
+    updated_at: now,
+    agent: 'dotacni-majak-hermes',
+    kind: 'github_root_orchestration',
+    blocker: null,
+    pr_number: null,
+  }];
+  const task = {
+    task_id: 'terminal-swarm', parent_task_id: null, parent_agent_id: null,
+    agent_id: null, state: 'done', role: 'worker',
+    model: 'model-a', fallback_model: null, attempt: 1, max_attempts: 2,
+    blocker: null, fencing_token: 0, dependencies: [], result_sha: 'a'.repeat(64),
+  };
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '48', paper_only: false,
+      policy_profiles: ['default'], agents: [], tasks: [task], edges: [],
+    }],
+  });
+
+  await h.refresh();
+  assert.equal(h.calls.states.at(-1), 'working');
+  assert.match(h.get('#face-task').textContent, /Maják #662/);
+
+  task.state = 'blocked';
+  task.blocker = 'test_failed';
+  await h.refresh();
+  assert.equal(h.calls.states.at(-1), 'working');
+  assert.match(h.get('#face-task').textContent, /Maják #662/);
+});
+
+test('swarm does not mask Majak herdr source failure', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const majakHerdr = h.snapshot().sources.find(item => item.kind === 'herdr' && item.profile === 'majak');
+  majakHerdr.status = 'unavailable';
+  majakHerdr.reason = 'stale';
+  majakHerdr.rows = [];
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '48', paper_only: false,
+      policy_profiles: ['default'], agents: [], tasks: [{
+        task_id: 'terminal-swarm', parent_task_id: null, parent_agent_id: null,
+        agent_id: null, state: 'done', role: 'worker',
+        model: 'model-a', fallback_model: null, attempt: 1, max_attempts: 2,
+        blocker: null, fencing_token: 0, dependencies: [], result_sha: 'a'.repeat(64),
+      }], edges: [],
+    }],
+  });
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().state, 'error');
+  assert.match(h.get('#face-task').textContent, /majak\/herdr.*stale/i);
+});
+
+test('swarm active counts include concurrently working Majak agent', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const majakHerdr = h.snapshot().sources.find(item => item.kind === 'herdr' && item.profile === 'majak');
+  majakHerdr.rows[0].status = 'working';
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '48', paper_only: false,
+      policy_profiles: ['default'],
+      agents: [{
+        agent_id: 'herdr-parent', task_id: 'parent', state: 'running',
+        parent_task_id: null, parent_agent_id: null, fencing_token: 1,
+      }],
+      tasks: [{
+        task_id: 'parent', parent_task_id: null, parent_agent_id: null,
+        agent_id: 'herdr-parent', state: 'running', role: 'planner',
+        model: 'model-a', fallback_model: null, attempt: 1, max_attempts: 2,
+        blocker: null, fencing_token: 1, dependencies: [], result_sha: null,
+      }],
+      edges: [],
+    }],
+  });
+  await h.refresh();
+  assert.match(h.get('#swarm-kpis').innerHTML, /<span>Active<\/span><b>2<\/b>/);
+  assert.match(h.get('#observability-kpis').innerHTML, /<span>Aktivní práce<\/span><b>2 agent ·/);
+  assert.equal(h.calls.activity.at(-1).workingAgents, 2);
+});
+
+test('AQL user blocker outside selected swarm remains global attention', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const quantQueue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
+  quantQueue.status = 'available';
+  quantQueue.reason = 'ok';
+  quantQueue.data_at = now;
+  quantQueue.rows = [{
+    task_id: 'aql-human-blocked',
+    repo: 'Bbambaaamm/Autonomous-Quant-Lab',
+    issue: 190,
+    issue_title: 'Needs GitHub write',
+    issue_open: true,
+    scheduler_state: 'blocked',
+    status: 'blocked',
+    attempts: 1,
+    max_attempts: 4,
+    not_before: null,
+    updated_at: now,
+    agent: 'quantlab-hermes',
+    kind: 'github_issue_slice',
+    blocker: 'github_write_auth_required',
+    pr_number: null,
+  }];
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '48', paper_only: false,
+      policy_profiles: ['default'],
+      agents: [{
+        agent_id: 'herdr-parent', task_id: 'parent', state: 'running',
+        parent_task_id: null, parent_agent_id: null, fencing_token: 1,
+      }],
+      tasks: [{
+        task_id: 'parent', parent_task_id: null, parent_agent_id: null,
+        agent_id: 'herdr-parent', state: 'running', role: 'planner',
+        model: 'model-a', fallback_model: null, attempt: 1, max_attempts: 2,
+        blocker: null, fencing_token: 1, dependencies: [], result_sha: null,
+      }],
+      edges: [],
+    }],
+  });
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().state, 'waiting_user');
+  assert.match(h.get('#face-task').textContent, /aql-human-blocked/);
+  assert.equal(h.get('#attention-summary').hidden, false);
+  assert.match(h.get('#attention-summary').textContent, /aql-human-blocked/);
+});
+
+test('cancelled swarm is not reported as complete', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '48', paper_only: false,
+      policy_profiles: ['default'], agents: [], tasks: [{
+        task_id: 'cancelled-task', parent_task_id: null, parent_agent_id: null,
+        agent_id: null, state: 'cancelled', role: 'worker',
+        model: 'model-a', fallback_model: null, attempt: 1, max_attempts: 2,
+        blocker: null, fencing_token: 0, dependencies: [], result_sha: null,
+      }], edges: [],
+    }],
+  });
+  await h.refresh();
+  assert.notEqual(h.ui.diagnostics().state, 'complete');
+  assert.doesNotMatch(h.get('#face-state').textContent, /Dokončeno/i);
+});
+
+test('QuantLab-only projection does not require Majak source health', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  h.snapshot().sources = h.snapshot().sources.filter(item => item.profile !== 'majak');
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '48', paper_only: false,
+      policy_profiles: ['default'],
+      agents: [{
+        agent_id: 'herdr-parent', task_id: 'parent', state: 'running',
+        parent_task_id: null, parent_agent_id: null, fencing_token: 1,
+      }],
+      tasks: [{
+        task_id: 'parent', parent_task_id: null, parent_agent_id: null,
+        agent_id: 'herdr-parent', state: 'running', role: 'planner',
+        model: 'model-a', fallback_model: null, attempt: 1, max_attempts: 2,
+        blocker: null, fencing_token: 1, dependencies: [], result_sha: null,
+      }],
+      edges: [],
+    }],
+  });
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().state, 'working');
+  assert.equal(h.ui.diagnostics().freshSnapshot, true);
+});
+
+test('observability active work uses authoritative running agents only', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '48', paper_only: false, policy_profiles: ['default'],
+      agents: [],
+      tasks: [{
+        task_id: 'blocked-history', parent_task_id: null, parent_agent_id: null,
+        agent_id: 'historic-agent', state: 'blocked', role: 'worker',
+        model: 'model-a', fallback_model: null, attempt: 1, max_attempts: 2,
+        blocker: 'dependency_wait', fencing_token: 9, dependencies: [], result_sha: null,
+      }],
+      edges: [],
+    }],
+  });
+  await h.refresh();
+  assert.match(h.get('#swarm-kpis').innerHTML, /<span>Active<\/span><b>0<\/b>/);
+  assert.match(h.get('#observability-kpis').innerHTML, /<span>Aktivní práce<\/span><b>0 agent ·/);
+});
+
 test('QuantLab swarm browser boundary rejects non-PAPER snapshots', async t => {
   const h = await harness(t);
   const now = Math.floor(Date.now() / 1000);
@@ -901,7 +1139,7 @@ test('QuantLab swarm browser boundary rejects non-PAPER snapshots', async t => {
     observed_at: now, data_at: now,
     rows: [{
       version: 1, repo: 'Bbambaaamm/Autonomous-Quant-Lab', issue: '231',
-      paper_only: false, policy_profiles: [], tasks: [], edges: [],
+      paper_only: false, policy_profiles: [], agents: [], tasks: [], edges: [],
     }],
   });
   await h.refresh();

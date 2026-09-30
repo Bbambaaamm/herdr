@@ -24,6 +24,12 @@ MODEL_ROUTING_PATH = '/var/lib/agent-platform-herdr/model-routing.json'
 ADMISSION_PATH = '/var/lib/agent-platform-herdr/admission.jsonl'
 RELEASE_PATH = '/var/lib/agent-platform-herdr/deployed-release.json'
 SWARM_PATH = '/var/lib/agent-platform-herdr/swarm.json'
+SWARM_FALLBACK_PATH = '/var/lib/agent-platform-herdr/agent-stack-swarm.json'
+SWARM_FRESH_SECONDS = 90
+
+
+class StaleSource(ValueError):
+    pass
 
 
 def command(argv, *, env=None, limit=65536, timeout=3):
@@ -313,7 +319,7 @@ def _swarm_stamp(value):
 
 
 def swarm(path, profile):
-    c.need(profile == 'quantlab' and path == SWARM_PATH)
+    c.need(profile == 'quantlab' and path in (SWARM_PATH, SWARM_FALLBACK_PATH))
     raw = c.parse(read(path, c.MAX_BYTES), c.MAX_BYTES)
     required = {'tasks', 'edges', 'agents', 'repo', 'issue', 'observed_at', 'version', 'paper_only'}
     canonical = required | {'policy_profiles', 'graph_latency', 'clock_snapshot', 'ts'}
@@ -328,13 +334,7 @@ def swarm(path, profile):
     c.need(type(raw['tasks']) is list and len(raw['tasks']) <= 100)
     c.need(type(raw['edges']) is list and len(raw['edges']) <= 200)
     c.need(type(raw['agents']) is list and len(raw['agents']) <= 100)
-    safe_agent_fields = {
-        'agent_id', 'event_ref', 'fallback_model', 'fencing_token', 'holder',
-        'issue', 'lease_until', 'model', 'parent_agent_id', 'parent_task_id',
-        'repo', 'role', 'state', 'task_id',
-    }
-    for agent in raw['agents']:
-        c.need(type(agent) is dict and set(agent) <= safe_agent_fields)
+
     allowed_task = {
         'task_id', 'state', 'role', 'tools', 'permissions', 'timeout_seconds',
         'max_attempts', 'dependencies', 'parent_task_id', 'parent_agent_id',
@@ -389,6 +389,7 @@ def swarm(path, profile):
         tasks.append(task)
     c.need(len({task['task_id'] for task in tasks}) == len(tasks))
     task_ids = {task['task_id'] for task in tasks}
+    tasks_by_id = {task['task_id']: task for task in tasks}
     c.need(all(edge[0] in task_ids and edge[1] in task_ids for edge in derived_edges))
 
     raw_edges = set()
@@ -398,6 +399,63 @@ def swarm(path, profile):
                and edge['kind'] in ('parent', 'dependency'))
         raw_edges.add((edge['from'], edge['to'], edge['kind']))
     c.need(raw_edges == derived_edges)
+
+    safe_agent_fields = {
+        'agent_id', 'event_ref', 'fallback_model', 'fencing_token', 'holder',
+        'issue', 'lease_until', 'model', 'parent_agent_id', 'parent_task_id',
+        'repo', 'role', 'state', 'task_id',
+    }
+    scheduler_snapshot = raw['version'] == 'v1.2.0'
+    agents = []
+    seen_agent_tasks = set()
+    running_agent_ids = set()
+    running_agent_tasks = set()
+    for item in raw['agents']:
+        c.need(type(item) is dict and set(item) <= safe_agent_fields)
+        agent_id = item.get('agent_id')
+        task_id = item.get('task_id')
+        agent_state = item.get('state')
+        c.need(c.identifier(agent_id, 256) and c.identifier(task_id, 256))
+        c.need(task_id not in seen_agent_tasks)
+        seen_agent_tasks.add(task_id)
+        parent_task_id = item.get('parent_task_id')
+        parent_agent_id = item.get('parent_agent_id')
+        c.need(parent_task_id is None or c.identifier(parent_task_id, 256))
+        c.need(parent_agent_id is None or c.identifier(parent_agent_id, 256))
+        fencing_token = item.get('fencing_token', 0)
+        c.need(c.number(fencing_token))
+        task = tasks_by_id.get(task_id)
+        c.need(task is not None and task['agent_id'] == agent_id)
+        c.need(task['parent_task_id'] == parent_task_id and task['parent_agent_id'] == parent_agent_id)
+        c.need(task['fencing_token'] == fencing_token)
+        if scheduler_snapshot:
+            c.need(agent_state == task['state'])
+        else:
+            c.need(agent_state == 'running' and task['state'] == 'running')
+        if agent_state == 'running':
+            c.need(task['state'] == 'running' and agent_id not in running_agent_ids)
+            running_agent_ids.add(agent_id)
+            running_agent_tasks.add(task_id)
+            agents.append({
+                'agent_id': agent_id,
+                'task_id': task_id,
+                'state': 'running',
+                'parent_task_id': parent_task_id,
+                'parent_agent_id': parent_agent_id,
+                'fencing_token': fencing_token,
+            })
+    expected_agent_tasks = {
+        task['task_id'] for task in tasks
+        if task['state'] == 'running' and task['agent_id'] is not None
+    }
+    c.need(running_agent_tasks == expected_agent_tasks)
+    if scheduler_snapshot:
+        expected_raw_agents = {
+            task['task_id'] for task in tasks if task['agent_id'] is not None
+        }
+        c.need(seen_agent_tasks == expected_raw_agents)
+    else:
+        c.need(seen_agent_tasks == expected_agent_tasks)
 
     raw_profiles = raw.get('policy_profiles')
     if raw_profiles is not None:
@@ -416,6 +474,7 @@ def swarm(path, profile):
         'issue': issue,
         'paper_only': raw['paper_only'],
         'policy_profiles': sorted(profiles),
+        'agents': sorted(agents, key=lambda item: (item['task_id'], item['agent_id'])),
         'tasks': sorted(tasks, key=lambda item: item['task_id']),
         'edges': [
             {'from_task': left, 'to_task': right, 'kind': kind}
@@ -424,6 +483,27 @@ def swarm(path, profile):
     }
     c.row('swarm', snapshot)
     return [snapshot], _swarm_stamp(raw['observed_at'])
+
+def live_swarm(profile, now, max_age=SWARM_FRESH_SECONDS):
+    c.need(profile == 'quantlab' and c.number(now) and c.number(max_age) and max_age >= 0)
+    stale = False
+    # Scheduler/runtime owns SWARM_PATH. Prefer it whenever it is fresh so a
+    # live TaskGraph cannot be masked by the periodic Agent Stack fallback.
+    # The fallback is a separate file and is considered only after the primary
+    # becomes stale/unavailable.
+    for path in dict.fromkeys((SWARM_PATH, SWARM_FALLBACK_PATH)):
+        try:
+            rows, stamp = swarm(path, profile)
+        except (OSError, ValueError):
+            continue
+        if stamp > now:
+            continue
+        if now - stamp <= max_age:
+            return rows, stamp
+        stale = True
+    if stale:
+        raise StaleSource('stale')
+    raise ValueError('swarm_unavailable')
 
 def _tail_regular(path, limit=65536):
     with regular(path) as (fd, info):

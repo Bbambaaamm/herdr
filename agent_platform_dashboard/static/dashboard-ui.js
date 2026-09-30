@@ -122,7 +122,7 @@ export function mountDashboard(createScene) {
       max_attempts: row.max_attempts,
       not_before: null,
       updated_at: updated,
-      agent: row.agent_id || row.parent_agent_id || 'quantlab-hermes',
+      agent: row.agent_id || null,
       kind: 'herdr_swarm',
       blocker: row.blocker,
       pr_number: null,
@@ -138,6 +138,7 @@ export function mountDashboard(createScene) {
       fencing_token: row.fencing_token,
     }));
   }
+  function swarmAgents() { return swarmSnapshot()?.agents || []; }
   function swarmEdges() { return swarmSnapshot()?.edges || []; }
   function taskRows() { return swarmSnapshot() ? [...swarmTasks(), ...queueTasks('majak')] : queueTasks(); }
   function admissionSource() { return source('quantlab', 'admission'); }
@@ -262,7 +263,7 @@ export function mountDashboard(createScene) {
     const running = count('running'), waiting = count('pending'), failed = count('failed'), blockedOnly = count('blocked'), done = count('done');
     const blocked = blockedOnly + failed;
     const activeAgents = swarmSnapshot()
-      ? new Set(queue.filter(row => ['running', 'blocked'].includes(row.status)).map(row => row.agent).filter(Boolean)).size
+      ? swarmAgents().length + agents().filter(row => row.profile === 'majak' && row.status === 'working').length
       : agents().filter(row => row.status === 'working').length;
     const retries = queue.reduce((sum, row) => sum + (Number.isSafeInteger(row.attempts) ? Math.max(0, row.attempts - 1) : 0), 0);
     const terminal = done + failed;
@@ -465,7 +466,35 @@ export function mountDashboard(createScene) {
   function effectiveState() {
     if (demo) return demoState;
     if (!liveData) return 'offline';
-    const all = agents(), hermes = all.filter(row => agentKind(row.agent) === 'hermes'), queued = queueTasks();
+    const swarm = swarmSnapshot();
+    const all = agents();
+    if (swarm) {
+      const tasks = swarmTasks();
+      const blocked = tasks.filter(row => ['blocked', 'failed'].includes(row.status));
+      const majakAgents = all.filter(row => row.profile === 'majak');
+      const majakQueue = queueTasks('majak');
+      const majakHerdr = source('majak', 'herdr');
+      const majakProjected = liveData.sources.some(row => row.profile === 'majak');
+      const userAttention = blocked.some(row => USER_ACTION_BLOCKERS.has(row.blocker))
+        || majakAgents.some(row => row.status === 'blocked')
+        || userBlockedTasks('quantlab').length
+        || userBlockedTasks('majak').length;
+      if (userAttention) return 'waiting_user';
+      if (majakProjected && (!majakHerdr || majakHerdr.status !== 'available')) {
+        return tasks.length || all.length ? 'error' : 'offline';
+      }
+      const working = swarmAgents().length
+        || tasks.some(row => row.status === 'running')
+        || majakAgents.some(row => row.status === 'working')
+        || majakQueue.some(row => row.status === 'running');
+      if (working) return 'working';
+      if (blocked.length || technicalBlockedTasks('majak').length) return 'waiting_result';
+      const majakOpen = majakQueue.some(row => row.status !== 'done');
+      if (tasks.length && tasks.every(row => row.raw_state === 'done') && !majakOpen) return 'complete';
+      if (majakAgents.some(row => row.status === 'idle')) return 'idle';
+      return 'idle';
+    }
+    const hermes = all.filter(row => agentKind(row.agent) === 'hermes'), queued = queueTasks();
     if (all.some(row => row.status === 'blocked') || userBlockedTasks().length) return 'waiting_user';
     if (liveData.sources.some(row => row.kind === 'herdr' && row.status !== 'available')) return all.length ? 'error' : 'offline';
     if (hermes.some(row => row.status === 'working') || queued.some(row => row.status === 'running')) return 'working';
@@ -477,19 +506,42 @@ export function mountDashboard(createScene) {
   function demoTarget() { return SCENE_AGENT_IDS.has(selectedAgent) ? selectedAgent : 'majak-codex'; }
   function faceCopy(state) {
     if (demo) return `DEMO · ${STATE_META[state].copy}`;
-    const active = agents().filter(row => row.status === 'working').map(row => row.agent), task = currentQueueTask();
+    const swarm = swarmSnapshot();
+    const allAgents = agents();
+    const active = swarm
+      ? [
+          ...swarmAgents().map(row => row.agent_id).filter(Boolean),
+          ...allAgents.filter(row => row.profile === 'majak' && row.status === 'working').map(row => row.agent),
+        ]
+      : allAgents.filter(row => row.status === 'working').map(row => row.agent);
+    const task = swarm
+      ? swarmTasks().find(row => row.status === 'running')
+        || queueTasks('majak').find(row => row.status === 'running')
+        || null
+      : currentQueueTask();
     if (state === 'working' && task) {
-      const project = task.repo === 'Bbambaaamm/dotacni-majak' ? 'Maják' : 'QuantLab';
+      const project = task.repo === 'Bbambaaamm/dotacni-majak' ? 'Maják'
+        : task.repo === 'Bbambaaamm/herdr' ? 'Herdr'
+        : 'QuantLab';
       return `${project} ${issueLabel(task)} · ${task.task_id} · ${QUEUE_STATUS[task.status]}.`;
     }
     if (state === 'working' || (state === 'idle' && active.length)) return `Pracují: ${active.join(', ')}. Přesný úkol zdroj neposkytuje.`;
     if (state === 'waiting_user') {
-      const blockedAgents = agents().filter(row => row.status === 'blocked').map(row => row.agent);
-      const blockedTasks = userBlockedTasks().map(row => `${issueLabel(row)} ${row.task_id}`);
+      const blockedAgents = agents()
+        .filter(row => row.status === 'blocked' && (!swarm || row.profile === 'majak'))
+        .map(row => row.agent);
+      const blockerRows = swarm
+        ? [...swarmTasks(), ...userBlockedTasks()]
+        : userBlockedTasks();
+      const blockedTasks = [...new Map(blockerRows.map(row => [row.task_id, row])).values()]
+        .filter(row => ['blocked', 'failed'].includes(row.status) && USER_ACTION_BLOCKERS.has(row.blocker))
+        .map(row => `${issueLabel(row)} ${row.task_id}`);
       return `Zkontrolujte: ${[...blockedAgents, ...blockedTasks].join(', ') || 'blokovanou úlohu'}.`;
     }
     if (state === 'waiting_result') {
-      const tasks = technicalBlockedTasks().map(row => `${issueLabel(row)} ${row.blocker || row.task_id}`);
+      const tasks = (swarm ? swarmTasks() : technicalBlockedTasks())
+        .filter(row => ['blocked', 'failed'].includes(row.status) && !USER_ACTION_BLOCKERS.has(row.blocker))
+        .map(row => `${issueLabel(row)} ${row.blocker || row.task_id}`);
       return `Čekají technické závislosti: ${tasks.join(', ') || 'interní kontrola'}.`;
     }
     if (state === 'offline') return loadReason;
@@ -507,14 +559,19 @@ export function mountDashboard(createScene) {
     ui.faceSignal.style.background = color; ui.faceSignal.style.color = color;
     ui.faceSignal.style.boxShadow = reduced ? 'none' : `0 0 13px ${color}`;
     if (state !== lastFaceState) { sceneCall('setState', state); lastFaceState = state; }
-    const queue = queueTasks(), working = agents().filter(row => row.status === 'working');
+    const liveSwarm = swarmSnapshot(), queue = liveSwarm ? taskRows() : queueTasks();
+    const working = agents().filter(row => row.status === 'working');
+    const majakWorking = working.filter(row => row.profile === 'majak');
+    const liveAgents = liveSwarm ? swarmAgents() : null;
     sceneCall('setActivity', {
       running: queue.filter(row => row.status === 'running').length,
       pending: queue.filter(row => row.status === 'pending').length,
       blocked: queue.filter(row => ['blocked', 'failed'].includes(row.status)).length,
       userBlocked: userBlockedTasks().length,
-      workingAgents: working.length,
-      activeAgent: sceneAgent(currentTask?.agent) || working[0]?.agent || null,
+      workingAgents: liveAgents ? liveAgents.length + majakWorking.length : working.length,
+      activeAgent: liveAgents
+        ? (liveAgents[0]?.agent_id || majakWorking[0]?.agent || null)
+        : (sceneAgent(currentTask?.agent) || working[0]?.agent || null),
     });
     const target = demoTarget();
     const key = `${demo}:${demoState}:${target}`;
@@ -599,9 +656,7 @@ export function mountDashboard(createScene) {
     const totalRequests = routersAvailable ? profileStats.reduce((sum, value) => sum + value.requests, 0) : null;
     const knownCost = routersAvailable ? profileStats.reduce((sum, value) => sum + value.costKnown, 0) : null;
     const unknownCostRequests = routersAvailable ? profileStats.reduce((sum, value) => sum + value.costUnknownRequests, 0) : null;
-    const activeAgents = swarmSnapshot()
-      ? new Set(taskRows().filter(row => ['running', 'blocked'].includes(row.status)).map(row => row.agent).filter(Boolean)).size
-      : agents().filter(row => row.status === 'working').length;
+    const activeAgents = swarmMetrics().activeAgents;
     const activeQueue = activeQueueTasks().length;
     const remaining = codex ? 100 - codex.used_percent : null;
     const severity = remaining == null ? 'warn' : remaining <= 5 ? 'critical' : remaining <= 25 ? 'warn' : 'ok';
@@ -932,7 +987,7 @@ export function mountDashboard(createScene) {
         for (const row of item.rows) {
           if (row.version !== 1 || typeof row.repo !== 'string' || typeof row.issue !== 'string'
             || typeof row.paper_only !== 'boolean' || !Array.isArray(row.policy_profiles)
-            || !Array.isArray(row.tasks) || !Array.isArray(row.edges)
+            || !Array.isArray(row.agents) || !Array.isArray(row.tasks) || !Array.isArray(row.edges)
             || (row.repo === 'Bbambaaamm/Autonomous-Quant-Lab' && row.paper_only !== true)) throw new Error('invalid');
           const taskIds = new Set();
           for (const task of row.tasks) {
@@ -949,6 +1004,24 @@ export function mountDashboard(createScene) {
               || (task.result_sha != null && (typeof task.result_sha !== 'string' || !/^[0-9a-f]{64}$/.test(task.result_sha)))) throw new Error('invalid');
             taskIds.add(task.task_id);
           }
+          const tasksById = new Map(row.tasks.map(task => [task.task_id, task]));
+          const agentIds = new Set(), agentTaskIds = new Set();
+          for (const agent of row.agents) {
+            if (!agent || typeof agent.agent_id !== 'string' || agentIds.has(agent.agent_id)
+              || typeof agent.task_id !== 'string' || agentTaskIds.has(agent.task_id)
+              || agent.state !== 'running'
+              || (agent.parent_task_id != null && typeof agent.parent_task_id !== 'string')
+              || (agent.parent_agent_id != null && typeof agent.parent_agent_id !== 'string')
+              || !Number.isSafeInteger(agent.fencing_token) || agent.fencing_token < 0) throw new Error('invalid');
+            const task = tasksById.get(agent.task_id);
+            if (!task || task.state !== 'running' || task.agent_id !== agent.agent_id
+              || task.parent_task_id !== agent.parent_task_id
+              || task.parent_agent_id !== agent.parent_agent_id
+              || task.fencing_token !== agent.fencing_token) throw new Error('invalid');
+            agentIds.add(agent.agent_id); agentTaskIds.add(agent.task_id);
+          }
+          const expectedAgentTasks = new Set(row.tasks.filter(task => task.state === 'running' && task.agent_id != null).map(task => task.task_id));
+          if (expectedAgentTasks.size !== agentTaskIds.size || [...expectedAgentTasks].some(taskId => !agentTaskIds.has(taskId))) throw new Error('invalid');
           for (const edge of row.edges) {
             if (!edge || !['parent', 'dependency'].includes(edge.kind)
               || typeof edge.from_task !== 'string' || typeof edge.to_task !== 'string'

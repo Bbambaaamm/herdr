@@ -279,7 +279,7 @@ def weekly_self_review():
     mark("self-review")
     log(f"self-review OK: {daydir}")
 def agent_task_maintenance():
-    for name in ("agent-github-intake", "agent-task-dispatcher", "agent-task-export"):
+    for name in ("agent-github-intake", "agent-task-dispatcher", "agent-task-export", "agent-swarm-export"):
         script = BIN / name
         rc, text = run([script], 30)
         if rc:
