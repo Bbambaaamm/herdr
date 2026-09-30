@@ -55,6 +55,31 @@ UNITS = (
     "agent-stack-watchdog.service",
 )
 
+# One-time bridge for the deployed RC8 marker, which predates
+# payload_manifest_sha256 in deployed-release.json. These hashes are reviewed
+# immutable source evidence from commit d58283bc4bf98490bb96bd9bffd58b293b451061.
+# Once staging is on a marker that carries payload_manifest_sha256, upgrades use
+# the generic manifest-bound path below.
+BOOTSTRAP_VERSIONED_UNIT_HASHES = {
+    (
+        "v0.3.0-rc.8",
+        "d58283bc4bf98490bb96bd9bffd58b293b451061",
+    ): {
+        "agent-platform-web.service":
+            "c5a834ae268d02f5b27938f90c3d9bf766118399f65ae07d9f3016a530460e5e",
+        "agent-platform-export.service":
+            "f674e5d42bea703c48d1dd7156bff56d07d21f314c8379f6a9255114c946e608",
+        "agent-platform-herdr.service":
+            "d02e097c200e4c28290b24029ec7cbe6a73aec2a46635df86929c1b4e266d4da",
+        "agent-platform-export.timer":
+            "e568c8d2a5fb27f9e968868952d296191e3be30962c0dba1fc415c35c994cf04",
+        "agent-platform-herdr.timer":
+            "875c7512d5504a0f10cd2b975cffc5ff8116529cc8d147d37c5fee8c83cf8e28",
+        "agent-stack-watchdog.service":
+            "4263cadfa131fe3e117989751d3966058ab74748b82ca28683a99d5e7c61a413",
+    },
+}
+
 
 def need(value: bool, message: str) -> None:
     if not value:
@@ -135,14 +160,7 @@ def root_owned_readonly(path: Path) -> bool:
 
 
 def current_release_unit_hashes() -> dict[Path, str]:
-    """Return unit hashes bound to the currently deployed immutable release.
-
-    This permits a versioned release -> versioned release upgrade without
-    weakening the runtime drift gate. The previous unit bytes are trusted only
-    when /opt/herdr/current points at a root-owned release directory, the
-    deployed marker identifies that same release, and each unit template is
-    bound by that release's MANIFEST.sha256.
-    """
+    """Return unit hashes independently bound to the deployed release identity."""
     if not CURRENT.exists() and not CURRENT.is_symlink():
         return {}
     need(CURRENT.is_symlink(), "current_is_not_symlink")
@@ -187,13 +205,37 @@ def current_release_unit_hashes() -> dict[Path, str]:
          and public.get("config_sha256") == document.get("config_contract_sha256"),
          "current_release_public_state_mismatch")
 
-    manifest_data = manifest_path.read_bytes()
-    manifest_digest = document.get("payload_manifest_sha256")
-    need(isinstance(manifest_digest, str)
-         and len(manifest_digest) == 64
-         and sha256(manifest_data) == manifest_digest,
-         "current_release_manifest_mismatch")
+    identity = (document["tag"], document["commit"])
+    evidence_digest = public.get("payload_manifest_sha256")
 
+    # RC8 predates manifest identity in the deployed marker. Permit only the
+    # exact reviewed RC8 unit hashes embedded in this incoming immutable release.
+    if evidence_digest is None:
+        baseline = BOOTSTRAP_VERSIONED_UNIT_HASHES.get(identity)
+        need(baseline is not None, "current_release_manifest_evidence_missing")
+        need(set(baseline) == set(UNITS), "invalid_bootstrap_unit_baseline")
+        hashes: dict[Path, str] = {}
+        for name in UNITS:
+            source = current / "deploy" / "agent_platform" / "production" / f"{name}.in"
+            need(source.is_file() and not source.is_symlink(),
+                 f"current_release_unit_missing:{name}")
+            need(root_owned_readonly(source),
+                 f"unsafe_current_release_unit:{name}")
+            expected = baseline[name]
+            need(digest_file(source) == expected,
+                 f"current_release_unit_baseline_mismatch:{name}")
+            hashes[UNIT_DIR / name] = expected
+        return hashes
+
+    need(isinstance(evidence_digest, str)
+         and len(evidence_digest) == 64
+         and all(ch in "0123456789abcdef" for ch in evidence_digest)
+         and document.get("payload_manifest_sha256") == evidence_digest,
+         "current_release_manifest_evidence_mismatch")
+
+    manifest_data = manifest_path.read_bytes()
+    need(sha256(manifest_data) == evidence_digest,
+         "current_release_manifest_mismatch")
     try:
         manifest_lines = manifest_data.decode("ascii").splitlines()
     except UnicodeError as exc:
@@ -222,7 +264,6 @@ def current_release_unit_hashes() -> dict[Path, str]:
              f"current_release_unit_manifest_mismatch:{name}")
         hashes[UNIT_DIR / name] = bound[relative]
     return hashes
-
 
 def run(*args: str, check: bool = True) -> str:
     result = subprocess.run(args, check=check, capture_output=True, text=True,
@@ -616,6 +657,7 @@ def assert_deployed_coherence(
             "tag",
             "commit",
             "config_sha256",
+            "payload_manifest_sha256",
             "deployed_at",
         },
         "already_deployed_public_state_shape",
@@ -627,6 +669,8 @@ def assert_deployed_coherence(
         and document["commit"] == release["commit"]
         and document["config_sha256"]
         == release["config_contract_sha256"]
+        and document["payload_manifest_sha256"]
+        == release["payload_manifest_sha256"]
         and isinstance(document["deployed_at"], int)
         and document["deployed_at"] > 0,
         "already_deployed_public_state_mismatch",
@@ -635,11 +679,17 @@ def assert_deployed_coherence(
 
 def deployed_document(release: dict[str, object], config_digest: str, deployed_at: int) -> dict[str, object]:
     need(config_digest == release["config_contract_sha256"], "deployment_config_mismatch")
+    manifest_digest = release.get("payload_manifest_sha256")
+    need(isinstance(manifest_digest, str)
+         and len(manifest_digest) == 64
+         and all(ch in "0123456789abcdef" for ch in manifest_digest),
+         "deployment_manifest_digest_invalid")
     return {
         "version": 1,
         "tag": release["tag"],
         "commit": release["commit"],
         "config_sha256": config_digest,
+        "payload_manifest_sha256": manifest_digest,
         "deployed_at": deployed_at,
     }
 
