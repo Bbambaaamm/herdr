@@ -102,7 +102,7 @@ def intake_state():
     return out
 
 
-def result_info(task_id):
+def result_info(task_id, run_token=None):
     path = ROOT / "results" / f"{task_id}.json"
     if not path.is_file():
         return None, None
@@ -110,6 +110,10 @@ def result_info(task_id):
         raw = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return "details_available", None
+    if str(raw.get("task_id") or "") != task_id:
+        return None, None
+    if run_token not in (None, "") and str(raw.get("run_token") or "") != str(run_token):
+        return None, None
     value = raw.get("blocker")
     blocker = None if value in (None, "") else safe_text(value, "details_available")
     chunks = []
