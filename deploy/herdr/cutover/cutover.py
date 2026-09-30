@@ -1425,6 +1425,84 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
             )
         )
 
+        if not previous_requires_web and not rollback_errors:
+            degraded_state_path = (
+                STATE_DIR
+                / (
+                    f"{document['deployed_at']}-"
+                    f"{identifier}.rollback-degraded.json"
+                )
+            )
+            degraded_document = {
+                "version": 1,
+                "candidate_tag": release["tag"],
+                "candidate_commit": release["commit"],
+                "previous_path": str(previous),
+                "reason": "rollback_degraded_rc8_web_unavailable",
+                "public_root_status": root_status,
+            }
+            degraded_errors = run_rollback_steps(
+                [
+                    (
+                        "record_degraded_rollback",
+                        lambda: atomic_write(
+                            degraded_state_path,
+                            canonical_json(degraded_document),
+                            0o600,
+                        ),
+                    ),
+                    (
+                        "degraded_fail_closed_route",
+                        lambda: atomic_write(
+                            NGINX_ROUTE,
+                            maintenance,
+                            0o644,
+                        ),
+                    ),
+                    (
+                        "degraded_fail_closed_nginx_test",
+                        lambda: run(
+                            "/usr/sbin/nginx",
+                            "-t",
+                        ),
+                    ),
+                    (
+                        "degraded_fail_closed_nginx_reload",
+                        lambda: run(
+                            "/usr/bin/systemctl",
+                            "reload",
+                            "nginx",
+                        ),
+                    ),
+                    (
+                        "degraded_fail_closed_public_health",
+                        lambda: wait_http_status(
+                            "https://2.28.67.165/"
+                            "agent-platform/health",
+                            "503",
+                        ),
+                    ),
+                ]
+            )
+            run(
+                "/usr/bin/systemctl",
+                "stop",
+                "agent-stack-watchdog.service",
+                check=False,
+            )
+            raise ReleaseError(
+                "deployment_failed:"
+                f"{type(original_error).__name__}:"
+                f"{original_error};"
+                "rollback_degraded_rc8_web_unavailable"
+                + (
+                    ";fail_closed_errors:"
+                    + "|".join(degraded_errors)
+                    if degraded_errors
+                    else ""
+                )
+            ) from original_error
+
         if rollback_errors:
             # Recovery is not proven coherent. Keep the public Agent
             # Platform route fail-closed and never reopen dispatch.
