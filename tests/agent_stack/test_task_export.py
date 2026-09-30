@@ -166,5 +166,39 @@ class TaskExportTests(unittest.TestCase):
         self.assertEqual(self.exporter.rows(), [])
 
 
+    def test_blocked_task_ignores_stale_result_from_older_run_token(self):
+        self.exporter.INTAKE.write_text("{}", encoding="utf-8")
+        task = {
+            "id": "orphan-current",
+            "repo": "Bbambaaamm/Autonomous-Quant-Lab",
+            "issue": 9,
+            "agent": "quantlab-hermes",
+            "kind": "github_issue_slice",
+            "attempts": 1,
+            "max_attempts": 4,
+            "run_token": "current-token",
+        }
+        (self.root / "blocked" / "orphan-current.json").write_text(
+            json.dumps(task), encoding="utf-8"
+        )
+        (self.root / "results" / "orphan-current.json").write_text(
+            json.dumps(
+                {
+                    "task_id": "orphan-current",
+                    "run_token": "older-token",
+                    "status": "completed",
+                    "blocker": "github_write_auth_required",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        rows = {row["task_id"]: row for row in self.exporter.rows()}
+
+        self.assertIn("orphan-current", rows)
+        self.assertIsNone(rows["orphan-current"]["blocker"])
+        self.assertIsNone(rows["orphan-current"]["pr_number"])
+
+
 if __name__ == "__main__":
     unittest.main()
