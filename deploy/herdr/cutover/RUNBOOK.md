@@ -74,6 +74,29 @@ The apply operation:
 9. restores the exact authenticated Nginx route and proves the QuantLab root status
    and unauthenticated `401` boundary are unchanged.
 
+### RC8 one-time rollback compatibility
+
+The exact deployed bootstrap release
+`/opt/herdr/releases/v0.3.0-rc.8-d58283bc4bf9` predates the bounded
+high-cardinality router projection used by later releases. With current production
+router history, its legacy web preflight cannot represent more than 50 grouped
+router rows and therefore cannot be truthfully restarted during the intermediate
+rollback exercise.
+
+For this exact path only, cutover still restores and verifies the previous symlink,
+systemd unit bytes and deployed marker, starts the previous bounded exporter, keeps
+the legacy web process stopped, and proves that the public Agent Platform remains
+fail-closed behind the maintenance `503` route. The final candidate promotion must
+still start its own exporter and web service and prove the normal local `401`
+boundary before public activation.
+
+This is not a generic rollback bypass. Any previous release other than the exact RC8
+bootstrap path still requires the full web restart and local `401` rollback proof.
+If a later deployment fails and must remain on RC8, the exact active Nginx route is
+restored and the unauthenticated `401` boundary is re-proved, while RC8 web may
+remain unavailable for authenticated traffic; the operator must treat that as a
+degraded fail-closed rollback state, not as successful application availability.
+
 An `already_deployed` result is accepted only when the current symlink,
 all candidate systemd units, installed consumer policy digest, and bounded
 `deployed-release.json` identify the same immutable release.
