@@ -58,9 +58,10 @@ def test_stale_orphan_is_quarantined_without_blind_requeue(tmp_path, monkeypatch
 
     recovery.recover_orphan_tasks(now)
 
-    assert path.exists()
-    assert not (recovery.BLOCKED / path.name).exists()
-    quarantined = json.loads(path.read_text(encoding="utf-8"))
+    assert not path.exists()
+    blocked_path = recovery.BLOCKED / path.name
+    assert blocked_path.exists()
+    quarantined = json.loads(blocked_path.read_text(encoding="utf-8"))
     assert quarantined["watchdog_blocker"] == "orphaned_running_unknown_delivery"
     assert quarantined["attempt_state"] == "delivery_uncertain"
     assert "result_status" not in quarantined
@@ -70,6 +71,53 @@ def test_stale_orphan_is_quarantined_without_blind_requeue(tmp_path, monkeypatch
     result = json.loads(sidecars[0].read_text(encoding="utf-8"))
     assert result["status"] == "blocked"
     assert result["blocker"] == "orphaned_running_unknown_delivery"
+
+
+def test_orphan_quarantine_preserves_attempt_identity_and_never_requeues(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    now = datetime(2026, 9, 27, 7, 0, tzinfo=timezone.utc)
+    payload = task(now)
+    payload["attempts"] = 2
+    payload["run_token"] = "stable-run-token"
+    payload["attempt_state"] = "dispatching"
+    path = recovery.RUNNING / "task-1.json"
+    write_task(path, payload)
+    monkeypatch.setattr(recovery, "active_worker_tasks", lambda: set())
+
+    recovery.recover_orphan_tasks(now)
+
+    blocked_path = recovery.BLOCKED / path.name
+    saved = json.loads(blocked_path.read_text(encoding="utf-8"))
+    assert saved["attempts"] == 2
+    assert saved["run_token"] == "stable-run-token"
+    assert saved["attempt_state"] == "delivery_uncertain"
+    assert saved["watchdog_blocker"] == "orphaned_running_unknown_delivery"
+    assert not list(recovery.RUNNING.glob("*.json"))
+    assert not list(recovery.DONE.glob("*.json"))
+    assert not list(recovery.FAILED.glob("*.json"))
+
+
+def test_marked_running_orphan_resumes_interrupted_move_to_blocked(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    now = datetime(2026, 9, 27, 7, 0, tzinfo=timezone.utc)
+    payload = task(now)
+    payload["watchdog_blocker"] = "orphaned_running_unknown_delivery"
+    payload["attempt_state"] = "delivery_uncertain"
+    payload["last_error"] = "previous watchdog interrupted before rename"
+    path = recovery.RUNNING / "task-1.json"
+    write_task(path, payload)
+    monkeypatch.setattr(recovery, "active_worker_tasks", lambda: set())
+
+    recovery.recover_orphan_tasks(now)
+
+    assert not path.exists()
+    blocked = recovery.BLOCKED / "task-1.json"
+    assert blocked.exists()
+    saved = json.loads(blocked.read_text(encoding="utf-8"))
+    assert saved["run_token"] == "token-1"
+    assert saved["attempt_state"] == "delivery_uncertain"
+    assert saved["watchdog_blocker"] == "orphaned_running_unknown_delivery"
+    assert len(list(recovery.RESULTS.glob("task-1.watchdog-recovery-*.json"))) == 0
 
 
 def test_live_worker_prevents_orphan_recovery(tmp_path, monkeypatch):
@@ -354,7 +402,9 @@ def test_late_result_after_quarantine_terminalizes_on_next_cycle(tmp_path, monke
     recovery.recover_orphan_tasks(now)
     sidecars_before = list(recovery.RESULTS.glob("task-1.watchdog-recovery-*.json"))
     assert len(sidecars_before) == 1
-    assert path.exists()
+    assert not path.exists()
+    blocked_path = recovery.BLOCKED / "task-1.json"
+    assert blocked_path.exists()
 
     write_task(
         recovery.RESULTS / "task-1.json",
@@ -365,9 +415,9 @@ def test_late_result_after_quarantine_terminalizes_on_next_cycle(tmp_path, monke
             "blocker": None,
         },
     )
-    recovery.recover_orphan_tasks(now + timedelta(seconds=60))
+    recovery.reconcile_watchdog_blocked_tasks()
 
-    assert not path.exists()
+    assert not blocked_path.exists()
     assert (recovery.DONE / "task-1.json").exists()
     assert len(list(recovery.RESULTS.glob("task-1.watchdog-recovery-*.json"))) == 1
 
@@ -380,9 +430,14 @@ def test_quarantined_orphan_does_not_repeat_sidecar_evidence(tmp_path, monkeypat
     monkeypatch.setattr(recovery, "active_worker_tasks", lambda: set())
 
     recovery.recover_orphan_tasks(now)
-    recovery.recover_orphan_tasks(now + timedelta(seconds=60))
+    blocked_path = recovery.BLOCKED / "task-1.json"
+    assert not path.exists()
+    assert blocked_path.exists()
 
-    assert path.exists()
+    recovery.recover_orphan_tasks(now + timedelta(seconds=60))
+    recovery.reconcile_watchdog_blocked_tasks()
+
+    assert blocked_path.exists()
     assert len(list(recovery.RESULTS.glob("task-1.watchdog-recovery-*.json"))) == 1
 
 
@@ -444,8 +499,10 @@ def test_non_object_result_does_not_abort_recovery_of_later_task(tmp_path, monke
 
     recovery.recover_orphan_tasks(now)
 
-    assert first.exists()
-    first_saved = json.loads(first.read_text(encoding="utf-8"))
+    assert not first.exists()
+    first_blocked = recovery.BLOCKED / "task-a.json"
+    assert first_blocked.exists()
+    first_saved = json.loads(first_blocked.read_text(encoding="utf-8"))
     assert first_saved["attempt_state"] == "delivery_uncertain"
     assert "invalid_shape" in first_saved["last_error"]
     assert not second.exists()
@@ -658,9 +715,11 @@ def test_unsupported_exact_result_preserves_task_owned_pane(
     )
 
     assert cleanup_calls == []
-    assert path.exists()
+    assert not path.exists()
+    blocked_path = recovery.BLOCKED / "task-1.json"
+    assert blocked_path.exists()
 
-    saved = json.loads(path.read_text(encoding="utf-8"))
+    saved = json.loads(blocked_path.read_text(encoding="utf-8"))
 
     assert saved["attempt_state"] == "delivery_uncertain"
     assert (
