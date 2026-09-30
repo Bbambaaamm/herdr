@@ -23,8 +23,21 @@
       "workspace": "/home/agentops/workspaces/dotacni-majak",
       "safety_profile": "dotacni-majak",
       "hermes_profile": "majak",
-      "priority_default": 10,
-      "priority_architecture": 10
+      "priority_default": 60,
+      "priority_architecture": 60
+    },
+    {
+      "consumer": "herdr",
+      "enabled": true,
+      "repository": "Bbambaaamm/herdr",
+      "mode": "root_only",
+      "root_issue": 53,
+      "coordinator_agent": "herdr-hermes",
+      "workspace": "/home/agentops/workspaces/herdr",
+      "safety_profile": "herdr-core",
+      "hermes_profile": "quantlab",
+      "priority_default": 60,
+      "priority_architecture": 60
     },
     {
       "consumer": "heating",

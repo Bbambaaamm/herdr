@@ -290,6 +290,46 @@ Stop only for an explicit human release gate, new credential/secret, billing/pai
 Do not flatten or independently queue the full Maják backlog from this root cycle.
 """.strip()
 
+    if name == "herdr":
+        return f"""
+Continue Herdr control root issue #{number} as ONE autonomous backlog-drain orchestration cycle.
+Issue: {title}
+URL: {url}
+
+Current root issue body:
+{body[:12000]}
+
+Prior durable evidence for this root:
+{prior}
+
+This is the stable control-plane root for the Herdr repository, not a normal implementation ticket.
+Before acting:
+- fetch current origin/main, all open issues, open PRs, exact-head CI/reviews and prior durable results;
+- identify already-running tasks/branches/PRs before planning so no semantic or economic work is duplicated;
+- derive the live dependency-safe backlog from issue bodies, acceptance gates and repository evidence;
+- classify remaining work as AUTO, HUMAN_GATE, CREDENTIAL_GATE, PRIVILEGE_GATE, EXTERNAL_GATE or ACCEPTANCE_GATE.
+
+Operating model:
+- herdr-hermes is the stable cognitive parent/coordinator;
+- Herdr durable TaskGraph/admission/lease/fencing/recovery semantics remain authoritative;
+- select the nearest dependency-ready AUTO slice, not simply the lowest or newest issue number;
+- delegate bounded research/code/test/review work to available Herdr child agents (including herdr-codex) when useful;
+- independent dependency-safe branches may run concurrently only inside admission/resource/fanout limits;
+- use isolated clean worktrees under /home/agentops/worktrees/herdr/ for code changes;
+- never write directly to main, bypass CI/review/rulesets, widen child permissions, create unbounded retries/fallbacks/fanout, or fabricate acceptance evidence;
+- merge only after required tests, exact-head green CI and independent exact-head review with no unresolved applicable finding;
+- after every merge re-read live main/issues/PRs and replan immediately;
+- keep root #{number} open until every agent-compatible Herdr issue is satisfied and any remainder is explicitly evidenced as a genuine gate.
+
+Gate handling:
+- a gated leaf must not stop the root while another dependency-ready AUTO issue is available;
+- do not mark the root user_action_required merely because one leaf is gated;
+- if only an elapsed-time ACCEPTANCE_GATE remains (for example the #9 >=24h clean soak), return a completed cycle with precise next_action so intake can re-check after cooldown; never manufacture elapsed time;
+- use a blocking root result only when no safe AUTO work remains and progress truly requires human input, a new credential/secret, a paid/billing decision, an external dependency, sudo/production deployment or another irreversible privileged action.
+
+Do not flatten the Herdr backlog into duplicate outer durable tasks. This root owns backlog selection and bounded delegation.
+""".strip()
+
     if name == "quantlab":
         return f"""
 Continue Autonomous Quant Lab GitHub issue #{number} as ONE bounded, dependency-safe work slice.

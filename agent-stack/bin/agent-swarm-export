@@ -13,7 +13,8 @@ STATES = ("running", "pending", "blocked", "failed", "done")
 STATE_RANK = {"running": 5, "pending": 4, "blocked": 3, "failed": 2, "done": 1}
 ALLOWED_REPOS = {"Bbambaaamm/herdr", "Bbambaaamm/Autonomous-Quant-Lab"}
 AQL_REPO = "Bbambaaamm/Autonomous-Quant-Lab"
-ALLOWED_POLICY_PROFILES = {"default", "quantlab-paper"}
+HERDR_REPO = "Bbambaaamm/herdr"
+ALLOWED_POLICY_PROFILES = {"default", "herdr-core", "quantlab-paper"}
 IDENTIFIER = re.compile(r"^[A-Za-z0-9._/:-]{1,256}$")
 TASK_IDENTIFIER = re.compile(r"^[A-Za-z0-9._:-]{1,256}$")
 HEX_ID = re.compile(r"^[0-9a-f]{64}$")
@@ -121,6 +122,12 @@ def policy_metadata(raw, repo):
         if not (paper is True or profile == "quantlab-paper" or safety == "quantlab"):
             raise ValueError("quantlab_non_paper")
         return "quantlab-paper", True
+    if repo == HERDR_REPO and safety == "herdr-core":
+        if paper is True or profile == "quantlab-paper":
+            raise ValueError("herdr_policy_conflict")
+        if profile not in (None, "", "default", "herdr-core"):
+            raise ValueError("herdr_unknown_policy_profile")
+        return "herdr-core", False
     if safety not in (None, "", "quantlab"):
         raise ValueError("non_quantlab_safety_profile")
     if paper is False and profile == "quantlab-paper":
@@ -360,6 +367,7 @@ def materialize(records, observed_at=None):
     agent_ids = set()
     edge_keys = set()
     paper_flags = []
+    policy_profiles = set()
     for record in sorted(selected, key=lambda row: row["task_id"]):
         raw = record["raw"]
         result = result_for(record["task_id"], raw)
@@ -410,6 +418,7 @@ def materialize(records, observed_at=None):
         profile, task_paper = policy_metadata(raw, repo)
         if profile is not None:
             task["policy_profile"] = profile
+            policy_profiles.add(profile)
         task["paper_only"] = task_paper
         paper_flags.append(task_paper)
         tasks.append(task)
@@ -440,6 +449,7 @@ def materialize(records, observed_at=None):
         "issue": issue,
         "observed_at": now_epoch() if observed_at is None else nonnegative_int(observed_at),
         "paper_only": bool(tasks) and all(paper_flags),
+        "policy_profiles": sorted(policy_profiles),
         "agents": agents,
         "tasks": tasks,
         "edges": edges,

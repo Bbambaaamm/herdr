@@ -1,0 +1,15 @@
+schema_version: 1
+consumer: herdr
+repository: Bbambaaamm/herdr
+policy_profile: herdr-core
+hard_invariants:
+  - no_direct_main_write
+  - no_ci_review_or_ruleset_bypass
+  - bounded_retries_fallbacks_and_fanout
+  - no_permission_escalation
+  - no_fabricated_acceptance_evidence
+inheritance:
+  child_may_expand_parent_permissions: false
+routing:
+  capability_aware: true
+  cost_aware: true

@@ -27,6 +27,27 @@ Runtime GitHub intake consumers are declared in
 `agent-stack/config/github-intake-consumers.json`. Durable intake/task identity is scoped by
 `repository#issue` so issue numbers cannot collide across consumers.
 
+## Herdr
+
+Repository: Bbambaaamm/herdr
+
+Herdr is also a consumer of its own orchestration runtime for repository maintenance and completion.
+GitHub intake is root-only through issue `#53`: the stable `herdr-hermes` coordinator reads the
+live Herdr backlog, derives dependency-safe AUTO work, delegates bounded child work and replans
+after every merge. Individual Herdr implementation issues are not flattened into duplicate outer
+durable tasks.
+
+Runtime workspace: `/home/agentops/workspaces/herdr`.
+Task worktrees: `/home/agentops/worktrees/herdr/` (outside the persistent checkout).
+Repository policy profile: `herdr-core`.
+The persistent Hermes process currently reuses the deployed `quantlab` Hermes runtime profile
+for model/tool wiring only; Herdr repository authority and safety semantics come from the separate
+`herdr-core` task contract.
+
+A gated leaf does not stop unrelated AUTO work. Human/credential/external/privileged blockers
+become a root blocker only when no dependency-ready AUTO work remains. Elapsed acceptance gates
+such as the #9 soak are re-checked after cooldown and may never be fabricated.
+
 ## Heating
 
 Repository: Bbambaaamm/heating

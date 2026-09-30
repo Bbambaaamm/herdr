@@ -16,7 +16,7 @@ ExecStartPre=/opt/herdr/current/agent-stack/bin/agent-stack-ensure
 ExecStart=/opt/herdr/current/agent-stack/bin/agent-stack-watchdog
 Restart=always
 RestartSec=5
-TimeoutStartSec=120
+TimeoutStartSec=300
 
 [Install]
 WantedBy=multi-user.target

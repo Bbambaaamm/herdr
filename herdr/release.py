@@ -17,7 +17,7 @@ SCHEMA_VERSION = 1
 TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z][0-9A-Za-z.-]{0,47})?")
 HEX40 = re.compile(r"[0-9a-f]{40}")
 HEX64 = re.compile(r"[0-9a-f]{64}")
-CONSUMERS = ("heating", "majak", "quantlab")
+CONSUMERS = ("heating", "herdr", "majak", "quantlab")
 PAYLOAD_PATHS = (
     "README.md",
     "agent-stack",

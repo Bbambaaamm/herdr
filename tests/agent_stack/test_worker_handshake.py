@@ -280,6 +280,40 @@ def test_run_prompt_targets_task_session_never_persistent_coordinator(tmp_path, 
     assert "persistent coordinator chat is control-plane only" in prompt
 
 
+def test_herdr_core_prompt_has_generic_backlog_contract(tmp_path):
+    configure_paths(tmp_path)
+    task = base_task()
+    task.update(
+        {
+            "repo": "Bbambaaamm/herdr",
+            "workspace": "/home/agentops/workspaces/herdr",
+            "safety_profile": "herdr-core",
+            "hermes_profile": "quantlab",
+            "run_token": "herdr-root-run",
+            "routing": {
+                "selected_agent": "herdr-hermes",
+                "tier": "profile-default",
+                "model": "profile-router",
+            },
+            "execution_session": {
+                "agent_name": "herdr-hermes-t-deadbeef",
+                "session_name": "durable-herdr",
+                "pane_id": "owned-herdr-pane",
+                "coordinator_agent": "herdr-hermes",
+                "owned_pane": True,
+            },
+        }
+    )
+
+    prompt = worker.prompt_text(task)
+    assert "repository Bbambaaamm/herdr" in prompt
+    assert "Root issue #53 is orchestration authority" in prompt
+    assert "PAPER-only, PIT/causality" not in prompt
+    assert "status=blocked only when the whole safe backlog cannot progress" in prompt
+    assert "/home/agentops/worktrees/herdr/" in prompt
+    assert "/home/agentops/workspaces/herdr/worktrees/" not in prompt
+
+
 def test_run_prompt_fails_closed_without_isolated_session(tmp_path):
     configure_paths(tmp_path)
     task = base_task()

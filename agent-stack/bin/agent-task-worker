@@ -415,6 +415,24 @@ TASK COMPLETION CONTRACT:
 - If GitHub write authorization is required, set status=blocked and blocker=github_write_auth_required. Preserve exact branch/patch/evidence and do not redo implementation.
 - If user-only approval, paid-provider activation, new credential, production deploy, or another interactive authorization is required, do not guess or self-approve; report the specific blocker.
 """
+    elif profile == "herdr-core":
+        contract = f"""
+
+TASK COMPLETION CONTRACT:
+- You are running in isolated durable-task session {task_agent}, derived from coordinator {agent}, under Herdr for GitHub repository {repo}. The persistent coordinator chat is control-plane only and must not receive this task payload.
+- Work from {workspace}. Fetch current origin/main and inspect live issues, PRs, exact-head CI/reviews and prior durable evidence before changing code.
+- Root issue #53 is orchestration authority, not an implementation target. Select only dependency-ready AUTO work and avoid duplicating any running task/branch/PR/economic attempt.
+- Use isolated clean worktrees under /home/agentops/worktrees/herdr/ for code changes. Never contaminate the persistent coordinator checkout.
+- Preserve durable task identity, run_token/idempotency, leases/fencing, bounded retries/fanout, consumer isolation, admission/resource limits and fail-closed reconciliation.
+- No child may widen permissions above the parent. Never write directly to main or bypass branch protection, CI, review, credentials, billing, deploy holds, release gates or acceptance gates.
+- Exact-head merge flow is tests -> CI green -> independent review with no unresolved applicable finding -> unchanged head verification -> merge only if repository protection permits.
+- A gated leaf does not block unrelated dependency-ready AUTO work. Do not fabricate elapsed soak evidence; an elapsed-time acceptance wait should end this cycle as completed with a precise next_action for later re-check.
+- Use status=blocked only when the whole safe backlog cannot progress without genuine human/credential/external/privileged action.
+- Before finishing, write UTF-8 JSON to {result}.
+- The JSON MUST contain exactly this task identity: task_id="{task_id}" and run_token="{run_token}".
+- Include keys: task_id, run_token, status, summary, issue, repo, evidence, blocker, next_action, completed_at. repo must be "{repo}".
+- status must be one of completed, blocked, failed.
+"""
     else:
         route_rule = {
             "free": f"- Keep {agent} as the root coordinator. Eligible child nodes may use the FREE route via {executor_agent}; do not replace the parent identity.",

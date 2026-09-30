@@ -52,6 +52,10 @@ def minimal_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path,
     return repo, commit
 
 
+def test_release_consumer_contract_includes_herdr():
+    assert "herdr" in release.CONSUMERS
+
+
 def test_consumer_contract_is_closed_and_permission_monotonic():
     files = {f"{name}.yaml": consumer(name) for name in release.CONSUMERS}
     assert len(release.consumer_digest(files)) == 64
