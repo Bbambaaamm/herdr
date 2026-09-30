@@ -105,14 +105,11 @@ def policy_metadata(raw, repo):
     paper = raw.get("paper_only")
     if paper is not None and type(paper) is not bool:
         raise ValueError("invalid_paper_only")
-    if paper is False:
-        if repo == AQL_REPO:
-            raise ValueError("quantlab_non_paper")
-        raise ValueError("explicit_non_paper")
-    if profile not in (None, ""):
-        if profile not in ALLOWED_POLICY_PROFILES:
-            raise ValueError("unknown_policy_profile")
+    if profile not in (None, "") and profile not in ALLOWED_POLICY_PROFILES:
+        raise ValueError("unknown_policy_profile")
     if repo == AQL_REPO:
+        if paper is False:
+            raise ValueError("quantlab_non_paper")
         if profile not in (None, "", "quantlab-paper"):
             raise ValueError("quantlab_non_paper")
         if safety not in (None, "", "quantlab"):
@@ -122,6 +119,8 @@ def policy_metadata(raw, repo):
         return "quantlab-paper", True
     if safety not in (None, "", "quantlab"):
         raise ValueError("non_quantlab_safety_profile")
+    if paper is False and profile == "quantlab-paper":
+        raise ValueError("explicit_non_paper")
     return (profile or None), paper is True or profile == "quantlab-paper"
 
 def explicit_agent_id(raw):
@@ -151,18 +150,21 @@ def optional_task_id(value):
         raise ValueError("invalid_task_id")
     return value
 
+def file_identity(path):
+    info = path.stat()
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+
 def stable_task_json(path):
     try:
-        before = path.stat()
+        before = file_identity(path)
         raw = read_json(path)
-        after = path.stat()
+        after = file_identity(path)
     except FileNotFoundError as exc:
         raise SnapshotRace("task_moved_during_scan") from exc
-    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-    if identity_before != identity_after:
+    if before != after:
         raise SnapshotRace("task_changed_during_scan")
-    return raw
+    return raw, after
 
 
 def state_inventory():
@@ -178,14 +180,17 @@ def state_inventory():
 
 def _load_records_once():
     before_inventory = state_inventory()
+    listed = {
+        state: tuple(ROOT / state / name for name in before_inventory[state])
+        for state in STATES
+    }
     records = []
+    observed_files = []
     seen = set()
     for state in STATES:
-        folder = ROOT / state
-        if not folder.is_dir():
-            continue
-        for path in sorted(folder.glob("*.json")):
-            raw = stable_task_json(path)
+        for path in listed[state]:
+            raw, identity_after = stable_task_json(path)
+            observed_files.append((path, identity_after))
             repo = raw.get("repo")
             if repo not in ALLOWED_REPOS:
                 continue
@@ -208,6 +213,13 @@ def _load_records_once():
             })
     if state_inventory() != before_inventory:
         raise SnapshotRace("task_directory_changed_during_scan")
+    for path, expected in observed_files:
+        try:
+            current = file_identity(path)
+        except FileNotFoundError as exc:
+            raise SnapshotRace("task_moved_after_read") from exc
+        if current != expected:
+            raise SnapshotRace("task_replaced_after_read")
     return records
 
 
@@ -415,7 +427,8 @@ def materialize(records, observed_at=None):
             agents.append(agent)
     if len(edge_keys) > MAX_EDGES:
         raise ValueError("too_many_edges")
-    ensure_acyclic(ids, edge_keys)
+    ensure_acyclic(ids, {edge for edge in edge_keys if edge[2] == "parent"})
+    ensure_acyclic(ids, {edge for edge in edge_keys if edge[2] == "dependency"})
     edges = [{"from": left, "to": right, "kind": kind} for left, right, kind in sorted(edge_keys)]
     return {
         "version": 1,
