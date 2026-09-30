@@ -122,7 +122,7 @@ export function mountDashboard(createScene) {
       max_attempts: row.max_attempts,
       not_before: null,
       updated_at: updated,
-      agent: row.agent_id || row.parent_agent_id || 'quantlab-hermes',
+      agent: row.agent_id || null,
       kind: 'herdr_swarm',
       blocker: row.blocker,
       pr_number: null,
@@ -138,6 +138,7 @@ export function mountDashboard(createScene) {
       fencing_token: row.fencing_token,
     }));
   }
+  function swarmAgents() { return swarmSnapshot()?.agents || []; }
   function swarmEdges() { return swarmSnapshot()?.edges || []; }
   function taskRows() { return swarmSnapshot() ? [...swarmTasks(), ...queueTasks('majak')] : queueTasks(); }
   function admissionSource() { return source('quantlab', 'admission'); }
@@ -262,7 +263,7 @@ export function mountDashboard(createScene) {
     const running = count('running'), waiting = count('pending'), failed = count('failed'), blockedOnly = count('blocked'), done = count('done');
     const blocked = blockedOnly + failed;
     const activeAgents = swarmSnapshot()
-      ? new Set(queue.filter(row => ['running', 'blocked'].includes(row.status)).map(row => row.agent).filter(Boolean)).size
+      ? swarmAgents().length
       : agents().filter(row => row.status === 'working').length;
     const retries = queue.reduce((sum, row) => sum + (Number.isSafeInteger(row.attempts) ? Math.max(0, row.attempts - 1) : 0), 0);
     const terminal = done + failed;
@@ -600,7 +601,7 @@ export function mountDashboard(createScene) {
     const knownCost = routersAvailable ? profileStats.reduce((sum, value) => sum + value.costKnown, 0) : null;
     const unknownCostRequests = routersAvailable ? profileStats.reduce((sum, value) => sum + value.costUnknownRequests, 0) : null;
     const activeAgents = swarmSnapshot()
-      ? new Set(taskRows().filter(row => ['running', 'blocked'].includes(row.status)).map(row => row.agent).filter(Boolean)).size
+      ? swarmAgents().length
       : agents().filter(row => row.status === 'working').length;
     const activeQueue = activeQueueTasks().length;
     const remaining = codex ? 100 - codex.used_percent : null;
