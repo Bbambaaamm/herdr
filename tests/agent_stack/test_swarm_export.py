@@ -235,6 +235,20 @@ class SwarmExportTests(unittest.TestCase):
                     self.exporter.load_records()
                 path.unlink()
 
+    def test_generic_herdr_explicit_non_paper_is_valid(self):
+        self.write_task(
+            "pending",
+            self.herdr_task(
+                "generic-non-paper",
+                policy_profile="default",
+                paper_only=False,
+            ),
+        )
+        payload = self.exporter.materialize(self.exporter.load_records(), observed_at=100)
+        self.assertFalse(payload["paper_only"])
+        self.assertFalse(payload["tasks"][0]["paper_only"])
+        self.assertEqual(payload["tasks"][0]["policy_profile"], "default")
+
     def test_non_paper_quantlab_is_rejected(self):
         self.write_task(
             "pending",
@@ -425,6 +439,44 @@ class SwarmExportTests(unittest.TestCase):
         self.write_task("pending", self.herdr_task("b", parent_task_id="a"))
         with self.assertRaisesRegex(ValueError, "cyclic_graph"):
             self.exporter.materialize(self.exporter.load_records(), observed_at=100)
+
+    def test_parent_and_dependency_graphs_are_validated_independently(self):
+        self.write_task(
+            "pending",
+            self.herdr_task("parent", dependencies=["child"]),
+        )
+        self.write_task(
+            "pending",
+            self.herdr_task("child", parent_task_id="parent"),
+        )
+        payload = self.exporter.materialize(self.exporter.load_records(), observed_at=100)
+        self.assertEqual(
+            payload["edges"],
+            [
+                {"from": "child", "to": "parent", "kind": "dependency"},
+                {"from": "parent", "to": "child", "kind": "parent"},
+            ],
+        )
+
+    def test_same_path_rewrite_after_read_forces_snapshot_retry(self):
+        path = self.write_task("running", self.herdr_task("rewritten", attempts=0))
+        original = self.exporter.file_identity
+        calls = {"count": 0}
+
+        def rewrite_before_final_recheck(candidate):
+            if candidate == path:
+                calls["count"] += 1
+                if calls["count"] == 3:
+                    changed = self.herdr_task("rewritten", attempts=1)
+                    path.write_text(json.dumps(changed), encoding="utf-8")
+            return original(candidate)
+
+        self.exporter.file_identity = rewrite_before_final_recheck
+        try:
+            with self.assertRaisesRegex(self.exporter.SnapshotRace, "task_replaced_after_read"):
+                self.exporter._load_records_once()
+        finally:
+            self.exporter.file_identity = original
 
     def test_explicit_false_cannot_be_overridden_by_policy_label(self):
         self.write_task(
