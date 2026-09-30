@@ -75,6 +75,22 @@ class GitHubIntakeTests(unittest.TestCase):
             "priority_architecture": 10,
         }
 
+    @staticmethod
+    def herdr_consumer():
+        return {
+            "consumer": "herdr",
+            "enabled": True,
+            "repository": "Bbambaaamm/herdr",
+            "mode": "root_only",
+            "root_issue": 53,
+            "coordinator_agent": "quantlab-hermes",
+            "workspace": "/home/agentops/workspaces/quantlab",
+            "safety_profile": "herdr",
+            "hermes_profile": "quantlab",
+            "priority_default": 20,
+            "priority_architecture": 20,
+        }
+
     def test_load_state_migrates_legacy_quantlab_keys(self):
         self.intake.STATE.write_text(
             json.dumps({"45": {"open": True, "scheduler_state": "active"}}),
@@ -105,7 +121,7 @@ class GitHubIntakeTests(unittest.TestCase):
         self.assertEqual(len(indexed["Bbambaaamm/Autonomous-Quant-Lab#45"]), 1)
         self.assertEqual(len(indexed["Bbambaaamm/dotacni-majak#45"]), 1)
 
-    def test_registry_enables_quantlab_and_majak_but_not_disabled_heating(self):
+    def test_registry_enables_quantlab_majak_and_herdr_but_not_disabled_heating(self):
         heating = {
             "consumer": "heating",
             "enabled": False,
@@ -116,9 +132,17 @@ class GitHubIntakeTests(unittest.TestCase):
             "safety_profile": "heating-safe-engineering",
             "hermes_profile": "heating",
         }
-        self.write_config([self.quantlab_consumer(), self.majak_consumer(), heating])
+        self.write_config([
+            self.quantlab_consumer(),
+            self.majak_consumer(),
+            self.herdr_consumer(),
+            heating,
+        ])
         consumers = self.intake.load_consumers()
-        self.assertEqual([row["consumer"] for row in consumers], ["quantlab", "majak"])
+        self.assertEqual(
+            [row["consumer"] for row in consumers],
+            ["quantlab", "majak", "herdr"],
+        )
 
     def test_registry_fails_closed_on_duplicate_repository(self):
         duplicate = self.majak_consumer()
@@ -183,6 +207,50 @@ class GitHubIntakeTests(unittest.TestCase):
         self.assertEqual(task["priority"], 10)
         self.assertIn("control-plane root", task["prompt"])
         self.assertIn("Do not flatten", task["prompt"])
+
+    def test_herdr_root_fetch_targets_only_53(self):
+        seen = []
+
+        def fake_fetch(url):
+            seen.append(url)
+            return {
+                "number": 53,
+                "state": "open",
+                "title": "HERDR CONTROL: autonomous backlog drain",
+                "html_url": "https://github.com/Bbambaaamm/herdr/issues/53",
+                "body": "root",
+            }
+
+        self.intake.fetch_json = fake_fetch
+        issues = self.intake.fetch_issues(self.herdr_consumer())
+        self.assertEqual([row["number"] for row in issues], [53])
+        self.assertEqual(
+            seen,
+            ["https://api.github.com/repos/Bbambaaamm/herdr/issues/53"],
+        )
+
+    def test_queue_herdr_root_is_repo_scoped_and_dependency_safe(self):
+        issue = {
+            "number": 53,
+            "title": "HERDR CONTROL: autonomous backlog drain",
+            "body": "Drain the Herdr backlog",
+            "html_url": "https://github.com/Bbambaaamm/herdr/issues/53",
+        }
+        task_id = self.intake.queue_issue(self.herdr_consumer(), issue, [])
+        task = json.loads((self.intake.PENDING / f"{task_id}.json").read_text())
+
+        self.assertTrue(task_id.startswith("github-herdr-issue-53-"))
+        self.assertEqual(task["kind"], "github_root_orchestration")
+        self.assertEqual(task["repo"], "Bbambaaamm/herdr")
+        self.assertEqual(task["workspace"], "/home/agentops/workspaces/quantlab")
+        self.assertEqual(task["safety_profile"], "herdr")
+        self.assertEqual(task["hermes_profile"], "quantlab")
+        self.assertEqual(task["agent"], "quantlab-hermes")
+        self.assertEqual(task["coordinator_agent"], "quantlab-hermes")
+        self.assertEqual(task["priority"], 20)
+        self.assertIn("dependency/gate view", task["prompt"])
+        self.assertIn("#9 elapsed-time/soak acceptance", task["prompt"])
+        self.assertIn("Do not flatten all Herdr issues", task["prompt"])
 
     def test_repo_scoped_prior_evidence_does_not_cross_consumers(self):
         qtask = {
