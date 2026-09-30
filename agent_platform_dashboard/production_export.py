@@ -89,6 +89,8 @@ def collect(config, now):
                 if queue_load_failed:
                     raise ValueError('invalid_metadata')
                 rows, data_at = sources.queue_from_payload(queue_payload, profile)
+            elif kind == 'swarm':
+                rows, data_at = sources.live_swarm(profile, now)
             else:
                 rows, data_at = adapters[kind](setting, profile)
             c.need(data_at is None or data_at <= now)
@@ -106,6 +108,8 @@ def collect(config, now):
             c.validate(snapshot)
             if kind == 'swarm':
                 c.encode(snapshot)
+        except sources.StaleSource:
+            source.update(rows=[], data_at=None, status='unavailable', reason='stale', board_id=None, source_epoch=None)
         except sources.NotConfigured:
             source.update(rows=[], data_at=None, status='unavailable', reason='not_configured', board_id=None, source_epoch=None)
         except Exception:
