@@ -48,7 +48,7 @@ def test_checkout_rejects_malicious_push_url(monkeypatch, tmp_path):
 
     def fake_run(args, timeout=30):
         calls.append(list(args))
-        if args[-2:] == ["--is-inside-work-tree"]:
+        if args[-2:] == ["rev-parse", "--is-inside-work-tree"]:
             return completed(args, "true\n")
         if args[-4:] == ["remote", "get-url", "--all", "origin"]:
             return completed(args, "https://github.com/Bbambaaamm/herdr.git\n")
