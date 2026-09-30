@@ -167,11 +167,13 @@ CASE WHEN count(cost_usd)=count(*) THEN sum(cost_usd) END,
 sum(coalesce(fallback_used,0)),
 sum(CASE WHEN success=1 THEN 1 ELSE 0 END),
 CASE WHEN count(duration_s)=count(*) THEN sum(duration_s) END,
-max(coalesce(ended_at,started_at)) FROM
+max(coalesce(ended_at,started_at)) AS last_used_at FROM
 (SELECT id,task_id,actual_model,provider,started_at,ended_at,input_tokens,output_tokens,
         cost_usd,fallback_used,success,duration_s
  FROM requests ORDER BY id DESC LIMIT 1000)
-GROUP BY task_id,actual_model,provider LIMIT 51'''
+GROUP BY task_id,actual_model,provider
+ORDER BY last_used_at DESC,task_id ASC,actual_model ASC,provider ASC
+LIMIT 50'''
 
 
 def router(path, profile):
