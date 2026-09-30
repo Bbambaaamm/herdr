@@ -65,8 +65,6 @@ DESIRED = [
     },
 ]
 
-STATE.mkdir(parents=True, exist_ok=True)
-
 def log(message):
     line = f"{datetime.now().isoformat(timespec='seconds')} {message}"
     with LOG.open("a", encoding="utf-8") as fh:
@@ -320,6 +318,7 @@ def ensure_agent(workspace_id, spec):
     log(f"{spec['name']}: restored in {pane}")
 
 def main():
+    STATE.mkdir(parents=True, exist_ok=True)
     log("=== ensure start ===")
     ensure_desktop_commander()
     ensure_herdr_server()
