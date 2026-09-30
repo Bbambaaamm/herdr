@@ -467,16 +467,28 @@ export function mountDashboard(createScene) {
     if (demo) return demoState;
     if (!liveData) return 'offline';
     const swarm = swarmSnapshot();
+    const all = agents();
     if (swarm) {
       const tasks = swarmTasks();
       const blocked = tasks.filter(row => ['blocked', 'failed'].includes(row.status));
-      if (blocked.some(row => USER_ACTION_BLOCKERS.has(row.blocker))) return 'waiting_user';
-      if (swarmAgents().length || tasks.some(row => row.status === 'running')) return 'working';
-      if (blocked.length) return 'waiting_result';
-      if (tasks.length && tasks.every(row => row.status === 'done')) return 'complete';
+      const majakAgents = all.filter(row => row.profile === 'majak');
+      const majakQueue = queueTasks('majak');
+      const userAttention = blocked.some(row => USER_ACTION_BLOCKERS.has(row.blocker))
+        || majakAgents.some(row => row.status === 'blocked')
+        || userBlockedTasks('majak').length;
+      if (userAttention) return 'waiting_user';
+      const working = swarmAgents().length
+        || tasks.some(row => row.status === 'running')
+        || majakAgents.some(row => row.status === 'working')
+        || majakQueue.some(row => row.status === 'running');
+      if (working) return 'working';
+      if (blocked.length || technicalBlockedTasks('majak').length) return 'waiting_result';
+      const majakOpen = majakQueue.some(row => row.status !== 'done');
+      if (tasks.length && tasks.every(row => row.status === 'done') && !majakOpen) return 'complete';
+      if (majakAgents.some(row => row.status === 'idle')) return 'idle';
       return 'idle';
     }
-    const all = agents(), hermes = all.filter(row => agentKind(row.agent) === 'hermes'), queued = queueTasks();
+    const hermes = all.filter(row => agentKind(row.agent) === 'hermes'), queued = queueTasks();
     if (all.some(row => row.status === 'blocked') || userBlockedTasks().length) return 'waiting_user';
     if (liveData.sources.some(row => row.kind === 'herdr' && row.status !== 'available')) return all.length ? 'error' : 'offline';
     if (hermes.some(row => row.status === 'working') || queued.some(row => row.status === 'running')) return 'working';
@@ -489,11 +501,17 @@ export function mountDashboard(createScene) {
   function faceCopy(state) {
     if (demo) return `DEMO · ${STATE_META[state].copy}`;
     const swarm = swarmSnapshot();
+    const allAgents = agents();
     const active = swarm
-      ? swarmAgents().map(row => row.agent_id).filter(Boolean)
-      : agents().filter(row => row.status === 'working').map(row => row.agent);
+      ? [
+          ...swarmAgents().map(row => row.agent_id).filter(Boolean),
+          ...allAgents.filter(row => row.profile === 'majak' && row.status === 'working').map(row => row.agent),
+        ]
+      : allAgents.filter(row => row.status === 'working').map(row => row.agent);
     const task = swarm
-      ? swarmTasks().find(row => row.status === 'running') || null
+      ? swarmTasks().find(row => row.status === 'running')
+        || queueTasks('majak').find(row => row.status === 'running')
+        || null
       : currentQueueTask();
     if (state === 'working' && task) {
       const project = task.repo === 'Bbambaaamm/dotacni-majak' ? 'Maják'
