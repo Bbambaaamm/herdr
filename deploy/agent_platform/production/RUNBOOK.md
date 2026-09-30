@@ -145,10 +145,12 @@ to its private temporary directory, verifies source identity/size/timestamps and
 sidecars remained absent, and queries only that copy. A partial sidecar pair, source
 change, access/schema error or oversized DB is unavailable. NEVER use immutable=1,
 chmod live DBs, recovery, journal changes, migrations or writer helper imports.
-Queries expose last1000 requests grouped by task digest, maximum50 groups.
-Overflow/time budget => unavailable; numbers are this bounded window, not all-time
-totals. Cost null is unknown; zero is only a measured zero. Router sensitive columns
-are not queried.
+Queries expose the last 1000 requests grouped by task digest, model and provider.
+The projection is deterministically capped to the 50 most recently observed groups;
+higher live cardinality does not make the entire router source unavailable. Access,
+schema, consistency or time-budget failures still fail closed as unavailable.
+Numbers are this bounded window, not all-time totals. Cost null is unknown; zero is
+only a measured zero. Router sensitive columns are not queried.
 
 Create `/etc/systemd/system/agent-platform-export.service.d` with
 `sudo install -d -o root -g root -m 0755 /etc/systemd/system/agent-platform-export.service.d`.

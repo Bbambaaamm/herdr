@@ -178,6 +178,49 @@ def test_sql_ro_authorizer_aggregate_unknown_cost_profile_isolation(tmp_path):
     assert path.read_bytes() == before
 
 
+def test_router_projection_caps_high_cardinality_to_recent_50_groups(tmp_path):
+    path = tmp_path / 'router.db'
+    router_db(path)
+    db = sqlite3.connect(path)
+    for index in range(2, 62):
+        started = 99 + index
+        ended = 100 + index
+        db.execute(
+            "INSERT INTO requests VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                index,
+                f"task-{index:02d}",
+                started,
+                ended,
+                1,
+                2,
+                None,
+                "PRIVATE",
+                "SECRET",
+                "model-a",
+                "nous",
+                0,
+                1,
+                0.5,
+            ),
+        )
+    db.commit()
+    db.close()
+
+    rows, stamp = sources.router(str(path), 'majak')
+
+    assert len(rows) == 50
+    assert stamp == 161
+    assert rows[0]['last_used_at'] == 161
+    assert rows[-1]['last_used_at'] == 112
+    assert {row['task_id'] for row in rows} == {
+        c.identity('majak', f"task-{index:02d}")
+        for index in range(12, 62)
+    }
+    assert all(row['actual_model'] == 'model-a' for row in rows)
+    assert all(row['provider'] == 'nous' for row in rows)
+
+
 def search_db(path):
     db = sqlite3.connect(path)
     db.execute(
