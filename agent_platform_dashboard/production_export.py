@@ -104,7 +104,8 @@ def collect(config, now):
             if kind == 'kanban':
                 source.update(board_id=setting['board_id'], source_epoch=setting['source_epoch'])
             c.validate(snapshot)
-            c.encode(snapshot)
+            if kind == 'swarm':
+                c.encode(snapshot)
         except sources.NotConfigured:
             source.update(rows=[], data_at=None, status='unavailable', reason='not_configured', board_id=None, source_epoch=None)
         except Exception:
