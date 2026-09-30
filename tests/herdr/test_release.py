@@ -608,6 +608,10 @@ def test_rc8_fail_closed_rollback_exception_is_exactly_pinned():
     assert "require_web=previous_requires_web" in apply_source
     assert "fail_closed_rc8_observability" in apply_source
     assert "legacy_rollback_web_unexpectedly_active" in apply_source
+    assert "rollback_degraded_rc8_web_unavailable" in apply_source
+    assert ".rollback-degraded.json" in apply_source
+    assert "degraded_fail_closed_route" in apply_source
+    assert '"503"' in apply_source
 
 
 def test_switch_runtime_resets_rate_limit_and_starts_herdr_once_via_export(
