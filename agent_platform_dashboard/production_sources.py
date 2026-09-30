@@ -564,8 +564,12 @@ def admission(path, profile):
 def release(path, profile):
     c.need(profile == 'quantlab' and path == RELEASE_PATH)
     value = c.parse(read(path, 4096), 4096)
-    c.keys(value, 'version tag commit config_sha256 deployed_at')
+    legacy = {'version', 'tag', 'commit', 'config_sha256', 'deployed_at'}
+    current = legacy | {'payload_manifest_sha256'}
+    c.need(type(value) is dict and set(value) in (legacy, current))
     c.need(value['version'] == 1)
+    if 'payload_manifest_sha256' in value:
+        c.need(c.hex_id(value['payload_manifest_sha256']))
     row = {name: value[name] for name in ('tag', 'commit', 'config_sha256', 'deployed_at')}
     c.row('release', row)
     return [row], row['deployed_at']

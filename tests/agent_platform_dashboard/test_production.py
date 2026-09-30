@@ -696,6 +696,16 @@ def test_release_projection_is_fixed_bounded_and_sanitized(tmp_path, monkeypatch
     assert stamp == 100 and 'version' not in rows[0]
     with pytest.raises(ValueError):
         sources.release(str(path), 'majak')
+
+    payload['payload_manifest_sha256'] = 'c' * 64
+    path.write_text(json.dumps(payload))
+    rows, stamp = sources.release(str(path), 'quantlab')
+    assert rows == [{
+        key: payload[key]
+        for key in ('tag', 'commit', 'config_sha256', 'deployed_at')
+    }]
+    assert stamp == 100  # manifest-bound release marker remains dashboard-compatible
+
     payload['prompt'] = 'PRIVATE'
     path.write_text(json.dumps(payload))
     with pytest.raises(ValueError):

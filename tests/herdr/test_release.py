@@ -171,14 +171,26 @@ def test_runtime_units_use_only_atomic_current_symlink():
 
 def test_deployed_document_is_closed_and_binds_config():
     value = cutover.deployed_document(
-        {"tag": "v1.2.3", "commit": "a" * 40, "config_contract_sha256": "b" * 64},
+        {
+            "tag": "v1.2.3",
+            "commit": "a" * 40,
+            "config_contract_sha256": "b" * 64,
+            "payload_manifest_sha256": "d" * 64,
+        },
         "b" * 64, 100)
     assert json.dumps(value, sort_keys=True) == json.dumps({
         "version": 1, "tag": "v1.2.3", "commit": "a" * 40,
-        "config_sha256": "b" * 64, "deployed_at": 100}, sort_keys=True)
+        "config_sha256": "b" * 64,
+        "payload_manifest_sha256": "d" * 64,
+        "deployed_at": 100}, sort_keys=True)
     with pytest.raises(release.ReleaseError, match="deployment_config_mismatch"):
         cutover.deployed_document(
-            {"tag": "v1.2.3", "commit": "a" * 40, "config_contract_sha256": "b" * 64},
+            {
+                "tag": "v1.2.3",
+                "commit": "a" * 40,
+                "config_contract_sha256": "b" * 64,
+                "payload_manifest_sha256": "d" * 64,
+            },
             "c" * 64, 100)
 
 
@@ -212,6 +224,178 @@ def test_watchdog_unit_is_versioned_and_cutover_managed():
         cutover.UNIT_DIR / "agent-stack-watchdog.service"
         in expected
     )
+
+
+def _versioned_current_release_fixture(monkeypatch, tmp_path):
+    releases = tmp_path / "releases"
+    releases.mkdir()
+    legacy = tmp_path / "legacy"
+    legacy.mkdir()
+    unit_dir = tmp_path / "units"
+    unit_dir.mkdir()
+    public_state = tmp_path / "deployed-release.json"
+
+    commit = "a" * 40
+    tag = "v0.3.0-rc.8"
+    current_release = releases / f"{tag}-{commit[:12]}"
+    bundle = current_release / "deploy" / "agent_platform" / "production"
+    bundle.mkdir(parents=True)
+
+    manifest_lines = []
+    expected = {}
+    for name in cutover.UNITS:
+        data = f"previous-release:{name}\n".encode()
+        source = bundle / f"{name}.in"
+        source.write_bytes(data)
+        relative = f"deploy/agent_platform/production/{name}.in"
+        digest = release.sha256(data)
+        manifest_lines.append(f"{digest}  {relative}\n")
+        expected[unit_dir / name] = digest
+        (unit_dir / name).write_bytes(data)
+
+    manifest = "".join(manifest_lines).encode()
+    document = {
+        "schema_version": 1,
+        "tag": tag,
+        "commit": commit,
+        "commit_time": 1,
+        "config_contract_sha256": "b" * 64,
+        "external_dependency": {
+            "name": "herdr",
+            "version": "0.9.1",
+            "sha256": "c" * 64,
+            "size": 1,
+        },
+        "payload_manifest_sha256": release.sha256(manifest),
+    }
+    (current_release / "RELEASE.json").write_bytes(
+        release.canonical_json(document)
+    )
+    (current_release / "MANIFEST.sha256").write_bytes(manifest)
+
+    current = tmp_path / "current"
+    current.symlink_to(current_release)
+    public_state.write_text(
+        json.dumps({
+            "version": 1,
+            "tag": tag,
+            "commit": commit,
+            "config_sha256": document["config_contract_sha256"],
+            "payload_manifest_sha256": document["payload_manifest_sha256"],
+            "deployed_at": 1,
+        }),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(cutover, "RELEASES", releases)
+    monkeypatch.setattr(cutover, "LEGACY", legacy)
+    monkeypatch.setattr(cutover, "CURRENT", current)
+    monkeypatch.setattr(cutover, "UNIT_DIR", unit_dir)
+    monkeypatch.setattr(cutover, "PUBLIC_STATE", public_state)
+    monkeypatch.setattr(cutover, "root_owned_readonly", lambda _path: True)
+    return current_release, expected
+
+
+def test_versioned_upgrade_accepts_manifest_bound_previous_release_units(
+    monkeypatch,
+    tmp_path,
+):
+    _current, expected = _versioned_current_release_fixture(
+        monkeypatch,
+        tmp_path,
+    )
+    assert cutover.current_release_unit_hashes() == expected
+
+
+def test_versioned_upgrade_rejects_tampered_previous_release_unit(
+    monkeypatch,
+    tmp_path,
+):
+    current, _expected = _versioned_current_release_fixture(
+        monkeypatch,
+        tmp_path,
+    )
+    source = (
+        current
+        / "deploy"
+        / "agent_platform"
+        / "production"
+        / f"{cutover.UNITS[0]}.in"
+    )
+    source.write_text("tampered\n", encoding="utf-8")
+
+    with pytest.raises(
+        release.ReleaseError,
+        match="current_release_unit_manifest_mismatch",
+    ):
+        cutover.current_release_unit_hashes()
+
+
+def test_versioned_upgrade_rejects_public_marker_identity_mismatch(
+    monkeypatch,
+    tmp_path,
+):
+    _current, _expected = _versioned_current_release_fixture(
+        monkeypatch,
+        tmp_path,
+    )
+    marker = json.loads(
+        cutover.PUBLIC_STATE.read_text(encoding="utf-8")
+    )
+    marker["commit"] = "d" * 40
+    cutover.PUBLIC_STATE.write_text(
+        json.dumps(marker),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        release.ReleaseError,
+        match="current_release_public_state_mismatch",
+    ):
+        cutover.current_release_unit_hashes()
+
+
+def test_rc8_bootstrap_accepts_only_explicit_reviewed_unit_hashes(
+    monkeypatch,
+    tmp_path,
+):
+    current, expected = _versioned_current_release_fixture(
+        monkeypatch,
+        tmp_path,
+    )
+    document = json.loads(
+        (current / "RELEASE.json").read_text(encoding="utf-8")
+    )
+    marker = json.loads(
+        cutover.PUBLIC_STATE.read_text(encoding="utf-8")
+    )
+    marker.pop("payload_manifest_sha256")
+    cutover.PUBLIC_STATE.write_text(
+        json.dumps(marker),
+        encoding="utf-8",
+    )
+    identity = (document["tag"], document["commit"])
+    reviewed = {
+        name: expected[cutover.UNIT_DIR / name]
+        for name in cutover.UNITS
+    }
+    monkeypatch.setattr(
+        cutover,
+        "BOOTSTRAP_VERSIONED_UNIT_HASHES",
+        {identity: reviewed},
+    )
+    assert cutover.current_release_unit_hashes() == expected
+
+    monkeypatch.setattr(
+        cutover,
+        "BOOTSTRAP_VERSIONED_UNIT_HASHES",
+        {},
+    )
+    with pytest.raises(
+        release.ReleaseError,
+        match="current_release_manifest_evidence_missing",
+    ):
+        cutover.current_release_unit_hashes()
 
 
 def test_agent_stack_runtime_chain_is_release_relative():
@@ -619,6 +803,7 @@ def test_already_deployed_requires_full_coherence(
         "tag": "v1.2.3-rc.7",
         "commit": "a" * 40,
         "config_contract_sha256": digest,
+        "payload_manifest_sha256": "d" * 64,
     }
 
     public_state.write_text(
@@ -628,6 +813,7 @@ def test_already_deployed_requires_full_coherence(
                 "tag": release_doc["tag"],
                 "commit": release_doc["commit"],
                 "config_sha256": digest,
+                "payload_manifest_sha256": release_doc["payload_manifest_sha256"],
                 "deployed_at": 123456789,
             }
         ),

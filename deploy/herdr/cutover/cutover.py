@@ -55,6 +55,31 @@ UNITS = (
     "agent-stack-watchdog.service",
 )
 
+# One-time bridge for the deployed RC8 marker, which predates
+# payload_manifest_sha256 in deployed-release.json. These hashes are reviewed
+# immutable source evidence from commit d58283bc4bf98490bb96bd9bffd58b293b451061.
+# Once staging is on a marker that carries payload_manifest_sha256, upgrades use
+# the generic manifest-bound path below.
+BOOTSTRAP_VERSIONED_UNIT_HASHES = {
+    (
+        "v0.3.0-rc.8",
+        "d58283bc4bf98490bb96bd9bffd58b293b451061",
+    ): {
+        "agent-platform-web.service":
+            "c5a834ae268d02f5b27938f90c3d9bf766118399f65ae07d9f3016a530460e5e",
+        "agent-platform-export.service":
+            "f674e5d42bea703c48d1dd7156bff56d07d21f314c8379f6a9255114c946e608",
+        "agent-platform-herdr.service":
+            "d02e097c200e4c28290b24029ec7cbe6a73aec2a46635df86929c1b4e266d4da",
+        "agent-platform-export.timer":
+            "e568c8d2a5fb27f9e968868952d296191e3be30962c0dba1fc415c35c994cf04",
+        "agent-platform-herdr.timer":
+            "875c7512d5504a0f10cd2b975cffc5ff8116529cc8d147d37c5fee8c83cf8e28",
+        "agent-stack-watchdog.service":
+            "4263cadfa131fe3e117989751d3966058ab74748b82ca28683a99d5e7c61a413",
+    },
+}
+
 
 def need(value: bool, message: str) -> None:
     if not value:
@@ -128,6 +153,117 @@ def expected_hashes(path: Path) -> dict[Path, str]:
          "incomplete_expected_hash_manifest")
     return values
 
+
+def root_owned_readonly(path: Path) -> bool:
+    info = path.stat()
+    return info.st_uid == 0 and not info.st_mode & 0o022
+
+
+def current_release_unit_hashes() -> dict[Path, str]:
+    """Return unit hashes independently bound to the deployed release identity."""
+    if not CURRENT.exists() and not CURRENT.is_symlink():
+        return {}
+    need(CURRENT.is_symlink(), "current_is_not_symlink")
+    current = CURRENT.resolve(strict=True)
+    if current == LEGACY:
+        return {}
+    need(current.parent == RELEASES, "unexpected_current_release")
+    need(root_owned_readonly(current), "unsafe_current_release")
+
+    release_path = current / "RELEASE.json"
+    manifest_path = current / "MANIFEST.sha256"
+    for path, code in (
+        (release_path, "unsafe_current_release_metadata"),
+        (manifest_path, "unsafe_current_release_manifest"),
+    ):
+        need(path.is_file() and not path.is_symlink(), code)
+        need(root_owned_readonly(path), code)
+
+    try:
+        document = json.loads(release_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError("current_release_metadata_invalid") from exc
+    need(type(document) is dict
+         and isinstance(document.get("tag"), str)
+         and isinstance(document.get("commit"), str)
+         and len(document["commit"]) == 40
+         and current.name == f"{document['tag']}-{document['commit'][:12]}",
+         "current_release_identity_mismatch")
+
+    need(PUBLIC_STATE.is_file() and not PUBLIC_STATE.is_symlink(),
+         "current_release_public_state_missing")
+    need(root_owned_readonly(PUBLIC_STATE),
+         "unsafe_current_release_public_state")
+    try:
+        public = json.loads(PUBLIC_STATE.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError("current_release_public_state_invalid") from exc
+    need(type(public) is dict
+         and public.get("version") == 1
+         and public.get("tag") == document["tag"]
+         and public.get("commit") == document["commit"]
+         and public.get("config_sha256") == document.get("config_contract_sha256"),
+         "current_release_public_state_mismatch")
+
+    identity = (document["tag"], document["commit"])
+    evidence_digest = public.get("payload_manifest_sha256")
+
+    # RC8 predates manifest identity in the deployed marker. Permit only the
+    # exact reviewed RC8 unit hashes embedded in this incoming immutable release.
+    if evidence_digest is None:
+        baseline = BOOTSTRAP_VERSIONED_UNIT_HASHES.get(identity)
+        need(baseline is not None, "current_release_manifest_evidence_missing")
+        need(set(baseline) == set(UNITS), "invalid_bootstrap_unit_baseline")
+        hashes: dict[Path, str] = {}
+        for name in UNITS:
+            source = current / "deploy" / "agent_platform" / "production" / f"{name}.in"
+            need(source.is_file() and not source.is_symlink(),
+                 f"current_release_unit_missing:{name}")
+            need(root_owned_readonly(source),
+                 f"unsafe_current_release_unit:{name}")
+            expected = baseline[name]
+            need(digest_file(source) == expected,
+                 f"current_release_unit_baseline_mismatch:{name}")
+            hashes[UNIT_DIR / name] = expected
+        return hashes
+
+    need(isinstance(evidence_digest, str)
+         and len(evidence_digest) == 64
+         and all(ch in "0123456789abcdef" for ch in evidence_digest)
+         and document.get("payload_manifest_sha256") == evidence_digest,
+         "current_release_manifest_evidence_mismatch")
+
+    manifest_data = manifest_path.read_bytes()
+    need(sha256(manifest_data) == evidence_digest,
+         "current_release_manifest_mismatch")
+    try:
+        manifest_lines = manifest_data.decode("ascii").splitlines()
+    except UnicodeError as exc:
+        raise ReleaseError("current_release_manifest_invalid") from exc
+
+    bound: dict[str, str] = {}
+    for line in manifest_lines:
+        digest, separator, name = line.partition("  ")
+        need(bool(separator)
+             and len(digest) == 64
+             and all(ch in "0123456789abcdef" for ch in digest)
+             and name not in bound,
+             "current_release_manifest_invalid")
+        bound[name] = digest
+
+    hashes: dict[Path, str] = {}
+    for name in UNITS:
+        relative = f"deploy/agent_platform/production/{name}.in"
+        source = current / relative
+        need(relative in bound, f"current_release_unit_unbound:{name}")
+        need(source.is_file() and not source.is_symlink(),
+             f"current_release_unit_missing:{name}")
+        need(root_owned_readonly(source),
+             f"unsafe_current_release_unit:{name}")
+        need(digest_file(source) == bound[relative],
+             f"current_release_unit_manifest_mismatch:{name}")
+        hashes[UNIT_DIR / name] = bound[relative]
+    return hashes
 
 def run(*args: str, check: bool = True) -> str:
     result = subprocess.run(args, check=check, capture_output=True, text=True,
@@ -311,10 +447,15 @@ def preflight(archive: Path, expected_legacy_commit: str) -> dict[str, object]:
     need(binary.stat().st_size == dependency["size"] and digest_file(binary) == dependency["sha256"],
          "external_binary_mismatch")
     manifest = ROOT / "deploy" / "herdr" / "cutover" / "legacy-quantlab-staging-01.sha256"
+    previous_units = current_release_unit_hashes()
     for path, digest in expected_hashes(manifest).items():
         if path.name.endswith((".service", ".timer")):
             candidate = ROOT / "deploy" / "agent_platform" / "production" / f"{path.name}.in"
-            need(digest_file(path) in (digest, digest_file(candidate)), f"unexpected_runtime_drift:{path}")
+            allowed = {digest, digest_file(candidate)}
+            previous = previous_units.get(path)
+            if previous:
+                allowed.add(previous)
+            need(digest_file(path) in allowed, f"unexpected_runtime_drift:{path}")
         else:
             need(digest_file(path) == digest, f"unexpected_runtime_drift:{path}")
     statuses = {unit: run("/usr/bin/systemctl", "is-active", unit, check=False) for unit in UNITS}
@@ -516,6 +657,7 @@ def assert_deployed_coherence(
             "tag",
             "commit",
             "config_sha256",
+            "payload_manifest_sha256",
             "deployed_at",
         },
         "already_deployed_public_state_shape",
@@ -527,6 +669,8 @@ def assert_deployed_coherence(
         and document["commit"] == release["commit"]
         and document["config_sha256"]
         == release["config_contract_sha256"]
+        and document["payload_manifest_sha256"]
+        == release["payload_manifest_sha256"]
         and isinstance(document["deployed_at"], int)
         and document["deployed_at"] > 0,
         "already_deployed_public_state_mismatch",
@@ -535,11 +679,17 @@ def assert_deployed_coherence(
 
 def deployed_document(release: dict[str, object], config_digest: str, deployed_at: int) -> dict[str, object]:
     need(config_digest == release["config_contract_sha256"], "deployment_config_mismatch")
+    manifest_digest = release.get("payload_manifest_sha256")
+    need(isinstance(manifest_digest, str)
+         and len(manifest_digest) == 64
+         and all(ch in "0123456789abcdef" for ch in manifest_digest),
+         "deployment_manifest_digest_invalid")
     return {
         "version": 1,
         "tag": release["tag"],
         "commit": release["commit"],
         "config_sha256": config_digest,
+        "payload_manifest_sha256": manifest_digest,
         "deployed_at": deployed_at,
     }
 
