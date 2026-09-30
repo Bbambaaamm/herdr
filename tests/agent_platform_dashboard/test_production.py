@@ -377,7 +377,24 @@ def swarm_payload():
         'graph_latency': 0.1,
         'clock_snapshot': 100.5,
         'ts': '100.5',
-        'agents': [],
+        'agents': [
+            {
+                'agent_id': 'herdr-parent',
+                'task_id': 'root',
+                'state': 'running',
+                'parent_task_id': None,
+                'parent_agent_id': None,
+                'fencing_token': 1,
+            },
+            {
+                'agent_id': 'herdr-child',
+                'task_id': 'child',
+                'state': 'done',
+                'parent_task_id': 'root',
+                'parent_agent_id': 'herdr-parent',
+                'fencing_token': 2,
+            },
+        ],
         'tasks': [
             {
                 'task_id': 'root',
@@ -437,9 +454,18 @@ def test_swarm_projection_is_atomic_bounded_and_sanitized(tmp_path, monkeypatch)
     rows, stamp = sources.swarm(str(path), 'quantlab')
     assert stamp == 100 and len(rows) == 1
     snapshot = rows[0]
+    assert len(payload['agents']) == 2
     assert snapshot['repo'] == 'Bbambaaamm/herdr'
     assert snapshot['issue'] == '7'
     assert snapshot['policy_profiles'] == ['default']
+    assert snapshot['agents'] == [{
+        'agent_id': 'herdr-parent',
+        'task_id': 'root',
+        'state': 'running',
+        'parent_task_id': None,
+        'parent_agent_id': None,
+        'fencing_token': 1,
+    }]
     assert snapshot['edges'] == [
         {'from_task': 'root', 'to_task': 'child', 'kind': 'parent'}
     ]
@@ -478,6 +504,67 @@ def test_swarm_raw_edge_mismatch_and_sensitive_task_field_fail_closed(tmp_path, 
     path.write_text(json.dumps(payload))
     with pytest.raises(ValueError):
         sources.swarm(str(path), 'quantlab')
+
+
+
+def test_scheduler_historical_agent_state_must_match_task(tmp_path, monkeypatch):
+    path = tmp_path / 'swarm.json'
+    monkeypatch.setattr(sources, 'SWARM_PATH', str(path))
+    payload = swarm_payload()
+    payload['agents'][1]['state'] = 'running'
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError):
+        sources.swarm(str(path), 'quantlab')
+
+
+def test_swarm_agents_must_match_running_task_identity(tmp_path, monkeypatch):
+    path = tmp_path / 'swarm.json'
+    monkeypatch.setattr(sources, 'SWARM_PATH', str(path))
+    payload = swarm_payload()
+    payload['agents'][0]['task_id'] = 'child'
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError):
+        sources.swarm(str(path), 'quantlab')
+
+def test_collect_marks_only_swarm_unavailable_when_full_snapshot_budget_would_overflow(tmp_path, monkeypatch):
+    large_tasks = []
+    for index in range(100):
+        suffix = f"{index:03d}"
+        large_tasks.append({
+            'task_id': ('task-' + suffix + '-' + 'x' * 240)[:256],
+            'parent_task_id': None,
+            'parent_agent_id': 'p' * 256,
+            'agent_id': ('agent-' + suffix + '-' + 'y' * 240)[:256],
+            'state': 'done',
+            'role': 'r' * 64,
+            'model': 'm' * 128,
+            'fallback_model': 'f' * 128,
+            'attempt': 1,
+            'max_attempts': 1,
+            'blocker': 'b' * 128,
+            'fencing_token': 0,
+            'dependencies': [],
+            'result_sha': 'a' * 64,
+        })
+    large_swarm = {
+        'version': 1,
+        'repo': 'Bbambaaamm/herdr',
+        'issue': '48',
+        'paper_only': False,
+        'policy_profiles': ['default'],
+        'agents': [],
+        'tasks': large_tasks,
+        'edges': [],
+    }
+    c.row('swarm', large_swarm)
+    monkeypatch.setattr(sources, 'swarm', lambda path, profile: ([large_swarm], 100))
+    snapshot = collect(config(tmp_path), 100)
+    swarm_source = next(source for source in snapshot['sources'] if source['kind'] == 'swarm')
+    assert swarm_source['status'] == 'unavailable'
+    assert swarm_source['reason'] == 'source_failed'
+    assert swarm_source['rows'] == []
+    encoded = c.encode(snapshot)
+    assert len(encoded) <= c.MAX_BYTES
 
 
 def test_swarm_collect_and_staleness_are_fail_closed(tmp_path, monkeypatch):
