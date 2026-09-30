@@ -517,6 +517,52 @@ def test_scheduler_historical_agent_state_must_match_task(tmp_path, monkeypatch)
         sources.swarm(str(path), 'quantlab')
 
 
+def test_scheduler_history_may_reuse_agent_id_across_terminal_tasks(tmp_path, monkeypatch):
+    path = tmp_path / 'swarm.json'
+    monkeypatch.setattr(sources, 'SWARM_PATH', str(path))
+    payload = swarm_payload()
+    payload['tasks'].append({
+        'task_id': 'old-root',
+        'state': 'done',
+        'role': 'planner',
+        'tools': [],
+        'permissions': [],
+        'model_policy': {'model': 'model-a'},
+        'timeout_seconds': 30,
+        'max_attempts': 1,
+        'dependencies': [],
+        'parent_task_id': None,
+        'parent_agent_id': None,
+        'agent_id': 'herdr-parent',
+        'fencing_token': 0,
+        'blocker': None,
+        'policy_profile': 'default',
+        'paper_only': False,
+        'telemetry': [],
+        'ts': '90',
+        'result_sha': 'b' * 64,
+    })
+    payload['agents'].append({
+        'agent_id': 'herdr-parent',
+        'task_id': 'old-root',
+        'state': 'done',
+        'parent_task_id': None,
+        'parent_agent_id': None,
+        'fencing_token': 0,
+    })
+    path.write_text(json.dumps(payload))
+
+    rows, _ = sources.swarm(str(path), 'quantlab')
+    assert rows[0]['agents'] == [{
+        'agent_id': 'herdr-parent',
+        'task_id': 'root',
+        'state': 'running',
+        'parent_task_id': None,
+        'parent_agent_id': None,
+        'fencing_token': 1,
+    }]
+
+
 def test_swarm_agents_must_match_running_task_identity(tmp_path, monkeypatch):
     path = tmp_path / 'swarm.json'
     monkeypatch.setattr(sources, 'SWARM_PATH', str(path))
