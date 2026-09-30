@@ -611,6 +611,8 @@ def test_rc8_fail_closed_rollback_exception_is_exactly_pinned():
     assert "rollback_degraded_rc8_web_unavailable" in apply_source
     assert ".rollback-degraded.json" in apply_source
     assert "degraded_fail_closed_route" in apply_source
+    assert "if degraded_errors:" in apply_source
+    assert "rollback_errors.extend(" in apply_source
     assert '"503"' in apply_source
 
 
