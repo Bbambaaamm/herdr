@@ -169,12 +169,15 @@ The watchdog is a safety net, not a second executor.
   old attempt timestamp cannot make a freshly claimed task look orphaned.
 - Immediately before any orphan mutation, the watchdog re-checks both the worker
   process and exact durable result to close startup/publication races.
-- Without a matching result, the task stays in `running/` as
-  `delivery_uncertain` with `orphaned_running_unknown_delivery`. This
-  quarantines the exact task identity in place so the dispatcher cannot replay
-  it while a late result may still arrive.
+- Without a matching result, the task is atomically retired from `running/`
+  into `blocked/` as `delivery_uncertain` with
+  `orphaned_running_unknown_delivery`. This removes false-running queue state
+  while preserving the exact task/run identity so the dispatcher cannot replay it.
+- If the watchdog is interrupted after persisting the quarantine marker but before
+  the rename, the next recovery cycle resumes the `running/ -> blocked/`
+  transition without creating a new attempt.
 - A later canonical result matching the same `task_id + run_token` terminalizes
-  that quarantined task normally; watchdog recovery never creates a new attempt.
+  that blocked quarantined task normally; watchdog recovery never creates a new attempt.
 - Watchdog-generated recovery evidence is always written to a sidecar result;
   the canonical task result path remains exclusively owned by the executor/runtime.
 - A stale/mismatched canonical result is preserved and never overwritten.
