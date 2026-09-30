@@ -165,7 +165,19 @@ def stable_task_json(path):
     return raw
 
 
+def state_inventory():
+    inventory = {}
+    for state in STATES:
+        folder = ROOT / state
+        if not folder.is_dir():
+            inventory[state] = ()
+            continue
+        inventory[state] = tuple(sorted(path.name for path in folder.glob("*.json")))
+    return inventory
+
+
 def _load_records_once():
+    before_inventory = state_inventory()
     records = []
     seen = set()
     for state in STATES:
@@ -194,6 +206,8 @@ def _load_records_once():
                 "issue": issue,
                 "stamp": task_stamp(raw),
             })
+    if state_inventory() != before_inventory:
+        raise SnapshotRace("task_directory_changed_during_scan")
     return records
 
 
@@ -277,7 +291,12 @@ def bounded_history(records):
 def sanitized_blocker(raw, result, state):
     if state == "done":
         return None
-    for value in (raw.get("watchdog_blocker"), raw.get("blocker"), result.get("blocker")):
+    values = (
+        (result.get("blocker"), raw.get("blocker"), raw.get("watchdog_blocker"))
+        if state in ("blocked", "failed")
+        else (raw.get("watchdog_blocker"), raw.get("blocker"), result.get("blocker"))
+    )
+    for value in values:
         if isinstance(value, str) and ident(value, 128):
             return value
     return None
