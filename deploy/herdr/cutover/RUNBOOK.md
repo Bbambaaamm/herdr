@@ -97,3 +97,88 @@ Model Router/Search Router/Herdr telemetry for both profiles, no queue/lease or
 routing regression, current-versus-historical provider semantics intact, and all
 consumer invariants unchanged. QuantLab remains PAPER-only; Heating actuation stays
 disabled; Maják provenance rules remain authoritative.
+
+
+## Degraded RC8 recovery
+
+The normal `apply` path remains strict and requires a healthy authenticated
+previous runtime plus an exercised healthy rollback boot.
+
+A separate `recovery-preflight` / `recovery-apply` path exists only for the
+one known staging recovery state where exact RC8
+`d58283bc4bf98490bb96bd9bffd58b293b451061` is fail-closed because its router
+adapter returns unavailable once the last 1000 requests exceed 50 distinct
+task/model/provider groups.
+
+The recovery commands must run from a separately reviewed, manifest-valid
+recovery-controller release. That controller is not installed. Its only allowed
+target is the exact RC12 archive with all of these identities:
+
+- tag `v0.3.0-rc.12`;
+- commit `1d524ff25d8b340cb638224effb0f445fb4e4e98`;
+- archive SHA-256
+  `0f4fa8a24de0c367008532acb6319487d0da1948f458ee8d036910720ecb7b0f`;
+- payload-manifest SHA-256
+  `b97aa3900ad642ee55433cdb09b58fb99bb435360427a63eb1f68d9baa76938a`;
+- config-contract SHA-256
+  `3c7660874e437dd49dcbff83db20761fd595743c15ce3969a457d6f1de199ba9`.
+
+Do not run normal RC12 `apply`, and do not run these commands from the extracted
+RC12 tree: RC12 is the pinned target, not the recovery controller. Before any
+privileged change, run the read-only recovery preflight from the extracted
+controller tree:
+
+```sh
+sudo /usr/bin/python3 -I -B deploy/herdr/cutover/cutover.py recovery-preflight \
+  --archive /home/quantadmin/herdr-rc12-review/herdr-v0.3.0-rc.12-1d524ff25d8b.tar.gz \
+  --expected-legacy-commit 41179635c8654a60c5d9234acccb6e91b2028b72
+```
+
+Only an exact `preflight_ok` report with
+`recovery_mode=rc8_router_overflow` authorizes the single recovery apply:
+
+```sh
+sudo /usr/bin/python3 -I -B deploy/herdr/cutover/cutover.py recovery-apply \
+  --archive /home/quantadmin/herdr-rc12-review/herdr-v0.3.0-rc.12-1d524ff25d8b.tar.gz \
+  --expected-legacy-commit 41179635c8654a60c5d9234acccb6e91b2028b72 \
+  --confirm v0.3.0-rc.12-1d524ff25d8b
+```
+
+Recovery authorization is intentionally narrow:
+
+- current must resolve to that exact immutable RC8 release;
+- installed RC8 units must already satisfy the reviewed bootstrap hashes;
+- the candidate must match every pinned RC12 identity and the exact archive
+  bytes listed above;
+- the Herdr Unix socket must accept a live connection, not merely leave a socket
+  inode behind;
+- both Herdr profile sources and the RC8 release source must be fresh/available;
+- both router sources must be fresh `source_failed` with empty rows;
+- a bounded read-only query against each live router database must independently
+  prove at least 51 distinct task/model/provider groups without exposing rows;
+- both telemetry timers must be active, web must be failed/inactive, and durable
+  watchdog must be inactive;
+- public Agent Platform health must remain fail-closed (502/503).
+
+Before switching releases, recovery apply verifies that both telemetry timers,
+both timer-triggered oneshot services, and the watchdog actually stopped. It
+publishes the success record only after RC12 returns the authenticated `401`
+health boundary and `current` resolves to RC12; the watchdog starts last.
+
+Because the previous release is known unable to perform a healthy web boot,
+`recovery-apply` does **not** claim a healthy rollback exercise. It records
+`rollback_exercised=false` and
+`rollback_mode=skipped_known_degraded_previous`. On any candidate failure it
+restores the exact previous symlink, systemd unit bytes and deployed marker,
+keeps the Agent Platform route on the reviewed maintenance 503 fragment,
+re-quiesces the timers, their oneshot services and the durable watchdog before
+restoring mutable authority, and aborts authority restoration if that gate fails.
+It removes any premature success record only after exact authority restoration
+is verified, restarts telemetry timers only after all fail-closed rollback checks
+pass without error, and preserves the failed archive for audit even when another
+rollback step is incomplete. Normal and recovery cutovers share one root-owned
+non-blocking deployment lock under the verified mode-0700 `/run/herdr` directory,
+held from authorization through success or rollback.
+
+After a successful recovery promotion, the normal cutover path is authoritative
+again for subsequent releases.

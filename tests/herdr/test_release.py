@@ -426,6 +426,322 @@ def test_rc8_bootstrap_rejects_installed_unit_not_matching_baseline(
         cutover.current_release_unit_hashes()
 
 
+def test_rc8_router_recovery_evidence_is_exact_and_fail_closed(
+    monkeypatch,
+    tmp_path,
+):
+    releases = tmp_path / "releases"
+    releases.mkdir()
+    previous = releases / (
+        f"{cutover.RECOVERY_RC8_TAG}-"
+        f"{cutover.RECOVERY_RC8_COMMIT[:12]}"
+    )
+    previous.mkdir()
+
+    class CurrentLink:
+        @staticmethod
+        def is_symlink():
+            return True
+
+        @staticmethod
+        def resolve(*, strict):
+            assert strict
+            return previous
+
+    snapshot = tmp_path / "snapshot.json"
+    now = int(cutover.time.time())
+    sources = []
+    for profile in ("majak", "quantlab"):
+        sources.append({
+            "profile": profile,
+            "kind": "router",
+            "status": "unavailable",
+            "reason": "source_failed",
+            "rows": [],
+        })
+        sources.append({
+            "profile": profile,
+            "kind": "herdr",
+            "status": "available",
+            "reason": "ok",
+            "rows": [{"agent": f"{profile}-hermes", "status": "idle"}],
+        })
+    sources.append({
+        "profile": "quantlab",
+        "kind": "release",
+        "status": "available",
+        "reason": "ok",
+        "rows": [{
+            "tag": cutover.RECOVERY_RC8_TAG,
+            "commit": cutover.RECOVERY_RC8_COMMIT,
+        }],
+    })
+    snapshot.write_text(
+        json.dumps({
+            "version": 1,
+            "generated_at": now,
+            "sources": sources,
+        }),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(cutover, "RELEASES", releases)
+    monkeypatch.setattr(cutover, "CURRENT", CurrentLink())
+    monkeypatch.setattr(cutover, "SNAPSHOT", snapshot)
+    live_socket = {"value": True}
+    monkeypatch.setattr(
+        cutover,
+        "live_unix_socket",
+        lambda path: live_socket["value"],
+    )
+    counts = {"majak": 51, "quantlab": 51}
+    monkeypatch.setattr(
+        cutover,
+        "recovery_router_group_counts",
+        lambda: dict(counts),
+    )
+
+    statuses = {
+        "agent-platform-web.service": "failed",
+        "agent-platform-export.timer": "active",
+        "agent-platform-herdr.timer": "active",
+        "agent-stack-watchdog.service": "inactive",
+    }
+
+    assert cutover.rc8_router_recovery_evidence(statuses)
+    bad = dict(statuses)
+    bad["agent-stack-watchdog.service"] = "active"
+    assert not cutover.rc8_router_recovery_evidence(bad)
+
+    counts["majak"] = 50
+    assert not cutover.rc8_router_recovery_evidence(statuses)
+    counts["majak"] = 51
+
+    document = json.loads(snapshot.read_text(encoding="utf-8"))
+    document["sources"][0]["reason"] = "stale"
+    snapshot.write_text(json.dumps(document), encoding="utf-8")
+    assert not cutover.rc8_router_recovery_evidence(statuses)
+
+    document["sources"][0]["reason"] = "source_failed"
+    snapshot.write_text(json.dumps(document), encoding="utf-8")
+    live_socket["value"] = False
+    assert not cutover.rc8_router_recovery_evidence(statuses)
+
+
+def test_live_unix_socket_requires_live_listener(tmp_path):
+    import socket as socket_module
+
+    if not hasattr(socket_module, "AF_UNIX"):
+        pytest.skip("Unix sockets are unavailable on this platform")
+    socket_path = tmp_path / "herdr.sock"
+    listener = socket_module.socket(
+        socket_module.AF_UNIX,
+        socket_module.SOCK_STREAM,
+    )
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    try:
+        assert cutover.live_unix_socket(socket_path)
+    finally:
+        listener.close()
+
+    assert not cutover.live_unix_socket(socket_path)
+
+
+def test_recovery_router_group_query_is_bounded_at_overflow():
+    import sqlite3
+
+    database = sqlite3.connect(":memory:")
+    database.execute(
+        "CREATE TABLE requests ("
+        "id INTEGER, task_id TEXT, actual_model TEXT, provider TEXT)"
+    )
+    database.executemany(
+        "INSERT INTO requests VALUES (?, ?, ?, ?)",
+        [
+            (index, f"task-{index}", "model", "provider")
+            for index in range(1, 53)
+        ],
+    )
+    try:
+        count = database.execute(
+            cutover.RECOVERY_ROUTER_GROUP_COUNT_SQL
+        ).fetchone()[0]
+    finally:
+        database.close()
+
+    assert count == 51
+
+
+def test_recovery_target_is_exact_reviewed_rc12(monkeypatch, tmp_path):
+    archive = tmp_path / "rc12.tar.gz"
+    archive.write_bytes(b"reviewed rc12 archive")
+    monkeypatch.setattr(
+        cutover,
+        "RECOVERY_TARGET_ARCHIVE_SHA256",
+        cutover.digest_file(archive),
+    )
+    document = {
+        "tag": cutover.RECOVERY_TARGET_TAG,
+        "commit": cutover.RECOVERY_TARGET_COMMIT,
+        "config_contract_sha256": cutover.RECOVERY_TARGET_CONFIG_SHA256,
+        "payload_manifest_sha256": (
+            cutover.RECOVERY_TARGET_PAYLOAD_MANIFEST_SHA256
+        ),
+    }
+
+    cutover.verify_recovery_target(archive, document)
+
+    for field in (
+        "tag",
+        "commit",
+        "config_contract_sha256",
+        "payload_manifest_sha256",
+    ):
+        changed = dict(document)
+        changed[field] = "unexpected"
+        with pytest.raises(
+            release.ReleaseError,
+            match="recovery_target_identity_mismatch",
+        ):
+            cutover.verify_recovery_target(archive, changed)
+
+    archive.write_bytes(b"different archive")
+    with pytest.raises(
+        release.ReleaseError,
+        match="recovery_target_archive_mismatch",
+    ):
+        cutover.verify_recovery_target(archive, document)
+
+
+def test_recovery_unit_quiescence_is_verified(monkeypatch):
+    states = {
+        "agent-platform-export.timer": "inactive",
+        "agent-platform-herdr.timer": "inactive",
+        "agent-platform-export.service": "inactive",
+        "agent-platform-herdr.service": "inactive",
+        "agent-stack-watchdog.service": "inactive",
+    }
+    calls = []
+
+    def fake_run(*args, check=True):
+        calls.append((args, check))
+        if args[:2] == ("/usr/bin/systemctl", "is-active"):
+            return states[args[2]]
+        return ""
+
+    monkeypatch.setattr(cutover, "run", fake_run)
+    cutover.stop_recovery_units()
+    assert calls[0] == ((
+        "/usr/bin/systemctl",
+        "stop",
+        "agent-platform-export.timer",
+        "agent-platform-herdr.timer",
+        "agent-platform-export.service",
+        "agent-platform-herdr.service",
+        "agent-stack-watchdog.service",
+    ), True)
+
+    states["agent-platform-herdr.timer"] = "active"
+    with pytest.raises(
+        release.ReleaseError,
+        match="recovery_timer_not_stopped:agent-platform-herdr.timer",
+    ):
+        cutover.stop_recovery_units()
+
+    states["agent-platform-herdr.timer"] = "inactive"
+    states["agent-platform-export.service"] = "active"
+    with pytest.raises(
+        release.ReleaseError,
+        match="recovery_service_not_stopped:agent-platform-export.service",
+    ):
+        cutover.stop_recovery_units()
+
+    states["agent-platform-export.service"] = "inactive"
+    states["agent-stack-watchdog.service"] = "active"
+    with pytest.raises(
+        release.ReleaseError,
+        match="recovery_watchdog_not_stopped",
+    ):
+        cutover.stop_recovery_units()
+
+
+def test_recovery_apply_is_explicit_and_never_claims_rollback_exercise():
+    source = Path("deploy/herdr/cutover/cutover.py").read_text(
+        encoding="utf-8"
+    )
+    recovery = source.split("def recovery_apply(", 1)[1].split(
+        "def main()",
+        1,
+    )[0]
+
+    assert '"rollback_exercised": False' in recovery
+    assert '"rollback_mode": "skipped_known_degraded_previous"' in recovery
+    assert '"recovery_mode": "rc8_router_overflow"' in recovery
+    assert '"fail_closed_route"' in recovery
+    success, rollback = recovery.split("except BaseException as original_error:", 1)
+    public_probe = (
+        'wait_http_status(\n            "https://2.28.67.165/agent-platform/health",\n            "401",'
+    )
+    assert "stop_recovery_units()" in success
+    assert success.index(public_probe) < success.index(
+        "atomic_write(state_path, canonical_json(state), 0o600)"
+    )
+    assert success.index(
+        "atomic_write(state_path, canonical_json(state), 0o600)"
+    ) < success.index("start_watchdog_service()")
+    quiescence = '("quiesce_recovery_units", stop_recovery_units)'
+    assert quiescence in rollback
+    assert rollback.index("if not quiescence_errors:") < rollback.index(
+        "restore_units(unit_snapshots)"
+    )
+    restart_gate = "if authority_restored and not errors:"
+    assert restart_gate in rollback
+    assert rollback.index("verify_recovery_rollback:") < rollback.index(
+        restart_gate
+    )
+    assert rollback.index(restart_gate) < rollback.index(
+        '("restart_timers", start_telemetry_timers)'
+    )
+    assert rollback.index("restore_units(unit_snapshots)") < rollback.index(
+        '("restart_timers", start_telemetry_timers)'
+    )
+    assert "remove_regular_file(state_path)" in rollback
+    assert "recovery_rollback_watchdog_active" in rollback
+    assert "if not errors:\n            try:\n                source =" not in rollback
+    assert '"preserve_failed_archive:"' in rollback
+
+
+def test_cutovers_hold_the_deployment_lock(monkeypatch):
+    events = []
+
+    class FakeLock:
+        def __enter__(self):
+            events.append("lock_enter")
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            events.append("lock_exit")
+
+    monkeypatch.setattr(cutover, "deployment_lock", FakeLock)
+
+    @cutover.serialized_deployment
+    def operation():
+        events.append("operation")
+        return "done"
+
+    assert operation() == "done"
+    assert events == ["lock_enter", "operation", "lock_exit"]
+
+    source = Path("deploy/herdr/cutover/cutover.py").read_text(
+        encoding="utf-8"
+    )
+    assert "@serialized_deployment\ndef apply(" in source
+    assert "@serialized_deployment\ndef recovery_apply(" in source
+    assert 'DEPLOYMENT_LOCK = Path("/run/herdr/cutover.lock")' in source
+    assert 'os.mkdir(DEPLOYMENT_LOCK.parent, 0o700)' in source
+    assert '"unsafe_deployment_lock_directory"' in source
+
+
 def test_agent_stack_runtime_chain_is_release_relative():
     dispatcher = Path(
         "agent-stack/bin/agent-task-dispatcher"
