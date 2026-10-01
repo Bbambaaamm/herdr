@@ -690,12 +690,18 @@ def test_recovery_apply_is_explicit_and_never_claims_rollback_exercise():
     assert success.index(
         "atomic_write(state_path, canonical_json(state), 0o600)"
     ) < success.index("start_watchdog_service()")
-    assert '("quiesce_recovery_units", stop_recovery_units)' in rollback
-    assert rollback.index(
-        '("quiesce_recovery_units", stop_recovery_units)'
-    ) < rollback.index('("restore_units"')
-    assert '"remove_success_state"' in rollback
-    assert "start_telemetry_timers" in rollback
+    quiescence = '("quiesce_recovery_units", stop_recovery_units)'
+    assert quiescence in rollback
+    assert rollback.index("if not quiescence_errors:") < rollback.index(
+        "restore_units(unit_snapshots)"
+    )
+    assert rollback.index("if authority_restored:") < rollback.index(
+        '("restart_timers", start_telemetry_timers)'
+    )
+    assert rollback.index("restore_units(unit_snapshots)") < rollback.index(
+        '("restart_timers", start_telemetry_timers)'
+    )
+    assert "remove_regular_file(state_path)" in rollback
     assert "recovery_rollback_watchdog_active" in rollback
 
 

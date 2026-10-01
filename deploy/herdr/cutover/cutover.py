@@ -959,6 +959,18 @@ def start_telemetry_timers() -> None:
         )
 
 
+def stop_recovery_web() -> None:
+    run(
+        "/usr/bin/systemctl",
+        "stop",
+        "agent-platform-web.service",
+    )
+    need(
+        unit_state("agent-platform-web.service") in {"inactive", "failed"},
+        "recovery_web_not_stopped",
+    )
+
+
 def remove_regular_file(path: Path) -> None:
     if not path.exists() and not path.is_symlink():
         return
@@ -1755,16 +1767,7 @@ def recovery_apply(
              "public_root_changed")
 
         stop_recovery_units()
-        run(
-            "/usr/bin/systemctl",
-            "stop",
-            "agent-platform-web.service",
-            check=False,
-        )
-        need(
-            unit_state("agent-platform-web.service") in {"inactive", "failed"},
-            "recovery_web_not_stopped",
-        )
+        stop_recovery_web()
         assert_no_active_durable_worker()
 
         install_units(
@@ -1809,35 +1812,11 @@ def recovery_apply(
             "state_file": str(state_path),
         }
     except BaseException as original_error:
-        errors = run_rollback_steps([
+        quiescence_errors = run_rollback_steps([
             ("quiesce_recovery_units", stop_recovery_units),
-            (
-                "stop_web",
-                lambda: run(
-                    "/usr/bin/systemctl",
-                    "stop",
-                    "agent-platform-web.service",
-                ),
-            ),
-            ("remove_success_state", lambda: remove_regular_file(state_path)),
-            ("restore_units", lambda: restore_units(unit_snapshots)),
-            (
-                "restore_current",
-                lambda: atomic_symlink(previous, CURRENT)
-                if switched else None,
-            ),
-            (
-                "restore_public_state",
-                lambda: restore_file(PUBLIC_STATE, public_state_snapshot),
-            ),
-            (
-                "daemon_reload",
-                lambda: run("/usr/bin/systemctl", "daemon-reload"),
-            ),
-            (
-                "restart_timers",
-                start_telemetry_timers,
-            ),
+            ("stop_web", stop_recovery_web),
+        ])
+        errors = [*quiescence_errors, *run_rollback_steps([
             (
                 "fail_closed_route",
                 lambda: atomic_write(NGINX_ROUTE, maintenance, 0o644),
@@ -1851,19 +1830,38 @@ def recovery_apply(
                     "503",
                 ),
             ),
-        ])
+        ])]
+        authority_restored = False
+        if not quiescence_errors:
+            try:
+                restore_units(unit_snapshots)
+                if switched:
+                    atomic_symlink(previous, CURRENT)
+                restore_file(PUBLIC_STATE, public_state_snapshot)
+                run("/usr/bin/systemctl", "daemon-reload")
+                need(CURRENT.resolve(strict=True) == previous,
+                     "recovery_rollback_current_mismatch")
+                for path, digest in previous_unit_hashes.items():
+                    need(digest_file(path) == digest,
+                         f"recovery_rollback_unit_mismatch:{path.name}")
+                need(snapshot_file(PUBLIC_STATE) == public_state_snapshot,
+                     "recovery_rollback_public_state_mismatch")
+                remove_regular_file(state_path)
+                need(not state_path.exists() and not state_path.is_symlink(),
+                     "recovery_rollback_state_present")
+                authority_restored = True
+            except BaseException as restore_error:
+                errors.append(
+                    "restore_recovery_authority:"
+                    f"{type(restore_error).__name__}:{restore_error}"
+                )
+        if authority_restored:
+            errors.extend(run_rollback_steps([
+                ("restart_timers", start_telemetry_timers),
+            ]))
         try:
-            need(CURRENT.resolve(strict=True) == previous,
-                 "recovery_rollback_current_mismatch")
-            for path, digest in previous_unit_hashes.items():
-                need(digest_file(path) == digest,
-                     f"recovery_rollback_unit_mismatch:{path.name}")
-            need(snapshot_file(PUBLIC_STATE) == public_state_snapshot,
-                 "recovery_rollback_public_state_mismatch")
             need(digest_file(NGINX_ROUTE) == sha256(maintenance),
                  "recovery_rollback_route_not_fail_closed")
-            need(not state_path.exists() and not state_path.is_symlink(),
-                 "recovery_rollback_state_present")
             need(
                 unit_state("agent-stack-watchdog.service")
                 in {"inactive", "failed"},
@@ -1876,17 +1874,25 @@ def recovery_apply(
                 "verify_recovery_rollback:"
                 f"{type(verify_error).__name__}:{verify_error}"
             )
-        source = evidence_archive if evidence_moved else archive
-        if source.exists():
-            failed_archive = STATE_DIR / (
-                f"{document['deployed_at']}-{identifier}.failed.tar.gz"
-            )
-            if failed_archive.exists():
+        if not errors:
+            try:
+                source = evidence_archive if evidence_moved else archive
+                need(source.is_file() and not source.is_symlink(),
+                     "recovery_failed_archive_missing")
                 failed_archive = STATE_DIR / (
-                    f"{document['deployed_at']}-{identifier}.failed-"
-                    f"{os.getpid()}.tar.gz"
+                    f"{document['deployed_at']}-{identifier}.failed.tar.gz"
                 )
-            os.replace(source, failed_archive)
+                if failed_archive.exists():
+                    failed_archive = STATE_DIR / (
+                        f"{document['deployed_at']}-{identifier}.failed-"
+                        f"{os.getpid()}.tar.gz"
+                    )
+                os.replace(source, failed_archive)
+            except BaseException as archive_error:
+                errors.append(
+                    "preserve_failed_archive:"
+                    f"{type(archive_error).__name__}:{archive_error}"
+                )
         if errors:
             raise ReleaseError(
                 "recovery_deployment_failed:"

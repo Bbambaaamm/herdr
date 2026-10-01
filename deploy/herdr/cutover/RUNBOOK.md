@@ -172,8 +172,10 @@ Because the previous release is known unable to perform a healthy web boot,
 restores the exact previous symlink, systemd unit bytes and deployed marker,
 keeps the Agent Platform route on the reviewed maintenance 503 fragment,
 re-quiesces the timers, their oneshot services and the durable watchdog before
-restoring mutable authority, removes any premature success record, verifies that
-the telemetry timers were restored, and preserves the failed archive for audit.
+restoring mutable authority, and aborts authority restoration if that gate fails.
+It removes any premature success record only after exact authority restoration
+is verified, restarts telemetry timers only after that complete restoration, and
+preserves the failed archive for audit.
 
 After a successful recovery promotion, the normal cutover path is authoritative
 again for subsequent releases.
