@@ -342,6 +342,9 @@ def terminalize_from_result(
         return
 
     task.pop("watchdog_cleanup_blocker", None)
+    task.pop("watchdog_blocker", None)
+    task["watchdog_resolution"] = "exact_durable_result"
+    task["watchdog_resolved_at"] = utcnow().isoformat()
 
     task["result_status"] = status
     task["finished_at"] = utcnow().isoformat()
