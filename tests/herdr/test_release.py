@@ -708,6 +708,35 @@ def test_recovery_apply_is_explicit_and_never_claims_rollback_exercise():
     )
     assert "remove_regular_file(state_path)" in rollback
     assert "recovery_rollback_watchdog_active" in rollback
+    assert "if not errors:\n            try:\n                source =" not in rollback
+    assert '"preserve_failed_archive:"' in rollback
+
+
+def test_cutovers_hold_the_deployment_lock(monkeypatch):
+    events = []
+
+    class FakeLock:
+        def __enter__(self):
+            events.append("lock_enter")
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            events.append("lock_exit")
+
+    monkeypatch.setattr(cutover, "deployment_lock", FakeLock)
+
+    @cutover.serialized_deployment
+    def operation():
+        events.append("operation")
+        return "done"
+
+    assert operation() == "done"
+    assert events == ["lock_enter", "operation", "lock_exit"]
+
+    source = Path("deploy/herdr/cutover/cutover.py").read_text(
+        encoding="utf-8"
+    )
+    assert "@serialized_deployment\ndef apply(" in source
+    assert "@serialized_deployment\ndef recovery_apply(" in source
 
 
 def test_agent_stack_runtime_chain_is_release_relative():

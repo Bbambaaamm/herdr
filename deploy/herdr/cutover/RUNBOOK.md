@@ -175,7 +175,9 @@ re-quiesces the timers, their oneshot services and the durable watchdog before
 restoring mutable authority, and aborts authority restoration if that gate fails.
 It removes any premature success record only after exact authority restoration
 is verified, restarts telemetry timers only after all fail-closed rollback checks
-pass without error, and preserves the failed archive for audit.
+pass without error, and preserves the failed archive for audit even when another
+rollback step is incomplete. Normal and recovery cutovers share one root-owned
+non-blocking deployment lock held from authorization through success or rollback.
 
 After a successful recovery promotion, the normal cutover path is authoritative
 again for subsequent releases.

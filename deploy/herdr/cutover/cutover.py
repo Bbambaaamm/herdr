@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from argparse import ArgumentParser
+from contextlib import contextmanager
+from functools import wraps
 import hashlib
 import json
 import os
@@ -15,6 +17,11 @@ import sys
 import tarfile
 import tempfile
 import time
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - production cutover is Linux-only
+    fcntl = None
 
 try:
     import grp
@@ -46,6 +53,7 @@ INCOMING_DIR = Path("/var/lib/herdr/incoming")
 PUBLIC_STATE = Path("/var/lib/agent-platform-herdr/deployed-release.json")
 NGINX_ROUTE = Path("/etc/agent-platform/nginx-server.conf")
 UNIT_DIR = Path("/etc/systemd/system")
+DEPLOYMENT_LOCK = Path("/run/lock/herdr-cutover.lock")
 UNITS = (
     "agent-platform-web.service",
     "agent-platform-export.service",
@@ -109,6 +117,44 @@ BOOTSTRAP_VERSIONED_UNIT_HASHES = {
 def need(value: bool, message: str) -> None:
     if not value:
         raise ReleaseError(message)
+
+
+@contextmanager
+def deployment_lock():
+    """Serialize every cutover from authorization through rollback."""
+    need(fcntl is not None, "deployment_lock_unavailable")
+    flags = os.O_CREAT | os.O_RDWR
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(DEPLOYMENT_LOCK, flags, 0o600)
+    locked = False
+    try:
+        info = os.fstat(descriptor)
+        need(
+            stat.S_ISREG(info.st_mode)
+            and info.st_uid == 0
+            and not stat.S_IMODE(info.st_mode) & 0o077,
+            "unsafe_deployment_lock",
+        )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ReleaseError("deployment_in_progress") from error
+        locked = True
+        yield
+    finally:
+        if locked:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def serialized_deployment(operation):
+    @wraps(operation)
+    def locked_operation(*args, **kwargs):
+        with deployment_lock():
+            return operation(*args, **kwargs)
+
+    return locked_operation
 
 
 def digest_file(path: Path) -> str:
@@ -1072,6 +1118,7 @@ def start_watchdog_service() -> None:
     )
 
 
+@serialized_deployment
 def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict[str, object]:
     need(os.geteuid() == 0, "root_required")
     archive = pin_archive(archive)
@@ -1699,6 +1746,7 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
         raise
 
 
+@serialized_deployment
 def recovery_apply(
     archive: Path,
     expected_legacy_commit: str,
@@ -1874,25 +1922,24 @@ def recovery_apply(
             errors.extend(run_rollback_steps([
                 ("restart_timers", start_telemetry_timers),
             ]))
-        if not errors:
-            try:
-                source = evidence_archive if evidence_moved else archive
-                need(source.is_file() and not source.is_symlink(),
-                     "recovery_failed_archive_missing")
+        try:
+            source = evidence_archive if evidence_moved else archive
+            need(source.is_file() and not source.is_symlink(),
+                 "recovery_failed_archive_missing")
+            failed_archive = STATE_DIR / (
+                f"{document['deployed_at']}-{identifier}.failed.tar.gz"
+            )
+            if failed_archive.exists():
                 failed_archive = STATE_DIR / (
-                    f"{document['deployed_at']}-{identifier}.failed.tar.gz"
+                    f"{document['deployed_at']}-{identifier}.failed-"
+                    f"{os.getpid()}.tar.gz"
                 )
-                if failed_archive.exists():
-                    failed_archive = STATE_DIR / (
-                        f"{document['deployed_at']}-{identifier}.failed-"
-                        f"{os.getpid()}.tar.gz"
-                    )
-                os.replace(source, failed_archive)
-            except BaseException as archive_error:
-                errors.append(
-                    "preserve_failed_archive:"
-                    f"{type(archive_error).__name__}:{archive_error}"
-                )
+            os.replace(source, failed_archive)
+        except BaseException as archive_error:
+            errors.append(
+                "preserve_failed_archive:"
+                f"{type(archive_error).__name__}:{archive_error}"
+            )
         if errors:
             raise ReleaseError(
                 "recovery_deployment_failed:"
