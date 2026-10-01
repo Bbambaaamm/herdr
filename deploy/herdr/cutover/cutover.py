@@ -52,6 +52,7 @@ STATE_DIR = Path("/var/lib/herdr/deployments")
 INCOMING_DIR = Path("/var/lib/herdr/incoming")
 PUBLIC_STATE = Path("/var/lib/agent-platform-herdr/deployed-release.json")
 NGINX_ROUTE = Path("/etc/agent-platform/nginx-server.conf")
+NGINX_LOCATION_COMMON = Path("/etc/agent-platform/nginx-location-common.conf")
 UNIT_DIR = Path("/etc/systemd/system")
 DEPLOYMENT_LOCK = Path("/run/herdr/cutover.lock")
 UNITS = (
@@ -240,7 +241,12 @@ def expected_hashes(path: Path) -> dict[Path, str]:
         need(bool(separator) and len(digest) == 64 and target.is_absolute()
              and target not in values, "invalid_expected_hash_manifest")
         values[target] = digest
-    need(set(values) == {*(UNIT_DIR / name for name in UNITS), NGINX_ROUTE},
+    need(
+        set(values) == {
+            *(UNIT_DIR / name for name in UNITS),
+            NGINX_ROUTE,
+            NGINX_LOCATION_COMMON,
+        },
          "incomplete_expected_hash_manifest")
     return values
 
@@ -696,6 +702,7 @@ def preflight(
                 allowed.add(previous)
             need(digest_file(path) in allowed, f"unexpected_runtime_drift:{path}")
         else:
+            need(root_owned_readonly(path), f"unsafe_runtime_file:{path}")
             need(digest_file(path) == digest, f"unexpected_runtime_drift:{path}")
     statuses = {unit: run("/usr/bin/systemctl", "is-active", unit, check=False) for unit in UNITS}
     recovery_mode = (

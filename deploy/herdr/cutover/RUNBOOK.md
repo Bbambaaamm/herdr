@@ -159,7 +159,8 @@ Recovery authorization is intentionally narrow:
 - both telemetry timers must be active, web must be failed/inactive, and durable
   watchdog must be inactive;
 - public Agent Platform health must remain fail-closed: `401` from the exact
-  verified auth-first Nginx route, or an upstream-facing `502`/`503`.
+  verified auth-first Nginx route and its pinned common location include, or an
+  upstream-facing `502`/`503`.
 
 Before switching releases, recovery apply verifies that both telemetry timers,
 both timer-triggered oneshot services, and the watchdog actually stopped. It
