@@ -618,6 +618,8 @@ def test_recovery_unit_quiescence_is_verified(monkeypatch):
     states = {
         "agent-platform-export.timer": "inactive",
         "agent-platform-herdr.timer": "inactive",
+        "agent-platform-export.service": "inactive",
+        "agent-platform-herdr.service": "inactive",
         "agent-stack-watchdog.service": "inactive",
     }
     calls = []
@@ -635,6 +637,8 @@ def test_recovery_unit_quiescence_is_verified(monkeypatch):
         "stop",
         "agent-platform-export.timer",
         "agent-platform-herdr.timer",
+        "agent-platform-export.service",
+        "agent-platform-herdr.service",
         "agent-stack-watchdog.service",
     ), True)
 
@@ -642,6 +646,14 @@ def test_recovery_unit_quiescence_is_verified(monkeypatch):
     with pytest.raises(
         release.ReleaseError,
         match="recovery_timer_not_stopped:agent-platform-herdr.timer",
+    ):
+        cutover.stop_recovery_units()
+
+    states["agent-platform-herdr.timer"] = "inactive"
+    states["agent-platform-export.service"] = "active"
+    with pytest.raises(
+        release.ReleaseError,
+        match="recovery_service_not_stopped:agent-platform-export.service",
     ):
         cutover.stop_recovery_units()
 

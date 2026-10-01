@@ -919,16 +919,26 @@ def stop_recovery_units() -> None:
         "agent-platform-export.timer",
         "agent-platform-herdr.timer",
     )
+    services = (
+        "agent-platform-export.service",
+        "agent-platform-herdr.service",
+    )
     run(
         "/usr/bin/systemctl",
         "stop",
         *timers,
+        *services,
         "agent-stack-watchdog.service",
     )
     for timer in timers:
         need(
             unit_state(timer) == "inactive",
             f"recovery_timer_not_stopped:{timer}",
+        )
+    for service in services:
+        need(
+            unit_state(service) in {"inactive", "failed"},
+            f"recovery_service_not_stopped:{service}",
         )
     need(
         unit_state("agent-stack-watchdog.service") in {"inactive", "failed"},

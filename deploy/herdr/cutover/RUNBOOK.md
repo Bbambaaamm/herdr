@@ -160,10 +160,10 @@ Recovery authorization is intentionally narrow:
   watchdog must be inactive;
 - public Agent Platform health must remain fail-closed (502/503).
 
-Before switching releases, recovery apply verifies that both telemetry timers and
-the watchdog actually stopped. It publishes the success record only after RC12
-returns the authenticated `401` health boundary and `current` resolves to RC12;
-the watchdog starts last.
+Before switching releases, recovery apply verifies that both telemetry timers,
+both timer-triggered oneshot services, and the watchdog actually stopped. It
+publishes the success record only after RC12 returns the authenticated `401`
+health boundary and `current` resolves to RC12; the watchdog starts last.
 
 Because the previous release is known unable to perform a healthy web boot,
 `recovery-apply` does **not** claim a healthy rollback exercise. It records
