@@ -712,6 +712,16 @@ def test_recovery_apply_is_explicit_and_never_claims_rollback_exercise():
     assert '"preserve_failed_archive:"' in rollback
 
 
+def test_recovery_public_boundary_accepts_only_fail_closed_statuses():
+    assert cutover.RECOVERY_FAIL_CLOSED_PUBLIC_STATUSES == {
+        "401",
+        "502",
+        "503",
+    }
+    assert "200" not in cutover.RECOVERY_FAIL_CLOSED_PUBLIC_STATUSES
+    assert "000" not in cutover.RECOVERY_FAIL_CLOSED_PUBLIC_STATUSES
+
+
 def test_cutovers_hold_the_deployment_lock(monkeypatch):
     events = []
 

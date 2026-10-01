@@ -87,6 +87,7 @@ RECOVERY_ROUTER_DATABASES = {
     "majak": Path("/home/agentops/.hermes/profiles/majak/model-router/router.db"),
     "quantlab": Path("/home/agentops/.hermes/profiles/quantlab/model-router/router.db"),
 }
+RECOVERY_FAIL_CLOSED_PUBLIC_STATUSES = frozenset({"401", "502", "503"})
 RECOVERY_ROUTER_GROUP_COUNT_SQL = """SELECT count(*) FROM (
 SELECT task_id,actual_model,provider FROM
 (SELECT id,task_id,actual_model,provider FROM requests ORDER BY id DESC LIMIT 1000)
@@ -718,7 +719,14 @@ def preflight(
     if recovery_mode:
         direct_health = "unavailable"
         public_health = http_status("https://2.28.67.165/agent-platform/health")
-        need(public_health in {"502", "503"}, "recovery_public_boundary_not_fail_closed")
+        # The exact active Nginx route was verified above. It authenticates
+        # before proxying, so an unauthenticated probe remains fail-closed with
+        # 401 even while the unavailable upstream would yield 502/503 after
+        # successful authentication.
+        need(
+            public_health in RECOVERY_FAIL_CLOSED_PUBLIC_STATUSES,
+            "recovery_public_boundary_not_fail_closed",
+        )
     else:
         direct_health = http_status("http://127.0.0.1:3010/agent-platform/health")
         public_health = http_status("https://2.28.67.165/agent-platform/health")
