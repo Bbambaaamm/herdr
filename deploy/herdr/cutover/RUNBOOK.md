@@ -158,6 +158,8 @@ Recovery authorization is intentionally narrow:
   prove at least 51 distinct task/model/provider groups without exposing rows;
 - both telemetry timers must be active, web must be failed/inactive, and durable
   watchdog must be inactive;
+- the durable watchdog lock must be unheld; an inactive systemd unit is not
+  sufficient when a legacy or detached watchdog process still owns dispatch;
 - public Agent Platform health must remain fail-closed: `401` from the exact
   verified auth-first Nginx route and its pinned common location include, or an
   upstream-facing `502`/`503`.
@@ -166,6 +168,10 @@ Before switching releases, recovery apply verifies that both telemetry timers,
 both timer-triggered oneshot services, and the watchdog actually stopped. It
 publishes the success record only after RC12 returns the authenticated `401`
 health boundary and `current` resolves to RC12; the watchdog starts last.
+The final watchdog start must remain `active/running` with the same nonzero
+`MainPID` and restart count across a bounded observation interval. A process that
+briefly becomes active and exits because another process owns the lock is a hard
+failure, never successful deployment evidence.
 
 Because the previous release is known unable to perform a healthy web boot,
 `recovery-apply` does **not** claim a healthy rollback exercise. It records
