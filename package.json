@@ -6,6 +6,8 @@
   "type": "module",
   "scripts": {
     "build": "node scripts/build.mjs",
+    "benchmark:dashboard": "node scripts/benchmark-machine-city.mjs",
+    "benchmark:dashboard:headed": "node scripts/benchmark-machine-city.mjs --headed",
     "test": "node --test agent_platform_dashboard/static/*.test.js",
     "check": "npm test && npm run build && git diff --exit-code -- agent_platform_dashboard/static/machine-city.js"
   },

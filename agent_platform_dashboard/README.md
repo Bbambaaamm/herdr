@@ -41,6 +41,25 @@ The Linux production tests cover no-follow I/O, SQLite immutability, bounded
 subprocesses, source isolation, authentication, stale/replay rejection, atomic
 publication, and service-template hardening.
 
+### Operator-device performance acceptance
+
+Run the committed Machine City bundle against deterministic 12-agent and 30-agent
+snapshots in an isolated local Chrome profile:
+
+```sh
+npm run benchmark:dashboard:headed
+```
+
+The benchmark does not connect to production or reuse the operator's browser
+profile. It measures initial interactivity, telemetry-to-visible latency, sustained
+frame cadence at both loads, WebGL identity, and reduced-motion behavior at a
+1920x1080 viewport. It fails unless the dashboard becomes interactive within
+2.5 seconds, shows telemetry changes within 500 ms, reaches display-rate 60 FPS
+with 12 active agents, sustains at least 45 FPS with 30 active agents, and preserves
+the reduced-motion contract. The JSON report and screenshot are written under
+the ignored `dist/` directory. Use `npm run benchmark:dashboard` for the equivalent
+headless diagnostic; only the headed run is operator-device acceptance evidence.
+
 ## Operational boundary
 
 Deployment and rollback are governed by
