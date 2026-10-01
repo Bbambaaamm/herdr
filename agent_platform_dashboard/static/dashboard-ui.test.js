@@ -843,6 +843,116 @@ test('authoritative swarm snapshot drives real DAG edges and child task lineage'
   assert.equal(child.status, 'running');
 });
 
+test('recorded swarm lifecycle replay keeps scene, inspector, DAG and analytics consistent', async t => {
+  const h = await harness(t);
+  const ids = ['plan', 'dispatch', 'code-a', 'code-b', 'review', 'integrate'];
+  const roles = {
+    plan: 'planner', dispatch: 'dispatcher', 'code-a': 'coding', 'code-b': 'research',
+    review: 'reviewer', integrate: 'integrator',
+  };
+  const parents = {
+    plan: null, dispatch: 'plan', 'code-a': 'dispatch', 'code-b': 'dispatch',
+    review: 'dispatch', integrate: 'dispatch',
+  };
+  const dependencies = {
+    plan: [], dispatch: ['plan'], 'code-a': ['dispatch'], 'code-b': ['dispatch'],
+    review: ['code-a', 'code-b'], integrate: ['review'],
+  };
+  const edges = ids.flatMap(taskId => [
+    ...(parents[taskId] ? [{ from_task: parents[taskId], to_task: taskId, kind: 'parent' }] : []),
+    ...dependencies[taskId].map(from => ({ from_task: from, to_task: taskId, kind: 'dependency' })),
+  ]);
+  const stages = [
+    ['planning', { plan: 'running', dispatch: 'pending', 'code-a': 'pending', 'code-b': 'pending', review: 'pending', integrate: 'pending' }, 0, 'working'],
+    ['dispatch', { plan: 'done', dispatch: 'running', 'code-a': 'ready', 'code-b': 'ready', review: 'pending', integrate: 'pending' }, 0, 'working'],
+    ['parallel running', { plan: 'done', dispatch: 'done', 'code-a': 'running', 'code-b': 'running', review: 'pending', integrate: 'pending' }, 0, 'working'],
+    ['waiting dependency', { plan: 'done', dispatch: 'done', 'code-a': 'done', 'code-b': 'running', review: 'pending', integrate: 'pending' }, 0, 'working'],
+    ['review BLOCK', { plan: 'done', dispatch: 'done', 'code-a': 'done', 'code-b': 'done', review: 'blocked', integrate: 'pending' }, 0, 'waiting_result'],
+    ['redispatch', { plan: 'done', dispatch: 'done', 'code-a': 'running', 'code-b': 'done', review: 'pending', integrate: 'pending' }, 2, 'working'],
+    ['PASS', { plan: 'done', dispatch: 'done', 'code-a': 'done', 'code-b': 'done', review: 'done', integrate: 'pending' }, 2, 'idle'],
+    ['integrate', { plan: 'done', dispatch: 'done', 'code-a': 'done', 'code-b': 'done', review: 'done', integrate: 'running' }, 2, 'working'],
+    ['done', { plan: 'done', dispatch: 'done', 'code-a': 'done', 'code-b': 'done', review: 'done', integrate: 'done' }, 2, 'complete'],
+  ];
+  const source = {
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: 0, data_at: 0, rows: [],
+  };
+  h.snapshot().sources.push(source);
+
+  function publishStage(states, retryAttempt) {
+    const now = Math.floor(Date.now() / 1000);
+    h.snapshot().generated_at = now;
+    source.observed_at = now; source.data_at = now;
+    const tasks = ids.map((taskId, index) => {
+      const state = states[taskId];
+      const running = state === 'running';
+      const attempt = taskId === 'code-a' && retryAttempt ? retryAttempt
+        : ['pending', 'ready'].includes(state) ? 0 : 1;
+      return {
+        task_id: taskId,
+        parent_task_id: parents[taskId],
+        parent_agent_id: parents[taskId] ? `agent-${parents[taskId]}` : null,
+        agent_id: running ? `agent-${taskId}` : null,
+        state,
+        role: roles[taskId],
+        model: 'model-a',
+        fallback_model: 'model-b',
+        attempt,
+        max_attempts: 3,
+        blocker: taskId === 'review' && state === 'blocked' ? 'review_blocked' : null,
+        fencing_token: index + 1,
+        dependencies: dependencies[taskId],
+        result_sha: state === 'done' ? String(index + 1).repeat(64) : null,
+      };
+    });
+    source.rows = [{
+      version: 1,
+      repo: 'Bbambaaamm/herdr',
+      issue: '7',
+      paper_only: false,
+      policy_profiles: ['herdr-core'],
+      agents: tasks.filter(task => task.state === 'running').map(task => ({
+        agent_id: task.agent_id,
+        task_id: task.task_id,
+        state: 'running',
+        parent_task_id: task.parent_task_id,
+        parent_agent_id: task.parent_agent_id,
+        fencing_token: task.fencing_token,
+      })),
+      tasks,
+      edges,
+    }];
+  }
+
+  for (const [phase, states, retryAttempt, expectedGlobalState] of stages) {
+    publishStage(states, retryAttempt);
+    await h.refresh();
+    if (!h.ui.diagnostics().selectedTask) h.calls.selectTask('review');
+
+    const mapped = Object.values(states).map(state => state === 'ready' ? 'pending' : state);
+    const running = mapped.filter(state => state === 'running').length;
+    const waiting = mapped.filter(state => state === 'pending').length;
+    const blocked = mapped.filter(state => state === 'blocked').length;
+    const done = mapped.filter(state => state === 'done').length;
+    assert.equal(h.ui.diagnostics().freshSnapshot, true, phase);
+    assert.equal(h.ui.diagnostics().state, expectedGlobalState, phase);
+    assert.equal(h.ui.diagnostics().selectedTask, 'review', phase);
+    assert.match(h.get('#taskgraph-status').textContent, new RegExp(`Autoritativní Herdr DAG · ${edges.length} hran`), phase);
+    assert.match(h.get('#taskgraph-nodes').innerHTML, /Herdr swarm · reviewer/, phase);
+    assert.match(h.get('#detail-status').textContent, new RegExp(`Stav: ${states.review}`), phase);
+    assert.match(h.get('#detail-metrics').innerHTML, /depends on code-a, code-b/, phase);
+    assert.match(h.get('#detail-events').innerHTML, /Autoritativní DAG:/, phase);
+    assert.match(h.get('#swarm-kpis').innerHTML, new RegExp(`<span>Running<\\/span><b>${running}<\\/b>`), phase);
+    assert.match(h.get('#swarm-kpis').innerHTML, new RegExp(`<span>Waiting<\\/span><b>${waiting}<\\/b>`), phase);
+    assert.match(h.get('#swarm-kpis').innerHTML, new RegExp(`<span>Blocked \\/ Failed<\\/span><b>${blocked} \\/ 0<\\/b>`), phase);
+    assert.match(h.get('#swarm-analytics-grid').innerHTML,
+      new RegExp(`${running} running · ${waiting} waiting · ${blocked} blocked · 0 failed · ${done} done`), phase);
+    const sceneTasks = h.calls.tasks.at(-1);
+    assert.deepEqual(sceneTasks.map(task => task.task_id).sort(),
+      ids.filter(taskId => states[taskId] !== 'done').sort(), phase);
+  }
+});
+
 test('Majak root remains visible alongside authoritative QuantLab swarm tasks', async t => {
   const h = await harness(t);
   const now = Math.floor(Date.now() / 1000);

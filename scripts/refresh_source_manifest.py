@@ -12,7 +12,12 @@ ROOTS = (
     Path("integrations"),
     Path("scripts"),
 )
-FILES = (Path("package.json"), Path("package-lock.json"))
+FILES = (
+    Path("configs/consumers/herdr.yaml"),
+    Path("docs/CONSUMERS.md"),
+    Path("package.json"),
+    Path("package-lock.json"),
+)
 OUTPUT = Path("provenance/CANONICAL_SOURCE_MANIFEST.sha256")
 TEXT_SUFFIXES = {
     ".css", ".html", ".in", ".js", ".json", ".md", ".mjs", ".py",
