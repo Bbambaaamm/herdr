@@ -597,6 +597,11 @@ def test_cleanup_refuses_existing_pane_without_matching_marker(
         "_pane_has_marker",
         lambda pane_id, marker: False,
     )
+    monkeypatch.setattr(
+        recovery,
+        "_pane_identity_superseded",
+        lambda session: (False, None),
+    )
 
     def must_not_close(*args, **kwargs):
         raise AssertionError(
@@ -620,6 +625,108 @@ def test_cleanup_refuses_existing_pane_without_matching_marker(
         "pane ownership marker mismatch"
     )
     assert "closed_at" not in session
+
+
+def test_cleanup_accepts_proven_superseded_pane_without_closing_current(
+    tmp_path,
+    monkeypatch,
+):
+    configure_paths(tmp_path)
+
+    task_payload = {
+        "id": "task-1",
+        "execution_session": {
+            "owned_pane": True,
+            "agent_name": "old-task-agent",
+            "created_at": "2026-09-27T00:00:00+00:00",
+            "pane_id": "w2:p9",
+            "pane_marker": "durable-task-marker",
+            "coordinator_pane_id": "w2:p2",
+        },
+    }
+
+    monkeypatch.setattr(
+        recovery,
+        "_pane_presence",
+        lambda pane_id: True,
+    )
+    monkeypatch.setattr(
+        recovery,
+        "_pane_has_marker",
+        lambda pane_id, marker: False,
+    )
+    monkeypatch.setattr(
+        recovery,
+        "_pane_identity_superseded",
+        lambda session: (True, 77855),
+    )
+
+    def must_not_close(*args, **kwargs):
+        raise AssertionError(
+            "a pane with a superseded identity must not be closed"
+        )
+
+    monkeypatch.setattr(
+        recovery.subprocess,
+        "run",
+        must_not_close,
+    )
+
+    assert recovery.cleanup_task_owned_pane(task_payload) is True
+
+    session = task_payload["execution_session"]
+    assert session["cleanup_status"] == "superseded_identity_proven"
+    assert session["closed_at"]
+    assert session["superseded_at"] == session["closed_at"]
+    assert session["cleanup_evidence"] == {
+        "version": 1,
+        "expected_agent_absent": True,
+        "current_pane_unbound": True,
+        "ownership_marker_absent": True,
+        "shell_started_after_session_seconds": 77855,
+        "current_pane_close_performed": False,
+    }
+
+
+def test_superseded_identity_requires_absent_agent_unbound_new_shell(
+    tmp_path,
+    monkeypatch,
+):
+    configure_paths(tmp_path)
+    created = datetime(2026, 9, 27, 0, 0, tzinfo=timezone.utc)
+    session = {
+        "pane_id": "w2:p9",
+        "agent_name": "old-task-agent",
+        "created_at": created.isoformat(),
+    }
+    agents = []
+
+    def fake_herdr_json(args, timeout=15.0):
+        assert args == ["agent", "list"]
+        return {"result": {"agents": list(agents)}}
+
+    monkeypatch.setattr(recovery, "_herdr_json", fake_herdr_json)
+    monkeypatch.setattr(
+        recovery,
+        "_pane_shell_started_at",
+        lambda pane_id: created.timestamp() + 77855,
+    )
+
+    assert recovery._pane_identity_superseded(session) == (True, 77855)
+
+    agents.append({"name": "old-task-agent", "pane_id": "w2:p9"})
+    assert recovery._pane_identity_superseded(session) == (False, None)
+
+    agents[:] = [{"name": "other-agent", "pane_id": "w2:p9"}]
+    assert recovery._pane_identity_superseded(session) == (False, None)
+
+    agents.clear()
+    monkeypatch.setattr(
+        recovery,
+        "_pane_shell_started_at",
+        lambda pane_id: created.timestamp() + 300,
+    )
+    assert recovery._pane_identity_superseded(session) == (False, 300)
 
 
 def test_cleanup_accepts_already_absent_owned_pane(

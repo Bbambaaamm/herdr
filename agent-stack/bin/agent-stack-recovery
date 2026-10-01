@@ -15,6 +15,7 @@ BLOCKED = ROOT / "blocked"
 FAILED = ROOT / "failed"
 RESULTS = ROOT / "results"
 ORPHAN_GRACE_SECONDS = 300
+PANE_SUPERSESSION_GRACE_SECONDS = 3600
 TASK_PANE_ENV = "HERDR_DURABLE_TASK_PANE"
 
 ENV = os.environ.copy()
@@ -184,6 +185,69 @@ def _pane_has_marker(pane_id: str, marker: str) -> bool:
     return expected in environ
 
 
+def _pane_shell_started_at(pane_id: str) -> float | None:
+    process_payload = _herdr_json(
+        ["pane", "process-info", "--pane", pane_id],
+        timeout=10.0,
+    )
+    process_info = (
+        ((process_payload or {}).get("result") or {}).get("process_info")
+    )
+    if not isinstance(process_info, dict):
+        return False, None
+
+    try:
+        shell_pid = int(process_info.get("shell_pid") or 0)
+        raw_stat = Path(f"/proc/{shell_pid}/stat").read_text(encoding="utf-8")
+        fields = raw_stat[raw_stat.rfind(")") + 2 :].split()
+        start_ticks = int(fields[19])
+        ticks_per_second = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+        boot_epoch = next(
+            int(line.split()[1])
+            for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines()
+            if line.startswith("btime ")
+        )
+    except (OSError, StopIteration, TypeError, ValueError):
+        return None
+
+    return boot_epoch + start_ticks / ticks_per_second
+
+
+def _pane_identity_superseded(session: dict) -> tuple[bool, int | None]:
+    """Prove that a reused pane id no longer names the task-owned shell."""
+    pane_id = str(session.get("pane_id") or "")
+    expected_agent = str(session.get("agent_name") or "")
+    created_raw = str(session.get("created_at") or "")
+    if not pane_id or not expected_agent or not created_raw:
+        return False, None
+
+    agents_payload = _herdr_json(["agent", "list"], timeout=10.0)
+    if agents_payload is None:
+        return False, None
+    agents = (agents_payload.get("result") or {}).get("agents")
+    if not isinstance(agents, list):
+        return False, None
+    rows = [row for row in agents if isinstance(row, dict)]
+    if any(str(row.get("name") or "") == expected_agent for row in rows):
+        return False, None
+    if any(str(row.get("pane_id") or "") == pane_id for row in rows):
+        return False, None
+
+    shell_epoch = _pane_shell_started_at(pane_id)
+    if shell_epoch is None:
+        return False, None
+
+    try:
+        created = datetime.fromisoformat(
+            created_raw.replace("Z", "+00:00")
+        ).astimezone(timezone.utc)
+    except ValueError:
+        return False, None
+
+    delta = int(shell_epoch - created.timestamp())
+    return delta > PANE_SUPERSESSION_GRACE_SECONDS, delta
+
+
 def cleanup_task_owned_pane(task: dict) -> bool:
     session = task.get("execution_session")
 
@@ -229,6 +293,22 @@ def cleanup_task_owned_pane(task: dict) -> bool:
     # Never close a currently existing pane only because an old pane_id
     # happens to match. Durable task marker must prove ownership.
     if not _pane_has_marker(pane_id, marker):
+        superseded, delta = _pane_identity_superseded(session)
+        if superseded:
+            resolved_at = utcnow().isoformat()
+            session["superseded_at"] = resolved_at
+            session["closed_at"] = resolved_at
+            session["cleanup_status"] = "superseded_identity_proven"
+            session["cleanup_evidence"] = {
+                "version": 1,
+                "expected_agent_absent": True,
+                "current_pane_unbound": True,
+                "ownership_marker_absent": True,
+                "shell_started_after_session_seconds": delta,
+                "current_pane_close_performed": False,
+            }
+            session.pop("cleanup_error", None)
+            return True
         session["cleanup_status"] = "close_unproven"
         session["cleanup_error"] = "pane ownership marker mismatch"
         return False
