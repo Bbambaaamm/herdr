@@ -55,6 +55,8 @@ NGINX_ROUTE = Path("/etc/agent-platform/nginx-server.conf")
 NGINX_LOCATION_COMMON = Path("/etc/agent-platform/nginx-location-common.conf")
 UNIT_DIR = Path("/etc/systemd/system")
 DEPLOYMENT_LOCK = Path("/run/herdr/cutover.lock")
+WATCHDOG_LOCK = Path("/home/agentops/.local/state/agent-stack/watchdog.lock")
+WATCHDOG_STABILITY_SECONDS = 6
 UNITS = (
     "agent-platform-web.service",
     "agent-platform-export.service",
@@ -675,6 +677,23 @@ def rc8_router_recovery_evidence(statuses: dict[str, str]) -> bool:
     return counts == {"majak": 51, "quantlab": 51}
 
 
+def recovery_mode_authorized(
+    statuses: dict[str, str],
+    allow_degraded_rc8: bool,
+) -> bool:
+    authorized = (
+        allow_degraded_rc8
+        and os.geteuid() == 0
+        and rc8_router_recovery_evidence(statuses)
+    )
+    if authorized:
+        need(
+            watchdog_lock_available(),
+            "recovery_watchdog_lock_held",
+        )
+    return authorized
+
+
 def preflight(
     archive: Path,
     expected_legacy_commit: str,
@@ -713,10 +732,9 @@ def preflight(
             need(root_owned_readonly(path), f"unsafe_runtime_file:{path}")
             need(digest_file(path) == digest, f"unexpected_runtime_drift:{path}")
     statuses = {unit: run("/usr/bin/systemctl", "is-active", unit, check=False) for unit in UNITS}
-    recovery_mode = (
-        allow_degraded_rc8
-        and os.geteuid() == 0
-        and rc8_router_recovery_evidence(statuses)
+    recovery_mode = recovery_mode_authorized(
+        statuses,
+        allow_degraded_rc8,
     )
     if not recovery_mode:
         need(statuses["agent-platform-web.service"] == "active"
@@ -1001,6 +1019,32 @@ def unit_state(unit: str) -> str:
     )
 
 
+def watchdog_lock_available() -> bool:
+    """Fail closed when durable dispatch is held outside the managed unit."""
+    if fcntl is None:
+        return False
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(WATCHDOG_LOCK, flags)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return False
+        try:
+            fcntl.flock(
+                descriptor,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except (BlockingIOError, OSError):
+            return False
+        return True
+    finally:
+        os.close(descriptor)
+
+
 def stop_recovery_units() -> None:
     """Quiesce every unit that can race with the one-time recovery."""
     timers = (
@@ -1031,6 +1075,10 @@ def stop_recovery_units() -> None:
     need(
         unit_state("agent-stack-watchdog.service") in {"inactive", "failed"},
         "recovery_watchdog_not_stopped",
+    )
+    need(
+        watchdog_lock_available(),
+        "recovery_watchdog_lock_held",
     )
 
 
@@ -1142,6 +1190,44 @@ def switch_runtime(
     assert_hardening()
 
 
+def watchdog_runtime_state() -> tuple[str, str, int, int]:
+    output = run(
+        "/usr/bin/systemctl",
+        "show",
+        "agent-stack-watchdog.service",
+        "-p",
+        "ActiveState",
+        "-p",
+        "SubState",
+        "-p",
+        "MainPID",
+        "-p",
+        "NRestarts",
+    )
+    try:
+        values = dict(
+            line.split("=", 1)
+            for line in output.splitlines()
+            if line
+        )
+        need(
+            {"ActiveState", "SubState", "MainPID", "NRestarts"}
+            <= set(values),
+            "watchdog_state_invalid",
+        )
+        main_pid = int(values["MainPID"])
+        restarts = int(values["NRestarts"])
+    except (TypeError, ValueError):
+        raise ReleaseError("watchdog_state_invalid") from None
+    need(main_pid >= 0 and restarts >= 0, "watchdog_state_invalid")
+    return (
+        values["ActiveState"],
+        values["SubState"],
+        main_pid,
+        restarts,
+    )
+
+
 def start_watchdog_service() -> None:
     run("/usr/bin/systemctl", "daemon-reload")
     run(
@@ -1149,14 +1235,22 @@ def start_watchdog_service() -> None:
         "start",
         "agent-stack-watchdog.service",
     )
+    before = watchdog_runtime_state()
     need(
-        run(
-            "/usr/bin/systemctl",
-            "is-active",
-            "agent-stack-watchdog.service",
-        )
-        == "active",
+        before[0:2] == ("active", "running")
+        and before[2] > 0,
         "watchdog_not_active",
+    )
+    time.sleep(WATCHDOG_STABILITY_SECONDS)
+    after = watchdog_runtime_state()
+    need(
+        after[0:2] == ("active", "running")
+        and after[2] > 0,
+        "watchdog_not_active",
+    )
+    need(
+        after[2:] == before[2:],
+        "watchdog_not_stable",
     )
 
 

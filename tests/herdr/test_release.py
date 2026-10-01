@@ -532,6 +532,31 @@ def test_rc8_router_recovery_evidence_is_exact_and_fail_closed(
     assert not cutover.rc8_router_recovery_evidence(statuses)
 
 
+def test_recovery_mode_requires_unheld_watchdog_lock(monkeypatch):
+    monkeypatch.setattr(cutover.os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setattr(
+        cutover,
+        "rc8_router_recovery_evidence",
+        lambda statuses: True,
+    )
+    lock_available = {"value": True}
+    monkeypatch.setattr(
+        cutover,
+        "watchdog_lock_available",
+        lambda: lock_available["value"],
+    )
+
+    assert cutover.recovery_mode_authorized({}, True)
+    assert not cutover.recovery_mode_authorized({}, False)
+
+    lock_available["value"] = False
+    with pytest.raises(
+        release.ReleaseError,
+        match="recovery_watchdog_lock_held",
+    ):
+        cutover.recovery_mode_authorized({}, True)
+
+
 def test_live_unix_socket_requires_live_listener(tmp_path):
     import socket as socket_module
 
@@ -635,6 +660,12 @@ def test_recovery_unit_quiescence_is_verified(monkeypatch):
         return ""
 
     monkeypatch.setattr(cutover, "run", fake_run)
+    lock_available = {"value": True}
+    monkeypatch.setattr(
+        cutover,
+        "watchdog_lock_available",
+        lambda: lock_available["value"],
+    )
     cutover.stop_recovery_units()
     assert calls[0] == ((
         "/usr/bin/systemctl",
@@ -668,6 +699,43 @@ def test_recovery_unit_quiescence_is_verified(monkeypatch):
         match="recovery_watchdog_not_stopped",
     ):
         cutover.stop_recovery_units()
+
+    states["agent-stack-watchdog.service"] = "inactive"
+    lock_available["value"] = False
+    with pytest.raises(
+        release.ReleaseError,
+        match="recovery_watchdog_lock_held",
+    ):
+        cutover.stop_recovery_units()
+
+
+def test_watchdog_lock_probe_fails_closed(monkeypatch, tmp_path):
+    lock = tmp_path / "watchdog.lock"
+    lock.write_bytes(b"")
+    monkeypatch.setattr(cutover, "WATCHDOG_LOCK", lock)
+
+    class FakeFcntl:
+        LOCK_EX = 1
+        LOCK_NB = 2
+
+        def __init__(self):
+            self.locked = False
+
+        def flock(self, descriptor, flags):
+            assert descriptor >= 0
+            assert flags == self.LOCK_EX | self.LOCK_NB
+            if self.locked:
+                raise BlockingIOError
+
+    fake = FakeFcntl()
+    monkeypatch.setattr(cutover, "fcntl", fake)
+    assert cutover.watchdog_lock_available()
+
+    fake.locked = True
+    assert not cutover.watchdog_lock_available()
+
+    lock.unlink()
+    assert cutover.watchdog_lock_available()
 
 
 def test_recovery_apply_is_explicit_and_never_claims_rollback_exercise():
@@ -986,18 +1054,29 @@ def test_rollback_steps_continue_after_individual_failure():
 
 def test_watchdog_start_is_explicit(monkeypatch):
     events = []
+    sleeps = []
 
     def fake_run(*args, check=True):
         events.append(("run", *args))
         if args[:3] == (
             "/usr/bin/systemctl",
-            "is-active",
+            "show",
             "agent-stack-watchdog.service",
         ):
-            return "active"
+            return (
+                "ActiveState=active\n"
+                "SubState=running\n"
+                "MainPID=123\n"
+                "NRestarts=0"
+            )
         return ""
 
     monkeypatch.setattr(cutover, "run", fake_run)
+    monkeypatch.setattr(
+        cutover.time,
+        "sleep",
+        lambda seconds: sleeps.append(seconds),
+    )
 
     cutover.start_watchdog_service()
 
@@ -1007,6 +1086,42 @@ def test_watchdog_start_is_explicit(monkeypatch):
         "start",
         "agent-stack-watchdog.service",
     ) in events
+    assert sleeps == [cutover.WATCHDOG_STABILITY_SECONDS]
+
+
+def test_watchdog_start_rejects_restart_during_stability_window(monkeypatch):
+    states = iter((
+        (
+            "ActiveState=active\n"
+            "SubState=running\n"
+            "MainPID=123\n"
+            "NRestarts=0"
+        ),
+        (
+            "ActiveState=active\n"
+            "SubState=running\n"
+            "MainPID=456\n"
+            "NRestarts=1"
+        ),
+    ))
+
+    def fake_run(*args, check=True):
+        if args[:3] == (
+            "/usr/bin/systemctl",
+            "show",
+            "agent-stack-watchdog.service",
+        ):
+            return next(states)
+        return ""
+
+    monkeypatch.setattr(cutover, "run", fake_run)
+    monkeypatch.setattr(cutover.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(
+        release.ReleaseError,
+        match="watchdog_not_stable",
+    ):
+        cutover.start_watchdog_service()
 
 
 def test_active_worker_blocks_control_plane_promotion(monkeypatch):
