@@ -52,6 +52,7 @@ STATE_DIR = Path("/var/lib/herdr/deployments")
 INCOMING_DIR = Path("/var/lib/herdr/incoming")
 PUBLIC_STATE = Path("/var/lib/agent-platform-herdr/deployed-release.json")
 NGINX_ROUTE = Path("/etc/agent-platform/nginx-server.conf")
+NGINX_LOCATION_COMMON = Path("/etc/agent-platform/nginx-location-common.conf")
 UNIT_DIR = Path("/etc/systemd/system")
 DEPLOYMENT_LOCK = Path("/run/herdr/cutover.lock")
 UNITS = (
@@ -87,6 +88,7 @@ RECOVERY_ROUTER_DATABASES = {
     "majak": Path("/home/agentops/.hermes/profiles/majak/model-router/router.db"),
     "quantlab": Path("/home/agentops/.hermes/profiles/quantlab/model-router/router.db"),
 }
+RECOVERY_FAIL_CLOSED_PUBLIC_STATUSES = frozenset({"401", "502", "503"})
 RECOVERY_ROUTER_GROUP_COUNT_SQL = """SELECT count(*) FROM (
 SELECT task_id,actual_model,provider FROM
 (SELECT id,task_id,actual_model,provider FROM requests ORDER BY id DESC LIMIT 1000)
@@ -231,7 +233,11 @@ def pin_archive(source: Path) -> Path:
         os.close(target_fd)
 
 
-def expected_hashes(path: Path) -> dict[Path, str]:
+def expected_hashes(
+    path: Path,
+    *,
+    require_location_common: bool = False,
+) -> dict[Path, str]:
     values: dict[Path, str] = {}
     for line in path.read_text(encoding="ascii").splitlines():
         digest, separator, filename = line.partition("  ")
@@ -239,8 +245,14 @@ def expected_hashes(path: Path) -> dict[Path, str]:
         need(bool(separator) and len(digest) == 64 and target.is_absolute()
              and target not in values, "invalid_expected_hash_manifest")
         values[target] = digest
-    need(set(values) == {*(UNIT_DIR / name for name in UNITS), NGINX_ROUTE},
-         "incomplete_expected_hash_manifest")
+    expected = {*(UNIT_DIR / name for name in UNITS), NGINX_ROUTE}
+    if NGINX_LOCATION_COMMON in values:
+        expected.add(NGINX_LOCATION_COMMON)
+    need(set(values) == expected, "incomplete_expected_hash_manifest")
+    need(
+        not require_location_common or NGINX_LOCATION_COMMON in values,
+        "auth_include_missing_from_expected_hash_manifest",
+    )
     return values
 
 
@@ -686,7 +698,10 @@ def preflight(
          "external_binary_mismatch")
     manifest = ROOT / "deploy" / "herdr" / "cutover" / "legacy-quantlab-staging-01.sha256"
     previous_units = current_release_unit_hashes()
-    for path, digest in expected_hashes(manifest).items():
+    for path, digest in expected_hashes(
+        manifest,
+        require_location_common=allow_degraded_rc8,
+    ).items():
         if path.name.endswith((".service", ".timer")):
             candidate = ROOT / "deploy" / "agent_platform" / "production" / f"{path.name}.in"
             allowed = {digest, digest_file(candidate)}
@@ -695,6 +710,7 @@ def preflight(
                 allowed.add(previous)
             need(digest_file(path) in allowed, f"unexpected_runtime_drift:{path}")
         else:
+            need(root_owned_readonly(path), f"unsafe_runtime_file:{path}")
             need(digest_file(path) == digest, f"unexpected_runtime_drift:{path}")
     statuses = {unit: run("/usr/bin/systemctl", "is-active", unit, check=False) for unit in UNITS}
     recovery_mode = (
@@ -718,7 +734,14 @@ def preflight(
     if recovery_mode:
         direct_health = "unavailable"
         public_health = http_status("https://2.28.67.165/agent-platform/health")
-        need(public_health in {"502", "503"}, "recovery_public_boundary_not_fail_closed")
+        # The exact active Nginx route was verified above. It authenticates
+        # before proxying, so an unauthenticated probe remains fail-closed with
+        # 401 even while the unavailable upstream would yield 502/503 after
+        # successful authentication.
+        need(
+            public_health in RECOVERY_FAIL_CLOSED_PUBLIC_STATUSES,
+            "recovery_public_boundary_not_fail_closed",
+        )
     else:
         direct_health = http_status("http://127.0.0.1:3010/agent-platform/health")
         public_health = http_status("https://2.28.67.165/agent-platform/health")

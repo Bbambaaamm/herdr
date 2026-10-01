@@ -218,11 +218,15 @@ def test_watchdog_unit_is_versioned_and_cutover_managed():
         Path(
             "deploy/herdr/cutover/"
             "legacy-quantlab-staging-01.sha256"
-        )
+        ),
+        require_location_common=True,
     )
     assert (
         cutover.UNIT_DIR / "agent-stack-watchdog.service"
         in expected
+    )
+    assert expected[cutover.NGINX_LOCATION_COMMON] == (
+        "257bb38ccaa241e0c3a2e80ffacd87e32807d114025ff2c42424ed1f4a4acf38"
     )
 
 
@@ -710,6 +714,29 @@ def test_recovery_apply_is_explicit_and_never_claims_rollback_exercise():
     assert "recovery_rollback_watchdog_active" in rollback
     assert "if not errors:\n            try:\n                source =" not in rollback
     assert '"preserve_failed_archive:"' in rollback
+
+
+def test_recovery_public_boundary_accepts_only_fail_closed_statuses():
+    assert cutover.RECOVERY_FAIL_CLOSED_PUBLIC_STATUSES == {
+        "401",
+        "502",
+        "503",
+    }
+    assert "200" not in cutover.RECOVERY_FAIL_CLOSED_PUBLIC_STATUSES
+    assert "000" not in cutover.RECOVERY_FAIL_CLOSED_PUBLIC_STATUSES
+    source = Path("deploy/herdr/cutover/cutover.py").read_text(
+        encoding="utf-8"
+    )
+    assert "NGINX_LOCATION_COMMON" in source
+    assert "require_location_common=allow_degraded_rc8" in source
+    assert '"auth_include_missing_from_expected_hash_manifest"' in source
+    assert source.index("for path, digest in expected_hashes(") < (
+        source.index(
+            'public_health = http_status('
+            '"https://2.28.67.165/agent-platform/health")'
+        )
+    )
+    assert 'root_owned_readonly(path), f"unsafe_runtime_file:{path}"' in source
 
 
 def test_cutovers_hold_the_deployment_lock(monkeypatch):
