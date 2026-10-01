@@ -160,6 +160,39 @@ function benchmarkBootstrap() {
   return `<script>
     window.__machineCityBenchmark = { startedAt: performance.now() };
     window.__machineCityLongTasks = [];
+    window.__machineCityRenderFrames = [];
+    window.__machineCityActiveFrame = null;
+    const nativeRequestAnimationFrame = window.requestAnimationFrame.bind(window);
+    window.requestAnimationFrame = callback => nativeRequestAnimationFrame(timestamp => {
+      const frame = { timestamp, drew: false };
+      window.__machineCityActiveFrame = frame;
+      try { callback(timestamp); }
+      finally {
+        if (frame.drew) window.__machineCityRenderFrames.push({
+          timestamp: performance.now(),
+          raf_timestamp: timestamp,
+          motion: document.documentElement.dataset.motion,
+        });
+        window.__machineCityActiveFrame = null;
+      }
+    });
+    try {
+      const methods = ['drawArrays', 'drawElements', 'drawArraysInstanced', 'drawElementsInstanced'];
+      for (const prototype of [window.WebGLRenderingContext?.prototype, window.WebGL2RenderingContext?.prototype].filter(Boolean)) {
+        for (const name of methods) {
+          const original = prototype[name];
+          if (typeof original !== 'function' || Object.hasOwn(original, '__machineCityWrapped')) continue;
+          const wrapped = function (...args) {
+            if (this.canvas?.id === 'machine-scene' && window.__machineCityActiveFrame) window.__machineCityActiveFrame.drew = true;
+            return Reflect.apply(original, this, args);
+          };
+          Object.defineProperty(wrapped, '__machineCityWrapped', { value: true });
+          prototype[name] = wrapped;
+        }
+      }
+    } catch (error) {
+      window.__machineCityProbeError = String(error);
+    }
     if ('PerformanceObserver' in window) {
       try {
         const observer = new PerformanceObserver(list => {
@@ -243,6 +276,7 @@ class CdpClient {
     this.sequence = 0;
     this.pending = new Map();
     this.events = new Map();
+    this.closed = false;
   }
   async open() {
     await new Promise((resolvePromise, rejectPromise) => {
@@ -259,19 +293,37 @@ class CdpClient {
         const pending = this.pending.get(message.id);
         if (!pending) return;
         this.pending.delete(message.id);
+        clearTimeout(pending.timer);
         if (message.error) pending.reject(new Error(`${pending.method}: ${message.error.message}`));
         else pending.resolve(message.result);
         return;
       }
       for (const callback of this.events.get(message.method) || []) callback(message.params);
     });
-    this.socket.addEventListener('close', event => progress(`CDP socket closed code=${event.code}`));
-    this.socket.addEventListener('error', () => progress('CDP socket error'));
+    this.socket.addEventListener('close', event => {
+      this.rejectPending(new Error(`CDP socket closed code=${event.code}`));
+      progress(`CDP socket closed code=${event.code}`);
+    });
+    this.socket.addEventListener('error', () => this.rejectPending(new Error('CDP socket error')));
   }
-  send(method, params = {}) {
+  rejectPending(error) {
+    if (this.closed) return;
+    this.closed = true;
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pending.clear();
+  }
+  send(method, params = {}, timeoutMs = 15000) {
+    if (this.closed || this.socket.readyState !== 1) return Promise.reject(new Error(`CDP socket is not open for ${method}`));
     const id = ++this.sequence;
     return new Promise((resolvePromise, rejectPromise) => {
-      this.pending.set(id, { resolve: resolvePromise, reject: rejectPromise, method });
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        rejectPromise(new Error(`CDP command timed out: ${method}`));
+      }, timeoutMs);
+      this.pending.set(id, { resolve: resolvePromise, reject: rejectPromise, method, timer });
       this.socket.send(JSON.stringify({ id, method, params }));
     });
   }
@@ -306,21 +358,19 @@ async function waitFor(client, expression, timeoutMs = 15000) {
 
 const frameMeasureExpression = durationMs => `(async () => {
   const duration = ${durationMs};
-  const timestamps = [];
+  const firstFrame = window.__machineCityRenderFrames.length;
+  const started = performance.now();
   const longTaskStart = window.__machineCityLongTasks.length;
-  await new Promise(resolve => {
-    const start = performance.now();
-    const step = timestamp => {
-      timestamps.push(timestamp);
-      if (timestamp - start >= duration) resolve(); else requestAnimationFrame(step);
-    };
-    requestAnimationFrame(step);
-  });
+  await new Promise(resolve => setTimeout(resolve, duration));
+  const ended = performance.now();
+  const timestamps = window.__machineCityRenderFrames.slice(firstFrame)
+    .filter(frame => frame.timestamp >= started && frame.timestamp <= ended && frame.motion === 'full')
+    .map(frame => frame.timestamp);
   const deltas = timestamps.slice(1).map((value, index) => value - timestamps[index]).filter(value => value > 0);
   const sorted = [...deltas].sort((a, b) => a - b);
   const percentile = value => sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * value) - 1))] || null;
-  const elapsed = timestamps.at(-1) - timestamps[0];
-  const averageFps = elapsed > 0 ? (timestamps.length - 1) * 1000 / elapsed : 0;
+  const elapsed = ended - started;
+  const averageFps = elapsed > 0 ? timestamps.length * 1000 / elapsed : 0;
   return {
     frames: timestamps.length,
     duration_ms: Number(elapsed.toFixed(2)),
@@ -390,7 +440,9 @@ async function main() {
     progress('dashboard loaded');
     await waitFor(client, `document.querySelector('#swarm-kpis .swarm-kpi:first-child b')?.textContent.trim() === '12'
       && document.querySelector('#film-view')?.hidden === false
-      && document.querySelector('#webgl-fallback')?.hidden === true`);
+      && document.querySelector('#webgl-fallback')?.hidden === true
+      && window.__machineCityRenderFrames.length > 0
+      && !window.__machineCityProbeError`);
     const interactiveMs = await evaluate(client, 'performance.now()');
     progress(`interactive in ${interactiveMs.toFixed(2)} ms`);
     await new Promise(resolvePromise => setTimeout(resolvePromise, 1000));
@@ -430,8 +482,8 @@ async function main() {
     await writeFile(options.screenshot, Buffer.from(screenshot.data, 'base64'));
     const reducedMotion = await evaluate(client, `(async () => {
       const button = document.querySelector('#motion-toggle');
+      window.__machineCityReducedAt = performance.now();
       if (document.documentElement.dataset.motion !== 'reduced') button.click();
-      await new Promise(requestAnimationFrame);
       const card = document.querySelector('.coordinator-card');
       const style = getComputedStyle(card);
       return {
@@ -443,6 +495,20 @@ async function main() {
         fallback_hidden: document.querySelector('#webgl-fallback').hidden,
       };
     })()`);
+    await waitFor(client, `window.__machineCityRenderFrames.some(frame => frame.timestamp >= window.__machineCityReducedAt && frame.motion === 'reduced')`);
+    const reducedClip = await evaluate(client, `(() => {
+      const rect = document.querySelector('#machine-scene').getBoundingClientRect();
+      const width = Math.min(640, rect.width * .42), height = Math.min(640, rect.height * .58);
+      return { x: rect.left + (rect.width - width) / 2, y: rect.top + (rect.height - height) / 2, width, height, scale: 1 };
+    })()`);
+    const reducedFirst = await client.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false, clip: reducedClip });
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 600));
+    const reducedSecond = await client.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false, clip: reducedClip });
+    const firstReducedHash = createHash('sha256').update(Buffer.from(reducedFirst.data, 'base64')).digest('hex');
+    const secondReducedHash = createHash('sha256').update(Buffer.from(reducedSecond.data, 'base64')).digest('hex');
+    reducedMotion.scene_rendered_reduced_frame = true;
+    reducedMotion.scene_stable = firstReducedHash === secondReducedHash;
+    reducedMotion.scene_sha256 = firstReducedHash;
 
     const measuredAt = new Date().toISOString();
     const bundle = await readFile(join(STATIC, 'machine-city.js'));
@@ -471,6 +537,7 @@ async function main() {
         webgl: renderer,
       },
       measurements: {
+        frame_probe: 'Machine City WebGL draw calls grouped by dashboard requestAnimationFrame callback',
         initial_interactive_ms: Number(interactiveMs.toFixed(2)),
         telemetry_to_visible_ms: Number(updateMs.toFixed(2)),
         fps_12_active_agents: fps12,
@@ -488,7 +555,9 @@ async function main() {
           && reducedMotion.transition_duration === '0s'
           && reducedMotion.animation_name === 'none'
           && reducedMotion.canvas_present
-          && reducedMotion.fallback_hidden,
+          && reducedMotion.fallback_hidden
+          && reducedMotion.scene_rendered_reduced_frame
+          && reducedMotion.scene_stable,
       },
       artifacts: { screenshot: options.screenshot },
     };
