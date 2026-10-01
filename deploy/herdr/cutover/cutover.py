@@ -62,9 +62,27 @@ UNITS = (
 # the generic manifest-bound path below.
 RECOVERY_RC8_TAG = "v0.3.0-rc.8"
 RECOVERY_RC8_COMMIT = "d58283bc4bf98490bb96bd9bffd58b293b451061"
-RECOVERY_ROUTER_SOURCE_SHA256 = "a170ec52925b0631972d57ad48fe0ba51009fabc25d034915ac15fd5f6fc27a8"
+RECOVERY_TARGET_TAG = "v0.3.0-rc.12"
+RECOVERY_TARGET_COMMIT = "1d524ff25d8b340cb638224effb0f445fb4e4e98"
+RECOVERY_TARGET_CONFIG_SHA256 = (
+    "3c7660874e437dd49dcbff83db20761fd595743c15ce3969a457d6f1de199ba9"
+)
+RECOVERY_TARGET_PAYLOAD_MANIFEST_SHA256 = (
+    "b97aa3900ad642ee55433cdb09b58fb99bb435360427a63eb1f68d9baa76938a"
+)
+RECOVERY_TARGET_ARCHIVE_SHA256 = (
+    "0f4fa8a24de0c367008532acb6319487d0da1948f458ee8d036910720ecb7b0f"
+)
 SNAPSHOT = Path("/var/lib/agent-platform/snapshot.json")
 HERDR_SOCKET = Path("/home/agentops/.config/herdr/herdr.sock")
+RECOVERY_ROUTER_DATABASES = {
+    "majak": Path("/home/agentops/.hermes/profiles/majak/model-router/router.db"),
+    "quantlab": Path("/home/agentops/.hermes/profiles/quantlab/model-router/router.db"),
+}
+RECOVERY_ROUTER_GROUP_COUNT_SQL = """SELECT count(*) FROM (
+SELECT task_id,actual_model,provider FROM
+(SELECT id,task_id,actual_model,provider FROM requests ORDER BY id DESC LIMIT 1000)
+GROUP BY task_id,actual_model,provider LIMIT 51)"""
 
 
 BOOTSTRAP_VERSIONED_UNIT_HASHES = {
@@ -448,15 +466,68 @@ def extract_candidate(archive: Path, destination: Path) -> Path:
     return roots[0]
 
 
+def verify_recovery_target(
+    archive: Path,
+    release: dict[str, object],
+) -> None:
+    """Authorize the one-time recovery only for the reviewed RC12 bytes."""
+    need(
+        digest_file(archive) == RECOVERY_TARGET_ARCHIVE_SHA256,
+        "recovery_target_archive_mismatch",
+    )
+    need(
+        release.get("tag") == RECOVERY_TARGET_TAG
+        and release.get("commit") == RECOVERY_TARGET_COMMIT
+        and release.get("config_contract_sha256")
+        == RECOVERY_TARGET_CONFIG_SHA256
+        and release.get("payload_manifest_sha256")
+        == RECOVERY_TARGET_PAYLOAD_MANIFEST_SHA256,
+        "recovery_target_identity_mismatch",
+    )
+
+
+def live_unix_socket(path: Path) -> bool:
+    """Prove that an exact, non-symlink Unix socket has a live listener."""
+    try:
+        info = os.lstat(path)
+        if path.is_symlink() or not stat.S_ISSOCK(info.st_mode):
+            return False
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(2)
+            client.connect(str(path))
+        return True
+    except (OSError, TimeoutError):
+        return False
+
+
+def recovery_router_group_counts() -> dict[str, int]:
+    """Count at most 51 live groups without publishing identifiers or rows."""
+    from agent_platform_dashboard import production_sources as sources
+
+    counts = {}
+    for profile, path in RECOVERY_ROUTER_DATABASES.items():
+        with sources.readonly(
+            str(path),
+            "requests",
+            sources.ROUTER_COLUMNS,
+        ) as database:
+            value = database.execute(
+                RECOVERY_ROUTER_GROUP_COUNT_SQL
+            ).fetchone()[0]
+        need(
+            type(value) is int and 0 <= value <= 51,
+            f"invalid_recovery_router_count:{profile}",
+        )
+        counts[profile] = value
+    return counts
+
+
 def rc8_router_recovery_evidence(statuses: dict[str, str]) -> bool:
     """Recognize only the exact fail-closed RC8 router-overflow recovery state."""
     if not CURRENT.is_symlink():
         return False
     expected = RELEASES / f"{RECOVERY_RC8_TAG}-{RECOVERY_RC8_COMMIT[:12]}"
     if CURRENT.resolve(strict=True) != expected:
-        return False
-    source = ROOT / "agent_platform_dashboard" / "production_sources.py"
-    if not source.is_file() or digest_file(source) != RECOVERY_ROUTER_SOURCE_SHA256:
         return False
     if statuses.get("agent-platform-web.service") not in {"failed", "inactive"}:
         return False
@@ -466,11 +537,9 @@ def rc8_router_recovery_evidence(statuses: dict[str, str]) -> bool:
         return False
     if statuses.get("agent-stack-watchdog.service") != "inactive":
         return False
-    if not HERDR_SOCKET.exists() or HERDR_SOCKET.is_symlink():
+    if not live_unix_socket(HERDR_SOCKET):
         return False
     try:
-        if not stat.S_ISSOCK(HERDR_SOCKET.stat().st_mode):
-            return False
         info = os.lstat(SNAPSHOT)
         if not stat.S_ISREG(info.st_mode) or SNAPSHOT.is_symlink() or info.st_size > 131072:
             return False
@@ -517,10 +586,16 @@ def rc8_router_recovery_evidence(statuses: dict[str, str]) -> bool:
     ):
         return False
     row = release_source["rows"][0]
-    return (
+    if not (
         row.get("tag") == RECOVERY_RC8_TAG
         and row.get("commit") == RECOVERY_RC8_COMMIT
-    )
+    ):
+        return False
+    try:
+        counts = recovery_router_group_counts()
+    except Exception:
+        return False
+    return counts == {"majak": 51, "quantlab": 51}
 
 
 def preflight(
@@ -530,8 +605,12 @@ def preflight(
     allow_degraded_rc8: bool = False,
 ) -> dict[str, object]:
     release = verify_archive(archive)
-    need((ROOT / "RELEASE.json").is_file() and verify_tree(ROOT) == release,
-         "cutover_tool_release_mismatch")
+    need((ROOT / "RELEASE.json").is_file(), "cutover_tool_release_missing")
+    controller_release = verify_tree(ROOT)
+    if allow_degraded_rc8:
+        verify_recovery_target(archive, release)
+    else:
+        need(controller_release == release, "cutover_tool_release_mismatch")
     need(socket.gethostname() == HOST, "wrong_host")
     need(LEGACY.is_dir() and not LEGACY.is_symlink(), "legacy_release_missing")
     legacy_commit = (LEGACY / "DEPLOYED_GIT_SHA").read_text(encoding="ascii").strip()
@@ -824,6 +903,69 @@ def assert_no_active_durable_worker() -> None:
     )
     need(not workers.strip(), "durable_worker_active")
 
+
+def unit_state(unit: str) -> str:
+    return run(
+        "/usr/bin/systemctl",
+        "is-active",
+        unit,
+        check=False,
+    )
+
+
+def stop_recovery_units() -> None:
+    """Quiesce every unit that can race with the one-time recovery."""
+    timers = (
+        "agent-platform-export.timer",
+        "agent-platform-herdr.timer",
+    )
+    run(
+        "/usr/bin/systemctl",
+        "stop",
+        *timers,
+        "agent-stack-watchdog.service",
+    )
+    for timer in timers:
+        need(
+            unit_state(timer) == "inactive",
+            f"recovery_timer_not_stopped:{timer}",
+        )
+    need(
+        unit_state("agent-stack-watchdog.service") in {"inactive", "failed"},
+        "recovery_watchdog_not_stopped",
+    )
+
+
+def start_telemetry_timers() -> None:
+    timers = (
+        "agent-platform-herdr.timer",
+        "agent-platform-export.timer",
+    )
+    run("/usr/bin/systemctl", "start", *timers)
+    for timer in timers:
+        need(
+            unit_state(timer) == "active",
+            f"telemetry_timer_not_active:{timer}",
+        )
+
+
+def stop_watchdog_service() -> None:
+    run(
+        "/usr/bin/systemctl",
+        "stop",
+        "agent-stack-watchdog.service",
+    )
+    need(
+        unit_state("agent-stack-watchdog.service") in {"inactive", "failed"},
+        "watchdog_not_stopped",
+    )
+
+
+def remove_regular_file(path: Path) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    need(path.is_file() and not path.is_symlink(), f"unsafe_remove_file:{path}")
+    path.unlink()
 
 
 def run_rollback_steps(steps):
@@ -1614,14 +1756,16 @@ def recovery_apply(
         need(http_status("https://2.28.67.165/") == root_status,
              "public_root_changed")
 
+        stop_recovery_units()
         run(
             "/usr/bin/systemctl",
             "stop",
-            "agent-platform-export.timer",
-            "agent-platform-herdr.timer",
-            "agent-stack-watchdog.service",
             "agent-platform-web.service",
             check=False,
+        )
+        need(
+            unit_state("agent-platform-web.service") in {"inactive", "failed"},
+            "recovery_web_not_stopped",
         )
         assert_no_active_durable_worker()
 
@@ -1633,12 +1777,7 @@ def recovery_apply(
         switched = True
         switch_runtime(candidate, document)
 
-        run(
-            "/usr/bin/systemctl",
-            "start",
-            "agent-platform-herdr.timer",
-            "agent-platform-export.timer",
-        )
+        start_telemetry_timers()
 
         os.replace(archive, evidence_archive)
         evidence_moved = True
@@ -1653,8 +1792,6 @@ def recovery_apply(
             "archive_sha256": digest_file(evidence_archive),
             "archive_path": str(evidence_archive),
         }
-        atomic_write(state_path, canonical_json(state), 0o600)
-
         atomic_write(NGINX_ROUTE, active_route, 0o644)
         run("/usr/sbin/nginx", "-t")
         run("/usr/bin/systemctl", "reload", "nginx")
@@ -1666,6 +1803,7 @@ def recovery_apply(
              "public_root_changed")
         need(CURRENT.resolve(strict=True) == candidate,
              "final_current_mismatch")
+        atomic_write(state_path, canonical_json(state), 0o600)
         start_watchdog_service()
         return {
             "status": "success",
@@ -1673,14 +1811,17 @@ def recovery_apply(
             "state_file": str(state_path),
         }
     except BaseException as original_error:
-        run(
-            "/usr/bin/systemctl",
-            "stop",
-            "agent-stack-watchdog.service",
-            "agent-platform-web.service",
-            check=False,
-        )
         errors = run_rollback_steps([
+            ("stop_watchdog", stop_watchdog_service),
+            (
+                "stop_web",
+                lambda: run(
+                    "/usr/bin/systemctl",
+                    "stop",
+                    "agent-platform-web.service",
+                ),
+            ),
+            ("remove_success_state", lambda: remove_regular_file(state_path)),
             ("restore_units", lambda: restore_units(unit_snapshots)),
             (
                 "restore_current",
@@ -1697,12 +1838,7 @@ def recovery_apply(
             ),
             (
                 "restart_timers",
-                lambda: run(
-                    "/usr/bin/systemctl",
-                    "start",
-                    "agent-platform-herdr.timer",
-                    "agent-platform-export.timer",
-                ),
+                start_telemetry_timers,
             ),
             (
                 "fail_closed_route",
@@ -1728,6 +1864,13 @@ def recovery_apply(
                  "recovery_rollback_public_state_mismatch")
             need(digest_file(NGINX_ROUTE) == sha256(maintenance),
                  "recovery_rollback_route_not_fail_closed")
+            need(not state_path.exists() and not state_path.is_symlink(),
+                 "recovery_rollback_state_present")
+            need(
+                unit_state("agent-stack-watchdog.service")
+                in {"inactive", "failed"},
+                "recovery_rollback_watchdog_active",
+            )
             need(http_status("https://2.28.67.165/") == root_status,
                  "recovery_rollback_root_changed")
         except BaseException as verify_error:

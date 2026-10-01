@@ -437,13 +437,16 @@ def test_rc8_router_recovery_evidence_is_exact_and_fail_closed(
         f"{cutover.RECOVERY_RC8_COMMIT[:12]}"
     )
     previous.mkdir()
-    current = tmp_path / "current"
-    current.symlink_to(previous)
 
-    root = tmp_path / "candidate"
-    source = root / "agent_platform_dashboard" / "production_sources.py"
-    source.parent.mkdir(parents=True)
-    source.write_text("reviewed top50 adapter\n", encoding="utf-8")
+    class CurrentLink:
+        @staticmethod
+        def is_symlink():
+            return True
+
+        @staticmethod
+        def resolve(*, strict):
+            assert strict
+            return previous
 
     snapshot = tmp_path / "snapshot.json"
     now = int(cutover.time.time())
@@ -482,25 +485,20 @@ def test_rc8_router_recovery_evidence_is_exact_and_fail_closed(
         encoding="utf-8",
     )
 
-    socket_path = tmp_path / "herdr.sock"
-    import socket as socket_module
-    sock = socket_module.socket(socket_module.AF_UNIX)
-    sock.bind(str(socket_path))
-
     monkeypatch.setattr(cutover, "RELEASES", releases)
-    monkeypatch.setattr(cutover, "CURRENT", current)
-    monkeypatch.setattr(cutover, "ROOT", root)
+    monkeypatch.setattr(cutover, "CURRENT", CurrentLink())
     monkeypatch.setattr(cutover, "SNAPSHOT", snapshot)
-    monkeypatch.setattr(cutover, "HERDR_SOCKET", socket_path)
-    original_digest = cutover.digest_file
+    live_socket = {"value": True}
     monkeypatch.setattr(
         cutover,
-        "digest_file",
-        lambda path: (
-            cutover.RECOVERY_ROUTER_SOURCE_SHA256
-            if path == source
-            else original_digest(path)
-        ),
+        "live_unix_socket",
+        lambda path: live_socket["value"],
+    )
+    counts = {"majak": 51, "quantlab": 51}
+    monkeypatch.setattr(
+        cutover,
+        "recovery_router_group_counts",
+        lambda: dict(counts),
     )
 
     statuses = {
@@ -510,18 +508,161 @@ def test_rc8_router_recovery_evidence_is_exact_and_fail_closed(
         "agent-stack-watchdog.service": "inactive",
     }
 
-    try:
-        assert cutover.rc8_router_recovery_evidence(statuses)
-        bad = dict(statuses)
-        bad["agent-stack-watchdog.service"] = "active"
-        assert not cutover.rc8_router_recovery_evidence(bad)
+    assert cutover.rc8_router_recovery_evidence(statuses)
+    bad = dict(statuses)
+    bad["agent-stack-watchdog.service"] = "active"
+    assert not cutover.rc8_router_recovery_evidence(bad)
 
-        document = json.loads(snapshot.read_text(encoding="utf-8"))
-        document["sources"][0]["reason"] = "stale"
-        snapshot.write_text(json.dumps(document), encoding="utf-8")
-        assert not cutover.rc8_router_recovery_evidence(statuses)
+    counts["majak"] = 50
+    assert not cutover.rc8_router_recovery_evidence(statuses)
+    counts["majak"] = 51
+
+    document = json.loads(snapshot.read_text(encoding="utf-8"))
+    document["sources"][0]["reason"] = "stale"
+    snapshot.write_text(json.dumps(document), encoding="utf-8")
+    assert not cutover.rc8_router_recovery_evidence(statuses)
+
+    document["sources"][0]["reason"] = "source_failed"
+    snapshot.write_text(json.dumps(document), encoding="utf-8")
+    live_socket["value"] = False
+    assert not cutover.rc8_router_recovery_evidence(statuses)
+
+
+def test_live_unix_socket_requires_live_listener(tmp_path):
+    import socket as socket_module
+
+    if not hasattr(socket_module, "AF_UNIX"):
+        pytest.skip("Unix sockets are unavailable on this platform")
+    socket_path = tmp_path / "herdr.sock"
+    listener = socket_module.socket(
+        socket_module.AF_UNIX,
+        socket_module.SOCK_STREAM,
+    )
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    try:
+        assert cutover.live_unix_socket(socket_path)
     finally:
-        sock.close()
+        listener.close()
+
+    assert not cutover.live_unix_socket(socket_path)
+
+
+def test_recovery_router_group_query_is_bounded_at_overflow():
+    import sqlite3
+
+    database = sqlite3.connect(":memory:")
+    database.execute(
+        "CREATE TABLE requests ("
+        "id INTEGER, task_id TEXT, actual_model TEXT, provider TEXT)"
+    )
+    database.executemany(
+        "INSERT INTO requests VALUES (?, ?, ?, ?)",
+        [
+            (index, f"task-{index}", "model", "provider")
+            for index in range(1, 53)
+        ],
+    )
+    try:
+        count = database.execute(
+            cutover.RECOVERY_ROUTER_GROUP_COUNT_SQL
+        ).fetchone()[0]
+    finally:
+        database.close()
+
+    assert count == 51
+
+
+def test_recovery_target_is_exact_reviewed_rc12(monkeypatch, tmp_path):
+    archive = tmp_path / "rc12.tar.gz"
+    archive.write_bytes(b"reviewed rc12 archive")
+    monkeypatch.setattr(
+        cutover,
+        "RECOVERY_TARGET_ARCHIVE_SHA256",
+        cutover.digest_file(archive),
+    )
+    document = {
+        "tag": cutover.RECOVERY_TARGET_TAG,
+        "commit": cutover.RECOVERY_TARGET_COMMIT,
+        "config_contract_sha256": cutover.RECOVERY_TARGET_CONFIG_SHA256,
+        "payload_manifest_sha256": (
+            cutover.RECOVERY_TARGET_PAYLOAD_MANIFEST_SHA256
+        ),
+    }
+
+    cutover.verify_recovery_target(archive, document)
+
+    for field in (
+        "tag",
+        "commit",
+        "config_contract_sha256",
+        "payload_manifest_sha256",
+    ):
+        changed = dict(document)
+        changed[field] = "unexpected"
+        with pytest.raises(
+            release.ReleaseError,
+            match="recovery_target_identity_mismatch",
+        ):
+            cutover.verify_recovery_target(archive, changed)
+
+    archive.write_bytes(b"different archive")
+    with pytest.raises(
+        release.ReleaseError,
+        match="recovery_target_archive_mismatch",
+    ):
+        cutover.verify_recovery_target(archive, document)
+
+
+def test_recovery_unit_quiescence_is_verified(monkeypatch):
+    states = {
+        "agent-platform-export.timer": "inactive",
+        "agent-platform-herdr.timer": "inactive",
+        "agent-stack-watchdog.service": "inactive",
+    }
+    calls = []
+
+    def fake_run(*args, check=True):
+        calls.append((args, check))
+        if args[:2] == ("/usr/bin/systemctl", "is-active"):
+            return states[args[2]]
+        return ""
+
+    monkeypatch.setattr(cutover, "run", fake_run)
+    cutover.stop_recovery_units()
+    assert calls[0] == ((
+        "/usr/bin/systemctl",
+        "stop",
+        "agent-platform-export.timer",
+        "agent-platform-herdr.timer",
+        "agent-stack-watchdog.service",
+    ), True)
+
+    states["agent-platform-herdr.timer"] = "active"
+    with pytest.raises(
+        release.ReleaseError,
+        match="recovery_timer_not_stopped:agent-platform-herdr.timer",
+    ):
+        cutover.stop_recovery_units()
+
+
+def test_recovery_watchdog_stop_is_verified(monkeypatch):
+    state = {"value": "inactive"}
+
+    def fake_run(*args, check=True):
+        if args[:2] == ("/usr/bin/systemctl", "is-active"):
+            return state["value"]
+        return ""
+
+    monkeypatch.setattr(cutover, "run", fake_run)
+    cutover.stop_watchdog_service()
+
+    state["value"] = "active"
+    with pytest.raises(
+        release.ReleaseError,
+        match="watchdog_not_stopped",
+    ):
+        cutover.stop_watchdog_service()
 
 
 def test_recovery_apply_is_explicit_and_never_claims_rollback_exercise():
@@ -537,10 +678,21 @@ def test_recovery_apply_is_explicit_and_never_claims_rollback_exercise():
     assert '"rollback_mode": "skipped_known_degraded_previous"' in recovery
     assert '"recovery_mode": "rc8_router_overflow"' in recovery
     assert '"fail_closed_route"' in recovery
-    assert "start_watchdog_service()" in recovery
-    assert recovery.index(
+    success, rollback = recovery.split("except BaseException as original_error:", 1)
+    public_probe = (
         'wait_http_status(\n            "https://2.28.67.165/agent-platform/health",\n            "401",'
-    ) < recovery.index("start_watchdog_service()")
+    )
+    assert "stop_recovery_units()" in success
+    assert success.index(public_probe) < success.index(
+        "atomic_write(state_path, canonical_json(state), 0o600)"
+    )
+    assert success.index(
+        "atomic_write(state_path, canonical_json(state), 0o600)"
+    ) < success.index("start_watchdog_service()")
+    assert '("stop_watchdog", stop_watchdog_service)' in rollback
+    assert '"remove_success_state"' in rollback
+    assert "start_telemetry_timers" in rollback
+    assert "recovery_rollback_watchdog_active" in rollback
 
 
 def test_agent_stack_runtime_chain_is_release_relative():
