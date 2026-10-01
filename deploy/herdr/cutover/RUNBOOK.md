@@ -174,8 +174,8 @@ keeps the Agent Platform route on the reviewed maintenance 503 fragment,
 re-quiesces the timers, their oneshot services and the durable watchdog before
 restoring mutable authority, and aborts authority restoration if that gate fails.
 It removes any premature success record only after exact authority restoration
-is verified, restarts telemetry timers only after that complete restoration, and
-preserves the failed archive for audit.
+is verified, restarts telemetry timers only after all fail-closed rollback checks
+pass without error, and preserves the failed archive for audit.
 
 After a successful recovery promotion, the normal cutover path is authoritative
 again for subsequent releases.

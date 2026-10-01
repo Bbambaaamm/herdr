@@ -1855,10 +1855,6 @@ def recovery_apply(
                     "restore_recovery_authority:"
                     f"{type(restore_error).__name__}:{restore_error}"
                 )
-        if authority_restored:
-            errors.extend(run_rollback_steps([
-                ("restart_timers", start_telemetry_timers),
-            ]))
         try:
             need(digest_file(NGINX_ROUTE) == sha256(maintenance),
                  "recovery_rollback_route_not_fail_closed")
@@ -1874,6 +1870,10 @@ def recovery_apply(
                 "verify_recovery_rollback:"
                 f"{type(verify_error).__name__}:{verify_error}"
             )
+        if authority_restored and not errors:
+            errors.extend(run_rollback_steps([
+                ("restart_timers", start_telemetry_timers),
+            ]))
         if not errors:
             try:
                 source = evidence_archive if evidence_moved else archive

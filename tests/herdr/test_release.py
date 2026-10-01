@@ -695,7 +695,12 @@ def test_recovery_apply_is_explicit_and_never_claims_rollback_exercise():
     assert rollback.index("if not quiescence_errors:") < rollback.index(
         "restore_units(unit_snapshots)"
     )
-    assert rollback.index("if authority_restored:") < rollback.index(
+    restart_gate = "if authority_restored and not errors:"
+    assert restart_gate in rollback
+    assert rollback.index("verify_recovery_rollback:") < rollback.index(
+        restart_gate
+    )
+    assert rollback.index(restart_gate) < rollback.index(
         '("restart_timers", start_telemetry_timers)'
     )
     assert rollback.index("restore_units(unit_snapshots)") < rollback.index(
