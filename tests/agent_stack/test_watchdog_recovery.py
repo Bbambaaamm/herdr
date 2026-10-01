@@ -418,8 +418,69 @@ def test_late_result_after_quarantine_terminalizes_on_next_cycle(tmp_path, monke
     recovery.reconcile_watchdog_blocked_tasks()
 
     assert not blocked_path.exists()
-    assert (recovery.DONE / "task-1.json").exists()
+    done_path = recovery.DONE / "task-1.json"
+    assert done_path.exists()
+    done = json.loads(done_path.read_text(encoding="utf-8"))
+    assert "watchdog_blocker" not in done
+    assert done["watchdog_resolution"] == "exact_durable_result"
+    assert done["watchdog_resolved_at"]
     assert len(list(recovery.RESULTS.glob("task-1.watchdog-recovery-*.json"))) == 1
+
+    def must_not_terminalize(*args, **kwargs):
+        raise AssertionError(
+            "a reconciled result must not be terminalized again"
+        )
+
+    monkeypatch.setattr(
+        recovery,
+        "terminalize_from_result",
+        must_not_terminalize,
+    )
+    recovery.reconcile_watchdog_blocked_tasks()
+
+
+def test_exact_blocked_result_clears_watchdog_marker(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    blocked_path = recovery.BLOCKED / "task-1.json"
+    write_task(
+        blocked_path,
+        {
+            "id": "task-1",
+            "run_token": "token-1",
+            "attempt_state": "delivery_uncertain",
+            "watchdog_blocker": "orphaned_running_unknown_delivery",
+        },
+    )
+    write_task(
+        recovery.RESULTS / "task-1.json",
+        {
+            "task_id": "task-1",
+            "run_token": "token-1",
+            "status": "blocked",
+            "blocker": "external_acceptance_required",
+        },
+    )
+
+    recovery.reconcile_watchdog_blocked_tasks()
+
+    saved = json.loads(blocked_path.read_text(encoding="utf-8"))
+    assert saved["attempt_state"] == "blocked"
+    assert saved["result_status"] == "blocked"
+    assert "watchdog_blocker" not in saved
+    assert saved["watchdog_resolution"] == "exact_durable_result"
+    assert saved["watchdog_resolved_at"]
+
+    def must_not_terminalize(*args, **kwargs):
+        raise AssertionError(
+            "a reconciled blocked result must not be processed again"
+        )
+
+    monkeypatch.setattr(
+        recovery,
+        "terminalize_from_result",
+        must_not_terminalize,
+    )
+    recovery.reconcile_watchdog_blocked_tasks()
 
 
 def test_quarantined_orphan_does_not_repeat_sidecar_evidence(tmp_path, monkeypatch):
