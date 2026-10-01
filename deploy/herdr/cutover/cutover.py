@@ -53,7 +53,7 @@ INCOMING_DIR = Path("/var/lib/herdr/incoming")
 PUBLIC_STATE = Path("/var/lib/agent-platform-herdr/deployed-release.json")
 NGINX_ROUTE = Path("/etc/agent-platform/nginx-server.conf")
 UNIT_DIR = Path("/etc/systemd/system")
-DEPLOYMENT_LOCK = Path("/run/lock/herdr-cutover.lock")
+DEPLOYMENT_LOCK = Path("/run/herdr/cutover.lock")
 UNITS = (
     "agent-platform-web.service",
     "agent-platform-export.service",
@@ -123,6 +123,25 @@ def need(value: bool, message: str) -> None:
 def deployment_lock():
     """Serialize every cutover from authorization through rollback."""
     need(fcntl is not None, "deployment_lock_unavailable")
+    runtime_parent = DEPLOYMENT_LOCK.parent.parent
+    parent_info = os.lstat(runtime_parent)
+    need(
+        stat.S_ISDIR(parent_info.st_mode)
+        and parent_info.st_uid == 0
+        and not stat.S_IMODE(parent_info.st_mode) & 0o022,
+        "unsafe_deployment_lock_parent",
+    )
+    try:
+        os.mkdir(DEPLOYMENT_LOCK.parent, 0o700)
+    except FileExistsError:
+        pass
+    directory_info = os.lstat(DEPLOYMENT_LOCK.parent)
+    need(
+        stat.S_ISDIR(directory_info.st_mode)
+        and directory_info.st_uid == 0
+        and not stat.S_IMODE(directory_info.st_mode) & 0o077,
+        "unsafe_deployment_lock_directory",
+    )
     flags = os.O_CREAT | os.O_RDWR
     flags |= getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)

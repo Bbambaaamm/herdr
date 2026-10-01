@@ -737,6 +737,9 @@ def test_cutovers_hold_the_deployment_lock(monkeypatch):
     )
     assert "@serialized_deployment\ndef apply(" in source
     assert "@serialized_deployment\ndef recovery_apply(" in source
+    assert 'DEPLOYMENT_LOCK = Path("/run/herdr/cutover.lock")' in source
+    assert 'os.mkdir(DEPLOYMENT_LOCK.parent, 0o700)' in source
+    assert '"unsafe_deployment_lock_directory"' in source
 
 
 def test_agent_stack_runtime_chain_is_release_relative():
