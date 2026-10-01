@@ -792,10 +792,30 @@ export function mountDashboard(createScene) {
   }
   function renderTaskDetail() {
     const task = taskById(selectedTask);
+    const swarmTask = task?.kind === 'herdr_swarm';
+    const taskState = task?.raw_state || (task ? QUEUE_STATUS[task.status] || task.status : null);
+    const dependencyEvidence = task
+      ? swarmTask
+        ? [
+          task.parent_task_id ? `parent ${task.parent_task_id}` : 'root task',
+          task.dependencies?.length ? `depends on ${task.dependencies.join(', ')}` : 'no dependencies',
+        ].join(' · ')
+        : 'Nedostupné v telemetry kontraktu · žádná hrana nebyla odvozena'
+      : null;
+    const modelEvidence = task
+      ? swarmTask
+        ? `${task.model || 'model nehlášen'} · fallback ${task.fallback_model || '—'}`
+        : 'Nedostupné v telemetry kontraktu'
+      : null;
+    const resultEvidence = task
+      ? swarmTask
+        ? `result ${task.result_sha || '—'} · branch/base nejsou v kontraktu`
+        : 'Nedostupné v telemetry kontraktu'
+      : null;
     $('#detail-profile').textContent = 'SWARM TASK';
     $('#detail-title').textContent = task ? `${issueLabel(task)} · ${task.task_id}` : selectedTask || 'Task';
     $('#detail-role').textContent = 'Durable task node · read only';
-    $('#detail-status').textContent = task ? `Stav: ${QUEUE_STATUS[task.status] || task.status}` : 'Task už není v aktuálním snapshotu';
+    $('#detail-status').textContent = task ? `Stav: ${taskState}` : 'Task už není v aktuálním snapshotu';
     $('#detail-links').innerHTML = task ? [
       detailLink(issueUrl(task), `Otevřít Issue ${issueLabel(task)}`),
       detailLink(prUrl(task), task.pr_number ? `Otevřít PR #${task.pr_number}` : ''),
@@ -803,24 +823,28 @@ export function mountDashboard(createScene) {
     const metrics = task ? [
       ['Task ID', task.task_id],
       ['Issue / název', `${issueLabel(task)} · ${task.issue_title || task.kind}`],
-      ['Stav / scheduler', `${QUEUE_STATUS[task.status] || task.status} · ${task.scheduler_state || 'nehlášeno'}`],
+      ['Stav / scheduler', `${taskState} · ${swarmTask ? 'authoritative swarm' : task.scheduler_state || 'nehlášeno'}`],
       ['Pokus / maximum', attemptLabel(task)],
-      ['Agent', task.agent],
+      ['Agent', task.agent || '—'],
       ['Typ', task.kind],
       ['PR', task.pr_number ? `#${task.pr_number}` : 'Není hlášeno'],
       ['Blocker', task.blocker || '—'],
       ['Čas', task.status === 'pending' ? `nejdříve ${queueTime(task.not_before)}` : `změna ${queueTime(task.updated_at)}`],
-      ['Dependency edges', 'Nedostupné v telemetry kontraktu · žádná hrana nebyla odvozena'],
+      ['Dependency edges', dependencyEvidence],
+      ['Model / fallback', modelEvidence],
+      ['Fencing token', swarmTask ? number(task.fencing_token) : 'Nedostupné v telemetry kontraktu'],
       ['Runtime / queue wait', 'Nedostupné v telemetry kontraktu'],
-      ['Branch / base / result SHA', 'Nedostupné v telemetry kontraktu'],
+      ['Branch / base / result SHA', resultEvidence],
       ['Test / reviewer', 'Nedostupné v telemetry kontraktu'],
     ] : [['Stav', 'Task už není v aktuálním snapshotu']];
     $('#detail-metrics').innerHTML = metrics.map(([title, content]) => `<div><dt>${escapeHTML(title)}</dt><dd>${escapeHTML(content)}</dd></div>`).join('');
     const events = task ? [
-      `Durable queue: ${issueLabel(task)} · ${task.task_id} · ${QUEUE_STATUS[task.status] || task.status}`,
-      `Scheduler: ${task.scheduler_state || 'nehlášeno'} · pokus ${attemptLabel(task)}`,
+      `Durable queue: ${issueLabel(task)} · ${task.task_id} · ${taskState}`,
+      `Scheduler: ${swarmTask ? 'authoritative swarm' : task.scheduler_state || 'nehlášeno'} · pokus ${attemptLabel(task)}`,
       task.blocker ? `Blocker: ${task.blocker}` : 'Bez hlášeného blockeru',
-      'Dependency telemetry není součástí aktuálního snapshotu; DAG hrany nejsou odhadovány.',
+      swarmTask
+        ? `Autoritativní DAG: ${dependencyEvidence}.`
+        : 'Dependency telemetry není součástí aktuálního snapshotu; DAG hrany nejsou odhadovány.',
       'Prompt, interní myšlenky a raw log nejsou v dashboardu zobrazovány.',
     ] : ['Task není v aktuálním snapshotu.'];
     $('#detail-events').innerHTML = events.map(event => `<li>${escapeHTML(event)}</li>`).join('');
