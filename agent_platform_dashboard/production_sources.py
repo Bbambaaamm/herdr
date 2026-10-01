@@ -326,12 +326,23 @@ def swarm(path, profile):
     required = {'tasks', 'edges', 'agents', 'repo', 'issue', 'observed_at', 'version', 'paper_only'}
     fallback_with_policy = required | {'policy_profiles'}
     canonical = fallback_with_policy | {'graph_latency', 'clock_snapshot', 'ts'}
-    c.need(type(raw) is dict and set(raw) in (required, fallback_with_policy, canonical))
-    c.need((raw['version'] == 1 and set(raw) in (required, fallback_with_policy))
-           or (raw['version'] == 'v1.2.0' and set(raw) == canonical))
+    lifecycle_shapes = {
+        frozenset(candidate)
+        for shape in (required, fallback_with_policy, canonical)
+        for candidate in (shape, shape | {'issue_state'})
+    }
+    c.need(type(raw) is dict and frozenset(raw) in lifecycle_shapes)
+    c.need((raw['version'] == 1 and frozenset(raw) in {
+               frozenset(required), frozenset(required | {'issue_state'}),
+               frozenset(fallback_with_policy), frozenset(fallback_with_policy | {'issue_state'}),
+           })
+           or (raw['version'] == 'v1.2.0'
+               and frozenset(raw) in {frozenset(canonical), frozenset(canonical | {'issue_state'})}))
     c.need(type(raw['paper_only']) is bool)
     c.need(type(raw['repo']) is str and c.identifier(raw['repo'], 160))
     c.need(type(raw['issue']) is str and c.identifier(raw['issue'], 64))
+    issue_state = raw.get('issue_state', 'unknown')
+    c.need(issue_state in ('open', 'closed', 'unknown'))
     if raw['repo'] == 'Bbambaaamm/Autonomous-Quant-Lab':
         c.need(raw['paper_only'] is True)
     c.need(type(raw['tasks']) is list and len(raw['tasks']) <= 100)
@@ -475,6 +486,7 @@ def swarm(path, profile):
         'version': 1,
         'repo': repo,
         'issue': issue,
+        'issue_state': issue_state,
         'paper_only': raw['paper_only'],
         'policy_profiles': sorted(profiles),
         'agents': sorted(agents, key=lambda item: (item['task_id'], item['agent_id'])),

@@ -1241,6 +1241,39 @@ test('observability active work uses authoritative running agents only', async t
   assert.match(h.get('#observability-kpis').innerHTML, /<span>Aktivní práce<\/span><b>0 agent ·/);
 });
 
+test('closed issue terminal history is visible but not counted as active work', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
+  queue.rows = [];
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '53', issue_state: 'closed',
+      paper_only: false, policy_profiles: ['herdr-core'], agents: [],
+      tasks: [{
+        task_id: 'closed-blocked-history', parent_task_id: null, parent_agent_id: null,
+        agent_id: null, state: 'blocked', role: 'coordinator', model: null,
+        fallback_model: null, attempt: 0, max_attempts: 4,
+        blocker: 'delivery_uncertain_requires_recovery', fencing_token: 0,
+        dependencies: [], result_sha: null,
+      }],
+      edges: [],
+    }],
+  });
+
+  await h.refresh();
+
+  assert.equal(h.ui.diagnostics().state, 'idle');
+  assert.equal(h.ui.diagnostics().queueActive, 0);
+  assert.match(h.get('#swarm-kpis').innerHTML, /<span>Blocked \/ Failed<\/span><b>0 \/ 0<\/b>/);
+  assert.match(h.get('#swarm-kpis').innerHTML, /<span>Queue<\/span><b>0<\/b>/);
+  assert.match(h.get('#taskgraph-nodes').innerHTML, /closed-blocked-history/);
+  assert.doesNotMatch(h.get('#face-task').textContent, /delivery_uncertain_requires_recovery/);
+  assert.equal(h.calls.activity.at(-1).blocked, 0);
+});
+
 test('QuantLab swarm browser boundary rejects non-PAPER snapshots', async t => {
   const h = await harness(t);
   const now = Math.floor(Date.now() / 1000);
