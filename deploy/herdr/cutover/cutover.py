@@ -959,18 +959,6 @@ def start_telemetry_timers() -> None:
         )
 
 
-def stop_watchdog_service() -> None:
-    run(
-        "/usr/bin/systemctl",
-        "stop",
-        "agent-stack-watchdog.service",
-    )
-    need(
-        unit_state("agent-stack-watchdog.service") in {"inactive", "failed"},
-        "watchdog_not_stopped",
-    )
-
-
 def remove_regular_file(path: Path) -> None:
     if not path.exists() and not path.is_symlink():
         return
@@ -1822,7 +1810,7 @@ def recovery_apply(
         }
     except BaseException as original_error:
         errors = run_rollback_steps([
-            ("stop_watchdog", stop_watchdog_service),
+            ("quiesce_recovery_units", stop_recovery_units),
             (
                 "stop_web",
                 lambda: run(

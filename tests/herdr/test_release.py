@@ -657,24 +657,13 @@ def test_recovery_unit_quiescence_is_verified(monkeypatch):
     ):
         cutover.stop_recovery_units()
 
-
-def test_recovery_watchdog_stop_is_verified(monkeypatch):
-    state = {"value": "inactive"}
-
-    def fake_run(*args, check=True):
-        if args[:2] == ("/usr/bin/systemctl", "is-active"):
-            return state["value"]
-        return ""
-
-    monkeypatch.setattr(cutover, "run", fake_run)
-    cutover.stop_watchdog_service()
-
-    state["value"] = "active"
+    states["agent-platform-export.service"] = "inactive"
+    states["agent-stack-watchdog.service"] = "active"
     with pytest.raises(
         release.ReleaseError,
-        match="watchdog_not_stopped",
+        match="recovery_watchdog_not_stopped",
     ):
-        cutover.stop_watchdog_service()
+        cutover.stop_recovery_units()
 
 
 def test_recovery_apply_is_explicit_and_never_claims_rollback_exercise():
@@ -701,7 +690,10 @@ def test_recovery_apply_is_explicit_and_never_claims_rollback_exercise():
     assert success.index(
         "atomic_write(state_path, canonical_json(state), 0o600)"
     ) < success.index("start_watchdog_service()")
-    assert '("stop_watchdog", stop_watchdog_service)' in rollback
+    assert '("quiesce_recovery_units", stop_recovery_units)' in rollback
+    assert rollback.index(
+        '("quiesce_recovery_units", stop_recovery_units)'
+    ) < rollback.index('("restore_units"')
     assert '"remove_success_state"' in rollback
     assert "start_telemetry_timers" in rollback
     assert "recovery_rollback_watchdog_active" in rollback

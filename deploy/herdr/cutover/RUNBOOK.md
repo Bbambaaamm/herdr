@@ -170,10 +170,10 @@ Because the previous release is known unable to perform a healthy web boot,
 `rollback_exercised=false` and
 `rollback_mode=skipped_known_degraded_previous`. On any candidate failure it
 restores the exact previous symlink, systemd unit bytes and deployed marker,
-keeps the Agent Platform route on the reviewed maintenance 503 fragment, keeps
-the durable watchdog stopped, removes any premature success record, verifies
-that the telemetry timers were restored, and preserves the failed archive for
-audit.
+keeps the Agent Platform route on the reviewed maintenance 503 fragment,
+re-quiesces the timers, their oneshot services and the durable watchdog before
+restoring mutable authority, removes any premature success record, verifies that
+the telemetry timers were restored, and preserves the failed archive for audit.
 
 After a successful recovery promotion, the normal cutover path is authoritative
 again for subsequent releases.
