@@ -233,7 +233,11 @@ def pin_archive(source: Path) -> Path:
         os.close(target_fd)
 
 
-def expected_hashes(path: Path) -> dict[Path, str]:
+def expected_hashes(
+    path: Path,
+    *,
+    require_location_common: bool = False,
+) -> dict[Path, str]:
     values: dict[Path, str] = {}
     for line in path.read_text(encoding="ascii").splitlines():
         digest, separator, filename = line.partition("  ")
@@ -241,13 +245,14 @@ def expected_hashes(path: Path) -> dict[Path, str]:
         need(bool(separator) and len(digest) == 64 and target.is_absolute()
              and target not in values, "invalid_expected_hash_manifest")
         values[target] = digest
+    expected = {*(UNIT_DIR / name for name in UNITS), NGINX_ROUTE}
+    if NGINX_LOCATION_COMMON in values:
+        expected.add(NGINX_LOCATION_COMMON)
+    need(set(values) == expected, "incomplete_expected_hash_manifest")
     need(
-        set(values) == {
-            *(UNIT_DIR / name for name in UNITS),
-            NGINX_ROUTE,
-            NGINX_LOCATION_COMMON,
-        },
-         "incomplete_expected_hash_manifest")
+        not require_location_common or NGINX_LOCATION_COMMON in values,
+        "auth_include_missing_from_expected_hash_manifest",
+    )
     return values
 
 
@@ -693,7 +698,10 @@ def preflight(
          "external_binary_mismatch")
     manifest = ROOT / "deploy" / "herdr" / "cutover" / "legacy-quantlab-staging-01.sha256"
     previous_units = current_release_unit_hashes()
-    for path, digest in expected_hashes(manifest).items():
+    for path, digest in expected_hashes(
+        manifest,
+        require_location_common=allow_degraded_rc8,
+    ).items():
         if path.name.endswith((".service", ".timer")):
             candidate = ROOT / "deploy" / "agent_platform" / "production" / f"{path.name}.in"
             allowed = {digest, digest_file(candidate)}

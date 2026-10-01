@@ -218,7 +218,8 @@ def test_watchdog_unit_is_versioned_and_cutover_managed():
         Path(
             "deploy/herdr/cutover/"
             "legacy-quantlab-staging-01.sha256"
-        )
+        ),
+        require_location_common=True,
     )
     assert (
         cutover.UNIT_DIR / "agent-stack-watchdog.service"
@@ -727,7 +728,9 @@ def test_recovery_public_boundary_accepts_only_fail_closed_statuses():
         encoding="utf-8"
     )
     assert "NGINX_LOCATION_COMMON" in source
-    assert source.index("for path, digest in expected_hashes(manifest).items()") < (
+    assert "require_location_common=allow_degraded_rc8" in source
+    assert '"auth_include_missing_from_expected_hash_manifest"' in source
+    assert source.index("for path, digest in expected_hashes(") < (
         source.index(
             'public_health = http_status('
             '"https://2.28.67.165/agent-platform/health")'
