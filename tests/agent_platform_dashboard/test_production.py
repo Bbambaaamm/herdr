@@ -640,6 +640,7 @@ def test_collect_marks_only_swarm_unavailable_when_full_snapshot_budget_would_ov
         'version': 1,
         'repo': 'Bbambaaamm/herdr',
         'issue': '48',
+        'issue_state': 'unknown',
         'paper_only': False,
         'policy_profiles': ['default'],
         'agents': [],

@@ -29,6 +29,7 @@ class SwarmExportTests(unittest.TestCase):
         self.output = base / "swarm.json"
         self.exporter.ROOT = self.root
         self.exporter.RESULTS = self.root / "results"
+        self.exporter.INTAKE = self.root / "github-intake-state.json"
         self.exporter.OUTPUT = self.output
 
     def tearDown(self):
@@ -65,6 +66,7 @@ class SwarmExportTests(unittest.TestCase):
         self.assertEqual(payload["observed_at"], 100)
         self.assertEqual(payload["agents"], [])
         self.assertEqual(payload["tasks"][0]["state"], "done")
+        self.assertEqual(payload["issue_state"], "unknown")
         self.exporter.publish(payload)
         previous = sources.SWARM_PATH
         try:
@@ -73,8 +75,77 @@ class SwarmExportTests(unittest.TestCase):
         finally:
             sources.SWARM_PATH = previous
         self.assertEqual(stamp, 100)
+        self.assertEqual(rows[0]["issue_state"], "unknown")
         self.assertEqual(rows[0]["tasks"][0]["state"], "done")
         self.assertEqual(rows[0]["edges"], [])
+
+    def test_closed_issue_is_explicit_and_cannot_mask_open_work(self):
+        self.exporter.INTAKE.write_text(
+            json.dumps({
+                "Bbambaaamm/herdr#48": {
+                    "open": False,
+                    "repo": "Bbambaaamm/herdr",
+                    "issue": 48,
+                },
+                "Bbambaaamm/herdr#53": {
+                    "open": True,
+                    "repo": "Bbambaaamm/herdr",
+                    "issue": 53,
+                },
+            }),
+            encoding="utf-8",
+        )
+        self.write_task("blocked", self.herdr_task("closed-blocked", issue=48))
+        self.write_task("done", self.herdr_task("open-done", issue=53))
+
+        payload = self.exporter.materialize(self.exporter.load_records(), observed_at=100)
+
+        self.assertEqual(payload["issue"], "53")
+        self.assertEqual(payload["issue_state"], "open")
+        self.assertEqual([task["task_id"] for task in payload["tasks"]], ["open-done"])
+
+    def test_closed_terminal_group_remains_available_as_history(self):
+        self.exporter.INTAKE.write_text(
+            json.dumps({
+                "Bbambaaamm/herdr#48": {
+                    "open": False,
+                    "repo": "Bbambaaamm/herdr",
+                    "issue": 48,
+                }
+            }),
+            encoding="utf-8",
+        )
+        self.write_task("blocked", self.herdr_task("closed-blocked"))
+
+        payload = self.exporter.materialize(self.exporter.load_records(), observed_at=100)
+
+        self.assertEqual(payload["issue_state"], "closed")
+        self.assertEqual(payload["tasks"][0]["state"], "blocked")
+
+    def test_closed_issue_with_live_task_still_outranks_open_terminal_history(self):
+        self.exporter.INTAKE.write_text(
+            json.dumps({
+                "Bbambaaamm/herdr#48": {
+                    "open": False,
+                    "repo": "Bbambaaamm/herdr",
+                    "issue": 48,
+                },
+                "Bbambaaamm/herdr#53": {
+                    "open": True,
+                    "repo": "Bbambaaamm/herdr",
+                    "issue": 53,
+                },
+            }),
+            encoding="utf-8",
+        )
+        self.write_task("running", self.herdr_task("closed-running", issue=48))
+        self.write_task("done", self.herdr_task("open-done", issue=53))
+
+        payload = self.exporter.materialize(self.exporter.load_records(), observed_at=100)
+
+        self.assertEqual(payload["issue"], "48")
+        self.assertEqual(payload["issue_state"], "closed")
+        self.assertEqual(payload["tasks"][0]["state"], "running")
 
     def test_parent_children_and_fencing_are_exact(self):
         self.write_task(

@@ -87,7 +87,7 @@ def row(kind, value):
               'admission': ('event reason role repo issue node_count max_depth max_fanout '
                             'child_tools_count agents_after observed_at'),
               'release': 'tag commit config_sha256 deployed_at',
-              'swarm': 'version repo issue paper_only policy_profiles agents tasks edges',
+              'swarm': 'version repo issue issue_state paper_only policy_profiles agents tasks edges',
               'codex': ('used_percent window_minutes resets_at ordinary_usage_allowed has_credits '
                         'credits_unlimited credits_balance reset_credits_available lifetime_tokens '
                         'peak_daily_tokens longest_running_turn_sec current_streak_days '
@@ -171,6 +171,7 @@ def row(kind, value):
     elif kind == 'swarm':
         need(value['version'] == 1 and identifier(value['repo'], 160)
              and identifier(value['issue'], 64))
+        need(value['issue_state'] in ('open', 'closed', 'unknown'))
         need(type(value['paper_only']) is bool)
         if value['repo'] == 'Bbambaaamm/Autonomous-Quant-Lab':
             need(value['paper_only'] is True)

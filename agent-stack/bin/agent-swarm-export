@@ -9,6 +9,7 @@ HOME = Path("/home/agentops")
 ROOT = HOME / ".local/state/agent-stack/tasks"
 OUTPUT = Path("/var/lib/agent-platform-herdr/agent-stack-swarm.json")
 RESULTS = ROOT / "results"
+INTAKE = ROOT / "github-intake-state.json"
 STATES = ("running", "pending", "blocked", "failed", "done")
 STATE_RANK = {"running": 5, "pending": 4, "blocked": 3, "failed": 2, "done": 1}
 ALLOWED_REPOS = {"Bbambaaamm/herdr", "Bbambaaamm/Autonomous-Quant-Lab"}
@@ -75,6 +76,34 @@ def read_json(path):
     if not isinstance(raw, dict):
         raise ValueError("task_not_object")
     return raw
+
+
+def intake_issue_states():
+    if not INTAKE.is_file():
+        return {}
+    try:
+        raw = json.loads(INTAKE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    states = {}
+    for key, value in raw.items():
+        if not isinstance(value, dict) or type(value.get("open")) is not bool:
+            continue
+        text = str(key)
+        if text.isdigit():
+            repo, issue = AQL_REPO, text
+        else:
+            repo, separator, issue = text.rpartition("#")
+            if not separator:
+                continue
+        if repo not in ALLOWED_REPOS or not issue.isdigit() or not 0 < int(issue) < 10**9:
+            continue
+        if value.get("repo") not in (None, repo) or value.get("issue") not in (None, int(issue)):
+            continue
+        states[(repo, issue)] = "open" if value["open"] else "closed"
+    return states
 
 def result_for(task_id, task):
     if not task_ident(task_id):
@@ -243,18 +272,25 @@ def load_records():
             last_race = exc
     raise ValueError("unstable_snapshot") from last_race
 
-def select_group(records):
+def select_group(records, issue_states=None):
     if not records:
         raise ValueError("no_materializable_tasks")
     groups = {}
     for record in records:
         groups.setdefault((record["repo"], record["issue"]), []).append(record)
+    issue_states = intake_issue_states() if issue_states is None else issue_states
+    operational = [
+        item for item in groups.items()
+        if issue_states.get(item[0]) != "closed"
+        or any(row["state"] in ("running", "pending") for row in item[1])
+    ]
+    candidates = operational or list(groups.items())
     def score(item):
         key, rows = item
         rank = max(STATE_RANK[row["state"]] for row in rows)
         stamp = max(row["stamp"] for row in rows)
         return (rank, stamp, key[0], key[1])
-    return max(groups.items(), key=score)
+    return max(candidates, key=score)
 
 def bounded_history(records):
     if len(records) <= MAX_TASKS:
@@ -358,8 +394,9 @@ def ensure_acyclic(task_ids, edge_keys):
         raise ValueError("cyclic_graph")
 
 
-def materialize(records, observed_at=None):
-    (repo, issue), selected = select_group(records)
+def materialize(records, observed_at=None, issue_states=None):
+    issue_states = intake_issue_states() if issue_states is None else issue_states
+    (repo, issue), selected = select_group(records, issue_states)
     selected = bounded_history(selected)
     ids = {row["task_id"] for row in selected}
     tasks = []
@@ -447,6 +484,7 @@ def materialize(records, observed_at=None):
         "version": 1,
         "repo": repo,
         "issue": issue,
+        "issue_state": issue_states.get((repo, issue), "unknown"),
         "observed_at": now_epoch() if observed_at is None else nonnegative_int(observed_at),
         "paper_only": bool(tasks) and all(paper_flags),
         "policy_profiles": sorted(policy_profiles),
