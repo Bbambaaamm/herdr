@@ -122,6 +122,31 @@ class SwarmExportTests(unittest.TestCase):
         self.assertEqual(payload["issue_state"], "closed")
         self.assertEqual(payload["tasks"][0]["state"], "blocked")
 
+    def test_closed_issue_with_live_task_still_outranks_open_terminal_history(self):
+        self.exporter.INTAKE.write_text(
+            json.dumps({
+                "Bbambaaamm/herdr#48": {
+                    "open": False,
+                    "repo": "Bbambaaamm/herdr",
+                    "issue": 48,
+                },
+                "Bbambaaamm/herdr#53": {
+                    "open": True,
+                    "repo": "Bbambaaamm/herdr",
+                    "issue": 53,
+                },
+            }),
+            encoding="utf-8",
+        )
+        self.write_task("running", self.herdr_task("closed-running", issue=48))
+        self.write_task("done", self.herdr_task("open-done", issue=53))
+
+        payload = self.exporter.materialize(self.exporter.load_records(), observed_at=100)
+
+        self.assertEqual(payload["issue"], "48")
+        self.assertEqual(payload["issue_state"], "closed")
+        self.assertEqual(payload["tasks"][0]["state"], "running")
+
     def test_parent_children_and_fencing_are_exact(self):
         self.write_task(
             "running",

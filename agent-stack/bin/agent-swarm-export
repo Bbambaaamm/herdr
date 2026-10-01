@@ -279,8 +279,12 @@ def select_group(records, issue_states=None):
     for record in records:
         groups.setdefault((record["repo"], record["issue"]), []).append(record)
     issue_states = intake_issue_states() if issue_states is None else issue_states
-    non_closed = [item for item in groups.items() if issue_states.get(item[0]) != "closed"]
-    candidates = non_closed or list(groups.items())
+    operational = [
+        item for item in groups.items()
+        if issue_states.get(item[0]) != "closed"
+        or any(row["state"] in ("running", "pending") for row in item[1])
+    ]
+    candidates = operational or list(groups.items())
     def score(item):
         key, rows = item
         rank = max(STATE_RANK[row["state"]] for row in rows)
