@@ -1336,6 +1336,58 @@ test('live Herdr agents remain visible while durable root is pending delivery_un
   assert.equal(h.calls.activity.at(-1).workingAgents, 2);
 });
 
+test('durable running without runtime evidence never claims live execution', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
+  queue.rows = [];
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '80', issue_state: 'open',
+      paper_only: false, policy_profiles: ['herdr-core'],
+      agents: [{
+        agent_id: 'herdr-parent', task_id: 'root', state: 'running',
+        parent_task_id: null, parent_agent_id: null, fencing_token: 1,
+      }],
+      tasks: [{
+        task_id: 'root', parent_task_id: null, parent_agent_id: null,
+        agent_id: 'herdr-parent', state: 'running', role: 'planner',
+        model: 'model-a', fallback_model: null, attempt: 1, max_attempts: 2,
+        blocker: null, fencing_token: 1, dependencies: [], result_sha: null,
+      }],
+      edges: [],
+    }],
+  });
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().state, 'working');
+  assert.doesNotMatch(h.get('#face-task').textContent, /live práce probíhá/);
+  assert.match(h.get('#face-task').textContent, /durable running/);
+  assert.match(h.get('#face-task').textContent, /živý runtime nepotvrzen/);
+});
+
+test('blocked runtime agent is surfaced as coordinator attention', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
+  queue.rows = [];
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '80', issue_state: 'open',
+      paper_only: false, policy_profiles: ['herdr-core'],
+      runtime_status: 'available',
+      runtime_agents: [{ agent_id: 'task-hermes', status: 'blocked', task_id: null }],
+      agents: [], tasks: [], edges: [],
+    }],
+  });
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().state, 'waiting_user');
+  assert.match(h.get('#face-task').textContent, /task-hermes/);
+});
+
 test('QuantLab swarm browser boundary rejects non-PAPER snapshots', async t => {
   const h = await harness(t);
   const now = Math.floor(Date.now() / 1000);
