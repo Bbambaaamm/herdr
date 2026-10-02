@@ -489,7 +489,8 @@ def swarm(path, profile):
         runtime_ids = set()
         for item in raw_runtime_agents:
             c.keys(item, 'agent_id status task_id')
-            c.need(c.identifier(item['agent_id'], 256) and item['agent_id'] not in runtime_ids)
+            c.need(type(item['agent_id']) is str and c.identifier(item['agent_id'], 256)
+                   and item['agent_id'] not in runtime_ids)
             runtime_ids.add(item['agent_id'])
             c.need(item['status'] in ('idle', 'working', 'blocked', 'done', 'unknown'))
             c.need(item['task_id'] is None or item['task_id'] in task_ids)
