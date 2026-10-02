@@ -6,7 +6,7 @@ import pytest
 
 from herdr.capability import (
     CapabilityDescriptor, CapabilityError, CapabilityRegistry, CapabilityRequirement,
-    CapabilityScope, DataClass, DataPolicy, Egress, ExecutorDescriptor, Health,
+    CapabilityScope, DataClass, DataPolicy, Egress, ExecutorDescriptor, Feature, Health,
     ProviderDescriptor, Reason, RegistrySnapshot, Retention, RuntimeStateSnapshot,
     Training, VERSION, requirement_from_v1_model_policy,
 )
