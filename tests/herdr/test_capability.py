@@ -152,6 +152,8 @@ def test_secret_like_descriptor_values_rejected():
         replace(cap, features=("api_key",))
     with pytest.raises(CapabilityError, match="secret-like"):
         CapabilityDescriptor.from_dict({**cap.to_json(), "api_key": "x"})
+    with pytest.raises(CapabilityError, match="secret-like"):
+        replace(cap, spec_id="AIza" + "A" * 30)
 
 
 def test_legacy_adapter_preserves_taskgraph_payload_and_scope():
@@ -169,6 +171,20 @@ def test_legacy_adapter_preserves_taskgraph_payload_and_scope():
     assert req.region is None and req.data_class is None
     assert node.to_hash_json() == before
     assert node.model_policy == before["model_policy"]
+
+
+def test_legacy_adapter_preserves_opaque_model_strings():
+    req = requirement_from_v1_model_policy(
+        {"model": "Claude 3.5 Sonnet", "fallback_model": "vendor/model?mode=fast"},
+        capability_id="reason")
+    assert req.legacy_model_hints == ("Claude 3.5 Sonnet", "vendor/model?mode=fast")
+
+
+def test_scope_allows_valid_identifiers_containing_token_substring():
+    _, scope, _, _ = fixture()
+    changed = replace(scope, providers=("tokenizer-local",), capabilities=("reason-tokenizer",))
+    assert changed.providers == ("tokenizer-local",)
+    assert changed.capabilities == ("reason-tokenizer",)
 
 
 def test_legacy_adapter_leaves_opaque_token_limit_keys_opaque():
