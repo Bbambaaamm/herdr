@@ -8,7 +8,7 @@ from herdr.capability import (
     CapabilityDescriptor, CapabilityError, CapabilityRegistry, CapabilityRequirement,
     CapabilityScope, DataClass, DataPolicy, Egress, ExecutorDescriptor, Health,
     ProviderDescriptor, Reason, RegistrySnapshot, Retention, RuntimeStateSnapshot,
-    Training, requirement_from_v1_model_policy,
+    Training, VERSION, requirement_from_v1_model_policy,
 )
 from herdr.taskgraph import TaskNode
 
