@@ -513,6 +513,7 @@ export function mountDashboard(createScene) {
       const majakHerdr = source('majak', 'herdr');
       const majakProjected = liveData.sources.some(row => row.profile === 'majak');
       const userAttention = blocked.some(row => USER_ACTION_BLOCKERS.has(row.blocker))
+        || (runtimeAgents?.some(row => row.status === 'blocked') ?? false)
         || majakAgents.some(row => row.status === 'blocked')
         || userBlockedTasks('quantlab').length
         || userBlockedTasks('majak').length;
@@ -564,16 +565,24 @@ export function mountDashboard(createScene) {
         : task.repo === 'Bbambaaamm/herdr' ? 'Herdr'
         : 'QuantLab';
       const durable = task.raw_state || task.status;
-      const reconcile = task.attempt_state && task.attempt_state !== durable
-        ? ` · durable ${durable} / ${task.attempt_state}`
+      const attempt = task.attempt_state && task.attempt_state !== durable
+        ? ` / ${task.attempt_state}`
         : '';
+      const runtimeWorking = runtimeAgents?.some(row => row.status === 'working') ?? false;
+      if (swarm && !runtimeWorking) {
+        return `${project} ${issueLabel(task)} · ${task.task_id} · durable ${durable}${attempt} · živý runtime nepotvrzen.`;
+      }
+      const reconcile = attempt ? ` · durable ${durable}${attempt}` : '';
       return `${project} ${issueLabel(task)} · ${task.task_id} · live práce probíhá${reconcile}.`;
     }
     if (state === 'working' || (state === 'idle' && active.length)) return `Pracují: ${active.join(', ')}. Přesný úkol zdroj neposkytuje.`;
     if (state === 'waiting_user') {
-      const blockedAgents = agents()
-        .filter(row => row.status === 'blocked' && (!swarm || row.profile === 'majak'))
-        .map(row => row.agent);
+      const blockedAgents = [...new Set([
+        ...(runtimeAgents || []).filter(row => row.status === 'blocked').map(row => row.agent_id),
+        ...agents()
+          .filter(row => row.status === 'blocked' && (!swarm || row.profile === 'majak'))
+          .map(row => row.agent),
+      ])];
       const blockerRows = swarm
         ? [...operationalSwarmTasks(), ...userBlockedTasks()]
         : userBlockedTasks();
