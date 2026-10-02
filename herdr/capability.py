@@ -497,6 +497,7 @@ class RuntimeStateSnapshot:
     remaining_requests: int | None
     estimated_cost_microusd: int | None
     reason_code: str | None
+    registry_hash: str
 
     def __post_init__(self) -> None:
         _token(self.executor_id, "executor_id")
@@ -509,6 +510,9 @@ class RuntimeStateSnapshot:
         _number(self.estimated_cost_microusd, "estimated_cost_microusd")
         if self.reason_code is not None:
             _token(self.reason_code, "reason_code")
+            _secrets(self.reason_code)
+        if not isinstance(self.registry_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", self.registry_hash):
+            raise CapabilityError("registry_hash must be lowercase sha256")
         if self.health != Health.HEALTHY and self.reason_code is None:
             raise CapabilityError("nonhealthy observation requires reason_code")
 
@@ -523,7 +527,7 @@ class RuntimeStateSnapshot:
                 "ttl_seconds": self.ttl_seconds, "health": self.health.value,
                 "remaining_requests": self.remaining_requests,
                 "estimated_cost_microusd": self.estimated_cost_microusd,
-                "reason_code": self.reason_code}
+                "reason_code": self.reason_code, "registry_hash": self.registry_hash}
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> RuntimeStateSnapshot:
@@ -654,24 +658,25 @@ class CapabilityRegistry:
         if not isinstance(requirement, CapabilityRequirement) or not isinstance(policy, CapabilityScope):
             raise CapabilityError("typed requirement and policy required")
         snapshot = self._snapshot
+        registry_hash = snapshot.hash
         caps = {x.id: x for x in snapshot.capabilities}
         providers = {x.id: x for x in snapshot.providers}
         if requirement.capability_id not in caps:
-            return CandidateResult((), (Rejection(None, Reason.UNKNOWN_CAPABILITY),), snapshot.hash)
+            return CandidateResult((), (Rejection(None, Reason.UNKNOWN_CAPABILITY),), registry_hash)
         states: dict[str, RuntimeStateSnapshot] = {}
         for state in runtime_state:
             if not isinstance(state, RuntimeStateSnapshot) or state.executor_id in states:
                 raise CapabilityError("runtime observations must be typed and unique")
             states[state.executor_id] = state
         cap = caps[requirement.capability_id]
-        registry_hash = snapshot.hash
         matches: list[CapabilityMatch] = []
         rejects: list[Rejection] = []
         for executor in snapshot.executors:
             if executor.capability_id != cap.id:
                 continue
             provider = providers[executor.provider_id]
-            reason = _reject(requirement, policy, cap, provider, executor, states.get(executor.id), at)
+            reason = _reject(requirement, policy, cap, provider, executor, states.get(executor.id),
+                             registry_hash, at)
             if reason is not None:
                 rejects.append(Rejection(executor.id, reason))
                 continue
@@ -684,7 +689,7 @@ class CapabilityRegistry:
 
 def _reject(req: CapabilityRequirement, grant: CapabilityScope, cap: CapabilityDescriptor,
             provider: ProviderDescriptor, executor: ExecutorDescriptor,
-            state: RuntimeStateSnapshot | None, at: str) -> Reason | None:
+            state: RuntimeStateSnapshot | None, registry_hash: str, at: str) -> Reason | None:
     if (cap.id not in grant.capabilities or provider.id not in grant.providers or
         executor.id not in grant.executors or not set(req.permissions) <= set(grant.permissions) or
         not set(req.tools) <= set(grant.tools)):
@@ -724,6 +729,8 @@ def _reject(req: CapabilityRequirement, grant: CapabilityScope, cap: CapabilityD
         return Reason.DATA_POLICY_DENIED
     if state is None:
         return Reason.RUNTIME_MISSING
+    if state.registry_hash != registry_hash:
+        return Reason.RUNTIME_STALE
     if not state.is_fresh(at):
         return Reason.RUNTIME_STALE
     if state.health != Health.HEALTHY:
