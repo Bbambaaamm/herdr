@@ -556,6 +556,32 @@ def test_swarm_raw_edge_mismatch_and_sensitive_task_field_fail_closed(tmp_path, 
 
 
 
+def test_runtime_agent_id_must_be_nonempty_string_at_source_and_contract_boundaries(tmp_path, monkeypatch):
+    path = tmp_path / 'swarm.json'
+    monkeypatch.setattr(sources, 'SWARM_PATH', str(path))
+    payload = swarm_payload()
+    payload['version'] = 1
+    for key in ('graph_latency', 'clock_snapshot', 'ts'):
+        payload.pop(key)
+    payload['agents'] = [payload['agents'][0]]
+    payload['runtime_status'] = 'available'
+    payload['runtime_agents'] = [{
+        'agent_id': None,
+        'status': 'working',
+        'task_id': 'root',
+    }]
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError):
+        sources.swarm(str(path), 'quantlab')
+
+    payload['runtime_agents'][0]['agent_id'] = 'task-hermes'
+    path.write_text(json.dumps(payload))
+    snapshot = sources.swarm(str(path), 'quantlab')[0][0]
+    snapshot['runtime_agents'][0]['agent_id'] = None
+    with pytest.raises(ValueError):
+        c.row('swarm', snapshot)
+
+
 def test_scheduler_historical_agent_state_must_match_task(tmp_path, monkeypatch):
     path = tmp_path / 'swarm.json'
     monkeypatch.setattr(sources, 'SWARM_PATH', str(path))
