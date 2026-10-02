@@ -42,12 +42,14 @@ grant has a ceiling. No score can override a hard rejection.
 
 `RuntimeStateSnapshot` is supplied separately per executor. It carries an
 explicit UTC observation timestamp, positive TTL in seconds, health enum,
-remaining requests, estimated cost, and a reason code for nonhealthy states.
-The caller passes evaluation time (`at`); the match is deterministic for these
-inputs. Fresh means `observed_at <= at < observed_at + TTL`. Missing, future,
-or expired observations reject. Unknown/degraded/unavailable health and unknown
-or zero rate-limit availability reject. Runtime observations never enter a
-descriptor or registry hash.
+remaining requests, estimated cost, a reason code for nonhealthy states, and the
+exact `registry_hash` under which the observation was collected. The caller
+passes evaluation time (`at`); the match is deterministic for these inputs.
+Fresh means `observed_at <= at < observed_at + TTL`. Missing, future, expired,
+or registry-mismatched observations reject. A registry reload therefore fails
+closed for old runtime observations until fresh state is supplied. Unknown,
+degraded, or unavailable health and unknown or zero rate-limit availability
+reject. Runtime observations never enter a descriptor or registry hash.
 
 `CapabilityRegistry.candidates` returns every compatible executor, sorted first
 by preference score then executor id, plus explicit per-executor rejection
