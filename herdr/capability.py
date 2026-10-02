@@ -372,8 +372,11 @@ class CapabilityScope:
     output_modalities: tuple[Modality, ...]
     max_cost_microusd: int | None
     max_context_tokens: int | None
+    schema_version: str = VERSION
 
     def __post_init__(self) -> None:
+        if self.schema_version != VERSION:
+            raise CapabilityError("incompatible schema version")
         for name in ("providers", "capabilities", "executors", "tools", "permissions",
                      "regions"):
             object.__setattr__(self, name, _set(getattr(self, name), name))
@@ -402,9 +405,10 @@ class CapabilityScope:
             raise CapabilityError("child scope escalates above parent")
 
     def to_json(self) -> dict[str, Any]:
-        return {name: list(getattr(self, name)) for name in (
-            "providers", "capabilities", "executors", "tools", "permissions", "regions",
-            "data_classes", "input_modalities", "output_modalities")} | {
+        return {"schema_version": self.schema_version} | {
+            name: list(getattr(self, name)) for name in (
+                "providers", "capabilities", "executors", "tools", "permissions", "regions",
+                "data_classes", "input_modalities", "output_modalities")} | {
             "max_cost_microusd": self.max_cost_microusd,
             "max_context_tokens": self.max_context_tokens}
 
