@@ -128,10 +128,25 @@ class Latency(StrEnum):
 
 
 class Feature(StrEnum):
+    # Core logical capability dimensions required by the UCL contract. These are
+    # deliberately provider-neutral; modalities remain directional below.
+    REASONING = "reasoning"
+    CODING = "coding"
+    VISION = "vision"
+    AUDIO = "audio"
+    REALTIME = "realtime"
+    RESEARCH = "research"
+    COMPUTER_USE = "computer_use"
+    OCR_DOCUMENT = "ocr_document"
+    TOOL_USE = "tool_use"
+    STRUCTURED_OUTPUT = "structured_output"
+    MCP = "mcp"
+    A2A = "a2a"
+
+    # Backward-compatible feature spellings used by the first #69 fixture.
     TOOLS = "tools"
     JSON = "json"
     STREAMING = "streaming"
-    REASONING = "reasoning"
 
 
 class Modality(StrEnum):
@@ -719,6 +734,18 @@ def _reject(req: CapabilityRequirement, grant: CapabilityScope, cap: CapabilityD
         for needed in (req.min_context_tokens, req.min_input_tokens, req.min_output_tokens):
             if needed is not None and needed > grant_context:
                 return Reason.POLICY_DENIED
+
+    # Directional floors share one context window. Independent checks are not
+    # sufficient: 7k input + 7k output cannot fit into an 8k context even when
+    # each directional maximum is 8k.
+    if req.min_input_tokens is not None and req.min_output_tokens is not None:
+        combined = req.min_input_tokens + req.min_output_tokens
+        if cap.context_tokens is None:
+            return Reason.LIMIT_UNKNOWN
+        if combined > cap.context_tokens:
+            return Reason.LIMIT_EXCEEDED
+        if grant_context is not None and combined > grant_context:
+            return Reason.POLICY_DENIED
     if (req.region is None or req.data_class is None or req.max_egress is None or
             req.max_retention is None or req.training is None):
         return Reason.DATA_POLICY_UNKNOWN
