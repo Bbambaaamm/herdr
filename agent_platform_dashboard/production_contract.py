@@ -245,7 +245,9 @@ def row(kind, value):
         runtime_ids = set()
         for runtime_agent in runtime_agents:
             keys(runtime_agent, 'agent_id status task_id')
-            need(identifier(runtime_agent['agent_id'], 256) and runtime_agent['agent_id'] not in runtime_ids)
+            need(type(runtime_agent['agent_id']) is str
+                 and identifier(runtime_agent['agent_id'], 256)
+                 and runtime_agent['agent_id'] not in runtime_ids)
             runtime_ids.add(runtime_agent['agent_id'])
             need(runtime_agent['status'] in ('idle', 'working', 'blocked', 'done', 'unknown'))
             need(runtime_agent['task_id'] is None or runtime_agent['task_id'] in task_ids)
