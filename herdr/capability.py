@@ -20,7 +20,8 @@ _SECRET_KEYS = ("secret", "token", "password", "passwd", "apikey", "api_key",
 _SECRET_VALUES = tuple(re.compile(x) for x in (
     r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", r"\bghp_[A-Za-z0-9]{20,}\b",
     r"\bgithub_pat_[A-Za-z0-9_]{20,}\b", r"\bsk-[A-Za-z0-9_-]{20,}\b",
-    r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b", r"\bAKIA[0-9A-Z]{16}\b"))
+    r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b", r"\bAKIA[0-9A-Z]{16}\b",
+    r"\bAIza[0-9A-Za-z_-]{20,}\b"))
 _TOKEN_FIELDS = frozenset({"context_tokens", "max_input_tokens", "max_output_tokens",
                            "min_context_tokens", "min_input_tokens", "min_output_tokens",
                            "max_context_tokens"})
@@ -48,8 +49,7 @@ def _set(value: Any, name: str) -> tuple[str, ...]:
         raise CapabilityError(f"{name} must be an array")
     for item in value:
         _token(item, name)
-        if any(fragment in item.lower() for fragment in _SECRET_KEYS):
-            raise CapabilityError("secret-like identifier")
+        _secrets(item)
     if len(value) != len(set(value)):
         raise CapabilityError(f"{name} contains duplicates")
     return tuple(sorted(value))
@@ -748,7 +748,7 @@ def requirement_from_v1_model_policy(model_policy: Mapping[str, Any], *, capabil
         raise CapabilityError("model_policy must be an object")
     preferred = tuple(dict.fromkeys(x for x in (
         model_policy.get("model"), model_policy.get("fallback_model"))
-        if isinstance(x, str) and _TOKEN.fullmatch(x)))
+        if isinstance(x, str)))
     _secrets(preferred)
     return CapabilityRequirement(capability_id, (), (), (), tools, permissions,
                                  None, None, None, None, None, None, None, None, None,
