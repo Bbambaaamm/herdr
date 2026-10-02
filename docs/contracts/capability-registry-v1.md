@@ -11,7 +11,10 @@ are not added to the durable TaskGraph contract.
 All value objects are frozen dataclasses. `CapabilityDescriptor` declares a
 versioned logical spec, typed feature values (presence means supported),
 separate typed input/output modalities, nonnegative integer token limits,
-latency enum, and a typed `DataPolicy`. A `null` token limit means unknown, never
+latency enum, and a typed `DataPolicy`. The provider-neutral feature vocabulary
+explicitly represents reasoning, coding, vision, audio, realtime, research,
+computer use, OCR/document processing, tool use, structured output, MCP and A2A;
+`tools`, `json` and `streaming` remain backward-compatible v1 spellings. A `null` token limit means unknown, never
 unlimited. `ProviderDescriptor` contains supported refs, pricing version, modes,
 and data handling. `ExecutorDescriptor` identifies runtime and adapter separately.
 Registry validation rejects duplicate ids, unsupported schema versions, dangling
@@ -34,7 +37,9 @@ grant with the task's `CapabilityRequirement` and declarations; it does not
 implicitly grant features or tools from a descriptor.
 
 Requirement hard fields are separate from `preferred_providers`. Preferences
-only rank candidates surviving all hard checks. Cost ceilings use nonnegative
+only rank candidates surviving all hard checks. Directional input/output token
+floors must each fit their declared maxima and their sum must fit the shared
+context window and any delegated context ceiling. Cost ceilings use nonnegative
 integer micro-USD. Unknown estimated cost rejects when either requirement or
 grant has a ceiling. No score can override a hard rejection.
 
