@@ -286,3 +286,39 @@ def test_registry_hash_reused_across_all_provenance_records():
     found = registry.candidates(req, scope, states, at=NOW)
     assert len(found.matches) == 4
     assert all(m.provenance.registry_hash == found.registry_hash for m in found.matches)
+
+
+def test_required_ucl_capability_dimensions_are_typed():
+    required = (
+        "reasoning", "coding", "vision", "audio", "realtime", "research",
+        "computer_use", "ocr_document", "tool_use", "structured_output", "mcp", "a2a",
+    )
+    assert tuple(Feature(x).value for x in required) == required
+
+
+def test_combined_directional_floors_must_fit_context_window_and_grant():
+    registry, scope, req, states = fixture()
+
+    # Each directional floor fits independently, but the combined request does
+    # not fit the capability's 8192-token shared context window.
+    too_large_for_cap = replace(
+        req,
+        min_context_tokens=None,
+        min_input_tokens=7000,
+        min_output_tokens=2000,
+    )
+    found = result(registry, scope, too_large_for_cap, states)
+    assert found.matches == ()
+    assert found.rejections[0].reason == Reason.LIMIT_EXCEEDED
+
+    # The capability can fit this pair, but a narrower delegated grant cannot.
+    narrower_grant = replace(scope, max_context_tokens=4096)
+    too_large_for_grant = replace(
+        req,
+        min_context_tokens=None,
+        min_input_tokens=3000,
+        min_output_tokens=2000,
+    )
+    found = result(registry, narrower_grant, too_large_for_grant, states)
+    assert found.matches == ()
+    assert found.rejections[0].reason == Reason.POLICY_DENIED
