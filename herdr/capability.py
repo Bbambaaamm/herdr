@@ -452,7 +452,9 @@ class CapabilityRequirement:
         if not isinstance(self.legacy_model_hints, (tuple, list)):
             raise CapabilityError("legacy_model_hints must be an array")
         for hint in self.legacy_model_hints:
-            _token(hint, "legacy_model_hints")
+            if not isinstance(hint, str):
+                raise CapabilityError("legacy_model_hints must contain strings")
+            _secrets(hint)
         if len(self.legacy_model_hints) != len(set(self.legacy_model_hints)):
             raise CapabilityError("duplicate legacy_model_hints")
         object.__setattr__(self, "legacy_model_hints", tuple(self.legacy_model_hints))
