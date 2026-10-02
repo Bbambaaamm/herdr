@@ -61,6 +61,14 @@ def test_multiple_providers_and_pinned_provenance():
         assert match.provenance.executor_hash == executor.hash
 
 
+def test_scope_serialization_is_schema_versioned():
+    _, scope, _, _ = fixture()
+    assert scope.to_json()["schema_version"] == VERSION
+    assert CapabilityScope.from_dict(scope.to_json()).hash == scope.hash
+    with pytest.raises(CapabilityError, match="schema"):
+        replace(scope, schema_version="2.0.0")
+
+
 def test_duplicate_ids_and_schema_versions_rejected():
     registry, _, _, _ = fixture()
     cap = registry.snapshot.capabilities[0]
