@@ -325,16 +325,18 @@ def swarm(path, profile):
     raw = c.parse(read(path, c.MAX_BYTES), c.MAX_BYTES)
     required = {'tasks', 'edges', 'agents', 'repo', 'issue', 'observed_at', 'version', 'paper_only'}
     fallback_with_policy = required | {'policy_profiles'}
+    fallback_runtime = fallback_with_policy | {'runtime_status', 'runtime_agents'}
     canonical = fallback_with_policy | {'graph_latency', 'clock_snapshot', 'ts'}
     lifecycle_shapes = {
         frozenset(candidate)
-        for shape in (required, fallback_with_policy, canonical)
+        for shape in (required, fallback_with_policy, fallback_runtime, canonical)
         for candidate in (shape, shape | {'issue_state'})
     }
     c.need(type(raw) is dict and frozenset(raw) in lifecycle_shapes)
     c.need((raw['version'] == 1 and frozenset(raw) in {
                frozenset(required), frozenset(required | {'issue_state'}),
                frozenset(fallback_with_policy), frozenset(fallback_with_policy | {'issue_state'}),
+               frozenset(fallback_runtime), frozenset(fallback_runtime | {'issue_state'}),
            })
            or (raw['version'] == 'v1.2.0'
                and frozenset(raw) in {frozenset(canonical), frozenset(canonical | {'issue_state'})}))
@@ -355,7 +357,8 @@ def swarm(path, profile):
         'agent_id', 'fencing_token', 'model', 'fallback_model', 'attempts',
         'attempt', 'blocker', 'policy_profile', 'paper_only', 'telemetry', 'ts',
         'child_ids', 'completed_at', 'created_at', 'event_ref', 'issue',
-        'max_retries', 'repo', 'result_sha', 'updated_at',
+        'max_retries', 'repo', 'result_sha', 'updated_at', 'attempt_state',
+        'delivery_reconcile_count',
     }
     tasks = []
     derived_edges = set()
@@ -395,11 +398,17 @@ def swarm(path, profile):
             'fallback_model': item.get('fallback_model'),
             'attempt': item.get('attempts', item.get('attempt', 0)),
             'max_attempts': item.get('max_attempts', item.get('max_retries', 1)),
+            'attempt_state': item.get('attempt_state'),
+            'delivery_reconcile_count': item.get('delivery_reconcile_count', 0),
             'blocker': item.get('blocker'),
             'fencing_token': item.get('fencing_token', 0),
             'dependencies': list(dependencies),
             'result_sha': result_sha,
         }
+        c.need(task['attempt_state'] is None or task['attempt_state'] in (
+            'dispatching', 'accepted', 'working', 'delivery_uncertain', 'verifying',
+            'completed', 'done', 'blocked', 'failed', 'retry_scheduled'))
+        c.need(c.number(task['delivery_reconcile_count']))
         tasks.append(task)
     c.need(len({task['task_id'] for task in tasks}) == len(tasks))
     task_ids = {task['task_id'] for task in tasks}
@@ -471,6 +480,35 @@ def swarm(path, profile):
     else:
         c.need(seen_agent_tasks == expected_agent_tasks)
 
+    if 'runtime_status' in raw:
+        runtime_status = raw['runtime_status']
+        raw_runtime_agents = raw.get('runtime_agents', [])
+        c.need(runtime_status in ('available', 'unavailable', 'not_applicable'))
+        c.need(type(raw_runtime_agents) is list and len(raw_runtime_agents) <= 16)
+        runtime_agents = []
+        runtime_ids = set()
+        for item in raw_runtime_agents:
+            c.keys(item, 'agent_id status task_id')
+            c.need(c.identifier(item['agent_id'], 256) and item['agent_id'] not in runtime_ids)
+            runtime_ids.add(item['agent_id'])
+            c.need(item['status'] in ('idle', 'working', 'blocked', 'done', 'unknown'))
+            c.need(item['task_id'] is None or item['task_id'] in task_ids)
+            runtime_agents.append({
+                'agent_id': item['agent_id'],
+                'status': item['status'],
+                'task_id': item['task_id'],
+            })
+        c.need(runtime_status == 'available' or not runtime_agents)
+    elif scheduler_snapshot:
+        runtime_status = 'available'
+        runtime_agents = [
+            {'agent_id': item['agent_id'], 'status': 'working', 'task_id': item['task_id']}
+            for item in agents
+        ]
+    else:
+        runtime_status = 'unavailable' if raw['repo'] == 'Bbambaaamm/herdr' else 'not_applicable'
+        runtime_agents = []
+
     raw_profiles = raw.get('policy_profiles')
     if raw_profiles is not None:
         c.need(type(raw_profiles) is list and len(raw_profiles) <= 16)
@@ -490,6 +528,8 @@ def swarm(path, profile):
         'paper_only': raw['paper_only'],
         'policy_profiles': sorted(profiles),
         'agents': sorted(agents, key=lambda item: (item['task_id'], item['agent_id'])),
+        'runtime_status': runtime_status,
+        'runtime_agents': sorted(runtime_agents, key=lambda item: item['agent_id']),
         'tasks': sorted(tasks, key=lambda item: item['task_id']),
         'edges': [
             {'from_task': left, 'to_task': right, 'kind': kind}

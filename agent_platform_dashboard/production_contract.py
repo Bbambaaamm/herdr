@@ -87,7 +87,7 @@ def row(kind, value):
               'admission': ('event reason role repo issue node_count max_depth max_fanout '
                             'child_tools_count agents_after observed_at'),
               'release': 'tag commit config_sha256 deployed_at',
-              'swarm': 'version repo issue issue_state paper_only policy_profiles agents tasks edges',
+              'swarm': 'version repo issue issue_state paper_only policy_profiles agents runtime_status runtime_agents tasks edges',
               'codex': ('used_percent window_minutes resets_at ordinary_usage_allowed has_credits '
                         'credits_unlimited credits_balance reset_credits_available lifetime_tokens '
                         'peak_daily_tokens longest_running_turn_sec current_streak_days '
@@ -97,6 +97,10 @@ def row(kind, value):
                         'last_route_at last_route_tier last_route_model last_route_reason')}
     if kind == 'queue':
         legacy = set(fields[kind].replace(' repo', '').split())
+        current = set(fields[kind].split())
+        need(type(value) is dict and set(value) in (legacy, current))
+    elif kind == 'swarm':
+        legacy = set('version repo issue issue_state paper_only policy_profiles agents tasks edges'.split())
         current = set(fields[kind].split())
         need(type(value) is dict and set(value) in (legacy, current))
     else:
@@ -182,7 +186,9 @@ def row(kind, value):
         task_ids = set()
         tasks_by_id = {}
         for task in value['tasks']:
-            keys(task, 'task_id parent_task_id parent_agent_id agent_id state role model fallback_model attempt max_attempts blocker fencing_token dependencies result_sha')
+            legacy_task = set('task_id parent_task_id parent_agent_id agent_id state role model fallback_model attempt max_attempts blocker fencing_token dependencies result_sha'.split())
+            current_task = legacy_task | {'attempt_state', 'delivery_reconcile_count'}
+            need(type(task) is dict and set(task) in (legacy_task, current_task))
             need(identifier(task['task_id'], 256) and task['task_id'] not in task_ids)
             task_ids.add(task['task_id'])
             tasks_by_id[task['task_id']] = task
@@ -195,6 +201,11 @@ def row(kind, value):
             need(task['fallback_model'] is None or identifier(task['fallback_model'], 128))
             need(number(task['attempt']) and number(task['max_attempts'])
                  and task['attempt'] <= task['max_attempts'])
+            attempt_state = task.get('attempt_state')
+            need(attempt_state is None or attempt_state in (
+                'dispatching', 'accepted', 'working', 'delivery_uncertain', 'verifying',
+                'completed', 'done', 'blocked', 'failed', 'retry_scheduled'))
+            need(number(task.get('delivery_reconcile_count', 0)))
             need(task['blocker'] is None or identifier(task['blocker'], 128))
             need(number(task['fencing_token']))
             need(type(task['dependencies']) is list and len(task['dependencies']) <= 64
@@ -226,6 +237,20 @@ def row(kind, value):
             if task['state'] == 'running' and task['agent_id'] is not None
         }
         need(agent_tasks == expected_agent_tasks)
+
+        runtime_status = value.get('runtime_status', 'unavailable')
+        runtime_agents = value.get('runtime_agents', [])
+        need(runtime_status in ('available', 'unavailable', 'not_applicable'))
+        need(type(runtime_agents) is list and len(runtime_agents) <= 16)
+        runtime_ids = set()
+        for runtime_agent in runtime_agents:
+            keys(runtime_agent, 'agent_id status task_id')
+            need(identifier(runtime_agent['agent_id'], 256) and runtime_agent['agent_id'] not in runtime_ids)
+            runtime_ids.add(runtime_agent['agent_id'])
+            need(runtime_agent['status'] in ('idle', 'working', 'blocked', 'done', 'unknown'))
+            need(runtime_agent['task_id'] is None or runtime_agent['task_id'] in task_ids)
+        if runtime_status != 'available':
+            need(runtime_agents == [])
 
         need(type(value['edges']) is list and len(value['edges']) <= 200)
         edges = set()

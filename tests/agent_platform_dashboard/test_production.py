@@ -509,6 +509,12 @@ def test_swarm_projection_is_atomic_bounded_and_sanitized(tmp_path, monkeypatch)
         'parent_agent_id': None,
         'fencing_token': 1,
     }]
+    assert snapshot['runtime_status'] == 'available'
+    assert snapshot['runtime_agents'] == [{
+        'agent_id': 'herdr-parent',
+        'status': 'working',
+        'task_id': 'root',
+    }]
     assert snapshot['edges'] == [
         {'from_task': 'root', 'to_task': 'child', 'kind': 'parent'}
     ]

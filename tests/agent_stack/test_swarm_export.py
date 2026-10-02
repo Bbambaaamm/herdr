@@ -4,6 +4,8 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from agent_platform_dashboard import production_sources as sources
 
@@ -78,6 +80,58 @@ class SwarmExportTests(unittest.TestCase):
         self.assertEqual(rows[0]["issue_state"], "unknown")
         self.assertEqual(rows[0]["tasks"][0]["state"], "done")
         self.assertEqual(rows[0]["edges"], [])
+
+    def test_runtime_projection_keeps_live_state_separate_from_durable_delivery_uncertain(self):
+        self.write_task(
+            "pending",
+            self.herdr_task(
+                "root",
+                attempt_state="delivery_uncertain",
+                delivery_reconcile_count=5,
+                execution_session={"agent_name": "task-hermes"},
+            ),
+        )
+        payload = self.exporter.materialize(self.exporter.load_records(), observed_at=100)
+        self.assertEqual(payload["tasks"][0]["state"], "pending")
+        self.assertEqual(payload["tasks"][0]["attempt_state"], "delivery_uncertain")
+        self.assertEqual(payload["tasks"][0]["delivery_reconcile_count"], 5)
+        runtime = {
+            "id": "cli:agent:list",
+            "result": {
+                "type": "agent_list",
+                "agents": [
+                    {"name": "herdr-hermes", "agent_status": "idle"},
+                    {"name": "herdr-codex", "agent_status": "working"},
+                    {"name": "task-hermes", "agent_status": "working"},
+                    {"name": "quantlab-codex", "agent_status": "working"},
+                ],
+            },
+        }
+        fake = SimpleNamespace(returncode=0, stdout=json.dumps(runtime), stderr="")
+        with patch.object(self.exporter.subprocess, "run", return_value=fake):
+            status, agents = self.exporter.runtime_agent_projection(payload)
+        self.assertEqual(status, "available")
+        self.assertEqual(
+            agents,
+            [
+                {"agent_id": "herdr-codex", "status": "working", "task_id": None},
+                {"agent_id": "herdr-hermes", "status": "idle", "task_id": None},
+                {"agent_id": "task-hermes", "status": "working", "task_id": "root"},
+            ],
+        )
+        payload["runtime_status"] = status
+        payload["runtime_agents"] = agents
+        self.exporter.publish(payload)
+        previous = sources.SWARM_PATH
+        try:
+            sources.SWARM_PATH = str(self.output)
+            rows, _ = sources.swarm(str(self.output), "quantlab")
+        finally:
+            sources.SWARM_PATH = previous
+        self.assertEqual(rows[0]["tasks"][0]["state"], "pending")
+        self.assertEqual(rows[0]["tasks"][0]["attempt_state"], "delivery_uncertain")
+        self.assertEqual([row["agent_id"] for row in rows[0]["runtime_agents"]],
+                         ["herdr-codex", "herdr-hermes", "task-hermes"])
 
     def test_closed_issue_is_explicit_and_cannot_mask_open_work(self):
         self.exporter.INTAKE.write_text(

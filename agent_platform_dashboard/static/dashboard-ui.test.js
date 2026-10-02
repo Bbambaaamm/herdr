@@ -304,7 +304,7 @@ test('technical queue blocker does not masquerade as user intervention', async t
   await h.refresh();
   assert.equal(h.ui.diagnostics().state, 'waiting_result');
   assert.equal(h.get('#attention-summary').hidden, true);
-  assert.match(h.get('#face-task').textContent, /technické závislosti/i);
+  assert.match(h.get('#face-task').textContent, /Technicky blokováno/i);
   assert.match(h.get('#queue-list').innerHTML, /soak_evidence_pending/);
 });
 
@@ -660,16 +660,16 @@ test('Swarm KPI strip renders 10 cells from authoritative queue and router data'
   assert.match(html, /<span>Waiting<\/span><b>1<\/b>/);
   assert.match(html, /<span>Blocked \/ Failed<\/span><b>0 \/ 0<\/b>/);
   assert.match(html, /<span>Queue<\/span><b>1<\/b>/);
-  assert.match(html, /<span>Terminal success<\/span><b>—<\/b><small>0 done · 0 failed<\/small>/);
+  assert.match(html, /<span>Durable success<\/span><b>—<\/b><small>0 done · 0 failed v historii<\/small>/);
   assert.match(html, /<span>Retries<\/span><b>0<\/b>/);
-  assert.match(html, /<span>Tokens<\/span><b>24<\/b>/);
-  assert.match(html, /<span>Cost known<\/span><b>0 USD<\/b><small>2 req unknown<\/small>/);
+  assert.match(html, /<span>Tokens<\/span><b>—<\/b><small>0 req known · 2 unknown<\/small>/);
+  assert.match(html, /<span>Cost known<\/span><b>—<\/b><small>0 req oceněno · 2 unknown<\/small>/);
 });
 
 test('Avg task stays explicitly unavailable when duration telemetry is missing', async t => {
   const h = await harness(t);
   const html = h.get('#swarm-kpis').innerHTML;
-  assert.match(html, /<span>Avg task<\/span><b>\u2014<\/b><small>duration telemetry chybí<\/small>/);
+  assert.match(html, /<span>Avg task<\/span><b>\u2014<\/b><small>task duration se neměří<\/small>/);
   assert.doesNotMatch(html, /<span>Avg task<\/span><b>\d/);
 });
 
@@ -722,12 +722,12 @@ test('TaskGraph task nodes carry aria-selected for keyboard/select sync', async 
 });
 
 
-test('Retries KPI counts only attempts after the first try', async t => {
+test('Retries KPI uses durable retry counter where initial attempt is zero', async t => {
   const h = await harness(t);
   const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
   queue.rows[0].attempts = 3;
   await h.refresh();
-  assert.match(h.get('#swarm-kpis').innerHTML, /<span>Retries<\/span><b>2<\/b><small>opakované pokusy<\/small>/);
+  assert.match(h.get('#swarm-kpis').innerHTML, /<span>Retries<\/span><b>3<\/b><small>durable retry counter<\/small>/);
 });
 
 test('Blocked and failed stay semantically separate in KPI and analytics', async t => {
@@ -1100,6 +1100,8 @@ test('swarm active counts include concurrently working Majak agent', async t => 
     rows: [{
       version: 1, repo: 'Bbambaaamm/herdr', issue: '48', paper_only: false,
       policy_profiles: ['default'],
+      runtime_status: 'available',
+      runtime_agents: [{ agent_id: 'herdr-parent', status: 'working', task_id: 'parent' }],
       agents: [{
         agent_id: 'herdr-parent', task_id: 'parent', state: 'running',
         parent_task_id: null, parent_agent_id: null, fencing_token: 1,
@@ -1226,6 +1228,7 @@ test('observability active work uses authoritative running agents only', async t
     observed_at: now, data_at: now,
     rows: [{
       version: 1, repo: 'Bbambaaamm/herdr', issue: '48', paper_only: false, policy_profiles: ['default'],
+      runtime_status: 'available', runtime_agents: [],
       agents: [],
       tasks: [{
         task_id: 'blocked-history', parent_task_id: null, parent_agent_id: null,
@@ -1272,6 +1275,65 @@ test('closed issue terminal history is visible but not counted as active work', 
   assert.match(h.get('#taskgraph-nodes').innerHTML, /closed-blocked-history/);
   assert.doesNotMatch(h.get('#face-task').textContent, /delivery_uncertain_requires_recovery/);
   assert.equal(h.calls.activity.at(-1).blocked, 0);
+});
+
+test('live Herdr agents remain visible while durable root is pending delivery_uncertain', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
+  queue.rows = [];
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '53', issue_state: 'open',
+      paper_only: false, policy_profiles: ['herdr-core'],
+      runtime_status: 'available',
+      runtime_agents: [
+        { agent_id: 'herdr-codex', status: 'working', task_id: null },
+        { agent_id: 'herdr-hermes', status: 'idle', task_id: null },
+        { agent_id: 'task-hermes', status: 'working', task_id: 'root-current' },
+      ],
+      agents: [],
+      tasks: [
+        {
+          task_id: 'root-old-a', parent_task_id: null, parent_agent_id: null,
+          agent_id: 'old-a', state: 'failed', role: 'github_root_orchestration',
+          model: 'profile-router', fallback_model: null, attempt: 0, max_attempts: 4,
+          attempt_state: 'failed', delivery_reconcile_count: 12,
+          blocker: null, fencing_token: 0, dependencies: [], result_sha: null,
+        },
+        {
+          task_id: 'root-old-b', parent_task_id: null, parent_agent_id: null,
+          agent_id: 'old-b', state: 'failed', role: 'github_root_orchestration',
+          model: 'profile-router', fallback_model: null, attempt: 0, max_attempts: 4,
+          attempt_state: 'failed', delivery_reconcile_count: 7,
+          blocker: null, fencing_token: 0, dependencies: [], result_sha: null,
+        },
+        {
+          task_id: 'root-current', parent_task_id: null, parent_agent_id: null,
+          agent_id: 'task-hermes', state: 'pending', role: 'github_root_orchestration',
+          model: 'profile-router', fallback_model: null, attempt: 0, max_attempts: 4,
+          attempt_state: 'delivery_uncertain', delivery_reconcile_count: 5,
+          blocker: null, fencing_token: 0, dependencies: [], result_sha: null,
+        },
+      ],
+      edges: [],
+    }],
+  });
+  await h.refresh();
+  const html = h.get('#swarm-kpis').innerHTML;
+  assert.match(html, /<span>Active<\/span><b>2<\/b>/);
+  assert.match(html, /<span>Running<\/span><b>0<\/b>/);
+  assert.match(html, /<span>Waiting<\/span><b>1<\/b>/);
+  assert.match(html, /<span>Blocked \/ Failed<\/span><b>0 \/ 2<\/b>/);
+  assert.match(html, /<span>Queue<\/span><b>1<\/b>/);
+  assert.equal(h.ui.diagnostics().state, 'working');
+  assert.match(h.get('#face-task').textContent, /live práce probíhá/);
+  assert.match(h.get('#face-task').textContent, /durable pending \/ delivery_uncertain/);
+  assert.doesNotMatch(h.get('#face-task').textContent, /technické závislosti/i);
+  assert.match(h.get('#coordinator-current').textContent, /root-current/);
+  assert.equal(h.calls.activity.at(-1).workingAgents, 2);
 });
 
 test('QuantLab swarm browser boundary rejects non-PAPER snapshots', async t => {
