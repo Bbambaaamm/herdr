@@ -37,7 +37,8 @@ def fixture():
                                 Egress.REGION_BOUND, Retention.LIMITED, Training.EXCLUDED,
                                 1024, 512, 256, 50)
     states = tuple(RuntimeStateSnapshot(x.id, "2026-10-02T10:00:00+00:00", 30,
-                                        Health.HEALTHY, 2, 20, None) for x in executors)
+                                        Health.HEALTHY, 2, 20, None, registry.snapshot.hash)
+                   for x in executors)
     return registry, scope, req, states
 
 
@@ -217,12 +218,39 @@ def test_grant_context_ceiling_applies_to_directional_floors():
     assert found.rejections[0].reason == Reason.POLICY_DENIED
 
 
+def test_runtime_observation_is_bound_to_exact_registry_snapshot():
+    registry, scope, req, states = fixture()
+    previous_hash = registry.snapshot.hash
+    changed = replace(registry.snapshot.executors[0], version="2")
+    registry.reload(RegistrySnapshot(
+        registry.snapshot.capabilities,
+        registry.snapshot.providers,
+        (changed, registry.snapshot.executors[1]),
+    ))
+    assert registry.snapshot.hash != previous_hash
+    stale = result(registry, scope, req, states)
+    assert stale.matches == ()
+    assert {item.reason for item in stale.rejections} == {Reason.RUNTIME_STALE}
+
+    fresh_states = tuple(replace(state, registry_hash=registry.snapshot.hash) for state in states)
+    fresh = result(registry, scope, req, fresh_states)
+    assert [item.provider_id for item in fresh.matches] == ["a", "b"]
+
+
+def test_direct_runtime_reason_code_rejects_secret_values():
+    with pytest.raises(CapabilityError, match="secret-like"):
+        RuntimeStateSnapshot(
+            "a-runtime", "2026-10-02T10:00:00+00:00", 30,
+            Health.DEGRADED, 1, 1, "ghp_" + "A" * 24, "a" * 64,
+        )
+
+
 def test_runtime_ttl_is_bounded_and_never_overflows():
     with pytest.raises(CapabilityError, match="bounded"):
         RuntimeStateSnapshot("a-runtime", "2026-10-02T10:00:00+00:00", 10 ** 12,
-                             Health.HEALTHY, 1, 1, None)
+                             Health.HEALTHY, 1, 1, None, "a" * 64)
     near_max = RuntimeStateSnapshot("a-runtime", "9999-12-31T23:59:59+00:00", 30,
-                                    Health.HEALTHY, 1, 1, None)
+                                    Health.HEALTHY, 1, 1, None, "a" * 64)
     assert near_max.is_fresh("9999-12-31T23:59:59+00:00") is True
     assert near_max.is_fresh("9999-12-31T23:59:58+00:00") is False
 
@@ -245,7 +273,8 @@ def test_registry_hash_reused_across_all_provenance_records():
                                 Egress.REGION_BOUND, Retention.LIMITED, Training.EXCLUDED,
                                 1024, 512, 256, 50)
     states = tuple(RuntimeStateSnapshot(x.id, "2026-10-02T10:00:00+00:00", 30,
-                                        Health.HEALTHY, 2, 20, None) for x in executors)
+                                        Health.HEALTHY, 2, 20, None, registry.snapshot.hash)
+                   for x in executors)
     found = registry.candidates(req, scope, states, at=NOW)
     assert len(found.matches) == 4
     assert all(m.provenance.registry_hash == found.registry_hash for m in found.matches)
