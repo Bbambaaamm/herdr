@@ -1139,3 +1139,34 @@ def test_router_projection_exposes_only_bounded_operational_model_metadata(tmp_p
                         cost_microusd=None, fallback_count=0, successful_requests=1,
                         duration_ms=1000, last_used_at=11)]
     assert 'PRIVATE' not in json.dumps(rows) and 'SECRET' not in json.dumps(rows)
+
+def test_fresh_canonical_history_can_receive_compatible_live_fallback(tmp_path, monkeypatch):
+    import copy
+    path = tmp_path / "canonical.json"
+    path.write_text(json.dumps(swarm_payload()))
+    monkeypatch.setattr(sources, "SWARM_PATH", str(path))
+    canonical = sources.swarm(str(path), "quantlab")[0][0]
+    fallback = copy.deepcopy(canonical)
+    fallback["issue"] = "48"
+    fallback["runtime_status"] = "available"
+    fallback["runtime_agents"] = [
+        {"agent_id": "herdr-parent", "status": "working", "task_id": "root"},
+        {"agent_id": "outside-agent", "status": "working", "task_id": "child"},
+    ]
+    monkeypatch.setattr(sources, "SWARM_FALLBACK_PATH", "fallback")
+    monkeypatch.setattr(sources, "swarm", lambda path, profile:
+                        ([canonical], 195) if path == str(tmp_path / "canonical.json") else ([fallback], 194))
+    rows, stamp = sources.live_swarm("quantlab", 200)
+    assert stamp == 194
+    assert rows[0]["issue"] == canonical["issue"]
+    assert rows[0]["tasks"] == canonical["tasks"]
+    assert rows[0]["runtime_status"] == "available"
+    assert rows[0]["runtime_agents"][0]["task_id"] == "root"
+    assert rows[0]["runtime_agents"][1]["task_id"] is None
+
+    fallback["repo"] = "Bbambaaamm/Autonomous-Quant-Lab"
+    assert sources.live_swarm("quantlab", 200)[0][0]["runtime_status"] == "unavailable"
+    fallback["repo"] = canonical["repo"]
+    monkeypatch.setattr(sources, "swarm", lambda path, profile:
+                        ([canonical], 195) if path == str(tmp_path / "canonical.json") else ([fallback], 100))
+    assert sources.live_swarm("quantlab", 200)[0][0]["runtime_status"] == "unavailable"

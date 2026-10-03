@@ -1549,3 +1549,26 @@ for (const runtimeStatus of ['idle', 'done', 'working']) {
     }
   });
 }
+
+test('Active stays unknown when projected Majak runtime is unavailable', async t => {
+  const h = await harness(t);
+  reviewSwarm(h, [{ agent_id: 'task-hermes', status: 'working', task_id: null }]);
+  const majak = h.snapshot().sources.find(row => row.profile === 'majak' && row.kind === 'herdr');
+  Object.assign(majak, { status: 'unavailable', reason: 'source_failed', rows: [] });
+  await h.refresh();
+  assert.match(h.get('#swarm-kpis').innerHTML, /Active<\/span><b>—<\/b>/);
+  assert.match(h.get('#observability-kpis').innerHTML, /Aktivní práce<\/span><b>— agent/);
+});
+test('closed swarm terminal history contributes reliability but not operational queue', async t => {
+  const h = await harness(t);
+  reviewSwarm(h, [], [
+    { ...reviewPending('done-task'), state: 'done', attempt: 2, result_sha: 'a'.repeat(64) },
+    { ...reviewPending('failed-task'), state: 'failed', attempt: 3, max_attempts: 4 },
+  ]);
+  h.snapshot().sources.find(row => row.kind === 'swarm').rows[0].issue_state = 'closed';
+  await h.refresh();
+  assert.match(h.get('#swarm-kpis').innerHTML, /Queue<\/span><b>0<\/b>/);
+  assert.match(h.get('#swarm-kpis').innerHTML, /Retries<\/span><b>5<\/b>/);
+  assert.match(h.get('#swarm-kpis').innerHTML, /Durable success<\/span><b>50 %<\/b>/);
+  assert.match(h.get('#swarm-kpis').innerHTML, /Blocked \/ Failed<\/span><b>0 \/ 1<\/b>/);
+});

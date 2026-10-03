@@ -545,8 +545,8 @@ def live_swarm(profile, now, max_age=SWARM_FRESH_SECONDS):
     stale = False
     # Scheduler/runtime owns SWARM_PATH. Prefer it whenever it is fresh so a
     # live TaskGraph cannot be masked by the periodic Agent Stack fallback.
-    # The fallback is a separate file and is considered only after the primary
-    # becomes stale/unavailable.
+    # The separate fallback supplies lifecycle only after primary staleness;
+    # compatible fresh process observations may augment a fresh primary.
     for path in dict.fromkeys((SWARM_PATH, SWARM_FALLBACK_PATH)):
         try:
             rows, stamp = swarm(path, profile)
@@ -555,6 +555,28 @@ def live_swarm(profile, now, max_age=SWARM_FRESH_SECONDS):
         if stamp > now:
             continue
         if now - stamp <= max_age:
+            # The canonical TaskGraph remains authoritative. A compatible fresh
+            # fallback may supply actual process observations, never lifecycle.
+            if (path == SWARM_PATH and path != SWARM_FALLBACK_PATH
+                    and rows[0]['runtime_status'] != 'available'):
+                try:
+                    fallback, runtime_stamp = swarm(SWARM_FALLBACK_PATH, profile)
+                    observed = fallback[0]
+                    if (0 <= now - runtime_stamp <= max_age
+                            and observed['repo'] == rows[0]['repo']
+                            and observed['runtime_status'] == 'available'):
+                        canonical_tasks = {task['task_id']: task for task in rows[0]['tasks']}
+                        runtime = []
+                        for agent in observed['runtime_agents']:
+                            task = canonical_tasks.get(agent['task_id'])
+                            bound = (task is not None and task['agent_id'] == agent['agent_id']
+                                     and task['state'] in ('pending', 'running', 'blocked'))
+                            runtime.append({**agent, 'task_id': agent['task_id'] if bound else None})
+                        rows = [{**rows[0], 'runtime_status': 'available', 'runtime_agents': runtime}]
+                        c.row('swarm', rows[0])
+                        stamp = min(stamp, runtime_stamp)
+                except (OSError, ValueError):
+                    pass
             return rows, stamp
         stale = True
     if stale:

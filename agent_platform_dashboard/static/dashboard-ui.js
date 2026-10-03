@@ -315,15 +315,22 @@ export function mountDashboard(createScene) {
     const queue = swarmSnapshot()
       ? [...operationalSwarmTasks(), ...operationalQueueTasks('majak')]
       : operationalQueueTasks();
+    const history = swarmSnapshot()
+      ? [...swarmTasks(), ...queueTasks('majak')] : queueTasks();
     const count = status => queue.filter(row => row.status === status).length;
-    const running = count('running'), waiting = count('pending'), failed = count('failed'), blockedOnly = count('blocked'), done = count('done');
+    const running = count('running'), waiting = count('pending'), blockedOnly = count('blocked');
+    const failed = history.filter(row => row.status === 'failed').length;
+    const done = history.filter(row => row.status === 'done').length;
     const blocked = blockedOnly + failed;
     const runtimeAgents = swarmRuntimeAgents();
     const majakWorking = agents().filter(row => row.profile === 'majak' && row.status === 'working').length;
+    const projected = PROFILES.filter(profile => liveData.sources.some(row => row.profile === profile));
+    const majakAvailable = !projected.includes('majak') || source('majak', 'herdr')?.status === 'available';
     const activeAgents = swarmSnapshot()
-      ? runtimeAgents === null ? null : runtimeAgents.filter(row => row.status === 'working').length + majakWorking
-      : agents().filter(row => row.status === 'working').length;
-    const retries = queue.reduce((sum, row) => sum + (Number.isSafeInteger(row.attempts) ? Math.max(0, row.attempts) : 0), 0);
+      ? runtimeAgents === null || !majakAvailable ? null : runtimeAgents.filter(row => row.status === 'working').length + majakWorking
+      : projected.every(profile => source(profile, 'herdr')?.status === 'available')
+        ? agents().filter(row => row.status === 'working').length : null;
+    const retries = history.reduce((sum, row) => sum + (Number.isSafeInteger(row.attempts) ? Math.max(0, row.attempts) : 0), 0);
     const terminal = done + failed;
     const success = terminal ? Math.round(done / terminal * 100) : null;
     const profiles = PROFILES.map(stats);
