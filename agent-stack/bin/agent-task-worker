@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from agent_model_policy import decide as decide_model_route, record as record_model_route
+from agent_completion_evidence import EvidenceError, freeze_plan, verify_completion, completion_instructions
 
 HOME = Path("/home/agentops")
 HERDR = HOME / ".local/bin/herdr"
@@ -455,7 +456,7 @@ TASK COMPLETION CONTRACT:
 - If GitHub write authorization is required to complete the slice, set status=blocked and blocker=github_write_auth_required. Preserve exact local branch/patch/evidence and do not redo implementation.
 - If an interactive approval/question is required, do not guess or approve it yourself; leave it blocked with evidence.
 """
-    return base + contract
+    return base + contract + completion_instructions(task)
 
 def run_prompt(task: dict) -> tuple[int, str]:
     session = task.get("execution_session")
@@ -678,6 +679,26 @@ def finish(task_path: Path, task: dict, output: str) -> None:
         )
         return
 
+    blocker = str(result.get("blocker") or "").strip()
+    if str(result.get("status") or "") == "completed" and (not blocker or blocker.lower() in {"none", "null"}):
+        try:
+            accepted = verify_completion(ROOT, task, result)
+        except EvidenceError as exc:
+            # Keep the original publication and attempt identity. Missing CI or
+            # unavailable evidence is reconciliation, not another coding attempt.
+            task["attempt_state"] = "verification_pending"
+            task["result_status"] = "verification_pending"
+            task["verification_status"] = exc.code
+            task["last_error"] = str(exc)
+            task["verification_reconcile_count"] = int(task.get("verification_reconcile_count", 0)) + 1
+            task["not_before"] = (utcnow() + timedelta(seconds=60)).isoformat()
+            write_json(task_path, task)
+            move(task_path, BLOCKED)
+            return
+        task["completion_level"] = accepted["level"]
+        task["completion_bundle_hash"] = accepted.get("bundle_hash", accepted.get("result_digest"))
+        task["verification_status"] = "accepted"
+
     status = str(result.get("status") or "")
     blocker = str(result.get("blocker") or "").strip()
     task["agent_output_tail"] = output[-4000:]
@@ -708,6 +729,10 @@ def main(task_path: Path) -> int:
 
         task = json.loads(task_path.read_text(encoding="utf-8"))
         task_id = str(task["id"])
+
+        if task.get("attempt_state") == "verification_pending" and task.get("run_token"):
+            finish(task_path, task, "reconcile completion evidence without redispatch")
+            return 0
 
         if task.get("attempt_state") == "delivery_uncertain" and task.get("run_token"):
             log(
@@ -740,6 +765,12 @@ def main(task_path: Path) -> int:
             persist_current_task(task)
 
         prepare_attempt(task)
+        try:
+            freeze_plan(ROOT, task)
+        except EvidenceError as exc:
+            task["last_error"] = str(exc)
+            block_task(task_path, task, exc.code, "Trusted completion plan is unavailable before dispatch.")
+            return 0
         attempt = int(task.get("attempts") or 0)
         decision = decide_model_route(task)
         task["routing"] = decision

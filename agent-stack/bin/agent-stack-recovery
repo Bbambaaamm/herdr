@@ -3,8 +3,10 @@ import json
 import os
 import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from agent_completion_evidence import EvidenceError, verify_completion
 
 HOME = Path("/home/agentops")
 HERDR = HOME / ".local/bin/herdr"
@@ -398,6 +400,21 @@ def terminalize_from_result(
         )
         return
 
+    if status == "completed" and (not blocker or blocker.lower() in {"none", "null"}):
+        try:
+            accepted = verify_completion(ROOT, task, result)
+        except EvidenceError as exc:
+            task["attempt_state"] = "verification_pending"
+            task["result_status"] = "verification_pending"
+            task["verification_status"] = exc.code
+            task["last_error"] = str(exc)
+            task["not_before"] = (utcnow() + timedelta(seconds=60)).isoformat()
+            move_task(path, BLOCKED, task)
+            return
+        task["completion_level"] = accepted["level"]
+        task["completion_bundle_hash"] = accepted.get("bundle_hash", accepted.get("result_digest"))
+        task["verification_status"] = "accepted"
+
     if not cleanup_task_owned_pane(task):
         task["watchdog_cleanup_blocker"] = (
             "task_session_cleanup_failed"
@@ -541,6 +558,26 @@ def reconcile_watchdog_blocked_tasks() -> None:
         terminalize_from_result(path, task, result, 0)
 
 
+def reconcile_verification_pending() -> None:
+    """Collect late CI/review evidence without dispatching another execution."""
+    if not BLOCKED.exists():
+        return
+    active = active_worker_tasks()
+    for path in sorted(BLOCKED.glob("*.json")):
+        try:
+            task = json.loads(path.read_text(encoding="utf-8"))
+            due = task.get("not_before")
+            if (task.get("attempt_state") != "verification_pending"
+                    or path.resolve() in active
+                    or (due and datetime.fromisoformat(due.replace("Z", "+00:00")) > utcnow())):
+                continue
+        except (OSError, ValueError, TypeError):
+            continue
+        result, _ = matching_result(task)
+        if result is not None:
+            terminalize_from_result(path, task, result, 0)
+
+
 def run_herdr(args: list[str], timeout: float = 15.0) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [str(HERDR), *args],
@@ -610,6 +647,7 @@ def main() -> int:
     for action in (
         recover_orphan_tasks,
         reconcile_watchdog_blocked_tasks,
+        reconcile_verification_pending,
         recover_codex_update_dialogs,
     ):
         try:
