@@ -1446,3 +1446,88 @@ test('QuantLab swarm browser boundary rejects non-PAPER snapshots', async t => {
   await h.refresh();
   assert.equal(h.ui.diagnostics().freshSnapshot, false);
 });
+
+function reviewSwarm(h, runtimeAgents = [], tasks = []) {
+  const now = Math.floor(Date.now() / 1000);
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '80', issue_state: 'open',
+      paper_only: false, policy_profiles: ['herdr-core'],
+      runtime_status: 'available', runtime_agents: runtimeAgents,
+      agents: [], tasks, edges: [],
+    }],
+  });
+}
+function reviewPending(taskId = 'live-task') {
+  return {
+    task_id: taskId, parent_task_id: null, parent_agent_id: null,
+    agent_id: 'task-hermes', state: 'pending', role: 'coordinator',
+    model: null, fallback_model: null, attempt: 0, max_attempts: 2,
+    blocker: null, fencing_token: 0, dependencies: [], result_sha: null,
+  };
+}
+test('swarm analytics preserves known tokens and distinguishes unknown cost from measured zero', async t => {
+  const h = await harness(t);
+  for (const source of h.snapshot().sources.filter(row => row.kind === 'router')) {
+    source.rows.forEach(row => { row.input_tokens = 5; row.output_tokens = 7; row.cost_microusd = 0; });
+  }
+  await h.refresh();
+  assert.match(h.get('#swarm-analytics-grid').innerHTML, /Tokens & cost[^]*?<strong>24<\/strong>/);
+  assert.match(h.get('#swarm-analytics-grid').innerHTML, /0 USD known/);
+  for (const source of h.snapshot().sources.filter(row => row.kind === 'router')) {
+    source.rows.forEach(row => { row.input_tokens = null; row.cost_microusd = null; });
+  }
+  await h.refresh();
+  assert.match(h.get('#swarm-analytics-grid').innerHTML, /Tokens & cost[^]*?<strong>—<\/strong><p>— known/);
+});
+test('unbound blocked runtime agent opens an observed agent detail from both attention actions', async t => {
+  const h = await harness(t);
+  reviewSwarm(h, [{ agent_id: 'task-hermes', status: 'blocked', task_id: null }]);
+  await h.refresh();
+  assert.equal(h.get('#attention-summary').hidden, false);
+  assert.match(h.get('#attention-summary').textContent, /task-hermes/);
+  h.click('#attention-action');
+  assert.equal(h.get('#agent-detail').hidden, false);
+  assert.equal(h.get('#detail-title').textContent, 'task-hermes');
+  assert.equal(h.get('#detail-profile').textContent, 'HERDR');
+  assert.match(h.get('#detail-status').textContent, /Živý stav: Blokováno/);
+  h.click('#detail-close');
+  h.get('#attention-summary').children.at(-1).emit('click');
+  assert.equal(h.get('#agent-detail').hidden, false);
+});
+test('bound blocked runtime agent opens its authoritative task', async t => {
+  const h = await harness(t);
+  reviewSwarm(h, [{ agent_id: 'task-hermes', status: 'blocked', task_id: 'live-task' }], [reviewPending()]);
+  await h.refresh();
+  h.click('#attention-action');
+  assert.equal(h.ui.diagnostics().selectedTask, 'live-task');
+  assert.match(h.get('#detail-title').textContent, /live-task/);
+});
+test('coordinator current badge uses selected swarm before masked QuantLab queue', async t => {
+  const h = await harness(t);
+  h.snapshot().sources.find(row => row.profile === 'quantlab' && row.kind === 'queue').rows[0].status = 'running';
+  reviewSwarm(h, [{ agent_id: 'task-hermes', status: 'working', task_id: 'live-task' }], [reviewPending()]);
+  await h.refresh();
+  assert.match(h.get('#coordinator-current').textContent, /live-task/);
+  assert.match(h.get('#face-task').textContent, /live-task/);
+  assert.doesNotMatch(h.get('#coordinator-current').textContent, /issue190/);
+});
+test('Majak runtime identity confirms its durable queue task alongside swarm', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const queue = h.snapshot().sources.find(row => row.profile === 'majak' && row.kind === 'queue');
+  Object.assign(queue, { status: 'available', reason: 'ok', data_at: now, rows: [{
+    task_id: 'majak-live', repo: 'Bbambaaamm/dotacni-majak', issue: 662,
+    issue_title: 'Majak', issue_open: true, scheduler_state: 'active', status: 'running',
+    attempts: 0, max_attempts: 4, not_before: null, updated_at: now,
+    agent: 'dotacni-majak-hermes', kind: 'github_root_orchestration', blocker: null, pr_number: null,
+  }] });
+  h.snapshot().sources.find(row => row.profile === 'majak' && row.kind === 'herdr').rows
+    .find(row => row.agent === 'majak-hermes').status = 'working';
+  reviewSwarm(h);
+  await h.refresh();
+  assert.match(h.get('#face-task').textContent, /Maják #662[^]*live práce probíhá/);
+  assert.match(h.get('#coordinator-current').textContent, /majak-live/);
+});

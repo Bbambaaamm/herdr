@@ -163,6 +163,30 @@ export function mountDashboard(createScene) {
       .map(row => row.task_id);
     return activeTaskIds.map(taskById).find(Boolean) || null;
   }
+  function coordinatorTasks() {
+    return swarmSnapshot()
+      ? [...operationalSwarmTasks(), ...operationalQueueTasks('majak')]
+      : operationalQueueTasks();
+  }
+  function coordinatorTask() {
+    return coordinatorTasks().filter(row => row.status === 'running')
+      .sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0) || a.task_id.localeCompare(b.task_id))[0]
+      || runtimeLinkedTask()
+      || coordinatorTasks().find(row => row.status === 'blocked')
+      || null;
+  }
+  function blockedAgents() {
+    const swarm = swarmSnapshot();
+    return [
+      ...(swarmRuntimeAgents() || []).filter(row => row.status === 'blocked')
+        .map(row => ({ ...row, agent: row.agent_id, profile: 'quantlab', runtime: true })),
+      ...agents().filter(row => row.status === 'blocked' && (!swarm || row.profile === 'majak')),
+    ];
+  }
+  function openBlockedAgent(row) {
+    if (row.task_id && taskById(row.task_id)) openTaskDetail(row.task_id);
+    else openDetail(row.agent);
+  }
   function swarmEdges() { return swarmSnapshot()?.edges || []; }
   function taskRows() { return swarmSnapshot() ? [...swarmTasks(), ...queueTasks('majak')] : queueTasks(); }
   function admissionSource() { return source('quantlab', 'admission'); }
@@ -437,8 +461,8 @@ export function mountDashboard(createScene) {
     const m = swarmMetrics();
     const queueTotal = m.queue.length || 1;
     const mini = `<div class="swarm-mini">${['running','pending','blocked','failed','done'].map(status => { const count = m.queue.filter(row => row.status === status).length; return count ? `<i class="${status}" style="width:${(count / queueTotal * 100).toFixed(1)}%" title="${escapeHTML(QUEUE_STATUS[status] || status)}: ${count}"></i>` : ''; }).join('')}</div>`;
-    const tokens = m.inputTokens == null || m.outputTokens == null ? '—' : compact.format(m.inputTokens + m.outputTokens);
-    const cost = m.cost == null ? '—' : money(m.cost);
+    const tokens = m.tokenTotal == null || !m.tokenKnownRequests ? '—' : compact.format(m.tokenTotal);
+    const cost = m.cost == null || !m.costKnownRequests ? '—' : money(m.cost);
     const topModels = m.models.slice(0, 4);
     const mix = topModels.length ? topModels.map(row => `${escapeHTML(row.model)} ${fmt.format(row.requests)}`).join(' · ') : 'Model telemetry není dostupná.';
     root.innerHTML = [
@@ -554,12 +578,7 @@ export function mountDashboard(createScene) {
           ...allAgents.filter(row => row.profile === 'majak' && row.status === 'working').map(row => row.agent),
         ]
       : allAgents.filter(row => row.status === 'working').map(row => row.agent);
-    const task = swarm
-      ? operationalSwarmTasks().find(row => row.status === 'running')
-        || runtimeLinkedTask()
-        || operationalQueueTasks('majak').find(row => row.status === 'running')
-        || null
-      : currentQueueTask();
+    const task = coordinatorTask();
     if (state === 'working' && task) {
       const project = task.repo === 'Bbambaaamm/dotacni-majak' ? 'Maják'
         : task.repo === 'Bbambaaamm/herdr' ? 'Herdr'
@@ -570,7 +589,7 @@ export function mountDashboard(createScene) {
         : '';
       const taskRuntimeWorking = task.repo === 'Bbambaaamm/herdr'
         ? runtimeAgents?.some(row => row.status === 'working' && row.task_id === task.task_id) ?? false
-        : allAgents.some(row => row.profile === 'majak' && row.status === 'working' && row.agent === task.agent);
+        : allAgents.some(row => row.profile === 'majak' && row.status === 'working' && row.agent === sceneAgent(task.agent));
       if (swarm && !taskRuntimeWorking) {
         return `${project} ${issueLabel(task)} · ${task.task_id} · durable ${durable}${attempt} · živý runtime nepotvrzen.`;
       }
@@ -606,8 +625,10 @@ export function mountDashboard(createScene) {
   }
   function renderFace() {
     const state = effectiveState(), meta = STATE_META[state], color = toneColor(meta.tone);
-    const currentTask = currentQueueTask() || runtimeLinkedTask();
-    const pendingNext = nextQueueTask(currentTask?.agent || null);
+    const currentTask = coordinatorTask();
+    const pendingNext = coordinatorTasks()
+      .filter(row => row.status === 'pending' && (!currentTask?.agent || row.agent === currentTask.agent))
+      .sort((a, b) => (a.not_before ?? Number.MAX_SAFE_INTEGER) - (b.not_before ?? Number.MAX_SAFE_INTEGER) || a.task_id.localeCompare(b.task_id))[0];
     const nextTask = pendingNext?.task_id === currentTask?.task_id ? null : pendingNext;
     ui.faceState.textContent = meta.label; ui.faceTask.textContent = faceCopy(state);
     ui.coordinatorCurrent.textContent = demo ? `DEMO · ${STATE_META[state].label}` : taskDisplay(currentTask);
@@ -845,7 +866,7 @@ export function mountDashboard(createScene) {
     }).join('');
     const sourceUserActionReasons = new Set(['user_action_required', 'auth_required', 'credentials_missing', 'permission_required']);
     const sourceActions = (liveData?.sources || []).filter(row => row.status === 'unavailable' && sourceUserActionReasons.has(row.reason));
-    const blocked = agents().filter(row => row.status === 'blocked');
+    const blocked = blockedAgents();
     const queueAlerts = userBlockedTasks();
     const summary = $('#attention-summary');
     summary.hidden = Boolean(liveData) && !sourceActions.length && !blocked.length && !queueAlerts.length;
@@ -853,7 +874,7 @@ export function mountDashboard(createScene) {
     if (!summary.hidden) {
       const action = document.createElement('button'); action.type = 'button'; action.className = 'attention-action';
       action.textContent = blocked.length ? 'Otevřít blokovaného agenta' : queueAlerts.length ? 'Otevřít frontu' : 'Obnovit data';
-      action.addEventListener('click', () => blocked.length ? openDetail(blocked[0].agent) : queueAlerts.length ? $('#queue-title').scrollIntoView({ behavior: reduced ? 'auto' : 'smooth' }) : refresh(true)); summary.append(' ', action);
+      action.addEventListener('click', () => blocked.length ? openBlockedAgent(blocked[0]) : queueAlerts.length ? $('#queue-title').scrollIntoView({ behavior: reduced ? 'auto' : 'smooth' }) : refresh(true)); summary.append(' ', action);
     }
   }
   function renderTaskDetail() {
@@ -919,12 +940,17 @@ export function mountDashboard(createScene) {
   function renderDetail() {
     if (selectedTask) { renderTaskDetail(); return; }
     if (!selectedAgent) return;
-    const row = agents().find(item => item.agent === selectedAgent);
+    const runtimeRow = swarmRuntimeAgents()?.find(item => item.agent_id === selectedAgent);
+    const row = runtimeRow
+      ? { ...runtimeRow, agent: runtimeRow.agent_id, profile: 'quantlab', runtime: true }
+      : agents().find(item => item.agent === selectedAgent);
     const profile = row?.profile || (selectedAgent.startsWith('majak-') ? 'majak' : 'quantlab');
     const value = stats(profile), search = searchStats(profile), herdr = source(profile, 'herdr');
     const hasQueue = selectedAgent.endsWith('-hermes');
     const queueAgent = durableAgent(selectedAgent);
-    const task = hasQueue ? currentQueueTask(queueAgent) || nextQueueTask(queueAgent) : null;
+    const task = runtimeRow?.task_id
+      ? taskById(runtimeRow.task_id)
+      : hasQueue ? currentQueueTask(queueAgent) || nextQueueTask(queueAgent) : null;
     const currentTask = hasQueue
       ? task ? `${issueLabel(task)} · ${task.task_id} · ${QUEUE_STATUS[task.status] || task.status}` : 'Žádná úloha v durable queue'
       : 'Nedostupné v datovém kontraktu';
@@ -942,8 +968,8 @@ export function mountDashboard(createScene) {
     const costs = value.costKnown == null ? 'Nedostupné'
       : `${money(value.costKnown)} známé${value.costUnknownRequests ? ` + ${fmt.format(value.costUnknownRequests)} req bez ceny` : ''}`;
 
-    $('#detail-profile').textContent = profile.toUpperCase(); $('#detail-title').textContent = selectedAgent;
-    $('#detail-role').textContent = ROLES[agentKind(selectedAgent)];
+    $('#detail-profile').textContent = row?.runtime ? 'HERDR' : profile.toUpperCase(); $('#detail-title').textContent = selectedAgent;
+    $('#detail-role').textContent = row?.runtime ? 'Runtime agent · read only' : ROLES[agentKind(selectedAgent)];
     $('#detail-status').textContent = `Živý stav: ${row ? statusLabel(row.status) : 'Odpojeno / neznámé'}`;
     $('#detail-links').innerHTML = [
       detailLink(issueUrl(task), task ? `Otevřít Issue ${issueLabel(task)}` : ''),
@@ -972,7 +998,7 @@ export function mountDashboard(createScene) {
     ];
     $('#detail-metrics').innerHTML = metrics.map(([title, content]) => `<div><dt>${escapeHTML(title)}</dt><dd>${escapeHTML(content)}</dd></div>`).join('');
     const events = [];
-    if (row) events.push(`Herdr hlásí stav „${row.status}“ · pozorováno před ${age(herdr?.observed_at)}`);
+    if (row) events.push(`Herdr hlásí stav „${row.status}“ · pozorováno před ${age(row.runtime ? swarmSource()?.observed_at : herdr?.observed_at)}`);
     if (task) events.push(`Durable queue: ${issueLabel(task)} · ${task.task_id} · ${QUEUE_STATUS[task.status] || task.status} · pokus ${attemptLabel(task)} · scheduler ${task.scheduler_state || 'nehlášeno'}`);
     if (task?.blocker) events.push(`Blocker: ${task.blocker}`);
     if (value.router?.status === 'available') events.push(`Router profilu: ${number(value.requests)} požadavků · data před ${age(value.router.data_at)}`);
@@ -983,7 +1009,8 @@ export function mountDashboard(createScene) {
     $('#detail-events').innerHTML = events.map(event => `<li>${escapeHTML(event)}</li>`).join('');
   }
   function openDetail(name) {
-    if (!PROFILES.flatMap(displayedAgents).some(row => row.agent === name)) return;
+    if (!PROFILES.flatMap(displayedAgents).some(row => row.agent === name)
+      && !swarmRuntimeAgents()?.some(row => row.agent_id === name)) return;
     returnFocus = document.activeElement; selectedTask = null; selectedAgent = name; renderDetail();
     ui.detail.hidden = false; ui.backdrop.hidden = false; document.body.style.overflow = 'hidden';
     $('#detail-close').focus(); sceneCall('focusTask', null); sceneCall('focusAgent', name); if (demo) renderProjects(); renderTaskGraph(); renderFace();
@@ -1210,7 +1237,7 @@ export function mountDashboard(createScene) {
   });
   ui.attention.addEventListener('click', () => {
     if (!liveData) { refresh(true); return; }
-    const blocked = agents().find(row => row.status === 'blocked'); if (blocked) openDetail(blocked.agent); else applyView('work');
+    const blocked = blockedAgents()[0]; if (blocked) openBlockedAgent(blocked); else applyView('work');
   });
   document.querySelectorAll('[data-project-toggle]').forEach(button => button.addEventListener('click', () => {
     const list = button.closest('.project').querySelector('.agent-list'), expanded = button.getAttribute('aria-expanded') === 'true';
