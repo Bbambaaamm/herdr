@@ -570,7 +570,7 @@ def test_runtime_agent_id_must_be_nonempty_string_at_source_and_contract_boundar
     with pytest.raises(ValueError):
         sources.swarm(str(path), 'quantlab')
 
-    payload['runtime_agents'][0]['agent_id'] = 'task-hermes'
+    payload['runtime_agents'][0]['agent_id'] = 'herdr-parent'
     path.write_text(json.dumps(payload))
     snapshot = sources.swarm(str(path), 'quantlab')[0][0]
     snapshot['runtime_agents'][0]['agent_id'] = None
@@ -1170,3 +1170,39 @@ def test_fresh_canonical_history_can_receive_compatible_live_fallback(tmp_path, 
     monkeypatch.setattr(sources, "swarm", lambda path, profile:
                         ([canonical], 195) if path == str(tmp_path / "canonical.json") else ([fallback], 100))
     assert sources.live_swarm("quantlab", 200)[0][0]["runtime_status"] == "unavailable"
+
+@pytest.mark.parametrize("fault", ["wrong_agent", "terminal", "ambiguous"])
+def test_runtime_binding_is_exact_unique_nonterminal_at_source_and_contract(tmp_path, monkeypatch, fault):
+    path = tmp_path / "swarm.json"
+    payload = swarm_payload()
+    payload["version"] = 1
+    for key in ("graph_latency", "clock_snapshot", "ts"):
+        payload.pop(key)
+    payload["agents"] = [payload["agents"][0]]
+    payload["runtime_status"] = "available"
+    payload["runtime_agents"] = [{"agent_id": "herdr-parent", "status": "working", "task_id": "root"}]
+    path.write_text(json.dumps(payload))
+    monkeypatch.setattr(sources, "SWARM_PATH", str(path))
+    valid = sources.swarm(str(path), "quantlab")[0][0]
+    c.row("swarm", valid)
+    if fault == "wrong_agent":
+        payload["runtime_agents"][0]["agent_id"] = "unrelated"
+        valid["runtime_agents"][0]["agent_id"] = "unrelated"
+    elif fault == "terminal":
+        payload["tasks"][0]["state"] = "done"
+        payload["agents"] = []
+        next(task for task in valid["tasks"] if task["task_id"] == "root")["state"] = "done"
+        valid["agents"] = []
+    else:
+        import copy
+        raw_extra = copy.deepcopy(payload["tasks"][0])
+        raw_extra.update(task_id="also-pending", state="pending", dependencies=[])
+        payload["tasks"].append(raw_extra)
+        extra = copy.deepcopy(next(task for task in valid["tasks"] if task["task_id"] == "root"))
+        extra.update(task_id="also-pending", state="pending", dependencies=[])
+        valid["tasks"].append(extra)
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError):
+        sources.swarm(str(path), "quantlab")
+    with pytest.raises(ValueError):
+        c.row("swarm", valid)

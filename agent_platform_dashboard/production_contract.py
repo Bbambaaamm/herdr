@@ -250,7 +250,12 @@ def row(kind, value):
                  and runtime_agent['agent_id'] not in runtime_ids)
             runtime_ids.add(runtime_agent['agent_id'])
             need(runtime_agent['status'] in ('idle', 'working', 'blocked', 'done', 'unknown'))
-            need(runtime_agent['task_id'] is None or runtime_agent['task_id'] in task_ids)
+            matches = [task for task in value['tasks']
+                       if task['agent_id'] == runtime_agent['agent_id']
+                       and task['state'] in ('pending', 'running', 'blocked')]
+            need(runtime_agent['task_id'] is None or
+                 type(runtime_agent['task_id']) is str and len(matches) == 1
+                 and matches[0]['task_id'] == runtime_agent['task_id'])
         if runtime_status != 'available':
             need(runtime_agents == [])
 

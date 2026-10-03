@@ -1572,3 +1572,19 @@ test('closed swarm terminal history contributes reliability but not operational 
   assert.match(h.get('#swarm-kpis').innerHTML, /Durable success<\/span><b>50 %<\/b>/);
   assert.match(h.get('#swarm-kpis').innerHTML, /Blocked \/ Failed<\/span><b>0 \/ 1<\/b>/);
 });
+
+for (const fault of ['wrong_agent', 'terminal', 'ambiguous']) {
+  test(`browser rejects invalid runtime task binding: ${fault}`, async t => {
+    const h = await harness(t);
+    const task = reviewPending();
+    const runtime = { agent_id: 'task-hermes', status: 'working', task_id: task.task_id };
+    const tasks = [task];
+    if (fault === 'wrong_agent') runtime.agent_id = 'unrelated-agent';
+    else if (fault === 'terminal') task.state = 'done';
+    else tasks.push(reviewPending('also-pending'));
+    reviewSwarm(h, [runtime], tasks);
+    await h.refresh();
+    assert.equal(h.ui.diagnostics().freshSnapshot, false);
+    assert.doesNotMatch(h.get('#face-task').textContent, /live práce probíhá/);
+  });
+}

@@ -493,8 +493,12 @@ def swarm(path, profile):
                    and item['agent_id'] not in runtime_ids)
             runtime_ids.add(item['agent_id'])
             c.need(item['status'] in ('idle', 'working', 'blocked', 'done', 'unknown'))
+            bound_tasks = [task for task in tasks
+                           if task['agent_id'] == item['agent_id']
+                           and task['state'] in ('pending', 'running', 'blocked')]
             c.need(item['task_id'] is None or
-                   type(item['task_id']) is str and item['task_id'] in task_ids)
+                   type(item['task_id']) is str and len(bound_tasks) == 1
+                   and bound_tasks[0]['task_id'] == item['task_id'])
             runtime_agents.append({
                 'agent_id': item['agent_id'],
                 'status': item['status'],
@@ -569,8 +573,11 @@ def live_swarm(profile, now, max_age=SWARM_FRESH_SECONDS):
                         runtime = []
                         for agent in observed['runtime_agents']:
                             task = canonical_tasks.get(agent['task_id'])
-                            bound = (task is not None and task['agent_id'] == agent['agent_id']
-                                     and task['state'] in ('pending', 'running', 'blocked'))
+                            matches = [item for item in canonical_tasks.values()
+                                       if item['agent_id'] == agent['agent_id']
+                                       and item['state'] in ('pending', 'running', 'blocked')]
+                            bound = (task is not None and len(matches) == 1
+                                     and matches[0]['task_id'] == task['task_id'])
                             runtime.append({**agent, 'task_id': agent['task_id'] if bound else None})
                         rows = [{**rows[0], 'runtime_status': 'available', 'runtime_agents': runtime}]
                         c.row('swarm', rows[0])
