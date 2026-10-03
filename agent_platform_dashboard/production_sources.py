@@ -407,7 +407,7 @@ def swarm(path, profile):
         }
         c.need(task['attempt_state'] is None or task['attempt_state'] in (
             'dispatching', 'accepted', 'working', 'delivery_uncertain', 'verifying',
-            'completed', 'done', 'blocked', 'failed', 'retry_scheduled'))
+            'completed', 'done', 'blocked', 'failed', 'retry_scheduled', 'verification_pending'))
         c.need(c.number(task['delivery_reconcile_count']))
         tasks.append(task)
     c.need(len({task['task_id'] for task in tasks}) == len(tasks))

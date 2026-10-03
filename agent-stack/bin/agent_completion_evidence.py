@@ -90,7 +90,7 @@ def workflow_blob(repo: str, sha: str) -> str:
 
 
 def verify_workflow(plan: dict, artifact, checks: dict) -> None:
-    if not plan["required_checks"]:
+    if "Herdr contract" not in plan["required_checks"]:
         return
     expected = plan.get("environment", {}).get("ci_workflow_blob_sha")
     if (not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{40}", expected)
@@ -305,7 +305,7 @@ def freeze_plan(root: Path, task: dict) -> None:
                 raise EvidenceError("baseline is invalid")
         except (OSError, subprocess.SubprocessError) as exc:
             raise EvidenceUnavailable("trusted baseline is unavailable") from exc
-        required = list(CHECK_APPS) if kind == "coding" else []
+        required = list(CHECK_APPS) if kind == "coding" else ["GitGuardian Security Checks"]
         plan.update(base_sha=base, workspace_root="/home/agentops/worktrees",
                     required_checks=required, reviewer=BOT)
         if kind == "coding":
@@ -316,7 +316,7 @@ def freeze_plan(root: Path, task: dict) -> None:
     plan["plan_hash"] = digest(plan)
     plan["baseline"] = (list(collect_checks(task["repo"], base, plan["required_checks"],
                                             require_success=False).values())
-                        if kind == "coding" else [])
+                        if kind != "control" else [])
     store.publish("plan", key, plan)
     advertise_plan(task, plan)
 

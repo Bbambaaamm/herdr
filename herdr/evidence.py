@@ -191,6 +191,7 @@ def validate_criteria(kind: str, criteria: Any) -> None:
     if (set(criteria) != common | extra
             or criteria.get("schema") != f"{kind}-report-v1"
             or not isinstance(path, str) or len(path) > 256
+            or not path.startswith(f"reports/{kind}/") or not path.endswith(".json")
             or Path(path).is_absolute() or ":" in path or "\\" in path
             or any(part in {"", ".", ".."} for part in path.split("/"))):
         raise EvidenceError("invalid typed artifact criteria")
@@ -219,7 +220,7 @@ def validate_plan(plan: dict) -> None:
                    for n in ("spec_hash", "policy_hash", "plan_hash"))
             or not isinstance(plan["required_checks"], list)
             or (plan["kind"] == "coding" and not plan["required_checks"])
-            or (plan["kind"] != "coding" and plan["required_checks"])
+            or (plan["kind"] != "coding" and plan["required_checks"] != ["GitGuardian Security Checks"])
             or any(not isinstance(n, str) or not n or len(n) > 64
                    for n in plan["required_checks"])
             or len(set(plan["required_checks"])) != len(plan["required_checks"])
@@ -239,8 +240,8 @@ def validate_plan(plan: dict) -> None:
 def inspect_typed_artifact(plan: dict, artifact: ArtifactRef, workspace: Path) -> dict:
     criteria = plan["criteria"]
     path = criteria["report_path"]
-    if path not in artifact.changed_files:
-        raise EvidenceError("typed report is not in the sealed artifact")
+    if artifact.changed_files != (path,):
+        raise EvidenceError("typed report cannot carry implementation or unrelated changes")
     raw = read_only_git(workspace)(["show", f"{artifact.commit_sha}:{path}"])
     if len(raw.encode("utf-8")) > 1_000_000:
         raise EvidenceError("typed report exceeds its size bound")
@@ -267,7 +268,7 @@ def inspect_typed_artifact(plan: dict, artifact: ArtifactRef, workspace: Path) -
                     raise EvidenceError("research source is invalid")
                 url = urlparse(source["url"])
                 if url.scheme != "https" or not url.netloc or url.username or url.password:
-                    raise EvidenceError("research source must be a public HTTPS reference")
+                    raise EvidenceError("research source must be a credential-free HTTPS reference")
         coverage = {"sections": criteria["sections"], "source_reference_count": sum(len(row["sources"]) for row in sections),
                     "limits": "structure and independent artifact review; source truth is not asserted by schema validation"}
     else:

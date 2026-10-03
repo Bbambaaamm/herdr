@@ -204,7 +204,7 @@ def row(kind, value):
             attempt_state = task.get('attempt_state')
             need(attempt_state is None or attempt_state in (
                 'dispatching', 'accepted', 'working', 'delivery_uncertain', 'verifying',
-                'completed', 'done', 'blocked', 'failed', 'retry_scheduled'))
+                'completed', 'done', 'blocked', 'failed', 'retry_scheduled', 'verification_pending'))
             need(number(task.get('delivery_reconcile_count', 0)))
             need(task['blocker'] is None or identifier(task['blocker'], 128))
             need(number(task['fencing_token']))

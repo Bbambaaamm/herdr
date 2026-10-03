@@ -34,7 +34,7 @@ SNAPSHOT_RETRIES = 3
 RUNTIME_AGENT_NAMES = {"herdr-hermes", "herdr-codex"}
 RUNTIME_STATES = {"idle", "working", "blocked", "done", "unknown"}
 MAX_RUNTIME_AGENTS = 16
-ATTEMPT_STATES = {"dispatching", "accepted", "working", "delivery_uncertain", "verifying", "completed", "done", "blocked", "failed", "retry_scheduled"}
+ATTEMPT_STATES = {"dispatching", "accepted", "working", "delivery_uncertain", "verifying", "completed", "done", "blocked", "failed", "retry_scheduled", "verification_pending"}
 
 
 class SnapshotRace(RuntimeError):
@@ -362,6 +362,9 @@ def bounded_history(records):
 def sanitized_blocker(raw, result, state):
     if state == "done":
         return None
+    if raw.get("attempt_state") == "verification_pending":
+        status = raw.get("verification_status")
+        return status if status in {"evidence_missing", "evidence_unavailable", "evidence_invalid"} else "verification_pending"
     values = (
         (result.get("blocker"), raw.get("blocker"), raw.get("watchdog_blocker"))
         if state in ("blocked", "failed")

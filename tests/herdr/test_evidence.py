@@ -234,7 +234,8 @@ sys.stdout.buffer.write(sys.stdin.buffer.read() + b"filter-executed")
 
 def typed_fixture(tmp_path, kind, fault=None):
     task, result, plan, store, path, proof = fixture(tmp_path)
-    report_path = "report.json"
+    report_path = f"reports/{kind}/report.json"
+    plan["base_sha"] = run_git(path, "rev-parse", "HEAD")
     if kind == "research":
         criteria = {"schema": "research-report-v1", "report_path": report_path, "sections": ["architecture"]}
         report = {"version": 1, "kind": kind, "sections": [
@@ -252,6 +253,7 @@ def typed_fixture(tmp_path, kind, fault=None):
             report["target_commit"] = "e" * 40
         elif fault == "contradictory_pass":
             report["verdict"] = "pass"
+    (path / report_path).parent.mkdir(parents=True)
     (path / report_path).write_text(json.dumps(report))
     run_git(path, "add", report_path)
     run_git(path, "commit", "-qm", "typed output")
@@ -259,9 +261,9 @@ def typed_fixture(tmp_path, kind, fault=None):
     manager = WorkspaceManager(path, worktrees_dir=path.parent, artifacts_dir=tmp_path / "artifacts")
     artifact = manager.seal(ArtifactRef(task["id"], 1, plan["base_sha"], commit, "", (), "task"), path)
     result["artifact"] = artifact.to_json()
-    plan.update(kind=kind, required_checks=[], criteria=criteria)
+    plan.update(kind=kind, required_checks=["GitGuardian Security Checks"], criteria=criteria)
     plan["plan_hash"] = digest({k: v for k, v in plan.items() if k not in {"plan_hash", "baseline"}})
-    proof["checks"] = {}
+    proof["checks"] = {"GitGuardian Security Checks": {"head_sha": commit, "app_id": 46505, "status": "completed", "conclusion": "success"}}
     proof["review"]["commit_sha"] = commit
     return task, result, plan, store, path, proof
 
@@ -271,8 +273,8 @@ def test_typed_artifact_has_own_criteria_without_fictitious_build(tmp_path, kind
     task, result, plan, store, path, proof = typed_fixture(tmp_path, kind)
     accepted = accept_artifact(task, result, plan, store, path, lambda *a: proof)
     assert accepted["kind"] == kind
-    assert accepted["proof"]["checks"] == {}
-    assert accepted["typed_validation"]["report_path"] == "report.json"
+    assert set(accepted["proof"]["checks"]) == {"GitGuardian Security Checks"}
+    assert accepted["typed_validation"]["report_path"] == f"reports/{kind}/report.json"
     assert accepted["level"] == "verified_worker_result"
     assert accepted["integration"] is None and accepted["deployment"] is None
     if kind == "review":
@@ -284,5 +286,19 @@ def test_typed_artifact_has_own_criteria_without_fictitious_build(tmp_path, kind
 def test_typed_artifact_rejects_wrong_content_and_review_target(tmp_path, kind, fault):
     task, result, plan, store, path, proof = typed_fixture(tmp_path, kind, fault)
     with pytest.raises(EvidenceError):
+        accept_artifact(task, result, plan, store, path, lambda *a: proof)
+    assert not list(store.root.glob("accepted-*"))
+
+def test_research_cannot_smuggle_code_changes_under_report_criteria(tmp_path):
+    task, result, plan, store, path, proof = typed_fixture(tmp_path, "research")
+    (path / "implementation.py").write_text("unexpected_code = True")
+    run_git(path, "add", "implementation.py")
+    run_git(path, "commit", "-qm", "unrelated implementation")
+    manager = WorkspaceManager(path, worktrees_dir=path.parent, artifacts_dir=tmp_path / "artifacts")
+    artifact = manager.seal(ArtifactRef(task["id"], 1, plan["base_sha"],
+                            run_git(path, "rev-parse", "HEAD"), "", (), "task"), path)
+    result["artifact"] = artifact.to_json()
+    proof["review"]["commit_sha"] = artifact.commit_sha
+    with pytest.raises(EvidenceError, match="cannot carry implementation"):
         accept_artifact(task, result, plan, store, path, lambda *a: proof)
     assert not list(store.root.glob("accepted-*"))
