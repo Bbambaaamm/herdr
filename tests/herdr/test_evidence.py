@@ -136,7 +136,7 @@ def test_exclusive_atomic_publication_and_invalid_partial_records(tmp_path, monk
     payload = {"value": 1}
     real_link = os.link
     monkeypatch.setattr(os, "link", lambda *a, **k: (_ for _ in ()).throw(OSError("crash before publish")))
-    with pytest.raises(OSError):
+    with pytest.raises(EvidenceUnavailable):
         store.publish("accepted", key, payload)
     with pytest.raises(EvidenceMissing):
         store.read("accepted", key)
@@ -302,3 +302,126 @@ def test_research_cannot_smuggle_code_changes_under_report_criteria(tmp_path):
     with pytest.raises(EvidenceError, match="cannot carry implementation"):
         accept_artifact(task, result, plan, store, path, lambda *a: proof)
     assert not list(store.root.glob("accepted-*"))
+
+
+@pytest.mark.parametrize("target", ["result.txt", "unchanged.txt"])
+def test_normalizing_clean_filter_cannot_hide_bytes_absent_from_reviewed_commit(tmp_path, target):
+    task, result, plan, store, path, proof = fixture(tmp_path)
+    if target == "unchanged.txt":
+        (path / target).write_text("reviewed baseline")
+        run_git(path, "add", target)
+        run_git(path, "commit", "-qm", "baseline tracked content")
+        plan["base_sha"] = run_git(path, "rev-parse", "HEAD")
+        (path / "result.txt").write_text("new reviewed result")
+    attrs = f"{target} filter=normalize\n"
+    (path / ".gitattributes").write_text(attrs)
+    run_git(path, "add", ".")
+    run_git(path, "commit", "-qm", "reviewed result and attributes")
+    committed = (path / target).read_text()
+    cleaner = tmp_path / "normalize.py"
+    cleaner.write_text("import sys;sys.stdin.buffer.read();sys.stdout.write(" + repr(committed) + ")")
+    run_git(path, "config", "filter.normalize.clean", f"{sys.executable} {cleaner}")
+    (path / target).write_text("worker bytes never present in GitHub commit")
+    run_git(path, "add", target)  # normalization leaves the index at reviewed bytes
+    assert run_git(path, "status", "--porcelain") == ""
+    manager = WorkspaceManager(path, worktrees_dir=path.parent, artifacts_dir=tmp_path / "artifacts")
+    artifact = manager.seal(ArtifactRef(task["id"], 1, plan["base_sha"],
+                            run_git(path, "rev-parse", "HEAD"), "", (), "task"), path)
+    result["artifact"] = artifact.to_json()
+    plan["plan_hash"] = digest({k: v for k, v in plan.items() if k not in {"plan_hash", "baseline"}})
+    proof["review"]["commit_sha"] = artifact.commit_sha
+    with pytest.raises(EvidenceError, match="physical bytes"):
+        accept_artifact(task, result, plan, store, path, lambda *a: proof)
+    assert not list(store.root.glob("accepted-*"))
+
+
+def test_attempt_cannot_accept_a_second_valid_artifact(tmp_path):
+    task, result, plan, store, path, proof = fixture(tmp_path)
+    first = accept_artifact(task, result, plan, store, path, lambda *a: proof)
+    (path / "result.txt").write_text("another independently valid result")
+    run_git(path, "commit", "-qam", "second result")
+    manager = WorkspaceManager(path, worktrees_dir=path.parent, artifacts_dir=tmp_path / "artifacts")
+    artifact = manager.seal(ArtifactRef(task["id"], 1, plan["base_sha"],
+                            run_git(path, "rev-parse", "HEAD"), "", (), "task"), path)
+    result["artifact"] = artifact.to_json()
+    proof["review"]["commit_sha"] = artifact.commit_sha
+    with pytest.raises(EvidenceError, match="binding"):
+        accept_artifact(task, result, plan, store, path, lambda *a: proof)
+    records = list(store.root.glob("accepted-*"))
+    assert len(records) == 1
+    assert store.read("accepted", digest({"identity": binding(task), "plan_hash": plan["plan_hash"]}))["artifact"] == first["artifact"]
+
+
+def test_actual_normalizing_filter_is_rejected_at_production_namespace_boundary(tmp_path):
+    import tempfile
+    base = Path(os.environ.get("HERDR_BOUNDARY_TEST_ROOT", "/home/agentops/tmp"))
+    if not shutil.which("bwrap") or not base.is_dir() or not os.access(base, os.W_OK):
+        pytest.skip("physical artifact verifier fixture root is unavailable")
+    with tempfile.TemporaryDirectory(prefix="normalization-boundary-", dir=base) as directory:
+        try:
+            test_normalizing_clean_filter_cannot_hide_bytes_absent_from_reviewed_commit(Path(directory), "result.txt")
+        except EvidenceUnavailable:
+            pytest.skip("this host denies the artifact verifier namespace")
+
+
+def test_committed_binary_bytes_and_deletions_are_verified(tmp_path):
+    task, result, plan, store, path, proof = fixture(tmp_path)
+    (path / "binary.dat").write_bytes(bytes([0, 255, 254, 128]))
+    run_git(path, "rm", "result.txt")
+    run_git(path, "add", "binary.dat")
+    run_git(path, "commit", "-qm", "binary output and deletion")
+    manager = WorkspaceManager(path, worktrees_dir=path.parent, artifacts_dir=tmp_path / "artifacts")
+    artifact = manager.seal(ArtifactRef(task["id"], 1, plan["base_sha"],
+                            run_git(path, "rev-parse", "HEAD"), "", (), "task"), path)
+    result["artifact"] = artifact.to_json()
+    proof["review"]["commit_sha"] = artifact.commit_sha
+    assert accept_artifact(task, result, plan, store, path, lambda *a: proof)["level"] == "verified_worker_result"
+
+
+def test_failed_publication_is_typed_transient_and_leaves_no_accepted_record(tmp_path, monkeypatch):
+    store = EvidenceStore(tmp_path / "store")
+    monkeypatch.setattr(os, "link", lambda *a, **k: (_ for _ in ()).throw(OSError("temporary disk failure")))
+    with pytest.raises(EvidenceUnavailable, match="publication"):
+        store.publish("accepted", "a" * 64, {"accepted": True})
+    assert not list(store.root.iterdir())
+
+
+def test_restart_finishes_interrupted_directory_fsync_before_accepting_record(tmp_path, monkeypatch):
+    store = EvidenceStore(tmp_path / "store")
+    real_sync = store._sync_directory
+    calls = []
+    def sync():
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("temporary fsync error")
+        real_sync()
+    monkeypatch.setattr(store, "_sync_directory", sync)
+    with pytest.raises(EvidenceUnavailable):
+        store.publish("accepted", "a" * 64, {"accepted": True})
+    assert store.read("accepted", "a" * 64) == {"accepted": True}
+    assert len(calls) == 2
+
+
+def test_actual_replace_refs_cannot_change_the_verified_github_commit(tmp_path):
+    import tempfile
+    base = Path(os.environ.get("HERDR_BOUNDARY_TEST_ROOT", "/home/agentops/tmp"))
+    if not shutil.which("bwrap") or not base.is_dir() or not os.access(base, os.W_OK):
+        pytest.skip("physical artifact verifier fixture root is unavailable")
+    with tempfile.TemporaryDirectory(prefix="replace-ref-boundary-", dir=base) as directory:
+        task, result, plan, store, path, proof = fixture(Path(directory))
+        original = result["artifact"]["commit_sha"]
+        (path / "result.txt").write_text("replacement tree never reviewed by GitHub")
+        run_git(path, "commit", "-qam", "unreviewed replacement")
+        replacement = run_git(path, "rev-parse", "HEAD")
+        run_git(path, "replace", original, replacement)
+        run_git(path, "reset", "--hard", original)
+        manager = WorkspaceManager(path, worktrees_dir=path.parent, artifacts_dir=Path(directory) / "other-artifacts")
+        artifact = manager.seal(ArtifactRef(task["id"], 1, plan["base_sha"], original, "", (), "task"), path)
+        result["artifact"] = artifact.to_json()
+        assert artifact.commit_sha == original
+        try:
+            with pytest.raises(EvidenceError):
+                accept_artifact(task, result, plan, store, path, lambda *a: proof)
+        except EvidenceUnavailable:
+            pytest.skip("this host denies the artifact verifier namespace")
+        assert not list(store.root.glob("accepted-*"))

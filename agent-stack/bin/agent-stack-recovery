@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from agent_completion_evidence import EvidenceError, verify_completion
+from agent_completion_evidence import EvidenceError, record_verification_failure, verify_completion
 
 HOME = Path("/home/agentops")
 HERDR = HOME / ".local/bin/herdr"
@@ -404,11 +404,9 @@ def terminalize_from_result(
         try:
             accepted = verify_completion(ROOT, task, result)
         except EvidenceError as exc:
-            task["attempt_state"] = "verification_pending"
-            task["result_status"] = "verification_pending"
-            task["verification_status"] = exc.code
-            task["last_error"] = str(exc)
-            task["not_before"] = (utcnow() + timedelta(seconds=60)).isoformat()
+            waiting = record_verification_failure(task, exc)
+            if waiting:
+                task["not_before"] = (utcnow() + timedelta(seconds=60)).isoformat()
             move_task(path, BLOCKED, task)
             return
         task["completion_level"] = accepted["level"]
@@ -550,7 +548,8 @@ def reconcile_watchdog_blocked_tasks() -> None:
             task = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             continue
-        if task.get("watchdog_blocker") != "orphaned_running_unknown_delivery":
+        if (task.get("verification_resolution") == "needs_replan"
+                or task.get("watchdog_blocker") != "orphaned_running_unknown_delivery"):
             continue
         result, _ = matching_result(task)
         if result is None:
@@ -567,7 +566,9 @@ def reconcile_verification_pending() -> None:
         try:
             task = json.loads(path.read_text(encoding="utf-8"))
             due = task.get("not_before")
-            if (task.get("attempt_state") != "verification_pending"
+            waiting = (task.get("attempt_state") == "verification_pending"
+                       or task.get("watchdog_cleanup_blocker") == "task_session_cleanup_failed")
+            if (not waiting or task.get("verification_resolution") == "needs_replan"
                     or path.resolve() in active
                     or (due and datetime.fromisoformat(due.replace("Z", "+00:00")) > utcnow())):
                 continue

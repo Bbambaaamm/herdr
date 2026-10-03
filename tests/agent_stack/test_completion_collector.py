@@ -193,3 +193,46 @@ def test_malformed_check_collection_is_unavailable_without_execution_retry(monke
     monkeypatch.setattr(collector, "github", lambda *a: {"check_runs": [None]})
     with pytest.raises(EvidenceUnavailable):
         collector.collect_checks("Bbambaaamm/herdr", "a" * 40, list(collector.CHECK_APPS), require_success=True)
+
+
+def test_collector_rejects_a_pr_head_changed_during_collection(monkeypatch):
+    from copy import deepcopy
+    artifact, plan, pr, checks, comment = proof_fixture()
+    install_transport(monkeypatch, artifact, plan, pr, checks, comment)
+    old = collector.github
+    count = 0
+    def api(path):
+        nonlocal count
+        data = deepcopy(old(path))
+        if path.endswith("/pulls/4"):
+            count += 1
+            if count == 2:
+                data["head"]["sha"] = "e" * 40
+        return data
+    monkeypatch.setattr(collector, "github", api)
+    with pytest.raises(EvidenceError, match="changed during"):
+        collector.collect_github(plan, artifact, 4)
+    assert count == 2
+
+
+@pytest.mark.parametrize("actor", [collector.BOT, "human-reviewer", "another-review-bot"])
+def test_every_effective_requested_change_blocks_even_before_clean_comment(monkeypatch, actor):
+    artifact, plan, pr, checks, comment = proof_fixture()
+    reviews = [{"id": 1, "user": {"login": actor}, "state": "CHANGES_REQUESTED",
+                "commit_id": "e" * 40, "submitted_at": "2026-10-03T19:00:00Z"},
+               {"id": 2, "user": {"login": actor}, "state": "COMMENTED",
+                "commit_id": artifact.commit_sha, "submitted_at": "2026-10-03T19:30:00Z"}]
+    install_transport(monkeypatch, artifact, plan, pr, checks, comment, reviews=reviews)
+    with pytest.raises(EvidenceMissing, match="outstanding"):
+        collector.collect_github(plan, artifact, 4)
+
+
+@pytest.mark.parametrize("state", ["APPROVED", "DISMISSED"])
+def test_approved_or_dismissed_change_request_no_longer_blocks(monkeypatch, state):
+    artifact, plan, pr, checks, comment = proof_fixture()
+    reviews = [{"id": 1, "user": {"login": "reviewer"}, "state": "DISMISSED" if state == "DISMISSED" else "CHANGES_REQUESTED",
+                "submitted_at": "2026-10-03T18:00:00Z"},
+               {"id": 2, "user": {"login": "reviewer"}, "state": state,
+                "submitted_at": "2026-10-03T19:00:00Z"}]
+    install_transport(monkeypatch, artifact, plan, pr, checks, comment, reviews=reviews)
+    assert collector.collect_github(plan, artifact, 4)["source"] == "github-api"

@@ -137,6 +137,13 @@ def _unresolved_threads(repo: str, number: int) -> bool:
         raise EvidenceUnavailable("review thread collection failed") from exc
 
 
+def _pr_binding(pr: dict) -> tuple:
+    return (pr.get("head", {}).get("sha"), pr.get("base", {}).get("sha"),
+            pr.get("head", {}).get("repo", {}).get("full_name"),
+            pr.get("base", {}).get("repo", {}).get("full_name"),
+            pr.get("base", {}).get("ref"))
+
+
 def _collect_github(plan: dict, artifact, number):
     if type(number) is not int or number <= 0:
         raise EvidenceMissing("a pull request reference is required")
@@ -148,12 +155,23 @@ def _collect_github(plan: dict, artifact, number):
             or pr.get("base", {}).get("sha") != artifact.base_sha
             or pr.get("base", {}).get("ref") != "main"):
         raise EvidenceError("pull request repository, commit or baseline mismatch")
+    initial_binding = _pr_binding(pr)
     checks = collect_checks(repo, artifact.commit_sha, plan["required_checks"],
                             require_success=True)
     verify_workflow(plan, artifact, checks)
     if _unresolved_threads(repo, number):
         raise EvidenceMissing("pull request has unresolved review findings")
     reviews = github(f"repos/{repo}/pulls/{number}/reviews?per_page=100")
+    effective = {}
+    for row in sorted(reviews, key=lambda r: (r.get("submitted_at") or "", r.get("id", 0))):
+        if row.get("state") not in {"APPROVED", "CHANGES_REQUESTED"}:
+            continue
+        actor = row.get("user", {}).get("login")
+        if not isinstance(actor, str) or not actor:
+            raise EvidenceUnavailable("review authority is unavailable")
+        effective[actor] = row["state"]
+    if "CHANGES_REQUESTED" in effective.values():
+        raise EvidenceMissing("pull request has outstanding requested changes")
     comments = github(f"repos/{repo}/issues/{number}/comments?per_page=100")
     # Codex publishes its clean review as a bot-authored conversation comment.
     # Resolve the reported abbreviated commit through GitHub to bind the full SHA.
@@ -179,6 +197,9 @@ def _collect_github(plan: dict, artifact, number):
            and r.get("state") in {"COMMENTED", "CHANGES_REQUESTED"}
            for r in reviews):
         raise EvidenceMissing("newer exact-commit review must be reconciled")
+    latest = github(f"repos/{repo}/pulls/{number}")
+    if _pr_binding(latest) != initial_binding:
+        raise EvidenceError("pull request changed during evidence collection; replan is required")
     return {"source": "github-api", "checks": checks,
             "review": {"actor": BOT, "commit_sha": artifact.commit_sha,
                        "comment_id": clean["id"], "created_at": clean["created_at"],
@@ -338,7 +359,7 @@ def verify_completion(root: Path, task: dict, result: dict) -> dict:
         if (not isinstance(result.get("summary"), str) or not result["summary"].strip()
                 or not isinstance(result.get("next_action"), str) or not result["next_action"].strip()):
             raise EvidenceMissing("control cycle requires summary and next action")
-        key = digest({"identity": identity, "plan_hash": plan["plan_hash"], "result_hash": digest(result)})
+        key = digest({"identity": identity, "plan_hash": plan["plan_hash"]})
         bundle = {"version": 1, "identity": identity, "repo": task.get("repo"),
                   "level": "control_cycle", "kind": "control", "spec_hash": plan["spec_hash"],
                   "policy_hash": plan["policy_hash"], "plan_hash": plan["plan_hash"],
@@ -352,3 +373,22 @@ def verify_completion(root: Path, task: dict, result: dict) -> dict:
     if not isinstance(workspace, str) or not Path(workspace).is_absolute():
         raise EvidenceMissing("artifact workspace is missing")
     return accept_artifact(task, result, plan, store, Path(workspace), collect_github)
+
+
+def record_verification_failure(task: dict, exc: EvidenceError) -> bool:
+    """Return whether this exact attempt can wait for transient evidence."""
+    waiting = isinstance(exc, (EvidenceMissing, EvidenceUnavailable))
+    task["attempt_state"] = "verification_pending" if waiting else "blocked"
+    task["result_status"] = "verification_pending" if waiting else "blocked"
+    task["verification_status"] = exc.code
+    task["last_error"] = str(exc)
+    task["verification_resolution"] = "waiting_for_evidence" if waiting else "needs_replan"
+    task["verification_next_action"] = (
+        "Reconcile missing CI/review/transport evidence for this same attempt."
+        if waiting else
+        "Replan the rejected artifact or changed specification under trusted policy; "
+        "preserve this attempt and its immutable evidence. Automatic redispatch is forbidden."
+    )
+    if not waiting:
+        task.pop("not_before", None)
+    return waiting

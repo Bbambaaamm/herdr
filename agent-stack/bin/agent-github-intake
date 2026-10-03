@@ -404,6 +404,8 @@ def intervention_blocker(
     latest = records[0]
     task = latest["task"]
     task_id = str(task.get("id") or "")
+    if task.get("verification_resolution") == "needs_replan":
+        return task_id, str(task.get("verification_next_action") or "verification requires replan")
     if task.get("attempt_state") == "verification_pending":
         return task_id, str(task.get("verification_status") or "verification_pending")
     result = result_for(task_id)

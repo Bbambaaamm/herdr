@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from agent_model_policy import decide as decide_model_route, record as record_model_route
-from agent_completion_evidence import EvidenceError, freeze_plan, verify_completion, completion_instructions
+from agent_completion_evidence import EvidenceError, record_verification_failure, freeze_plan, verify_completion, completion_instructions
 
 HOME = Path("/home/agentops")
 HERDR = HOME / ".local/bin/herdr"
@@ -684,14 +684,10 @@ def finish(task_path: Path, task: dict, output: str) -> None:
         try:
             accepted = verify_completion(ROOT, task, result)
         except EvidenceError as exc:
-            # Keep the original publication and attempt identity. Missing CI or
-            # unavailable evidence is reconciliation, not another coding attempt.
-            task["attempt_state"] = "verification_pending"
-            task["result_status"] = "verification_pending"
-            task["verification_status"] = exc.code
-            task["last_error"] = str(exc)
-            task["verification_reconcile_count"] = int(task.get("verification_reconcile_count", 0)) + 1
-            task["not_before"] = (utcnow() + timedelta(seconds=60)).isoformat()
+            waiting = record_verification_failure(task, exc)
+            if waiting:
+                task["verification_reconcile_count"] = int(task.get("verification_reconcile_count", 0)) + 1
+                task["not_before"] = (utcnow() + timedelta(seconds=60)).isoformat()
             write_json(task_path, task)
             move(task_path, BLOCKED)
             return
@@ -729,6 +725,9 @@ def main(task_path: Path) -> int:
 
         task = json.loads(task_path.read_text(encoding="utf-8"))
         task_id = str(task["id"])
+
+        if task.get("verification_resolution") == "needs_replan":
+            return 0
 
         if task.get("attempt_state") == "verification_pending" and task.get("run_token"):
             finish(task_path, task, "reconcile completion evidence without redispatch")

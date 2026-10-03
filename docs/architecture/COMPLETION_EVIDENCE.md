@@ -29,3 +29,30 @@ Plans and accepted bundles use canonical JSON with an integrity digest, a flushe
 Accepted bundles and frozen plans outlive temporary workspaces. This implementation does not delete or rewrite them automatically. A future explicit host retention policy must preserve accepted audit bindings and coordinate access controls with issue #76. Bundle metadata contains digests and bounded source identities, rather than prompts, credentials, terminal text or model conversations.
 
 Physical regressions test protected evidence mounts and hostile Git filters on a host with bubblewrap. CI records unsupported namespace capability as a skip; separate host validation must demonstrate that boundary before release. Historical DONE records remain historical and are not relabelled as newly verified results.
+
+
+### Rejection and immutable acceptance
+An accepted address is derived only from protected task/attempt identity and
+the frozen plan, never from worker-selected result bytes. A different artifact,
+workspace, PR reference or control result for that address is a conflict; one
+attempt cannot publish two authoritative outcomes. Identical crash replay
+reuses the existing record.
+
+Only missing or unavailable evidence enters automatic verification reconciliation.
+Invalid identity, changed policy/workflow, conflicting publication or rejected
+artifact is preserved as blocked with verification_resolution: needs_replan
+and an explicit protected next action. Worker, watchdog and intake do not silently
+redispatch or poll this permanent rejection. A trusted subsequent plan must apply
+the node/retry/budget policy; this adapter does not manufacture that permission.
+
+Artifact verification compares every tracked regular file against the committed
+Git blob without filters and derives result hashes from committed binary blobs.
+Unsupported symlink/submodule outputs and tracked files above 64 MB fail closed;
+individual committed blobs are subject to the bounded verifier output limit.
+This prevents clean filters from hiding bytes absent from CI/review. The collector
+rejects outstanding change requests by any reviewer and rechecks PR head/base
+identity after collecting proof. Accepted historical records remain immutable;
+they describe the accepted commit, not later PR or deployment state.
+
+Cleanup failure after acceptance remains eligible for recovery from blocked
+storage, using the same exact result and accepted bundle without model dispatch.

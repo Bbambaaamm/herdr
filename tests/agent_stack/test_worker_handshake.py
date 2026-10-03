@@ -892,3 +892,37 @@ def test_worker_prompt_exposes_frozen_criteria_and_limited_completion_level(tmp_
     assert "does not satisfy an implementation" in prompt
     assert task["completion_plan"]["kind"] == "control"
     assert len(task["completion_plan"]["plan_hash"]) == 64
+
+
+def test_permanently_invalid_evidence_requires_replan_without_endless_reconciliation(tmp_path, monkeypatch):
+    from herdr.evidence import EvidenceError
+    task, path, result = verification_task(tmp_path)
+    monkeypatch.setattr(worker, "verify_completion",
+                        lambda *a: (_ for _ in ()).throw(EvidenceError("pinned workflow changed")))
+    worker.finish(path, task, "")
+    blocked = worker.BLOCKED / path.name
+    saved = json.loads(blocked.read_text())
+    assert saved["attempt_state"] == "blocked"
+    assert saved["verification_resolution"] == "needs_replan"
+    assert "Replan" in saved["verification_next_action"]
+    assert "not_before" not in saved
+    assert saved["run_token"] == task["run_token"]
+    monkeypatch.setattr(worker, "LOCK", tmp_path / "worker.lock")
+    monkeypatch.setattr(worker, "prepare_attempt",
+                        lambda *a: (_ for _ in ()).throw(AssertionError("economic redispatch")))
+    assert worker.main(blocked) == 0
+    assert json.loads(worker.result_path(task["id"]).read_text()) == result
+
+
+def test_control_cycle_cannot_publish_conflicting_outcomes_for_one_attempt(tmp_path):
+    from agent_completion_evidence import verify_completion
+    from herdr.evidence import EvidenceError
+    import pytest
+    task, path, result = verification_task(tmp_path)
+    task["kind"] = "github_root_orchestration"
+    worker.freeze_plan(worker.ROOT, task)
+    first = verify_completion(worker.ROOT, task, result)
+    result["summary"] = "contradictory second result"
+    with pytest.raises(EvidenceError, match="immutable"):
+        verify_completion(worker.ROOT, task, result)
+    assert len(list((worker.ROOT / "verification").glob("accepted-*"))) == 1
