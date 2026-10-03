@@ -7,7 +7,7 @@ import pytest
 from herdr.capability import (
     CapabilityDescriptor, CapabilityError, CapabilityRegistry, CapabilityRequirement,
     CapabilityScope, DataClass, DataPolicy, Egress, ExecutorDescriptor, Feature, Health,
-    ProviderDescriptor, Reason, RegistrySnapshot, Retention, RuntimeStateSnapshot,
+    ProviderDescriptor, Reason, RegistrySnapshot, Retention, RuntimeStateSnapshot, Latency, MAX_INTEGER,
     Training, VERSION, requirement_from_v1_model_policy,
 )
 from herdr.taskgraph import TaskNode
@@ -391,3 +391,49 @@ def test_runtime_executor_identity_rejects_credentials_in_both_construction_path
         replace(states[0], executor_id=credential)
     with pytest.raises(CapabilityError, match="secret-like"):
         RuntimeStateSnapshot.from_dict({**states[0].to_json(), "executor_id": credential})
+
+@pytest.mark.parametrize("declared,maximum,allowed", [
+    ("interactive", "interactive", True),
+    ("standard", "interactive", False),
+    ("batch", "standard", False),
+    ("interactive", "batch", True),
+    ("batch", None, True),
+])
+def test_latency_ceiling_is_a_hard_constraint(declared, maximum, allowed):
+    registry, scope, req, states = fixture()
+    cap = replace(registry.snapshot.capabilities[0], latency=declared)
+    registry.reload(RegistrySnapshot((cap,), registry.snapshot.providers, registry.snapshot.executors))
+    req = replace(req, max_latency=maximum, preferred_providers=("a",))
+    assert CapabilityRequirement.from_dict(req.to_json()).hash == req.hash
+    states = tuple(replace(s, registry_hash=registry.snapshot.hash, requirement_hash=req.hash) for s in states)
+    found = result(registry, scope, req, states)
+    assert bool(found.matches) is allowed
+    if not allowed:
+        assert {r.reason for r in found.rejections} == {Reason.LATENCY_EXCEEDED}
+
+
+@pytest.mark.parametrize("field", ["capabilities", "providers", "executors"])
+@pytest.mark.parametrize("malformed", [None, 1, "bad", {}])
+def test_malformed_reload_collections_preserve_snapshot(field, malformed):
+    registry, _, _, _ = fixture()
+    previous = registry.snapshot
+    raw = previous.to_json()
+    raw[field] = malformed
+    with pytest.raises(CapabilityError, match="must be an array"):
+        registry.reload(raw)
+    assert registry.snapshot is previous
+
+
+def test_numeric_contract_bounds_preserve_hashability():
+    registry, scope, req, states = fixture()
+    cap = registry.snapshot.capabilities[0]
+    assert replace(cap, context_tokens=MAX_INTEGER).hash
+    for value in (MAX_INTEGER + 1, 10 ** 5000):
+        for factory in (
+            lambda: replace(cap, context_tokens=value),
+            lambda: replace(scope, max_cost_microusd=value),
+            lambda: replace(req, min_input_tokens=value),
+            lambda: replace(states[0], remaining_requests=value),
+        ):
+            with pytest.raises(CapabilityError, match="bounded"):
+                factory()

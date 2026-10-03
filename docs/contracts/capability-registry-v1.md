@@ -42,6 +42,10 @@ those delegated limits and cannot authorize broader data handling. Call
 grant with the task's `CapabilityRequirement` and declarations; it does not
 implicitly grant features or tools from a descriptor.
 
+The optional requirement `max_latency` is a hard ceiling ordered
+`interactive < standard < batch`; null imposes no latency constraint.
+An incompatible declaration returns `latency_exceeded`.
+
 Requirement hard fields are separate from `preferred_providers`. Preferences
 only rank candidates surviving all hard checks. Directional input/output token
 floors must each fit their declared maxima and their sum must fit the shared
@@ -75,7 +79,9 @@ Every declaration has `to_json` and `to_hash_json`; both include
 `schema_version`. Registry snapshots serialize sorted by id. Set-like arrays
 are sorted lexicographically when constructed. Object keys are sorted by Unicode
 code point in compact UTF-8 JSON (`ensure_ascii=False`, separators `,` and `:`,
-no NaN). Integers are decimal JSON integers; unknown numeric facts are JSON
+no NaN). All numeric fields are bounded to `0..2^63-1` (TTL has its tighter bound).
+Malformed registry collections are rejected as `CapabilityError` before reload.
+Integers are decimal JSON integers; unknown numeric facts are JSON
 `null`. Enums use their lowercase contract values. Hashes are lowercase SHA-256
 hex of those exact bytes. Timestamps and live observations are absent from
 declaration and registry hashes. Field order on input does not affect a hash.

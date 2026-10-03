@@ -28,6 +28,8 @@ _TOKEN_FIELDS = frozenset({"context_tokens", "max_input_tokens", "max_output_tok
 # Upper bound for a runtime observation TTL: rejects absurd values at construction
 # so freshness arithmetic can never overflow the datetime range.
 MAX_TTL_SECONDS = 315_360_000
+# Portable signed 64-bit contract bound keeps every accepted number hashable.
+MAX_INTEGER = (1 << 63) - 1
 
 
 class CapabilityError(ValueError):
@@ -40,8 +42,8 @@ def _token(value: str, name: str) -> None:
 
 
 def _number(value: int | None, name: str) -> None:
-    if value is not None and (type(value) is not int or value < 0):
-        raise CapabilityError(f"{name} must be a nonnegative integer or null")
+    if value is not None and (type(value) is not int or not 0 <= value <= MAX_INTEGER):
+        raise CapabilityError(f"{name} must be a bounded nonnegative integer or null")
 
 
 def _set(value: Any, name: str) -> tuple[str, ...]:
@@ -193,6 +195,7 @@ class Reason(StrEnum):
     POLICY_DENIED = "policy_denied"
     FEATURE_MISSING = "feature_missing"
     MODALITY_MISSING = "modality_missing"
+    LATENCY_EXCEEDED = "latency_exceeded"
     LIMIT_UNKNOWN = "limit_unknown"
     LIMIT_EXCEEDED = "limit_exceeded"
     DATA_POLICY_UNKNOWN = "data_policy_unknown"
@@ -475,12 +478,15 @@ class CapabilityRequirement:
     max_cost_microusd: int | None
     preferred_providers: tuple[str, ...] = ()
     legacy_model_hints: tuple[str, ...] = ()
+    max_latency: Latency | None = None
     schema_version: str = VERSION
 
     def __post_init__(self) -> None:
         if self.schema_version != VERSION:
             raise CapabilityError("incompatible schema version")
         _token(self.capability_id, "capability_id")
+        if self.max_latency is not None:
+            object.__setattr__(self, "max_latency", _enum(self.max_latency, "max_latency", Latency))
         for name, typ in (("features", Feature), ("input_modalities", Modality),
                           ("output_modalities", Modality)):
             object.__setattr__(self, name, _enum_set(getattr(self, name), name, typ))
@@ -627,6 +633,9 @@ class RegistrySnapshot:
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> RegistrySnapshot:
         d = _strict(cls, raw)
+        for name in ("capabilities", "providers", "executors"):
+            if not isinstance(d[name], (tuple, list)):
+                raise CapabilityError(f"{name} must be an array")
         return cls(tuple(CapabilityDescriptor.from_dict(x) for x in d["capabilities"]),
                    tuple(ProviderDescriptor.from_dict(x) for x in d["providers"]),
                    tuple(ExecutorDescriptor.from_dict(x) for x in d["executors"]),
@@ -740,6 +749,9 @@ def _reject(req: CapabilityRequirement, grant: CapabilityScope, cap: CapabilityD
         executor.id not in grant.executors or not set(req.permissions) <= set(grant.permissions) or
         not set(req.tools) <= set(grant.tools)):
         return Reason.POLICY_DENIED
+    if (req.max_latency is not None and
+            list(Latency).index(cap.latency) > list(Latency).index(req.max_latency)):
+        return Reason.LATENCY_EXCEEDED
     if not set(req.features) <= set(cap.features):
         return Reason.FEATURE_MISSING
     if not set(req.tools) <= set(executor.tools):
