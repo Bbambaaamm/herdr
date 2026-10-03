@@ -163,7 +163,10 @@ def _enum_set(value: Any, name: str, typ: type[StrEnum]) -> tuple[StrEnum, ...]:
         if isinstance(item, str) and any(fragment in item.lower() for fragment in _SECRET_KEYS):
             raise CapabilityError("secret-like identifier")
     try:
-        items = tuple(sorted((typ(x) for x in value), key=str))
+        parsed = tuple(typ(x) for x in value)
+        if typ is Feature:
+            parsed = tuple(Feature.TOOL_USE if item == Feature.TOOLS else item for item in parsed)
+        items = tuple(sorted(parsed, key=str))
     except ValueError as exc:
         raise CapabilityError(f"unknown typed {name} value") from exc
     if len(items) != len(set(items)):
@@ -387,6 +390,9 @@ class CapabilityScope:
     output_modalities: tuple[Modality, ...]
     max_cost_microusd: int | None
     max_context_tokens: int | None
+    max_egress: Egress
+    max_retention: Retention
+    training: Training
     schema_version: str = VERSION
 
     def __post_init__(self) -> None:
@@ -399,6 +405,9 @@ class CapabilityScope:
             object.__setattr__(self, name, _enum_set(getattr(self, name), name, Modality))
         classes = _enum_set(self.data_classes, "data_classes", DataClass)
         object.__setattr__(self, "data_classes", classes)
+        for name, typ in (("max_egress", Egress), ("max_retention", Retention),
+                          ("training", Training)):
+            object.__setattr__(self, name, _enum(getattr(self, name), name, typ))
         for name in ("max_cost_microusd", "max_context_tokens"):
             _number(getattr(self, name), name)
 
@@ -413,6 +422,12 @@ class CapabilityScope:
             child, ceiling = getattr(self, name), getattr(parent, name)
             if ceiling is not None and (child is None or child > ceiling):
                 return False
+        if list(Egress).index(self.max_egress) > list(Egress).index(parent.max_egress):
+            return False
+        if list(Retention).index(self.max_retention) > list(Retention).index(parent.max_retention):
+            return False
+        if list(Training).index(self.training) > list(Training).index(parent.training):
+            return False
         return True
 
     def require_subset_of(self, parent: CapabilityScope) -> None:
@@ -425,7 +440,10 @@ class CapabilityScope:
                 "providers", "capabilities", "executors", "tools", "permissions", "regions",
                 "data_classes", "input_modalities", "output_modalities")} | {
             "max_cost_microusd": self.max_cost_microusd,
-            "max_context_tokens": self.max_context_tokens}
+            "max_context_tokens": self.max_context_tokens,
+            "max_egress": self.max_egress.value,
+            "max_retention": self.max_retention.value,
+            "training": self.training.value}
 
     to_hash_json = to_json
 
@@ -517,6 +535,7 @@ class RuntimeStateSnapshot:
     estimated_cost_microusd: int | None
     reason_code: str | None
     registry_hash: str
+    requirement_hash: str | None = None
 
     def __post_init__(self) -> None:
         _token(self.executor_id, "executor_id")
@@ -532,6 +551,12 @@ class RuntimeStateSnapshot:
             _secrets(self.reason_code)
         if not isinstance(self.registry_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", self.registry_hash):
             raise CapabilityError("registry_hash must be lowercase sha256")
+        if (self.requirement_hash is not None and
+                (not isinstance(self.requirement_hash, str) or
+                 not re.fullmatch(r"[0-9a-f]{64}", self.requirement_hash))):
+            raise CapabilityError("requirement_hash must be null or lowercase sha256")
+        if self.estimated_cost_microusd is not None and self.requirement_hash is None:
+            raise CapabilityError("cost estimate requires requirement_hash")
         if self.health != Health.HEALTHY and self.reason_code is None:
             raise CapabilityError("nonhealthy observation requires reason_code")
 
@@ -546,7 +571,8 @@ class RuntimeStateSnapshot:
                 "ttl_seconds": self.ttl_seconds, "health": self.health.value,
                 "remaining_requests": self.remaining_requests,
                 "estimated_cost_microusd": self.estimated_cost_microusd,
-                "reason_code": self.reason_code, "registry_hash": self.registry_hash}
+                "reason_code": self.reason_code, "registry_hash": self.registry_hash,
+                "requirement_hash": self.requirement_hash}
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> RuntimeStateSnapshot:
@@ -750,6 +776,9 @@ def _reject(req: CapabilityRequirement, grant: CapabilityScope, cap: CapabilityD
             req.max_retention is None or req.training is None):
         return Reason.DATA_POLICY_UNKNOWN
     if (req.region not in grant.regions or req.data_class not in grant.data_classes or
+        list(Egress).index(req.max_egress) > list(Egress).index(grant.max_egress) or
+        list(Retention).index(req.max_retention) > list(Retention).index(grant.max_retention) or
+        list(Training).index(req.training) > list(Training).index(grant.training) or
         req.region not in cap.data_policy.regions or req.region not in provider.data_policy.regions or
         req.data_class not in cap.data_policy.data_classes or req.data_class not in provider.data_policy.data_classes or
         list(Egress).index(cap.data_policy.egress) > list(Egress).index(req.max_egress) or
@@ -769,7 +798,8 @@ def _reject(req: CapabilityRequirement, grant: CapabilityScope, cap: CapabilityD
     if state.remaining_requests is None or state.remaining_requests == 0:
         return Reason.RATE_LIMITED
     ceilings = [x for x in (req.max_cost_microusd, grant.max_cost_microusd) if x is not None]
-    if ceilings and state.estimated_cost_microusd is None:
+    if ceilings and (state.estimated_cost_microusd is None or
+                     state.requirement_hash != req.hash):
         return Reason.PRICE_UNKNOWN
     if ceilings and state.estimated_cost_microusd > min(ceilings):
         return Reason.BUDGET_EXCEEDED

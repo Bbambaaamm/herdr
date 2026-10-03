@@ -31,13 +31,15 @@ def fixture():
     registry = CapabilityRegistry(RegistrySnapshot((cap,), providers, executors))
     scope = CapabilityScope(("a", "b"), ("reason",), ("a-runtime", "b-runtime"),
                             ("search",), ("repo:read",), ("us-east",),
-                            (DataClass.INTERNAL,), ("text",), ("text",), 100, 8192)
+                            (DataClass.INTERNAL,), ("text",), ("text",), 100, 8192,
+                            Egress.REGION_BOUND, Retention.LIMITED, Training.EXCLUDED)
     req = CapabilityRequirement("reason", ("tools",), ("text",), ("text",),
                                 ("search",), ("repo:read",), "us-east", DataClass.INTERNAL,
                                 Egress.REGION_BOUND, Retention.LIMITED, Training.EXCLUDED,
                                 1024, 512, 256, 50)
     states = tuple(RuntimeStateSnapshot(x.id, "2026-10-02T10:00:00+00:00", 30,
-                                        Health.HEALTHY, 2, 20, None, registry.snapshot.hash)
+                                        Health.HEALTHY, 2, 20, None, registry.snapshot.hash,
+                                        req.hash)
                    for x in executors)
     return registry, scope, req, states
 
@@ -129,6 +131,9 @@ def test_compound_scope_partial_order_and_escalation():
                     replace(child, data_classes=(DataClass.PUBLIC,)),
                     replace(child, max_cost_microusd=101),
                     replace(child, max_context_tokens=None),
+                    replace(child, max_egress=Egress.GLOBAL),
+                    replace(child, max_retention=Retention.INDEFINITE),
+                    replace(child, training=Training.ALLOWED),
                     replace(child, output_modalities=("image",))):
         assert not widened.is_subset_of(parent)
         with pytest.raises(CapabilityError, match="escalates"):
@@ -138,6 +143,7 @@ def test_compound_scope_partial_order_and_escalation():
 def test_hard_constraint_beats_preference_and_cost():
     registry, scope, req, states = fixture()
     req = replace(req, preferred_providers=("a",))
+    states = tuple(replace(state, requirement_hash=req.hash) for state in states)
     states = (replace(states[0], estimated_cost_microusd=90), states[1])
     found = result(registry, scope, req, states)
     assert [x.provider_id for x in found.matches] == ["b"]
@@ -249,16 +255,16 @@ def test_direct_runtime_reason_code_rejects_secret_values():
     with pytest.raises(CapabilityError, match="secret-like"):
         RuntimeStateSnapshot(
             "a-runtime", "2026-10-02T10:00:00+00:00", 30,
-            Health.DEGRADED, 1, 1, "ghp_" + "A" * 24, "a" * 64,
+            Health.DEGRADED, 1, 1, "ghp_" + "A" * 24, "a" * 64, "b" * 64,
         )
 
 
 def test_runtime_ttl_is_bounded_and_never_overflows():
     with pytest.raises(CapabilityError, match="bounded"):
         RuntimeStateSnapshot("a-runtime", "2026-10-02T10:00:00+00:00", 10 ** 12,
-                             Health.HEALTHY, 1, 1, None, "a" * 64)
+                             Health.HEALTHY, 1, 1, None, "a" * 64, "b" * 64)
     near_max = RuntimeStateSnapshot("a-runtime", "9999-12-31T23:59:59+00:00", 30,
-                                    Health.HEALTHY, 1, 1, None, "a" * 64)
+                                    Health.HEALTHY, 1, 1, None, "a" * 64, "b" * 64)
     assert near_max.is_fresh("9999-12-31T23:59:59+00:00") is True
     assert near_max.is_fresh("9999-12-31T23:59:58+00:00") is False
 
@@ -275,13 +281,15 @@ def test_registry_hash_reused_across_all_provenance_records():
     scope = CapabilityScope(("a", "b", "c", "d"), ("reason",),
                             tuple(f"{x}-runtime" for x in "abcd"), ("search",),
                             ("repo:read",), ("us-east",), (DataClass.INTERNAL,),
-                            ("text",), ("text",), 100, 8192)
+                            ("text",), ("text",), 100, 8192,
+                            Egress.REGION_BOUND, Retention.LIMITED, Training.EXCLUDED)
     req = CapabilityRequirement("reason", ("tools",), ("text",), ("text",), ("search",),
                                 ("repo:read",), "us-east", DataClass.INTERNAL,
                                 Egress.REGION_BOUND, Retention.LIMITED, Training.EXCLUDED,
                                 1024, 512, 256, 50)
     states = tuple(RuntimeStateSnapshot(x.id, "2026-10-02T10:00:00+00:00", 30,
-                                        Health.HEALTHY, 2, 20, None, registry.snapshot.hash)
+                                        Health.HEALTHY, 2, 20, None, registry.snapshot.hash,
+                                        req.hash)
                    for x in executors)
     found = registry.candidates(req, scope, states, at=NOW)
     assert len(found.matches) == 4
@@ -294,6 +302,43 @@ def test_required_ucl_capability_dimensions_are_typed():
         "computer_use", "ocr_document", "tool_use", "structured_output", "mcp", "a2a",
     )
     assert tuple(Feature(x).value for x in required) == required
+
+
+def test_legacy_tools_feature_normalizes_before_hash_and_matching():
+    registry, scope, req, states = fixture()
+    cap = registry.snapshot.capabilities[0]
+    assert cap.features == (Feature.JSON, Feature.TOOL_USE)
+    assert replace(cap, features=("json", "tool_use")).hash == cap.hash
+    canonical = replace(req, features=("tool_use",))
+    canonical_states = tuple(replace(state, requirement_hash=canonical.hash) for state in states)
+    assert result(registry, scope, canonical, canonical_states).matches
+
+
+def test_delegated_data_policy_limits_are_closed_and_enforced():
+    registry, scope, req, states = fixture()
+    restrictive = replace(scope, max_egress=Egress.NONE, max_retention=Retention.ZERO)
+    assert restrictive.is_subset_of(scope)
+    denied = result(registry, restrictive, req, states)
+    assert denied.matches == ()
+    assert denied.rejections[0].reason == Reason.DATA_POLICY_DENIED
+
+    with pytest.raises(CapabilityError, match="escalates"):
+        replace(scope, max_egress=Egress.GLOBAL).require_subset_of(scope)
+    with pytest.raises(CapabilityError, match="escalates"):
+        replace(scope, max_retention=Retention.INDEFINITE).require_subset_of(scope)
+    with pytest.raises(CapabilityError, match="escalates"):
+        replace(scope, training=Training.ALLOWED).require_subset_of(scope)
+
+
+def test_cost_estimate_is_bound_to_exact_requirement():
+    registry, scope, req, states = fixture()
+    larger = replace(req, min_input_tokens=req.min_input_tokens + 1)
+    found = result(registry, scope, larger, states)
+    assert found.matches == ()
+    assert {item.reason for item in found.rejections} == {Reason.PRICE_UNKNOWN}
+
+    rebound = tuple(replace(state, requirement_hash=larger.hash) for state in states)
+    assert result(registry, scope, larger, rebound).matches
 
 
 def test_combined_directional_floors_must_fit_context_window_and_grant():

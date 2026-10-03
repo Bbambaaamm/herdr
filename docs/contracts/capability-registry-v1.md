@@ -14,7 +14,9 @@ separate typed input/output modalities, nonnegative integer token limits,
 latency enum, and a typed `DataPolicy`. The provider-neutral feature vocabulary
 explicitly represents reasoning, coding, vision, audio, realtime, research,
 computer use, OCR/document processing, tool use, structured output, MCP and A2A;
-`tools`, `json` and `streaming` remain backward-compatible v1 spellings. A `null` token limit means unknown, never
+legacy `tools` is normalized to canonical `tool_use` before hashing and
+matching; `json` and `streaming` remain backward-compatible v1 spellings. A
+`null` token limit means unknown, never
 unlimited. `ProviderDescriptor` contains supported refs, pricing version, modes,
 and data handling. `ExecutorDescriptor` identifies runtime and adapter separately.
 Registry validation rejects duplicate ids, unsupported schema versions, dangling
@@ -31,7 +33,11 @@ both satisfy the data policy. No free-text privacy levels are interpreted.
 scope is a subset only when every provider, capability, executor, tool, permission,
 region, data class, and directional modality set is a subset of the parent. Each
 child numeric ceiling must be no larger than its parent's; `null` is unbounded
-and can only be a child ceiling when the parent is also unbounded. Call
+and can only be a child ceiling when the parent is also unbounded. Egress,
+retention and training limits are carried by every scope: a child may only
+narrow them (`none` < `region_bound` < `global`, `zero` < `limited` <
+`indefinite`, and `excluded` < `allowed`). A requirement is intersected with
+those delegated limits and cannot authorize broader data handling. Call
 `require_subset_of` before delegating a grant. The registry intersects this
 grant with the task's `CapabilityRequirement` and declarations; it does not
 implicitly grant features or tools from a descriptor.
@@ -49,7 +55,9 @@ grant has a ceiling. No score can override a hard rejection.
 explicit UTC observation timestamp, positive TTL in seconds, health enum,
 remaining requests, estimated cost, a reason code for nonhealthy states, and the
 exact `registry_hash` under which the observation was collected. The caller
-passes evaluation time (`at`); the match is deterministic for these inputs.
+also binds every non-null estimate to the exact `requirement_hash`; an estimate
+for another requirement is treated as unknown rather than authorizing a budget
+decision. The caller passes evaluation time (`at`); the match is deterministic for these inputs.
 Fresh means `observed_at <= at < observed_at + TTL`. Missing, future, expired,
 or registry-mismatched observations reject. A registry reload therefore fails
 closed for old runtime observations until fresh state is supplied. Unknown,
