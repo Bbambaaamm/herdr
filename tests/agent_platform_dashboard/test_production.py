@@ -1206,3 +1206,20 @@ def test_runtime_binding_is_exact_unique_nonterminal_at_source_and_contract(tmp_
         sources.swarm(str(path), "quantlab")
     with pytest.raises(ValueError):
         c.row("swarm", valid)
+
+@pytest.mark.parametrize("state", ["ready", "review"])
+def test_runtime_binding_preserves_declared_nonterminal_phases(tmp_path, monkeypatch, state):
+    path = tmp_path / "swarm.json"
+    payload = swarm_payload()
+    payload["version"] = 1
+    for key in ("graph_latency", "clock_snapshot", "ts"):
+        payload.pop(key)
+    payload["tasks"][0]["state"] = state
+    payload["agents"] = []
+    payload["runtime_status"] = "available"
+    payload["runtime_agents"] = [{"agent_id": "herdr-parent", "status": "working", "task_id": "root"}]
+    path.write_text(json.dumps(payload))
+    monkeypatch.setattr(sources, "SWARM_PATH", str(path))
+    snapshot = sources.swarm(str(path), "quantlab")[0][0]
+    c.row("swarm", snapshot)
+    assert snapshot["runtime_agents"][0]["task_id"] == "root"

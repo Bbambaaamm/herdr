@@ -495,7 +495,7 @@ def swarm(path, profile):
             c.need(item['status'] in ('idle', 'working', 'blocked', 'done', 'unknown'))
             bound_tasks = [task for task in tasks
                            if task['agent_id'] == item['agent_id']
-                           and task['state'] in ('pending', 'running', 'blocked')]
+                           and task['state'] in ('pending', 'ready', 'running', 'blocked', 'review')]
             c.need(item['task_id'] is None or
                    type(item['task_id']) is str and len(bound_tasks) == 1
                    and bound_tasks[0]['task_id'] == item['task_id'])
@@ -575,7 +575,7 @@ def live_swarm(profile, now, max_age=SWARM_FRESH_SECONDS):
                             task = canonical_tasks.get(agent['task_id'])
                             matches = [item for item in canonical_tasks.values()
                                        if item['agent_id'] == agent['agent_id']
-                                       and item['state'] in ('pending', 'running', 'blocked')]
+                                       and item['state'] in ('pending', 'ready', 'running', 'blocked', 'review')]
                             bound = (task is not None and len(matches) == 1
                                      and matches[0]['task_id'] == task['task_id'])
                             runtime.append({**agent, 'task_id': agent['task_id'] if bound else None})

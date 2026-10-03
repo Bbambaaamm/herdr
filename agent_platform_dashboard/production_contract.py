@@ -252,7 +252,7 @@ def row(kind, value):
             need(runtime_agent['status'] in ('idle', 'working', 'blocked', 'done', 'unknown'))
             matches = [task for task in value['tasks']
                        if task['agent_id'] == runtime_agent['agent_id']
-                       and task['state'] in ('pending', 'running', 'blocked')]
+                       and task['state'] in ('pending', 'ready', 'running', 'blocked', 'review')]
             need(runtime_agent['task_id'] is None or
                  type(runtime_agent['task_id']) is str and len(matches) == 1
                  and matches[0]['task_id'] == runtime_agent['task_id'])

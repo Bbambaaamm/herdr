@@ -1144,7 +1144,7 @@ export function mountDashboard(createScene) {
               || !['idle','working','blocked','done','unknown'].includes(runtimeAgent.status)
               || (runtimeAgent.task_id != null && !tasksById.has(runtimeAgent.task_id))) throw new Error('invalid');
             const matches = row.tasks.filter(task => task.agent_id === runtimeAgent.agent_id
-              && ['pending', 'running', 'blocked'].includes(task.state));
+              && ['pending', 'ready', 'running', 'blocked', 'review'].includes(task.state));
             if (runtimeAgent.task_id != null && (matches.length !== 1
               || matches[0].task_id !== runtimeAgent.task_id)) throw new Error('invalid');
             runtimeIds.add(runtimeAgent.agent_id);
