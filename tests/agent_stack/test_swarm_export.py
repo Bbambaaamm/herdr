@@ -4,6 +4,8 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from agent_platform_dashboard import production_sources as sources
 
@@ -31,6 +33,11 @@ class SwarmExportTests(unittest.TestCase):
         self.exporter.RESULTS = self.root / "results"
         self.exporter.INTAKE = self.root / "github-intake-state.json"
         self.exporter.OUTPUT = self.output
+
+    def private_records(self, payload):
+        return [{"task_id": task["task_id"], "repo": payload["repo"],
+                 "raw": {"execution_session": {"agent_name": task["agent_id"], "pane_id": "%1"}}}
+                for task in payload["tasks"]]
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -78,6 +85,159 @@ class SwarmExportTests(unittest.TestCase):
         self.assertEqual(rows[0]["issue_state"], "unknown")
         self.assertEqual(rows[0]["tasks"][0]["state"], "done")
         self.assertEqual(rows[0]["edges"], [])
+
+    def test_runtime_projection_keeps_live_state_separate_from_durable_delivery_uncertain(self):
+        self.write_task(
+            "pending",
+            self.herdr_task(
+                "root",
+                attempt_state="delivery_uncertain",
+                delivery_reconcile_count=5,
+                execution_session={"agent_name": "task-hermes", "pane_id": "%1"},
+            ),
+        )
+        payload = self.exporter.materialize(self.exporter.load_records(), observed_at=100)
+        self.assertEqual(payload["tasks"][0]["state"], "pending")
+        self.assertEqual(payload["tasks"][0]["attempt_state"], "delivery_uncertain")
+        self.assertEqual(payload["tasks"][0]["delivery_reconcile_count"], 5)
+        runtime = {
+            "id": "cli:agent:list",
+            "result": {
+                "type": "agent_list",
+                "agents": [
+                    {"name": "herdr-hermes", "agent_status": "idle"},
+                    {"name": "herdr-codex", "agent_status": "working"},
+                    {"name": "task-hermes", "agent_status": "working", "pane_id": "%1"},
+                    {"name": "quantlab-codex", "agent_status": "working"},
+                ],
+            },
+        }
+        fake = SimpleNamespace(returncode=0, stdout=json.dumps(runtime), stderr="")
+        with patch.object(self.exporter, "runtime_command", return_value=fake.stdout.encode()):
+            status, agents = self.exporter.runtime_agent_projection(payload, records=self.private_records(payload))
+        self.assertEqual(status, "available")
+        self.assertEqual(
+            agents,
+            [
+                {"agent_id": "herdr-codex", "status": "working", "task_id": None},
+                {"agent_id": "herdr-hermes", "status": "idle", "task_id": None},
+                {"agent_id": "task-hermes", "status": "working", "task_id": "root"},
+            ],
+        )
+        payload["runtime_status"] = status
+        payload["runtime_agents"] = agents
+        self.exporter.publish(payload)
+        previous = sources.SWARM_PATH
+        try:
+            sources.SWARM_PATH = str(self.output)
+            rows, _ = sources.swarm(str(self.output), "quantlab")
+        finally:
+            sources.SWARM_PATH = previous
+        self.assertEqual(rows[0]["tasks"][0]["state"], "pending")
+        self.assertEqual(rows[0]["tasks"][0]["attempt_state"], "delivery_uncertain")
+        self.assertEqual([row["agent_id"] for row in rows[0]["runtime_agents"]],
+                         ["herdr-codex", "herdr-hermes", "task-hermes"])
+
+    def test_runtime_projection_includes_blocked_tasks_in_unique_binding(self):
+        payload = {"repo": "Bbambaaamm/herdr", "tasks": [
+            {"task_id": "blocked", "state": "blocked", "agent_id": "task-hermes"},
+        ]}
+        raw = {"id": "cli:agent:list", "result": {"type": "agent_list", "agents": [
+            {"name": "task-hermes", "agent_status": "blocked", "pane_id": "%1"},
+        ]}}
+        fake = SimpleNamespace(returncode=0, stdout=json.dumps(raw), stderr="")
+        with patch.object(self.exporter, "runtime_command", return_value=fake.stdout.encode()):
+            status, agents = self.exporter.runtime_agent_projection(payload, records=self.private_records(payload))
+        self.assertEqual(status, "available")
+        self.assertEqual(agents[0]["task_id"], "blocked")
+        payload["tasks"].append(
+            {"task_id": "pending", "state": "pending", "agent_id": "task-hermes"})
+        with patch.object(self.exporter, "runtime_command", return_value=fake.stdout.encode()):
+            _, agents = self.exporter.runtime_agent_projection(payload, records=self.private_records(payload))
+        self.assertIsNone(agents[0]["task_id"])
+
+    def test_runtime_projection_binds_only_unique_nonterminal_task(self):
+        payload = {
+            "repo": "Bbambaaamm/herdr",
+            "tasks": [
+                {"task_id": "old", "state": "failed", "agent_id": "task-hermes"},
+                {"task_id": "current", "state": "pending", "agent_id": "task-hermes"},
+            ],
+        }
+        runtime = {
+            "id": "cli:agent:list",
+            "result": {"type": "agent_list", "agents": [
+                {"name": "task-hermes", "agent_status": "working", "pane_id": "%1"},
+            ]},
+        }
+        fake = SimpleNamespace(returncode=0, stdout=json.dumps(runtime), stderr="")
+        with patch.object(self.exporter, "runtime_command", return_value=fake.stdout.encode()):
+            status, agents = self.exporter.runtime_agent_projection(payload, records=self.private_records(payload))
+        self.assertEqual(status, "available")
+        self.assertEqual(agents, [{
+            "agent_id": "task-hermes", "status": "working", "task_id": "current",
+        }])
+
+        payload["tasks"].append(
+            {"task_id": "also-current", "state": "running", "agent_id": "task-hermes"}
+        )
+        with patch.object(self.exporter, "runtime_command", return_value=fake.stdout.encode()):
+            status, agents = self.exporter.runtime_agent_projection(payload, records=self.private_records(payload))
+        self.assertEqual(status, "available")
+        self.assertEqual(agents, [{
+            "agent_id": "task-hermes", "status": "working", "task_id": None,
+        }])
+
+    def test_runtime_projection_enforces_downstream_sixteen_row_limit(self):
+        tasks = [
+            {"task_id": f"task-{index}", "state": "pending", "agent_id": f"agent-{index}"}
+            for index in range(17)
+        ]
+        runtime = {
+            "id": "cli:agent:list",
+            "result": {"type": "agent_list", "agents": [
+                {"name": f"agent-{index}", "agent_status": "working"}
+                for index in range(17)
+            ]},
+        }
+        fake = SimpleNamespace(returncode=0, stdout=json.dumps(runtime), stderr="")
+        with patch.object(self.exporter, "runtime_command", return_value=fake.stdout.encode()):
+            status, agents = self.exporter.runtime_agent_projection({
+                "repo": "Bbambaaamm/herdr", "tasks": tasks,
+            })
+        self.assertEqual((status, agents), ("unavailable", []))
+
+    def test_runtime_projection_keeps_canonical_dynamic_children_without_fallback_task(self):
+        payload = {"repo": "Bbambaaamm/herdr", "tasks": []}
+        raw = {"id": "cli:agent:list", "result": {"type": "agent_list", "agents": [
+            {"name": "agent-1", "agent_status": "working", "pane_id": "%7"}]}}
+        with patch.object(self.exporter, "canonical_agent_ids", return_value={"agent-1"}), patch.object(
+                self.exporter, "runtime_command", return_value=json.dumps(raw).encode()):
+            status, agents = self.exporter.runtime_agent_projection(payload, records=[])
+        self.assertEqual(status, "available")
+        self.assertEqual(agents, [{"agent_id": "agent-1", "status": "working", "task_id": None}])
+
+    def test_runtime_projection_rejects_stale_or_missing_private_pane_binding(self):
+        payload = {"repo": "Bbambaaamm/herdr", "tasks": [
+            {"task_id": "task", "state": "pending", "agent_id": "task-hermes"}]}
+        raw = {"id": "cli:agent:list", "result": {"type": "agent_list", "agents": [
+            {"name": "task-hermes", "agent_status": "working", "pane_id": "%2"}]}}
+        with patch.object(self.exporter, "runtime_command", return_value=json.dumps(raw).encode()):
+            for records in ([], self.private_records(payload)):
+                status, agents = self.exporter.runtime_agent_projection(payload, records=records)
+                self.assertEqual(status, "available")
+                self.assertIsNone(agents[0]["task_id"])
+        self.assertNotIn("pane_id", agents[0])
+
+    def test_actual_runtime_command_bounds_stdout_and_discards_unbounded_stderr(self):
+        import sys
+        from agent_platform_dashboard.production_sources import command
+        with self.assertRaises(ValueError):
+            command([sys.executable, "-c", "import sys; sys.stdout.write('x'*1000000)"],
+                    limit=1024, timeout=2)
+        self.assertEqual(command([sys.executable, "-c",
+                         "import sys; sys.stderr.write('x'*1000000); print('ok')"],
+                         limit=1024, timeout=2), b"ok\n")
 
     def test_closed_issue_is_explicit_and_cannot_mask_open_work(self):
         self.exporter.INTAKE.write_text(

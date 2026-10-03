@@ -325,16 +325,18 @@ def swarm(path, profile):
     raw = c.parse(read(path, c.MAX_BYTES), c.MAX_BYTES)
     required = {'tasks', 'edges', 'agents', 'repo', 'issue', 'observed_at', 'version', 'paper_only'}
     fallback_with_policy = required | {'policy_profiles'}
+    fallback_runtime = fallback_with_policy | {'runtime_status', 'runtime_agents'}
     canonical = fallback_with_policy | {'graph_latency', 'clock_snapshot', 'ts'}
     lifecycle_shapes = {
         frozenset(candidate)
-        for shape in (required, fallback_with_policy, canonical)
+        for shape in (required, fallback_with_policy, fallback_runtime, canonical)
         for candidate in (shape, shape | {'issue_state'})
     }
     c.need(type(raw) is dict and frozenset(raw) in lifecycle_shapes)
     c.need((raw['version'] == 1 and frozenset(raw) in {
                frozenset(required), frozenset(required | {'issue_state'}),
                frozenset(fallback_with_policy), frozenset(fallback_with_policy | {'issue_state'}),
+               frozenset(fallback_runtime), frozenset(fallback_runtime | {'issue_state'}),
            })
            or (raw['version'] == 'v1.2.0'
                and frozenset(raw) in {frozenset(canonical), frozenset(canonical | {'issue_state'})}))
@@ -355,7 +357,8 @@ def swarm(path, profile):
         'agent_id', 'fencing_token', 'model', 'fallback_model', 'attempts',
         'attempt', 'blocker', 'policy_profile', 'paper_only', 'telemetry', 'ts',
         'child_ids', 'completed_at', 'created_at', 'event_ref', 'issue',
-        'max_retries', 'repo', 'result_sha', 'updated_at',
+        'max_retries', 'repo', 'result_sha', 'updated_at', 'attempt_state',
+        'delivery_reconcile_count',
     }
     tasks = []
     derived_edges = set()
@@ -395,11 +398,17 @@ def swarm(path, profile):
             'fallback_model': item.get('fallback_model'),
             'attempt': item.get('attempts', item.get('attempt', 0)),
             'max_attempts': item.get('max_attempts', item.get('max_retries', 1)),
+            'attempt_state': item.get('attempt_state'),
+            'delivery_reconcile_count': item.get('delivery_reconcile_count', 0),
             'blocker': item.get('blocker'),
             'fencing_token': item.get('fencing_token', 0),
             'dependencies': list(dependencies),
             'result_sha': result_sha,
         }
+        c.need(task['attempt_state'] is None or task['attempt_state'] in (
+            'dispatching', 'accepted', 'working', 'delivery_uncertain', 'verifying',
+            'completed', 'done', 'blocked', 'failed', 'retry_scheduled'))
+        c.need(c.number(task['delivery_reconcile_count']))
         tasks.append(task)
     c.need(len({task['task_id'] for task in tasks}) == len(tasks))
     task_ids = {task['task_id'] for task in tasks}
@@ -471,6 +480,40 @@ def swarm(path, profile):
     else:
         c.need(seen_agent_tasks == expected_agent_tasks)
 
+    if 'runtime_status' in raw:
+        runtime_status = raw['runtime_status']
+        raw_runtime_agents = raw.get('runtime_agents', [])
+        c.need(runtime_status in ('available', 'unavailable', 'not_applicable'))
+        c.need(type(raw_runtime_agents) is list and len(raw_runtime_agents) <= 16)
+        runtime_agents = []
+        runtime_ids = set()
+        for item in raw_runtime_agents:
+            c.keys(item, 'agent_id status task_id')
+            c.need(type(item['agent_id']) is str and c.identifier(item['agent_id'], 256)
+                   and item['agent_id'] not in runtime_ids)
+            runtime_ids.add(item['agent_id'])
+            c.need(item['status'] in ('idle', 'working', 'blocked', 'done', 'unknown'))
+            bound_tasks = [task for task in tasks
+                           if task['agent_id'] == item['agent_id']
+                           and task['state'] in ('pending', 'ready', 'running', 'blocked', 'review')]
+            c.need(item['task_id'] is None or
+                   type(item['task_id']) is str and len(bound_tasks) == 1
+                   and bound_tasks[0]['task_id'] == item['task_id'])
+            runtime_agents.append({
+                'agent_id': item['agent_id'],
+                'status': item['status'],
+                'task_id': item['task_id'],
+            })
+        c.need(runtime_status == 'available' or not runtime_agents)
+    elif scheduler_snapshot:
+        # Canonical v1.2 scheduler assignments are durable ownership records,
+        # not proof that the corresponding process is still alive.
+        runtime_status = 'unavailable'
+        runtime_agents = []
+    else:
+        runtime_status = 'unavailable' if raw['repo'] == 'Bbambaaamm/herdr' else 'not_applicable'
+        runtime_agents = []
+
     raw_profiles = raw.get('policy_profiles')
     if raw_profiles is not None:
         c.need(type(raw_profiles) is list and len(raw_profiles) <= 16)
@@ -490,6 +533,8 @@ def swarm(path, profile):
         'paper_only': raw['paper_only'],
         'policy_profiles': sorted(profiles),
         'agents': sorted(agents, key=lambda item: (item['task_id'], item['agent_id'])),
+        'runtime_status': runtime_status,
+        'runtime_agents': sorted(runtime_agents, key=lambda item: item['agent_id']),
         'tasks': sorted(tasks, key=lambda item: item['task_id']),
         'edges': [
             {'from_task': left, 'to_task': right, 'kind': kind}
@@ -504,8 +549,8 @@ def live_swarm(profile, now, max_age=SWARM_FRESH_SECONDS):
     stale = False
     # Scheduler/runtime owns SWARM_PATH. Prefer it whenever it is fresh so a
     # live TaskGraph cannot be masked by the periodic Agent Stack fallback.
-    # The fallback is a separate file and is considered only after the primary
-    # becomes stale/unavailable.
+    # The separate fallback supplies lifecycle only after primary staleness;
+    # compatible fresh process observations may augment a fresh primary.
     for path in dict.fromkeys((SWARM_PATH, SWARM_FALLBACK_PATH)):
         try:
             rows, stamp = swarm(path, profile)
@@ -514,6 +559,34 @@ def live_swarm(profile, now, max_age=SWARM_FRESH_SECONDS):
         if stamp > now:
             continue
         if now - stamp <= max_age:
+            # The canonical TaskGraph remains authoritative. A compatible fresh
+            # fallback may supply actual process observations, never lifecycle.
+            if (path == SWARM_PATH and path != SWARM_FALLBACK_PATH
+                    and rows[0]['runtime_status'] != 'available'):
+                try:
+                    fallback, runtime_stamp = swarm(SWARM_FALLBACK_PATH, profile)
+                    observed = fallback[0]
+                    if (0 <= now - runtime_stamp <= max_age
+                            and observed['repo'] == rows[0]['repo']
+                            and observed['runtime_status'] == 'available'
+                            and {task['agent_id'] for task in rows[0]['tasks']
+                                 if task['agent_id'] is not None and task['state'] in ('pending', 'ready', 'running', 'blocked', 'review')}
+                                <= {agent['agent_id'] for agent in observed['runtime_agents']}):
+                        canonical_tasks = {task['task_id']: task for task in rows[0]['tasks']}
+                        runtime = []
+                        for agent in observed['runtime_agents']:
+                            task = canonical_tasks.get(agent['task_id'])
+                            matches = [item for item in canonical_tasks.values()
+                                       if item['agent_id'] == agent['agent_id']
+                                       and item['state'] in ('pending', 'ready', 'running', 'blocked', 'review')]
+                            bound = (task is not None and len(matches) == 1
+                                     and matches[0]['task_id'] == task['task_id'])
+                            runtime.append({**agent, 'task_id': agent['task_id'] if bound else None})
+                        rows = [{**rows[0], 'runtime_status': 'available', 'runtime_agents': runtime}]
+                        c.row('swarm', rows[0])
+                        stamp = min(stamp, runtime_stamp)
+                except (OSError, ValueError):
+                    pass
             return rows, stamp
         stale = True
     if stale:

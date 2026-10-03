@@ -304,7 +304,7 @@ test('technical queue blocker does not masquerade as user intervention', async t
   await h.refresh();
   assert.equal(h.ui.diagnostics().state, 'waiting_result');
   assert.equal(h.get('#attention-summary').hidden, true);
-  assert.match(h.get('#face-task').textContent, /technické závislosti/i);
+  assert.match(h.get('#face-task').textContent, /Technicky blokováno/i);
   assert.match(h.get('#queue-list').innerHTML, /soak_evidence_pending/);
 });
 
@@ -660,16 +660,16 @@ test('Swarm KPI strip renders 10 cells from authoritative queue and router data'
   assert.match(html, /<span>Waiting<\/span><b>1<\/b>/);
   assert.match(html, /<span>Blocked \/ Failed<\/span><b>0 \/ 0<\/b>/);
   assert.match(html, /<span>Queue<\/span><b>1<\/b>/);
-  assert.match(html, /<span>Terminal success<\/span><b>—<\/b><small>0 done · 0 failed<\/small>/);
+  assert.match(html, /<span>Durable success<\/span><b>—<\/b><small>0 done · 0 failed v historii<\/small>/);
   assert.match(html, /<span>Retries<\/span><b>0<\/b>/);
-  assert.match(html, /<span>Tokens<\/span><b>24<\/b>/);
-  assert.match(html, /<span>Cost known<\/span><b>0 USD<\/b><small>2 req unknown<\/small>/);
+  assert.match(html, /<span>Tokens<\/span><b>—<\/b><small>0 req known · 2 unknown<\/small>/);
+  assert.match(html, /<span>Cost known<\/span><b>—<\/b><small>0 req oceněno · 2 unknown<\/small>/);
 });
 
 test('Avg task stays explicitly unavailable when duration telemetry is missing', async t => {
   const h = await harness(t);
   const html = h.get('#swarm-kpis').innerHTML;
-  assert.match(html, /<span>Avg task<\/span><b>\u2014<\/b><small>duration telemetry chybí<\/small>/);
+  assert.match(html, /<span>Avg task<\/span><b>\u2014<\/b><small>task duration se neměří<\/small>/);
   assert.doesNotMatch(html, /<span>Avg task<\/span><b>\d/);
 });
 
@@ -722,12 +722,12 @@ test('TaskGraph task nodes carry aria-selected for keyboard/select sync', async 
 });
 
 
-test('Retries KPI counts only attempts after the first try', async t => {
+test('Retries KPI uses durable retry counter where initial attempt is zero', async t => {
   const h = await harness(t);
   const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
   queue.rows[0].attempts = 3;
   await h.refresh();
-  assert.match(h.get('#swarm-kpis').innerHTML, /<span>Retries<\/span><b>2<\/b><small>opakované pokusy<\/small>/);
+  assert.match(h.get('#swarm-kpis').innerHTML, /<span>Retries<\/span><b>3<\/b><small>durable retry counter<\/small>/);
 });
 
 test('Blocked and failed stay semantically separate in KPI and analytics', async t => {
@@ -1100,6 +1100,8 @@ test('swarm active counts include concurrently working Majak agent', async t => 
     rows: [{
       version: 1, repo: 'Bbambaaamm/herdr', issue: '48', paper_only: false,
       policy_profiles: ['default'],
+      runtime_status: 'available',
+      runtime_agents: [{ agent_id: 'herdr-parent', status: 'working', task_id: 'parent' }],
       agents: [{
         agent_id: 'herdr-parent', task_id: 'parent', state: 'running',
         parent_task_id: null, parent_agent_id: null, fencing_token: 1,
@@ -1226,6 +1228,7 @@ test('observability active work uses authoritative running agents only', async t
     observed_at: now, data_at: now,
     rows: [{
       version: 1, repo: 'Bbambaaamm/herdr', issue: '48', paper_only: false, policy_profiles: ['default'],
+      runtime_status: 'available', runtime_agents: [],
       agents: [],
       tasks: [{
         task_id: 'blocked-history', parent_task_id: null, parent_agent_id: null,
@@ -1274,6 +1277,162 @@ test('closed issue terminal history is visible but not counted as active work', 
   assert.equal(h.calls.activity.at(-1).blocked, 0);
 });
 
+test('live Herdr agents remain visible while durable root is pending delivery_uncertain', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
+  queue.rows = [];
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '53', issue_state: 'open',
+      paper_only: false, policy_profiles: ['herdr-core'],
+      runtime_status: 'available',
+      runtime_agents: [
+        { agent_id: 'herdr-codex', status: 'working', task_id: null },
+        { agent_id: 'herdr-hermes', status: 'idle', task_id: null },
+        { agent_id: 'task-hermes', status: 'working', task_id: 'root-current' },
+      ],
+      agents: [],
+      tasks: [
+        {
+          task_id: 'root-old-a', parent_task_id: null, parent_agent_id: null,
+          agent_id: 'old-a', state: 'failed', role: 'github_root_orchestration',
+          model: 'profile-router', fallback_model: null, attempt: 0, max_attempts: 4,
+          attempt_state: 'failed', delivery_reconcile_count: 12,
+          blocker: null, fencing_token: 0, dependencies: [], result_sha: null,
+        },
+        {
+          task_id: 'root-old-b', parent_task_id: null, parent_agent_id: null,
+          agent_id: 'old-b', state: 'failed', role: 'github_root_orchestration',
+          model: 'profile-router', fallback_model: null, attempt: 0, max_attempts: 4,
+          attempt_state: 'failed', delivery_reconcile_count: 7,
+          blocker: null, fencing_token: 0, dependencies: [], result_sha: null,
+        },
+        {
+          task_id: 'root-current', parent_task_id: null, parent_agent_id: null,
+          agent_id: 'task-hermes', state: 'pending', role: 'github_root_orchestration',
+          model: 'profile-router', fallback_model: null, attempt: 0, max_attempts: 4,
+          attempt_state: 'delivery_uncertain', delivery_reconcile_count: 5,
+          blocker: null, fencing_token: 0, dependencies: [], result_sha: null,
+        },
+      ],
+      edges: [],
+    }],
+  });
+  await h.refresh();
+  const html = h.get('#swarm-kpis').innerHTML;
+  assert.match(html, /<span>Active<\/span><b>2<\/b>/);
+  assert.match(html, /<span>Running<\/span><b>0<\/b>/);
+  assert.match(html, /<span>Waiting<\/span><b>1<\/b>/);
+  assert.match(html, /<span>Blocked \/ Failed<\/span><b>0 \/ 2<\/b>/);
+  assert.match(html, /<span>Queue<\/span><b>1<\/b>/);
+  assert.equal(h.ui.diagnostics().state, 'working');
+  assert.match(h.get('#face-task').textContent, /live práce probíhá/);
+  assert.match(h.get('#face-task').textContent, /durable pending \/ delivery_uncertain/);
+  assert.doesNotMatch(h.get('#face-task').textContent, /technické závislosti/i);
+  assert.match(h.get('#coordinator-current').textContent, /root-current/);
+  assert.equal(h.calls.activity.at(-1).workingAgents, 2);
+});
+
+test('durable running without runtime evidence never claims live execution', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
+  queue.rows = [];
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '80', issue_state: 'open',
+      paper_only: false, policy_profiles: ['herdr-core'],
+      agents: [{
+        agent_id: 'herdr-parent', task_id: 'root', state: 'running',
+        parent_task_id: null, parent_agent_id: null, fencing_token: 1,
+      }],
+      tasks: [{
+        task_id: 'root', parent_task_id: null, parent_agent_id: null,
+        agent_id: 'herdr-parent', state: 'running', role: 'planner',
+        model: 'model-a', fallback_model: null, attempt: 1, max_attempts: 2,
+        blocker: null, fencing_token: 1, dependencies: [], result_sha: null,
+      }],
+      edges: [],
+    }],
+  });
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().state, 'working');
+  assert.doesNotMatch(h.get('#face-task').textContent, /live práce probíhá/);
+  assert.match(h.get('#face-task').textContent, /durable running/);
+  assert.match(h.get('#face-task').textContent, /živý runtime nepotvrzen/);
+  assert.equal(h.calls.activity.at(-1).workingAgents, 0);
+  assert.equal(h.calls.activity.at(-1).activeAgent, null);
+});
+
+test('observed runtime-bound task takes precedence over unrelated durable running', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
+  queue.rows = [];
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '80', issue_state: 'open',
+      paper_only: false, policy_profiles: ['herdr-core'],
+      runtime_status: 'available',
+      runtime_agents: [{ agent_id: 'other-agent', status: 'working', task_id: 'other' }],
+      agents: [{
+        agent_id: 'selected-agent', task_id: 'selected', state: 'running',
+        parent_task_id: null, parent_agent_id: null, fencing_token: 1,
+      }],
+      tasks: [
+        {
+          task_id: 'selected', parent_task_id: null, parent_agent_id: null,
+          agent_id: 'selected-agent', state: 'running', role: 'worker',
+          model: null, fallback_model: null, attempt: 0, max_attempts: 2,
+          blocker: null, fencing_token: 1, dependencies: [], result_sha: null,
+        },
+        {
+          task_id: 'other', parent_task_id: null, parent_agent_id: null,
+          agent_id: 'other-agent', state: 'pending', role: 'worker',
+          model: null, fallback_model: null, attempt: 0, max_attempts: 2,
+          blocker: null, fencing_token: 2, dependencies: [], result_sha: null,
+        },
+      ],
+      edges: [],
+    }],
+  });
+  await h.refresh();
+  assert.match(h.get('#face-task').textContent, /live práce probíhá/);
+  assert.match(h.get('#face-task').textContent, /other/);
+  assert.doesNotMatch(h.get('#face-task').textContent, /selected/);
+  assert.match(h.get('#coordinator-current').textContent, /other/);
+  assert.equal(h.calls.activity.at(-1).workingAgents, 1);
+  assert.equal(h.calls.activity.at(-1).activeAgent, 'other-agent');
+});
+
+test('blocked runtime agent is surfaced as coordinator attention', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
+  queue.rows = [];
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '80', issue_state: 'open',
+      paper_only: false, policy_profiles: ['herdr-core'],
+      runtime_status: 'available',
+      runtime_agents: [{ agent_id: 'task-hermes', status: 'blocked', task_id: null }],
+      agents: [], tasks: [], edges: [],
+    }],
+  });
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().state, 'waiting_user');
+  assert.match(h.get('#face-task').textContent, /task-hermes/);
+});
+
 test('QuantLab swarm browser boundary rejects non-PAPER snapshots', async t => {
   const h = await harness(t);
   const now = Math.floor(Date.now() / 1000);
@@ -1288,3 +1447,145 @@ test('QuantLab swarm browser boundary rejects non-PAPER snapshots', async t => {
   await h.refresh();
   assert.equal(h.ui.diagnostics().freshSnapshot, false);
 });
+
+function reviewSwarm(h, runtimeAgents = [], tasks = []) {
+  const now = Math.floor(Date.now() / 1000);
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '80', issue_state: 'open',
+      paper_only: false, policy_profiles: ['herdr-core'],
+      runtime_status: 'available', runtime_agents: runtimeAgents,
+      agents: [], tasks, edges: [],
+    }],
+  });
+}
+function reviewPending(taskId = 'live-task') {
+  return {
+    task_id: taskId, parent_task_id: null, parent_agent_id: null,
+    agent_id: 'task-hermes', state: 'pending', role: 'coordinator',
+    model: null, fallback_model: null, attempt: 0, max_attempts: 2,
+    blocker: null, fencing_token: 0, dependencies: [], result_sha: null,
+  };
+}
+test('swarm analytics preserves known tokens and distinguishes unknown cost from measured zero', async t => {
+  const h = await harness(t);
+  for (const source of h.snapshot().sources.filter(row => row.kind === 'router')) {
+    source.rows.forEach(row => { row.input_tokens = 5; row.output_tokens = 7; row.cost_microusd = 0; });
+  }
+  await h.refresh();
+  assert.match(h.get('#swarm-analytics-grid').innerHTML, /Tokens & cost[^]*?<strong>24<\/strong>/);
+  assert.match(h.get('#swarm-analytics-grid').innerHTML, /0 USD known/);
+  for (const source of h.snapshot().sources.filter(row => row.kind === 'router')) {
+    source.rows.forEach(row => { row.input_tokens = null; row.cost_microusd = null; });
+  }
+  await h.refresh();
+  assert.match(h.get('#swarm-analytics-grid').innerHTML, /Tokens & cost[^]*?<strong>—<\/strong><p>— known/);
+});
+test('unbound blocked runtime agent opens an observed agent detail from both attention actions', async t => {
+  const h = await harness(t);
+  reviewSwarm(h, [{ agent_id: 'task-hermes', status: 'blocked', task_id: null }]);
+  await h.refresh();
+  assert.equal(h.get('#attention-summary').hidden, false);
+  assert.match(h.get('#attention-summary').textContent, /task-hermes/);
+  h.click('#attention-action');
+  assert.equal(h.get('#agent-detail').hidden, false);
+  assert.equal(h.get('#detail-title').textContent, 'task-hermes');
+  assert.equal(h.get('#detail-profile').textContent, 'HERDR');
+  assert.match(h.get('#detail-status').textContent, /Živý stav: Blokováno/);
+  h.click('#detail-close');
+  h.get('#attention-summary').children.at(-1).emit('click');
+  assert.equal(h.get('#agent-detail').hidden, false);
+});
+test('bound blocked runtime agent opens its authoritative task', async t => {
+  const h = await harness(t);
+  reviewSwarm(h, [{ agent_id: 'task-hermes', status: 'blocked', task_id: 'live-task' }], [reviewPending()]);
+  await h.refresh();
+  h.click('#attention-action');
+  assert.equal(h.ui.diagnostics().selectedTask, 'live-task');
+  assert.match(h.get('#detail-title').textContent, /live-task/);
+});
+test('coordinator current badge uses selected swarm before masked QuantLab queue', async t => {
+  const h = await harness(t);
+  h.snapshot().sources.find(row => row.profile === 'quantlab' && row.kind === 'queue').rows[0].status = 'running';
+  reviewSwarm(h, [{ agent_id: 'task-hermes', status: 'working', task_id: 'live-task' }], [reviewPending()]);
+  await h.refresh();
+  assert.match(h.get('#coordinator-current').textContent, /live-task/);
+  assert.match(h.get('#face-task').textContent, /live-task/);
+  assert.doesNotMatch(h.get('#coordinator-current').textContent, /issue190/);
+});
+test('Majak runtime identity confirms its durable queue task alongside swarm', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const queue = h.snapshot().sources.find(row => row.profile === 'majak' && row.kind === 'queue');
+  Object.assign(queue, { status: 'available', reason: 'ok', data_at: now, rows: [{
+    task_id: 'majak-live', repo: 'Bbambaaamm/dotacni-majak', issue: 662,
+    issue_title: 'Majak', issue_open: true, scheduler_state: 'active', status: 'running',
+    attempts: 0, max_attempts: 4, not_before: null, updated_at: now,
+    agent: 'dotacni-majak-hermes', kind: 'github_root_orchestration', blocker: null, pr_number: null,
+  }] });
+  h.snapshot().sources.find(row => row.profile === 'majak' && row.kind === 'herdr').rows
+    .find(row => row.agent === 'majak-hermes').status = 'working';
+  reviewSwarm(h);
+  await h.refresh();
+  assert.match(h.get('#face-task').textContent, /Maják #662[^]*live práce probíhá/);
+  assert.match(h.get('#coordinator-current').textContent, /majak-live/);
+});
+
+for (const runtimeStatus of ['idle', 'done', 'working']) {
+  test(`queue fallback claims live work only with matching runtime: ${runtimeStatus}`, async t => {
+    const h = await harness(t);
+    const queue = h.snapshot().sources.find(row => row.profile === 'quantlab' && row.kind === 'queue');
+    queue.rows[0].status = 'running';
+    h.snapshot().sources.find(row => row.profile === 'quantlab' && row.kind === 'herdr')
+      .rows.find(row => row.agent === 'quantlab-hermes').status = runtimeStatus;
+    await h.refresh();
+    const copy = h.get('#face-task').textContent;
+    assert.match(copy, /issue190/);
+    if (runtimeStatus === 'working') assert.match(copy, /live práce probíhá/);
+    else {
+      assert.doesNotMatch(copy, /live práce probíhá/);
+      assert.match(copy, /durable running.*živý runtime nepotvrzen/);
+    }
+  });
+}
+
+test('Active stays unknown when projected Majak runtime is unavailable', async t => {
+  const h = await harness(t);
+  reviewSwarm(h, [{ agent_id: 'task-hermes', status: 'working', task_id: null }]);
+  const majak = h.snapshot().sources.find(row => row.profile === 'majak' && row.kind === 'herdr');
+  Object.assign(majak, { status: 'unavailable', reason: 'source_failed', rows: [] });
+  await h.refresh();
+  assert.match(h.get('#swarm-kpis').innerHTML, /Active<\/span><b>—<\/b>/);
+  assert.match(h.get('#observability-kpis').innerHTML, /Aktivní práce<\/span><b>— agent/);
+});
+test('closed swarm terminal history contributes reliability but not operational queue', async t => {
+  const h = await harness(t);
+  reviewSwarm(h, [], [
+    { ...reviewPending('done-task'), state: 'done', attempt: 2, result_sha: 'a'.repeat(64) },
+    { ...reviewPending('failed-task'), state: 'failed', attempt: 3, max_attempts: 4 },
+  ]);
+  h.snapshot().sources.find(row => row.kind === 'swarm').rows[0].issue_state = 'closed';
+  await h.refresh();
+  assert.match(h.get('#swarm-kpis').innerHTML, /Queue<\/span><b>0<\/b>/);
+  assert.match(h.get('#swarm-kpis').innerHTML, /Retries<\/span><b>5<\/b>/);
+  assert.match(h.get('#swarm-kpis').innerHTML, /Durable success<\/span><b>50 %<\/b>/);
+  assert.match(h.get('#swarm-kpis').innerHTML, /Blocked \/ Failed<\/span><b>0 \/ 1<\/b>/);
+});
+
+for (const fault of ['wrong_agent', 'terminal', 'ambiguous']) {
+  test(`browser rejects invalid runtime task binding: ${fault}`, async t => {
+    const h = await harness(t);
+    const task = reviewPending();
+    const runtime = { agent_id: 'task-hermes', status: 'working', task_id: task.task_id };
+    const tasks = [task];
+    if (fault === 'wrong_agent') runtime.agent_id = 'unrelated-agent';
+    else if (fault === 'terminal') task.state = 'done';
+    else tasks.push(reviewPending('also-pending'));
+    reviewSwarm(h, [runtime], tasks);
+    await h.refresh();
+    assert.equal(h.ui.diagnostics().freshSnapshot, false);
+    assert.doesNotMatch(h.get('#face-task').textContent, /live práce probíhá/);
+  });
+}
