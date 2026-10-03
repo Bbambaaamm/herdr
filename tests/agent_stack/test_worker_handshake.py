@@ -3,6 +3,7 @@ import json
 import sys
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 BIN = ROOT / "agent-stack" / "bin"
@@ -38,6 +39,16 @@ def base_task():
     }
 
 
+def test_existing_herdr_task_gets_explicit_consumer_scope():
+    task = base_task()
+    task["safety_profile"] = "herdr-core"
+    worker.ensure_parent_scope(task)
+    assert task["parent_role"] == "writer"
+    assert task["worktree_root"] == "/home/agentops/worktrees/herdr"
+    assert set(task["parent_tools"]) == {"read_file", "search_files", "patch", "write_file"}
+    assert task["parent_permissions"] == ["workspace-write"]
+
+
 def test_prepare_attempt_reuses_identity_during_reconciliation(tmp_path):
     configure_paths(tmp_path)
     task = base_task()
@@ -53,6 +64,24 @@ def test_prepare_attempt_reuses_identity_during_reconciliation(tmp_path):
     assert task["attempts"] == 0
 
 
+def test_child_prompt_requires_admitted_attempt_and_preserves_identity(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["parent_task_id"] = "parent"
+    task["execution_session"] = {"agent_name": "child-agent"}
+    with pytest.raises(RuntimeError, match="durable_child_admission_identity_missing"):
+        worker.prepare_attempt(task)
+    with pytest.raises(RuntimeError, match="durable_child_admission_identity_missing"):
+        worker.run_prompt(task)
+    task.update(run_token="child-run", idempotency_key="attempt-key",
+                fencing_token=7, delegation_key="research")
+    worker.prepare_attempt(task)
+    assert task["run_token"] == "child-run"
+    assert task["idempotency_key"] == "attempt-key"
+    assert task["attempts"] == 0
+    assert "artifact_sha256" in worker.prompt_text(task)
+
+
 def test_delivery_uncertain_does_not_increment_execution_attempt(tmp_path):
     configure_paths(tmp_path)
     running = tmp_path / "running"
@@ -65,11 +94,13 @@ def test_delivery_uncertain_does_not_increment_execution_attempt(tmp_path):
 
     worker.defer_delivery_reconciliation(task_path, task, "ambiguous")
 
-    pending = worker.PENDING / task_path.name
+    pending = worker.BLOCKED / task_path.name
     saved = json.loads(pending.read_text(encoding="utf-8"))
     assert saved["attempts"] == 0
     assert saved["run_token"] == token
     assert saved["attempt_state"] == "delivery_uncertain"
+    assert saved["delivery_reconcile_pending"] is True
+    assert saved["observed_execution"]["state"] == "unavailable"
     assert saved["delivery_reconcile_count"] == 1
 
 
@@ -156,6 +187,79 @@ def test_finish_uses_trusted_evidence_without_redispatch(tmp_path):
     assert result["status"] == "completed"
 
 
+def test_block_task_quarantines_until_task_pane_cleanup(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    task = base_task()
+    worker.prepare_attempt(task)
+    task["execution_session"] = {"owned_pane": True, "pane_id": "owned-pane"}
+    running = worker.RUNNING / "task-1.json"
+    running.write_text(json.dumps(task), encoding="utf-8")
+    monkeypatch.setattr(worker, "cleanup_task_session", lambda current: False)
+
+    worker.block_task(running, task, "needs-human", "blocked safely")
+
+    quarantined = worker.BLOCKED / "task-1.json"
+    saved = json.loads(quarantined.read_text(encoding="utf-8"))
+    assert saved["attempt_state"] == "delivery_uncertain"
+    assert saved["watchdog_cleanup_blocker"] == "task_session_cleanup_failed"
+    assert "result_status" not in saved and "finished_at" not in saved
+    result = json.loads(worker.result_path("task-1").read_text(encoding="utf-8"))
+    assert result["status"] == "blocked" and result["run_token"] == task["run_token"]
+
+
+def test_finish_defers_terminal_move_until_task_pane_cleanup(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    task = base_task()
+    worker.prepare_attempt(task)
+    task["execution_session"] = {
+        "owned_pane": True, "pane_id": "owned-pane",
+        "agent_name": "task-agent", "pane_marker": "marker",
+        "session_name": "marker",
+    }
+    running = worker.RUNNING / "task-1.json"
+    running.write_text(json.dumps(task), encoding="utf-8")
+    worker.write_json(worker.result_path("task-1"), {
+        "task_id": "task-1", "run_token": task["run_token"],
+        "status": "completed", "blocker": None,
+    })
+    monkeypatch.setattr(worker, "cleanup_task_session", lambda current: False)
+
+    worker.finish(running, task, "settled")
+
+    assert running.exists()
+    assert not (worker.DONE / running.name).exists()
+    saved = json.loads(running.read_text(encoding="utf-8"))
+    assert saved["attempt_state"] == "delivery_uncertain"
+    assert saved["watchdog_cleanup_blocker"] == "task_session_cleanup_failed"
+    assert saved["run_token"] == task["run_token"]
+
+
+def test_finish_cleans_task_pane_before_terminal_move(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    task = base_task()
+    worker.prepare_attempt(task)
+    task["execution_session"] = {"owned_pane": True, "pane_id": "owned-pane"}
+    running = worker.RUNNING / "task-1.json"
+    running.write_text(json.dumps(task), encoding="utf-8")
+    worker.write_json(worker.result_path("task-1"), {
+        "task_id": "task-1", "run_token": task["run_token"],
+        "status": "completed", "blocker": None,
+    })
+    calls = []
+    def cleanup(current):
+        calls.append("cleanup")
+        current["execution_session"]["closed_at"] = "now"
+        return True
+    monkeypatch.setattr(worker, "cleanup_task_session", cleanup)
+
+    worker.finish(running, task, "settled")
+
+    assert calls == ["cleanup"]
+    done = json.loads((worker.DONE / "task-1.json").read_text(encoding="utf-8"))
+    assert done["attempt_state"] == "done"
+    assert done["execution_session"]["closed_at"] == "now"
+
+
 def test_finish_without_result_defers_same_attempt(tmp_path):
     configure_paths(tmp_path)
     running = tmp_path / "running"
@@ -168,7 +272,7 @@ def test_finish_without_result_defers_same_attempt(tmp_path):
 
     worker.finish(task_path, task, "settled but no result")
 
-    pending = worker.PENDING / task_path.name
+    pending = worker.BLOCKED / task_path.name
     saved = json.loads(pending.read_text(encoding="utf-8"))
     assert saved["attempt_state"] == "delivery_uncertain"
     assert saved["attempts"] == 0
@@ -193,6 +297,51 @@ def test_task_session_identity_is_bound_to_run_token(tmp_path):
     assert "task-1" not in first_identity[1]
 
 
+def test_exact_owned_session_observation_does_not_complete_attempt(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["run_token"] = "owned-run"
+    agent, marker = worker._task_session_identity(task)
+    task["execution_session"] = dict(agent_name=agent, session_name=marker,
+                                     pane_marker=marker, pane_id="pane-1")
+    task["attempt_state"] = "delivery_uncertain"
+    monkeypatch.setattr(worker, "_pane_has_marker", lambda pane, value: pane == "pane-1" and value == marker)
+    monkeypatch.setattr(worker, "_herdr_json", lambda *args, **kwargs: {"result": {
+        "agent": {"pane_id": "pane-1", "agent_status": "done"}}})
+    assert worker.observe_task_execution(task) == "settled"
+    assert task["attempt_state"] == "delivery_uncertain"
+    task["execution_session"]["agent_name"] = "wrong-agent"
+    assert worker.observe_task_execution(task) == "unavailable"
+
+
+def test_finish_reconciles_snapshot_over_zero_byte_result_placeholder(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["run_token"] = "snapshot-run"
+    task["completion_evidence"] = {"kind": "herdr_swarm_snapshot"}
+    running = worker.RUNNING / f"{task['id']}.json"
+    worker.RUNNING.mkdir(parents=True, exist_ok=True)
+    worker.DONE.mkdir(parents=True, exist_ok=True)
+    worker.BLOCKED.mkdir(parents=True, exist_ok=True)
+    worker.RESULTS.mkdir(parents=True, exist_ok=True)
+    running.write_text(json.dumps(task), encoding="utf-8")
+    rp = worker.result_path(task["id"])
+    rp.touch()
+    assert rp.stat().st_size == 0
+
+    monkeypatch.setattr(worker, "reconcile_completion_evidence", lambda payload: (
+        worker.write_json(rp, {
+            "task_id": payload["id"], "run_token": payload["run_token"],
+            "status": "completed", "evidence": ["snapshot"], "blocker": None,
+        }) or True
+    ))
+    monkeypatch.setattr(worker, "cleanup_task_session", lambda payload: True)
+    monkeypatch.setattr(worker, "defer_for_active_children", lambda *args, **kwargs: False)
+    worker._finish_locked(running, task, "done", True)
+    assert (worker.DONE / running.name).exists()
+    assert json.loads(rp.read_text())["status"] == "completed"
+
+
 def test_create_task_session_uses_fresh_owned_pane_and_named_chat(tmp_path, monkeypatch):
     configure_paths(tmp_path)
     task = base_task()
@@ -201,6 +350,19 @@ def test_create_task_session_uses_fresh_owned_pane_and_named_chat(tmp_path, monk
     task["run_token"] = "isolated-run"
 
     calls = []
+    boundary_events = []
+    def start_bridge(task, session):
+        boundary_events.append("bridge_outside_sandbox")
+        session.update(bridge_pid=123, bridge_socket="@test")
+    def sandbox_command(*args, **kwargs):
+        boundary_events.append("sandbox_command")
+        return ["bwrap", "/bin/bash"]
+    monkeypatch.setattr(worker, "start_bridge", start_bridge)
+    monkeypatch.setattr(worker, "frozen_policy", lambda: tmp_path / "policy")
+    monkeypatch.setattr(worker, "sandbox_command", sandbox_command)
+    monkeypatch.setattr(worker, "verify_sandbox", lambda *args, **kwargs: True)
+    monkeypatch.setattr(worker, "inner_pid", lambda *args, **kwargs: 123)
+    monkeypatch.setattr(worker, "_setup_pane_ids", lambda: {"persistent-pane"})
 
     def fake_herdr_json(args, *, timeout_seconds=30.0):
         calls.append(list(args))
@@ -217,12 +379,17 @@ def test_create_task_session_uses_fresh_owned_pane_and_named_chat(tmp_path, monk
             }
         if args[:2] == ["pane", "split"]:
             return {"result": {"pane": {"pane_id": "owned-task-pane"}}}
+        if args[:2] == ["pane", "run"]:
+            return {"result": {}}
+        if args[:2] == ["pane", "process-info"]:
+            return {"result": {"process_info": {"shell_pid": 123}}}
         if args[:2] == ["agent", "start"]:
             return {"result": {"agent": {"name": args[2]}}}
         raise AssertionError(args)
 
     monkeypatch.setattr(worker, "_herdr_json", fake_herdr_json)
     session = worker.create_task_session(task)
+    assert boundary_events == ["bridge_outside_sandbox", "sandbox_command"]
 
     assert session["coordinator_agent"] == "quantlab-hermes"
     assert session["coordinator_pane_id"] == "persistent-pane"
@@ -232,6 +399,11 @@ def test_create_task_session_uses_fresh_owned_pane_and_named_chat(tmp_path, monk
     assert ["--pane", "persistent-pane"] == split[2:4]
     assert "--env" in split
     assert split[split.index("--env") + 1] == f"{worker.TASK_PANE_ENV}={session['session_name']}"
+    assert f"HERDR_DURABLE_TASK_ID={task['id']}" in split
+    assert f"HERDR_DURABLE_RUN_TOKEN={task['run_token']}" in split
+    assert f"HERDR_DURABLE_AGENT={session['agent_name']}" in split
+    path_env = next(value for value in split if value.startswith(f"PATH={worker.POLICY_BIN}:"))
+    assert str(worker.AGENT_BIN) in path_env
     start = next(call for call in calls if call[:2] == ["agent", "start"])
     assert start[2] == session["agent_name"]
     assert "--continue" in start
@@ -335,21 +507,43 @@ def test_cleanup_closes_only_owned_task_pane(tmp_path, monkeypatch):
         "agent_name": "quantlab-hermes-task-deadbeef",
         "session_name": "durable-deadbeef",
         "pane_id": "owned-task-pane",
+        "pane_marker": "durable-deadbeef",
         "coordinator_pane_id": "persistent-pane",
         "owned_pane": True,
     }
     calls = []
 
-    def fake_run(cmd, **kwargs):
-        calls.append(list(cmd))
-        return worker.subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+    monkeypatch.setattr(worker, "_herdr_json", lambda args, **kw: {
+        "result": {"panes": [{"pane_id": "owned-task-pane"}]}} if args[:2] == ["pane", "list"]
+        else {"result": {"agent": {"name": task["execution_session"]["agent_name"],
+                                    "pane_id": "owned-task-pane"}}})
+    monkeypatch.setattr(worker, "_pane_has_marker", lambda pane, marker: True)
+    monkeypatch.setattr(worker, "_close_owned_pane", lambda pane: calls.append(pane) or True)
     worker.cleanup_task_session(task)
 
-    assert calls == [[str(worker.HERDR), "pane", "close", "owned-task-pane"]]
+    assert calls == ["owned-task-pane"]
     assert task["execution_session"]["cleanup_status"] == "closed"
     assert task["execution_session"]["pane_id"] != task["execution_session"]["coordinator_pane_id"]
+
+
+@pytest.mark.parametrize("case", ["reused", "wrong_agent", "wrong_marker", "absent", "exact"])
+def test_task_cleanup_requires_live_identity(tmp_path, monkeypatch, case):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["execution_session"] = {
+        "owned_pane": True, "pane_id": "pane-1", "agent_name": "task-agent",
+        "pane_marker": "task-marker", "coordinator_pane_id": "coordinator",
+    }
+    closed = []
+    monkeypatch.setattr(worker, "_herdr_json", lambda args, **kw: {
+        "result": {"panes": [] if case == "absent" else [{"pane_id": "pane-1"}]}}
+        if args[:2] == ["pane", "list"] else
+        {"result": {"agent": {"name": "other" if case == "wrong_agent" else "task-agent",
+                              "pane_id": "other-pane" if case == "reused" else "pane-1"}}})
+    monkeypatch.setattr(worker, "_pane_has_marker", lambda pane, marker: case != "wrong_marker")
+    monkeypatch.setattr(worker, "_close_owned_pane", lambda pane: closed.append(pane) or True)
+    assert worker.cleanup_task_session(task) is (case in {"absent", "exact"})
+    assert closed == (["pane-1"] if case == "exact" else [])
 
 
 def test_new_semantic_attempt_discards_previous_session_metadata(tmp_path):
@@ -425,6 +619,7 @@ def test_ambiguous_split_reconciles_and_closes_marked_pane(tmp_path, monkeypatch
     task["routing"] = {"selected_agent": "quantlab-hermes"}
     task["run_token"] = "isolated-run"
     closed = []
+    monkeypatch.setattr(worker, "_setup_pane_ids", lambda: {"persistent-pane"})
 
     def fake_herdr_json(args, *, timeout_seconds=30.0):
         if args[:2] == ["agent", "get"]:
@@ -440,6 +635,8 @@ def test_ambiguous_split_reconciles_and_closes_marked_pane(tmp_path, monkeypatch
             }
         if args[:2] == ["pane", "split"]:
             raise RuntimeError("lost split response")
+        if args[:2] == ["pane", "list"]:
+            return {"result": {"panes": [{"pane_id": "orphan-pane"}]}}
         raise AssertionError(args)
 
     monkeypatch.setattr(worker, "_herdr_json", fake_herdr_json)
@@ -447,6 +644,7 @@ def test_ambiguous_split_reconciles_and_closes_marked_pane(tmp_path, monkeypatch
         worker, "_find_marked_task_panes", lambda marker, workspace_id: ("orphan-pane",)
     )
     monkeypatch.setattr(worker, "_close_owned_pane", lambda pane_id: closed.append(pane_id) or True)
+    monkeypatch.setattr(worker, "_pane_has_marker", lambda pane, marker: pane == "orphan-pane")
 
     try:
         worker.create_task_session(task)
@@ -465,6 +663,7 @@ def test_ambiguous_split_never_closes_marked_coordinator(tmp_path, monkeypatch):
     task["routing"] = {"selected_agent": "quantlab-hermes"}
     task["run_token"] = "isolated-run"
     closed = []
+    monkeypatch.setattr(worker, "_setup_pane_ids", lambda: {"persistent-pane"})
 
     def fake_herdr_json(args, *, timeout_seconds=30.0):
         if args[:2] == ["agent", "get"]:
@@ -479,6 +678,8 @@ def test_ambiguous_split_never_closes_marked_coordinator(tmp_path, monkeypatch):
             }
         if args[:2] == ["pane", "split"]:
             raise RuntimeError("lost split response")
+        if args[:2] == ["pane", "list"]:
+            return {"result": {"panes": [{"pane_id": "orphan-pane"}]}}
         raise AssertionError(args)
 
     monkeypatch.setattr(worker, "_herdr_json", fake_herdr_json)
@@ -488,6 +689,7 @@ def test_ambiguous_split_never_closes_marked_coordinator(tmp_path, monkeypatch):
         lambda marker, workspace_id: ("persistent-pane", "orphan-pane"),
     )
     monkeypatch.setattr(worker, "_close_owned_pane", lambda pane_id: closed.append(pane_id) or True)
+    monkeypatch.setattr(worker, "_pane_has_marker", lambda pane, marker: pane == "orphan-pane")
 
     try:
         worker.create_task_session(task)
@@ -504,6 +706,7 @@ def test_unreconciled_split_fails_closed(tmp_path, monkeypatch):
     task = base_task()
     task["routing"] = {"selected_agent": "quantlab-hermes"}
     task["run_token"] = "isolated-run"
+    monkeypatch.setattr(worker, "_setup_pane_ids", lambda: {"persistent-pane"})
 
     def fake_herdr_json(args, *, timeout_seconds=30.0):
         if args[:2] == ["agent", "get"]:
@@ -545,18 +748,32 @@ def test_cleanup_failure_blocks_retry_and_preserves_attempt_identity(tmp_path, m
     task["execution_session"] = {
         "agent_name": "quantlab-hermes-task-deadbeef",
         "session_name": "durable-deadbeef",
+        "pane_marker": "durable-deadbeef",
         "pane_id": "owned-task-pane",
         "owned_pane": True,
     }
     task_path = worker.PENDING / "task-1.json"
     task_path.write_text(json.dumps(task), encoding="utf-8")
+    def cleanup_herdr(args, *, timeout_seconds=30.0):
+        if args[:2] == ["pane", "list"]:
+            return {"result": {"panes": [{"pane_id": "owned-task-pane"}]}}
+        if args[:2] == ["agent", "get"]:
+            return {"result": {"agent": {
+                "name": "quantlab-hermes-task-deadbeef",
+                "pane_id": "owned-task-pane",
+            }}}
+        raise AssertionError(args)
+    monkeypatch.setattr(worker, "_herdr_json", cleanup_herdr)
+    monkeypatch.setattr(worker, "_pane_has_marker",
+                        lambda pane, marker: pane == "owned-task-pane" and marker == "durable-deadbeef")
     monkeypatch.setattr(worker, "_close_owned_pane", lambda pane_id: False)
 
     assert worker.cleanup_task_session_if_safe(task) is False
 
     blocked_path = worker.BLOCKED / task_path.name
     blocked = json.loads(blocked_path.read_text(encoding="utf-8"))
-    assert blocked["attempt_state"] == "blocked"
+    assert blocked["attempt_state"] == "delivery_uncertain"
+    assert blocked["watchdog_cleanup_blocker"] == "task_session_cleanup_failed"
     assert blocked["run_token"] == token
     assert blocked["idempotency_key"] == key
     result = json.loads(worker.result_path("task-1").read_text(encoding="utf-8"))
@@ -584,6 +801,7 @@ def test_cleanup_failure_blocks_even_completed_task(tmp_path, monkeypatch):
     task["execution_session"] = {
         "agent_name": "task-agent",
         "session_name": "durable-live",
+        "pane_marker": "durable-live",
         "pane_id": "owned-pane",
         "owned_pane": True,
     }
@@ -597,6 +815,15 @@ def test_cleanup_failure_blocks_even_completed_task(tmp_path, monkeypatch):
             "status": "completed",
         },
     )
+    def cleanup_herdr(args, *, timeout_seconds=30.0):
+        if args[:2] == ["pane", "list"]:
+            return {"result": {"panes": [{"pane_id": "owned-pane"}]}}
+        if args[:2] == ["agent", "get"]:
+            return {"result": {"agent": {"name": "task-agent", "pane_id": "owned-pane"}}}
+        raise AssertionError(args)
+    monkeypatch.setattr(worker, "_herdr_json", cleanup_herdr)
+    monkeypatch.setattr(worker, "_pane_has_marker",
+                        lambda pane, marker: pane == "owned-pane" and marker == "durable-live")
     monkeypatch.setattr(worker, "_close_owned_pane", lambda pane_id: False)
 
     assert worker.cleanup_task_session_if_safe(task) is False
@@ -604,8 +831,9 @@ def test_cleanup_failure_blocks_even_completed_task(tmp_path, monkeypatch):
     blocked_path = worker.BLOCKED / "task-1.json"
     assert blocked_path.exists()
     saved = json.loads(blocked_path.read_text(encoding="utf-8"))
-    assert saved["attempt_state"] == "blocked"
+    assert saved["attempt_state"] == "delivery_uncertain"
     assert saved["watchdog_blocker"] == "task_session_cleanup_failed"
+    assert saved["watchdog_cleanup_blocker"] == "task_session_cleanup_failed"
     assert not done_path.exists()
     result = json.loads(worker.result_path("task-1").read_text(encoding="utf-8"))
     assert result["status"] == "blocked"
@@ -619,6 +847,7 @@ def test_ambiguous_split_without_marker_never_retries(tmp_path, monkeypatch):
     task["workspace"] = str(tmp_path / "workspace")
     task["routing"] = {"selected_agent": "quantlab-hermes"}
     task["run_token"] = "ambiguous-run"
+    monkeypatch.setattr(worker, "_setup_pane_ids", lambda: {"persistent-pane"})
 
     def fake_herdr_json(args, *, timeout_seconds=30.0):
         if args[:2] == ["agent", "get"]:
@@ -679,6 +908,7 @@ def test_create_task_session_rejects_non_isolated_split(tmp_path, monkeypatch):
     task["workspace"] = str(tmp_path / "workspace")
     task["routing"] = {"selected_agent": "quantlab-hermes"}
     task["run_token"] = "isolated-run"
+    monkeypatch.setattr(worker, "_setup_pane_ids", lambda: {"persistent-pane"})
 
     def fake_herdr_json(args, *, timeout_seconds=30.0):
         if args[:2] == ["agent", "get"]:
@@ -709,7 +939,13 @@ def test_create_task_session_rejects_wrong_started_agent(tmp_path, monkeypatch):
     task["workspace"] = str(tmp_path / "workspace")
     task["routing"] = {"selected_agent": "quantlab-hermes"}
     task["run_token"] = "isolated-run"
+    monkeypatch.setattr(worker, "_setup_pane_ids", lambda: {"persistent-pane"})
     closed = []
+    monkeypatch.setattr(worker, "start_bridge", lambda task, session: None)
+    monkeypatch.setattr(worker, "frozen_policy", lambda: tmp_path / "policy")
+    monkeypatch.setattr(worker, "sandbox_command", lambda *args, **kwargs: ["bwrap", "/bin/bash"])
+    monkeypatch.setattr(worker, "verify_sandbox", lambda *args, **kwargs: True)
+    monkeypatch.setattr(worker, "inner_pid", lambda *args, **kwargs: 123)
 
     def fake_herdr_json(args, *, timeout_seconds=30.0):
         if args[:2] == ["agent", "get"]:
@@ -721,21 +957,89 @@ def test_create_task_session_rejects_wrong_started_agent(tmp_path, monkeypatch):
             }}}
         if args[:2] == ["pane", "split"]:
             return {"result": {"pane": {"pane_id": "owned-pane"}}}
+        if args[:2] == ["pane", "run"]:
+            return {"result": {}}
+        if args[:2] == ["pane", "process-info"]:
+            return {"result": {"process_info": {"shell_pid": 123}}}
         if args[:2] == ["agent", "start"]:
             return {"result": {"agent": {"name": "wrong-agent", "pane_id": "owned-pane"}}}
+        if args[:2] == ["pane", "list"]:
+            return {"result": {"panes": [{"pane_id": "owned-pane"}]}}
         raise AssertionError(args)
 
     monkeypatch.setattr(worker, "_herdr_json", fake_herdr_json)
     monkeypatch.setattr(worker, "_close_owned_pane", lambda pane_id: closed.append(pane_id) or True)
+    monkeypatch.setattr(worker, "_pane_has_marker", lambda pane, marker: True)
 
     try:
         worker.create_task_session(task)
     except RuntimeError as exc:
-        assert str(exc) == "task_session_agent_start_invalid"
+        assert str(exc) == "task_session_cleanup_failed"
     else:
         raise AssertionError("wrong agent identity must fail closed")
 
-    assert closed == ["owned-pane"]
+    assert closed == []
+
+
+@pytest.mark.parametrize("case,after_start,expected_close", [
+    ("absent", False, False),
+    ("exact", False, True),
+    ("wrong_marker", False, False),
+    ("reused_pane", False, False),
+    ("exact", True, True),
+    ("wrong_agent", True, False),
+    ("wrong_pane", True, False),
+    ("wrong_marker", True, False),
+])
+def test_setup_failure_cleanup_proves_pane_identity(
+        tmp_path, monkeypatch, case, after_start, expected_close):
+    configure_paths(tmp_path)
+    task = base_task()
+    task.update(workspace=str(tmp_path / "workspace"), run_token="setup-run",
+                routing={"selected_agent": "quantlab-hermes"})
+    closed = []
+    monkeypatch.setattr(worker, "start_bridge", lambda *args: None)
+    monkeypatch.setattr(worker, "frozen_policy", lambda: tmp_path / "policy")
+    monkeypatch.setattr(worker, "sandbox_command", lambda *args, **kw: ["bwrap"])
+    monkeypatch.setattr(worker, "verify_sandbox", lambda *args, **kw: True)
+    monkeypatch.setattr(worker, "inner_pid", lambda *args, **kw: 123)
+    monkeypatch.setattr(worker, "_pane_has_marker",
+                        lambda pane, marker: case != "wrong_marker")
+    monkeypatch.setattr(worker, "_close_owned_pane",
+                        lambda pane: closed.append(pane) or True)
+    def fake_herdr_json(args, *, timeout_seconds=30.0):
+        if args[:2] == ["agent", "get"]:
+            if args[2] == "quantlab-hermes":
+                return {"result": {"agent": {"agent": "hermes", "pane_id": "coordinator",
+                                              "workspace_id": "w2"}}}
+            return {"result": {"agent": {"name": "other-agent" if case == "wrong_agent"
+                                              else args[2], "pane_id": "other-pane" if
+                                              case == "wrong_pane" else "owned-pane"}}}
+        if args[:2] == ["pane", "split"]:
+            return {"result": {"pane": {"pane_id": "owned-pane"}}}
+        if args[:2] == ["pane", "list"]:
+            lists.append(True)
+            return {"result": {"panes": ([{"pane_id": "owned-pane"}]
+                       if case == "reused_pane" else []) if len(lists) == 1 else
+                       ([] if case == "absent" else [{"pane_id": "owned-pane"}])}}
+        if args[:2] == ["pane", "run"]:
+            return {"result": {}}
+        if args[:2] == ["pane", "process-info"]:
+            return {"result": {"process_info": {"shell_pid": 123}}}
+        if args[:2] == ["agent", "start"]:
+            raise RuntimeError("start failed")
+        raise AssertionError(args)
+    lists = []
+    monkeypatch.setattr(worker, "_herdr_json", fake_herdr_json)
+    if not after_start:
+        monkeypatch.setattr(worker, "start_bridge",
+                            lambda *args: (_ for _ in ()).throw(RuntimeError("bridge failed")))
+    expected = "start failed" if after_start else "bridge failed"
+    if case not in {"absent", "exact"}:
+        expected = "task_session_cleanup_failed"
+    with pytest.raises(RuntimeError, match=expected):
+        worker.create_task_session(task)
+    assert closed == (["owned-pane"] if expected_close else [])
 
 
 def test_task_session_agent_name_respects_herdr_limit_for_all_coordinators(tmp_path):

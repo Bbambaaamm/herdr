@@ -14,6 +14,9 @@ Herdr core.
 from __future__ import annotations
 
 import json
+import os
+import hashlib
+import uuid
 import re
 import subprocess
 import threading
@@ -148,14 +151,12 @@ class _DefaultConsumerPolicy:
                 DenyReason.TOOL_NOT_IN_ROLE_ALLOWLIST,
                 detail=f"tools not in allowlist for {proposal.child_role}: {sorted(outside_role)}",
             )
-        parent_prohibitive = set(proposal.parent_tools)
-        if parent_prohibitive:
-            outside_parent = child_tools - parent_prohibitive
-            if outside_parent:
-                return DenyDecision(
-                    DenyReason.CHILD_TOOL_ESCALATION,
-                    detail=f"child tools above parent: {sorted(outside_parent)}",
-                )
+        outside_parent = child_tools - set(proposal.parent_tools)
+        if outside_parent:
+            return DenyDecision(
+                DenyReason.CHILD_TOOL_ESCALATION,
+                detail=f"child tools above parent: {sorted(outside_parent)}",
+            )
         outside_permissions = set(proposal.child_permissions) - set(proposal.parent_permissions)
         if outside_permissions:
             return DenyDecision(
@@ -206,6 +207,7 @@ class ChildProposal:
     child_fallback_model: str = "longcat"
     parent_permissions: tuple[str, ...] = ()
     child_permissions: tuple[str, ...] = ()
+    worktree_identity: str = ""
 
 
 @dataclass(frozen=True)
@@ -253,17 +255,22 @@ class AuditLog:
             self._buffer.append(event)
 
     def flush(self) -> None:
-        if not self._buffer:
-            return
         with self._lock:
+            if not self._buffer:
+                return
             events = self._buffer
             self._buffer = []
-        payload = (
-            json.dumps(e, sort_keys=True, separators=(",", ":")) + "\n" for e in events
-        )
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self._path, "a", encoding="utf-8") as fh:
-            fh.writelines(payload)
+            payload = (json.dumps(e, sort_keys=True, separators=(",", ":")) + "\n" for e in events)
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._path, "a", encoding="utf-8") as fh:
+                fh.writelines(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            directory = os.open(self._path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
 
     def replay(self) -> list[dict[str, object]]:
         if not self._path.exists():
@@ -301,6 +308,25 @@ class TaskRecord:
     submitted_at: float | None = None
     started_at: float | None = None
     id: str | None = None  # set from node.id after submit
+    delegation_key: str | None = None
+    idempotency_key: str | None = None
+    parent_run_token: str | None = None
+    run_token: str | None = None
+    attempt_state: str = "dispatching"
+    observed_execution: str = "unavailable"
+    observation_source: str | None = None
+    observed_at: str | None = None
+    execution_agent: str | None = None
+    execution_pane: str | None = None
+    execution_marker: str | None = None
+    worktree_identity: str = ""
+    cleanup_complete: bool = False
+    pre_delivery_failure: str | None = None
+    pre_delivery_agent_start_attempted: bool = False
+    pre_delivery_pane_creation_attempted: bool = False
+    delivery_prompt_sha256: str | None = None
+    result_status: str | None = None
+    result_artifact_sha256: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "id", self.node.id)
@@ -326,6 +352,7 @@ class DynamicChildScheduler:
         audit_log: AuditLog | None = None,
         consumer_policy: ConsumerPolicy | None = None,
         telemetry_store: TelemetryStore | None = None,
+        execution_verifier: Callable[[str, str, str], str] | None = None,
     ) -> None:
         self.budget = budget or SchedulerBudget(
             max_global_concurrency=4,
@@ -340,6 +367,7 @@ class DynamicChildScheduler:
         self.audit_log = audit_log or AuditLog(HERE / EVENT_LOG_NAME)
         self.consumer_policy = consumer_policy or _DefaultConsumerPolicy()
         self.telemetry_store = telemetry_store
+        self.execution_verifier = execution_verifier
         self._tasks: dict[str, TaskRecord] = {}
         self._claims: dict[str, Lease] = {}
         self._next_agent_id_value: int = 1
@@ -675,9 +703,10 @@ class DynamicChildScheduler:
                 ready_nodes.append(rec.node)
         return ready_nodes
 
-    def dispatch(self, now: float | None = None) -> list[Lease]:
+    def dispatch(self, now: float | None = None, *, task_ids: set[str] | None = None) -> list[Lease]:
         now = now or self.clock()
-        ready_nodes = sorted(self.ready(), key=lambda n: (n.priority, n.id))
+        ready_nodes = sorted((n for n in self.ready() if task_ids is None or n.id in task_ids),
+                             key=lambda n: (n.priority, n.id))
         leases: list[Lease] = []
         used_global = 0
         used_repo: dict[str, int] = defaultdict(int)
@@ -725,6 +754,13 @@ class DynamicChildScheduler:
                 )
                 rec.lease = lease
             rec.state = LifecycleState.RUNNING
+            rec.attempt_state = "accepted"
+            if rec.run_token is None:
+                rec.run_token = uuid.uuid4().hex
+            if rec.delegation_key is not None and rec.idempotency_key is None:
+                rec.idempotency_key = hashlib.sha256(
+                    f"{task_id}:{rec.run_token}:economic-attempt".encode()
+                ).hexdigest()
             rec.agent_id = lease.agent_id
             rec.started_at = now
             rec.blocker = None
@@ -738,8 +774,12 @@ class DynamicChildScheduler:
                     "event": "claim",
                     "task_id": task_id,
                     "agent_id": lease.agent_id,
+                    "holder": lease.holder,
                     "fencing_token": lease.fencing_token,
                     "lease_until": lease.lease_until,
+                    "attempt_state": rec.attempt_state,
+                    "run_token": rec.run_token,
+                    "idempotency_key": rec.idempotency_key,
                     "ts": datetime.now(UTC).isoformat(),
                 }
             )
@@ -755,6 +795,7 @@ class DynamicChildScheduler:
                 queue_wait_ms=queue_wait_ms,
                 moment=now,
             )
+        self.audit_log.flush()
         return leases
 
     # -- completion ----------------------------------------------------------
@@ -772,6 +813,10 @@ class DynamicChildScheduler:
         rec = self._tasks.get(task_id)
         if rec is None:
             self._deny(DenyReason.UNKNOWN_TASK, f"unknown task: {task_id}")
+            return False
+        if rec.delegation_key is not None:
+            # Durable delegated work must use publish_child_result, which
+            # checks exact attempt identity and artifact evidence.
             return False
         lease = rec.lease
         if lease is None:
@@ -911,6 +956,12 @@ class DynamicChildScheduler:
                 LifecycleState.CANCELLED,
             ):
                 continue
+            if rec.delegation_key is not None or (rec.run_token and rec.attempt_state in {
+                "accepted", "delivery_uncertain", "result_ready", "verifying"
+            }):
+                # An accepted economic prompt may still be running. Reclaiming
+                # would make it eligible for another prompt delivery.
+                continue
             reclaimed.append(task_id)
         if not reclaimed:
             return reclaimed
@@ -945,6 +996,12 @@ class DynamicChildScheduler:
             {
                 "event": "reclaim",
                 "reclaimed": reclaimed,
+                "leases": {task_id: {
+                    "agent_id": self._tasks[task_id].lease.agent_id,
+                    "holder": self._tasks[task_id].lease.holder,
+                    "fencing_token": self._tasks[task_id].lease.fencing_token,
+                    "lease_until": self._tasks[task_id].lease.lease_until,
+                } for task_id in reclaimed},
                 "ts": datetime.now(UTC).isoformat(),
             }
         )
@@ -989,6 +1046,9 @@ class DynamicChildScheduler:
         self,
         parent_id: str,
         proposal: ChildProposal,
+        *,
+        delegation_key: str | None = None,
+        parent_run_token: str | None = None,
     ) -> TaskNode | DenyDecision:
         parent_rec = self._tasks.get(parent_id)
         if parent_rec is None:
@@ -997,6 +1057,24 @@ class DynamicChildScheduler:
             )
             self._deny(deny.reason, deny.detail or "")
             return deny
+        if delegation_key is not None:
+            if not delegation_key.strip() or not parent_run_token:
+                raise SchedulerError("delegation requires key and parent run_token")
+            for existing in self._tasks.values():
+                if existing.parent_task_id == parent_id and existing.delegation_key == delegation_key:
+                    if (existing.parent_run_token != parent_run_token
+                            or existing.node.objective != proposal.child_task
+                            or existing.node.role != proposal.child_role
+                            or existing.node.tools != tuple(proposal.child_tools)
+                            or existing.node.permissions != tuple(proposal.child_permissions)):
+                        raise SchedulerError("delegation key reused with different identity or work")
+                    if existing.worktree_identity != proposal.worktree_identity:
+                        raise SchedulerError("delegation key reused with different identity or work")
+                    return existing.node
+            if parent_rec.state is not LifecycleState.RUNNING:
+                raise SchedulerError("economic delegation requires a running durable parent")
+            if parent_rec.run_token != parent_run_token:
+                raise SchedulerError("economic delegation parent attempt mismatch")
 
         canonical = replace(
             proposal,
@@ -1052,7 +1130,10 @@ class DynamicChildScheduler:
             return deny
 
         proposal = canonical
-        child_id = f"{parent_id}-child-{self._next_agent_id()}"
+        child_id = (
+            f"{parent_id}-child-{hashlib.sha256(f'{parent_id}:{parent_run_token}:{delegation_key}'.encode()).hexdigest()[:16]}"
+            if delegation_key is not None else f"{parent_id}-child-{self._next_agent_id()}"
+        )
         child_node = TaskNode(
             id=child_id,
             parent_id=parent_id,
@@ -1082,10 +1163,16 @@ class DynamicChildScheduler:
             policy_profile=parent_rec.policy_profile,
             model_used=proposal.child_model,
             fallback_used=proposal.child_fallback_model,
+            delegation_key=delegation_key,
+            parent_run_token=parent_run_token,
+            worktree_identity=proposal.worktree_identity,
         )
         rec.submitted_at = self.clock()
         self._tasks[child_id] = rec
-        child_agent_id = f"agent-{self._next_agent_id()}"
+        child_agent_id = (
+            f"hc-{hashlib.sha256(child_id.encode()).hexdigest()[:24]}"
+            if delegation_key is not None else f"agent-{self._next_agent_id()}"
+        )
         rec.lease = Lease(
             task_id=child_id,
             agent_id=child_agent_id,
@@ -1119,6 +1206,9 @@ class DynamicChildScheduler:
                 "child_tools": list(proposal.child_tools),
                 "child_permissions": list(proposal.child_permissions),
                 "child_task": proposal.child_task,
+                "delegation_key": delegation_key,
+                "parent_run_token": parent_run_token,
+                "worktree_identity": proposal.worktree_identity,
                 "repo": parent_rec.repo,
                 "issue": parent_rec.issue,
                 "policy_profile": parent_rec.policy_profile,
@@ -1127,6 +1217,235 @@ class DynamicChildScheduler:
         )
         self.audit_log.flush()
         return child_node
+
+    def delegate_child(self, parent_id: str, parent_run_token: str,
+                       delegation_key: str, proposal: ChildProposal) -> TaskNode | DenyDecision:
+        """Admit and persist an economic child before any prompt is delivered."""
+        return self.spawn_child(parent_id, proposal, delegation_key=delegation_key,
+                                parent_run_token=parent_run_token)
+
+    def bind_child_prompt(self, task_id: str, prompt: str) -> None:
+        rec = self._tasks.get(task_id)
+        if rec is None or rec.delegation_key is None or not prompt:
+            raise SchedulerError("unknown economic child prompt")
+        digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        if rec.delivery_prompt_sha256 and rec.delivery_prompt_sha256 != digest:
+            raise SchedulerError("delegation key reused with different prompt")
+        if rec.delivery_prompt_sha256 is None:
+            rec.delivery_prompt_sha256 = digest
+            self.audit_log.append({"event": "child_prompt_bound", "task_id": task_id,
+                                   "sha256": digest})
+            self.audit_log.flush()
+
+    def authorize_child_delivery(self, task_id: str, run_token: str,
+                                 agent_id: str, fencing_token: int,
+                                 idempotency_key: str) -> bool:
+        """Gate economic prompt delivery on a claimed, durable child attempt."""
+        rec = self._tasks.get(task_id)
+        lease = rec.lease if rec else None
+        allowed = bool(rec and rec.delegation_key and rec.parent_task_id
+                       and rec.delivery_prompt_sha256
+                       and rec.state is LifecycleState.RUNNING and lease
+                       and lease.agent_id == agent_id
+                       and lease.fencing_token == fencing_token
+                       and self.clock() < lease.lease_until
+                       and rec.run_token == run_token
+                       and rec.idempotency_key == idempotency_key)
+        if not allowed:
+            self.audit_log.append({"event": "economic_delivery_denied",
+                                   "task_id": task_id, "ts": datetime.now(UTC).isoformat()})
+            self.audit_log.flush()
+        return allowed
+
+    def bind_execution_session(self, task_id: str, run_token: str,
+                               agent_name: str, pane_id: str, marker: str) -> bool:
+        rec = self._tasks.get(task_id)
+        if (rec is None or rec.state is not LifecycleState.RUNNING
+                or rec.run_token != run_token or not all((agent_name, pane_id, marker))):
+            return False
+        identity = (agent_name, pane_id, marker)
+        previous = (rec.execution_agent, rec.execution_pane, rec.execution_marker)
+        if any(previous) and previous != identity:
+            return False
+        rec.execution_agent, rec.execution_pane, rec.execution_marker = identity
+        self.audit_log.append({"event": "execution_session_bound", "task_id": task_id,
+                               "run_token": run_token, "agent_name": agent_name,
+                               "pane_id": pane_id, "marker": marker,
+                               "ts": datetime.now(UTC).isoformat()})
+        self.audit_log.flush()
+        return True
+
+    def bind_pre_delivery_pane(self, task_id: str, run_token: str,
+                               agent_name: str, pane_id: str, marker: str) -> bool:
+        """Persist a created pane before starting its agent, for safe recovery."""
+        rec = self._tasks.get(task_id)
+        if rec is None or rec.delegation_key is None or rec.agent_id != agent_name:
+            return False
+        return self.bind_execution_session(task_id, run_token, agent_name, pane_id, marker)
+
+    def mark_pre_delivery_agent_start(self, task_id: str) -> None:
+        rec = self._tasks[task_id]
+        if not rec.execution_pane or rec.state is not LifecycleState.RUNNING:
+            raise SchedulerError("child pane unavailable")
+        if not rec.pre_delivery_agent_start_attempted:
+            self.audit_log.append({"event": "child_agent_start_attempted", "task_id": task_id,
+                                   "run_token": rec.run_token})
+            self.audit_log.flush()
+            rec.pre_delivery_agent_start_attempted = True
+
+    def fail_child_pre_delivery(self, task_id: str, run_token: str, agent_id: str,
+                                fencing_token: int, idempotency_key: str,
+                                reason: str, *, cleanup_complete: bool,
+                                pane_creation_attempted: bool = False) -> bool:
+        rec = self._tasks.get(task_id)
+        lease = rec.lease if rec else None
+        if (rec is None or rec.delegation_key is None or rec.state is not LifecycleState.RUNNING
+                or lease is None or not reason or len(reason) > 1024
+                or (rec.run_token, rec.agent_id, rec.fencing_token, rec.idempotency_key) !=
+                   (run_token, agent_id, fencing_token, idempotency_key)
+                or cleanup_complete
+                ):
+            return False
+        self.audit_log.append({"event": "child_pre_delivery_failed", "task_id": task_id,
+                               "run_token": run_token, "agent_id": agent_id,
+                               "fencing_token": fencing_token,
+                               "idempotency_key": idempotency_key, "reason": reason,
+                               "cleanup_complete": cleanup_complete,
+                               "pane_creation_attempted": pane_creation_attempted,
+                               "ts": datetime.now(UTC).isoformat()})
+        self.audit_log.flush()
+        rec.state = LifecycleState.BLOCKED
+        rec.attempt_state = "terminal"
+        rec.pre_delivery_failure = reason
+        rec.pre_delivery_pane_creation_attempted = pane_creation_attempted
+        rec.blocker = reason
+        rec.cleanup_complete = False
+        rec.lease = None
+        self._claims.pop(task_id, None)
+        return True
+
+    def observe_execution(self, task_id: str, run_token: str, state: str,
+                          source: str, *, agent_name: str | None = None,
+                          pane_id: str | None = None, marker: str | None = None) -> bool:
+        rec = self._tasks.get(task_id)
+        if rec is None or state not in {"working", "blocked", "settled", "unavailable"} or not source:
+            return False
+        if rec.run_token != run_token or rec.state is not LifecycleState.RUNNING:
+            return False
+        if rec.delegation_key is not None and (
+            not all((rec.execution_agent, rec.execution_pane, rec.execution_marker))
+            or (agent_name, pane_id, marker) !=
+            (rec.execution_agent, rec.execution_pane, rec.execution_marker)
+        ):
+            return False
+        if rec.delegation_key is not None:
+            if self.execution_verifier is None:
+                return False
+            try:
+                live_status = self.execution_verifier(rec.execution_agent,
+                                                       rec.execution_pane,
+                                                       rec.execution_marker)
+            except Exception:
+                return False
+            live_state = {"working": "working", "busy": "working",
+                          "blocked": "blocked", "done": "settled",
+                          "idle": "settled"}.get(live_status, "unavailable")
+            if state != live_state:
+                return False
+        if not run_token:
+            return False
+        rec.observed_execution = state
+        rec.observation_source = source
+        rec.observed_at = datetime.now(UTC).isoformat()
+        self.audit_log.append({"event": "execution_observed", "task_id": task_id,
+                               "run_token": run_token, "state": state,
+                               "source": source, "ts": rec.observed_at})
+        self.audit_log.flush()
+        return True
+
+    def publish_child_result(self, task_id: str, run_token: str, agent_id: str,
+                             fencing_token: int, idempotency_key: str,
+                             artifact_sha256: str, evidence: list[object],
+                             status: str = "completed") -> bool:
+        rec = self._tasks.get(task_id)
+        states = {"completed": LifecycleState.DONE,
+                  "blocked": LifecycleState.BLOCKED,
+                  "failed": LifecycleState.FAILED}
+        if rec is None or rec.delegation_key is None or not run_token or status not in states:
+            return False
+        if rec.run_token != run_token or idempotency_key != rec.idempotency_key:
+            return False
+        if not isinstance(evidence, list) or not evidence:
+            return False
+        try:
+            canonical = json.dumps(evidence, sort_keys=True, ensure_ascii=False,
+                                   allow_nan=False).encode("utf-8")
+        except (TypeError, ValueError):
+            return False
+        if artifact_sha256 != hashlib.sha256(canonical).hexdigest():
+            return False
+        lease = rec.lease
+        if lease is None or lease.agent_id != agent_id or lease.fencing_token != fencing_token:
+            return False
+        # Managed claims are quarantined across lease expiry; the exact
+        # run/fence/key still identifies a late result for this same attempt.
+        if rec.state is not LifecycleState.RUNNING:
+            return False
+        rec.state = states[status]
+        rec.attempt_state = "terminal"
+        rec.result_status = status
+        rec.result_artifact_sha256 = artifact_sha256
+        rec.fencing_token = fencing_token
+        rec.lease = None
+        self._claims.pop(task_id, None)
+        self.audit_log.append({"event": "child_result", "task_id": task_id,
+                               "agent_id": agent_id, "fencing_token": fencing_token,
+                               "run_token": run_token, "idempotency_key": idempotency_key,
+                               "artifact_sha256": artifact_sha256, "evidence": evidence,
+                               "status": status, "state": rec.state.value,
+                               "ts": datetime.now(UTC).isoformat()})
+        self.audit_log.flush()
+        if status == "completed":
+            self._mark_dependents_done(task_id)
+        return True
+
+    def mark_child_cleanup_complete(self, task_id: str) -> bool:
+        """Record cleanup only for the exact terminal, bound child attempt."""
+        rec = self._tasks.get(task_id)
+        if (rec is None or rec.delegation_key is None or rec.attempt_state != "terminal"
+                or not all((rec.run_token, rec.fencing_token, rec.idempotency_key,
+                            rec.execution_pane, rec.execution_agent, rec.execution_marker))
+                or rec.execution_agent != rec.agent_id):
+            return False
+        if rec.cleanup_complete:
+            return True
+        self.audit_log.append({"event": "child_cleanup_complete", "task_id": task_id,
+                               "run_token": rec.run_token, "fencing_token": rec.fencing_token,
+                               "idempotency_key": rec.idempotency_key,
+                               "agent_name": rec.execution_agent,
+                               "pane_id": rec.execution_pane,
+                               "marker": rec.execution_marker})
+        self.audit_log.flush()
+        rec.cleanup_complete = True
+        return True
+
+    def mark_pre_delivery_cleanup_complete(self, task_id: str) -> bool:
+        rec = self._tasks.get(task_id)
+        if rec is None or not rec.pre_delivery_failure or rec.attempt_state != "terminal":
+            return False
+        if rec.cleanup_complete:
+            return True
+        if rec.execution_pane:
+            return self.mark_child_cleanup_complete(task_id)
+        if rec.pre_delivery_pane_creation_attempted:
+            return False
+        self.audit_log.append({"event": "child_pre_delivery_cleanup_complete",
+                               "task_id": task_id, "run_token": rec.run_token,
+                               "fencing_token": rec.fencing_token,
+                               "idempotency_key": rec.idempotency_key})
+        self.audit_log.flush()
+        rec.cleanup_complete = True
+        return True
 
     def evaluate_child_proposal(
         self, proposal: ChildProposal
@@ -1146,6 +1465,23 @@ class DynamicChildScheduler:
                 {
                     "task_id": task_id,
                     "state": rec.state.value,
+                    "attempt_state": rec.attempt_state,
+                    "result_status": rec.result_status,
+                    "result_artifact_sha256": rec.result_artifact_sha256,
+                    "observed_execution": rec.observed_execution,
+                    "observation_source": rec.observation_source,
+                    "observed_at": rec.observed_at,
+                    "execution_agent": rec.execution_agent,
+                    "execution_pane": rec.execution_pane,
+                    "worktree_identity": rec.worktree_identity,
+                    "cleanup_complete": rec.cleanup_complete,
+                    "pre_delivery_failure": rec.pre_delivery_failure,
+                    "pre_delivery_agent_start_attempted": rec.pre_delivery_agent_start_attempted,
+                    "pre_delivery_pane_creation_attempted": rec.pre_delivery_pane_creation_attempted,
+                    "run_token": rec.run_token,
+                    "delegation_key": rec.delegation_key,
+                    "idempotency_key": rec.idempotency_key,
+                    "parent_run_token": rec.parent_run_token,
                     "role": node.role,
                     "tools": list(node.tools),
                     "permissions": list(node.permissions),
@@ -1173,7 +1509,7 @@ class DynamicChildScheduler:
                     "attempts": rec.attempts,
                     "blocker": rec.blocker,
                     "policy_profile": rec.policy_profile,
-                    "paper_only": rec.policy_profile == "quantlab-paper",
+                    "paper_only": rec.policy_profile in {"quantlab", "quantlab-paper"},
                     "telemetry": list(rec.telemetry),
                     "ts": str(self.clock()),
                 }
@@ -1212,7 +1548,7 @@ class DynamicChildScheduler:
             "edges": edges,
             "agents": agents_snapshot,
             "policy_profiles": sorted({rec.policy_profile for rec in self._tasks.values()}),
-            "paper_only": bool(self._tasks) and all(rec.policy_profile == "quantlab-paper" for rec in self._tasks.values()),
+            "paper_only": bool(self._tasks) and all(rec.policy_profile in {"quantlab", "quantlab-paper"} for rec in self._tasks.values()),
             "repo": next(iter(self._tasks.values())).repo if self._tasks else "",
             "issue": next(iter(self._tasks.values())).issue if self._tasks else "",
             "observed_at": str(self.clock()),
@@ -1243,10 +1579,19 @@ class DynamicChildScheduler:
                 "submit",
                 "claim",
                 "complete",
+                "child_result",
+                "child_cleanup_complete",
+                "child_pre_delivery_cleanup_complete",
+                "child_agent_start_attempted",
+                "child_pre_delivery_failed",
                 "fail",
                 "cancel",
                 "reclaim",
                 "spawn_child",
+                "execution_observed",
+                "execution_session_bound",
+                "bind_parent",
+                "child_prompt_bound",
             }
         )
         for e in events:
@@ -1317,22 +1662,55 @@ class DynamicChildScheduler:
                 rec = self._tasks.get(task_id)
                 if rec is None:
                     continue
-                if rec.lease is None:
-                    rec.lease = Lease(
+                rec.lease = Lease(
                         task_id=task_id,
                         agent_id=str(e.get("agent_id", "")),
                         holder=str(e.get("holder", "scheduler")),
                         fencing_token=int(e.get("fencing_token", 0)),
                         lease_until=float(e.get("lease_until", 0.0)),
                     )
-                    rec.state = LifecycleState.RUNNING
-                    rec.agent_id = rec.lease.agent_id
-                    rec.fencing_token = rec.lease.fencing_token
-            elif event_type == "complete":
+                rec.state = LifecycleState.RUNNING
+                rec.attempt_state = str(e.get("attempt_state", "accepted"))
+                rec.run_token = str(e["run_token"]) if e.get("run_token") else rec.run_token
+                rec.idempotency_key = str(e["idempotency_key"]) if e.get("idempotency_key") else rec.idempotency_key
+                rec.agent_id = rec.lease.agent_id
+                rec.fencing_token = rec.lease.fencing_token
+                self._claims[task_id] = rec.lease
+            elif event_type in {"complete", "child_result"}:
                 task_id = str(e.get("task_id", ""))
                 rec = self._tasks.get(task_id)
                 if rec is not None:
-                    rec.state = LifecycleState.DONE
+                    status = str(e.get("status", "completed"))
+                    states = {"completed": LifecycleState.DONE,
+                              "blocked": LifecycleState.BLOCKED,
+                              "failed": LifecycleState.FAILED}
+                    if status not in states:
+                        raise SchedulerError("invalid durable child result status")
+                    if event_type == "child_result":
+                        try:
+                            evidence = e["evidence"]
+                            canonical = json.dumps(evidence, sort_keys=True,
+                                                   ensure_ascii=False, allow_nan=False).encode("utf-8")
+                            valid = (isinstance(evidence, list) and bool(evidence)
+                                     and rec.delegation_key is not None
+                                     and rec.lease is not None
+                                     and rec.run_token == e.get("run_token")
+                                     and rec.idempotency_key == e.get("idempotency_key")
+                                     and rec.lease.agent_id == e.get("agent_id")
+                                     and rec.lease.fencing_token == e.get("fencing_token")
+                                     and hashlib.sha256(canonical).hexdigest() ==
+                                     e.get("artifact_sha256"))
+                        except (KeyError, TypeError, ValueError):
+                            valid = False
+                        if not valid:
+                            raise SchedulerError("invalid durable child result evidence")
+                    rec.state = states[status]
+                    rec.attempt_state = "terminal"
+                    rec.result_status = status if event_type == "child_result" else None
+                    rec.result_artifact_sha256 = (str(e["artifact_sha256"])
+                                                  if event_type == "child_result" else None)
+                    rec.lease = None
+                    self._claims.pop(task_id, None)
                     if e.get("fencing_token") is not None:
                         rec.fencing_token = int(e["fencing_token"])
                     if e.get("agent_id"):
@@ -1342,14 +1720,31 @@ class DynamicChildScheduler:
                 rec = self._tasks.get(task_id)
                 if rec is not None:
                     rec.state = LifecycleState.FAILED
+                    rec.lease = None
+                    self._claims.pop(task_id, None)
                     rec.attempts = int(e.get("attempts", 1))
             elif event_type == "cancel":
                 task_id = str(e.get("task_id", ""))
                 rec = self._tasks.get(task_id)
                 if rec is not None:
                     rec.state = LifecycleState.CANCELLED
+                    rec.lease = None
+                    self._claims.pop(task_id, None)
             elif event_type == "reclaim":
-                pass
+                for task_id, lease_data in (e.get("leases") or {}).items():
+                    rec = self._tasks.get(task_id)
+                    if rec is None or rec.delegation_key is not None or (rec.run_token and rec.attempt_state in {
+                        "accepted", "delivery_uncertain", "result_ready", "verifying"
+                    }):
+                        continue
+                    rec.lease = Lease(task_id=task_id,
+                                      agent_id=str(lease_data["agent_id"]),
+                                      holder=str(lease_data["holder"]),
+                                      fencing_token=int(lease_data["fencing_token"]),
+                                      lease_until=float(lease_data["lease_until"]))
+                    rec.state = LifecycleState.PENDING
+                    rec.attempt_state = "retry_scheduled"
+                    self._claims[task_id] = rec.lease
             elif event_type == "spawn_child":
                 child_id = str(e.get("child_id", ""))
                 rec = self._tasks.get(child_id)
@@ -1392,6 +1787,12 @@ class DynamicChildScheduler:
                     )
                     self._tasks[child_id] = rec
                 rec.model_used = str(e.get("model", rec.model_used or "laguna"))
+                rec.delegation_key = str(e["delegation_key"]) if e.get("delegation_key") else None
+                rec.parent_run_token = str(e["parent_run_token"]) if e.get("parent_run_token") else None
+                identity = e.get("worktree_identity", "")
+                if not isinstance(identity, str):
+                    raise SchedulerError("invalid durable child worktree identity")
+                rec.worktree_identity = identity
                 rec.fallback_used = str(
                     e.get("fallback_model", rec.fallback_used or "longcat")
                 )
@@ -1410,6 +1811,89 @@ class DynamicChildScheduler:
                     self._claims[child_id] = rec.lease
                     rec.agent_id = rec.lease.agent_id
                     rec.fencing_token = rec.lease.fencing_token
+            elif event_type == "execution_observed":
+                rec = self._tasks.get(str(e.get("task_id", "")))
+                if rec is not None:
+                    if rec.run_token == str(e.get("run_token", "")):
+                        rec.observed_execution = str(e.get("state", "unavailable"))
+                        rec.observation_source = str(e.get("source", ""))
+                        rec.observed_at = str(e.get("ts", ""))
+            elif event_type == "child_prompt_bound":
+                rec = self._tasks.get(str(e.get("task_id", "")))
+                if rec is not None:
+                    rec.delivery_prompt_sha256 = str(e.get("sha256", ""))
+            elif event_type == "execution_session_bound":
+                rec = self._tasks.get(str(e.get("task_id", "")))
+                if rec is not None and rec.run_token == str(e.get("run_token", "")):
+                    rec.execution_agent = str(e.get("agent_name", ""))
+                    rec.execution_pane = str(e.get("pane_id", ""))
+                    rec.execution_marker = str(e.get("marker", ""))
+            elif event_type == "child_agent_start_attempted":
+                rec = self._tasks.get(str(e.get("task_id", "")))
+                if rec is None or rec.run_token != e.get("run_token") or not rec.execution_pane:
+                    raise SchedulerError("invalid child agent start evidence")
+                rec.pre_delivery_agent_start_attempted = True
+            elif event_type == "child_pre_delivery_failed":
+                rec = self._tasks.get(str(e.get("task_id", "")))
+                lease = rec.lease if rec else None
+                reason = e.get("reason")
+                if (rec is None or rec.delegation_key is None or rec.state is not LifecycleState.RUNNING
+                        or lease is None or not isinstance(reason, str) or not reason
+                        or (rec.run_token, rec.agent_id, rec.fencing_token, rec.idempotency_key) !=
+                           (e.get("run_token"), e.get("agent_id"), e.get("fencing_token"),
+                            e.get("idempotency_key"))
+                        or not isinstance(e.get("cleanup_complete"), bool)
+                        or e["cleanup_complete"]
+                        ):
+                    raise SchedulerError("invalid child pre-delivery failure")
+                rec.state = LifecycleState.BLOCKED
+                rec.attempt_state = "terminal"
+                rec.pre_delivery_failure = reason
+                rec.pre_delivery_pane_creation_attempted = bool(e.get("pane_creation_attempted"))
+                rec.blocker = reason
+                rec.cleanup_complete = e["cleanup_complete"]
+                rec.lease = None
+                self._claims.pop(rec.node.id, None)
+            elif event_type == "child_cleanup_complete":
+                rec = self._tasks.get(str(e.get("task_id", "")))
+                if (rec is None or rec.delegation_key is None or rec.attempt_state != "terminal"
+                        or not all((rec.execution_pane, rec.execution_agent,
+                                    rec.execution_marker, rec.idempotency_key))
+                        or rec.execution_agent != rec.agent_id
+                        or (e.get("run_token"), e.get("fencing_token"),
+                            e.get("idempotency_key"), e.get("agent_name"),
+                            e.get("pane_id"), e.get("marker")) !=
+                           (rec.run_token, rec.fencing_token, rec.idempotency_key,
+                            rec.execution_agent, rec.execution_pane, rec.execution_marker)):
+                    raise SchedulerError("invalid durable child cleanup evidence")
+                rec.cleanup_complete = True
+            elif event_type == "child_pre_delivery_cleanup_complete":
+                rec = self._tasks.get(str(e.get("task_id", "")))
+                if (rec is None or not rec.pre_delivery_failure or rec.execution_pane
+                        or rec.pre_delivery_pane_creation_attempted
+                        or rec.attempt_state != "terminal"
+                        or (e.get("run_token"), e.get("fencing_token"),
+                            e.get("idempotency_key")) !=
+                           (rec.run_token, rec.fencing_token, rec.idempotency_key)):
+                    raise SchedulerError("invalid pre-delivery cleanup evidence")
+                rec.cleanup_complete = True
+            elif event_type == "bind_parent":
+                rec = self._tasks.get(str(e.get("task_id", "")))
+                if rec is not None and rec.lease is not None:
+                    rec.lease = replace(rec.lease, agent_id=str(e.get("agent_id", "")),
+                                        holder="external",
+                                        fencing_token=int(e.get("fencing_token", 0)))
+                    rec.agent_id = rec.lease.agent_id
+                    rec.fencing_token = rec.lease.fencing_token
+                    self._claims[rec.node.id] = rec.lease
+        max_fence = max((int(e.get("fencing_token") or 0) for e in events), default=0)
+        max_fence = max(max_fence, max((rec.fencing_token or 0 for rec in self._tasks.values()), default=0))
+        self._next_fencing_token_value = max(self._next_fencing_token_value, max_fence + 1)
+        agent_numbers = [int(match.group(1)) for rec in self._tasks.values()
+                         for match in [re.fullmatch(r"agent-(\d+)", rec.agent_id or "")]
+                         if match]
+        self._next_agent_id_value = max(self._next_agent_id_value,
+                                        max(agent_numbers, default=0) + 1)
         return applied
 
     # -- internal helpers ----------------------------------------------------
@@ -1471,6 +1955,62 @@ class DynamicChildScheduler:
             moment=self.clock(),
         )
         return lease
+
+    def register_external_parent_attempt(
+        self, *, task_id: str, run_token: str, idempotency_key: str,
+        agent_name: str, pane_id: str, marker: str, repo: str, issue: str,
+        role: str, tools: Sequence[str], permissions: Sequence[str],
+        policy_profile: str,
+    ) -> TaskRecord:
+        """Durably bind an already running Agent Stack attempt to this scheduler."""
+        if not all((task_id, run_token, idempotency_key, agent_name, pane_id,
+                    marker, repo, role, policy_profile)):
+            raise SchedulerError("external parent identity incomplete")
+        existing = self._tasks.get(task_id)
+        if existing is not None:
+            if (existing.run_token, existing.idempotency_key,
+                    existing.execution_agent, existing.execution_pane,
+                    existing.execution_marker) != (run_token, idempotency_key,
+                    agent_name, pane_id, marker):
+                raise SchedulerError("external parent attempt mismatch")
+            return existing
+        node = TaskNode(id=task_id, parent_id=None, type="task", role=role,
+                        objective=f"external durable attempt {task_id}",
+                        inputs=[{"artifact_ref": "agent-stack-task"}],
+                        expected_outputs=[{"kind": "result"}], dependencies=[],
+                        priority=0, resource_class="standard",
+                        model_policy={"model": "external"}, tools=tuple(tools),
+                        permissions=tuple(permissions), timeout_seconds=3600,
+                        max_attempts=1)
+        rec = TaskRecord(node=node, state=LifecycleState.RUNNING,
+                         repo=repo, issue=issue, policy_profile=policy_profile,
+                         agent_id=agent_name, run_token=run_token,
+                         idempotency_key=idempotency_key, attempt_state="accepted",
+                         execution_agent=agent_name, execution_pane=pane_id,
+                         execution_marker=marker)
+        rec.lease = Lease(task_id, agent_name, "external", self._next_fencing_token(),
+                          self.clock() + self.budget.claim_ttl_seconds)
+        rec.fencing_token = rec.lease.fencing_token
+        self._tasks[task_id] = rec
+        self._claims[task_id] = rec.lease
+        self.audit_log.append({"event": "submit", "task_id": task_id,
+                               "repo": repo, "issue": issue, "role": role,
+                               "tools": list(tools), "permissions": list(permissions),
+                               "policy_profile": policy_profile,
+                               "objective": node.objective, "agent_id": agent_name,
+                               "fencing_token": rec.fencing_token})
+        self.audit_log.append({"event": "claim", "task_id": task_id,
+                               "agent_id": agent_name, "holder": "external",
+                               "fencing_token": rec.fencing_token,
+                               "lease_until": rec.lease.lease_until,
+                               "run_token": run_token,
+                               "idempotency_key": idempotency_key,
+                               "attempt_state": "accepted"})
+        self.audit_log.append({"event": "execution_session_bound", "task_id": task_id,
+                               "run_token": run_token, "agent_name": agent_name,
+                               "pane_id": pane_id, "marker": marker})
+        self.audit_log.flush()
+        return rec
 
 
 # ---------------------------------------------------------------------------

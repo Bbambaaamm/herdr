@@ -386,6 +386,10 @@ def queue_issue(consumer: dict, issue: dict, records: list[dict]) -> str:
         "attempts": 0,
         "prompt": prompt_for(consumer, issue, prior),
     }
+    scope_fields = ("parent_role", "parent_tools", "parent_permissions", "worktree_root")
+    if all(field in consumer for field in scope_fields):
+        for field in scope_fields:
+            task[field] = consumer[field]
     path = PENDING / f"{task_id}.json"
     path.write_text(json.dumps(task, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.chmod(path, 0o600)

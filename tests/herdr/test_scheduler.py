@@ -10,9 +10,11 @@ canonical herdr v1.1 TaskNode/TaskGraph contract.
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
 import pytest
+import herdr.scheduler as scheduler_module
 
 from herdr.telemetry import CostUnknownReason, TelemetryStore
 from herdr import (
@@ -251,13 +253,11 @@ def test_lost_worker_reclaim_without_double_commit(tmp_path: Path) -> None:
     first = {lease.task_id: lease for lease in sched.dispatch()}
     stale = first["a"]
     reclaimed = sched.reclaim(stale.holder, now=1_000_000.0 + 1_000.0)
-    assert reclaimed == ["a"]
-    assert sched._tasks["a"].state == LifecycleState.PENDING  # back to ready
-    # Add new lease after reclaim
+    assert reclaimed == []
+    assert sched._tasks["a"].state == LifecycleState.RUNNING
     leases_after = sched.dispatch(now=1_000_001.0)
     replacement = next((lease for lease in leases_after if lease.task_id == "a"), None)
-    assert replacement is not None
-    assert replacement.fencing_token > stale.fencing_token
+    assert replacement is None
 
 
 def test_expired_lease_cannot_commit_before_reclaim(tmp_path: Path) -> None:
@@ -570,6 +570,20 @@ def test_authoritative_snapshot_is_deterministic_and_exportable(tmp_path: Path) 
     assert json.loads(target.read_text(encoding="utf-8")) == snap1
 
 
+def test_quantlab_snapshot_reports_paper_only_consistently(tmp_path: Path) -> None:
+    sched = DynamicChildScheduler(
+        clock=lambda: 1234.0,
+        audit_log=AuditLog(tmp_path / "events.jsonl"),
+    )
+    node = _node("paper")
+    sched.submit(TaskGraph(envelope=_envelope(issue="82", policy_profile="quantlab"),
+                                nodes=(node,)),
+                 repo="QuantLab", issue="82")
+    snapshot = sched.snapshot()
+    assert snapshot["paper_only"] is True
+    assert snapshot["tasks"][0]["paper_only"] is True
+
+
 # ---------------------------------------------------------------------------
 # Acceptance: replay restores parent/child identity and fencing
 # ---------------------------------------------------------------------------
@@ -627,6 +641,137 @@ def test_replay_restores_parent_child_identity_and_fencing(tmp_path: Path) -> No
     if child_row is not None:
         assert child_row["parent_agent_id"] == parent_lease.agent_id
         assert child_row["parent_task_id"] == "parent"
+
+
+def test_durable_delegation_survives_uncertainty_and_restart(tmp_path: Path) -> None:
+    log = AuditLog(tmp_path / "events.jsonl")
+    budget = SchedulerBudget(max_global_concurrency=4, max_per_issue=4)
+    sched = DynamicChildScheduler(budget=budget, clock=lambda: 1000.0, audit_log=log)
+    _submit(sched, [_node("parent", role="writer", tools=("read_file", "patch"))])
+    sched.dispatch()
+    parent_token = sched._tasks["parent"].run_token
+    proposal = ChildProposal("writer", ("read_file", "patch"), "reader",
+                             ("read_file",), child_task="bounded research")
+    child = sched.delegate_child("parent", parent_token, "research-1", proposal)
+    assert isinstance(child, TaskNode)
+    assert child.parent_id == "parent"
+    assert sched.delegate_child("parent", parent_token, "research-1", proposal).id == child.id
+    assert not sched.complete(child.id, "UI says done")
+    child_lease = next(lease for lease in sched.dispatch() if lease.task_id == child.id)
+    child_token = sched._tasks[child.id].run_token
+    child_key = sched._tasks[child.id].idempotency_key
+    assert child_key != "research-1"
+    sched.bind_child_prompt(child.id, "bounded prompt")
+    assert sched.authorize_child_delivery(child.id, child_token, child_lease.agent_id,
+                                          child_lease.fencing_token, child_key)
+    assert not sched.authorize_child_delivery("unmanaged", child_token, child_lease.agent_id,
+                                              child_lease.fencing_token, child_key)
+    assert sched.bind_execution_session(child.id, child_token, "child-agent", "pane-1", "owned-marker")
+    assert not sched.observe_execution(child.id, child_token, "working", "task-session",
+                                       agent_name="other", pane_id="pane-1", marker="owned-marker")
+    owned = dict(agent_name="child-agent", pane_id="pane-1", marker="owned-marker")
+    assert not sched.observe_execution(child.id, child_token, "settled", "caller string", **owned)
+    live = ["working"]
+    sched.execution_verifier = lambda agent, pane, marker: live[0]
+    assert sched.observe_execution(child.id, child_token, "working", "task-session", **owned)
+    live[0] = "done"
+    assert sched.observe_execution(child.id, child_token, "settled", "brief lifecycle report", **owned)
+    assert sched._tasks[child.id].attempt_state == "accepted"
+    assert sched._tasks[child.id].state.value == "running"
+    live[0] = "working"
+    assert sched.observe_execution(child.id, child_token, "working", "semantic session", **owned)
+
+    recovered = DynamicChildScheduler(budget=budget, clock=lambda: 1001.0, audit_log=log)
+    recovered.replay()
+    assert recovered.delegate_child("parent", parent_token, "research-1", proposal).id == child.id
+    assert recovered.ready() == []
+    assert recovered.reclaim(child_lease.holder) == []
+    row = next(row for row in recovered.snapshot()["tasks"] if row["task_id"] == child.id)
+    assert row["observed_execution"] == "working"
+    assert row["parent_run_token"] == parent_token
+    assert not recovered.publish_child_result(child.id, "wrong-run", child_lease.agent_id,
+                                              child_lease.fencing_token, child_key, "a" * 64, "done")
+    assert not recovered.publish_child_result(child.id, child_token, child_lease.agent_id,
+                                              child_lease.fencing_token + 1, child_key,
+                                              hashlib.sha256(b"artifact").hexdigest(), "artifact")
+    assert not recovered.publish_child_result(child.id, child_token, child_lease.agent_id,
+                                              child_lease.fencing_token, "research-1",
+                                              hashlib.sha256(b"artifact").hexdigest(), "artifact")
+    assert not recovered.publish_child_result(child.id, child_token, child_lease.agent_id,
+                                              child_lease.fencing_token, child_key, "a" * 64, "artifact")
+    evidence = ["artifact"]
+    evidence_sha = hashlib.sha256(json.dumps(evidence, sort_keys=True,
+                                         ensure_ascii=False).encode()).hexdigest()
+    assert recovered.publish_child_result(child.id, child_token, child_lease.agent_id,
+                                          child_lease.fencing_token, child_key,
+                                          evidence_sha, evidence)
+    assert recovered._tasks[child.id].observed_execution == "working"
+    assert recovered.snapshot()["tasks"][0]["state"] in {"running", "done"}
+    assert sum(e.get("event") == "spawn_child" for e in log.replay()) == 1
+    again = DynamicChildScheduler(budget=budget, clock=lambda: 1002.0, audit_log=log)
+    again.replay()
+    assert next(row for row in again.snapshot()["tasks"] if row["task_id"] == child.id)["state"] == "done"
+    assert again._tasks[child.id].observed_execution == "working"
+
+
+@pytest.mark.parametrize("status,state", [
+    ("completed", LifecycleState.DONE),
+    ("blocked", LifecycleState.BLOCKED),
+    ("failed", LifecycleState.FAILED),
+])
+def test_exact_child_result_terminal_replay_and_identity(tmp_path: Path, status, state) -> None:
+    log = AuditLog(tmp_path / "scheduler.jsonl")
+    sched = DynamicChildScheduler(audit_log=log)
+    sched.register_external_parent_attempt(
+        task_id="parent", run_token="parent-run", idempotency_key="parent-key",
+        agent_name="parent-agent", pane_id="parent-pane", marker="parent-marker",
+        repo="repo", issue="82", role="writer", tools=("read_file",),
+        permissions=(), policy_profile="default")
+    child = sched.delegate_child("parent", "parent-run", "research",
+        ChildProposal("writer", ("read_file",), "reader", ("read_file",),
+                      child_task="inspect"))
+    lease = sched.dispatch(task_ids={child.id})[0]
+    rec = sched._tasks[child.id]
+    evidence = [{"exact": True}]
+    digest = hashlib.sha256(json.dumps(evidence, sort_keys=True,
+                                    ensure_ascii=False).encode()).hexdigest()
+    for run, fence, key, artifact in (
+        ("wrong", lease.fencing_token, rec.idempotency_key, digest),
+        (rec.run_token, lease.fencing_token + 1, rec.idempotency_key, digest),
+        (rec.run_token, lease.fencing_token, "wrong", digest),
+        (rec.run_token, lease.fencing_token, rec.idempotency_key, "0" * 64),
+    ):
+        assert not sched.publish_child_result(child.id, run, lease.agent_id, fence,
+                                              key, artifact, evidence, status=status)
+        assert rec.state is LifecycleState.RUNNING
+    sched.clock = lambda: lease.lease_until + 1
+    assert sched.publish_child_result(child.id, rec.run_token, lease.agent_id,
+                                      lease.fencing_token, rec.idempotency_key,
+                                      digest, evidence, status=status)
+    assert rec.state is state and rec.result_status == status
+    assert rec.observed_execution == "unavailable"
+    assert rec.attempt_state == "terminal" and rec.lease is None
+    assert child.id not in sched._claims
+    again = DynamicChildScheduler(audit_log=log)
+    again.replay()
+    replayed = again._tasks[child.id]
+    assert replayed.state is state and replayed.result_status == status
+    assert replayed.observed_execution == "unavailable"
+    assert replayed.attempt_state == "terminal" and replayed.lease is None
+    assert again.dispatch(task_ids={child.id}) == []
+
+
+def test_delegated_child_scope_is_parent_subset(tmp_path: Path) -> None:
+    sched = _scheduler_with_budget(tmp_path)
+    _submit(sched, [_node("parent", role="writer", tools=("read_file",),
+                          permissions=("repo:read",))])
+    sched.dispatch()
+    parent_token = sched._tasks["parent"].run_token
+    denied = sched.delegate_child(
+        "parent", parent_token, "bad", ChildProposal("writer", ("read_file",),
+        "writer", ("write_file",), "write", child_permissions=("repo:write",)))
+    assert isinstance(denied, DenyDecision)
+    assert len(sched.snapshot()["tasks"]) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -825,3 +970,35 @@ def test_dag_node_limit_denied(tmp_path: Path) -> None:
     events = sched.audit_log.replay()
     denies = [e for e in events if e.get("reason") == DenyReason.DAG_NODE_LIMIT.value]
     assert denies
+
+
+def test_audit_flush_fsyncs_claim_before_dispatch_returns(tmp_path: Path, monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(scheduler_module.os, "fsync", lambda fd: calls.append(fd))
+    log = AuditLog(tmp_path / "durable.jsonl")
+    sched = DynamicChildScheduler(
+        budget=SchedulerBudget(max_global_concurrency=1),
+        clock=lambda: 1000.0,
+        audit_log=log,
+    )
+    _submit(sched, [_node("root")])
+    calls.clear()
+    leases = sched.dispatch()
+    assert len(leases) == 1
+    assert len(calls) >= 2  # file + containing directory
+    events = [json.loads(line) for line in (tmp_path / "durable.jsonl").read_text().splitlines()]
+    claim = events[-1]
+    assert claim["event"] == "claim"
+    assert claim["holder"] == leases[0].holder
+    assert claim["run_token"] == sched._tasks["root"].run_token
+
+
+def test_pre_delivery_pending_lease_can_still_be_reclaimed(tmp_path: Path) -> None:
+    sched = _scheduler_with_budget(tmp_path, max_global=1, clock=lambda: 1000.0)
+    _submit(sched, [_node("root")])
+    original = sched._tasks["root"].lease
+    assert sched._tasks["root"].run_token is None
+    reclaimed = sched.reclaim(original.holder, now=1100.0)
+    assert reclaimed == ["root"]
+    assert sched._tasks["root"].state == LifecycleState.PENDING
+    assert sched._tasks["root"].lease.fencing_token > original.fencing_token

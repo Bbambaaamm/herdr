@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+"""Delegate one economic child from a verified Agent Stack task pane."""
+import argparse
+import hashlib
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+from pathlib import Path
+from contextlib import closing
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from herdr.runtime import (MAX_PROMPT_CHARS, AdmissionRegistry, HerdrChildRuntime, HerdrRuntimeError,
+                           PreDeliveryFailure,
+                           SubprocessHerdrRunner, _json_result)
+from herdr.scheduler import (AuditLog, ChildProposal, DenyDecision,
+                             DynamicChildScheduler, SchedulerError)
+from herdr.taskgraph import LifecycleState
+from agent_durable_children import (attempt_directory, ledger_required,
+                                    mark_ledger_required, parent_attempt_guard,
+                                    publish_exact_child_result)
+from agent_durable_sandbox import PinnedWorktree
+
+
+def _delivery_prompt(prompt, result_path, child_id, run_token, fencing_token,
+                     idempotency_key):
+    return (f"{prompt}\n\nDurable child result: write UTF-8 JSON to {result_path}. "
+            f"Use task_id={child_id}, run_token={run_token}, "
+            f"fencing_token={fencing_token}, idempotency_key={idempotency_key}, "
+            "status=completed|blocked|failed, a nonempty evidence list, "
+            "and exact fencing_token and idempotency_key. "
+            "artifact_sha256 is SHA-256 of the UTF-8 bytes produced exactly by Python "
+            "json.dumps(evidence, sort_keys=True, ensure_ascii=False, allow_nan=False) "
+            "with the default separators/whitespace. "
+            "Evidence binds the result identity; it does not prove tests passed.")
+
+
+def _validate_delivery_prompt(prompt, directory, child_id):
+    """Bound the complete prompt before the attempt directory can be created.
+
+    A replayed ledger may start at a higher fencing token. At most 256 nodes
+    can be admitted, so account for every remaining claim before taking the
+    parent lock; another bridge request may claim while this one waits.
+    """
+    ledger = directory / "scheduler.jsonl"
+    scheduler = DynamicChildScheduler(audit_log=AuditLog(ledger))
+    if ledger.is_file():
+        if not ledger_required(directory):
+            raise SchedulerError("durable child scheduler sentinel missing")
+        scheduler.replay()
+    elif ledger_required(directory):
+        raise SchedulerError("durable child scheduler ledger missing")
+    existing = scheduler._tasks.get(child_id)
+    if existing is not None:
+        token = existing.run_token or "x" * 32
+        key = existing.idempotency_key or "x" * 64
+        fence = existing.fencing_token or 0
+    else:
+        token = "x" * 32  # uuid4().hex in scheduler.dispatch()
+        key = "x" * 64  # SHA-256 in scheduler.dispatch()
+        # Parent registration consumes one fence. Every remaining DAG node
+        # can consume one more before this request acquires bridge.lock.
+        fence = scheduler._next_fencing_token_value + scheduler.budget.max_dag_nodes
+    result_path = directory / "results" / f"{child_id}.result.json"
+    preview = _delivery_prompt(prompt, result_path, child_id, token, fence, key)
+    if len(preview) > MAX_PROMPT_CHARS:
+        raise ValueError("managed child prompt exceeds maximum length")
+
+
+def _required_env(name):
+    value = os.environ.get(name, "")
+    if not value:
+        raise ValueError(f"missing {name}")
+    return value
+
+
+def _write_capable_request(args) -> bool:
+    write_tools = {"write_file", "write", "patch", "edit_file", "apply_patch", "shell"}
+    return (args.role in {"writer", "reviewer"}
+            and "workspace-write" in args.permission
+            and bool(write_tools.intersection(args.tool)))
+
+
+def _resolve_child_cwd(task: dict, args) -> Path:
+    raw = str(getattr(args, "cwd", "") or "").strip()
+    writable = _write_capable_request(args)
+    if not raw:
+        if writable:
+            raise ValueError("write-capable child requires exact --cwd worktree")
+        workspace = Path(str(task.get("workspace") or ""))
+        if not workspace.is_absolute() or not workspace.is_dir():
+            raise ValueError("parent workspace unavailable")
+        return workspace.resolve(strict=True)
+
+    root_raw = str(task.get("worktree_root") or "")
+    if not root_raw:
+        raise ValueError("consumer worktree root unavailable")
+    root = Path(root_raw).resolve(strict=True)
+    candidate = Path(raw).resolve(strict=True)
+    if not candidate.is_dir() or candidate == root or root not in candidate.parents:
+        raise ValueError("child cwd must be an exact worktree below consumer root")
+    proc = subprocess.run(
+        ["git", "-C", str(candidate), "rev-parse", "--show-toplevel"],
+        text=True, capture_output=True, timeout=10, check=False,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        raise ValueError("child cwd is not a Git worktree")
+    try:
+        top = Path(proc.stdout.strip()).resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("child cwd Git top-level unavailable") from exc
+    if top != candidate:
+        raise ValueError("child cwd must be the Git worktree top-level")
+    return candidate
+
+
+def _pin_child_cwd(task: dict, args) -> PinnedWorktree:
+    """Validate the exact directory through an fd that survives pane launch."""
+    logical = _resolve_child_cwd(task, args)
+    root_raw = str(task.get("worktree_root") or "")
+    explicit = bool(str(getattr(args, "cwd", "") or "").strip())
+    root = (Path(root_raw).resolve(strict=True)
+            if root_raw and Path(root_raw).is_dir() else None)
+    if explicit and root is None:
+        raise ValueError("consumer worktree root unavailable")
+    flags = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        fd = os.open(logical, flags)
+    except OSError as exc:
+        raise ValueError("child cwd cannot be pinned") from exc
+    pin = None
+    try:
+        held = os.fstat(fd)
+        pin = PinnedWorktree(logical, fd, held.st_dev, held.st_ino, root)
+        pin.verify()
+        if explicit:
+            if root is None or logical == root or root not in logical.parents:
+                raise ValueError("child cwd is outside consumer worktree root")
+            proc = subprocess.run(
+                ["git", "-C", f"/proc/self/fd/{fd}", "rev-parse", "--show-toplevel"],
+                text=True, capture_output=True, timeout=10, check=False,
+                pass_fds=(fd,),
+            )
+            if proc.returncode != 0 or not proc.stdout.strip():
+                raise ValueError("pinned child cwd is not a Git worktree")
+            if Path(proc.stdout.strip()) != logical:
+                raise ValueError("pinned child cwd is not the requested Git top-level")
+        current = os.stat(logical, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (pin.device, pin.inode):
+            raise ValueError("child cwd changed while pinning")
+        return pin
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _parent_context(runner):
+    task_id = _required_env("HERDR_DURABLE_TASK_ID")
+    token = _required_env("HERDR_DURABLE_RUN_TOKEN")
+    task_file = Path(_required_env("HERDR_DURABLE_TASK_FILE")).resolve(strict=True)
+    agent = _required_env("HERDR_DURABLE_AGENT")
+    marker = _required_env("HERDR_DURABLE_MARKER")
+    if marker != _required_env("HERDR_DURABLE_TASK_PANE"):
+        raise ValueError("parent pane marker mismatch")
+    task = json.loads(task_file.read_text(encoding="utf-8"))
+    session = task.get("execution_session")
+    if (not isinstance(session, dict) or task.get("id") != task_id
+            or task.get("run_token") != token
+            or not task.get("idempotency_key") or task.get("attempt_state") not in {
+                "dispatching", "accepted", "delivery_uncertain", "result_ready", "verifying"
+            } or session.get("closed_at") or not session.get("owned_pane")
+            or session.get("agent_name") != agent or session.get("pane_marker") != marker
+            or session.get("session_name") != marker):
+        raise ValueError("parent task attempt/session mismatch")
+    pane = str(session.get("pane_id") or "")
+    if not pane or os.environ.get("HERDR_PANE_ID") != pane:
+        raise ValueError("parent pane mismatch")
+    payload = _json_result(runner.run(["agent", "get", agent]), "parent agent get")
+    live = (payload.get("result") or {}).get("agent")
+    if not isinstance(live, dict) or live.get("pane_id") != pane:
+        raise ValueError("parent agent is not in task pane")
+    info = _json_result(runner.run(["pane", "process-info", "--pane", pane]),
+                        "parent pane process-info")
+    process = (info.get("result") or {}).get("process_info")
+    if not isinstance(process, dict):
+        raise ValueError("parent pane ownership unavailable")
+    try:
+        pid = int(process.get("shell_pid") or 0)
+        environ = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except (OSError, ValueError):
+        raise ValueError("parent pane ownership unavailable") from None
+    if f"HERDR_DURABLE_TASK_PANE={marker}".encode() not in environ:
+        raise ValueError("parent pane ownership mismatch")
+    role = task.get("parent_role")
+    tools = task.get("parent_tools")
+    permissions = task.get("parent_permissions")
+    if (role not in {"reader", "writer", "reviewer"}
+            or not isinstance(tools, list) or not isinstance(permissions, list)
+            or not all(isinstance(item, str) for item in tools + permissions)):
+        raise ValueError("explicit parent scope missing")
+    config = Path(__file__).resolve().parents[1] / "config/github-intake-consumers.json"
+    consumers = json.loads(config.read_text(encoding="utf-8"))["consumers"]
+    matching = [entry for entry in consumers
+                if entry.get("repository") == task.get("repo")
+                and entry.get("safety_profile") == task.get("safety_profile")]
+    role_rank = {"reader": 1, "writer": 2, "reviewer": 3}
+    if (len(matching) != 1
+            or role_rank.get(role, 0) > role_rank.get(matching[0].get("parent_role"), 0)
+            or not set(tools) <= set(matching[0].get("parent_tools", []))
+            or not set(permissions) <= set(matching[0].get("parent_permissions", []))
+            or task.get("worktree_root") != matching[0].get("worktree_root")):
+        raise ValueError("parent scope differs from consumer policy")
+    return task, pane, agent, marker
+
+
+def delegate(args, *, runner=None):
+    real = _required_env("HERDR_REAL_BINARY")
+    if not Path(real).is_absolute() or not Path(real).is_file():
+        raise ValueError("real Herdr binary unavailable")
+    runner = runner or SubprocessHerdrRunner(real)
+    task, pane, agent, marker = _parent_context(runner)
+    if isinstance(runner, SubprocessHerdrRunner):
+        runner.env = {**os.environ, "HERDR_ENV": "1", "HERDR_PANE_ID": pane}
+    parent_id, token = task["id"], task["run_token"]
+    with closing(_pin_child_cwd(task, args)) as pinned:
+        return _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned)
+
+
+def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned):
+    child_cwd = pinned.logical
+    parent_id, token = task["id"], task["run_token"]
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", args.key):
+        raise ValueError("invalid delegation key")
+    if not args.objective.strip() or not args.prompt.strip():
+        raise ValueError("objective and prompt required")
+    state_root = Path(_required_env("HERDR_DURABLE_TASK_FILE")).resolve(strict=True).parent.parent
+    directory = attempt_directory(state_root, parent_id, token)
+    predicted_id = (f"{parent_id}-child-"
+                    f"{hashlib.sha256(f'{parent_id}:{token}:{args.key}'.encode()).hexdigest()[:16]}")
+    result_path = directory / "results" / f"{predicted_id}.result.json"
+    _validate_delivery_prompt(args.prompt, directory, predicted_id)
+    with parent_attempt_guard(state_root, parent_id, token):
+        # Recheck while holding the same lock as parent terminalization.
+        current = json.loads(Path(_required_env("HERDR_DURABLE_TASK_FILE")).read_text(
+            encoding="utf-8"))
+        if (current.get("id") != parent_id or current.get("run_token") != token
+                or current.get("attempt_state") not in {
+                    "dispatching", "accepted", "delivery_uncertain", "result_ready", "verifying"
+                }):
+            raise ValueError("parent attempt changed during delegation")
+        ledger = directory / "scheduler.jsonl"
+        ledger_preexisting = ledger.is_file()
+        if ledger_preexisting and not ledger_required(directory):
+            raise SchedulerError("durable child scheduler sentinel missing")
+        if ledger_required(directory) and not ledger_preexisting:
+            raise SchedulerError("durable child scheduler ledger missing")
+        scheduler = DynamicChildScheduler(audit_log=AuditLog(ledger))
+        scheduler.replay()
+        # The outer preflight is conservative for concurrent claims. Recheck
+        # exact identities here before registering the parent or child.
+        existing = scheduler._tasks.get(predicted_id)
+        fence = (existing.fencing_token if existing is not None else
+                 scheduler._next_fencing_token_value + (parent_id not in scheduler._tasks))
+        token_preview = (existing.run_token if existing is not None else None) or "x" * 32
+        key_preview = (existing.idempotency_key if existing is not None else None) or "x" * 64
+        if len(_delivery_prompt(args.prompt, result_path, predicted_id,
+                                token_preview, fence, key_preview)) > MAX_PROMPT_CHARS:
+            raise ValueError("managed child prompt exceeds maximum length")
+        parent_result = state_root / "results" / f"{parent_id}.json"
+        published = False
+        if parent_result.exists():
+            if parent_result.stat().st_size == 0:
+                # Worker pre-creates an empty writable bind target for the sandbox.
+                # Zero bytes carry no semantic result authority.
+                result = None
+            else:
+                try:
+                    result = json.loads(parent_result.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise ValueError("parent result is corrupt") from exc
+                if not isinstance(result, dict):
+                    raise ValueError("parent result is corrupt")
+                if (result.get("task_id") != parent_id
+                        or result.get("run_token") != token):
+                    raise ValueError("parent result identity mismatch")
+                published = True
+        if published and not any(
+            rec.parent_task_id == parent_id and rec.parent_run_token == token
+            and rec.delegation_key == args.key for rec in scheduler._tasks.values()
+        ):
+            raise ValueError("parent result already published; new child denied")
+        scheduler.register_external_parent_attempt(
+            task_id=parent_id, run_token=token,
+            idempotency_key=task["idempotency_key"], agent_name=agent,
+            pane_id=pane, marker=marker, repo=task["repo"],
+            issue=str(task.get("issue") or ""), role=task["parent_role"],
+            tools=task["parent_tools"], permissions=task["parent_permissions"],
+            policy_profile=task["safety_profile"])
+        if not ledger.is_file():
+            raise SchedulerError("durable child scheduler ledger missing")
+        mark_ledger_required(directory)
+        proposal = ChildProposal(parent_role=task["parent_role"],
+                                 parent_tools=tuple(task["parent_tools"]),
+                                 parent_permissions=tuple(task["parent_permissions"]),
+                                 child_role=args.role, child_tools=tuple(args.tool),
+                                 child_permissions=tuple(args.permission),
+                                 child_task=args.objective,
+                                 worktree_identity=pinned.identity)
+        child = scheduler.delegate_child(parent_id, token, args.key, proposal)
+        if isinstance(child, DenyDecision):
+            raise ValueError(f"child denied: {child.reason.value}")
+        if child.id != predicted_id:
+            raise SchedulerError("child identity differs from predicted identity")
+        result_dir = directory / "results"
+        result_dir.mkdir(mode=0o700, exist_ok=True)
+        rec = scheduler._tasks[child.id]
+        newly_claimed = rec.state is LifecycleState.PENDING
+        if newly_claimed:
+            leases = scheduler.dispatch(task_ids={child.id})
+            if len(leases) != 1 or leases[0].task_id != child.id:
+                raise SchedulerError("child claim unavailable")
+            rec = scheduler._tasks[child.id]
+        delivery_prompt = _delivery_prompt(args.prompt, result_path, child.id,
+                                           rec.run_token, rec.fencing_token,
+                                           rec.idempotency_key)
+        if len(delivery_prompt) > MAX_PROMPT_CHARS:
+            raise ValueError("managed child prompt exceeds maximum length")
+        scheduler.bind_child_prompt(child.id, delivery_prompt)
+        # Only the call that made the durable claim may deliver. A replayed
+        # accepted claim is ambiguous and must never be prompted again.
+        runtime = None
+        if newly_claimed:
+            runtime = HerdrChildRuntime(
+                scheduler, runner, cwd=child_cwd, pinned_worktree=pinned,
+                snapshot_path=directory / "swarm.json",
+                env={**os.environ, "HERDR_ENV": "1", "HERDR_PANE_ID": pane,
+                     "HERDR_PROFILE": task["safety_profile"],
+                     "HERDR_HERMES_PROFILE": task.get("hermes_profile", "quantlab")},
+                admission_registry=AdmissionRegistry())
+            try:
+                runtime.run_managed_child(rec.lease, delivery_prompt,
+                                          run_token=rec.run_token,
+                                          idempotency_key=rec.idempotency_key)
+            except PreDeliveryFailure as exc:
+                if not rec.pre_delivery_failure or rec.pre_delivery_failure != exc.detail:
+                    raise SchedulerError("pre-delivery failure audit missing or mismatched") from exc
+            # An error after prompt invocation remains the accepted attempt.
+        result_status = (None if rec.pre_delivery_failure else
+                         publish_exact_child_result(scheduler, rec, result_path))
+        if result_status is not None:
+            # Exact terminal result evidence permits deterministic resource
+            # cleanup. Without such evidence the execution pane remains owned
+            # and quarantined for late-result reconciliation.
+            reconciler = runtime or HerdrChildRuntime(
+                scheduler, runner, cwd=child_cwd, pinned_worktree=pinned,
+                snapshot_path=directory / "swarm.json",
+                env={**os.environ, "HERDR_ENV": "1", "HERDR_PANE_ID": pane,
+                     "HERDR_PROFILE": task["safety_profile"],
+                     "HERDR_HERMES_PROFILE": task.get("hermes_profile", "quantlab")},
+                admission_registry=AdmissionRegistry())
+            # Even the immediate result path must re-prove the exact live
+            # agent/pane/marker before closing anything.
+            reconciler.cleanup_bound_child(child.id)
+            if rec.execution_pane and not scheduler.mark_child_cleanup_complete(child.id):
+                raise SchedulerError("child cleanup evidence denied")
+    return {"task_id": child.id, "parent_task_id": parent_id,
+                "run_token": rec.run_token, "agent_id": rec.agent_id,
+                "fencing_token": rec.fencing_token,
+                "idempotency_key": rec.idempotency_key,
+                "state": rec.state.value,
+                "result_status": result_status,
+                "pre_delivery_failure": rec.pre_delivery_failure,
+                "observed_execution": rec.observed_execution,
+                "evidence_note": "UI settlement is observation, not proof of tests or semantic completion"}
+
+
+MAX_REQUEST = 131072
+
+
+def client_delegate(args):
+    """The sandbox client has no real-Herdr execution path."""
+    if os.environ.get("HERDR_DURABLE_SANDBOX") != "1":
+        raise ValueError("durable sandbox marker missing")
+    name = _required_env("HERDR_DURABLE_BRIDGE_SOCKET")
+    if not name.startswith("@") or len(name) > 100:
+        raise ValueError("invalid bridge socket")
+    request = {
+        "operation": "delegate",
+        "task_id": _required_env("HERDR_DURABLE_TASK_ID"),
+        "run_token": _required_env("HERDR_DURABLE_RUN_TOKEN"),
+        "agent": _required_env("HERDR_DURABLE_AGENT"),
+        "pane": _required_env("HERDR_PANE_ID"),
+        "marker": _required_env("HERDR_DURABLE_MARKER"),
+        "key": args.key, "role": args.role, "objective": args.objective,
+        "prompt": args.prompt, "tool": args.tool, "permission": args.permission,
+        "cwd": str(getattr(args, "cwd", "") or ""),
+    }
+    payload = json.dumps(request, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    if len(payload) > MAX_REQUEST:
+        raise ValueError("delegation request too large")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(3600)
+        connection.connect("\0" + name[1:])
+        connection.sendall(len(payload).to_bytes(4, "big") + payload)
+        length = int.from_bytes(_receive(connection, 4), "big")
+        if not 0 < length <= MAX_REQUEST:
+            raise ValueError("invalid bridge response length")
+        response = json.loads(_receive(connection, length))
+    if not isinstance(response, dict) or set(response) != {"ok", "result", "error"}:
+        raise ValueError("invalid bridge response")
+    if not response["ok"]:
+        raise ValueError(str(response["error"]))
+    return response["result"]
+
+
+def _receive(connection, length):
+    data = bytearray()
+    while len(data) < length:
+        chunk = connection.recv(length - len(data))
+        if not chunk:
+            raise ValueError("bridge connection closed")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--key", required=True)
+    parser.add_argument("--role", required=True)
+    parser.add_argument("--objective", required=True)
+    parser.add_argument("--prompt", required=True)
+    parser.add_argument("--tool", action="append", default=[])
+    parser.add_argument("--permission", action="append", default=[])
+    parser.add_argument("--cwd", default="")
+    args = parser.parse_args()
+    try:
+        if os.environ.get("HERDR_DURABLE_BRIDGE_SOCKET"):
+            result = client_delegate(args)
+        elif os.environ.get("HERDR_DURABLE_SANDBOX") == "1":
+            raise ValueError("durable bridge unavailable")
+        else:
+            raise ValueError("durable bridge required")
+        print(json.dumps(result, sort_keys=True))
+    except (ValueError, OSError, SchedulerError, HerdrRuntimeError) as exc:
+        print(f"durable child denied: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import time
+import stat
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -83,6 +84,14 @@ class HerdrRuntimeError(RuntimeError):
         super().__init__(f"{code}: {detail}")
         self.code = code
         self.detail = detail
+
+
+class PreDeliveryFailure(HerdrRuntimeError):
+    """A managed child failed before runner.run(agent prompt) was invoked."""
+
+    def __init__(self, reason: str, *, cleanup_complete: bool) -> None:
+        super().__init__("child_pre_delivery_failed", reason)
+        self.cleanup_complete = cleanup_complete
 
 
 def _json_result(result: CommandResult, action: str) -> dict[str, object]:
@@ -224,7 +233,7 @@ def scheduler_resource_usage(
 
 @dataclass
 class AdmissionRegistry:
-    """Cross-runtime durable child-slot registry with lease-based crash recovery."""
+    """Cross-runtime durable child-slot registry requiring explicit release."""
 
     path: Path = DEFAULT_ADMISSION_REGISTRY
 
@@ -255,18 +264,22 @@ class AdmissionRegistry:
     def _write(self, entries: Sequence[Mapping[str, object]]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(
-            json.dumps(
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(
                 {"version": 1, "entries": list(entries)},
                 sort_keys=True,
                 separators=(",", ":"),
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        tmp.chmod(0o640)
+            ) + "\n")
+            handle.flush()
+            os.fchmod(handle.fileno(), 0o640)
+            os.fsync(handle.fileno())
         tmp.replace(self.path)
         self.path.chmod(0o640)
+        directory_fd = os.open(self.path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
     def _lock_fd(self) -> int:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -286,14 +299,17 @@ class AdmissionRegistry:
         *,
         now: float | None = None,
     ) -> None:
-        moment = time.time() if now is None else now
         fd = self._lock_fd()
         try:
+            existing = self._read()
+            if any(entry["agent_id"] == lease.agent_id and
+                   (entry["task_id"], entry["fencing_token"]) !=
+                   (lease.task_id, lease.fencing_token) for entry in existing):
+                raise HerdrRuntimeError("child_admission_identity_conflict", lease.agent_id)
             entries = [
                 entry
-                for entry in self._read()
-                if float(entry["lease_until"]) > moment
-                and entry["agent_id"] != lease.agent_id
+                for entry in existing
+                if entry["agent_id"] != lease.agent_id
             ]
             registry_repo: dict[str, int] = {}
             registry_issue: dict[tuple[str, str], int] = {}
@@ -347,15 +363,17 @@ class AdmissionRegistry:
         finally:
             os.close(fd)
 
-    def release(self, agent_id: str, *, now: float | None = None) -> None:
-        moment = time.time() if now is None else now
+    def release(self, agent_id: str, *, now: float | None = None,
+                task_id: str | None = None, fencing_token: int | None = None) -> None:
+        if (task_id is None) != (fencing_token is None):
+            raise HerdrRuntimeError("admission_release_unproven", agent_id)
         fd = self._lock_fd()
         try:
-            entries = [
-                entry
-                for entry in self._read()
-                if float(entry["lease_until"]) > moment and entry["agent_id"] != agent_id
-            ]
+            entries = self._read()
+            entries = [entry for entry in entries if not (
+                entry["agent_id"] == agent_id and
+                (task_id is None or
+                 (entry["task_id"], entry["fencing_token"]) == (task_id, fencing_token)))]
             self._write(entries)
         finally:
             os.close(fd)
@@ -375,6 +393,7 @@ class HerdrChildRuntime:
         runner: HerdrRunner,
         *,
         cwd: Path,
+        pinned_worktree: object | None = None,
         snapshot_path: Path = DEFAULT_SNAPSHOT,
         env: Mapping[str, str] | None = None,
         host_guard: Callable[[], bool] = host_resources_allow_spawn,
@@ -387,7 +406,8 @@ class HerdrChildRuntime:
     ) -> None:
         self.scheduler = scheduler
         self.runner = runner
-        self.cwd = cwd.resolve()
+        self.cwd = Path(cwd).absolute() if pinned_worktree is not None else cwd.resolve()
+        self.pinned_worktree = pinned_worktree
         self.snapshot_path = snapshot_path
         self.env = dict(env if env is not None else os.environ)
         self.host_guard = host_guard
@@ -457,7 +477,7 @@ class HerdrChildRuntime:
             issue=context["issue"],
             parent_role=parent.role,
             parent_tools=frozenset(parent.tools),
-            paper_only=context["policy_profile"] == "quantlab-paper",
+            paper_only=context["policy_profile"] in {"quantlab", "quantlab-paper"},
         )
         spec = TaskGraphSpec(
             node_count=node_count,
@@ -478,7 +498,8 @@ class HerdrChildRuntime:
         self._reserved_agents.add(lease.agent_id)
         self._reservation_panes[lease.agent_id] = None
 
-    def _create_pane(self, index: int) -> str:
+    def _create_pane(self, index: int, marker: str | None = None,
+                     policy_env: Mapping[str, str] | None = None) -> str:
         self._assert_prepared()
         direction = "right" if index % 2 == 0 else "down"
         payload = _json_result(
@@ -491,6 +512,9 @@ class HerdrChildRuntime:
                     direction,
                     "--cwd",
                     str(self.cwd),
+                    *(["--env", f"HERDR_DURABLE_TASK_PANE={marker}"] if marker else []),
+                    *(part for key, value in (policy_env or {}).items()
+                      for part in ("--env", f"{key}={value}")),
                     "--no-focus",
                 ]
             ),
@@ -515,7 +539,7 @@ class HerdrChildRuntime:
                 "60000",
                 "--",
                 "-p",
-                DEFAULT_PROFILE,
+                self.env.get("HERDR_HERMES_PROFILE", DEFAULT_PROFILE),
                 "chat",
                 "-t",
                 "bot_room",
@@ -526,7 +550,342 @@ class HerdrChildRuntime:
             ],
             timeout_seconds=75.0,
         )
-        _json_result(result, "agent start")
+        payload = _json_result(result, "agent start")
+        started = (payload.get("result") or {}).get("agent")
+        if not isinstance(started, Mapping) or started.get("name") != lease.agent_id:
+            raise HerdrRuntimeError("child_agent_start_mismatch", lease.agent_id)
+        if started.get("pane_id") and started["pane_id"] != pane_id:
+            raise HerdrRuntimeError("child_wrong_pane", pane_id)
+
+    def _verify_live_child(self, agent_id: str, pane_id: str, marker: str,
+                           *, require_sandbox: bool = False,
+                           require_owned: bool = True) -> str:
+        if require_owned and pane_id not in self._owned_panes:
+            raise HerdrRuntimeError("child_pane_unowned", pane_id)
+        payload = _json_result(self.runner.run(["agent", "get", agent_id]), "agent get")
+        agent = (payload.get("result") or {}).get("agent")
+        if (not isinstance(agent, Mapping) or agent.get("name") != agent_id
+                or agent.get("pane_id") != pane_id):
+            raise HerdrRuntimeError("child_wrong_pane", agent_id)
+        info = _json_result(self.runner.run(["pane", "process-info", "--pane", pane_id]),
+                            "pane process-info")
+        process = (info.get("result") or {}).get("process_info")
+        if not isinstance(process, Mapping):
+            raise HerdrRuntimeError("child_marker_missing", pane_id)
+        # Managed children run behind a bwrap PID/mount boundary. Prove the
+        # marker on an inner process when such a namespace exists; retain the
+        # legacy shell-marker path for the older read-only canary runtime.
+        marker_ok = False
+        try:
+            import importlib.util
+            from importlib.machinery import SourceFileLoader
+            sandbox_file = Path(__file__).resolve().parents[1] / "agent-stack/bin/agent_durable_sandbox.py"
+            loader = SourceFileLoader("agent_durable_sandbox_verify", str(sandbox_file))
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            sandbox = importlib.util.module_from_spec(spec)
+            loader.exec_module(sandbox)
+            inner = sandbox.inner_pid(dict(process), marker)
+            if inner:
+                marker_ok = True
+            elif not require_sandbox:
+                # If any pane foreground process is already in a non-host PID
+                # or mount namespace, this is a managed sandbox and failure to
+                # prove the exact inner marker is fatal. Only the legacy
+                # unsandboxed canary may fall back to the shell marker.
+                host_pid_ns = os.readlink("/proc/self/ns/pid")
+                host_mnt_ns = os.readlink("/proc/self/ns/mnt")
+                namespaced = False
+                for row in process.get("foreground_processes") or []:
+                    if not isinstance(row, Mapping):
+                        continue
+                    try:
+                        pid = int(row.get("pid") or 0)
+                        if pid > 0 and (
+                            os.readlink(f"/proc/{pid}/ns/pid") != host_pid_ns
+                            or os.readlink(f"/proc/{pid}/ns/mnt") != host_mnt_ns
+                        ):
+                            namespaced = True
+                            break
+                    except (OSError, TypeError, ValueError):
+                        continue
+                if not namespaced:
+                    shell_pid = int(process.get("shell_pid") or 0)
+                    environ = Path(f"/proc/{shell_pid}/environ").read_bytes().split(b"\0")
+                    marker_ok = f"HERDR_DURABLE_TASK_PANE={marker}".encode() in environ
+        except (OSError, ValueError, TypeError):
+            marker_ok = False
+        if not marker_ok:
+            raise HerdrRuntimeError("child_sandbox_missing" if require_sandbox
+                                    else "child_marker_missing", pane_id)
+        return str(agent.get("agent_status") or agent.get("status") or "").lower()
+
+    def _child_result_writable(self, task_id: str) -> tuple[Path, ...]:
+        """Create one durable, regular result target; never expose sibling results writable."""
+        result_dir = self.snapshot_path.parent / "results"
+        result_dir.mkdir(parents=True, exist_ok=True)
+        target = result_dir / f"{task_id}.result.json"
+        flags = (os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_CLOEXEC
+                 | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            fd = os.open(target, flags, 0o600)
+        except FileExistsError as exc:
+            raise HerdrRuntimeError("child_result_target_exists", str(target)) from exc
+        try:
+            mode = os.fstat(fd).st_mode
+            if not stat.S_ISREG(mode):
+                raise HerdrRuntimeError("child_result_target_invalid", str(target))
+            os.fchmod(fd, 0o600)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        directory_fd = os.open(result_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                               | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return (target,)
+
+    def _sandbox_child_pane(self, pane_id: str, marker: str, real: str,
+                            task_id: str) -> Path:
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
+        sandbox_file = Path(__file__).resolve().parents[1] / "agent-stack/bin/agent_durable_sandbox.py"
+        loader = SourceFileLoader("agent_durable_sandbox_runtime", str(sandbox_file))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        sandbox = importlib.util.module_from_spec(spec)
+        loader.exec_module(sandbox)
+        policy = sandbox.frozen_policy()
+        writable = self._child_result_writable(task_id)
+        sandbox_args = sandbox.command(
+            self.cwd,
+            Path(real),
+            writable=writable,
+            policy=policy,
+            child_workspace_writable=self._child_workspace_writable(task_id),
+            pinned_worktree=self.pinned_worktree,
+        )
+        _json_result(self.runner.run(["pane", "run", pane_id,
+                                      sandbox.shell_command(sandbox_args)]), "child sandbox start")
+        info = _json_result(self.runner.run(["pane", "process-info", "--pane", pane_id]),
+                            "child sandbox process-info")
+        process_info = (info.get("result") or {}).get("process_info")
+        sandbox_pid = sandbox.inner_pid(
+            dict(process_info) if isinstance(process_info, Mapping) else {}, marker
+        )
+        if not sandbox_pid or not sandbox.verify(sandbox_pid, Path(real), marker, policy=policy):
+            raise HerdrRuntimeError("child_sandbox_unverified", pane_id)
+        return policy
+
+    def _child_workspace_writable(self, task_id: str) -> bool:
+        node = self.scheduler.task_node(task_id)
+        write_tools = {"write_file", "write", "patch", "edit_file", "apply_patch", "shell"}
+        return (node.role in {"writer", "reviewer"}
+                and "workspace-write" in node.permissions
+                and bool(write_tools.intersection(node.tools)))
+
+    def cleanup_bound_child(self, task_id: str) -> None:
+        """Close a previously bound durable child after exact result reconciliation."""
+        rec = self.scheduler._tasks.get(task_id)
+        if rec is None:
+            raise HerdrRuntimeError("unknown_child_task", task_id)
+        pane_id = str(rec.execution_pane or "")
+        if pane_id:
+            if (rec.execution_agent != rec.agent_id or not rec.execution_marker
+                    or not rec.run_token or not rec.idempotency_key
+                    or not rec.fencing_token):
+                raise HerdrRuntimeError("child_cleanup_unproven", pane_id)
+            listed = _json_result(self.runner.run(["pane", "list"]), "pane list")
+            panes = (listed.get("result") or {}).get("panes")
+            if not isinstance(panes, list):
+                raise HerdrRuntimeError("child_cleanup_unproven", pane_id)
+            present = any(isinstance(row, Mapping) and row.get("pane_id") == pane_id
+                          for row in panes)
+            if present:
+                agent = str(rec.execution_agent or "")
+                marker = str(rec.execution_marker or "")
+                if not agent or not marker or agent != rec.agent_id:
+                    raise HerdrRuntimeError("child_cleanup_unproven", pane_id)
+                self._verify_live_child(agent, pane_id, marker, require_sandbox=True,
+                                        require_owned=False)
+            else:
+                self.admission_registry.release(
+                    rec.agent_id, now=self.scheduler.current_time(),
+                    task_id=rec.id, fencing_token=rec.fencing_token)
+                return
+            result = self.runner.run(["pane", "close", pane_id], timeout_seconds=15.0)
+            if result.returncode != 0:
+                listed = _json_result(self.runner.run(["pane", "list"]), "pane list")
+                panes = (listed.get("result") or {}).get("panes")
+                if not isinstance(panes, list):
+                    raise HerdrRuntimeError("child_cleanup_unproven", pane_id)
+                if any(isinstance(row, Mapping) and row.get("pane_id") == pane_id for row in panes):
+                    raise HerdrRuntimeError("child_cleanup_failed", pane_id)
+        if rec.agent_id:
+            self.admission_registry.release(
+                rec.agent_id, now=self.scheduler.current_time(),
+                task_id=rec.id, fencing_token=rec.fencing_token)
+
+    def _verify_created_pane_marker(self, pane_id: str, marker: str) -> None:
+        info = _json_result(self.runner.run(["pane", "process-info", "--pane", pane_id]),
+                            "child pane process-info")
+        process = (info.get("result") or {}).get("process_info")
+        try:
+            pid = int(process.get("shell_pid") or 0) if isinstance(process, Mapping) else 0
+            environ = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0") if pid > 0 else []
+        except (OSError, TypeError, ValueError):
+            environ = []
+        if f"HERDR_DURABLE_TASK_PANE={marker}".encode() not in environ:
+            raise HerdrRuntimeError("child_cleanup_unproven", pane_id)
+
+    def cleanup_managed_pre_delivery(self, lease: _Lease, pane_id: str | None,
+                                     marker: str, *, agent_start_attempted: bool) -> None:
+        """Close only a missing or live, exactly identified created pane."""
+        if not pane_id:
+            raise HerdrRuntimeError("child_cleanup_unproven", lease.task_id)
+        listed = _json_result(self.runner.run(["pane", "list"]), "pane list")
+        panes = (listed.get("result") or {}).get("panes")
+        if not isinstance(panes, list):
+            raise HerdrRuntimeError("child_cleanup_unproven", pane_id)
+        present = any(isinstance(row, Mapping) and row.get("pane_id") == pane_id
+                      for row in panes)
+        if present:
+            if pane_id not in self._owned_panes or not marker:
+                raise HerdrRuntimeError("child_cleanup_unproven", pane_id)
+            self._verify_created_pane_marker(pane_id, marker)
+            if agent_start_attempted:
+                self._verify_live_child(lease.agent_id, pane_id, marker,
+                                        require_sandbox=True)
+            result = self.runner.run(["pane", "close", pane_id], timeout_seconds=15.0)
+            if result.returncode != 0:
+                listed = _json_result(self.runner.run(["pane", "list"]), "pane list")
+                remaining = (listed.get("result") or {}).get("panes")
+                if (not isinstance(remaining, list) or any(
+                        isinstance(row, Mapping) and row.get("pane_id") == pane_id
+                        for row in remaining)):
+                    raise HerdrRuntimeError("child_cleanup_failed", pane_id)
+        self._owned_panes.discard(pane_id)
+        self.admission_registry.release(
+            lease.agent_id, now=self.scheduler.current_time(),
+            task_id=lease.task_id, fencing_token=lease.fencing_token)
+        self._reserved_agents.discard(lease.agent_id)
+        self._reservation_panes.pop(lease.agent_id, None)
+
+    def cleanup_bound_pre_delivery(self, task_id: str) -> None:
+        rec = self.scheduler._tasks[task_id]
+        if not rec.pre_delivery_failure or not rec.execution_pane or not all((
+                rec.execution_agent, rec.execution_marker, rec.fencing_token,
+                rec.run_token, rec.idempotency_key)):
+            raise HerdrRuntimeError("child_cleanup_unproven", task_id)
+        self._owned_panes.add(rec.execution_pane)
+        lease = _Lease(task_id=task_id, agent_id=rec.agent_id, holder="reconcile",
+                       fencing_token=rec.fencing_token, lease_until=0)
+        self.cleanup_managed_pre_delivery(
+            lease, rec.execution_pane, rec.execution_marker,
+            agent_start_attempted=rec.pre_delivery_agent_start_attempted)
+
+    def run_managed_child(self, lease: _Lease, prompt: str, *,
+                          run_token: str, idempotency_key: str) -> str:
+        """Deliver once through the durable scheduler; UI status is observation only."""
+        real = getattr(self.runner, "executable", "")
+        marker = f"child-{run_token}"
+        policy_bin = Path(__file__).resolve().parents[1] / "agent-stack/policy-bin"
+        policy_env = {
+            "HERDR_DURABLE_TASK_ID": lease.task_id,
+            "HERDR_DURABLE_RUN_TOKEN": run_token,
+            "HERDR_DURABLE_MARKER": marker,
+            "HERDR_REAL_BINARY": real,
+            "PATH": f"{policy_bin}:{self.env.get('PATH', os.environ.get('PATH', ''))}",
+        }
+        delivery_started = False
+        agent_start_attempted = False
+        pane_creation_attempted = False
+        pane_id = None
+        try:
+            record = self.scheduler._tasks.get(lease.task_id)
+            if (record is not None and record.worktree_identity and
+                    (self.pinned_worktree is None or
+                     self.pinned_worktree.identity != record.worktree_identity)):
+                raise HerdrRuntimeError("child_worktree_identity_mismatch", lease.task_id)
+            if not real or not Path(real).is_absolute():
+                raise HerdrRuntimeError("real_herdr_required", "managed child needs real binary")
+            self.prepare()
+            self._admit_child(lease)
+            pane_creation_attempted = True
+            pane_id = self._create_pane(0, marker, policy_env)
+            self._reservation_panes[lease.agent_id] = pane_id
+            if not self.scheduler.bind_pre_delivery_pane(lease.task_id, run_token,
+                                                          lease.agent_id, pane_id, marker):
+                raise HerdrRuntimeError("child_bind_denied", lease.task_id)
+            policy = self._sandbox_child_pane(pane_id, marker, real, lease.task_id)
+            self.scheduler.mark_pre_delivery_agent_start(lease.task_id)
+            agent_start_attempted = True
+            self._start_agent(lease, pane_id)
+            self._verify_live_child(lease.agent_id, pane_id, marker, require_sandbox=True)
+            if not self.scheduler.bind_execution_session(lease.task_id, run_token,
+                                                         lease.agent_id, pane_id, marker):
+                raise HerdrRuntimeError("child_bind_denied", lease.task_id)
+            if not self.scheduler.authorize_child_delivery(lease.task_id, run_token,
+                                                           lease.agent_id, lease.fencing_token,
+                                                           idempotency_key):
+                raise HerdrRuntimeError("child_delivery_denied", lease.task_id)
+            self.scheduler.execution_verifier = (
+                lambda agent, pane, bound_marker: self._verify_live_child(
+                    agent, pane, bound_marker, require_sandbox=True))
+            if not prompt or len(prompt) > MAX_PROMPT_CHARS:
+                raise HerdrRuntimeError("invalid_child_prompt", lease.task_id)
+            timeout = int(min(3600.0, max(1.0, self.scheduler.budget.claim_ttl_seconds - 30.0)))
+            delivery_started = True
+            result = self.runner.run(["agent", "prompt", lease.agent_id, prompt,
+                                      "--wait", "--timeout", str(timeout * 1000)],
+                                     timeout_seconds=timeout + 5.0)
+            _json_result(result, "agent prompt")
+            status = self._verify_live_child(lease.agent_id, pane_id, marker,
+                                             require_sandbox=True)
+            if status in {"done", "idle"}:
+                self.scheduler.observe_execution(lease.task_id, run_token, "settled",
+                                                  "herdr_agent_get+pane_marker",
+                                                  agent_name=lease.agent_id, pane_id=pane_id,
+                                                  marker=marker)
+                return "settled"
+            state = "working" if status in {"working", "busy"} else "unavailable"
+            self.scheduler.observe_execution(lease.task_id, run_token, state,
+                                              "herdr_agent_get+pane_marker",
+                                              agent_name=lease.agent_id, pane_id=pane_id,
+                                              marker=marker)
+            return state
+        except Exception as exc:
+            if not delivery_started:
+                reason = f"{type(exc).__name__}: {exc}"[:1024]
+                if not self.scheduler.fail_child_pre_delivery(
+                        lease.task_id, run_token, lease.agent_id, lease.fencing_token,
+                        idempotency_key, reason, cleanup_complete=False,
+                        pane_creation_attempted=pane_creation_attempted):
+                    raise HerdrRuntimeError("child_pre_delivery_audit_denied", lease.task_id) from exc
+                cleaned = False
+                try:
+                    if pane_id is None:
+                        if not pane_creation_attempted:
+                            self.admission_registry.release(
+                                lease.agent_id, now=self.scheduler.current_time(),
+                                task_id=lease.task_id, fencing_token=lease.fencing_token)
+                        else:
+                            raise HerdrRuntimeError("child_cleanup_unproven", lease.task_id)
+                    else:
+                        self.cleanup_managed_pre_delivery(
+                            lease, pane_id, marker,
+                            agent_start_attempted=agent_start_attempted)
+                    cleaned = self.scheduler.mark_pre_delivery_cleanup_complete(lease.task_id)
+                except Exception:
+                    pass
+                raise PreDeliveryFailure(reason, cleanup_complete=cleaned) from exc
+            raise
+        finally:
+            if "policy" in locals():
+                try:
+                    policy.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _prompt_and_complete(self, child: _OwnedChild) -> tuple[str, bool]:
         if len(child.prompt) > MAX_PROMPT_CHARS:
