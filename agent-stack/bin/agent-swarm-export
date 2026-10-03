@@ -537,7 +537,7 @@ def runtime_agent_projection(payload):
     active_bindings = {}
     for task in payload.get("tasks", []):
         agent_id = task.get("agent_id")
-        if isinstance(agent_id, str) and task.get("state") in {"running", "pending"}:
+        if isinstance(agent_id, str) and task.get("state") in {"running", "pending", "blocked"}:
             active_bindings.setdefault(agent_id, set()).add(task["task_id"])
     task_agents = {
         agent_id: next(iter(task_ids)) if len(task_ids) == 1 else None

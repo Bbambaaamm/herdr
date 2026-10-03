@@ -589,8 +589,9 @@ export function mountDashboard(createScene) {
         : '';
       const taskRuntimeWorking = task.repo === 'Bbambaaamm/herdr'
         ? runtimeAgents?.some(row => row.status === 'working' && row.task_id === task.task_id) ?? false
-        : allAgents.some(row => row.profile === 'majak' && row.status === 'working' && row.agent === sceneAgent(task.agent));
-      if (swarm && !taskRuntimeWorking) {
+        : allAgents.some(row => row.profile === (task.repo === 'Bbambaaamm/dotacni-majak' ? 'majak' : 'quantlab')
+          && row.status === 'working' && row.agent === sceneAgent(task.agent));
+      if (!taskRuntimeWorking) {
         return `${project} ${issueLabel(task)} · ${task.task_id} · durable ${durable}${attempt} · živý runtime nepotvrzen.`;
       }
       const reconcile = attempt ? ` · durable ${durable}${attempt}` : '';

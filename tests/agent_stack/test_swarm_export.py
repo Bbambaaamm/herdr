@@ -133,6 +133,24 @@ class SwarmExportTests(unittest.TestCase):
         self.assertEqual([row["agent_id"] for row in rows[0]["runtime_agents"]],
                          ["herdr-codex", "herdr-hermes", "task-hermes"])
 
+    def test_runtime_projection_includes_blocked_tasks_in_unique_binding(self):
+        payload = {"repo": "Bbambaaamm/herdr", "tasks": [
+            {"task_id": "blocked", "state": "blocked", "agent_id": "task-hermes"},
+        ]}
+        raw = {"id": "cli:agent:list", "result": {"type": "agent_list", "agents": [
+            {"name": "task-hermes", "agent_status": "blocked"},
+        ]}}
+        fake = SimpleNamespace(returncode=0, stdout=json.dumps(raw), stderr="")
+        with patch.object(self.exporter.subprocess, "run", return_value=fake):
+            status, agents = self.exporter.runtime_agent_projection(payload)
+        self.assertEqual(status, "available")
+        self.assertEqual(agents[0]["task_id"], "blocked")
+        payload["tasks"].append(
+            {"task_id": "pending", "state": "pending", "agent_id": "task-hermes"})
+        with patch.object(self.exporter.subprocess, "run", return_value=fake):
+            _, agents = self.exporter.runtime_agent_projection(payload)
+        self.assertIsNone(agents[0]["task_id"])
+
     def test_runtime_projection_binds_only_unique_nonterminal_task(self):
         payload = {
             "repo": "Bbambaaamm/herdr",

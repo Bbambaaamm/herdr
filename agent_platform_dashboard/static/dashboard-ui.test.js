@@ -1531,3 +1531,21 @@ test('Majak runtime identity confirms its durable queue task alongside swarm', a
   assert.match(h.get('#face-task').textContent, /Maják #662[^]*live práce probíhá/);
   assert.match(h.get('#coordinator-current').textContent, /majak-live/);
 });
+
+for (const runtimeStatus of ['idle', 'done', 'working']) {
+  test(`queue fallback claims live work only with matching runtime: ${runtimeStatus}`, async t => {
+    const h = await harness(t);
+    const queue = h.snapshot().sources.find(row => row.profile === 'quantlab' && row.kind === 'queue');
+    queue.rows[0].status = 'running';
+    h.snapshot().sources.find(row => row.profile === 'quantlab' && row.kind === 'herdr')
+      .rows.find(row => row.agent === 'quantlab-hermes').status = runtimeStatus;
+    await h.refresh();
+    const copy = h.get('#face-task').textContent;
+    assert.match(copy, /issue190/);
+    if (runtimeStatus === 'working') assert.match(copy, /live práce probíhá/);
+    else {
+      assert.doesNotMatch(copy, /live práce probíhá/);
+      assert.match(copy, /durable running.*živý runtime nepotvrzen/);
+    }
+  });
+}
