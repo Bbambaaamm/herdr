@@ -137,6 +137,19 @@ def _unresolved_threads(repo: str, number: int) -> bool:
         raise EvidenceUnavailable("review thread collection failed") from exc
 
 
+def _check_effective_reviews(reviews: list) -> None:
+    effective = {}
+    for row in sorted(reviews, key=lambda r: (r.get("submitted_at") or "", r.get("id", 0))):
+        if row.get("state") not in {"APPROVED", "CHANGES_REQUESTED"}:
+            continue
+        actor = row.get("user", {}).get("login")
+        if not isinstance(actor, str) or not actor:
+            raise EvidenceUnavailable("review authority is unavailable")
+        effective[actor] = row["state"]
+    if "CHANGES_REQUESTED" in effective.values():
+        raise EvidenceMissing("pull request has outstanding requested changes")
+
+
 def _pr_binding(pr: dict) -> tuple:
     return (pr.get("head", {}).get("sha"), pr.get("base", {}).get("sha"),
             pr.get("head", {}).get("repo", {}).get("full_name"),
@@ -146,7 +159,7 @@ def _pr_binding(pr: dict) -> tuple:
 
 def _collect_github(plan: dict, artifact, number):
     if type(number) is not int or number <= 0:
-        raise EvidenceMissing("a pull request reference is required")
+        raise EvidenceError("immutable pull request reference is required")
     repo = plan["repo"]
     pr = github(f"repos/{repo}/pulls/{number}")
     if (pr.get("head", {}).get("repo", {}).get("full_name") != repo
@@ -162,16 +175,7 @@ def _collect_github(plan: dict, artifact, number):
     if _unresolved_threads(repo, number):
         raise EvidenceMissing("pull request has unresolved review findings")
     reviews = github(f"repos/{repo}/pulls/{number}/reviews?per_page=100")
-    effective = {}
-    for row in sorted(reviews, key=lambda r: (r.get("submitted_at") or "", r.get("id", 0))):
-        if row.get("state") not in {"APPROVED", "CHANGES_REQUESTED"}:
-            continue
-        actor = row.get("user", {}).get("login")
-        if not isinstance(actor, str) or not actor:
-            raise EvidenceUnavailable("review authority is unavailable")
-        effective[actor] = row["state"]
-    if "CHANGES_REQUESTED" in effective.values():
-        raise EvidenceMissing("pull request has outstanding requested changes")
+    _check_effective_reviews(reviews)
     comments = github(f"repos/{repo}/issues/{number}/comments?per_page=100")
     # Codex publishes its clean review as a bot-authored conversation comment.
     # Resolve the reported abbreviated commit through GitHub to bind the full SHA.
@@ -191,11 +195,15 @@ def _collect_github(plan: dict, artifact, number):
     if not candidates:
         raise EvidenceMissing("independent exact-commit review has not passed")
     clean = max(candidates, key=lambda r: r["id"])
+    latest_reviews = github(f"repos/{repo}/pulls/{number}/reviews?per_page=100")
+    _check_effective_reviews(latest_reviews)
+    if _unresolved_threads(repo, number):
+        raise EvidenceMissing("pull request acquired unresolved review findings during collection")
     if any(r.get("commit_id") == artifact.commit_sha
            and r.get("user", {}).get("login") == BOT
            and r.get("submitted_at", "") > clean["created_at"]
            and r.get("state") in {"COMMENTED", "CHANGES_REQUESTED"}
-           for r in reviews):
+           for r in latest_reviews):
         raise EvidenceMissing("newer exact-commit review must be reconciled")
     latest = github(f"repos/{repo}/pulls/{number}")
     if _pr_binding(latest) != initial_binding:
@@ -286,7 +294,7 @@ def completion_instructions(task: dict) -> str:
 def freeze_plan(root: Path, task: dict) -> None:
     kind = completion_kind(task)
     if kind not in {"coding", "control", "research", "review"}:
-        raise EvidenceMissing(f"typed {kind} completion contract is not configured")
+        raise EvidenceError(f"typed {kind} immutable completion contract is not configured")
     if kind != "control" and task.get("repo") != POLICY["repo"]:
         raise EvidenceMissing("consumer verification policy is not configured")
     criteria = task.get("completion_contract")
@@ -345,12 +353,15 @@ def freeze_plan(root: Path, task: dict) -> None:
 def verify_completion(root: Path, task: dict, result: dict) -> dict:
     kind = completion_kind(task)
     if kind not in {"coding", "control", "research", "review"}:
-        raise EvidenceMissing(f"typed {kind} completion contract is not configured")
+        raise EvidenceError(f"typed {kind} immutable completion contract is not configured")
     if kind in {"research", "review"}:
         validate_criteria(kind, task.get("completion_contract"))
     store = store_for(root, task)
     identity = binding(task)
-    plan = store.read("plan", digest(identity))
+    try:
+        plan = store.read("plan", digest(identity))
+    except EvidenceMissing as exc:
+        raise EvidenceError("immutable predispatch completion plan is missing") from exc
     if (plan.get("identity") != identity or plan.get("kind") != kind
             or plan.get("spec_hash") != spec_digest(task)
             or plan.get("policy_hash") != digest(typed_policy(kind))):
@@ -358,8 +369,19 @@ def verify_completion(root: Path, task: dict, result: dict) -> dict:
     if kind == "control":
         if (not isinstance(result.get("summary"), str) or not result["summary"].strip()
                 or not isinstance(result.get("next_action"), str) or not result["next_action"].strip()):
-            raise EvidenceMissing("control cycle requires summary and next action")
+            raise EvidenceError("immutable control cycle requires summary and next action")
         key = digest({"identity": identity, "plan_hash": plan["plan_hash"]})
+        previous, legacy = store.lookup_acceptance(identity, plan["plan_hash"])
+        if previous is not None:
+            if (previous.get("identity") != identity or previous.get("plan_hash") != plan["plan_hash"]
+                    or previous.get("kind") != "control" or previous.get("level") != "control_cycle"
+                    or previous.get("spec_hash") != plan["spec_hash"]
+                    or previous.get("policy_hash") != plan["policy_hash"]
+                    or previous.get("proof", {}).get("result_digest") != digest(result)):
+                raise EvidenceError("immutable control outcome publication conflict")
+            if legacy:
+                store.publish("accepted", key, previous)
+            return {**previous, "bundle_hash": digest(previous)}
         bundle = {"version": 1, "identity": identity, "repo": task.get("repo"),
                   "level": "control_cycle", "kind": "control", "spec_hash": plan["spec_hash"],
                   "policy_hash": plan["policy_hash"], "plan_hash": plan["plan_hash"],
@@ -371,7 +393,7 @@ def verify_completion(root: Path, task: dict, result: dict) -> dict:
         raise EvidenceError("trusted publication requires a verified worker sandbox")
     workspace = result.get("artifact_workspace")
     if not isinstance(workspace, str) or not Path(workspace).is_absolute():
-        raise EvidenceMissing("artifact workspace is missing")
+        raise EvidenceError("immutable artifact workspace is missing")
     return accept_artifact(task, result, plan, store, Path(workspace), collect_github)
 
 

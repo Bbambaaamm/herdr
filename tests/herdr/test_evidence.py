@@ -16,7 +16,7 @@ from herdr.workspace import ArtifactRef, WorkspaceManager
 
 @pytest.fixture(autouse=True)
 def trusted_fixture_git(monkeypatch, request):
-    if request.node.name.startswith("test_actual"):
+    if request.node.name.startswith("test_actual") or request.node.name == "test_bounded_git_output_failure_is_permanent_rejection":
         return
     from herdr.workspace import _real_git
     monkeypatch.setattr("herdr.evidence.read_only_git", _real_git)
@@ -425,3 +425,81 @@ def test_actual_replace_refs_cannot_change_the_verified_github_commit(tmp_path):
         except EvidenceUnavailable:
             pytest.skip("this host denies the artifact verifier namespace")
         assert not list(store.root.glob("accepted-*"))
+
+
+def legacy_artifact_record(store, task, result, plan, first):
+    legacy = {k: v for k, v in first.items() if k not in {"bundle_hash", "publication_hash"}}
+    old_key = digest({"identity": binding(task), "plan_hash": plan["plan_hash"], "artifact": legacy["artifact"]})
+    new_key = digest({"identity": binding(task), "plan_hash": plan["plan_hash"]})
+    store.publish("accepted", old_key, legacy)
+    store._path("accepted", new_key).unlink()
+    return old_key, legacy
+
+
+def test_upgrade_indexes_legacy_acceptance_without_recollecting_or_deleting(tmp_path):
+    task, result, plan, store, path, proof = fixture(tmp_path)
+    proof["review"]["pull_request"] = 4
+    first = accept_artifact(task, result, plan, store, path, lambda *a: proof)
+    old_key, legacy = legacy_artifact_record(store, task, result, plan, first)
+    shutil.rmtree(path)
+    def no_recollection(*a):
+        raise AssertionError("legacy accepted proof must not be recollected")
+    migrated = accept_artifact(task, result, plan, store, path, no_recollection)
+    assert migrated == first
+    assert store.read("accepted", old_key) == legacy
+    assert len(list(store.root.glob("accepted-*"))) == 2
+    assert accept_artifact(task, result, plan, store, path, no_recollection) == first
+
+
+def test_upgrade_cannot_accept_rewritten_artifact_after_old_publication(tmp_path):
+    task, result, plan, store, path, proof = fixture(tmp_path)
+    proof["review"]["pull_request"] = 4
+    first = accept_artifact(task, result, plan, store, path, lambda *a: proof)
+    old_key, legacy = legacy_artifact_record(store, task, result, plan, first)
+    (path / "result.txt").write_text("another result after crash and upgrade")
+    run_git(path, "commit", "-qam", "second result")
+    manager = WorkspaceManager(path, worktrees_dir=path.parent, artifacts_dir=tmp_path / "artifacts")
+    second = manager.seal(ArtifactRef(task["id"], 1, plan["base_sha"],
+                          run_git(path, "rev-parse", "HEAD"), "", (), "task"), path)
+    result["artifact"] = second.to_json()
+    with pytest.raises(EvidenceError, match="binding"):
+        accept_artifact(task, result, plan, store, path, lambda *a: proof)
+    assert len(list(store.root.glob("accepted-*"))) == 1
+    assert store.read("accepted", old_key) == legacy
+
+
+def test_conflicting_legacy_outcomes_require_replan_before_new_index(tmp_path):
+    task, result, plan, store, path, proof = fixture(tmp_path)
+    proof["review"]["pull_request"] = 4
+    first = accept_artifact(task, result, plan, store, path, lambda *a: proof)
+    _, legacy = legacy_artifact_record(store, task, result, plan, first)
+    different = json.loads(json.dumps(legacy))
+    different["artifact"]["commit_sha"] = "e" * 40
+    key = digest({"identity": binding(task), "plan_hash": plan["plan_hash"], "artifact": different["artifact"]})
+    store.publish("accepted", key, different)
+    with pytest.raises(EvidenceError, match="conflicting legacy"):
+        accept_artifact(task, result, plan, store, path, lambda *a: proof)
+    assert len(list(store.root.glob("accepted-*"))) == 2
+
+
+def test_blob_above_explicit_limit_is_permanent_rejection(tmp_path):
+    task, result, plan, store, path, proof = fixture(tmp_path)
+    (path / "result.txt").write_bytes(b"x" * 2_000_001)
+    run_git(path, "commit", "-qam", "oversized output")
+    manager = WorkspaceManager(path, worktrees_dir=path.parent, artifacts_dir=tmp_path / "artifacts")
+    artifact = manager.seal(ArtifactRef(task["id"], 1, plan["base_sha"],
+                            run_git(path, "rev-parse", "HEAD"), "", (), "task"), path)
+    result["artifact"] = artifact.to_json()
+    with pytest.raises(EvidenceError, match="oversized") as error:
+        accept_artifact(task, result, plan, store, path, lambda *a: proof)
+    assert not isinstance(error.value, (EvidenceMissing, EvidenceUnavailable))
+    assert not list(store.root.glob("accepted-*"))
+
+
+def test_bounded_git_output_failure_is_permanent_rejection(tmp_path, monkeypatch):
+    from herdr.evidence import read_only_git
+    monkeypatch.setattr("herdr.evidence.artifact_command",
+                        lambda *a, **k: (_ for _ in ()).throw(ValueError("output limit")))
+    with pytest.raises(EvidenceError, match="bounded") as error:
+        read_only_git(tmp_path)(["ls-tree", "-r", "HEAD"])
+    assert not isinstance(error.value, (EvidenceMissing, EvidenceUnavailable))

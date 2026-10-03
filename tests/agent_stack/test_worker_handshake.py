@@ -775,8 +775,9 @@ def test_completed_coding_without_host_proof_is_not_done_or_retried(tmp_path):
     identity = (task["run_token"], task["idempotency_key"], task["attempts"])
     worker.finish(path, task, "claims completed")
     saved = json.loads((worker.BLOCKED / path.name).read_text())
-    assert saved["attempt_state"] == "verification_pending"
-    assert saved["verification_status"] == "evidence_missing"
+    assert saved["attempt_state"] == "blocked"
+    assert saved["verification_resolution"] == "needs_replan"
+    assert saved["verification_status"] == "evidence_invalid"
     assert (saved["run_token"], saved["idempotency_key"], saved["attempts"]) == identity
     assert not list(worker.DONE.iterdir())
     assert json.loads(worker.result_path(task["id"]).read_text()) == result
@@ -825,7 +826,7 @@ def test_unconfigured_research_criteria_fail_closed_without_fictitious_build(tmp
     task, path, result = verification_task(tmp_path, "research")
     worker.finish(path, task, "")
     saved = json.loads((worker.BLOCKED / path.name).read_text())
-    assert saved["verification_status"] == "evidence_missing"
+    assert saved["verification_status"] == "evidence_invalid"
     assert "research" in saved["last_error"]
     assert saved["attempts"] == 0
 
@@ -852,8 +853,9 @@ def test_absent_blocker_spellings_cannot_bypass_completion_evidence(tmp_path):
         worker.write_json(worker.result_path(task["id"]), result)
         worker.finish(path, task, "")
         saved = json.loads((worker.BLOCKED / path.name).read_text())
-        assert saved["attempt_state"] == "verification_pending"
-        assert saved["verification_status"] == "evidence_missing"
+        assert saved["attempt_state"] == "blocked"
+        assert saved["verification_resolution"] == "needs_replan"
+        assert saved["verification_status"] == "evidence_invalid"
         assert not list(worker.DONE.iterdir())
         assert json.loads(worker.result_path(task["id"]).read_text()) == result
         (worker.BLOCKED / path.name).unlink()
@@ -863,7 +865,7 @@ def test_control_cycle_without_predispatch_plan_stays_unverified(tmp_path):
     task["kind"] = "github_root_orchestration"
     worker.finish(path, task, "")
     saved = json.loads((worker.BLOCKED / path.name).read_text())
-    assert saved["verification_status"] == "evidence_missing"
+    assert saved["verification_status"] == "evidence_invalid"
     assert not list(worker.DONE.iterdir())
 
 
@@ -926,3 +928,40 @@ def test_control_cycle_cannot_publish_conflicting_outcomes_for_one_attempt(tmp_p
     with pytest.raises(EvidenceError, match="immutable"):
         verify_completion(worker.ROOT, task, result)
     assert len(list((worker.ROOT / "verification").glob("accepted-*"))) == 1
+
+
+def test_control_upgrade_preserves_legacy_outcome_and_rejects_rewrite(tmp_path):
+    from agent_completion_evidence import verify_completion
+    from herdr.evidence import EvidenceStore, binding, digest, EvidenceError
+    import pytest
+    task, path, result = verification_task(tmp_path)
+    task["kind"] = "github_root_orchestration"
+    worker.freeze_plan(worker.ROOT, task)
+    first = verify_completion(worker.ROOT, task, result)
+    store = EvidenceStore(worker.ROOT / "verification")
+    plan_hash = first["plan_hash"]
+    payload = {k: v for k, v in first.items() if k != "bundle_hash"}
+    old_key = digest({"identity": binding(task), "plan_hash": plan_hash, "result_hash": digest(result)})
+    new_key = digest({"identity": binding(task), "plan_hash": plan_hash})
+    store.publish("accepted", old_key, payload)
+    store._path("accepted", new_key).unlink()
+    assert verify_completion(worker.ROOT, task, result) == first
+    result["summary"] = "rewritten after upgrade"
+    with pytest.raises(EvidenceError, match="conflict"):
+        verify_completion(worker.ROOT, task, result)
+    assert store.read("accepted", old_key) == payload
+
+
+def test_incomplete_control_publication_is_replan_not_missing_late_evidence(tmp_path):
+    for field in ("summary", "next_action"):
+        task, path, result = verification_task(tmp_path)
+        task["kind"] = "github_root_orchestration"
+        worker.freeze_plan(worker.ROOT, task)
+        result.pop(field)
+        worker.write_json(worker.result_path(task["id"]), result)
+        worker.finish(path, task, "")
+        saved = json.loads((worker.BLOCKED / path.name).read_text())
+        assert saved["verification_status"] == "evidence_invalid"
+        assert saved["verification_resolution"] == "needs_replan"
+        assert saved["attempts"] == 0
+        (worker.BLOCKED / path.name).unlink()

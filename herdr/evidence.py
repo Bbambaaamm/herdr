@@ -66,7 +66,7 @@ def parse_artifact(raw: Any) -> ArtifactRef:
     names = {"task_id", "attempt", "base_sha", "commit_sha", "result_sha",
              "changed_files", "branch"}
     if not isinstance(raw, dict) or set(raw) != names:
-        raise EvidenceMissing("a complete ArtifactRef is required")
+        raise EvidenceError("a complete immutable ArtifactRef is required")
     if (type(raw["attempt"]) is not int or raw["attempt"] < 0
             or not isinstance(raw["task_id"], str) or not raw["task_id"]
             or not isinstance(raw["branch"], str) or not raw["branch"]
@@ -136,6 +136,48 @@ class EvidenceStore:
         except (TypeError, ValueError, KeyError) as exc:
             raise EvidenceError("invalid evidence encoding") from exc
 
+    def lookup_acceptance(self, identity: dict, plan_hash: str) -> tuple[dict | None, bool]:
+        """Read the unique address, or fail-closed reconcile legacy addresses.
+
+        Scan all old records for this attempt, not just the caller's current
+        artifact-derived key. Original records are retained and never rewritten.
+        Upgrade requires old writers to be quiesced by the release envelope.
+        """
+        key = digest({"identity": identity, "plan_hash": plan_hash})
+        try:
+            return self.read("accepted", key), False
+        except EvidenceMissing:
+            pass
+        matches = []
+        for index, path in enumerate(sorted(self.root.glob("accepted-*.json"))):
+            if index >= 10_000:
+                raise EvidenceError("legacy evidence index exceeds migration bound")
+            address = path.name.removeprefix("accepted-").removesuffix(".json")
+            if not _SHA.fullmatch(address):
+                raise EvidenceError("invalid legacy evidence address")
+            record = self.read("accepted", address)
+            if record.get("identity") != identity or record.get("plan_hash") != plan_hash:
+                continue
+            if record.get("level") == "verified_worker_result":
+                legacy_key = digest({"identity": identity, "plan_hash": plan_hash,
+                                     "artifact": record.get("artifact")})
+            elif record.get("level") == "control_cycle":
+                result_hash = record.get("proof", {}).get("result_digest")
+                if not isinstance(result_hash, str) or not _SHA.fullmatch(result_hash):
+                    raise EvidenceError("invalid legacy result digest")
+                legacy_key = digest({"identity": identity, "plan_hash": plan_hash,
+                                     "result_hash": result_hash})
+            else:
+                raise EvidenceError("unsupported legacy completion record")
+            if address != legacy_key:
+                raise EvidenceError("legacy completion address does not bind its payload")
+            matches.append(record)
+        if not matches:
+            return None, False
+        if any(item != matches[0] for item in matches[1:]):
+            raise EvidenceError("conflicting legacy attempt records require trusted replan")
+        return matches[0], True
+
     def _sync_directory(self) -> None:
         fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
         try:
@@ -193,7 +235,9 @@ def read_only_git(root: Path):
         ]
         try:
             return artifact_command(command, limit=2_000_000, timeout=30)
-        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        except ValueError as exc:
+            raise EvidenceError("bounded artifact metadata or blob output exceeded") from exc
+        except (OSError, subprocess.SubprocessError) as exc:
             raise EvidenceUnavailable("artifact verifier execution unavailable") from exc
     def run(args):
         try:
@@ -230,7 +274,7 @@ def verify_committed_bytes(artifact: ArtifactRef, workspace: Path, git) -> None:
             with os.fdopen(fd, "rb") as handle:
                 info = os.fstat(handle.fileno())
                 size = info.st_size
-                if not stat.S_ISREG(info.st_mode) or size > 64_000_000:
+                if not stat.S_ISREG(info.st_mode) or size > 2_000_000:
                     raise EvidenceError("unsupported or oversized tracked file")
                 if bool(info.st_mode & stat.S_IXUSR) != (mode == "100755"):
                     raise EvidenceError("physical executable mode differs from committed tree")
@@ -266,7 +310,7 @@ def verify_committed_bytes(artifact: ArtifactRef, workspace: Path, git) -> None:
 
 def validate_criteria(kind: str, criteria: Any) -> None:
     if not isinstance(criteria, dict):
-        raise EvidenceMissing(f"typed {kind} artifact criteria are missing")
+        raise EvidenceError(f"typed {kind} immutable artifact criteria are missing")
     common = {"schema", "report_path"}
     extra = {"sections"} if kind == "research" else {"target_commit"}
     path = criteria.get("report_path")
@@ -391,18 +435,21 @@ def accept_artifact(task: dict, result: dict, plan: dict, store: EvidenceStore,
     key = digest({"identity": identity, "plan_hash": plan["plan_hash"]})
     publication_hash = digest({"artifact": artifact.to_json(), "workspace": str(workspace),
                                "pr_number": result.get("pr_number")})
-    try:
-        accepted = store.read("accepted", key)
-    except EvidenceMissing:
-        accepted = None
+    accepted, legacy = store.lookup_acceptance(identity, plan["plan_hash"])
     if accepted is not None:
         if (accepted.get("identity") != identity
                 or accepted.get("plan_hash") != plan["plan_hash"]
                 or accepted.get("artifact") != json.loads(canonical(artifact.to_json()))
                 or accepted.get("level") != "verified_worker_result"
                 or accepted.get("artifact_workspace") != str(workspace)
-                or accepted.get("publication_hash") != publication_hash):
+                or accepted.get("spec_hash") != plan["spec_hash"]
+                or accepted.get("policy_hash") != plan["policy_hash"]
+                or (not legacy and accepted.get("publication_hash") != publication_hash)
+                or (legacy and accepted.get("proof", {}).get("review", {}).get("pull_request") != result.get("pr_number"))):
             raise EvidenceError("accepted record binding mismatch")
+        if legacy:
+            accepted = {**accepted, "publication_hash": publication_hash}
+            store.publish("accepted", key, accepted)
         return {**accepted, "bundle_hash": digest(accepted)}
 
     try:

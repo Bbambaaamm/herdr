@@ -937,8 +937,9 @@ def test_completed_coding_result_cannot_bypass_gate_through_watchdog(tmp_path, m
     monkeypatch.setattr(recovery, "active_worker_tasks", lambda: set())
     recovery.recover_orphan_tasks(now)
     saved = json.loads((recovery.BLOCKED / path.name).read_text())
-    assert saved["attempt_state"] == "verification_pending"
-    assert saved["verification_status"] == "evidence_missing"
+    assert saved["attempt_state"] == "blocked"
+    assert saved["verification_resolution"] == "needs_replan"
+    assert saved["verification_status"] == "evidence_invalid"
     assert not list(recovery.DONE.iterdir())
     assert json.loads((recovery.RESULTS / "task-1.json").read_text()) == result
 

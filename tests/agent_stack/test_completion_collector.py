@@ -236,3 +236,55 @@ def test_approved_or_dismissed_change_request_no_longer_blocks(monkeypatch, stat
                 "submitted_at": "2026-10-03T19:00:00Z"}]
     install_transport(monkeypatch, artifact, plan, pr, checks, comment, reviews=reviews)
     assert collector.collect_github(plan, artifact, 4)["source"] == "github-api"
+
+
+def test_changes_requested_during_commit_resolution_prevents_acceptance(monkeypatch):
+    artifact, plan, pr, checks, comment = proof_fixture()
+    install_transport(monkeypatch, artifact, plan, pr, checks, comment)
+    old = collector.github
+    count = 0
+    def api(path):
+        nonlocal count
+        if path.endswith("/reviews?per_page=100"):
+            count += 1
+            if count == 2:
+                return [{"id": 10, "user": {"login": "human"}, "state": "CHANGES_REQUESTED",
+                         "submitted_at": "2026-10-03T20:10:00Z", "commit_id": artifact.commit_sha}]
+        return old(path)
+    monkeypatch.setattr(collector, "github", api)
+    with pytest.raises(EvidenceMissing, match="outstanding"):
+        collector.collect_github(plan, artifact, 4)
+    assert count == 2
+
+
+def test_new_unresolved_thread_during_collection_prevents_acceptance(monkeypatch):
+    artifact, plan, pr, checks, comment = proof_fixture()
+    install_transport(monkeypatch, artifact, plan, pr, checks, comment)
+    calls = []
+    monkeypatch.setattr(collector, "_unresolved_threads", lambda *a: calls.append(1) or len(calls) == 2)
+    with pytest.raises(EvidenceMissing, match="during collection"):
+        collector.collect_github(plan, artifact, 4)
+
+
+@pytest.mark.parametrize("missing", ["artifact", "artifact_workspace", "pr_number"])
+def test_missing_immutable_coding_publication_fields_require_replan(tmp_path, monkeypatch, missing):
+    import importlib.util
+    from herdr.evidence import binding, digest
+    from herdr.workspace import _real_git
+    helper_path = Path(__file__).resolve().parents[1] / "herdr" / "test_evidence.py"
+    spec = importlib.util.spec_from_file_location("immutable_publication_fixture", helper_path)
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    task, result, plan, store, workspace, proof = helper.fixture(tmp_path)
+    task["workspace"] = str(workspace)
+    result["artifact_workspace"] = str(workspace)
+    plan["spec_hash"] = collector.spec_digest(task)
+    plan["policy_hash"] = digest(collector.typed_policy("coding"))
+    plan["plan_hash"] = digest({k: v for k, v in plan.items() if k not in {"plan_hash", "baseline"}})
+    store.publish("plan", digest(binding(task)), plan)
+    result.pop(missing)
+    monkeypatch.setattr("herdr.evidence.read_only_git", _real_git)
+    monkeypatch.setattr(collector, "github", lambda *a: (_ for _ in ()).throw(AssertionError("no remote lookup")))
+    with pytest.raises(EvidenceError) as error:
+        collector.verify_completion(store.root.parent, task, result)
+    assert not isinstance(error.value, (EvidenceMissing, EvidenceUnavailable))

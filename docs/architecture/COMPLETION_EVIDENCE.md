@@ -47,7 +47,7 @@ the node/retry/budget policy; this adapter does not manufacture that permission.
 
 Artifact verification compares every tracked regular file against the committed
 Git blob without filters and derives result hashes from committed binary blobs.
-Unsupported symlink/submodule outputs and tracked files above 64 MB fail closed;
+Unsupported symlink/submodule outputs and tracked files above 2 MB fail closed;
 individual committed blobs are subject to the bounded verifier output limit.
 This prevents clean filters from hiding bytes absent from CI/review. The collector
 rejects outstanding change requests by any reviewer and rechecks PR head/base
@@ -56,3 +56,20 @@ they describe the accepted commit, not later PR or deployment state.
 
 Cleanup failure after acceptance remains eligible for recovery from blocked
 storage, using the same exact result and accepted bundle without model dispatch.
+
+
+### Store upgrades
+The unique acceptance lookup scans pre-upgrade artifact/result-derived addresses
+before new publication. Matching legacy records are bound to the protected
+attempt and frozen plan, compared with the incoming claim and atomically indexed
+at the new address without deleting originals. Conflicting old records require
+trusted reconciliation; a rewritten claim cannot create a second accepted
+outcome. Release upgrades must quiesce prior writers before enabling the new
+addressing contract.
+
+Missing immutable worker fields or a missing predispatch plan are permanent
+rejections. Only late CI/review proof and temporarily unavailable host/provider
+evidence can wait. Metadata and changed blobs have an explicit 2 MB bound;
+exceeding it requires replanning rather than automatic verification polling.
+Reviews and unresolved threads are refreshed after resolving clean-comment
+commit candidates, before the final PR identity check.
