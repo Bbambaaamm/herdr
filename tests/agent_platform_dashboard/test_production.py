@@ -509,6 +509,8 @@ def test_swarm_projection_is_atomic_bounded_and_sanitized(tmp_path, monkeypatch)
         'parent_agent_id': None,
         'fencing_token': 1,
     }]
+    assert snapshot['runtime_status'] == 'unavailable'
+    assert snapshot['runtime_agents'] == []
     assert snapshot['edges'] == [
         {'from_task': 'root', 'to_task': 'child', 'kind': 'parent'}
     ]
@@ -548,6 +550,51 @@ def test_swarm_raw_edge_mismatch_and_sensitive_task_field_fail_closed(tmp_path, 
     with pytest.raises(ValueError):
         sources.swarm(str(path), 'quantlab')
 
+
+
+def test_runtime_agent_id_must_be_nonempty_string_at_source_and_contract_boundaries(tmp_path, monkeypatch):
+    path = tmp_path / 'swarm.json'
+    monkeypatch.setattr(sources, 'SWARM_PATH', str(path))
+    payload = swarm_payload()
+    payload['version'] = 1
+    for key in ('graph_latency', 'clock_snapshot', 'ts'):
+        payload.pop(key)
+    payload['agents'] = [payload['agents'][0]]
+    payload['runtime_status'] = 'available'
+    payload['runtime_agents'] = [{
+        'agent_id': None,
+        'status': 'working',
+        'task_id': 'root',
+    }]
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError):
+        sources.swarm(str(path), 'quantlab')
+
+    payload['runtime_agents'][0]['agent_id'] = 'herdr-parent'
+    path.write_text(json.dumps(payload))
+    snapshot = sources.swarm(str(path), 'quantlab')[0][0]
+    snapshot['runtime_agents'][0]['agent_id'] = None
+    with pytest.raises(ValueError):
+        c.row('swarm', snapshot)
+
+
+def test_runtime_task_id_must_be_string_before_membership_lookup(tmp_path, monkeypatch):
+    path = tmp_path / 'swarm.json'
+    monkeypatch.setattr(sources, 'SWARM_PATH', str(path))
+    payload = swarm_payload()
+    payload['version'] = 1
+    for key in ('graph_latency', 'clock_snapshot', 'ts'):
+        payload.pop(key)
+    payload['agents'] = [payload['agents'][0]]
+    payload['runtime_status'] = 'available'
+    payload['runtime_agents'] = [{
+        'agent_id': 'task-hermes',
+        'status': 'working',
+        'task_id': ['root'],
+    }]
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError):
+        sources.swarm(str(path), 'quantlab')
 
 
 def test_scheduler_historical_agent_state_must_match_task(tmp_path, monkeypatch):
@@ -1092,3 +1139,111 @@ def test_router_projection_exposes_only_bounded_operational_model_metadata(tmp_p
                         cost_microusd=None, fallback_count=0, successful_requests=1,
                         duration_ms=1000, last_used_at=11)]
     assert 'PRIVATE' not in json.dumps(rows) and 'SECRET' not in json.dumps(rows)
+
+def test_fresh_canonical_history_can_receive_compatible_live_fallback(tmp_path, monkeypatch):
+    import copy
+    path = tmp_path / "canonical.json"
+    path.write_text(json.dumps(swarm_payload()))
+    monkeypatch.setattr(sources, "SWARM_PATH", str(path))
+    canonical = sources.swarm(str(path), "quantlab")[0][0]
+    fallback = copy.deepcopy(canonical)
+    fallback["issue"] = "48"
+    fallback["runtime_status"] = "available"
+    fallback["runtime_agents"] = [
+        {"agent_id": "herdr-parent", "status": "working", "task_id": "root"},
+        {"agent_id": "outside-agent", "status": "working", "task_id": "child"},
+    ]
+    monkeypatch.setattr(sources, "SWARM_FALLBACK_PATH", "fallback")
+    monkeypatch.setattr(sources, "swarm", lambda path, profile:
+                        ([canonical], 195) if path == str(tmp_path / "canonical.json") else ([fallback], 194))
+    rows, stamp = sources.live_swarm("quantlab", 200)
+    assert stamp == 194
+    assert rows[0]["issue"] == canonical["issue"]
+    assert rows[0]["tasks"] == canonical["tasks"]
+    assert rows[0]["runtime_status"] == "available"
+    assert rows[0]["runtime_agents"][0]["task_id"] == "root"
+    assert rows[0]["runtime_agents"][1]["task_id"] is None
+
+    fallback["repo"] = "Bbambaaamm/Autonomous-Quant-Lab"
+    assert sources.live_swarm("quantlab", 200)[0][0]["runtime_status"] == "unavailable"
+    fallback["repo"] = canonical["repo"]
+    monkeypatch.setattr(sources, "swarm", lambda path, profile:
+                        ([canonical], 195) if path == str(tmp_path / "canonical.json") else ([fallback], 100))
+    assert sources.live_swarm("quantlab", 200)[0][0]["runtime_status"] == "unavailable"
+
+@pytest.mark.parametrize("fault", ["wrong_agent", "terminal", "ambiguous"])
+def test_runtime_binding_is_exact_unique_nonterminal_at_source_and_contract(tmp_path, monkeypatch, fault):
+    path = tmp_path / "swarm.json"
+    payload = swarm_payload()
+    payload["version"] = 1
+    for key in ("graph_latency", "clock_snapshot", "ts"):
+        payload.pop(key)
+    payload["agents"] = [payload["agents"][0]]
+    payload["runtime_status"] = "available"
+    payload["runtime_agents"] = [{"agent_id": "herdr-parent", "status": "working", "task_id": "root"}]
+    path.write_text(json.dumps(payload))
+    monkeypatch.setattr(sources, "SWARM_PATH", str(path))
+    valid = sources.swarm(str(path), "quantlab")[0][0]
+    c.row("swarm", valid)
+    if fault == "wrong_agent":
+        payload["runtime_agents"][0]["agent_id"] = "unrelated"
+        valid["runtime_agents"][0]["agent_id"] = "unrelated"
+    elif fault == "terminal":
+        payload["tasks"][0]["state"] = "done"
+        payload["agents"] = []
+        next(task for task in valid["tasks"] if task["task_id"] == "root")["state"] = "done"
+        valid["agents"] = []
+    else:
+        import copy
+        raw_extra = copy.deepcopy(payload["tasks"][0])
+        raw_extra.update(task_id="also-pending", state="pending", dependencies=[])
+        payload["tasks"].append(raw_extra)
+        extra = copy.deepcopy(next(task for task in valid["tasks"] if task["task_id"] == "root"))
+        extra.update(task_id="also-pending", state="pending", dependencies=[])
+        valid["tasks"].append(extra)
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError):
+        sources.swarm(str(path), "quantlab")
+    with pytest.raises(ValueError):
+        c.row("swarm", valid)
+
+@pytest.mark.parametrize("state", ["ready", "review"])
+def test_runtime_binding_preserves_declared_nonterminal_phases(tmp_path, monkeypatch, state):
+    path = tmp_path / "swarm.json"
+    payload = swarm_payload()
+    payload["version"] = 1
+    for key in ("graph_latency", "clock_snapshot", "ts"):
+        payload.pop(key)
+    payload["tasks"][0]["state"] = state
+    payload["agents"] = []
+    payload["runtime_status"] = "available"
+    payload["runtime_agents"] = [{"agent_id": "herdr-parent", "status": "working", "task_id": "root"}]
+    path.write_text(json.dumps(payload))
+    monkeypatch.setattr(sources, "SWARM_PATH", str(path))
+    snapshot = sources.swarm(str(path), "quantlab")[0][0]
+    c.row("swarm", snapshot)
+    assert snapshot["runtime_agents"][0]["task_id"] == "root"
+
+
+def test_filtered_fallback_cannot_claim_complete_canonical_child_runtime(tmp_path, monkeypatch):
+    import copy
+    path = tmp_path / "canonical.json"
+    path.write_text(json.dumps(swarm_payload()))
+    monkeypatch.setattr(sources, "SWARM_PATH", str(path))
+    canonical = sources.swarm(str(path), "quantlab")[0][0]
+    child = next(task for task in canonical["tasks"] if task["task_id"] == "child")
+    child["state"] = "pending"
+    child["agent_id"] = "agent-1"
+    canonical["agents"] = [row for row in canonical["agents"] if row["task_id"] == "root"]
+    fallback = copy.deepcopy(canonical)
+    fallback.update(runtime_status="available", runtime_agents=[
+        {"agent_id": "herdr-parent", "status": "working", "task_id": "root"}])
+    monkeypatch.setattr(sources, "SWARM_PATH", "canonical")
+    monkeypatch.setattr(sources, "SWARM_FALLBACK_PATH", "fallback")
+    monkeypatch.setattr(sources, "swarm", lambda path, profile:
+                        ([canonical], 195) if path == "canonical" else ([fallback], 194))
+    assert sources.live_swarm("quantlab", 200)[0][0]["runtime_status"] == "unavailable"
+    fallback["runtime_agents"].append({"agent_id": "agent-1", "status": "working", "task_id": None})
+    rows, stamp = sources.live_swarm("quantlab", 200)
+    assert rows[0]["runtime_status"] == "available"
+    assert len(rows[0]["runtime_agents"]) == 2 and stamp == 194
