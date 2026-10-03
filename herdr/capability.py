@@ -559,6 +559,7 @@ class RuntimeStateSnapshot:
             raise CapabilityError("cost estimate requires requirement_hash")
         if self.health != Health.HEALTHY and self.reason_code is None:
             raise CapabilityError("nonhealthy observation requires reason_code")
+        _secrets(self.to_json())
 
     def is_fresh(self, at: str) -> bool:
         now, then = _time(at), _time(self.observed_at)
@@ -764,8 +765,8 @@ def _reject(req: CapabilityRequirement, grant: CapabilityScope, cap: CapabilityD
     # Directional floors share one context window. Independent checks are not
     # sufficient: 7k input + 7k output cannot fit into an 8k context even when
     # each directional maximum is 8k.
-    if req.min_input_tokens is not None and req.min_output_tokens is not None:
-        combined = req.min_input_tokens + req.min_output_tokens
+    if req.min_input_tokens is not None or req.min_output_tokens is not None:
+        combined = (req.min_input_tokens or 0) + (req.min_output_tokens or 0)
         if cap.context_tokens is None:
             return Reason.LIMIT_UNKNOWN
         if combined > cap.context_tokens:

@@ -367,3 +367,27 @@ def test_combined_directional_floors_must_fit_context_window_and_grant():
     found = result(registry, narrower_grant, too_large_for_grant, states)
     assert found.matches == ()
     assert found.rejections[0].reason == Reason.POLICY_DENIED
+
+
+@pytest.mark.parametrize("direction", ["input", "output"])
+def test_directional_floor_rejects_unknown_shared_context(direction):
+    registry, scope, req, states = fixture()
+    cap = replace(registry.snapshot.capabilities[0], context_tokens=None)
+    registry.reload(RegistrySnapshot((cap,), registry.snapshot.providers, registry.snapshot.executors))
+    directional = replace(req, min_context_tokens=None,
+                          min_input_tokens=512 if direction == "input" else None,
+                          min_output_tokens=256 if direction == "output" else None)
+    fresh_states = tuple(replace(state, registry_hash=registry.snapshot.hash,
+                                requirement_hash=directional.hash) for state in states)
+    found = result(registry, scope, directional, fresh_states)
+    assert not found.matches
+    assert {item.reason for item in found.rejections} == {Reason.LIMIT_UNKNOWN}
+
+
+@pytest.mark.parametrize("credential", ["ghp_" + "A" * 24, "AIza" + "A" * 30])
+def test_runtime_executor_identity_rejects_credentials_in_both_construction_paths(credential):
+    _, _, _, states = fixture()
+    with pytest.raises(CapabilityError, match="secret-like"):
+        replace(states[0], executor_id=credential)
+    with pytest.raises(CapabilityError, match="secret-like"):
+        RuntimeStateSnapshot.from_dict({**states[0].to_json(), "executor_id": credential})
