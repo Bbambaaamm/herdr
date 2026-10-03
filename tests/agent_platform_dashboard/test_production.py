@@ -509,12 +509,8 @@ def test_swarm_projection_is_atomic_bounded_and_sanitized(tmp_path, monkeypatch)
         'parent_agent_id': None,
         'fencing_token': 1,
     }]
-    assert snapshot['runtime_status'] == 'available'
-    assert snapshot['runtime_agents'] == [{
-        'agent_id': 'herdr-parent',
-        'status': 'working',
-        'task_id': 'root',
-    }]
+    assert snapshot['runtime_status'] == 'unavailable'
+    assert snapshot['runtime_agents'] == []
     assert snapshot['edges'] == [
         {'from_task': 'root', 'to_task': 'child', 'kind': 'parent'}
     ]
@@ -580,6 +576,25 @@ def test_runtime_agent_id_must_be_nonempty_string_at_source_and_contract_boundar
     snapshot['runtime_agents'][0]['agent_id'] = None
     with pytest.raises(ValueError):
         c.row('swarm', snapshot)
+
+
+def test_runtime_task_id_must_be_string_before_membership_lookup(tmp_path, monkeypatch):
+    path = tmp_path / 'swarm.json'
+    monkeypatch.setattr(sources, 'SWARM_PATH', str(path))
+    payload = swarm_payload()
+    payload['version'] = 1
+    for key in ('graph_latency', 'clock_snapshot', 'ts'):
+        payload.pop(key)
+    payload['agents'] = [payload['agents'][0]]
+    payload['runtime_status'] = 'available'
+    payload['runtime_agents'] = [{
+        'agent_id': 'task-hermes',
+        'status': 'working',
+        'task_id': ['root'],
+    }]
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError):
+        sources.swarm(str(path), 'quantlab')
 
 
 def test_scheduler_historical_agent_state_must_match_task(tmp_path, monkeypatch):

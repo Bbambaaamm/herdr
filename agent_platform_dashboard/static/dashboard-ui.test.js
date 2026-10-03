@@ -1365,6 +1365,50 @@ test('durable running without runtime evidence never claims live execution', asy
   assert.doesNotMatch(h.get('#face-task').textContent, /live práce probíhá/);
   assert.match(h.get('#face-task').textContent, /durable running/);
   assert.match(h.get('#face-task').textContent, /živý runtime nepotvrzen/);
+  assert.equal(h.calls.activity.at(-1).workingAgents, 0);
+  assert.equal(h.calls.activity.at(-1).activeAgent, null);
+});
+
+test('runtime work on another task never claims the selected durable task is live', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
+  queue.rows = [];
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '80', issue_state: 'open',
+      paper_only: false, policy_profiles: ['herdr-core'],
+      runtime_status: 'available',
+      runtime_agents: [{ agent_id: 'other-agent', status: 'working', task_id: 'other' }],
+      agents: [{
+        agent_id: 'selected-agent', task_id: 'selected', state: 'running',
+        parent_task_id: null, parent_agent_id: null, fencing_token: 1,
+      }],
+      tasks: [
+        {
+          task_id: 'selected', parent_task_id: null, parent_agent_id: null,
+          agent_id: 'selected-agent', state: 'running', role: 'worker',
+          model: null, fallback_model: null, attempt: 0, max_attempts: 2,
+          blocker: null, fencing_token: 1, dependencies: [], result_sha: null,
+        },
+        {
+          task_id: 'other', parent_task_id: null, parent_agent_id: null,
+          agent_id: 'other-agent', state: 'pending', role: 'worker',
+          model: null, fallback_model: null, attempt: 0, max_attempts: 2,
+          blocker: null, fencing_token: 2, dependencies: [], result_sha: null,
+        },
+      ],
+      edges: [],
+    }],
+  });
+  await h.refresh();
+  assert.doesNotMatch(h.get('#face-task').textContent, /live práce probíhá/);
+  assert.match(h.get('#face-task').textContent, /selected/);
+  assert.match(h.get('#face-task').textContent, /živý runtime nepotvrzen/);
+  assert.equal(h.calls.activity.at(-1).workingAgents, 1);
+  assert.equal(h.calls.activity.at(-1).activeAgent, 'other-agent');
 });
 
 test('blocked runtime agent is surfaced as coordinator attention', async t => {

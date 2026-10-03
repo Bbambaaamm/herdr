@@ -493,7 +493,8 @@ def swarm(path, profile):
                    and item['agent_id'] not in runtime_ids)
             runtime_ids.add(item['agent_id'])
             c.need(item['status'] in ('idle', 'working', 'blocked', 'done', 'unknown'))
-            c.need(item['task_id'] is None or item['task_id'] in task_ids)
+            c.need(item['task_id'] is None or
+                   type(item['task_id']) is str and item['task_id'] in task_ids)
             runtime_agents.append({
                 'agent_id': item['agent_id'],
                 'status': item['status'],
@@ -501,11 +502,10 @@ def swarm(path, profile):
             })
         c.need(runtime_status == 'available' or not runtime_agents)
     elif scheduler_snapshot:
-        runtime_status = 'available'
-        runtime_agents = [
-            {'agent_id': item['agent_id'], 'status': 'working', 'task_id': item['task_id']}
-            for item in agents
-        ]
+        # Canonical v1.2 scheduler assignments are durable ownership records,
+        # not proof that the corresponding process is still alive.
+        runtime_status = 'unavailable'
+        runtime_agents = []
     else:
         runtime_status = 'unavailable' if raw['repo'] == 'Bbambaaamm/herdr' else 'not_applicable'
         runtime_agents = []

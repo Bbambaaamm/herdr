@@ -133,6 +133,57 @@ class SwarmExportTests(unittest.TestCase):
         self.assertEqual([row["agent_id"] for row in rows[0]["runtime_agents"]],
                          ["herdr-codex", "herdr-hermes", "task-hermes"])
 
+    def test_runtime_projection_binds_only_unique_nonterminal_task(self):
+        payload = {
+            "repo": "Bbambaaamm/herdr",
+            "tasks": [
+                {"task_id": "old", "state": "failed", "agent_id": "task-hermes"},
+                {"task_id": "current", "state": "pending", "agent_id": "task-hermes"},
+            ],
+        }
+        runtime = {
+            "id": "cli:agent:list",
+            "result": {"type": "agent_list", "agents": [
+                {"name": "task-hermes", "agent_status": "working"},
+            ]},
+        }
+        fake = SimpleNamespace(returncode=0, stdout=json.dumps(runtime), stderr="")
+        with patch.object(self.exporter.subprocess, "run", return_value=fake):
+            status, agents = self.exporter.runtime_agent_projection(payload)
+        self.assertEqual(status, "available")
+        self.assertEqual(agents, [{
+            "agent_id": "task-hermes", "status": "working", "task_id": "current",
+        }])
+
+        payload["tasks"].append(
+            {"task_id": "also-current", "state": "running", "agent_id": "task-hermes"}
+        )
+        with patch.object(self.exporter.subprocess, "run", return_value=fake):
+            status, agents = self.exporter.runtime_agent_projection(payload)
+        self.assertEqual(status, "available")
+        self.assertEqual(agents, [{
+            "agent_id": "task-hermes", "status": "working", "task_id": None,
+        }])
+
+    def test_runtime_projection_enforces_downstream_sixteen_row_limit(self):
+        tasks = [
+            {"task_id": f"task-{index}", "state": "pending", "agent_id": f"agent-{index}"}
+            for index in range(17)
+        ]
+        runtime = {
+            "id": "cli:agent:list",
+            "result": {"type": "agent_list", "agents": [
+                {"name": f"agent-{index}", "agent_status": "working"}
+                for index in range(17)
+            ]},
+        }
+        fake = SimpleNamespace(returncode=0, stdout=json.dumps(runtime), stderr="")
+        with patch.object(self.exporter.subprocess, "run", return_value=fake):
+            status, agents = self.exporter.runtime_agent_projection({
+                "repo": "Bbambaaamm/herdr", "tasks": tasks,
+            })
+        self.assertEqual((status, agents), ("unavailable", []))
+
     def test_closed_issue_is_explicit_and_cannot_mask_open_work(self):
         self.exporter.INTAKE.write_text(
             json.dumps({

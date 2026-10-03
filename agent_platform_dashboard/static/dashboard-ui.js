@@ -568,8 +568,10 @@ export function mountDashboard(createScene) {
       const attempt = task.attempt_state && task.attempt_state !== durable
         ? ` / ${task.attempt_state}`
         : '';
-      const runtimeWorking = runtimeAgents?.some(row => row.status === 'working') ?? false;
-      if (swarm && !runtimeWorking) {
+      const taskRuntimeWorking = task.repo === 'Bbambaaamm/herdr'
+        ? runtimeAgents?.some(row => row.status === 'working' && row.task_id === task.task_id) ?? false
+        : allAgents.some(row => row.profile === 'majak' && row.status === 'working' && row.agent === task.agent);
+      if (swarm && !taskRuntimeWorking) {
         return `${project} ${issueLabel(task)} · ${task.task_id} · durable ${durable}${attempt} · živý runtime nepotvrzen.`;
       }
       const reconcile = attempt ? ` · durable ${durable}${attempt}` : '';
@@ -621,17 +623,16 @@ export function mountDashboard(createScene) {
     const majakWorking = working.filter(row => row.profile === 'majak');
     const runtimeAgents = liveSwarm ? swarmRuntimeAgents() : null;
     const runtimeWorking = runtimeAgents?.filter(row => row.status === 'working') || null;
-    const durableAgents = liveSwarm ? swarmAgents() : null;
     sceneCall('setActivity', {
       running: queue.filter(row => row.status === 'running').length,
       pending: queue.filter(row => row.status === 'pending').length,
       blocked: queue.filter(row => row.status === 'blocked').length,
       userBlocked: userBlockedTasks().length,
       workingAgents: liveSwarm
-        ? (runtimeWorking ? runtimeWorking.length : durableAgents.length) + majakWorking.length
+        ? (runtimeWorking?.length || 0) + majakWorking.length
         : working.length,
       activeAgent: liveSwarm
-        ? (runtimeWorking?.[0]?.agent_id || durableAgents[0]?.agent_id || majakWorking[0]?.agent || null)
+        ? (runtimeWorking?.[0]?.agent_id || majakWorking[0]?.agent || null)
         : (sceneAgent(currentTask?.agent) || working[0]?.agent || null),
     });
     const target = demoTarget();
