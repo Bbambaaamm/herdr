@@ -568,7 +568,10 @@ def live_swarm(profile, now, max_age=SWARM_FRESH_SECONDS):
                     observed = fallback[0]
                     if (0 <= now - runtime_stamp <= max_age
                             and observed['repo'] == rows[0]['repo']
-                            and observed['runtime_status'] == 'available'):
+                            and observed['runtime_status'] == 'available'
+                            and {task['agent_id'] for task in rows[0]['tasks']
+                                 if task['agent_id'] is not None and task['state'] in ('pending', 'ready', 'running', 'blocked', 'review')}
+                                <= {agent['agent_id'] for agent in observed['runtime_agents']}):
                         canonical_tasks = {task['task_id']: task for task in rows[0]['tasks']}
                         runtime = []
                         for agent in observed['runtime_agents']:

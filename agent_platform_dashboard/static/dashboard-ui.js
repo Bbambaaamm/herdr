@@ -169,9 +169,9 @@ export function mountDashboard(createScene) {
       : operationalQueueTasks();
   }
   function coordinatorTask() {
-    return coordinatorTasks().filter(row => row.status === 'running')
-      .sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0) || a.task_id.localeCompare(b.task_id))[0]
-      || runtimeLinkedTask()
+    return runtimeLinkedTask()
+      || coordinatorTasks().filter(row => row.status === 'running')
+        .sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0) || a.task_id.localeCompare(b.task_id))[0]
       || coordinatorTasks().find(row => row.status === 'blocked')
       || null;
   }

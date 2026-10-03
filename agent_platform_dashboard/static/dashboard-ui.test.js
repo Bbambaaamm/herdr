@@ -1369,7 +1369,7 @@ test('durable running without runtime evidence never claims live execution', asy
   assert.equal(h.calls.activity.at(-1).activeAgent, null);
 });
 
-test('runtime work on another task never claims the selected durable task is live', async t => {
+test('observed runtime-bound task takes precedence over unrelated durable running', async t => {
   const h = await harness(t);
   const now = Math.floor(Date.now() / 1000);
   const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
@@ -1404,9 +1404,10 @@ test('runtime work on another task never claims the selected durable task is liv
     }],
   });
   await h.refresh();
-  assert.doesNotMatch(h.get('#face-task').textContent, /live práce probíhá/);
-  assert.match(h.get('#face-task').textContent, /selected/);
-  assert.match(h.get('#face-task').textContent, /živý runtime nepotvrzen/);
+  assert.match(h.get('#face-task').textContent, /live práce probíhá/);
+  assert.match(h.get('#face-task').textContent, /other/);
+  assert.doesNotMatch(h.get('#face-task').textContent, /selected/);
+  assert.match(h.get('#coordinator-current').textContent, /other/);
   assert.equal(h.calls.activity.at(-1).workingAgents, 1);
   assert.equal(h.calls.activity.at(-1).activeAgent, 'other-agent');
 });

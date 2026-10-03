@@ -3,8 +3,13 @@ import json
 import os
 import re
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from agent_platform_dashboard import production_sources as snapshot_sources
+from agent_platform_dashboard.production_sources import command as runtime_command
 
 HOME = Path("/home/agentops")
 HERDR = HOME / ".local/bin/herdr"
@@ -526,7 +531,19 @@ def _parse_herdr_agent_list(data):
     raise ValueError("runtime_agent_list_invalid")
 
 
-def runtime_agent_projection(payload):
+def canonical_agent_ids():
+    try:
+        rows, stamp = snapshot_sources.swarm(snapshot_sources.SWARM_PATH, "quantlab")
+        if (len(rows) != 1 or rows[0]["repo"] != HERDR_REPO
+                or not 0 <= now_epoch() - stamp <= snapshot_sources.SWARM_FRESH_SECONDS):
+            return set()
+        return {task["agent_id"] for task in rows[0]["tasks"]
+                if task["agent_id"] is not None and task["state"] in {"pending", "ready", "running", "blocked", "review"}}
+    except (OSError, ValueError):
+        return set()
+
+
+def runtime_agent_projection(payload, *, records=None):
     if payload.get("repo") != HERDR_REPO:
         return "not_applicable", []
     task_agent_ids = {
@@ -543,18 +560,27 @@ def runtime_agent_projection(payload):
         agent_id: next(iter(task_ids)) if len(task_ids) == 1 else None
         for agent_id, task_ids in active_bindings.items()
     }
-    allowed = set(RUNTIME_AGENT_NAMES) | task_agent_ids
+    allowed = set(RUNTIME_AGENT_NAMES) | task_agent_ids | canonical_agent_ids()
+    expected_panes = {}
+    for record in load_records() if records is None else records:
+        if record.get("repo") != payload["repo"]:
+            continue
+        raw = record["raw"]
+        session = raw.get("execution_session")
+        if not isinstance(session, dict) or session.get("closed_at"):
+            continue
+        task_id = record["task_id"]
+        matching = next((task for task in payload.get("tasks", [])
+                         if task["task_id"] == task_id), None)
+        if (matching and session.get("agent_name") == matching.get("agent_id")
+                and isinstance(session.get("pane_id"), str)
+                and 0 < len(session["pane_id"]) <= 128
+                and all(ord(ch) >= 32 for ch in session["pane_id"])):
+            expected_panes[task_id] = session["pane_id"]
     try:
-        proc = subprocess.run(
-            [str(HERDR), "agent", "list"],
-            text=True,
-            capture_output=True,
-            timeout=10,
-            env=HERDR_ENV,
-        )
-        if proc.returncode != 0:
-            return "unavailable", []
-        raw = _parse_herdr_agent_list(proc.stdout)
+        output = runtime_command([str(HERDR), "agent", "list"], env=HERDR_ENV,
+                                 limit=MAX_BYTES, timeout=10)
+        raw = _parse_herdr_agent_list(output.decode("utf-8"))
         result = raw.get("result")
         if raw.get("id") != "cli:agent:list" or not isinstance(result, dict) or result.get("type") != "agent_list":
             return "unavailable", []
@@ -573,11 +599,10 @@ def runtime_agent_projection(payload):
             if status not in RUNTIME_STATES or name in seen:
                 return "unavailable", []
             seen.add(name)
-            rows.append({
-                "agent_id": name,
-                "status": status,
-                "task_id": task_agents.get(name),
-            })
+            task_id = task_agents.get(name)
+            expected = expected_panes.get(task_id)
+            bound = task_id if expected is not None and item.get("pane_id") == expected else None
+            rows.append({"agent_id": name, "status": status, "task_id": bound})
             if len(rows) > MAX_RUNTIME_AGENTS:
                 return "unavailable", []
         return "available", sorted(rows, key=lambda row: row["agent_id"])
@@ -605,7 +630,7 @@ def main():
     if not records:
         return 0
     payload = materialize(records)
-    runtime_status, runtime_agents = runtime_agent_projection(payload)
+    runtime_status, runtime_agents = runtime_agent_projection(payload, records=records)
     payload["runtime_status"] = runtime_status
     payload["runtime_agents"] = runtime_agents
     publish(payload)
