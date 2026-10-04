@@ -224,3 +224,58 @@ def test_secret_metadata_is_rejected_instead_of_rewriting_evidence_reference(tmp
         store.append(bad)
     assert not store.load().records
     store.close()
+
+
+def test_traversal_memory_path_cannot_bypass_worker_root_isolation(tmp_path):
+    (tmp_path / "host").mkdir()
+    (tmp_path / "worker").mkdir()
+    path = tmp_path / "host" / ".." / "worker" / "store"
+    with pytest.raises(ContextError, match="memory_path"):
+        ExperienceStore(path, writable_roots=(tmp_path / "worker",), redactor=SecretRedactor())
+    assert not (tmp_path / "worker/store").exists()
+
+
+@pytest.mark.parametrize("outcome", [TrialOutcome.SUCCESS, TrialOutcome.FAILURE])
+def test_bounded_recall_keeps_comparable_trial_ahead_of_unavailable_records(outcome):
+    usable = record(id="zz-comparable", outcome=outcome)
+    unavailable = tuple(record(id=f"aa-unavailable-{i}", state=SourceState.UNAVAILABLE) for i in range(8))
+    result = retrieve(ExperienceMemory((*unavailable, usable)), limit=1)
+    assert result[0].record.id == usable.id and result[0].comparable_trial_exists
+
+
+@pytest.mark.parametrize("field", ["summary", "hypothesis", "limitations"])
+def test_rotated_known_secret_is_redacted_on_load_without_rewriting_evidence(tmp_path, field):
+    secret = "newly-classified-private-value"
+    root = tmp_path / "memory"
+    before = ExperienceStore(root, writable_roots=(), redactor=SecretRedactor())
+    original = record(**{field: secret})
+    accepted = before.append(original)
+    before.close()
+    published = root / (accepted + ".json")
+    raw = published.read_bytes()
+    after = ExperienceStore(root, writable_roots=(), redactor=SecretRedactor((secret,)))
+    loaded = after.load().records[0]
+    assert getattr(loaded, field) == "[REDACTED]"
+    assert loaded.evidence == original.evidence and published.read_bytes() == raw
+    after.close()
+
+
+@pytest.mark.parametrize("field", ["id", "source_uri", "condition"])
+def test_rotated_secret_in_immutable_metadata_is_rejected_on_load(tmp_path, field):
+    secret = "newly-classified-private-value"
+    changes = ({"id": secret} if field == "id" else
+               {"evidence": (replace(evidence(), uri="artifact://herdr/"+secret),)} if field == "source_uri" else
+               {"conditions": conditions(model=secret)})
+    root = tmp_path / "memory"
+    before = ExperienceStore(root, writable_roots=(), redactor=SecretRedactor())
+    accepted = before.append(record(**changes))
+    before.close()
+    published = root / (accepted + ".json")
+    raw = published.read_bytes()
+    after = ExperienceStore(root, writable_roots=(), redactor=SecretRedactor((secret,)))
+    try:
+        with pytest.raises(ContextError, match="secret_memory_metadata"):
+            after.load()
+        assert published.read_bytes() == raw
+    finally:
+        after.close()

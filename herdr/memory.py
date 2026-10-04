@@ -196,7 +196,9 @@ class ExperienceMemory:
                       "experience_" + state.value)
             candidates.append(Recall(record, state, reason, changed, comparable))
         # Relevant comparables first; bounded metadata retrieval never executes a trial.
-        candidates.sort(key=lambda x: (len(x.changed_conditions), x.record.id))
+        candidates.sort(key=lambda x: (not x.comparable_trial_exists,
+                                      x.applicability != Applicability.REVIEW_CHANGED,
+                                      len(x.changed_conditions), x.record.id))
         return tuple(candidates[:limit])
 
 
@@ -204,7 +206,9 @@ class ExperienceStore:
     """Host-only content-addressed records; no overwrite or original evidence mutation."""
     def __init__(self, path: Path, *, writable_roots, redactor: SecretRedactor):
         require(isinstance(redactor, SecretRedactor), "host_redactor")
-        path = Path(path).absolute()
+        path = Path(path)
+        require(".." not in path.parts, "memory_path")
+        path = path.absolute()
         require(path.name not in {"", ".", ".."}, "memory_path")
         for root in writable_roots:
             root = Path(root).resolve()
@@ -269,7 +273,8 @@ class ExperienceStore:
             require(hashlib.sha256(raw).hexdigest() == name[:-5], "memory_digest")
             record = Experience.from_dict(json.loads(raw))
             require(canonical(record.to_json()) == raw, "memory_canonical")
-            return record
+            record.derived(self.redactor)  # Revalidate metadata against active credentials.
+            return record  # Internal publication checks retain the original stored digest.
         finally:
             os.close(fd)
 
@@ -293,7 +298,7 @@ class ExperienceStore:
 
     def load(self):
         with self._locked():
-            return self._load()
+            return ExperienceMemory(tuple(x.derived(self.redactor) for x in self._load().records))
 
     def append(self, record: Experience):
         require(isinstance(record, Experience), "typed_experience")

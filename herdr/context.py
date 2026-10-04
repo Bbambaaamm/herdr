@@ -129,6 +129,7 @@ class ContextItem:
                 or self.memory_class == MemoryClass.EPISODIC and len(self.sources) > 1
                 and self.sources[0].state == SourceState.UNVERIFIED
                 and self.sources[0].uri.startswith("herdr://derived/")), "derived_summary_binding")
+        require(not (self.mandatory and self.derived_summary), "derived_summary_cannot_be_mandatory")
         require(not self.mandatory or self.memory_class != MemoryClass.PROVIDER_CACHE,
                 "cache_cannot_be_mandatory")
 
@@ -176,7 +177,19 @@ class ProjectMap:
         return digest(asdict(self))
 
     def require_current(self, base_sha, file_versions):
-        if base_sha != self.base_sha or dict(self.file_versions) != dict(file_versions):
+        require(isinstance(file_versions, (tuple, list)) and len(file_versions) <= 64,
+                "current_file_versions")
+        current = {}
+        for entry in file_versions:
+            require(isinstance(entry, (tuple, list)) and len(entry) == 2, "current_file_versions")
+            path, version = entry
+            require(isinstance(path, str) and len(path) <= 512 and not path.startswith("/")
+                    and "\\" not in path and all(x not in {"", ".", ".."} for x in path.split("/")),
+                    "current_file_versions")
+            hash_value(version)
+            require(path not in current, "duplicate_current_file")
+            current[path] = version
+        if base_sha != self.base_sha or dict(self.file_versions) != current:
             raise ContextBlocked("project_map_invalidated")
 
 
@@ -218,8 +231,12 @@ class SecretRedactor:
         self.policy_hash = digest({"version": VERSION, "known_secret_hashes":
                                    sorted(hashlib.sha256(x.encode()).hexdigest() for x in self._secrets)})
 
-    def redact(self, value):
-        bounded_text(value, MAX_BYTES, empty=True)
+    def redact(self, value, *, maximum=MAX_BYTES):
+        # Capture may decode up to 1 MiB of bytes; replacement UTF-8 characters
+        # can expand malformed input to three times that size. Keep one bounded
+        # string so credentials spanning any chunk boundary remain redacted.
+        require(type(maximum) is int and 0 < maximum <= 3_145_728, "redaction_limit")
+        bounded_text(value, maximum, empty=True)
         for secret in self._secrets:
             value = value.replace(secret, "[REDACTED]")
         for pattern in self._patterns:
@@ -415,6 +432,7 @@ class ContextCompiler:
                 raise ContextBlocked("required_evidence_" + reason)
         safe_items = []
         for item in items:
+            require(self.redactor.redact(item.id) == item.id, "secret_context_identity")
             require(all(canonical(self.redactor.tree(asdict(x))) == canonical(asdict(x)) for x in item.sources),
                     "secret_source_reference")
             safe_items.append(replace(item, reason=self.redactor.redact(item.reason)))
@@ -426,7 +444,7 @@ class ContextCompiler:
             "project_map": asdict(project_map), "selection": {"tools": snapshot["tools"], "skills": snapshot["skills"]}})
         payload = canonical({"binding": context.binding(), "stable_prefix": stable,
                              "controls": controls_raw, "node_instructions": self.redactor.redact(layers.node),
-                             "selection_hash": selection.hash, "selection_reason": selection.reason,
+                             "selection_hash": selection.hash, "selection_reason": self.redactor.redact(selection.reason),
                              "previous_selection_hash": selection.previous_hash,
                              "skill_trace": self.redactor.tree(snapshot["skill_trace"]),
                              "control_source_digest": digest(asdict(controls))})
@@ -503,7 +521,8 @@ class ContextCompiler:
                     reason = reason or "secret_source_reference"
                 source_reason = _source_policy(source, plan.project, plan.context,
                                                 series=plan.experiment_series, role=plan.role)
-                if item.derived_summary and source_index == 0 and source_reason == SourceState.UNVERIFIED.value:
+                if (item.derived_summary and not item.mandatory and source_index == 0
+                        and source_reason == SourceState.UNVERIFIED.value):
                     source_reason = None
                 reason = reason or source_reason
                 if source.data_class not in set(cap.data_policy.data_classes) & set(provider.data_policy.data_classes):
@@ -619,10 +638,12 @@ def capture_output(source: SourceRef, stdout: bytes, stderr: bytes, *, exit_code
     require(type(max_bytes) is int and 0 < max_bytes <= 1_048_576
             and type(max_ms) is int and 0 < max_ms <= 300_000
             and type(max_excerpt) is int and 256 <= max_excerpt <= 32_768, "output_limits")
+    require(isinstance(redactor, SecretRedactor), "host_redactor")
+    require(canonical(redactor.tree(asdict(source))) == canonical(asdict(source)), "secret_source_reference")
     if elapsed_ms > max_ms or len(stdout) + len(stderr) > max_bytes:
         raise ContextBlocked("tool_output_limit")
-    out = redactor.redact(stdout.decode("utf-8", errors="replace"))
-    err = redactor.redact(stderr.decode("utf-8", errors="replace"))
+    out = redactor.redact(stdout.decode("utf-8", errors="replace"), maximum=3 * max_bytes)
+    err = redactor.redact(stderr.decode("utf-8", errors="replace"), maximum=3 * max_bytes)
     # Redaction expansion can increase bytes; artifact limit still applies.
     artifact = canonical({"source": asdict(source), "exit_code": exit_code,
                           "elapsed_ms": elapsed_ms, "stdout": out, "stderr": err})
@@ -631,6 +652,8 @@ def capture_output(source: SourceRef, stdout: bytes, stderr: bytes, *, exit_code
     ref = persist(artifact)
     require(isinstance(ref, SourceRef) and ref.sha256 == hashlib.sha256(artifact).hexdigest()
             and ref.project == source.project and ref.data_class == source.data_class
+            and ref.holdout_series == source.holdout_series
+            and canonical(redactor.tree(asdict(ref))) == canonical(asdict(ref))
             and ref.state == SourceState.VERIFIED, "output_artifact_binding")
     def excerpt(value):
         raw = value.encode()

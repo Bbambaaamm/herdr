@@ -327,3 +327,83 @@ def test_failed_process_without_stderr_still_reports_failure_and_artifact():
     result = capture_output(source(), b"ordinary output", b"", exit_code=5, elapsed_ms=1,
                             redactor=SecretRedactor(), persist=persist)
     assert "5" in result.error_excerpt and result.source.sha256 == hashlib.sha256(saved[0]).hexdigest()
+
+
+def test_host_known_selection_reason_is_redacted_in_plan_and_telemetry():
+    secret = "host-private-rotated-value"
+    compiler, plan, project, controls, selection = fixture(redactor=SecretRedactor((secret,)))
+    selection = replace(selection, reason="Changed model because " + secret)
+    replacement = compiler.plan(plan.context, project, controls, LAYERS, selection,
+        current_base_sha=BASE, current_file_versions=project.file_versions, token_budget=4096)
+    assert secret.encode() not in replacement.payload
+    assert compile(compiler, replacement).telemetry()["selection_reason"] == "Changed model because [REDACTED]"
+
+
+@pytest.mark.parametrize("field", ["uri", "revision"])
+def test_capture_rejects_known_secret_source_metadata_before_persistence(field):
+    secret = "host-private-rotated-value"
+    ref = replace(source(), **{field: "artifact://herdr/" + secret if field == "uri" else secret})
+    with pytest.raises(ContextError, match="secret_source_reference"):
+        capture_output(ref, b"output", b"", exit_code=0, elapsed_ms=1,
+                       redactor=SecretRedactor((secret,)), persist=lambda _: pytest.fail("secret metadata persisted"))
+
+
+def test_context_item_identity_cannot_carry_known_secret():
+    secret = "host-private-rotated-value"
+    with pytest.raises(ContextError, match="secret_context_identity"):
+        fixture(redactor=SecretRedactor((secret,)), items=(item(id=secret),))
+
+
+def test_optional_compaction_cannot_be_promoted_to_required_evidence():
+    original = item()
+    compacted, _ = Compaction("Derived advisory", original.sources,
+        ((original.id, original.sources[0].sha256),)).item((original,), SecretRedactor())
+    with pytest.raises(ContextError, match="derived_summary_cannot_be_mandatory"):
+        replace(compacted, mandatory=True)
+
+
+@pytest.mark.parametrize("holdout", [None, "series-2"])
+def test_captured_reference_must_preserve_original_holdout_binding(holdout):
+    with pytest.raises(ContextError, match="output_artifact_binding"):
+        capture_output(source(holdout="series-1"), b"output", b"", exit_code=0, elapsed_ms=1,
+            redactor=SecretRedactor(), persist=lambda raw: source(raw, holdout=holdout))
+
+
+def test_captured_private_holdout_remains_evaluator_scoped():
+    result = capture_output(source(holdout="series-1"), b"output", b"", exit_code=0, elapsed_ms=1,
+        redactor=SecretRedactor(), persist=lambda raw: source(raw, holdout="series-1"))
+    assert result.source.holdout_series == "series-1"
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_capture_handles_large_admitted_stream_and_secret_across_256k_boundary(stream):
+    saved = []
+    secret = "known-private-secret"
+    raw = b"x" * (262144-5) + secret.encode() + b"y" * 50000
+    def persist(payload):
+        saved.append(payload)
+        return source(payload)
+    result = capture_output(source(), raw if stream == "stdout" else b"", raw if stream == "stderr" else b"",
+        exit_code=1, elapsed_ms=1, redactor=SecretRedactor((secret,)), persist=persist)
+    assert result.total_bytes == len(raw) and result.truncated
+    assert secret.encode() not in saved[0] and b"[REDACTED]" in saved[0]
+
+
+@pytest.mark.parametrize("entries", [
+    (("src/main.py", "f"*64), ("src/main.py", FILE_SHA)),
+    (("src/main.py", FILE_SHA), ("src/main.py", FILE_SHA)),
+    (("src/main.py", "not-a-digest"),),
+    (("../main.py", FILE_SHA),),
+], ids=["conflicting-duplicates", "identical-duplicates", "invalid-digest", "traversal"])
+def test_project_map_rejects_ambiguous_or_malformed_current_versions(entries):
+    _, _, project, *_ = fixture()
+    with pytest.raises(ContextError):
+        project.require_current(BASE, entries)
+
+
+def test_capture_rejects_secret_in_returned_reference_metadata():
+    secret = "known-private-secret"
+    with pytest.raises(ContextError, match="output_artifact_binding"):
+        capture_output(source(), b"output", b"", exit_code=0, elapsed_ms=1,
+            redactor=SecretRedactor((secret,)),
+            persist=lambda raw: replace(source(raw), uri="artifact://herdr/"+secret))

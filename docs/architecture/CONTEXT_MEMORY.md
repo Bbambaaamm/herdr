@@ -109,3 +109,13 @@ the evaluator for their exact series. Missing/unverified/stale/conflicting sourc
 retain explicit states; optional retrieval outages cannot substitute assumptions
 for missing mandatory proof. No automatic wiki, graph database, skill promotion
 or production policy self-modification is introduced.
+
+Security checks also cover context item identities, selection explanations and
+captured artifact metadata against host-known secrets. Capture preserves private
+holdout bindings and redacts a single bounded string across the entire admitted
+output, including streams larger than 256 KiB. A derived compaction can never
+be mandatory evidence. Current project-map inputs reject duplicate file entries.
+Memory paths reject traversal components before worker-root isolation checks.
+Loading immutable memory revalidates metadata and derives redacted text under
+the current credential configuration without rewriting stored records.
+Bounded recall prioritizes verified comparable trials before unusable notes.
