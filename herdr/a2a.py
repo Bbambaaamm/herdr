@@ -130,6 +130,13 @@ def _https_url(value: Any,limit: int):
             ascii_host=host.encode("idna").decode("ascii").rstrip(".")
             if not ascii_host or len(ascii_host)>253 or any(not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?",part) for part in ascii_host.split(".")):
                 raise ValueError("invalid hostname")
+            for name in ascii_host.split("."):
+                if name.lower().startswith("xn--"):
+                    decoded=name.lower().encode("ascii").decode("idna")
+                    if (decoded.encode("idna").decode("ascii")!=name.lower()
+                            or unicodedata.category(decoded[0]).startswith("M")
+                            or any(c!="-" and not unicodedata.category(c).startswith(("L","M","N")) for c in decoded)):
+                        raise ValueError("invalid IDNA A-label")
         if parsed.scheme!="https" or parsed.username or parsed.password or port is not None and not 1<=port<=65535:
             raise ValueError("invalid HTTPS URL authority or embedded credentials")
     except (ValueError,UnicodeError) as exc:
@@ -217,6 +224,11 @@ def parse_card(raw: Any) -> AgentCard:
             # #71 intentionally implements no A2A extensions. Fail before
             # admission/economic dispatch instead of relying on a remote error.
             raise A2AError("unsupported required extension")
+    for mode_key in ("defaultInputModes", "defaultOutputModes"):
+        modes = card[mode_key]
+        if not isinstance(modes, list) or not modes or len(modes) > 32 or any(not isinstance(mode, str) or not mode for mode in modes):
+            raise A2AError("invalid modes")
+        for mode in modes:_label(mode,"mode")
     if not isinstance(card["skills"], list) or not 1 <= len(card["skills"]) <= 32:
         raise A2AError("invalid skills")
     skill_ids=set()
@@ -229,19 +241,15 @@ def parse_card(raw: Any) -> AgentCard:
         for mode_key in ("inputModes","outputModes"):
             if mode_key in item:
                 modes=item[mode_key]
-                if not isinstance(modes,list) or not modes or len(modes)>32:
+                if modes is None:modes=[]
+                if not isinstance(modes,list) or len(modes)>32:
                     raise A2AError("invalid skill modes")
                 for mode in modes:_label(mode,"skill mode")
-        skill_input_modes.extend(item.get("inputModes",card["defaultInputModes"]))
+        skill_input_modes.extend(item.get("inputModes") or card["defaultInputModes"])
         _label(item["name"], "skill name")
         _label(item["description"], "skill description")
         if not isinstance(item["tags"], list) or not item["tags"] or any(not isinstance(tag, str) or not tag for tag in item["tags"]):
             raise A2AError("invalid skill tags")
-    for mode_key in ("defaultInputModes", "defaultOutputModes"):
-        modes = card[mode_key]
-        if not isinstance(modes, list) or not modes or len(modes) > 32 or any(not isinstance(mode, str) or not mode for mode in modes):
-            raise A2AError("invalid modes")
-        for mode in modes:_label(mode,"mode")
     entries = card["supportedInterfaces"]
     if not isinstance(entries, list) or not 1 <= len(entries) <= 8:
         raise A2AError("invalid interfaces")
@@ -801,14 +809,14 @@ def _parse_response(
         )
     task = _response_object(envelope["task"], {"id", "status"})
     task_id = _remote_id(task["id"], "task id")
-    context = _remote_id(task["contextId"], "context id") if "contextId" in task else None
+    context = _remote_id(task["contextId"], "context id") if task.get("contextId") is not None else None
     status = _response_object(task["status"], {"state"})
     state = _task_state(status["state"])
     artifacts = task.get("artifacts", [])
     if not isinstance(artifacts, list) or len(artifacts) > MAX_PARTS:
         raise A2AError("invalid artifacts")
     candidates = []
-    if "message" in status:
+    if status.get("message") is not None:
         msg = _response_object(status["message"], {"messageId", "role", "parts"})
         _remote_id(msg["messageId"], "messageId")
         if not _agent_role(msg["role"]):
@@ -831,8 +839,13 @@ def _parse_response(
                 msg,
             )
         )
-    if binding and (binding["remote_task_id"] != task_id or binding["remote_context_id"] != context):
-        raise A2AError("remote binding mismatch")
+    if binding:
+        observed_context=context
+        if context is None:context=binding["remote_context_id"]
+        if (binding["remote_task_id"] != task_id
+                or binding["remote_context_id"] is not None and observed_context is not None
+                    and binding["remote_context_id"] != observed_context):
+            raise A2AError("remote binding mismatch")
     artifact_ids=set()
     for artifact in artifacts:
         item = _response_object(artifact, {"artifactId", "parts"})
@@ -898,10 +911,11 @@ class Gateway:
             if self.interface.tenant is not None:
                 request["tenant"] = self.interface.tenant
             response = self.transport.get(self.interface, request, HEADER)
-            state, _, _, candidates = _parse_response(
+            state, _, context, candidates = _parse_response(
                 response, identity, data, allow_bare_task=True
             )
             data["last_observation"] = state
+            data["remote_context_id"] = context
             if candidates:
                 data["candidates"] = _merge_candidate_records(data["candidates"], candidates)
             self.store._write(directory, data)
@@ -931,10 +945,11 @@ class Gateway:
             if self.interface.tenant is not None:
                 request["tenant"] = self.interface.tenant
             response = self.transport.cancel(self.interface, request, HEADER)
-            state, _, _, candidates = _parse_response(
+            state, _, context, candidates = _parse_response(
                 response, identity, data, allow_bare_task=True, discard_history=True
             )
             data["last_observation"] = state
+            data["remote_context_id"] = context
             if candidates:
                 data["candidates"] = _merge_candidate_records(data["candidates"], candidates)
             self.store._write(directory, data)

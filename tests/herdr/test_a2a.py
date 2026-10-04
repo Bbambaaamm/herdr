@@ -436,12 +436,15 @@ def test_task_context_optional_unspecified_state_and_context_binding(tmp_path):
     assert bound["remote_context_id"] is None
     assert bound["last_observation"] == "TASK_STATE_UNSPECIFIED"
 
-    # Remote context is execution metadata. Once the first task response bound
-    # its exact absence, a later context cannot silently create a new session
-    # identity or reset Herdr's economic fence.
+    # Absence is an unobserved optional field. Its first later observation
+    # binds metadata without changing the Herdr identity or economic fence.
     transport.response = task("TASK_STATE_WORKING", context="late-context")
-    with pytest.raises(A2AError, match="remote binding"):
-        Gateway(transport, store, card, policy).poll(identity)
+    assert Gateway(transport, store, card, policy).poll(identity)==()
+    assert store.read()["remote_context_id"]=="late-context"
+    assert store.read()["identity"]==bound["identity"]
+    transport.response=task("TASK_STATE_WORKING",context="foreign-context")
+    with pytest.raises(A2AError,match="remote binding"):
+        Gateway(transport,store,card,policy).poll(identity)
     assert len(transport.sends) == 1
 
 
@@ -1037,3 +1040,50 @@ def test_duplicate_task_artifact_ids_are_rejected(tmp_path):
                              {"artifactId":"same","parts":[{"text":"two"}]}])
     with pytest.raises(A2AError,match="duplicate artifact"):
         Gateway(Mock(response),store,card,policy).send(identity,"work")
+
+
+@pytest.mark.parametrize("key",["inputModes","outputModes"])
+@pytest.mark.parametrize("empty",[[],None])
+def test_optional_empty_or_null_skill_modes_inherit_required_defaults(tmp_path,key,empty):
+    raw,*_=setup(tmp_path);raw["skills"][0][key]=empty
+    assert parse_card(raw).supports_text_input
+
+@pytest.mark.parametrize("bad",["xn--abc","xn--ls8h","xn--"])
+def test_fake_idna_alabel_denied_before_card_admission(tmp_path,bad):
+    raw,*_=setup(tmp_path);raw["supportedInterfaces"][0]["url"]=f"https://{bad}.example/a2a"
+    with pytest.raises(A2AError,match="HTTPS"):parse_card(raw)
+
+@pytest.mark.parametrize("bare",[False,True])
+@pytest.mark.parametrize("null_fields",[False,True])
+def test_bound_context_survives_later_unobserved_optional_fields(tmp_path,bare,null_fields):
+    _,card,policy,identity,store=setup(tmp_path)
+    payload=task(context=None)
+    payload["task"]["status"]["message"]={"messageId":"status-1","role":2,
+        "parts":[{"text":"working"}],"contextId":"known-context"}
+    transport=Mock(payload);gateway=Gateway(transport,store,card,policy)
+    gateway.send(identity,"work")
+    later=task("TASK_STATE_COMPLETED",context=None,
+        artifacts=[{"artifactId":"final","parts":[{"text":"late result"}]}])
+    if null_fields:
+        later["task"]["contextId"]=None;later["task"]["status"]["message"]=None
+    transport.response=later["task"] if bare else later
+    candidate,=gateway.poll(identity)
+    assert candidate.remote_context_id=="known-context"
+    assert store.read()["remote_context_id"]=="known-context"
+    assert len(Gateway(Mock(),store,card,policy).recover(identity))==2
+
+def test_context_first_observed_after_send_binds_once_without_new_economic_send(tmp_path):
+    _,card,policy,identity,store=setup(tmp_path)
+    transport=Mock(task(context=None));gateway=Gateway(transport,store,card,policy)
+    gateway.send(identity,"work");assert store.read()["remote_context_id"] is None
+    transport.response=task("TASK_STATE_WORKING",context="learned-context",
+        artifacts=[{"artifactId":"one","parts":[{"text":"first result"}]}])
+    first,=gateway.poll(identity)
+    assert first.remote_context_id=="learned-context" and store.read()["remote_context_id"]=="learned-context"
+    transport.response=task("TASK_STATE_COMPLETED",context=None,
+        artifacts=[{"artifactId":"two","parts":[{"text":"final result"}]}])
+    second,=gateway.poll(identity)
+    assert second.remote_context_id=="learned-context"
+    transport.response=task(context="foreign-context")
+    with pytest.raises(A2AError,match="binding mismatch"):gateway.poll(identity)
+    assert len(transport.sends)==1 and len(gateway.recover(identity))==2
