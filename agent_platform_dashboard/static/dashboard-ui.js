@@ -1126,7 +1126,7 @@ export function mountDashboard(createScene) {
               || !Object.hasOwn(SWARM_STATUS, task.state) || typeof task.role !== 'string'
               || !Number.isSafeInteger(task.attempt) || task.attempt < 0
               || !Number.isSafeInteger(task.max_attempts) || task.max_attempts < task.attempt
-              || (task.attempt_state != null && !['dispatching','accepted','working','delivery_uncertain','verifying','completed','done','blocked','failed','retry_scheduled'].includes(task.attempt_state))
+              || (task.attempt_state != null && !['dispatching','accepted','working','delivery_uncertain','verifying','completed','done','blocked','failed','retry_scheduled', 'verification_pending'].includes(task.attempt_state))
               || (task.delivery_reconcile_count != null && (!Number.isSafeInteger(task.delivery_reconcile_count) || task.delivery_reconcile_count < 0))
               || !Number.isSafeInteger(task.fencing_token) || task.fencing_token < 0
               || !Array.isArray(task.dependencies)

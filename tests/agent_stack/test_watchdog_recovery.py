@@ -33,6 +33,8 @@ def configure_paths(tmp_path):
 def task(now, *, task_id="task-1", timeout=1800):
     return {
         "id": task_id,
+        "kind": "github_root_orchestration",
+        "idempotency_key": "control-fixture-key",
         "run_token": "token-1",
         "timeout_seconds": timeout,
         "attempt_started_at": (now - timedelta(seconds=timeout + 600)).isoformat(),
@@ -42,6 +44,9 @@ def task(now, *, task_id="task-1", timeout=1800):
 
 
 def write_task(path, payload):
+    if payload.get("id") and payload.get("kind") == "github_root_orchestration":
+        from agent_completion_evidence import freeze_plan
+        freeze_plan(recovery.ROOT, payload)
     path.write_text(json.dumps(payload), encoding="utf-8")
     raw = str(payload.get("attempt_started_at") or "")
     if raw:
@@ -145,6 +150,8 @@ def test_matching_completed_result_terminalizes_done(tmp_path, monkeypatch):
             "task_id": "task-1",
             "run_token": "token-1",
             "status": "completed",
+            "summary": "control cycle finished",
+            "next_action": "continue remaining implementation",
             "blocker": None,
         },
     )
@@ -168,6 +175,8 @@ def test_mismatched_result_is_not_overwritten(tmp_path, monkeypatch):
         "task_id": "task-1",
         "run_token": "older-token",
         "status": "completed",
+            "summary": "control cycle finished",
+            "next_action": "continue remaining implementation",
     }
     write_task(canonical, original)
     monkeypatch.setattr(recovery, "active_worker_tasks", lambda: set())
@@ -244,6 +253,8 @@ def test_result_appearing_on_second_check_terminalizes_instead_of_block(tmp_path
         "task_id": "task-1",
         "run_token": "token-1",
         "status": "completed",
+            "summary": "control cycle finished",
+            "next_action": "continue remaining implementation",
         "blocker": None,
     }
     calls = iter(((None, "missing"), (completed, "matched")))
@@ -412,6 +423,8 @@ def test_late_result_after_quarantine_terminalizes_on_next_cycle(tmp_path, monke
             "task_id": "task-1",
             "run_token": "token-1",
             "status": "completed",
+            "summary": "control cycle finished",
+            "next_action": "continue remaining implementation",
             "blocker": None,
         },
     )
@@ -507,6 +520,8 @@ def test_terminal_result_waits_for_task_pane_cleanup(tmp_path, monkeypatch):
     path = recovery.RUNNING / "task-1.json"
     payload = {
         "id": "task-1",
+        "kind": "github_root_orchestration",
+        "idempotency_key": "control-fixture-key",
         "run_token": "token-1",
         "execution_session": {
             "owned_pane": True,
@@ -519,6 +534,8 @@ def test_terminal_result_waits_for_task_pane_cleanup(tmp_path, monkeypatch):
         "task_id": "task-1",
         "run_token": "token-1",
         "status": "completed",
+            "summary": "control cycle finished",
+            "next_action": "continue remaining implementation",
         "blocker": None,
     }
     monkeypatch.setattr(recovery, "cleanup_task_owned_pane", lambda task: False)
@@ -554,6 +571,8 @@ def test_non_object_result_does_not_abort_recovery_of_later_task(tmp_path, monke
             "task_id": "task-b",
             "run_token": "token-1",
             "status": "completed",
+            "summary": "control cycle finished",
+            "next_action": "continue remaining implementation",
             "blocker": None,
         },
     )
@@ -780,6 +799,8 @@ def test_cleanup_blocker_retries_exact_result_without_timeout_delay(
 
     payload = {
         "id": "task-1",
+        "kind": "github_root_orchestration",
+        "idempotency_key": "control-fixture-key",
         "run_token": "token-1",
         "timeout_seconds": 1800,
         "attempt_started_at": now.isoformat(),
@@ -802,6 +823,8 @@ def test_cleanup_blocker_retries_exact_result_without_timeout_delay(
             "task_id": "task-1",
             "run_token": "token-1",
             "status": "completed",
+            "summary": "control cycle finished",
+            "next_action": "continue remaining implementation",
             "blocker": None,
         },
     )
@@ -899,3 +922,115 @@ def test_unsupported_exact_result_preserves_task_owned_pane(
 
     session = saved["execution_session"]
     assert "closed_at" not in session
+
+
+def test_completed_coding_result_cannot_bypass_gate_through_watchdog(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    now = datetime.now(timezone.utc)
+    payload = task(now)
+    payload["kind"] = "github_issue_slice"
+    path = recovery.RUNNING / "task-1.json"
+    write_task(path, payload)
+    result = {"task_id": "task-1", "run_token": "token-1", "status": "completed",
+              "summary": "claims tests passed", "blocker": None}
+    write_task(recovery.RESULTS / "task-1.json", result)
+    monkeypatch.setattr(recovery, "active_worker_tasks", lambda: set())
+    recovery.recover_orphan_tasks(now)
+    saved = json.loads((recovery.BLOCKED / path.name).read_text())
+    assert saved["attempt_state"] == "blocked"
+    assert saved["verification_resolution"] == "needs_replan"
+    assert saved["verification_status"] == "evidence_invalid"
+    assert not list(recovery.DONE.iterdir())
+    assert json.loads((recovery.RESULTS / "task-1.json").read_text()) == result
+
+
+def test_late_verification_recovery_does_not_repeat_worker_execution(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    now = datetime.now(timezone.utc)
+    payload = task(now)
+    payload["attempt_state"] = "verification_pending"
+    payload["attempts"] = 2
+    path = recovery.BLOCKED / "task-1.json"
+    write_task(path, payload)
+    result = {"task_id": "task-1", "run_token": "token-1", "status": "completed",
+              "summary": "completed cycle", "next_action": "continue", "blocker": None}
+    write_task(recovery.RESULTS / "task-1.json", result)
+    monkeypatch.setattr(recovery, "active_worker_tasks", lambda: set())
+    recovery.reconcile_verification_pending()
+    saved = json.loads((recovery.DONE / path.name).read_text())
+    assert saved["attempts"] == 2
+    assert saved["run_token"] == "token-1"
+    assert saved["completion_level"] == "control_cycle"
+
+
+def test_pending_verification_cleanup_failure_is_retried_from_blocked_storage(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    payload = task(datetime.now(timezone.utc))
+    payload["attempt_state"] = "verification_pending"
+    payload["attempts"] = 2
+    path = recovery.BLOCKED / "task-1.json"
+    write_task(path, payload)
+    result = {"task_id": "task-1", "run_token": "token-1", "status": "completed",
+              "summary": "completed cycle", "next_action": "continue", "blocker": None}
+    write_task(recovery.RESULTS / "task-1.json", result)
+    monkeypatch.setattr(recovery, "active_worker_tasks", lambda: set())
+    monkeypatch.setattr(recovery, "cleanup_task_owned_pane", lambda *a: False)
+    recovery.reconcile_verification_pending()
+    saved = json.loads(path.read_text())
+    assert saved["verification_status"] == "accepted"
+    assert saved["attempt_state"] == "delivery_uncertain"
+    assert saved["watchdog_cleanup_blocker"] == "task_session_cleanup_failed"
+    monkeypatch.setattr(recovery, "cleanup_task_owned_pane", lambda *a: True)
+    recovery.reconcile_verification_pending()
+    done = json.loads((recovery.DONE / path.name).read_text())
+    assert done["completion_level"] == "control_cycle"
+    assert done["run_token"] == "token-1" and done["attempts"] == 2
+    assert not path.exists()
+
+
+def test_invalid_watchdog_evidence_requests_replan_and_is_not_polled_again(tmp_path, monkeypatch):
+    from herdr.evidence import EvidenceError
+    configure_paths(tmp_path)
+    payload = task(datetime.now(timezone.utc))
+    payload["attempt_state"] = "verification_pending"
+    payload["watchdog_blocker"] = "orphaned_running_unknown_delivery"
+    path = recovery.BLOCKED / "task-1.json"
+    write_task(path, payload)
+    result = {"task_id": "task-1", "run_token": "token-1", "status": "completed",
+              "summary": "completed cycle", "next_action": "continue", "blocker": None}
+    write_task(recovery.RESULTS / "task-1.json", result)
+    calls = []
+    def verify(*a):
+        calls.append(1)
+        raise EvidenceError("artifact identity mismatch")
+    monkeypatch.setattr(recovery, "verify_completion", verify)
+    monkeypatch.setattr(recovery, "active_worker_tasks", lambda: set())
+    recovery.reconcile_verification_pending()
+    saved = json.loads(path.read_text())
+    assert saved["verification_resolution"] == "needs_replan"
+    assert "not_before" not in saved
+    recovery.reconcile_verification_pending()
+    recovery.reconcile_watchdog_blocked_tasks()
+    assert len(calls) == 1
+    assert saved["run_token"] == "token-1"
+
+
+def test_worker_cleanup_marker_recovers_same_exact_completed_result(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    now = datetime.now(timezone.utc)
+    payload = task(now)
+    payload.update(attempt_state="blocked", verification_status="accepted",
+                   watchdog_blocker="task_session_cleanup_failed")
+    path = recovery.BLOCKED / "task-1.json"
+    write_task(path, payload)
+    result = {"task_id": payload["id"], "run_token": payload["run_token"],
+              "status": "completed", "summary": "control done", "next_action": "continue", "blocker": None}
+    (recovery.RESULTS / "task-1.json").write_text(json.dumps(result))
+    monkeypatch.setattr(recovery, "active_worker_tasks", lambda: set())
+    monkeypatch.setattr(recovery, "cleanup_task_owned_pane", lambda *a: True)
+    recovery.reconcile_verification_pending()
+    saved = json.loads((recovery.DONE / path.name).read_text())
+    assert saved["attempt_state"] == "done"
+    assert saved["run_token"] == payload["run_token"]
+    assert "watchdog_blocker" not in saved
+    assert json.loads((recovery.RESULTS / "task-1.json").read_text()) == result

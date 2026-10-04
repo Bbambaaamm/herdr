@@ -32,11 +32,11 @@ class StaleSource(ValueError):
     pass
 
 
-def command(argv, *, env=None, limit=65536, timeout=3):
+def command(argv, *, env=None, limit=65536, timeout=3, pass_fds=()):
     """Bound bytes while draining; no communicate() allocation of unlimited output."""
     process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, env=SAFE_ENV if env is None else env,
-                               start_new_session=True, close_fds=True)
+                               start_new_session=True, close_fds=True, pass_fds=pass_fds)
     deadline = time.monotonic() + timeout
     result = bytearray()
     try:
@@ -44,7 +44,8 @@ def command(argv, *, env=None, limit=65536, timeout=3):
             selector.register(process.stdout, selectors.EVENT_READ)
             while True:
                 left = deadline - time.monotonic()
-                c.need(left > 0)
+                if left <= 0:
+                    raise ValueError("source_timeout")
                 if not selector.select(left):
                     raise ValueError('source_timeout')
                 chunk = os.read(process.stdout.fileno(), min(8192, limit + 1 - len(result)))
@@ -407,7 +408,7 @@ def swarm(path, profile):
         }
         c.need(task['attempt_state'] is None or task['attempt_state'] in (
             'dispatching', 'accepted', 'working', 'delivery_uncertain', 'verifying',
-            'completed', 'done', 'blocked', 'failed', 'retry_scheduled'))
+            'completed', 'done', 'blocked', 'failed', 'retry_scheduled', 'verification_pending'))
         c.need(c.number(task['delivery_reconcile_count']))
         tasks.append(task)
     c.need(len({task['task_id'] for task in tasks}) == len(tasks))

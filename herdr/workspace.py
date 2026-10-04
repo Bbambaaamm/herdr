@@ -343,5 +343,18 @@ def _real_git(root: Path) -> GitRunner:
         )
         return proc.stdout
 
+    def raw(args: Sequence[str]) -> bytes:
+        # Used only by trusted artifact collection; return committed binary
+        # blobs without text decoding or Git clean/smudge conversion.
+        words = [value for value in args if not value.startswith("-")]
+        if any(word in denied for word in words):
+            raise WorkspaceError("network/remote Git operations are forbidden")
+        env = dict(os.environ)
+        for key in ("GH_TOKEN", "GITHUB_TOKEN", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_SSH_COMMAND"):
+            env.pop(key, None)
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        return subprocess.run([executable, "-C", str(root), *args], check=True,
+                              capture_output=True, env=env).stdout
+    run.raw = raw
     return run
 
