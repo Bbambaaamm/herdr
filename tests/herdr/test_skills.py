@@ -395,7 +395,7 @@ def test_source_manifest_accepts_declared_assets_and_preserves_exact_bytes(tmp_p
         replace(x, media_type=media_type) if x.path.startswith("assets/") else x for x in manifest.files))
     (root / "manifest.json").write_bytes(canonical(manifest.to_json()))
     for path in ("configs/consumers/herdr.yaml", "docs/CONSUMERS.md", "docs/architecture/AGENT_SKILLS.md",
-                 "package.json", "package-lock.json"):
+                 "package.json", "package-lock.json", "requirements-mcp.txt", "docs/architecture/MCP_GATEWAY.md"):
         target = workspace / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("{}\n")
@@ -522,7 +522,7 @@ def test_source_manifest_rejects_nonregular_skill_tree_entries(tmp_path, kind):
     skill_root.mkdir()
     item = package(skill_root)
     for path in ("configs/consumers/herdr.yaml", "docs/CONSUMERS.md", "docs/architecture/AGENT_SKILLS.md",
-                 "package.json", "package-lock.json"):
+                 "package.json", "package-lock.json", "requirements-mcp.txt", "docs/architecture/MCP_GATEWAY.md"):
         target = workspace / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("{}\n")

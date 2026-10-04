@@ -208,6 +208,22 @@ Malformed mutation output retains uncertainty and cannot trigger redelivery.
 Configured endpoint ports and URL shape are validated before the transport can
 participate in discovery or delivery. Pinned discovery bytes still must be
 valid protocol definitions, including optional tool title and description.
-Structured tool output must be an object even without an output schema.
+Structured tool output may be any JSON value, including arrays, scalars and
+null. A declared output schema constrains that value; tool input schemas must
+explicitly declare object type. This follows the finalized 2026-07-28 schema.
 Resource reads validate text/blob exclusivity, types, encoding and metadata in
 addition to the exact admitted URI.
+
+Resource reads require both finite nonnegative ttlMs and private/public
+cacheScope before their contents may be recorded or forwarded. Input-required
+results require typed inputRequests or an opaque bounded requestState; nested
+requests remain observations and never execute callbacks or authorize OAuth,
+sampling, new tools or resources.
+
+Missing, ambiguous or mismatched HTTP routing headers return HTTP 400 and MCP
+HeaderMismatch (-32020). An unsupported version with matching headers returns
+HTTP 400 and UnsupportedProtocolVersion (-32022), including supported/requested
+version data. Invalid failed-Task error objects are rejected before terminal
+observation. Endpoint request targets require already encoded ASCII paths,
+validated before any reservation. Legacy SQLite column migrations run under
+BEGIN IMMEDIATE with an in-transaction schema check across host processes.

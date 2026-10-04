@@ -45,6 +45,17 @@ class GatewayError(RuntimeError):
     code = "invalid_request"
 
 
+class HeaderMismatch(GatewayError):
+    code = "header_mismatch"
+
+
+class UnsupportedProtocolVersion(GatewayError):
+    code = "unsupported_protocol_version"
+    def __init__(self, requested):
+        super().__init__(self.code)
+        self.requested = requested
+
+
 class PolicyDenied(GatewayError):
     code = "policy_denied"
 
@@ -186,12 +197,104 @@ def validate_schema(schema: dict, instance=None, *, check_only=False):
 
 
 
+def validate_cacheable(result):
+    ttl, scope = result.get("ttlMs"), result.get("cacheScope")
+    if type(ttl) not in {int, float} or not 0 <= ttl <= 2**53 - 1 or not math.isfinite(ttl):
+        raise GatewayError("invalid cache TTL")
+    if not isinstance(scope, str) or scope not in {"private", "public"}:
+        raise GatewayError("invalid or absent cache scope")
+    return ttl
+
+
+def validate_protocol_error(error):
+    if (not isinstance(error, dict) or type(error.get("code")) is not int
+            or not -(2**53 - 1) <= error["code"] <= 2**53 - 1
+            or not isinstance(error.get("message"), str)):
+        raise GatewayError("malformed protocol error")
+
+
+def validate_input_required(result):
+    # These are nested InputRequest objects, not JSON-RPC envelopes. None is
+    # executed here: their only meaning is an explicitly bounded input hold.
+    if "inputRequests" not in result and "requestState" not in result:
+        raise GatewayError("input-required payload is missing")
+    if "requestState" in result and (
+            not isinstance(result["requestState"], str) or len(result["requestState"]) > 32768):
+        raise GatewayError("invalid opaque request state")
+    if "inputRequests" not in result:
+        return
+    requests = result["inputRequests"]
+    if not isinstance(requests, dict) or len(requests) > 32:
+        raise GatewayError("invalid bounded input requests")
+    for key, request in requests.items():
+        identifier(key)
+        if not isinstance(request, dict) or not isinstance(request.get("method"), str) or request["method"] not in {
+                "roots/list", "elicitation/create", "sampling/createMessage"}:
+            raise GatewayError("invalid input request method")
+        method, params = request["method"], request.get("params", {})
+        if not isinstance(params, dict) or "_meta" in params and not isinstance(params["_meta"], dict):
+            raise GatewayError("invalid input request parameters")
+        if method == "roots/list":
+            continue
+        if "params" not in request:
+            raise GatewayError("input request parameters are missing")
+        if method == "elicitation/create":
+            if not isinstance(params.get("message"), str):
+                raise GatewayError("invalid elicitation message")
+            mode = params.get("mode", "form")
+            if mode == "url":
+                identifier(params.get("url"), maximum=4096)
+            elif mode == "form":
+                schema = params.get("requestedSchema")
+                if (not isinstance(schema, dict) or schema.get("type") != "object"
+                        or not isinstance(schema.get("properties"), dict)
+                        or len(schema["properties"]) > 128):
+                    raise GatewayError("invalid elicitation form schema")
+                for name, prop in schema["properties"].items():
+                    identifier(name)
+                    if not isinstance(prop, dict) or not isinstance(prop.get("type"), str) or prop["type"] not in {"string", "number", "integer", "boolean", "array"}:
+                        raise GatewayError("invalid elicitation property")
+                    if prop.get("type") == "array":
+                        if (not isinstance(prop.get("items"), dict) or prop["items"].get("type") != "string"
+                                or not isinstance(prop["items"].get("enum"), list)):
+                            raise GatewayError("invalid multi-select elicitation property")
+                validate_schema(schema, check_only=True)
+            else:
+                raise GatewayError("invalid elicitation mode")
+        else:
+            messages, maximum = params.get("messages"), params.get("maxTokens")
+            if (not isinstance(messages, list) or len(messages) > 128
+                    or type(maximum) not in {int, float} or not 0 < maximum <= 2**53 - 1 or not math.isfinite(maximum)):
+                raise GatewayError("invalid sampling parameters")
+            for message in messages:
+                if not isinstance(message, dict) or not isinstance(message.get("role"), str) or message["role"] not in {"user", "assistant"}:
+                    raise GatewayError("invalid sampling message")
+                content = message.get("content")
+                blocks = content if isinstance(content, list) else [content]
+                if len(blocks) > 256:
+                    raise GatewayError("sampling content exceeded")
+                for block in blocks:
+                    if not isinstance(block, dict):
+                        raise GatewayError("invalid sampling content")
+                    if not isinstance(block.get("type"), str):
+                        raise GatewayError("invalid sampling content type")
+                    if block.get("type") == "tool_use":
+                        identifier(block.get("id")); identifier(block.get("name"))
+                        if not isinstance(block.get("input"), dict):
+                            raise GatewayError("invalid sampling tool input")
+                    elif block.get("type") == "tool_result":
+                        identifier(block.get("toolUseId"))
+                        validate_tool_content({"content": block.get("content"), "isError": block.get("isError", False)})
+                    elif block.get("type") in {"text", "image", "audio"}:
+                        validate_tool_content({"content": [block]})
+                    else:
+                        raise GatewayError("invalid sampling content type")
+
+
 def validate_tool_content(result):
     if (not isinstance(result, dict) or not isinstance(result.get("content"), list)
             or len(result["content"]) > 256 or type(result.get("isError", False)) is not bool):
         raise GatewayError("invalid tool result")
-    if "structuredContent" in result and not isinstance(result["structuredContent"], dict):
-        raise GatewayError("invalid structured tool content")
     for block in result["content"]:
         if not isinstance(block, dict) or not isinstance(block.get("type"), str):
             raise GatewayError("invalid tool content block")
@@ -407,7 +510,7 @@ class CallLedger:
         if self.path.is_symlink():
             raise PolicyDenied("ledger database is a symlink")
         self._mutex = threading.RLock()
-        self.db = sqlite3.connect(self.path, timeout=5, isolation_level=None, check_same_thread=False)
+        self.db = sqlite3.connect(self.path, timeout=30, isolation_level=None, check_same_thread=False)
         os.chmod(self.path, 0o600)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
@@ -430,10 +533,19 @@ class CallLedger:
         CREATE TABLE IF NOT EXISTS health(
           server TEXT PRIMARY KEY, failures INTEGER NOT NULL, open_until REAL NOT NULL);
         """)
-        columns = {row[1] for row in self.db.execute("PRAGMA table_info(calls)")}
-        for name in ("validation_plan_json", "remote_task_json"):
-            if name not in columns:
-                self.db.execute(f"ALTER TABLE calls ADD COLUMN {name} TEXT")
+        # Each process must observe the schema under the same SQLite write
+        # transaction; a thread mutex alone cannot serialize legacy migration.
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            for name in ("validation_plan_json", "remote_task_json"):
+                columns = {row[1] for row in self.db.execute("PRAGMA table_info(calls)")}
+                if name not in columns:
+                    self.db.execute(f"ALTER TABLE calls ADD COLUMN {name} TEXT")
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            self.db.close()
+            raise
         self.db.row_factory = sqlite3.Row
 
     @locked
@@ -601,10 +713,14 @@ class HTTPTransport:
             if not isinstance(endpoint, str) or any(ord(x) < 32 for x in endpoint):
                 raise ValueError("invalid endpoint")
             parsed = urlsplit(endpoint)
+            target = parsed.path or "/"
+            if any(ord(x) <= 32 or ord(x) > 126 for x in target):
+                raise ValueError("endpoint requires an encoded ASCII request target")
+            parsed.hostname.encode("ascii")
             port = parsed.port
             if port is not None and not 1 <= port <= 65535:
                 raise ValueError("invalid endpoint port")
-        except ValueError as exc:
+        except (ValueError, UnicodeError) as exc:
             raise PolicyDenied("invalid host-approved endpoint") from exc
         if (parsed.username or parsed.password or parsed.query or parsed.fragment or not parsed.hostname
                 or (parsed.scheme != "https" and not (
@@ -759,8 +875,7 @@ class ClientAdapter:
         if response is None:
             raise DeliveryUncertain("no exact request response")
         if "error" in response:
-            if not isinstance(response["error"], dict) or type(response["error"].get("code")) is not int:
-                raise GatewayError("malformed protocol error")
+            validate_protocol_error(response["error"])
             return {"resultType": "protocol_error", "code": response["error"]["code"]}, tuple(notifications)
         result = response["result"]
         if isinstance(result, dict) and "_meta" in result and not isinstance(result["_meta"], dict):
@@ -770,6 +885,8 @@ class ClientAdapter:
             raise GatewayError("unrecognized protocol result type")
         if result["resultType"] == "task" and (method != "tools/call" or not self.server.tasks):
             raise GatewayError("unnegotiated asynchronous task result")
+        if result["resultType"] == "input_required":
+            validate_input_required(result)
         return result, tuple(notifications)
 
     def listen(self, context, filters, request_id, *, prepared=None):
@@ -870,19 +987,14 @@ class ClientAdapter:
                 if "title" in annotations and not isinstance(annotations["title"], str):
                     raise GatewayError("tool annotation title must be a string")
                 schema = row.get("inputSchema")
-                if not isinstance(schema, dict):
-                    raise GatewayError("tool input schema is required")
+                if not isinstance(schema, dict) or schema.get("type") != "object":
+                    raise GatewayError("tool input schema must declare object type")
                 validate_schema(schema, check_only=True)
                 schema_headers(schema)
                 if "outputSchema" in row:
                     validate_schema(row["outputSchema"], check_only=True)
                 definitions[row["name"]] = decode(encoded(row))
-            cache_scope = result.get("cacheScope")
-            if not isinstance(cache_scope, str) or cache_scope not in {"private", "public"}:
-                raise GatewayError("invalid or absent discovery cache scope")
-            raw_ttl = result.get("ttlMs")
-            if type(raw_ttl) is not int or not 0 <= raw_ttl <= 2**53 - 1:
-                raise GatewayError("invalid discovery TTL")
+            raw_ttl = validate_cacheable(result)
             ttl = min(ttl, raw_ttl / 1000)
             cursor = result.get("nextCursor")
             if cursor is None:
@@ -1074,7 +1186,7 @@ class McpGateway:
                     value = value[part]
                 else:
                     if routing_headers.get(("Mcp-Param-" + header).lower()) != header_value(value):
-                        raise GatewayError("custom routing header mismatch")
+                        raise HeaderMismatch("custom routing header mismatch")
         replay = self._replay(context, client, "tools/call", params,
                               operation_key, readonly=binding.read_only)
         if replay is not None:
@@ -1203,6 +1315,7 @@ class McpGateway:
                         state, remote, due = "observed_error", None, None
                     else:
                         if method == "resources/read":
+                            validate_cacheable(result)
                             contents = result.get("contents")
                             if not isinstance(contents, list) or not contents or any(
                                     not isinstance(x, dict) or x.get("uri") != params["uri"] for x in contents):
@@ -1276,10 +1389,10 @@ class McpGateway:
                 validate_schema(definition["outputSchema"], completed["structuredContent"])
             if completed.get("isError"):
                 status = "failed"
-        elif status == "input_required" and not isinstance(result.get("inputRequests"), dict):
-            raise GatewayError("remote task input requests are missing")
-        elif status == "failed" and not isinstance(result.get("error"), dict):
-            raise GatewayError("failed remote task error is missing")
+        elif status == "input_required":
+            validate_input_required(result)
+        elif status == "failed":
+            validate_protocol_error(result.get("error"))
         state = {"working": "remote_running", "input_required": "remote_running",
                  "completed": "observed_complete", "failed": "observed_error", "cancelled": "observed_error"}[status]
         due = (self.clock() + max(1, result.get("pollIntervalMs", 1000) / 1000)
@@ -1569,8 +1682,10 @@ class ServerAdapter:
             meta = params.get("_meta", {})
             if not isinstance(meta, dict):
                 raise GatewayError("invalid request metadata")
-            if meta.get(META + "protocolVersion") != PROTOCOL or not isinstance(meta.get(META + "clientCapabilities"), dict):
-                raise GatewayError("unsupported or absent per-request protocol fields")
+            requested_version = meta.get(META + "protocolVersion")
+            identifier(requested_version)
+            if not isinstance(meta.get(META + "clientCapabilities"), dict):
+                raise GatewayError("absent per-request client capabilities")
             capabilities = meta[META + "clientCapabilities"]
             if not isinstance(capabilities.get("extensions", {}), dict):
                 raise GatewayError("invalid client extensions")
@@ -1580,20 +1695,22 @@ class ServerAdapter:
             if meta.get("org.herdr/task") != {**asdict(context.identity), "toolset_hash": context.toolset.hash}:
                 raise PolicyDenied("request does not bind authenticated task identity")
             if not isinstance(headers, dict) or len(headers) > 128:
-                raise GatewayError("invalid bounded HTTP headers")
+                raise HeaderMismatch("invalid bounded HTTP headers")
             normalized = {}
             for name, value in headers.items():
                 if (not isinstance(name, str) or not re.fullmatch(r"[!#$%&'*+.^_A-Za-z0-9|-]{1,128}", name)
                         or name.lower() in normalized or not isinstance(value, str)
                         or len(value) > 8192 or chr(13) in value or chr(10) in value):
-                    raise GatewayError("invalid or ambiguous HTTP header")
+                    raise HeaderMismatch("invalid or ambiguous HTTP header")
                 normalized[name.lower()] = value
             headers = normalized
-            if headers.get("mcp-protocol-version") != PROTOCOL or headers.get("mcp-method") != method:
-                raise GatewayError("HTTP protocol header mismatch")
+            if headers.get("mcp-protocol-version") != requested_version or headers.get("mcp-method") != method:
+                raise HeaderMismatch("HTTP protocol header mismatch")
             name = params.get("name", params.get("uri", params.get("taskId")))
             if name is not None and headers.get("mcp-name") != header_value(name):
-                raise GatewayError("HTTP routing header mismatch")
+                raise HeaderMismatch("HTTP routing header mismatch")
+            if requested_version != PROTOCOL:
+                raise UnsupportedProtocolVersion(requested_version)
             if method == "server/discover":
                 if not self.gateway.authority(context):
                     raise PolicyDenied("inactive task")
@@ -1667,12 +1784,17 @@ class ServerAdapter:
             result.setdefault("_meta", {})[META + "serverInfo"] = {"name": "herdr", "version": VERSION}
             return 200, encoded({"jsonrpc": "2.0", "id": request_id, "result": result})
         except GatewayError as exc:
-            code = -32602 if exc.code == "invalid_request" else -32000
+            code = (-32020 if isinstance(exc, HeaderMismatch) else
+                    -32022 if isinstance(exc, UnsupportedProtocolVersion) else
+                    -32602 if exc.code == "invalid_request" else -32000)
             self.gateway.ledger.audit(context.identity.hash, exc.code, self.gateway.clock())
             status = (403 if isinstance(exc, PolicyDenied) else
                       503 if isinstance(exc, GatewayUnavailable) else
                       502 if isinstance(exc, (DeliveryUncertain, RemoteProtocolError)) else 400)
+            data = ({"supported": [PROTOCOL], "requested": exc.requested}
+                    if isinstance(exc, UnsupportedProtocolVersion) else
+                    {"retryable": isinstance(exc, GatewayUnavailable),
+                     "reconcileRequired": isinstance(exc, DeliveryUncertain)})
             return status, encoded(
-                {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": exc.code,
-                 "data": {"retryable": isinstance(exc, GatewayUnavailable),
-                          "reconcileRequired": isinstance(exc, DeliveryUncertain)}}})
+                {"jsonrpc": "2.0", "id": request_id,
+                 "error": {"code": code, "message": exc.code, "data": data}})

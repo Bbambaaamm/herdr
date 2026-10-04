@@ -94,7 +94,7 @@ class FakeTransport:
         elif self.response is not None:
             result = self.response
         elif method == "resources/read":
-            result = {"resultType": "complete", "contents": [{"uri": request["params"]["uri"], "text": "scoped data"}]}
+            result = {"resultType": "complete", "ttlMs": 0, "cacheScope": "private", "contents": [{"uri": request["params"]["uri"], "text": "scoped data"}]}
         elif method == "tasks/get" or self.task:
             result = {"resultType": "complete" if method == "tasks/get" else "task",
                       "taskId": "remote-task-1", "status": self.poll_status,
@@ -105,7 +105,7 @@ class FakeTransport:
             elif self.poll_status == "failed":
                 result["error"] = {"code": -32603, "message": "remote failure"}
             elif self.poll_status == "input_required":
-                result["inputRequests"] = {"question": {"method": "elicitation/create", "params": {}}}
+                result["inputRequests"] = {"question": {"method": "elicitation/create", "params": {"message": "Choose", "requestedSchema": {"type": "object", "properties": {}}}}}
         else:
             result = {"resultType": "complete", "content": [{"type": "text", "text": "untrusted output"}],
                       "structuredContent": {"grant": "root", "task_state": "done"}}
@@ -289,7 +289,7 @@ def test_resources_require_exact_uri_node_permission_and_content_scope(tmp_path)
     assert result.state == "observed_complete"
     with pytest.raises(PolicyDenied):
         gateway.read_resource(context, "local", "file:///private/credentials", "resource2")
-    transport.response = {"resultType": "complete", "contents": [{"uri": "file:///private/credentials", "text": "untrusted"}]}
+    transport.response = {"resultType": "complete", "ttlMs": 0, "cacheScope": "private", "contents": [{"uri": "file:///private/credentials", "text": "untrusted"}]}
     with pytest.raises(PolicyDenied):
         gateway.read_resource(context, "local", "herdr://docs/one", "resource3")
 
@@ -810,7 +810,8 @@ def test_server_distinguishes_policy_outage_and_uncertain_delivery(tmp_path, mon
     assert b"private detail" not in raw
 
 
-@pytest.mark.parametrize("ttl", [10**500, -1, True, 1.5])
+@pytest.mark.parametrize("ttl", [10**500, -1, True, float("inf")],
+                         ids=["huge", "negative", "bool", "nonfinite"])
 def test_discovery_ttl_is_rejected_before_float_conversion(tmp_path, ttl):
     gateway, context, transport, clock, client, _ = fixture(tmp_path)
     original = transport.request
@@ -1035,7 +1036,7 @@ def test_legacy_eligible_rows_persist_validation_plan_before_transmission(tmp_pa
 @pytest.mark.parametrize("args", [[], "path", None, 1, True])
 @pytest.mark.parametrize("headers", [False, True])
 def test_tool_arguments_are_objects_even_with_permissive_approved_schema(tmp_path, monkeypatch, args, headers):
-    monkeypatch.setitem(READ, "inputSchema", {})
+    monkeypatch.setitem(READ, "inputSchema", {"type": "object"})
     gateway, context, transport, *_ = fixture(tmp_path)
     gateway.argument_authority = lambda *a: pytest.fail("non-object arguments must not reach host authorization")
     gateway.clients["local"].expires_at = 0
@@ -1852,7 +1853,7 @@ def test_pinned_tool_definition_hash_does_not_excuse_malformed_optional_text(tmp
 
 @pytest.mark.parametrize("content", [[], None, 1, "text", True])
 @pytest.mark.parametrize("task", [False, True])
-def test_structured_content_requires_object_even_without_output_schema(tmp_path, content, task):
+def test_structured_content_accepts_any_json_without_output_schema(tmp_path, content, task):
     gateway, context, transport, clock, *_ = fixture(tmp_path, tasks=task)
     bad = {"resultType": "complete", "content": [{"type": "text", "text": "valid text"}],
            "structuredContent": content}
@@ -1867,16 +1868,15 @@ def test_structured_content_requires_object_even_without_output_schema(tmp_path,
     else:
         transport.response = bad
         action = lambda: gateway.call(context, "local", "read", {"path": "source.py"}, "op")
-    with pytest.raises(GatewayError, match="structured tool content"):
-        action()
-    assert gateway.ledger.get(operation_key(context))["state"] != "observed_complete"
+    assert action().state == "observed_complete"
+    assert gateway.ledger.get(operation_key(context))["state"] == "observed_complete"
 
 
 @pytest.mark.parametrize("payload", [{}, {"text": "a", "blob": "AA=="}, {"text": None}, {"text": []},
     {"blob": 1}, {"blob": "bad!"}, {"text": "valid", "mimeType": 1}, {"text": "valid", "_meta": []}])
 def test_resource_read_requires_valid_text_or_blob_payload(tmp_path, payload):
     gateway, context, transport, *_ = fixture(tmp_path, tools=("docs_read",))
-    transport.response = {"resultType": "complete", "contents": [{"uri": "herdr://docs/one", **payload}]}
+    transport.response = {"resultType": "complete", "ttlMs": 0, "cacheScope": "private", "contents": [{"uri": "herdr://docs/one", **payload}]}
     with pytest.raises(GatewayError):
         gateway.read_resource(context, "local", "herdr://docs/one", "op")
     assert gateway.ledger.get(operation_key(context))["state"] == "response_rejected"
@@ -1887,5 +1887,177 @@ def test_resource_read_requires_valid_text_or_blob_payload(tmp_path, payload):
                                     {"blob": "AA==", "mimeType": "application/octet-stream"}])
 def test_valid_resource_payloads_remain_supported(tmp_path, payload):
     gateway, context, transport, *_ = fixture(tmp_path, tools=("docs_read",))
-    transport.response = {"resultType": "complete", "contents": [{"uri": "herdr://docs/one", **payload}]}
+    transport.response = {"resultType": "complete", "ttlMs": 0, "cacheScope": "private", "contents": [{"uri": "herdr://docs/one", **payload}]}
     assert gateway.read_resource(context, "local", "herdr://docs/one", "op").state == "observed_complete"
+
+
+@pytest.mark.parametrize("schema", [{}, {"type": "array"}, {"type": ["object", "null"]}, {"type": None}])
+def test_discovery_rejects_non_object_input_schema_even_when_hash_approved(tmp_path, schema):
+    gateway, context, transport, clock, client, _ = fixture(tmp_path)
+    malformed = {**READ, "inputSchema": schema}
+    transport.definitions = [malformed, WRITE]
+    client.server = replace(client.server, tools=(
+        replace(client.server.tools[0], definition_hash=hashed(malformed)), client.server.tools[1]))
+    with pytest.raises(GatewayError, match="object type"):
+        client.discover(context, clock())
+    assert client.definitions["read"] == READ
+
+
+@pytest.mark.parametrize("metadata", [{}, {"ttlMs": 0}, {"cacheScope": "private"},
+    {"ttlMs": -1, "cacheScope": "private"}, {"ttlMs": True, "cacheScope": "private"},
+    {"ttlMs": 0, "cacheScope": "shared"}, {"ttlMs": 10**400, "cacheScope": "private"}],
+    ids=["missing-both", "missing-scope", "missing-ttl", "negative", "bool", "unknown-scope", "huge"])
+def test_resource_cache_contract_rejects_malformed_response_before_forwarding(tmp_path, metadata):
+    gateway, context, transport, *_ = fixture(tmp_path, tools=("docs_read",))
+    transport.response = {"resultType": "complete", "contents": [{"uri": "herdr://docs/one", "text": "valid"}], **metadata}
+    with pytest.raises(GatewayError):
+        gateway.read_resource(context, "local", "herdr://docs/one", "cache-op")
+    row = gateway.ledger.get(operation_key(context, "cache-op"))
+    assert row["state"] == "response_rejected"
+
+
+@pytest.mark.parametrize("scope", ["private", "public"])
+@pytest.mark.parametrize("ttl", [0, 1.5, 2**53-1])
+def test_resource_cache_contract_accepts_finite_number_and_declared_scope(tmp_path, scope, ttl):
+    gateway, context, transport, *_ = fixture(tmp_path, tools=("docs_read",))
+    transport.response = {"resultType": "complete", "ttlMs": ttl, "cacheScope": scope,
+                          "contents": [{"uri": "herdr://docs/one", "text": "valid"}]}
+    assert gateway.read_resource(context, "local", "herdr://docs/one", "cache-op").state == "observed_complete"
+
+
+@pytest.mark.parametrize("endpoint", ["https://provider/path with space", "https://provider/česká",
+    "https://provider/\x7f", "https://provider/\ud800"])
+def test_unencodable_request_targets_fail_at_configuration(endpoint):
+    with pytest.raises(PolicyDenied):
+        HTTPTransport(endpoint)
+
+
+def test_percent_encoded_request_target_is_accepted():
+    assert HTTPTransport("https://provider/%C4%8Desk%C3%A1%20cesta").parsed.path == "/%C4%8Desk%C3%A1%20cesta"
+
+
+@pytest.mark.parametrize("payload", [{}, {"requestState": None}, {"requestState": []},
+    {"requestState": "x"*32769}, {"inputRequests": []},
+    {"inputRequests": {"question": None}}, {"inputRequests": {"question": {"method": []}}},
+    {"inputRequests": {"question": {"method": "tools/call", "params": {}}}},
+    {"inputRequests": {"question": {"method": "elicitation/create", "params": {}}}},
+    {"inputRequests": {"question": {"method": "roots/list", "params": []}}},
+    {"inputRequests": {"question": {"method": "sampling/createMessage", "params": {"messages": [], "maxTokens": True}}}}],
+    ids=["missing", "null-state", "array-state", "large-state", "array-requests", "null-request",
+         "array-method", "foreign-method", "empty-form", "bad-roots", "bad-sampling"])
+@pytest.mark.parametrize("task", [False, True])
+def test_input_required_shape_is_validated_without_executing_callbacks(tmp_path, payload, task):
+    gateway, context, transport, clock, *_ = fixture(tmp_path, tasks=task)
+    if task:
+        transport.task = True
+        gateway.call(context, "local", "read", {"path": "source.py"}, "hold")
+        clock.value += 2
+        transport.response = {"resultType": "complete", "taskId": "remote-task-1", "status": "input_required",
+            "createdAt": "2026-10-03T20:00:00Z", "lastUpdatedAt": "2026-10-03T20:00:01Z",
+            "ttlMs": 60000, **payload}
+        action = lambda: gateway.poll(context, "hold")
+    else:
+        transport.response = {"resultType": "input_required", **payload}
+        action = lambda: gateway.call(context, "local", "read", {"path": "source.py"}, "hold")
+    with pytest.raises(GatewayError):
+        action()
+    assert gateway.ledger.get(operation_key(context, "hold"))["state"] != "input_required"
+
+
+@pytest.mark.parametrize("payload", [{"requestState": ""}, {"requestState": "opaque"},
+    {"inputRequests": {}}, {"inputRequests": {"roots": {"method": "roots/list"}}},
+    {"inputRequests": {"sample": {"method": "sampling/createMessage",
+        "params": {"messages": [{"role": "user", "content": {"type": "text", "text": "question"}}], "maxTokens": 32}}}},
+    {"inputRequests": {"form": {"method": "elicitation/create",
+        "params": {"message": "Choose", "requestedSchema": {"type": "object", "properties": {}}}}}}],
+    ids=["empty-state", "opaque", "empty-map", "roots", "sampling", "form"])
+def test_valid_input_required_payload_is_a_hold_only(tmp_path, payload):
+    gateway, context, transport, *_ = fixture(tmp_path)
+    transport.response = {"resultType": "input_required", **payload}
+    assert gateway.call(context, "local", "read", {"path": "source.py"}, "hold").state == "input_required"
+    assert [req["method"] for req, _ in semantic_calls(transport)] == ["tools/call"]
+
+
+@pytest.mark.parametrize("fault", ["missing", "version", "method", "name", "parameter", "duplicate"])
+def test_header_mismatch_returns_reserved_protocol_error_without_delivery(tmp_path, fault):
+    gateway, context, transport, *_ = fixture(tmp_path)
+    raw = encoded(tool_request(context))
+    headers = wire_headers(raw)
+    if fault == "missing":
+        headers = {}
+    elif fault == "duplicate":
+        headers["mcp-method"] = "tools/call"
+    else:
+        key = {"version": "MCP-Protocol-Version", "method": "Mcp-Method",
+               "name": "Mcp-Name", "parameter": "Mcp-Param-Path"}[fault]
+        headers[key] = "wrong"
+    status, body = StrictHTTPAdapter(gateway, lambda _: context, origins=()).handle(raw, authorization="host", headers=headers)
+    assert status == 400 and decode(body)["error"]["code"] == -32020
+    assert not semantic_calls(transport)
+
+
+def test_unsupported_version_echoes_bounded_negotiation_data(tmp_path):
+    gateway, context, transport, *_ = fixture(tmp_path)
+    message = tool_request(context)
+    message["params"]["_meta"][META+"protocolVersion"] = "2025-11-25"
+    raw = encoded(message)
+    headers = wire_headers(raw)
+    headers["MCP-Protocol-Version"] = "2025-11-25"
+    adapter = StrictHTTPAdapter(gateway, lambda _: context, origins=())
+    status, body = adapter.handle(raw, authorization="host", headers=headers)
+    error = decode(body)["error"]
+    assert status == 400 and error["code"] == -32022
+    assert error["data"] == {"supported": [PROTOCOL], "requested": "2025-11-25"}
+    headers["MCP-Protocol-Version"] = PROTOCOL
+    assert decode(adapter.handle(raw, authorization="host", headers=headers)[1])["error"]["code"] == -32020
+    assert not semantic_calls(transport)
+
+
+@pytest.mark.parametrize("error", [{}, {"code": -32603}, {"message": "failed"},
+    {"code": True, "message": "failed"}, {"code": 1.5, "message": "failed"},
+    {"code": -32603, "message": []}, {"code": 2**53, "message": "failed"}])
+def test_failed_task_requires_jsonrpc_error_shape(tmp_path, error):
+    gateway, context, transport, clock, *_ = fixture(tmp_path, tasks=True)
+    transport.task = True
+    gateway.call(context, "local", "read", {"path": "source.py"}, "failed")
+    clock.value += 2
+    transport.response = {"resultType": "complete", "taskId": "remote-task-1", "status": "failed",
+        "createdAt": "2026-10-03T20:00:00Z", "lastUpdatedAt": "2026-10-03T20:00:01Z", "ttlMs": 60000, "error": error}
+    with pytest.raises(GatewayError, match="protocol error"):
+        gateway.poll(context, "failed")
+
+
+def _concurrent_legacy_ledger(root, barrier, results):
+    try:
+        barrier.wait(timeout=10)
+        ledger = CallLedger(root)
+        columns = {row[1] for row in ledger.db.execute("PRAGMA table_info(calls)")}
+        budget = tuple(ledger.db.execute("SELECT * FROM budgets").fetchone())
+        ledger.close()
+        results.put(("ok", sorted(columns), budget))
+    except Exception as exc:
+        results.put(("error", type(exc).__name__, str(exc)))
+
+
+def test_legacy_schema_migration_is_serialized_across_real_processes(tmp_path):
+    import multiprocessing
+    import sqlite3
+    root = tmp_path / "legacy"
+    root.mkdir()
+    ledger = CallLedger(root)
+    ledger.db.execute("ALTER TABLE calls DROP COLUMN validation_plan_json")
+    ledger.db.execute("ALTER TABLE calls DROP COLUMN remote_task_json")
+    ledger.db.execute("INSERT INTO budgets VALUES(?,?,?,?)", ("consumer", "task", 7, 21))
+    ledger.close()
+    process_context = multiprocessing.get_context("fork")
+    barrier, results = process_context.Barrier(6), process_context.Queue()
+    processes = [process_context.Process(target=_concurrent_legacy_ledger, args=(root, barrier, results)) for _ in range(6)]
+    for process in processes:
+        process.start()
+    outcomes = [results.get(timeout=15) for _ in processes]
+    for process in processes:
+        process.join(timeout=10)
+        assert process.exitcode == 0
+    assert all(outcome[0] == "ok" for outcome in outcomes), outcomes
+    assert all({"validation_plan_json", "remote_task_json"} <= set(outcome[1]) for outcome in outcomes)
+    assert all(outcome[2] == ("consumer", "task", 7, 21) for outcome in outcomes)
