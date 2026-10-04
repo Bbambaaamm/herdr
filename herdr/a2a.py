@@ -328,7 +328,7 @@ class Identity:
     def __post_init__(self) -> None:
         for name in ("parent_agent_id", "child_agent_id", "task_id", "run_token", "idempotency_key"):
             _id(getattr(self, name), name)
-        if type(self.fencing_token) is not int or not 0 <= self.fencing_token < 2**63:
+        if type(self.fencing_token) is not int or not 1 <= self.fencing_token < 2**63:
             raise A2AError("invalid fence")
 
     @property
@@ -736,7 +736,7 @@ def _parts(raw: Any) -> Any:
         for field in ("mediaType", "filename"):
             if field in part and (not isinstance(part[field], str) or len(part[field]) > 256):
                 raise A2AError("invalid part metadata")
-        if "metadata" in part and not isinstance(part["metadata"], dict):
+        if part.get("metadata") is not None and not isinstance(part["metadata"], dict):
             raise A2AError("invalid part metadata")
     return raw
 
@@ -766,13 +766,13 @@ def _parse_response(
         # or authority input; discard it before bounding/scanning persisted data.
         if isinstance(raw.get("task"),dict):
             task=dict(raw["task"])
-            if "history" in task and not isinstance(task["history"],list):
+            if task.get("history") is not None and not isinstance(task["history"],list):
                 raise A2AError("invalid task history")
             task.pop("history",None)
             raw={**raw,"task":task}
         elif "message" not in raw:
             raw=dict(raw)
-            if "history" in raw and not isinstance(raw["history"],list):
+            if raw.get("history") is not None and not isinstance(raw["history"],list):
                 raise A2AError("invalid task history")
             raw.pop("history",None)
     _bounded(raw, MAX_RESPONSE, secret_scan=False)
@@ -809,7 +809,8 @@ def _parse_response(
     context = _remote_id(task["contextId"], "context id") if task.get("contextId") is not None else None
     status = _response_object(task["status"], {"state"})
     state = _task_state(status["state"])
-    artifacts = task.get("artifacts", [])
+    artifacts = task.get("artifacts")
+    if artifacts is None: artifacts = []
     if not isinstance(artifacts, list) or len(artifacts) > MAX_PARTS:
         raise A2AError("invalid artifacts")
     candidates = []
@@ -824,7 +825,7 @@ def _parse_response(
         message_context = _remote_id(msg["contextId"], "contextId")
         if context is not None and message_context != context:
             raise A2AError("status message context mismatch")
-        if "taskId" in msg and _remote_id(msg["taskId"], "taskId") != task_id:
+        if msg.get("taskId") is not None and _remote_id(msg["taskId"], "taskId") != task_id:
             raise A2AError("status message task mismatch")
         context=message_context if context is None else context
         candidates.append(

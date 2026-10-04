@@ -1113,3 +1113,34 @@ def test_null_optional_message_task_id_is_direct_and_restart_never_resends(tmp_p
     assert restarted.poll(identity)[0].digest == first.digest
     assert restarted.recover(identity)[0].digest == first.digest
     assert len(transport.sends) == 1 and transport.gets == []
+
+
+@pytest.mark.parametrize("operation", ["send", "poll", "cancel"])
+@pytest.mark.parametrize("bare", [False, True])
+def test_null_optional_status_message_task_id_keeps_candidates_and_binding(tmp_path, operation, bare):
+    _, card, policy, identity, store = setup(tmp_path)
+    transport = Mock(); gateway = Gateway(transport, store, card, policy)
+    response = task("TASK_STATE_WORKING")
+    response["task"]["status"]["message"] = {"messageId":"current", "role":"ROLE_AGENT",
+        "contextId":"remote-context", "taskId":None, "parts":[{"text":"findings", "metadata":None}]}
+    response["task"]["artifacts"] = None
+    if operation == "send":
+        transport.response = response
+        candidate, = gateway.send(identity,"work")
+    else:
+        gateway.send(identity,"work")
+        transport.response = response["task"] if bare else response
+        if operation == "poll":
+            candidate, = gateway.poll(identity)
+        else:
+            response["task"]["status"]["state"] = "TASK_STATE_CANCELED"
+            response["task"]["history"] = None
+            transport.cancel = lambda interface, request, headers: response["task"] if bare else response
+            candidate, = gateway.cancel(identity)
+    assert candidate.remote_task_id == "remote-task"
+    assert len(gateway.recover(identity)) == 1 and len(transport.sends) == 1
+
+@pytest.mark.parametrize("fence", [0, -1, True, 1.0, 2**63])
+def test_invalid_fence_rejected_before_gateway_or_economic_claim(fence):
+    with pytest.raises(A2AError, match="fence"):
+        Identity("parent","child","task","run",fence,"key")
