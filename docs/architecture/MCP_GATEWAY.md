@@ -235,3 +235,8 @@ and upstream source digest. Both titled and untitled multi-select forms are
 accepted. Cache TTLs and sampling limits are JSON integers (integral 1.0 is
 equivalent to 1 in JSON Schema); fractional values and booleans are rejected.
 Hostless endpoints produce a bounded configuration denial before admission.
+
+
+Tool bindings declare typed output modalities. Those modalities enter capability admission and every ordinary or completed-task result is checked against both the approved binding and the frozen scope. Embedded blobs with a declared image/audio/video MIME type require that modality; generic blobs stay encoded opaque data in the text interface and are never automatically decoded or rendered. Full pinned Tool and CallToolResult shapes, nested annotations and the protocol URI/base64 formats are validated offline. Runtime and host authority outages return bounded availability errors without leaking dependency details.
+
+Provider DNS runs in an isolated credential-free subprocess that is terminated at the request deadline; subsequent connects use numeric addresses and retain the original approved TLS hostname. Correlated bounded JSON-RPC refusals on applicable HTTP error statuses remain observed errors. Redirects, malformed or uncorrelated errors remain unavailable/uncertain and never authorize a second mutation.

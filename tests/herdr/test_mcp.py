@@ -2145,3 +2145,150 @@ def test_pinned_protocol_definitions_are_offline_and_include_upstream_license():
     assert definitions["CacheableResult"]["properties"]["ttlMs"]["type"] == "integer"
     assert definitions["CreateMessageRequestParams"]["properties"]["maxTokens"]["type"] == "integer"
     assert definitions["TitledMultiSelectEnumSchema"]["properties"]["items"]["required"] == ["anyOf"]
+
+@pytest.mark.parametrize("annotations", [{"priority":2},{"priority":-1},{"audience":"user"},{"audience":["root"]}])
+@pytest.mark.parametrize("task", [False,True])
+def test_nested_content_annotations_are_validated_before_observation(tmp_path,annotations,task):
+    gateway,context,transport,clock,*_ = fixture(tmp_path,tasks=task)
+    bad={"resultType":"complete","content":[{"type":"text","text":"value","annotations":annotations}]}
+    if task:
+        transport.task=True
+        gateway.call(context,"local","read",{"path":"source.py"},"op")
+        clock.value+=2
+        transport.response={"resultType":"complete","taskId":"remote-task-1","status":"completed",
+                            "createdAt":"2026-10-03T20:00:00Z","lastUpdatedAt":"2026-10-03T20:00:01Z",
+                            "ttlMs":60000,"result":bad}
+        action=lambda:gateway.poll(context,"op")
+    else:
+        transport.response=bad
+        action=lambda:gateway.call(context,"local","read",{"path":"source.py"},"op")
+    with pytest.raises(GatewayError):action()
+    assert gateway.ledger.get(operation_key(context))["state"]!="observed_complete"
+
+@pytest.mark.parametrize("icons",["invalid",[{}],[{"src":42}]])
+def test_entire_pinned_tool_definition_must_conform(tmp_path,icons):
+    gateway,context,transport,clock,client,_=fixture(tmp_path)
+    bad={**READ,"icons":icons}
+    transport.definitions=[bad,WRITE]
+    client.server=replace(client.server,tools=(replace(client.server.tools[0],definition_hash=hashed(bad)),client.server.tools[1]))
+    with pytest.raises(GatewayError):client.discover(context,clock())
+
+@pytest.mark.parametrize("port",["runtime","authority","arguments"])
+def test_host_dependency_outages_produce_bounded_503_without_delivery(tmp_path,port):
+    gateway,context,transport,*_=fixture(tmp_path)
+    def unavailable(*args):raise OSError("private-database-hostname")
+    if port=="runtime":gateway.runtime_states=unavailable
+    elif port=="authority":gateway.authority=unavailable
+    else:gateway.argument_authority=unavailable
+    adapter=ServerAdapter(gateway,lambda credential:context,origins=())
+    message=request_message(context,"tools/call",{"name":"local.read","arguments":{"path":"source.py"}},"wire")
+    message["params"]["_meta"]["org.herdr/operation"]="op"
+    response=adapter.handle(encoded(message),authorization="opaque")
+    status, body = response
+    assert status==503
+    assert b"private-database-hostname" not in body
+    assert not semantic_calls(transport)
+
+@pytest.mark.parametrize("kind",["image","audio"])
+@pytest.mark.parametrize("task",[False,True])
+def test_text_only_scope_cannot_receive_binary_modalities(tmp_path,kind,task):
+    gateway,context,transport,clock,*_=fixture(tmp_path,tasks=task)
+    result={"resultType":"complete","content":[{"type":kind,"data":"AA==","mimeType":kind+"/fixture"}]}
+    if task:
+        transport.task=True
+        gateway.call(context,"local","read",{"path":"source.py"},"op")
+        clock.value+=2
+        transport.response={"resultType":"complete","taskId":"remote-task-1","status":"completed",
+            "createdAt":"2026-10-03T20:00:00Z","lastUpdatedAt":"2026-10-03T20:00:01Z","ttlMs":60000,"result":result}
+        action=lambda:gateway.poll(context,"op")
+    else:
+        transport.response=result
+        action=lambda:gateway.call(context,"local","read",{"path":"source.py"},"op")
+    with pytest.raises(PolicyDenied,match="modality"):action()
+    assert gateway.ledger.get(operation_key(context))["state"]!="observed_complete"
+
+def test_approved_multimodal_binding_and_scope_accept_binary_result(tmp_path):
+    gateway,context,transport,clock,client,authority=fixture(tmp_path)
+    modalities=(Modality.TEXT,Modality.IMAGE)
+    client.server=replace(client.server,tools=(replace(client.server.tools[0],output_modalities=modalities),client.server.tools[1]))
+    registry=CapabilityRegistry(client.registry_snapshot())
+    scope=replace(context.toolset.scope,output_modalities=modalities)
+    context=replace(context,parent_scope=scope,consumer_scope=scope,
+                    toolset=replace(context.toolset,scope=scope,registry_hash=registry.snapshot.hash))
+    authority["context_hash"]=context.hash
+    gateway.registry=registry
+    gateway._client_policies[client.server.id]=client.policy_hash
+    def states(req,provider):
+        executor=next(x for x in registry.snapshot.executors if x.capability_id==req.capability_id)
+        assert req.output_modalities==tuple(sorted(modalities))
+        return (RuntimeStateSnapshot(executor.id,datetime.fromtimestamp(clock(),UTC).isoformat(),
+                60,Health.HEALTHY,32,5,None,registry.snapshot.hash,req.hash),)
+    gateway.runtime_states=states
+    transport.response={"resultType":"complete","content":[{"type":"image","data":"AA==","mimeType":"image/png"}]}
+    assert gateway.call(context,"local","read",{"path":"source.py"},"op").state=="observed_complete"
+
+@pytest.mark.parametrize("params",[
+    {"mode":"url","message":"Authorize","url":"not a uri","elicitationId":"opaque"},
+    {"messages":[{"role":"user","content":{"type":"image","data":"bad!","mimeType":"image/png"}}],"maxTokens":1},
+])
+def test_input_required_formats_are_explicitly_enforced(tmp_path,params):
+    gateway,context,transport,*_=fixture(tmp_path)
+    method="sampling/createMessage" if "messages" in params else "elicitation/create"
+    transport.response={"resultType":"input_required","inputRequests":{"request":{"method":method,"params":params}}}
+    with pytest.raises(GatewayError):gateway.call(context,"local","read",{"path":"source.py"},"op")
+
+@pytest.mark.parametrize("status",[400,403])
+def test_actual_http_correlated_refusal_is_known_mutating_outcome(tmp_path,status):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self,*args):pass
+        def do_POST(self):
+            request=decode(self.rfile.read(int(self.headers["Content-Length"])))
+            if request["method"]=="tools/list":
+                body=encoded({"jsonrpc":"2.0","id":request["id"],"result":{
+                    "resultType":"complete","tools":[READ,WRITE],"ttlMs":1000,"cacheScope":"private"}})
+                code=200
+            else:
+                body=encoded({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32602,"message":"Denied"}})
+                code=status
+            self.send_response(code);self.send_header("Content-Type","application/json")
+            self.send_header("Content-Length",str(len(body)));self.end_headers();self.wfile.write(body)
+    server=ThreadingHTTPServer(("127.0.0.1",0),Handler)
+    thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+    try:
+        transport=HTTPTransport("http://127.0.0.1:"+str(server.server_port)+"/mcp",allow_loopback=True)
+        gateway,context,*_=fixture(tmp_path,tools=("code_write",),transport=transport)
+        outcome=gateway.call(context,"local","write",{"value":"test"},"op")
+        assert outcome.state=="observed_error"
+        assert gateway.call(context,"local","write",{"value":"test"},"op").replay
+        assert gateway.ledger.get(operation_key(context))["deliveries"]==1
+    finally:
+        server.shutdown();server.server_close();thread.join()
+
+def test_dns_resolver_process_is_killed_at_deadline_without_credentials(monkeypatch,tmp_path):
+    import subprocess
+    import herdr.mcp as module
+    calls=[]
+    def stalled(args,**kwargs):
+        calls.append((args,kwargs))
+        raise subprocess.TimeoutExpired(args,kwargs["timeout"])
+    monkeypatch.setattr(module.subprocess,"run",stalled)
+    monkeypatch.setenv("PRIVATE_PROVIDER_CREDENTIAL","must-not-cross")
+    start=time.monotonic()
+    with pytest.raises(GatewayUnavailable,match="DNS"):
+        module.resolve_addresses("provider.example.invalid",443,start+0.1)
+    assert time.monotonic()-start<0.5
+    assert calls[0][1]["timeout"]<=0.1
+    assert "PRIVATE_PROVIDER_CREDENTIAL" not in calls[0][1]["env"]
+
+def test_actual_stalled_dns_helper_is_terminated_within_deadline(tmp_path,monkeypatch):
+    import subprocess,sys
+    import herdr.mcp as module
+    original = subprocess.run
+    def stalled_resolver(args, **kwargs):
+        assert args[-1].endswith("mcp_dns.py")
+        return original([sys.executable,"-I","-S","-c","import time;time.sleep(30)"], **kwargs)
+    monkeypatch.setattr(module.subprocess,"run",stalled_resolver)
+    start=time.monotonic()
+    with pytest.raises(GatewayUnavailable,match="DNS"):
+        module.resolve_addresses("provider.example.invalid",443,start+0.1)
+    assert time.monotonic()-start<1

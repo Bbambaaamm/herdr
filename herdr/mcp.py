@@ -14,6 +14,8 @@ import math
 import os
 import re
 import sqlite3
+import socket
+import ipaddress
 import stat
 import subprocess
 import sys
@@ -216,7 +218,7 @@ def _protocol_schema():
             chunks.append(chunk)
             remaining -= len(chunk)
         raw = b"".join(chunks)
-        if remaining or hashlib.sha256(raw).hexdigest() != "6e0ee904bd4f08cc7f7f04bbdb3e7274265ad9cff182e8dd03459717695c8d31":
+        if remaining or hashlib.sha256(raw).hexdigest() != "2de15e390380d17eaf28718511776ebfeb5119a1329768db2277b2dbd74714fe":
             raise GatewayUnavailable("pinned protocol schema unavailable")
         return decode(raw)["schema"]
     except (OSError, GatewayError) as exc:
@@ -227,8 +229,24 @@ def _protocol_schema():
 
 
 def validate_protocol_shape(name, value):
-    schema = {**_protocol_schema(), "$ref": "#/$defs/" + name}
-    validate_schema(schema, value)
+    source = _protocol_schema()
+    selected, pending = {}, [name]
+    def references(item):
+        if isinstance(item, dict):
+            ref = item.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/$defs/"):
+                yield ref[len("#/$defs/"):]
+            for child in item.values():
+                yield from references(child)
+        elif isinstance(item, list):
+            for child in item:
+                yield from references(child)
+    while pending:
+        key = pending.pop()
+        if key not in selected:
+            selected[key] = source["$defs"][key]
+            pending.extend(references(selected[key]))
+    validate_schema({"$schema": source["$schema"], "$defs": selected, "$ref": "#/$defs/" + name}, value)
 
 
 def validate_cacheable(result):
@@ -277,6 +295,7 @@ def validate_tool_content(result):
     if (not isinstance(result, dict) or not isinstance(result.get("content"), list)
             or len(result["content"]) > 256 or type(result.get("isError", False)) is not bool):
         raise GatewayError("invalid tool result")
+    validate_protocol_shape("CallToolResult", {"resultType": "complete", **result})
     for block in result["content"]:
         if not isinstance(block, dict) or not isinstance(block.get("type"), str):
             raise GatewayError("invalid tool content block")
@@ -327,6 +346,23 @@ def validate_tool_content(result):
         else:
             raise GatewayError("unknown tool content type")
 
+def require_output_modalities(result, binding_modalities, scope_modalities):
+    observed = {Modality.TEXT} if "structuredContent" in result else set()
+    for block in result.get("content", ()):
+        kind = block["type"]
+        if kind in {"image", "audio"}:
+            observed.add(Modality(kind))
+        elif kind == "resource" and "blob" in block["resource"]:
+            mime = block["resource"].get("mimeType", "").split(";", 1)[0].lower()
+            major = mime.split("/", 1)[0]
+            # Generic blobs remain encoded opaque data in the text interface;
+            # no decoding/rendering or inferred media grant occurs here.
+            observed.add(Modality(major) if major in {"image", "audio", "video"} else Modality.TEXT)
+        else:
+            observed.add(Modality.TEXT)
+    if not observed <= set(binding_modalities) or not observed <= set(scope_modalities):
+        raise PolicyDenied("tool output modality outside approved binding or frozen scope")
+
 
 class _PreparedHTTP:
     # Credential-bearing data is ephemeral host state, never ledger/audit content.
@@ -363,6 +399,7 @@ class ToolBinding:
     permissions: tuple[str, ...]
     read_only: bool
     definition_hash: str
+    output_modalities: tuple[Modality, ...] = (Modality.TEXT,)
 
     def __post_init__(self):
         if not _NAME.fullmatch(self.name) or not _NAME.fullmatch(self.logical_id):
@@ -371,6 +408,10 @@ class ToolBinding:
             raise GatewayError("unknown logical tool class")
         if type(self.read_only) is not bool or not self.permissions or not _HASH.fullmatch(self.definition_hash):
             raise GatewayError("tool effect, permissions and pinned definition are required")
+        if (not isinstance(self.output_modalities, tuple) or not self.output_modalities
+                or any(not isinstance(x, Modality) for x in self.output_modalities)
+                or len(set(self.output_modalities)) != len(self.output_modalities)):
+            raise GatewayError("typed explicit tool output modalities required")
         for permission in self.permissions:
             identifier(permission)
 
@@ -687,6 +728,63 @@ class CredentialRejected(PolicyDenied):
 class CredentialUnavailable(GatewayUnavailable):
     """Local credential resolution outage, never provider health evidence."""
 
+def resolve_addresses(hostname, port, deadline):
+    try:
+        direct = ipaddress.ip_address(hostname)
+    except ValueError:
+        direct = None
+    if direct is not None:
+        return ((socket.AF_INET if direct.version == 4 else socket.AF_INET6, socket.IPPROTO_TCP,
+                 (str(direct), port) if direct.version == 4 else (str(direct), port, 0, 0)),)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise GatewayUnavailable("provider DNS deadline exceeded")
+    try:
+        environment = {"PATH": os.defpath, "LANG": "C.UTF-8"}
+        if os.name == "nt" and os.environ.get("SYSTEMROOT"):
+            environment["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
+        result = subprocess.run([sys.executable, "-I", "-S", str(Path(__file__).with_name("mcp_dns.py"))],
+                                input=encoded({"hostname": hostname, "port": port}),
+                                capture_output=True, timeout=remaining, env=environment)
+        if result.returncode != 0 or len(result.stdout) > 8192:
+            raise ValueError("resolver unavailable")
+        addresses = decode(result.stdout)
+        if not isinstance(addresses, list) or not 0 < len(addresses) <= 16:
+            raise ValueError("resolver result")
+        approved = []
+        for family, protocol, address in addresses:
+            if (family not in (socket.AF_INET, socket.AF_INET6) or protocol not in (0, socket.IPPROTO_TCP)
+                    or not isinstance(address, list) or len(address) != (2 if family == socket.AF_INET else 4)
+                    or address[1] != port or type(address[1]) is not int):
+                raise ValueError("resolver address")
+            ip = ipaddress.ip_address(address[0])
+            if (ip.version != (4 if family == socket.AF_INET else 6)
+                    or family == socket.AF_INET6 and any(type(x) is not int or x < 0 for x in address[2:])):
+                raise ValueError("resolver family")
+            approved.append((family, protocol, tuple(address)))
+        return tuple(approved)
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, GatewayError) as exc:
+        raise GatewayUnavailable("provider DNS unavailable or deadline exceeded") from exc
+
+
+def connect_resolved(addresses, deadline, source_address=None):
+    last_error = None
+    for family, protocol, address in addresses:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise GatewayUnavailable("provider connection deadline exceeded")
+        sock = socket.socket(family, socket.SOCK_STREAM, protocol)
+        try:
+            sock.settimeout(remaining)
+            if source_address is not None:
+                sock.bind(source_address)
+            sock.connect(address)
+            return sock
+        except OSError as exc:
+            last_error = exc
+            sock.close()
+    raise GatewayUnavailable("provider connection unavailable") from last_error
+
 
 class HTTPTransport:
     """Fixed host-approved endpoint; no redirects, cookies or discovery URLs."""
@@ -745,8 +843,14 @@ class HTTPTransport:
             raise PolicyDenied("prepared HTTP request identity mismatch")
         raw, headers = prepared.raw, prepared.headers
         connection_class = http.client.HTTPSConnection if self.parsed.scheme == "https" else http.client.HTTPConnection
-        connection = connection_class(self.parsed.hostname, self.parsed.port, timeout=timeout)
         deadline = time.monotonic() + timeout
+        port = self.parsed.port or (443 if self.parsed.scheme == "https" else 80)
+        addresses = resolve_addresses(self.parsed.hostname, port, deadline)
+        connection = connection_class(self.parsed.hostname, port, timeout=max(0.01, deadline-time.monotonic()))
+        # TLS retains the original approved hostname for SNI/certificate checks.
+        # All socket connects use numeric, already resolved addresses.
+        connection._create_connection = lambda address, timeout=None, source_address=None, **kwargs: connect_resolved(
+            addresses, deadline, source_address)
         try:
             connection.connect()
             sock = connection.sock
@@ -754,10 +858,30 @@ class HTTPTransport:
             connection.request("POST", self.parsed.path or "/", body=raw, headers=headers)
             sock.settimeout(max(0.01, deadline - time.monotonic()))
             response = connection.getresponse()
-            if response.status != 200:
-                # Includes redirects: credential/data never follows an unapproved URL.
-                raise GatewayUnavailable("provider returned non-success HTTP status")
             content_type = response.getheader("Content-Type", "").split(";")[0].strip().lower()
+            if response.status != 200:
+                # A correlated protocol refusal establishes an observed error;
+                # redirects and uncorrelated/malformed bodies never do.
+                if response.status in {400, 401, 403, 404, 405, 406, 409, 410, 415, 422, 429} and content_type == "application/json":
+                    body = b""
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise GatewayUnavailable("provider error-response deadline exceeded")
+                        sock.settimeout(remaining)
+                        chunk = response.read1(65536)
+                        body += chunk
+                        if len(body) > LIMIT:
+                            raise GatewayUnavailable("provider error response exceeds bound")
+                        if not chunk or response.isclosed():
+                            break
+                    item = decode(body)
+                    if (isinstance(item, dict) and item.get("jsonrpc") == "2.0" and item.get("id") == message["id"]
+                            and "error" in item and "result" not in item and "method" not in item):
+                        validate_protocol_error(item["error"])
+                        yield item
+                        return
+                raise GatewayUnavailable("provider returned non-success HTTP status")
             if content_type not in {"application/json", "text/event-stream"}:
                 raise GatewayError("unsupported provider content type")
             buffer, total, messages, pending_cr = b"", 0, [], False
@@ -977,6 +1101,7 @@ class ClientAdapter:
                 schema_headers(schema)
                 if "outputSchema" in row:
                     validate_schema(row["outputSchema"], check_only=True)
+                validate_protocol_shape("Tool", row)
                 definitions[row["name"]] = decode(encoded(row))
             raw_ttl = validate_cacheable(result)
             ttl = min(ttl, raw_ttl / 1000)
@@ -1018,7 +1143,7 @@ class ClientAdapter:
             capability_id = provider_id + "." + binding.logical_id
             capabilities.append(CapabilityDescriptor(
                 capability_id, hashed(asdict(binding)), "mcp.tools.v1", (Feature.MCP, Feature.TOOL_USE),
-                (Modality.TEXT,), (Modality.TEXT,), None, None, None, Latency.STANDARD, server.data_policy))
+                (Modality.TEXT,), binding.output_modalities, None, None, None, Latency.STANDARD, server.data_policy))
             executors.append(ExecutorDescriptor(capability_id + ".executor", VERSION, provider_id,
                                                capability_id, provider_id + ".runtime", "mcp.gateway",
                                                "http", "stateless", (binding.logical_id,)))
@@ -1031,6 +1156,17 @@ class ClientAdapter:
         provider = ProviderDescriptor(provider_id, self.policy_hash, tuple(x.id for x in capabilities),
                                       "cost-unknown", server.data_policy, ("http",), ("stateless",))
         return RegistrySnapshot(tuple(capabilities), (provider,), tuple(executors))
+
+def host_decision(callback, *args):
+    try:
+        result = callback(*args)
+        if type(result) is not bool:
+            raise ValueError("host decision is not boolean")
+        return result
+    except GatewayError:
+        raise
+    except Exception as exc:
+        raise GatewayUnavailable("host authority unavailable") from exc
 
 
 class McpGateway:
@@ -1059,7 +1195,7 @@ class McpGateway:
     def _static_admit(self, context: CallContext, server: str, logical: str, permissions: tuple[str, ...]):
         if isinstance(context, CallContext):
             self.ledger.bind(context)
-        if not isinstance(context, CallContext) or not self.authority(context):
+        if not isinstance(context, CallContext) or not host_decision(self.authority, context):
             raise PolicyDenied("task attempt/fence is not actively admitted")
         context.toolset.scope.require_subset_of(context.parent_scope)
         context.toolset.scope.require_subset_of(context.consumer_scope)
@@ -1087,13 +1223,21 @@ class McpGateway:
         classes = sorted(set(data.data_classes) & set(scope.data_classes), key=lambda value: value.value)
         if not regions or not classes:
             raise PolicyDenied("provider data policy has no granted region or data class")
+        outputs = next((binding.output_modalities for binding in client.server.tools
+                        if binding.logical_id == logical), (Modality.TEXT,)) if tools else (Modality.TEXT,)
         req = CapabilityRequirement(
             "mcp." + server + "." + logical,
             (Feature.MCP, Feature.TOOL_USE) if tools else (Feature.MCP,),
-            (Modality.TEXT,), (Modality.TEXT,), (logical,), permissions,
+            (Modality.TEXT,), outputs, (logical,), permissions,
             regions[0], classes[0], data.egress, data.retention, data.training,
             None, None, None, scope.max_cost_microusd)
-        states = self.runtime_states(req, client)
+        try:
+            states = self.runtime_states(req, client)
+            if (not isinstance(states, (tuple, list)) or len(states) > 512
+                    or any(not isinstance(x, RuntimeStateSnapshot) for x in states)):
+                raise ValueError("invalid bounded runtime observations")
+        except Exception as exc:
+            raise GatewayUnavailable("runtime observation unavailable") from exc
         found = CapabilityRegistry(snapshot).candidates(
             req, scope, states, at=datetime.fromtimestamp(self.clock(), UTC).isoformat())
         self._static_admit(context, server, logical, permissions)
@@ -1182,7 +1326,7 @@ class McpGateway:
                 raise GatewayUnavailable("approved tool missing from discovery")
             definition = definitions[tool]
         validate_schema(definition["inputSchema"], arguments)
-        if not self.argument_authority(context, server, binding.logical_id, arguments):
+        if not host_decision(self.argument_authority, context, server, binding.logical_id, arguments):
             raise PolicyDenied("arguments target an unapproved resource or operation")
         headers = {}
         for path, name in schema_headers(definition["inputSchema"]):
@@ -1268,7 +1412,7 @@ class McpGateway:
                 if logical:
                     binding = next(x for x in client.server.tools if x.logical_id == logical)
                     _, estimate = self._admit(context, client.server.id, logical, binding.permissions, quote=True)
-                    if not self.argument_authority(context, client.server.id, logical, params["arguments"]):
+                    if not host_decision(self.argument_authority, context, client.server.id, logical, params["arguments"]):
                         raise PolicyDenied("argument policy denied immediately before transmission")
                 else:
                     resource = dict(client.server.resources).get(params["uri"])
@@ -1290,7 +1434,7 @@ class McpGateway:
                     for _notification in notifications:
                         self.ledger.audit(key, "untrusted_notification", self.clock())
                     if result["resultType"] == "task":
-                        state, due = self._task_state(result, definition)
+                        state, due = self._task_state(result, definition, binding.output_modalities, context.toolset.scope.output_modalities)
                         remote = result["taskId"]
                     elif result["resultType"] == "input_required":
                         # No automatic elicitation, OAuth, callback or tool expansion.
@@ -1305,9 +1449,12 @@ class McpGateway:
                                     not isinstance(x, dict) or x.get("uri") != params["uri"] for x in contents):
                                 raise PolicyDenied("remote resource contents escaped allowlist")
                             for resource in contents:
-                                validate_tool_content({"content": [{"type": "resource", "resource": resource}]})
+                                content = {"content": [{"type": "resource", "resource": resource}]}
+                                validate_tool_content(content)
+                                require_output_modalities(content, (Modality.TEXT,), context.toolset.scope.output_modalities)
                         else:
                             validate_tool_content(result)
+                            require_output_modalities(result, binding.output_modalities, context.toolset.scope.output_modalities)
                         if definition and "outputSchema" in definition:
                             if "structuredContent" not in result:
                                 raise GatewayError("declared structured output is missing")
@@ -1357,7 +1504,7 @@ class McpGateway:
         if "pollIntervalMs" in result and (type(result["pollIntervalMs"]) is not int or not 0 <= result["pollIntervalMs"] <= 86_400_000):
             raise GatewayError("invalid bounded polling interval")
 
-    def _task_state(self, result, definition):
+    def _task_state(self, result, definition, binding_modalities=(Modality.TEXT,), scope_modalities=(Modality.TEXT,)):
         self._remote_task(result)
         status = result["status"]
         if status == "completed":
@@ -1367,6 +1514,7 @@ class McpGateway:
                     or type(completed.get("isError", False)) is not bool):
                 raise GatewayError("completed remote task has invalid tool result")
             validate_tool_content(completed)
+            require_output_modalities(completed, binding_modalities, scope_modalities)
             if definition and "outputSchema" in definition:
                 if "structuredContent" not in completed:
                     raise GatewayError("completed task structured result is missing")
@@ -1483,7 +1631,7 @@ class McpGateway:
                 if result.get("resultType") != "complete" or result["taskId"] != row["remote_task_id"]:
                     raise GatewayError("remote task correlation mismatch")
                 definition = self._recorded_definition(row, binding)
-                state, due = self._task_state(result, definition)
+                state, due = self._task_state(result, definition, binding.output_modalities, context.toolset.scope.output_modalities)
                 self.ledger.observed(key, state, result, self.clock(), row["remote_task_id"], due)
                 self.ledger.healthy(client.server.id)
                 return Outcome(state, hashed(result), result, row["remote_task_id"])
@@ -1495,7 +1643,7 @@ class McpGateway:
 
     def observe_event(self, context: CallContext, server: str, message: dict):
         """Bounded authenticated subscription observations, never lifecycle writes."""
-        if (not isinstance(context, CallContext) or not self.authority(context)
+        if (not isinstance(context, CallContext) or not host_decision(self.authority, context)
                 or server not in self.clients or self.clients[server].server.consumer != context.identity.consumer
                 or context.toolset.registry_hash != self.registry.snapshot.hash
                 or context.toolset.argument_policy_hash != self.argument_policy_hash):
@@ -1696,7 +1844,7 @@ class ServerAdapter:
             if requested_version != PROTOCOL:
                 raise UnsupportedProtocolVersion(requested_version)
             if method == "server/discover":
-                if not self.gateway.authority(context):
+                if not host_decision(self.gateway.authority, context):
                     raise PolicyDenied("inactive task")
                 capabilities = {"tools": {}, "resources": {}}
                 if any(client.server.tasks for client in self.gateway.clients.values()

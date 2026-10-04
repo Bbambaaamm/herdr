@@ -10,7 +10,7 @@ def main():
             _, hard = resource.getrlimit(kind)
             soft = ceiling if hard == resource.RLIM_INFINITY else min(ceiling, hard)
             resource.setrlimit(kind, (soft, hard))
-        from jsonschema import Draft202012Validator
+        from jsonschema import Draft202012Validator, FormatChecker
         from jsonschema.exceptions import SchemaError, ValidationError
         from referencing import Registry
         from referencing.exceptions import Unresolvable
@@ -67,7 +67,30 @@ def main():
         Draft202012Validator.check_schema(schema)
         def denied(uri):
             raise ValueError("external reference denied")
-        validator = Draft202012Validator(schema, registry=Registry(retrieve=denied))
+        import base64, re
+        from urllib.parse import urlsplit
+        checker = FormatChecker()
+        @checker.checks("byte", raises=(ValueError, TypeError, UnicodeError))
+        def valid_byte(value):
+            if not isinstance(value, str):
+                return True
+            return base64.b64encode(base64.b64decode(value, validate=True)).decode() == value
+        @checker.checks("uri", raises=(ValueError, TypeError, UnicodeError))
+        def valid_uri(value):
+            if not isinstance(value, str):
+                return True
+            if (not value or any(ord(x) <= 32 or ord(x) > 126 or x in '<>"{}|\\^' + chr(96) for x in value)
+                    or re.search(r"%(?![0-9A-Fa-f]{2})", value)):
+                return False
+            parsed = urlsplit(value)
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*", parsed.scheme):
+                return False
+            if parsed.scheme in {"http", "https"} and not parsed.hostname:
+                return False
+            if parsed.netloc:
+                parsed.port
+            return True
+        validator = Draft202012Validator(schema, registry=Registry(retrieve=denied), format_checker=checker)
         if not data["check_only"] and not validator.is_valid(data["instance"]):
             return 1
         sys.stdout.buffer.write(b"valid")
