@@ -214,7 +214,7 @@ explicitly declare object type. This follows the finalized 2026-07-28 schema.
 Resource reads validate text/blob exclusivity, types, encoding and metadata in
 addition to the exact admitted URI.
 
-Resource reads require both finite nonnegative ttlMs and private/public
+Resource reads require both nonnegative integer ttlMs and private/public
 cacheScope before their contents may be recorded or forwarded. Input-required
 results require typed inputRequests or an opaque bounded requestState; nested
 requests remain observations and never execute callbacks or authorize OAuth,
@@ -227,3 +227,11 @@ version data. Invalid failed-Task error objects are rejected before terminal
 observation. Endpoint request targets require already encoded ASCII paths,
 validated before any reservation. Legacy SQLite column migrations run under
 BEGIN IMMEDIATE with an in-transaction schema check across host processes.
+
+Nested input-request shape validation uses a hash-pinned, offline closure of
+the official 2026-07-28 JSON Schema at upstream revision
+75db1e987cbbba6d170315dc99d0dfc440754aef. The vendored file includes its original license
+and upstream source digest. Both titled and untitled multi-select forms are
+accepted. Cache TTLs and sampling limits are JSON integers (integral 1.0 is
+equivalent to 1 in JSON Schema); fractional values and booleans are rejected.
+Hostless endpoints produce a bounded configuration denial before admission.

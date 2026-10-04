@@ -14,11 +14,12 @@ import math
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
 import threading
-from functools import wraps
+from functools import wraps, lru_cache
 from collections.abc import Callable
 from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass
@@ -197,9 +198,42 @@ def validate_schema(schema: dict, instance=None, *, check_only=False):
 
 
 
+@lru_cache(maxsize=1)
+def _protocol_schema():
+    # Pinned, vendored upstream definitions; no runtime network/schema resolver.
+    fd = -1
+    try:
+        fd = os.open(Path(__file__).with_name("mcp_protocol_20260728.json"),
+                     os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 131072:
+            raise GatewayUnavailable("pinned protocol schema unavailable")
+        chunks, remaining = [], info.st_size
+        while remaining:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if remaining or hashlib.sha256(raw).hexdigest() != "6e0ee904bd4f08cc7f7f04bbdb3e7274265ad9cff182e8dd03459717695c8d31":
+            raise GatewayUnavailable("pinned protocol schema unavailable")
+        return decode(raw)["schema"]
+    except (OSError, GatewayError) as exc:
+        raise GatewayUnavailable("pinned protocol schema unavailable") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def validate_protocol_shape(name, value):
+    schema = {**_protocol_schema(), "$ref": "#/$defs/" + name}
+    validate_schema(schema, value)
+
+
 def validate_cacheable(result):
     ttl, scope = result.get("ttlMs"), result.get("cacheScope")
-    if type(ttl) not in {int, float} or not 0 <= ttl <= 2**53 - 1 or not math.isfinite(ttl):
+    if type(ttl) not in {int, float} or not 0 <= ttl <= 2**53 - 1 or (type(ttl) is float and not ttl.is_integer()):
         raise GatewayError("invalid cache TTL")
     if not isinstance(scope, str) or scope not in {"private", "public"}:
         raise GatewayError("invalid or absent cache scope")
@@ -222,73 +256,21 @@ def validate_input_required(result):
             not isinstance(result["requestState"], str) or len(result["requestState"]) > 32768):
         raise GatewayError("invalid opaque request state")
     if "inputRequests" not in result:
+        validate_protocol_shape("InputRequiredResult", result)
         return
     requests = result["inputRequests"]
     if not isinstance(requests, dict) or len(requests) > 32:
         raise GatewayError("invalid bounded input requests")
-    for key, request in requests.items():
+    for key in requests:
         identifier(key)
-        if not isinstance(request, dict) or not isinstance(request.get("method"), str) or request["method"] not in {
-                "roots/list", "elicitation/create", "sampling/createMessage"}:
-            raise GatewayError("invalid input request method")
-        method, params = request["method"], request.get("params", {})
-        if not isinstance(params, dict) or "_meta" in params and not isinstance(params["_meta"], dict):
-            raise GatewayError("invalid input request parameters")
-        if method == "roots/list":
-            continue
-        if "params" not in request:
-            raise GatewayError("input request parameters are missing")
-        if method == "elicitation/create":
-            if not isinstance(params.get("message"), str):
-                raise GatewayError("invalid elicitation message")
-            mode = params.get("mode", "form")
-            if mode == "url":
-                identifier(params.get("url"), maximum=4096)
-            elif mode == "form":
-                schema = params.get("requestedSchema")
-                if (not isinstance(schema, dict) or schema.get("type") != "object"
-                        or not isinstance(schema.get("properties"), dict)
-                        or len(schema["properties"]) > 128):
-                    raise GatewayError("invalid elicitation form schema")
-                for name, prop in schema["properties"].items():
-                    identifier(name)
-                    if not isinstance(prop, dict) or not isinstance(prop.get("type"), str) or prop["type"] not in {"string", "number", "integer", "boolean", "array"}:
-                        raise GatewayError("invalid elicitation property")
-                    if prop.get("type") == "array":
-                        if (not isinstance(prop.get("items"), dict) or prop["items"].get("type") != "string"
-                                or not isinstance(prop["items"].get("enum"), list)):
-                            raise GatewayError("invalid multi-select elicitation property")
-                validate_schema(schema, check_only=True)
-            else:
-                raise GatewayError("invalid elicitation mode")
-        else:
-            messages, maximum = params.get("messages"), params.get("maxTokens")
-            if (not isinstance(messages, list) or len(messages) > 128
-                    or type(maximum) not in {int, float} or not 0 < maximum <= 2**53 - 1 or not math.isfinite(maximum)):
-                raise GatewayError("invalid sampling parameters")
-            for message in messages:
-                if not isinstance(message, dict) or not isinstance(message.get("role"), str) or message["role"] not in {"user", "assistant"}:
-                    raise GatewayError("invalid sampling message")
-                content = message.get("content")
-                blocks = content if isinstance(content, list) else [content]
-                if len(blocks) > 256:
-                    raise GatewayError("sampling content exceeded")
-                for block in blocks:
-                    if not isinstance(block, dict):
-                        raise GatewayError("invalid sampling content")
-                    if not isinstance(block.get("type"), str):
-                        raise GatewayError("invalid sampling content type")
-                    if block.get("type") == "tool_use":
-                        identifier(block.get("id")); identifier(block.get("name"))
-                        if not isinstance(block.get("input"), dict):
-                            raise GatewayError("invalid sampling tool input")
-                    elif block.get("type") == "tool_result":
-                        identifier(block.get("toolUseId"))
-                        validate_tool_content({"content": block.get("content"), "isError": block.get("isError", False)})
-                    elif block.get("type") in {"text", "image", "audio"}:
-                        validate_tool_content({"content": [block]})
-                    else:
-                        raise GatewayError("invalid sampling content type")
+    # The published JSON Schema covers both titled/untitled enum forms,
+    # nested tool-use sampling messages, required fields and integer limits.
+    validate_protocol_shape("InputRequiredResult", result)
+    for request in requests.values():
+        if request["method"] == "sampling/createMessage":
+            maximum = request["params"]["maxTokens"]
+            if abs(maximum) > 2**53 - 1:
+                raise GatewayError("sampling limit outside safe integer range")
 
 
 def validate_tool_content(result):
@@ -716,6 +698,8 @@ class HTTPTransport:
             target = parsed.path or "/"
             if any(ord(x) <= 32 or ord(x) > 126 for x in target):
                 raise ValueError("endpoint requires an encoded ASCII request target")
+            if not parsed.hostname:
+                raise ValueError("endpoint hostname is missing")
             parsed.hostname.encode("ascii")
             port = parsed.port
             if port is not None and not 1 <= port <= 65535:

@@ -1917,8 +1917,8 @@ def test_resource_cache_contract_rejects_malformed_response_before_forwarding(tm
 
 
 @pytest.mark.parametrize("scope", ["private", "public"])
-@pytest.mark.parametrize("ttl", [0, 1.5, 2**53-1])
-def test_resource_cache_contract_accepts_finite_number_and_declared_scope(tmp_path, scope, ttl):
+@pytest.mark.parametrize("ttl", [0, 1.0, 2**53-1])
+def test_resource_cache_contract_accepts_integer_number_and_declared_scope(tmp_path, scope, ttl):
     gateway, context, transport, *_ = fixture(tmp_path, tools=("docs_read",))
     transport.response = {"resultType": "complete", "ttlMs": ttl, "cacheScope": scope,
                           "contents": [{"uri": "herdr://docs/one", "text": "valid"}]}
@@ -2061,3 +2061,87 @@ def test_legacy_schema_migration_is_serialized_across_real_processes(tmp_path):
     assert all(outcome[0] == "ok" for outcome in outcomes), outcomes
     assert all({"validation_plan_json", "remote_task_json"} <= set(outcome[1]) for outcome in outcomes)
     assert all(outcome[2] == ("consumer", "task", 7, 21) for outcome in outcomes)
+
+
+@pytest.mark.parametrize("options", [
+    {"type": "string", "enum": ["red", "blue"]},
+    {"anyOf": [{"const": "red", "title": "Red"}, {"const": "blue", "title": "Blue"}]},
+], ids=["untitled", "titled"])
+def test_multiselect_elicitation_follows_published_protocol_schema(tmp_path, options):
+    gateway, context, transport, *_ = fixture(tmp_path)
+    transport.response = {"resultType": "input_required", "inputRequests": {"choose": {
+        "method": "elicitation/create", "params": {"message": "Choose colors",
+            "requestedSchema": {"type": "object", "properties": {"colors": {
+                "type": "array", "items": options, "minItems": 1, "maxItems": 2}}}}}}}
+    result = gateway.call(context, "local", "read", {"path": "source.py"}, "selection")
+    assert result.state == "input_required"
+    assert [req["method"] for req, _ in semantic_calls(transport)] == ["tools/call"]
+
+
+@pytest.mark.parametrize("options", [{"anyOf": [{"const": "red"}]},
+    {"anyOf": [{"const": 1, "title": "Red"}]}, {"anyOf": "bad"},
+    {"type": "string", "enum": [1]}, {}])
+def test_malformed_multiselect_schema_is_rejected_without_callback(tmp_path, options):
+    gateway, context, transport, *_ = fixture(tmp_path)
+    transport.response = {"resultType": "input_required", "inputRequests": {"choose": {
+        "method": "elicitation/create", "params": {"message": "Choose",
+            "requestedSchema": {"type": "object", "properties": {"colors": {
+                "type": "array", "items": options}}}}}}}
+    with pytest.raises(GatewayError):
+        gateway.call(context, "local", "read", {"path": "source.py"}, "selection")
+
+
+@pytest.mark.parametrize("endpoint", ["https://", "https:///path", "/relative", "path"])
+def test_endpoint_requires_hostname_with_bounded_denial(endpoint):
+    with pytest.raises(PolicyDenied):
+        HTTPTransport(endpoint)
+
+
+@pytest.mark.parametrize("method", ["tools/list", "resources/read"])
+def test_fractional_cache_ttl_is_not_a_protocol_integer(tmp_path, method):
+    gateway, context, transport, clock, client, _ = fixture(tmp_path, tools=("docs_read",) if method == "resources/read" else ("code_read",))
+    if method == "resources/read":
+        transport.response = {"resultType": "complete", "ttlMs": 1.5, "cacheScope": "private",
+                              "contents": [{"uri": "herdr://docs/one", "text": "valid"}]}
+        action = lambda: gateway.read_resource(context, "local", "herdr://docs/one", "fractional")
+    else:
+        original = transport.request
+        def request(message, **kwargs):
+            result = original(message, **kwargs)
+            result[0]["result"]["ttlMs"] = 1.5
+            return result
+        transport.request = request
+        action = lambda: client.discover(context, clock())
+    with pytest.raises(GatewayError, match="TTL"):
+        action()
+
+
+@pytest.mark.parametrize("maximum", [1.5, True, 2**53])
+def test_sampling_hold_requires_bounded_json_integer_token_limit(tmp_path, maximum):
+    gateway, context, transport, *_ = fixture(tmp_path)
+    transport.response = {"resultType": "input_required", "inputRequests": {"sample": {
+        "method": "sampling/createMessage", "params": {"messages": [], "maxTokens": maximum}}}}
+    with pytest.raises(GatewayError):
+        gateway.call(context, "local", "read", {"path": "source.py"}, "sampling")
+    assert len(semantic_calls(transport)) == 1
+
+
+def test_integral_sampling_limit_follows_json_schema_integer_semantics(tmp_path):
+    gateway, context, transport, *_ = fixture(tmp_path)
+    transport.response = {"resultType": "input_required", "inputRequests": {"sample": {
+        "method": "sampling/createMessage", "params": {"messages": [], "maxTokens": 1.0}}}}
+    assert gateway.call(context, "local", "read", {"path": "source.py"}, "sampling").state == "input_required"
+
+
+def test_pinned_protocol_definitions_are_offline_and_include_upstream_license():
+    from herdr.mcp import _protocol_schema
+    from pathlib import Path
+    import herdr.mcp as module
+    document = decode(Path(module.__file__).with_name("mcp_protocol_20260728.json").read_bytes())
+    assert document["protocol_version"] == PROTOCOL
+    assert document["source_revision"] == "75db1e987cbbba6d170315dc99d0dfc440754aef"
+    assert document["upstream_license"]
+    definitions = _protocol_schema()["$defs"]
+    assert definitions["CacheableResult"]["properties"]["ttlMs"]["type"] == "integer"
+    assert definitions["CreateMessageRequestParams"]["properties"]["maxTokens"]["type"] == "integer"
+    assert definitions["TitledMultiSelectEnumSchema"]["properties"]["items"]["required"] == ["anyOf"]
