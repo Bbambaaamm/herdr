@@ -16,13 +16,13 @@ import json
 import os
 import re
 import stat
-import threading
+import socket
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from urllib.parse import urlsplit
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from herdr.capability import CapabilityScope, DataClass, Egress, Retention, Training
 
@@ -61,6 +61,20 @@ _SECRET_VALUE = tuple(
         r"\bAIza[0-9A-Za-z_-]{20,}\b",
     )
 )
+APPROVAL_SOCKET = Path("/run/herdr-policy/approval.sock")
+
+
+def _credential_ref(value: Any, name: str) -> str:
+    ref = _token(value, name)
+    if any(pattern.search(ref) for pattern in _SECRET_VALUE):
+        raise SecurityError(f"{name} contains secret material")
+    if not re.fullmatch(r"pool:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+", ref):
+        raise SecurityError(f"{name} must be an opaque pool identity")
+    return ref
+
+
+def _credential_refs(values: Any, name: str) -> tuple[str, ...]:
+    return tuple(_credential_ref(value, name) for value in _tuple_tokens(values, name))
 
 
 class SecurityError(ValueError):
@@ -384,7 +398,8 @@ class ProviderRoute:
         object.__setattr__(self, "max_egress", _enum(Egress, self.max_egress, "max_egress"))
         object.__setattr__(self, "max_retention", _enum(Retention, self.max_retention, "max_retention"))
         object.__setattr__(self, "training", _enum(Training, self.training, "training"))
-        object.__setattr__(self, "credential_refs", _tuple_tokens(self.credential_refs, "provider credential_refs"))
+        refs = _credential_refs(self.credential_refs, "provider credential_refs")
+        object.__setattr__(self, "credential_refs", refs)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -482,7 +497,7 @@ class SecurityGrant:
             raise SecurityError("process policy must be typed")
         if not isinstance(self.runtime_assurance, RuntimeAssurance):
             raise SecurityError("runtime assurance must be host-produced and typed")
-        object.__setattr__(self, "credential_refs", _tuple_tokens(self.credential_refs, "credential_refs"))
+        object.__setattr__(self, "credential_refs", _credential_refs(self.credential_refs, "credential_refs"))
         if not isinstance(self.approval_required_for, (tuple, list)):
             raise SecurityError("approval_required_for must be an array")
         risks = tuple(sorted((_enum(RiskClass, value, "approval risk") for value in self.approval_required_for), key=str))
@@ -502,8 +517,11 @@ class SecurityGrant:
                          "terminal": RiskClass.PROCESS, "execute_code": RiskClass.PROCESS}
         for rule in self.tool_rules:
             if rule.tool in {"read_file", "search_files", "write_file", "patch"}:
-                if "path" not in rule.path_fields or not rule.allowed_roots or not _roots_subset(rule.allowed_roots, (self.workspace_root,)):
+                required = () if rule.tool == "patch" else ("path",)
+                if not set(required) <= set(rule.path_fields) or not rule.allowed_roots or not _roots_subset(rule.allowed_roots, (self.workspace_root,)):
                     raise SecurityError("file tool paths must be workspace-scoped")
+                if rule.tool == "patch" and "path" in rule.allowed_arg_keys and "path" not in rule.path_fields:
+                    raise SecurityError("patch path argument must be constrained")
             if rule.risk == RiskClass.PROCESS and (not rule.requires_process or not rule.requires_sandbox):
                 raise SecurityError("process tool requires process policy and sandbox")
             if rule.tool in built_in_risk and rule.risk != built_in_risk[rule.tool]:
@@ -548,6 +566,9 @@ class SecurityGrant:
         ):
             raise SecurityError("child parent identity mismatch")
         self.scope.require_subset_of(parent.scope)
+        if (_utc(self.issued_at, "issued_at") < _utc(parent.issued_at, "issued_at")
+                or _utc(self.expires_at, "expires_at") > _utc(parent.expires_at, "expires_at")):
+            raise SecurityError("child lifetime exceeds parent interval")
         if not self.process.is_subset_of(parent.process):
             raise SecurityError("child process policy escalates above parent")
         if not _path_within(Path(self.workspace_root), Path(parent.workspace_root)):
@@ -559,9 +580,7 @@ class SecurityGrant:
                 raise SecurityError("child tool rule missing from parent")
             if not set(child_rule.allowed_arg_keys) <= set(parent_rule.allowed_arg_keys):
                 raise SecurityError("child tool argument ceiling escalates above parent")
-            required_path_fields = (
-                set(parent_rule.path_fields) & set(child_rule.allowed_arg_keys)
-            )
+            required_path_fields = set(parent_rule.path_fields)
             if not required_path_fields <= set(child_rule.path_fields):
                 raise SecurityError("child weakens parent path constraint")
             if not _roots_subset(child_rule.allowed_roots, parent_rule.allowed_roots):
@@ -971,7 +990,7 @@ class ProviderRequest:
         object.__setattr__(self, "retention", _enum(Retention, self.retention, "retention"))
         object.__setattr__(self, "training", _enum(Training, self.training, "training"))
         if self.credential_ref is not None:
-            _token(self.credential_ref, "credential_ref")
+            _credential_ref(self.credential_ref, "credential_ref")
 
 
 class ProviderCircuitBreaker:
@@ -1001,10 +1020,11 @@ class InvocationGuard:
     assurance: RuntimeAssurance | None = None
     aliases: Mapping[str, str] = field(default_factory=dict)
     breaker: ProviderCircuitBreaker = field(default_factory=ProviderCircuitBreaker)
-    _consumed_approvals: set[str] = field(default_factory=set, init=False, repr=False)
-    _approval_lock: threading.Lock = field(
-        default_factory=threading.Lock, init=False, repr=False
+    path_resolver: Callable[[str, str], str | Path] | None = field(
+        default=None, repr=False
     )
+    approval_socket: Path = APPROVAL_SOCKET
+    approval_consumer: Callable[[str, str, str, str], str] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.grant, SecurityGrant):
@@ -1041,10 +1061,31 @@ class InvocationGuard:
         taint: TaintRestrictions | None = None,
         consume_approval: bool = True,
     ) -> str:
+        canonical, _checked = self.authorize_tool_call(
+            tool,
+            args,
+            caller_task_id=caller_task_id,
+            taint=taint,
+            consume_approval=consume_approval,
+        )
+        return canonical
+
+    def authorize_tool_call(
+        self,
+        tool: str,
+        args: Mapping[str, Any] | None,
+        *,
+        caller_task_id: str | None = None,
+        taint: TaintRestrictions | None = None,
+        consume_approval: bool = True,
+    ) -> tuple[str, dict[str, Any]]:
+        """Authorize and canonicalize the exact arguments Hermes will execute."""
         if not self.grant.is_active():
             raise PolicyDenied("grant_expired")
         canonical = self.canonical_tool(tool)
-        if caller_task_id not in (None, "", self.grant.identity.task_id):
+        if caller_task_id is None:
+            caller_task_id = self.grant.identity.task_id
+        if caller_task_id != self.grant.identity.task_id:
             raise PolicyDenied("task_identity_mismatch")
         if taint is not None and canonical in taint.deny_tools:
             raise PolicyDenied("tainted_tool_denied")
@@ -1054,7 +1095,13 @@ class InvocationGuard:
         rule = rules.get(canonical)
         if rule is None:
             raise PolicyDenied("tool_rule_missing", canonical)
-        checked_args = _validate_args(args or {}, rule, self.grant.credential_refs)
+        checked_args = _validate_args(
+            args if args is not None else {},
+            rule,
+            self.grant.credential_refs,
+            path_resolver=self.path_resolver,
+            task_id=caller_task_id,
+        )
         if rule.requires_sandbox and not self.assurance.sandbox_verified:
             raise PolicyDenied("sandbox_attestation_required", canonical)
         if rule.requires_process:
@@ -1070,7 +1117,7 @@ class InvocationGuard:
                 raise PolicyDenied("credential_boundary_unverified", canonical)
         if rule.risk in self.grant.approval_required_for:
             self._require_approval(canonical, checked_args, consume=consume_approval)
-        return canonical
+        return canonical, checked_args
 
     def _require_approval(self, tool: str, args: Mapping[str, Any], *, consume: bool) -> None:
         digest = canonical_digest({"tool": tool, "args": args})
@@ -1087,10 +1134,29 @@ class InvocationGuard:
         if evidence is None:
             raise PolicyDenied("approval_required", tool)
         if consume:
-            with self._approval_lock:
-                if evidence.approval_id in self._consumed_approvals:
+            if self.approval_consumer is not None:
+                answer_text = self.approval_consumer(self.grant.hash, evidence.approval_id, tool, digest)
+                if answer_text == "consumed":
+                    return
+                if answer_text == "replayed":
                     raise PolicyDenied("approval_replayed", evidence.approval_id)
-                self._consumed_approvals.add(evidence.approval_id)
+                raise PolicyDenied("approval_authority_unavailable")
+            request = canonical_json_bytes({"grant_hash": self.grant.hash,
+                                            "approval_id": evidence.approval_id,
+                                            "tool": tool, "args_sha256": digest}) + b"\n"
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                    client.settimeout(2)
+                    client.connect(str(self.approval_socket))
+                    client.sendall(request)
+                    answer = client.recv(256)
+            except (OSError, TimeoutError) as exc:
+                raise PolicyDenied("approval_authority_unavailable") from exc
+            if answer == b"consumed\n":
+                return
+            if answer == b"replayed\n":
+                raise PolicyDenied("approval_replayed", evidence.approval_id)
+            raise PolicyDenied("approval_authority_unavailable")
 
     def authorize_provider(
         self,
@@ -1118,6 +1184,8 @@ class InvocationGuard:
             raise PolicyDenied("retention_denied", request.retention.value)
         if _TRAINING_ORDER[request.training] > _TRAINING_ORDER[self.grant.scope.training] or _TRAINING_ORDER[request.training] > _TRAINING_ORDER[route.training]:
             raise PolicyDenied("training_denied", request.training.value)
+        if route.credential_refs and request.credential_ref is None:
+            raise PolicyDenied("credential_ref_required", request.provider)
         if request.credential_ref is not None:
             if request.credential_ref not in self.grant.credential_refs or request.credential_ref not in route.credential_refs:
                 raise PolicyDenied("credential_ref_denied", request.credential_ref)
@@ -1127,6 +1195,9 @@ def _validate_args(
     args: Mapping[str, Any],
     rule: ToolRule,
     credential_refs: Sequence[str],
+    *,
+    path_resolver: Callable[[str, str], str | Path] | None,
+    task_id: str,
 ) -> dict[str, Any]:
     if not isinstance(args, Mapping):
         raise PolicyDenied("tool_args_invalid")
@@ -1141,11 +1212,13 @@ def _validate_args(
     checked = _validate_value(dict(args), rule, credential_refs, depth=0, budget=budget, parent_key="")
     for field in rule.path_fields:
         if field not in checked:
+            if rule.tool == "patch" and field == "path" and checked.get("mode") == "patch":
+                continue
             raise PolicyDenied("path_arg_required", field)
         value = checked[field]
         if not isinstance(value, str):
             raise PolicyDenied("path_arg_invalid", field)
-        resolved = Path(value).expanduser().resolve(strict=False)
+        resolved = _resolve_authorized_path(value, path_resolver, task_id)
         if not any(_path_within(resolved, Path(root)) for root in rule.allowed_roots):
             raise PolicyDenied("path_outside_grant", field)
         checked[field] = str(resolved)
@@ -1154,34 +1227,72 @@ def _validate_args(
         patch = checked.get("patch")
         if not isinstance(patch, str):
             raise PolicyDenied("patch_content_required")
-        targets = _v4a_patch_targets(patch)
+        normalized_patch, targets = _normalize_v4a_patch(
+            patch, path_resolver=path_resolver, task_id=task_id
+        )
         if not targets:
             raise PolicyDenied("patch_target_required")
         if not rule.allowed_roots:
             raise PolicyDenied("path_root_required", "patch")
         for target in targets:
-            resolved = Path(target).expanduser().resolve(strict=False)
-            if not any(_path_within(resolved, Path(root)) for root in rule.allowed_roots):
-                raise PolicyDenied("path_outside_grant", target[:256])
+            if not any(_path_within(target, Path(root)) for root in rule.allowed_roots):
+                raise PolicyDenied("path_outside_grant", str(target)[:256])
+        checked["patch"] = normalized_patch
     return checked
 
 
-def _v4a_patch_targets(patch: str) -> tuple[str, ...]:
-    """Extract every source/destination path from Hermes V4A patch headers."""
-    targets: list[str] = []
+def _resolve_authorized_path(
+    value: str,
+    resolver: Callable[[str, str], str | Path] | None,
+    task_id: str,
+) -> Path:
+    """Resolve exactly as the runtime will; never guess a relative cwd."""
+    try:
+        if resolver is not None:
+            raw = resolver(value, task_id)
+            resolved = Path(str(raw))
+        else:
+            candidate = Path(value).expanduser()
+            if not candidate.is_absolute():
+                raise PolicyDenied("path_resolution_context_required")
+            resolved = candidate.resolve(strict=False)
+    except PolicyDenied:
+        raise
+    except Exception as exc:
+        raise PolicyDenied("path_resolution_failed", type(exc).__name__) from exc
+    if not resolved.is_absolute() or ".." in resolved.parts:
+        raise PolicyDenied("path_resolution_failed")
+    return resolved
+
+
+def _normalize_v4a_patch(
+    patch: str,
+    *,
+    path_resolver: Callable[[str, str], str | Path] | None,
+    task_id: str,
+) -> tuple[str, tuple[Path, ...]]:
+    """Normalize every V4A path header to the authorized absolute path."""
+    targets: list[Path] = []
+    lines: list[str] = []
     for raw_line in patch.splitlines():
-        line = raw_line
-        move = _V4A_MOVE_HEADER.match(line)
+        move = _V4A_MOVE_HEADER.match(raw_line)
         if move:
-            targets.extend((move.group(1).strip(), move.group(2).strip()))
+            source = _resolve_authorized_path(move.group(1).strip(), path_resolver, task_id)
+            destination = _resolve_authorized_path(move.group(2).strip(), path_resolver, task_id)
+            targets.extend((source, destination))
+            lines.append(f"*** Move File: {source} -> {destination}")
             continue
-        single = _V4A_SINGLE_HEADER.match(line)
+        single = _V4A_SINGLE_HEADER.match(raw_line)
         if single:
-            targets.append(single.group(2).strip())
+            target = _resolve_authorized_path(single.group(2).strip(), path_resolver, task_id)
+            targets.append(target)
+            lines.append(f"*** {single.group(1)} File: {target}")
             continue
-        if _V4A_ANY_FILE_HEADER.match(line):
+        if _V4A_ANY_FILE_HEADER.match(raw_line):
             raise PolicyDenied("patch_header_invalid")
-    return tuple(target for target in targets if target)
+        lines.append(raw_line)
+    trailing_newline = "\n" if patch.endswith("\n") else ""
+    return "\n".join(lines) + trailing_newline, tuple(targets)
 
 
 def _validate_value(

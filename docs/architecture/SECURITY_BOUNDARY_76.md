@@ -28,6 +28,10 @@ identify the parent's task and agent, and pass `require_subset_of(parent)`.
 Tool, provider, permission, region, data-class, egress, retention, training,
 process, network, writable-root and credential-reference ceilings can only stay
 equal or narrow.
+The child's issue/expiry interval must fit entirely inside the parent's.
+If a child retains a custom tool, it must retain every parent path and
+credential-reference field constraint, even when the argument is omitted from
+the child's allowed keys: Hermes runtime defaults can still supply it.
 
 ## Installed Hermes v0.21.5 finding
 
@@ -97,12 +101,23 @@ No live Hermes config is changed by the probe.
 
 Every granted tool needs a `ToolRule`. Unknown argument keys fail closed.
 Declared path fields are canonicalized and must remain under an allowed root. Built-in file tool roots must remain within the signed workspace root.
+V4A patch mode checks and normalizes every Update, Add, Delete and Move
+source/destination header. Its top-level `path` is optional; when supplied it
+is checked too. The normalized arguments are the ones passed to Hermes.
+Relative paths use Hermes' task path resolver, and unavailable resolution
+denies execution.
 This logical check complements, and does not replace, #82's inode/mount
 physical boundary.
 
 Raw secret-like keys or values are rejected from model-controlled arguments.
 A tool may receive only an explicit non-secret credential reference listed in
 the signed grant.
+Grant, provider-route and provider-request credential references accept only
+opaque `pool:<provider>:<entry-id>` identities; raw keys and key hashes are
+not authorization identities. For Hermes v0.21.5 the guard checks the actual
+`agent.api_key` against `agent._credential_pool.entry_id_for_api_key` and the
+pool's exact provider before using that opaque identity. Direct keys, token
+callables and absent/ambiguous pools fail closed.
 
 `terminal` / `execute_code` are process authorities, not alternate spellings
 of file/network permissions. They require a `ProcessPolicy` and signed
@@ -135,8 +150,14 @@ may still require per-call approval for those classes.
 `EXTERNAL_SIDE_EFFECT`, `CREDENTIAL_USE`, and `PHYSICAL` operations always
 require an explicit approval class in the grant. Approval evidence is bound to
 the exact consumer/agent/parent/task/run/fence identity, canonical tool and
-canonical argument digest and is one-use in the guard. Missing, mismatched or
+canonical argument digest and is one-use across guarded processes. Missing, mismatched or
 replayed evidence fails closed.
+Consumption goes to the fixed `/run/herdr-policy/approval.sock` Unix broker.
+The host registers verified grant approvals in a durable SQLite ledger outside
+every model-writable mount, then serves atomic consumption from the host side.
+The guarded process cannot choose the broker path; an absent/unreachable broker
+denies a high-risk call. The broker and its ledger are an integration contract
+for the host launch owner; #76 does not start a live service.
 
 ## Untrusted content and providers
 
@@ -193,6 +214,11 @@ installs the guard in the audited Hermes interpreter before importing and
 calling `hermes_cli.main`, passing ordinary Hermes argv through. Empty,
 truncated, noncanonical or invalid bundles fail closed. CLI/env-selected grant,
 key, bundle, policy code and Hermes root paths have no authority.
+Before importing Hermes modules, bootstrap checks version 0.21.5, the audited
+Git HEAD `ee5ee84a345204a3b1d6ef6ba1ab747e602867b9`, a clean tree and the
+deterministic digest of actual tracked bytes. The signed scope must contain the
+exact `hermes:0.21.5:sha256:525219e866137f43c8c8b068488e07d97f14529d2d67497cd52fbfd1197da4f4`
+executor identifier.
 
 ## #82 integration interface
 
@@ -218,10 +244,15 @@ scheduler/sentinel recovery fixes. Required integration steps:
    exact tool rules and any delegated `parent_grant_hash`; call
    `child.require_subset_of(parent)` for children. Seal once through the held
    FD with the actual attestation digest. Do not rename the inode.
-5. Independently recheck the sandbox readonly bind, same device/inode and
+5. Register verified approval evidence with `ApprovalLedger` on the host and
+   serve a host-created Unix listener at `/run/herdr-policy/approval.sock`.
+   Keep its SQLite database and WAL outside all pane writable mounts; expose
+   only the socket to the guarded pane. Start Hermes only after this authority
+   is ready. If the broker is lost, high-risk calls fail closed.
+6. Independently recheck the sandbox readonly bind, same device/inode and
    SHA256 returned by `seal`. Only after this check may `herdr agent start`
    occur. A stale/failed seal or mismatch must deny launch.
-6. Kill/quarantine a superseded process before a newer fence is authoritative;
+7. Kill/quarantine a superseded process before a newer fence is authoritative;
    the grant is scoped to one exact process/run/fence.
 
 No #82 runtime or deployment change is made by #76.

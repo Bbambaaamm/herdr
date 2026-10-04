@@ -2,6 +2,8 @@
 from __future__ import annotations
 import importlib.machinery
 import importlib.util
+import hashlib
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -53,6 +55,7 @@ def test_policy_bin_hermes_invokes_guarded_launcher():
 
 def test_same_process_guard_precedes_hermes_main(monkeypatch, tmp_path):
     module = _launcher()
+    monkeypatch.setattr(module, '_verify_hermes_build', lambda root: module.HERMES_EXECUTOR)
     hermes = tmp_path / 'hermes'
     (hermes / 'venv').mkdir(parents=True)
     (hermes / 'model_tools.py').write_text('')
@@ -85,7 +88,7 @@ def test_same_process_guard_precedes_hermes_main(monkeypatch, tmp_path):
                         lambda root, got, **kwargs: (
                             events.append('verified') if root == tmp_path / 'bundle' and got == identity
                             else (_ for _ in ()).throw(AssertionError('alternate authority used'))
-                        ) or object())
+                        ) or types.SimpleNamespace(scope=types.SimpleNamespace(executors=(module.HERMES_EXECUTOR,))))
     monkeypatch.setattr(sys, 'prefix', str(hermes / 'venv'))
     saved_path, saved_argv = sys.path[:], sys.argv[:]
     try:
@@ -100,6 +103,7 @@ def test_same_process_guard_precedes_hermes_main(monkeypatch, tmp_path):
 
 def test_launcher_requires_exact_pane_identity(monkeypatch, tmp_path):
     module = _launcher()
+    monkeypatch.setattr(module, '_verify_hermes_build', lambda root: module.HERMES_EXECUTOR)
     hermes = tmp_path / 'hermes'
     (hermes / 'venv').mkdir(parents=True)
     (hermes / 'model_tools.py').write_text('')
@@ -117,3 +121,31 @@ def test_launcher_requires_exact_pane_identity(monkeypatch, tmp_path):
             assert False, 'missing fence was accepted'
     finally:
         sys.path[:] = saved_path
+
+
+def test_preimport_executor_verifier_checks_actual_bytes(monkeypatch, tmp_path):
+    module = _launcher()
+    root = tmp_path / 'hermes'
+    root.mkdir()
+    (root / 'pyproject.toml').write_text('[project]\nversion = "0.21.5"\n')
+    (root / 'model_tools.py').write_text('audited = True\n')
+    def git(*args):
+        return subprocess.run(['git', '-C', str(root), *args], capture_output=True,
+                              text=True, check=True).stdout.strip()
+    git('init')
+    git('config', 'user.name', 'Test')
+    git('config', 'user.email', 'test@example.invalid')
+    git('add', '.')
+    git('commit', '-m', 'audited')
+    digest = hashlib.sha256()
+    for name in subprocess.check_output(['git', '-C', str(root), 'ls-files', '-z']).split(b'\0'):
+        if name:
+            digest.update(name + b'\0')
+            digest.update(hashlib.sha256((root / name.decode()).read_bytes()).digest())
+    expected = f'hermes:0.21.5:sha256:{digest.hexdigest()}'
+    monkeypatch.setattr(module, 'HERMES_HEAD', git('rev-parse', 'HEAD'))
+    monkeypatch.setattr(module, 'HERMES_EXECUTOR', expected)
+    assert module._verify_hermes_build(root) == expected
+    (root / 'model_tools.py').write_text('audited = False\n')
+    with pytest.raises(SystemExit, match='cannot verify audited Hermes build|differs from signed executor'):
+        module._verify_hermes_build(root)

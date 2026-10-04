@@ -8,6 +8,8 @@ and must fail before Hermes starts.
 from __future__ import annotations
 
 import argparse
+import importlib.machinery
+import importlib.util
 import json
 import os
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -29,6 +31,11 @@ def main() -> int:
     repo = Path(ns.repo_root).resolve()
     hermes = Path(ns.hermes_root).resolve()
     sys.path.insert(0, str(repo))
+    launcher_path = repo / "agent-stack/bin/agent-hermes-policy-run"
+    loader = importlib.machinery.SourceFileLoader("herdr76_probe_launcher", str(launcher_path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    launcher = importlib.util.module_from_spec(spec)
+    loader.exec_module(launcher)
 
     from herdr.capability import CapabilityScope, DataClass, Egress, Retention, Training
     from herdr.security import (
@@ -54,7 +61,7 @@ def main() -> int:
     scope = CapabilityScope(
         providers=(),
         capabilities=("tool_use",),
-        executors=("hermes-v0.21.5",),
+        executors=(launcher.HERMES_EXECUTOR,),
         tools=("read_file",),
         permissions=("repo:read",),
         regions=("eu-central",),

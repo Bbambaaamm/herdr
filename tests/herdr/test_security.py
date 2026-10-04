@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -14,6 +16,7 @@ import pytest
 
 from herdr.capability import CapabilityScope, DataClass, Egress, Retention, Training
 from herdr import security
+from herdr.approval_broker import ApprovalLedger
 from herdr.security import (
     ApprovalEvidence,
     ContentProvenance,
@@ -422,12 +425,18 @@ def test_exact_approval_is_bound_to_identity_tool_args_and_single_use(tmp_path):
         approvals=(approval,),
         approval_required_for=(RiskClass.WORKSPACE_WRITE,),
     )
-    guard = InvocationGuard(item, assurance())
+    ledger = ApprovalLedger(tmp_path / "host-approval.db")
+    ledger.register(item)
+    with pytest.raises(PolicyDenied, match="approval_authority_unavailable"):
+        InvocationGuard(item, assurance(), approval_socket=tmp_path / "missing.sock").authorize_tool("write_file", args)
+    guard = InvocationGuard(item, assurance(), approval_consumer=ledger.consume)
     assert guard.authorize_tool("write_file", args) == "write_file"
     with pytest.raises(PolicyDenied, match="approval_replayed"):
         guard.authorize_tool("write_file", args)
 
-    fresh = InvocationGuard(item, assurance())
+    fresh = InvocationGuard(item, assurance(), approval_consumer=ApprovalLedger(tmp_path / "host-approval.db").consume)
+    with pytest.raises(PolicyDenied, match="approval_replayed"):
+        fresh.authorize_tool("write_file", args)
     with pytest.raises(PolicyDenied, match="approval_required"):
         fresh.authorize_tool(
             "write_file",
@@ -474,6 +483,56 @@ def test_v4a_patch_authorizes_every_embedded_target(tmp_path):
     with pytest.raises(PolicyDenied, match="path_outside_grant"):
         guard.authorize_tool("patch", escaped)
 
+    # V4A mode has no top-level path requirement. Every effective header is
+    # checked, including delete and both move endpoints.
+    allowed.pop("path")
+    assert guard.authorize_tool_call("patch", allowed)[1]["patch"].endswith("*** End Patch")
+    pathless_rule = ToolRule("patch", RiskClass.WORKSPACE_WRITE, ("mode", "patch"), (), (str(tmp_path),))
+    InvocationGuard(grant(tmp_path, tools=("patch",), rules=(pathless_rule,)), assurance()).authorize_tool("patch", allowed)
+    for header in (f"*** Add File: {outside}", f"*** Delete File: {outside}",
+                   f"*** Move File: {inside} -> {outside}",
+                   f"*** Move File: {outside} -> {inside}"):
+        with pytest.raises(PolicyDenied, match="path_outside_grant"):
+            guard.authorize_tool("patch", {"mode": "patch", "patch": f"*** Begin Patch\n{header}\n+ok\n*** End Patch"})
+
+
+def test_child_lifetime_and_credential_identity_constraints(tmp_path):
+    parent_rule = ToolRule("custom_file", RiskClass.READ, ("path",), ("path",), (str(tmp_path),))
+    parent = grant(tmp_path, tools=("custom_file",), rules=(parent_rule,))
+    child_identity = identity(agent_id="grandchild", parent_agent_id=parent.identity.agent_id,
+                              parent_task_id=parent.identity.task_id, task_id="grandchild-task")
+    child = replace(parent, identity=child_identity, parent_grant_hash=parent.hash)
+    child.require_subset_of(parent)
+    with pytest.raises(SecurityError, match="lifetime"):
+        replace(child, issued_at="2025-12-31T00:00:00+00:00").require_subset_of(parent)
+    with pytest.raises(SecurityError, match="lifetime"):
+        replace(child, expires_at="2031-01-01T00:00:00+00:00").require_subset_of(parent)
+    with pytest.raises(SecurityError, match="weakens parent path constraint"):
+        replace(child, tool_rules=(ToolRule("custom_file", RiskClass.READ, (), (), ()),)).require_subset_of(parent)
+    credential_parent_rule = ToolRule(
+        "custom_ref", RiskClass.READ, ("target", "credential_ref"), (), (), ("credential_ref",)
+    )
+    credential_parent = grant(tmp_path, tools=("custom_ref",), rules=(credential_parent_rule,))
+    credential_child = replace(
+        credential_parent,
+        identity=child_identity,
+        parent_grant_hash=credential_parent.hash,
+        tool_rules=(ToolRule(
+            "custom_ref", RiskClass.READ, ("target", "credential_ref"), (), (),
+            ("credential_ref", "target"),
+        ),),
+    )
+    with pytest.raises(SecurityError, match="credential argument ceiling"):
+        credential_child.require_subset_of(credential_parent)
+    for raw in ("sk-abcdefghijklmnopqrstuvwxyz123456", "sha256:" + "a" * 64, "raw-secret"):
+        with pytest.raises(SecurityError):
+            replace(parent, credential_refs=(raw,))
+        with pytest.raises(SecurityError):
+            replace(route(), credential_refs=(raw,))
+        with pytest.raises(SecurityError):
+            ProviderRequest("provider-a", "eu-central", DataClass.INTERNAL, Egress.REGION_BOUND,
+                            Retention.LIMITED, Training.EXCLUDED, raw)
+
 
 def test_one_use_approval_is_atomic_under_concurrent_dispatch(tmp_path):
     args = {"target": "external-system"}
@@ -487,25 +546,37 @@ def test_one_use_approval_is_atomic_under_concurrent_dispatch(tmp_path):
         approvals=(approval,),
         approval_required_for=(RiskClass.EXTERNAL_SIDE_EFFECT,),
     )
-    guard = InvocationGuard(item, assurance())
+    ledger = ApprovalLedger(tmp_path / "host-approval.db")
+    ledger.register(item)
+    guards = [InvocationGuard(item, assurance(), approval_consumer=ApprovalLedger(tmp_path / "host-approval.db").consume) for _ in range(2)]
 
-    class SlowContainsSet(set):
-        def __contains__(self, value):
-            present = super().__contains__(value)
-            time.sleep(0.03)
-            return present
-
-    guard._consumed_approvals = SlowContainsSet()
-
-    def invoke():
+    def invoke(guard):
         try:
             return guard.authorize_tool("deploy_prod", args)
         except PolicyDenied as exc:
             return exc.reason
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(lambda _: invoke(), range(2)))
+        results = list(pool.map(invoke, guards))
     assert sorted(results) == ["approval_replayed", "deploy_prod"]
+
+
+def test_approval_ledger_survives_fresh_process(tmp_path):
+    ledger_path = tmp_path / "host-approval.db"
+    item = grant(tmp_path, tools=("deploy_prod",),
+                 rules=(ToolRule("deploy_prod", RiskClass.EXTERNAL_SIDE_EFFECT, ("target",)),),
+                 approvals=(ApprovalEvidence("restart-approval", identity(), "deploy_prod",
+                                             canonical_digest({"tool": "deploy_prod", "args": {"target": "external"}})),),
+                 approval_required_for=(RiskClass.EXTERNAL_SIDE_EFFECT,))
+    ledger = ApprovalLedger(ledger_path)
+    ledger.register(item)
+    assert ledger.consume(item.hash, "restart-approval", "deploy_prod", item.approvals[0].args_sha256) == "consumed"
+    code = ("from herdr.approval_broker import ApprovalLedger; import sys; "
+            "print(ApprovalLedger(sys.argv[1]).consume(*sys.argv[2:]))")
+    result = subprocess.run([sys.executable, "-c", code, str(ledger_path), item.hash,
+                             "restart-approval", "deploy_prod", item.approvals[0].args_sha256],
+                            cwd=os.getcwd(), capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == "replayed"
 
 
 def test_known_side_effect_cannot_lose_risk_or_approval_gate(tmp_path):
@@ -618,7 +689,8 @@ def test_child_cannot_drop_retained_parent_path_constraint(tmp_path):
         child,
         tool_rules=(ToolRule("custom_file", RiskClass.READ, ("format",), (), ()),),
     )
-    narrowed.require_subset_of(parent)
+    with pytest.raises(SecurityError, match="weakens parent path constraint"):
+        narrowed.require_subset_of(parent)
 
 
 def test_untrusted_content_can_only_restrict_not_grant(tmp_path):

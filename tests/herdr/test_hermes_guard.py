@@ -5,7 +5,25 @@ import types
 import pytest
 
 from herdr import hermes_guard
+from herdr.capability import DataClass
 from herdr.security import PolicyDenied, SecurityError
+
+
+def test_provider_credential_identity_comes_from_actual_pool_entry():
+    route = types.SimpleNamespace(provider="provider-a", credential_refs=("pool:provider-a:entry-1",))
+    pool = types.SimpleNamespace(provider="provider-a", entry_id_for_api_key=lambda key: "entry-1" if key == "actual" else None)
+    agent = types.SimpleNamespace(api_key="actual", api_mode="openai", _credential_pool=pool)
+    assert hermes_guard._actual_provider_credential_ref(agent, route) == "pool:provider-a:entry-1"
+    agent.api_key = "other"
+    with pytest.raises(PolicyDenied, match="provider_credential_identity_unknown"):
+        hermes_guard._actual_provider_credential_ref(agent, route)
+    agent.api_key = lambda: "actual"
+    with pytest.raises(PolicyDenied, match="provider_credential_identity_unknown"):
+        hermes_guard._actual_provider_credential_ref(agent, route)
+    agent.api_key = "actual"
+    agent._credential_pool = None
+    with pytest.raises(PolicyDenied, match="provider_credential_identity_unknown"):
+        hermes_guard._actual_provider_credential_ref(agent, route)
 
 
 def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
@@ -76,13 +94,19 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
     monkeypatch.setitem(sys.modules, "tools.connectors", connector_module)
     monkeypatch.setitem(sys.modules, "tools.connectors.dispatch", connector_dispatch)
     monkeypatch.setitem(sys.modules, "tools.tool_search", tool_search)
+    read_extract = types.ModuleType("tools.read_extract")
+    read_extract._hosted_ocr_config = lambda: (True, "secret", "url")
+    paths = types.ModuleType("tools.file_tools_paths")
+    paths._resolve_path_for_task = lambda value, task_id: value
+    monkeypatch.setitem(sys.modules, "tools.read_extract", read_extract)
+    monkeypatch.setitem(sys.modules, "tools.file_tools_paths", paths)
     monkeypatch.setattr(hermes_guard, "inspect_hermes_security_surface",
                         lambda: {"legacy_aliases": {"old_write": "write_file"}})
 
     class Guard:
         aliases = {}
         checks = []
-        grant = types.SimpleNamespace(provider_routes=(types.SimpleNamespace(provider="provider-a", base_url="https://provider-a.example.invalid/v1", api_mode="openai", regions=("eu-central",), data_classes=("internal",), max_egress="region_bound", max_retention="limited", training="excluded", credential_refs=()),))
+        grant = types.SimpleNamespace(identity=types.SimpleNamespace(task_id="task"), scope=types.SimpleNamespace(data_classes=(DataClass.INTERNAL,)), provider_routes=(types.SimpleNamespace(provider="provider-a", base_url="https://provider-a.example.invalid/v1", api_mode="openai", regions=("eu-central",), data_classes=("internal",), max_egress="region_bound", max_retention="limited", training="excluded", credential_refs=()),))
 
         def authorize_provider(self, request):
             if request.provider != "provider-a":
@@ -103,6 +127,10 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
             if args != {"path": "/scoped/file"}:
                 raise PolicyDenied("path_outside_grant")
             return canonical
+
+        def authorize_tool_call(self, name, args, *, caller_task_id=None, consume_approval=True):
+            return self.authorize_tool(name, args, caller_task_id=caller_task_id,
+                                       consume_approval=consume_approval), dict(args)
 
     policy = Guard()
     installation = hermes_guard.install_hermes_guard(policy)

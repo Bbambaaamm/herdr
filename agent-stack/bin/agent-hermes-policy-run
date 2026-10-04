@@ -8,7 +8,10 @@ select a grant, key, policy module, or executable.
 from __future__ import annotations
 
 import importlib
+import hashlib
 import os
+import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -16,6 +19,8 @@ from typing import Any
 BUNDLE_PATH = Path("/run/herdr-policy/grant.bundle.json")
 POLICY_CODE_ROOT = Path("/run/herdr/policy-code")
 HERMES_ROOT = Path("/home/agentops/.hermes/hermes-agent")
+HERMES_HEAD = "ee5ee84a345204a3b1d6ef6ba1ab747e602867b9"
+HERMES_EXECUTOR = "hermes:0.21.5:sha256:525219e866137f43c8c8b068488e07d97f14529d2d67497cd52fbfd1197da4f4"
 IDENTITY_ENV = {
     "consumer": "HERDR_POLICY_CONSUMER",
     "agent_id": "HERDR_POLICY_AGENT_ID",
@@ -102,6 +107,37 @@ def _require_module_origin(module: Any, root: Path, label: str) -> None:
         raise SystemExit(f"{label} import escaped trusted root")
 
 
+def _verify_hermes_build(root: Path) -> str:
+    """Verify actual tracked source against the pinned clean Git build before import."""
+    try:
+        project = (root / "pyproject.toml").read_text(encoding="utf-8")
+        version = re.search(r'(?m)^version = "([^"]+)"$', project).group(1)
+        env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent",
+               "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+        def git(*args: str) -> str:
+            return subprocess.run(["/usr/bin/git", "-C", str(root), *args],
+                                  env=env, capture_output=True, text=True,
+                                  check=True, timeout=30).stdout.strip()
+        head = git("rev-parse", "HEAD")
+        if head != HERMES_HEAD:
+            raise ValueError("Hermes revision changed")
+        names = subprocess.run(["/usr/bin/git", "-C", str(root), "ls-files", "-z"],
+                               env=env, capture_output=True, check=True, timeout=30).stdout
+        digest = hashlib.sha256()
+        for name in names.split(b"\0"):
+            if name:
+                digest.update(name + b"\0")
+                digest.update(hashlib.sha256((root / os.fsdecode(name)).read_bytes()).digest())
+        if git("status", "--porcelain", "--untracked-files=all"):
+            raise ValueError("Hermes source tree is not clean")
+    except (OSError, AttributeError, ValueError, subprocess.SubprocessError) as exc:
+        raise SystemExit("cannot verify audited Hermes build") from exc
+    actual = f"hermes:{version}:sha256:{digest.hexdigest()}"
+    if actual != HERMES_EXECUTOR:
+        raise SystemExit("Hermes build differs from signed executor pin")
+    return actual
+
+
 def bootstrap(
     hermes_args: list[str],
     *,
@@ -123,8 +159,7 @@ def bootstrap(
         raise SystemExit("bootstrap requires audited Hermes Python interpreter")
     if policy_code_root.is_symlink() or not policy_code_root.is_dir():
         raise SystemExit("trusted policy code root unavailable")
-    if not (hermes_root / "model_tools.py").is_file() or not (hermes_root / "hermes").is_file():
-        raise SystemExit("audited Hermes runtime unavailable")
+    executor = _verify_hermes_build(hermes_root)
 
     _reset_import_path(policy_code_root, hermes_root)
 
@@ -141,6 +176,8 @@ def bootstrap(
             bundle_path,
             identity,
         )
+        if tuple(grant.scope.executors) != (executor,):
+            raise security_module.SecurityError("signed executor scope differs from audited Hermes build")
         guard = security_module.InvocationGuard(grant)
     except (security_module.SecurityError, KeyError, TypeError, ValueError) as exc:
         raise SystemExit(f"signed Herdr grant rejected: {exc}") from exc

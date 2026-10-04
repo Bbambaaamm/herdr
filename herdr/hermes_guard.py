@@ -63,13 +63,60 @@ def _denied_result(reason: str, detail: str = "") -> str:
         )
 
 
+def _effective_request_data_class(guard: InvocationGuard) -> Any:
+    """Use the most sensitive class in the signed task scope.
+
+    Route metadata describes what a destination may accept; it must never be
+    reused as a claim about the sensitivity of the request being sent.
+    """
+    classes = tuple(getattr(getattr(guard, "grant", None), "scope", None).data_classes)
+    if not classes:
+        raise PolicyDenied("request_data_class_unknown")
+    order = {"public": 0, "internal": 1, "sensitive": 2}
+    try:
+        return max(classes, key=lambda item: order[item.value])
+    except (AttributeError, KeyError) as exc:
+        raise PolicyDenied("request_data_class_unknown") from exc
+
+
+def _actual_provider_credential_ref(agent: Any, route: Any) -> str | None:
+    """Resolve the actual selected key through Hermes' credential pool identity."""
+    refs = tuple(getattr(route, "credential_refs", ()) or ())
+    raw = getattr(agent, "api_key", None)
+    if getattr(agent, "api_mode", None) == "anthropic_messages":
+        raw = getattr(agent, "_anthropic_api_key", None) or raw
+    if raw is None:
+        raw = ""
+    if not isinstance(raw, str):
+        raise PolicyDenied("provider_credential_identity_unknown")
+    if not raw:
+        if refs:
+            raise PolicyDenied("provider_credential_missing")
+        return None
+    pool = getattr(agent, "_credential_pool", None)
+    resolver = getattr(pool, "entry_id_for_api_key", None)
+    if not callable(resolver) or getattr(pool, "provider", None) != route.provider:
+        raise PolicyDenied("provider_credential_identity_unknown")
+    try:
+        entry_id = resolver(raw)
+    except Exception as exc:
+        raise PolicyDenied("provider_credential_identity_unknown") from exc
+    if not isinstance(entry_id, str) or not entry_id:
+        raise PolicyDenied("provider_credential_identity_unknown")
+    actual = f"pool:{route.provider}:{entry_id}"
+    if actual not in refs:
+        raise PolicyDenied("provider_credential_mismatch")
+    return actual
+
+
 def inspect_hermes_security_surface() -> dict[str, Any]:
     """Fail-closed compatibility probe for the installed Hermes import surface."""
     try:
         import model_tools
         from hermes_cli import middleware, plugins
         from agent import turn_api_call, conversation_loop, tool_executor
-        from tools import connectors
+        from tools import connectors, read_extract
+        from tools.file_tools_paths import _resolve_path_for_task
         from tools.registry import registry
         from toolsets import resolve_toolset
     except Exception as exc:
@@ -121,6 +168,10 @@ def inspect_hermes_security_surface() -> dict[str, Any]:
         raise HermesCompatibilityError("provider execution seam drifted")
     if not callable(getattr(middleware, "run_llm_execution_middleware", None)):
         raise HermesCompatibilityError("provider middleware seam unavailable")
+    if not callable(_resolve_path_for_task):
+        raise HermesCompatibilityError("Hermes task path resolver unavailable")
+    if not callable(getattr(read_extract, "_hosted_ocr_config", None)):
+        raise HermesCompatibilityError("Hermes hosted OCR seam unavailable")
     if "pre_tool_call" not in getattr(plugins, "VALID_HOOKS", set()):
         raise HermesCompatibilityError("pre_tool_call compatibility hook unavailable")
     middleware_required = {"tool_request", "tool_execution"}
@@ -146,6 +197,8 @@ def inspect_hermes_security_surface() -> dict[str, Any]:
         "tool_request_middleware_supported": True,
         "tool_execution_middleware_supported": True,
         "agent_tool_execution_seam": True,
+        "task_path_resolver": True,
+        "hosted_ocr_disabled_under_guard": True,
         "security_authority": "herdr_dispatch_guard",
     }
 
@@ -184,13 +237,24 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
     import model_tools
     from agent import conversation_loop, turn_api_call, tool_executor
     from hermes_cli import middleware
-    from tools import connectors
+    from tools import connectors, read_extract
     from tools.connectors import dispatch as connector_dispatch_module
+    from tools.file_tools_paths import _resolve_path_for_task
     from tools.registry import ToolRegistry, registry
 
     aliases = dict(surface["legacy_aliases"])
     guard.aliases = aliases
+    guard.path_resolver = lambda value, task_id: _resolve_path_for_task(
+        value, task_id
+    )
     installation = GuardInstallation(guard=guard, surface=surface)
+
+    # A read_file PDF fallback can otherwise consume FIRECRAWL_API_KEY and send
+    # document bytes to hosted OCR while the model only invoked a READ-class
+    # tool. Under #76, cloud OCR must be an explicit separately granted tool.
+    installation._remember(
+        read_extract, "_hosted_ocr_config", lambda: (False, None, None)
+    )
 
     def authorize_agent_provider(agent: Any) -> None:
         provider = getattr(agent, "provider", None)
@@ -204,11 +268,10 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
         # data handling contract. Never infer these from model request fields.
         if len(route.regions) != 1 or len(route.data_classes) != 1:
             raise PolicyDenied("provider_route_ambiguous", str(provider))
-        credential_ref = route.credential_refs[0] if len(route.credential_refs) == 1 else None
-        if len(route.credential_refs) > 1:
-            raise PolicyDenied("provider_route_ambiguous", str(provider))
+        credential_ref = _actual_provider_credential_ref(agent, route)
+        data_class = _effective_request_data_class(guard)
         guard.authorize_provider(ProviderRequest(
-            provider=provider, region=route.regions[0], data_class=route.data_classes[0],
+            provider=provider, region=route.regions[0], data_class=data_class,
             egress=route.max_egress, retention=route.max_retention,
             training=route.training, credential_ref=credential_ref,
         ))
@@ -256,18 +319,18 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
                 denied = _precheck_bridge(guard, final_args, effective_task_id)
                 return denied if denied is not None else execute(final_args)
             try:
-                canonical = guard.authorize_tool(
+                canonical, checked = guard.authorize_tool_call(
                     function_name, final_args, caller_task_id=effective_task_id,
                     consume_approval=True,
                 )
-                digest = _call_digest(canonical, final_args)
+                digest = _call_digest(canonical, checked)
             except PolicyDenied as exc:
                 return _denied_result(exc.reason, exc.detail)
             except (SecurityError, TypeError, ValueError):
                 return _denied_result("security_contract_invalid")
             token = _AUTHORIZED_CALL.set((canonical, digest))
             try:
-                return execute(final_args)
+                return execute(checked)
             finally:
                 _AUTHORIZED_CALL.reset(token)
 
@@ -305,7 +368,7 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
             canonical_name = guard.canonical_tool(function_name)
             digest = _call_digest(canonical_name, function_args)
             already = _AUTHORIZED_CALL.get()
-            canonical = guard.authorize_tool(
+            canonical, checked = guard.authorize_tool_call(
                 function_name,
                 function_args,
                 caller_task_id=task_id,
@@ -317,12 +380,12 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
             return _denied_result("security_contract_invalid")
 
         try:
-            call_digest = _call_digest(canonical, function_args)
+            call_digest = _call_digest(canonical, checked)
         except (SecurityError, TypeError, ValueError):
             return _denied_result("security_contract_invalid")
         token = _AUTHORIZED_CALL.set((canonical, call_digest))
         try:
-            return original_handle(function_name, function_args, task_id, *args, **kwargs)
+            return original_handle(function_name, checked, task_id, *args, **kwargs)
         finally:
             _AUTHORIZED_CALL.reset(token)
 
@@ -346,7 +409,7 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
             canonical = guard.canonical_tool(name)
             digest = _call_digest(canonical, args)
             already = _AUTHORIZED_CALL.get()
-            guard.authorize_tool(
+            _, checked = guard.authorize_tool_call(
                 canonical,
                 args,
                 caller_task_id=kwargs.get("task_id"),
@@ -356,7 +419,7 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
             return _denied_result(exc.reason, exc.detail)
         except (SecurityError, TypeError, ValueError):
             return _denied_result("security_contract_invalid")
-        return original_registry_dispatch(self, name, args, *call_args, **kwargs)
+        return original_registry_dispatch(self, name, checked, *call_args, **kwargs)
 
     installation._remember(ToolRegistry, "dispatch", guarded_registry_dispatch)
 
@@ -375,16 +438,17 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
             canonical = guard.canonical_tool(name)
             digest = _call_digest(canonical, arguments)
             already = _AUTHORIZED_CALL.get()
-            guard.authorize_tool(
+            _, checked = guard.authorize_tool_call(
                 canonical,
                 arguments,
+                caller_task_id=guard.grant.identity.task_id,
                 consume_approval=(already != (canonical, digest)),
             )
         except PolicyDenied as exc:
             return _denied_result(exc.reason, exc.detail)
         except (SecurityError, TypeError, ValueError):
             return _denied_result("security_contract_invalid")
-        return original_connector_call(name, arguments, tool_call_id)
+        return original_connector_call(name, checked, tool_call_id)
 
     installation._remember(
         connector_dispatch_module, "dispatch_connector_call", guarded_connector_call
