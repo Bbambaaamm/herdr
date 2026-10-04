@@ -181,6 +181,9 @@ class _PolicyFileOps:
         if error:
             return self._common.PatchResult(error=error)
 
+        if any(getattr(getattr(op,"operation",None),"value",None)=="update" for op in operations):
+            return self._common.PatchResult(error="conditional replacement unavailable on shared workspace")
+
         # V4A Add is create-only. The parser's generic apply path calls
         # write_file for both Add and Update, so interpose only the first write
         # for each Add target with an atomic no-clobber create.
