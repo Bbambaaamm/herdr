@@ -1479,3 +1479,123 @@ def test_schema_helper_ignores_worker_import_paths_and_user_startup(tmp_path, mo
     with pytest.raises(GatewayError):
         validate_schema({"type": "integer"}, "invalid")
     assert not canary.exists()
+
+
+@pytest.mark.parametrize("encoding", ["ascii", "unicode"])
+@pytest.mark.parametrize("tool", ["read", "write"])
+def test_oversized_custom_routing_headers_fail_before_cost_or_delivery(tmp_path, monkeypatch, encoding, tool):
+    definition = READ if tool == "read" else WRITE
+    parameter = "path" if tool == "read" else "value"
+    monkeypatch.setitem(definition, "inputSchema", {"type": "object",
+        "properties": {parameter: {"type": "string", "x-mcp-header": "Route"}},
+        "required": [parameter]})
+    gateway, context, transport, *_ = fixture(tmp_path, tools=("code_" + tool,))
+    gateway.argument_authority = lambda *args: True
+    value = "a" * 8193 if encoding == "ascii" else "界" * 3000
+    with pytest.raises(GatewayError, match="routing header"):
+        gateway.call(context, "local", tool, {parameter: value}, "op")
+    assert not semantic_calls(transport)
+    assert gateway.ledger.get(operation_key(context)) is None
+
+
+def test_resource_uri_remains_only_in_request_not_protected_ledger(tmp_path):
+    gateway, context, transport, *_ = fixture(tmp_path, tools=("docs_read",))
+    assert gateway.read_resource(context, "local", "herdr://docs/one", "op").state == "observed_complete"
+    assert gateway.ledger.get(operation_key(context))["subject"] == "docs_read"
+    assert "herdr://docs/one" not in "\n".join(gateway.ledger.db.iterdump())
+    assert semantic_calls(transport)[0][0]["params"]["uri"] == "herdr://docs/one"
+
+
+@pytest.mark.parametrize("race", ["fence", "registry", "provider_policy"])
+@pytest.mark.parametrize("tool", ["read", "write"])
+def test_local_post_reservation_races_do_not_open_provider_circuit(tmp_path, race, tool):
+    gateway, context, transport, clock, client, authority = fixture(tmp_path, tools=("code_" + tool,))
+    original = gateway.ledger.sending
+    snapshot = gateway.registry.snapshot
+    server = client.server
+    def sending(*args, **kwargs):
+        original(*args, **kwargs)
+        if race == "fence":
+            authority["active"] = False
+        elif race == "registry":
+            gateway.registry.reload(replace(snapshot, providers=tuple(
+                replace(x, version=x.version + "-changed") for x in snapshot.providers)))
+        else:
+            client.server = replace(server, version=server.version + "-changed")
+    gateway.ledger.sending = sending
+    for i in range(3):
+        authority["active"] = True
+        gateway.registry.reload(snapshot)
+        client.server = server
+        with pytest.raises(PolicyDenied):
+            gateway.call(context, "local", tool,
+                         {"path": "source.py"} if tool == "read" else {"value": "output"}, "op-" + str(i))
+    assert not semantic_calls(transport)
+    assert gateway.ledger.db.execute("SELECT * FROM health").fetchall() == []
+    assert gateway.ledger.db.execute("SELECT COUNT(*) FROM calls WHERE state='response_rejected'").fetchone()[0] == 3
+
+
+@pytest.mark.parametrize("method", ["tools/call", "resources/read"])
+def test_upstream_protocol_rejection_becomes_valid_bounded_downstream_error(tmp_path, method):
+    gateway, context, transport, clock, client, _ = fixture(tmp_path, tools=("code_read", "docs_read"))
+    original = transport.request
+    def request(message, **kwargs):
+        if message["method"] == method:
+            transport.calls.append((message, kwargs))
+            return ({"jsonrpc": "2.0", "id": message["id"],
+                     "error": {"code": -32602, "message": "private upstream detail"}},)
+        return original(message, **kwargs)
+    transport.request = request
+    adapter = ServerAdapter(gateway, lambda _: context, origins=())
+    if method == "tools/call":
+        message = tool_request(context)
+    else:
+        message = request_message(context, method, {"uri": "herdr://docs/one"}, "request")
+        message["params"]["_meta"]["org.herdr/operation"] = "op"
+        message["params"]["_meta"]["org.herdr/provider"] = "local"
+    status, raw = adapter.handle(encoded(message), authorization="trusted")
+    assert status == 502
+    response = decode(raw)
+    assert "result" not in response and response["error"]["message"] == "upstream_protocol_error"
+    assert response["error"]["data"] == {"retryable": False, "reconcileRequired": False}
+    assert b"private upstream detail" not in raw and b"protocol_error" not in raw.replace(b"upstream_protocol_error", b"")
+    assert gateway.ledger.get(operation_key(context))["state"] == "observed_error"
+    assert gateway.ledger.db.execute("SELECT * FROM health").fetchall() == []
+    status, raw = adapter.handle(encoded(message), authorization="trusted")
+    assert status in {200, 502} and decode(raw).get("result", {}).get("resultType") != "protocol_error"
+    assert len(semantic_calls(transport)) == 1
+
+
+@pytest.mark.parametrize("data_keyword", ["const", "default", "examples", "enum"])
+def test_reference_shaped_annotation_data_is_not_schema_authority(data_keyword):
+    data = {"$ref": "https://ordinary.example/data", "$dynamicRef": "literal", "pattern": "a" * 5000}
+    value = [data] if data_keyword in {"examples", "enum"} else data
+    schema = {"type": "object", data_keyword: value}
+    validate_schema(schema, data if data_keyword in {"const", "enum"} else {}, check_only=False)
+
+
+def test_reference_named_properties_and_local_definitions_validate_as_data():
+    schema = {"type": "object", "properties": {
+        "$ref": {"type": "string"}, "$dynamicRef": {"type": "integer"}},
+        "required": ["$ref", "$dynamicRef"], "additionalProperties": False}
+    validate_schema(schema, {"$ref": "document reference", "$dynamicRef": 1})
+    with pytest.raises(GatewayError):
+        validate_schema(schema, {"$ref": "document reference", "$dynamicRef": "invalid"})
+
+
+@pytest.mark.parametrize("location", ["properties", "$defs", "dependentSchemas", "items", "if", "allOf", "prefixItems"])
+def test_actual_external_schema_refs_still_denied_in_every_supported_subschema(location):
+    external = {"$ref": "https://unapproved.example/schema"}
+    nested = {"type": "object", location: {"x": external}} if location in {"properties", "$defs", "dependentSchemas"} else (
+             {location: [external]} if location in {"allOf", "prefixItems"} else {location: external})
+    with pytest.raises(GatewayError):
+        validate_schema(nested, check_only=True)
+
+
+@pytest.mark.parametrize("annotation", ["const", "default", "examples"])
+def test_header_shaped_annotation_data_does_not_become_routing_authority(annotation):
+    data = {"x-mcp-header": "ordinary literal", "properties": {"path": {"x-mcp-header": "not authority"}}}
+    schema = {"type": "object", annotation: [data] if annotation == "examples" else data,
+              "properties": {"path": {"type": "string", "x-mcp-header": "Route"}}}
+    assert schema_headers(schema) == ((("path",), "Route"),)
+    validate_schema(schema, check_only=True)

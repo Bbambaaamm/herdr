@@ -25,23 +25,45 @@ def main():
         if not isinstance(schema, dict) or schema.get("$schema", "https://json-schema.org/draft/2020-12/schema") != "https://json-schema.org/draft/2020-12/schema":
             return 1
         nodes = 0
-        def walk(value, depth=0):
+        def bounded(value, depth=0):
             nonlocal nodes
             nodes += 1
             if nodes > 1024 or depth > 16:
                 raise ValueError("schema bounds")
             if isinstance(value, dict):
-                for key, item in value.items():
-                    if key in {"$ref", "$dynamicRef"} and (not isinstance(item, str) or not item.startswith("#")):
-                        raise ValueError("external reference denied")
-                    if key in {"pattern", "patternProperties"}:
-                        if len(json.dumps(item)) > 4096:
-                            raise ValueError("regex bounds")
-                    walk(item, depth + 1)
+                for item in value.values():
+                    bounded(item, depth + 1)
             elif isinstance(value, list):
                 for item in value:
-                    walk(item, depth + 1)
-        walk(schema)
+                    bounded(item, depth + 1)
+        bounded(schema)
+
+        # Only recognized subschema locations carry schema keywords.
+        # Property names and const/default/example payloads are ordinary data.
+        single = {"additionalProperties", "unevaluatedProperties", "propertyNames",
+                  "contentSchema", "items", "contains", "unevaluatedItems", "not",
+                  "if", "then", "else"}
+        mappings = {"$defs", "definitions", "properties", "patternProperties", "dependentSchemas"}
+        arrays = {"allOf", "anyOf", "oneOf", "prefixItems"}
+        def inspect(value):
+            if not isinstance(value, dict):
+                return
+            for key in ("$ref", "$dynamicRef"):
+                if key in value and (not isinstance(value[key], str) or not value[key].startswith("#")):
+                    raise ValueError("external reference denied")
+            for key in ("pattern", "patternProperties"):
+                if key in value and len(json.dumps(value[key])) > 4096:
+                    raise ValueError("regex bounds")
+            for key, item in value.items():
+                if key in single:
+                    inspect(item)
+                elif key in mappings and isinstance(item, dict):
+                    for child in item.values():
+                        inspect(child)
+                elif key in arrays and isinstance(item, list):
+                    for child in item:
+                        inspect(child)
+        inspect(schema)
         Draft202012Validator.check_schema(schema)
         def denied(uri):
             raise ValueError("external reference denied")

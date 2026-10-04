@@ -180,3 +180,5 @@ Protocol references:
 - [Opt-in Tasks extension](https://tasks.extensions.modelcontextprotocol.io/specification/draft/tasks)
 
 The disposable schema helper runs from its trusted absolute sibling path with isolated Python imports and a minimal environment; worker current directories, PYTHONPATH and user startup modules cannot replace the validator. This does not assert that a Hermes runtime is credential-isolated.
+
+Wire routing values are bounded after encoding, before delivery/cost reservation. Resource operations persist the logical capability, not raw URIs. Local post-reservation fence/registry/policy denials do not charge provider circuit health. Upstream JSON-RPC rejections become bounded downstream error responses rather than an internal resultType. Schema reference checks inspect actual subschema locations; property names and const/default/example data cannot be mistaken for schema authority. Offline reference retrieval remains denied.

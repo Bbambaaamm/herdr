@@ -65,6 +65,10 @@ class ReconciliationRequired(DeliveryUncertain):
     code = "remote_task_reconciliation_required"
 
 
+class RemoteProtocolError(GatewayError):
+    code = "upstream_protocol_error"
+
+
 def encoded(value) -> bytes:
     try:
         data = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
@@ -115,9 +119,13 @@ def header_value(value) -> str:
             raise GatewayError("routing header integer exceeds safe range")
         value = int(value)
     value = str(value).lower() if type(value) is bool else str(value)
+    if len(value) > 8192:
+        raise GatewayError("routing header exceeds bounded length")
     if (value != value.strip() or any(ord(c) < 32 or ord(c) > 126 for c in value)
             or (value.startswith("=?base64?") and value.endswith("?="))):
-        return "=?base64?" + base64.b64encode(value.encode()).decode() + "?="
+        value = "=?base64?" + base64.b64encode(value.encode()).decode() + "?="
+    if len(value) > 8192:
+        raise GatewayError("encoded routing header exceeds bounded length")
     return value
 
 
@@ -140,11 +148,16 @@ def schema_headers(schema: dict) -> tuple:
                 if key == "properties" and isinstance(child, dict):
                     for name, item in child.items():
                         walk(item, path + (name,), reachable, depth + 1)
-                elif isinstance(child, (dict, list)):
+                elif key in {"$defs", "definitions", "patternProperties", "dependentSchemas"} and isinstance(child, dict):
+                    for item in child.values():
+                        walk(item, path, False, depth + 1)
+                elif key in {"additionalProperties", "unevaluatedProperties", "propertyNames",
+                             "contentSchema", "items", "contains", "unevaluatedItems",
+                             "not", "if", "then", "else"}:
                     walk(child, path, False, depth + 1)
-        elif isinstance(value, list):
-            for item in value:
-                walk(item, path, False, depth + 1)
+                elif key in {"allOf", "anyOf", "oneOf", "prefixItems"} and isinstance(child, list):
+                    for item in child:
+                        walk(item, path, False, depth + 1)
     walk(schema)
     return tuple(result)
 
@@ -1009,6 +1022,14 @@ class McpGateway:
         key = hashed({"consumer": context.identity.consumer, "task_id": context.identity.task_id,
                       "operation_key": operation_key})
         request_hash = hashed({"server": client.server.id, "method": method, "params": params})
+        # Reject oversized wire headers before reserving a delivery or cost.
+        routed_name = params.get("name", params.get("uri"))
+        if routed_name is not None:
+            header_value(routed_name)
+        if sum(len(k) + len(v) for k, v in (extra_headers or {}).items()) > 32_768:
+            raise GatewayError("aggregate routing headers exceed bound")
+        persisted_subject = (params["name"] if method == "tools/call"
+                             else dict(client.server.resources)[params["uri"]])
         with self.ledger.lock(key):
             validation_plan = None
             if definition is not None:
@@ -1019,7 +1040,7 @@ class McpGateway:
             previous = self.ledger.get(key)
             retryable = readonly and (previous is None or previous["deliveries"] < maximum)
             row = self.ledger.reserve(key, context, request_hash, client.server.id, self.clock(),
-                                      method, params.get("name", params.get("uri")), validation_plan,
+                                      method, persisted_subject, validation_plan,
                                       retryable=retryable)
             if row["state"] == "reconciliation_required":
                 raise ReconciliationRequired("recorded remote task requires reconciliation")
@@ -1043,8 +1064,10 @@ class McpGateway:
                 subject = logical if logical else resource
                 self._static_admit(context, client.server.id, subject, permissions)
                 self.ledger.sending(key, context, self.clock(), estimate)
+                communication_started = False
                 try:
                     self._static_admit(context, client.server.id, subject, permissions)
+                    communication_started = True
                     result, notifications = client.exchange(context, method, params, key, extra_headers=extra_headers)
                     for _notification in notifications:
                         self.ledger.audit(key, "untrusted_notification", self.clock())
@@ -1075,6 +1098,10 @@ class McpGateway:
                     return Outcome(state, hashed(result), result, remote)
                 except GatewayError as exc:
                     self.ledger.audit(key, exc.code, self.clock())
+                    if not communication_started:
+                        # A local fence/policy race says nothing about provider health.
+                        self.ledger.observed(key, "response_rejected", {"code": exc.code}, self.clock())
+                        raise
                     self.ledger.failure(client.server.id, self.clock())
                     permanent = not isinstance(exc, (GatewayUnavailable, DeliveryUncertain))
                     if not readonly:
@@ -1453,6 +1480,8 @@ class ServerAdapter:
                 else:
                     outcome = self.gateway.call(context, server, tool, params["arguments"], operation,
                                                 routing_headers=headers)
+                if outcome.result is not None and outcome.result.get("resultType") == "protocol_error":
+                    raise RemoteProtocolError("upstream tools/call protocol rejection")
                 if outcome.result is None and outcome.state == "remote_running":
                     handle = hashed({"consumer": context.identity.consumer, "task_id": context.identity.task_id,
                                      "operation_key": operation})
@@ -1490,6 +1519,8 @@ class ServerAdapter:
                 outcome = self.gateway.read_resource(context, server, params.get("uri"), identifier(meta.get("org.herdr/operation")))
                 if outcome.result is None:
                     raise DeliveryUncertain("resource replay has no raw payload; reconcile its recorded digest")
+                if outcome.result.get("resultType") == "protocol_error":
+                    raise RemoteProtocolError("upstream resources/read protocol rejection")
                 result = outcome.result
             else:
                 raise PolicyDenied("method is outside exposed Herdr authority")
@@ -1500,7 +1531,7 @@ class ServerAdapter:
             self.gateway.ledger.audit(context.identity.hash, exc.code, self.gateway.clock())
             status = (403 if isinstance(exc, PolicyDenied) else
                       503 if isinstance(exc, GatewayUnavailable) else
-                      502 if isinstance(exc, DeliveryUncertain) else 400)
+                      502 if isinstance(exc, (DeliveryUncertain, RemoteProtocolError)) else 400)
             return status, encoded(
                 {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": exc.code,
                  "data": {"retryable": isinstance(exc, GatewayUnavailable),
