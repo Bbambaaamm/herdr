@@ -402,3 +402,139 @@ def test_source_manifest_accepts_declared_assets_and_preserves_exact_bytes(tmp_p
     (root / "assets/unlisted").write_text("must not enter release")
     result = subprocess.run([sys.executable, str(script)], cwd=workspace, capture_output=True, text=True)
     assert result.returncode != 0
+
+
+def test_declared_capability_must_be_implemented_by_selected_executor(tmp_path, registry_factory):
+    item = package(tmp_path, manifest_changes={"capabilities": ("other",)})
+    registry = registry_factory(item)
+    original = context()
+    second = replace(original.registry.capabilities[0], id="other")
+    providers = tuple(replace(x, capability_refs=("reason", "other")) for x in original.registry.providers)
+    snapshot = RegistrySnapshot((*original.registry.capabilities, second), providers, original.registry.executors)
+    scope = replace(original.scope, capabilities=("reason", "other"))
+    ctx = replace(original, scope=scope, parent_scope=scope, consumer_scope=scope, registry=snapshot)
+    bundle = registry.resolve((SkillRequest("sample", "requires other"),), ctx, policy(item[1]),
+                              LAYERS, executor_id="a-runtime")
+    assert not bundle.render()["skills"]
+    assert bundle.telemetry()["rejected"] == [{"name": "sample", "code": "executor_incompatible"}]
+    with pytest.raises(SkillError, match="mandatory_skill_unavailable"):
+        registry.resolve((), ctx, policy(item[1], mandatory=(item[1],)), LAYERS, executor_id="a-runtime")
+
+
+@pytest.mark.parametrize("binary", [False, True])
+def test_aggregate_budget_rejects_before_loading_next_large_resource(tmp_path, registry_factory, binary):
+    item = package(tmp_path, resources={"assets/one.txt": b"x"*150_000, "assets/two.txt": b"y"*150_000})
+    if binary:
+        manifest = replace(item[2], files=tuple(replace(x, media_type="application/octet-stream")
+            if x.path.startswith("assets/") else x for x in item[2].files))
+        (item[0] / "manifest.json").write_bytes(canonical(manifest.to_json()))
+        item = (item[0], replace(item[1], package_hash=manifest.hash), manifest)
+    registry = registry_factory(item)
+    loaded = []
+    original = registry.packages[0].load
+    def load(path):
+        loaded.append(path)
+        if path == "assets/two.txt":
+            pytest.fail("over-budget resource must not be read or expanded")
+        return original(path)
+    registry.packages[0].load = load
+    with pytest.raises(SkillError, match="context_budget_exceeded"):
+        registry.resolve((SkillRequest("sample", "bounded", ("assets/one.txt", "assets/two.txt")),),
+                         context(), policy(item[1]), LAYERS, executor_id="a-runtime")
+    assert loaded == ["SKILL.md", "assets/one.txt"]
+
+
+def test_json_control_character_expansion_is_bounded_before_following_resource(tmp_path, registry_factory):
+    item = package(tmp_path, resources={"assets/one.txt": b"\x00"*50_000, "assets/two.txt": b"must remain unread"})
+    registry = registry_factory(item)
+    original = registry.packages[0].load
+    def load(path):
+        assert path != "assets/two.txt", "serialization expansion must stop further loading"
+        return original(path)
+    registry.packages[0].load = load
+    with pytest.raises(SkillError, match="context_budget_exceeded"):
+        registry.resolve((SkillRequest("sample", "bounded", ("assets/one.txt", "assets/two.txt")),),
+                         context(), policy(item[1]), LAYERS, executor_id="a-runtime")
+
+
+def test_incremental_budget_matches_exact_serialized_payload_boundary(tmp_path, registry_factory):
+    item = package(tmp_path, resources={"references/a.md": b"one", "references/b.md": b"two"})
+    registry = registry_factory(item)
+    requests = (SkillRequest("sample", "bounded", ("references/a.md", "references/b.md")),)
+    bundle = registry.resolve(requests, context(), policy(item[1]), LAYERS, executor_id="a-runtime")
+    size = len(bundle.payload)
+    assert registry.resolve(requests, context(), policy(item[1]), LAYERS,
+                            executor_id="a-runtime", max_bytes=size).payload == bundle.payload
+    with pytest.raises(SkillError, match="context_budget_exceeded"):
+        registry.resolve(requests, context(), policy(item[1]), LAYERS,
+                         executor_id="a-runtime", max_bytes=size-1)
+
+
+def test_resolution_trace_distinguishes_selected_resource_disclosure(tmp_path, registry_factory):
+    item = package(tmp_path, resources={"references/a.md": b"private-a", "references/b.md": b"private-b"})
+    registry = registry_factory(item)
+    bundles = [registry.resolve((SkillRequest("sample", "same reason", (path,)),), context(),
+                policy(item[1]), LAYERS, executor_id="a-runtime")
+               for path in ("references/a.md", "references/b.md")]
+    assert bundles[0].trace != bundles[1].trace
+    for bundle, path in zip(bundles, ("references/a.md", "references/b.md")):
+        entry = next(x for x in item[2].files if x.path == path)
+        assert bundle.telemetry()["selected"][0]["resources"] == [{
+            "path": path, "sha256": entry.sha256, "size": entry.size,
+            "media_type": entry.media_type, "data_class": entry.data_class}]
+        assert b"private-a" not in bundle.trace and b"private-b" not in bundle.trace
+
+
+def test_exhaustive_lint_includes_fourth_package_and_rejects_invalid_body(tmp_path):
+    import subprocess
+    import sys
+    script = Path(__file__).resolve().parents[2] / "scripts/lint-skills.py"
+    packages = tmp_path / "skills"
+    packages.mkdir()
+    for name in ("first", "second", "third", "fourth"):
+        package(packages, name=name)
+    result = subprocess.run([sys.executable, str(script), "--all", str(packages)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0 and len(result.stdout.splitlines()) == 4
+    root = packages / "fourth"
+    manifest = SkillManifest.from_dict(json.loads((root / "manifest.json").read_text()))
+    raw = b"invalid frontmatter but declared exact bytes"
+    (root / "SKILL.md").write_bytes(raw)
+    manifest = replace(manifest, files=tuple(replace(x, size=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+                                             if x.path == "SKILL.md" else x for x in manifest.files))
+    (root / "manifest.json").write_bytes(canonical(manifest.to_json()))
+    result = subprocess.run([sys.executable, str(script), "--all", str(packages)],
+                            capture_output=True, text=True)
+    assert result.returncode == 78 and "skill_validation_failed" in result.stderr
+
+
+@pytest.mark.parametrize("kind", ["broken_link", "directory_link", "fifo", "package_link", "root_link"])
+def test_source_manifest_rejects_nonregular_skill_tree_entries(tmp_path, kind):
+    import subprocess
+    import sys
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    skill_root = workspace / "skills"
+    skill_root.mkdir()
+    item = package(skill_root)
+    for path in ("configs/consumers/herdr.yaml", "docs/CONSUMERS.md", "docs/architecture/AGENT_SKILLS.md",
+                 "package.json", "package-lock.json"):
+        target = workspace / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("{}\n")
+    if kind == "broken_link":
+        (item[0] / "assets").mkdir()
+        (item[0] / "assets/link").symlink_to("missing")
+    elif kind == "directory_link":
+        (item[0] / "link").symlink_to(tmp_path, target_is_directory=True)
+    elif kind == "fifo":
+        os.mkfifo(item[0] / "fifo")
+    elif kind == "package_link":
+        (skill_root / "linked").symlink_to(item[0], target_is_directory=True)
+    else:
+        skill_root.rename(workspace / "real-skills")
+        skill_root.symlink_to(workspace / "real-skills", target_is_directory=True)
+    script = Path(__file__).resolve().parents[2] / "scripts/refresh_source_manifest.py"
+    result = subprocess.run([sys.executable, str(script)], cwd=workspace,
+                            capture_output=True, text=True, timeout=3)
+    assert result.returncode != 0 and ("Nonregular skill" in result.stderr or "Non-directory skill" in result.stderr)

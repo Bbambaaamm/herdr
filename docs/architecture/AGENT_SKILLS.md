@@ -109,3 +109,17 @@ not be emulated by unsafe path-following reads.
 Reference: [Agent Skills specification](https://agentskills.io/specification).
 
 Authoring lint decodes every declared textual resource, including application/json, before approval. The source manifest hashes exact skill bytes and declared media independently of filename extension, including PNG/JPEG/octet-stream assets and text line endings. Undeclared or changed skill source files cannot be included by the source-manifest generator. Legacy tools feature spelling normalizes to tool_use before compatibility and hashing, matching the shared registry.
+
+## Exhaustive lint and bounded resolution
+
+CI discovers every direct package directory under skills and lints each package.
+Source-manifest traversal rejects symlinks, FIFOs and other nonregular entries,
+including broken links, before accepting a release payload. Declared capability
+requirements must match the selected executor's capability, in addition to
+remaining inside the grant.
+
+Resolution accounts for exact serialized JSON bytes incrementally. It rejects
+an over-budget resource from its declared size before reading or base64 expansion,
+and checks text escaping before loading the next resource. Mandatory content
+cannot bypass the same budget. Selected telemetry includes resource paths,
+digests, sizes, media types and data classes; resource bytes remain excluded.

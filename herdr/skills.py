@@ -494,7 +494,8 @@ def compatibility(manifest, context, executor_id):
         return "executor_scope"
     cap = next(x for x in context.registry.capabilities if x.id == executor.capability_id)
     provider = next(x for x in context.registry.providers if x.id == executor.provider_id)
-    if (cap.id not in scope.capabilities or not set(manifest.features) <= set(cap.features)
+    if (cap.id not in scope.capabilities or not set(manifest.capabilities) <= {cap.id}
+            or not set(manifest.features) <= set(cap.features)
             or not set(manifest.tools) <= set(executor.tools)):
         return "executor_incompatible"
     if Modality.TEXT not in set(scope.input_modalities) & set(cap.input_modalities):
@@ -585,6 +586,11 @@ class SkillRegistry:
                 requested[package.manifest.name] = SkillRequest(package.manifest.name, "mandatory_project_security")
         by_name = {x.manifest.name: x for x in self.packages}
         selected, rejected, content = [], [], []
+        envelope = {"schema_version": VERSION, "binding": context.binding(),
+                    "consumer_skill_policy_hash": policy.hash,
+                    "policy_layers": layers.to_json(), "skills": content}
+        used_bytes = len(canonical(envelope))
+        need(used_bytes <= max_bytes, "context_budget_exceeded")
         # Trace all omissions without opening any unused body/resource.
         for package in self.packages:
             if package.manifest.name not in requested:
@@ -602,31 +608,41 @@ class SkillRegistry:
                 rejected.append({"name": skill_name, "code": reason})
                 continue
             manifest = package.manifest
-            resources = []
+            body = parse_skill_body(package.load("SKILL.md"), manifest)
+            provenance = {"name": manifest.name, "version": manifest.version, "package_hash": manifest.hash,
+                          "publisher": manifest.publisher, "source_uri": manifest.source_uri,
+                          "approved_revision": package.approval.approved_revision,
+                          "trust_tier": package.approval.trust_tier}
+            item = {**provenance, "authority": "context_data", "instructions": body, "resources": []}
+            used_bytes += len(canonical(item)) + int(bool(content))
+            need(used_bytes <= max_bytes, "context_budget_exceeded")
+            resource_trace = []
             for path in request.resources:
                 entry = next(x for x in manifest.files if x.path == path)
+                textual = entry.media_type.startswith("text/") or entry.media_type == "application/json"
+                lower_bound = entry.size if textual else 4 * ((entry.size + 2) // 3)
+                # Reject oversized declared bytes before reading or expanding them.
+                need(lower_bound <= max_bytes - used_bytes, "context_budget_exceeded")
                 raw = package.load(path)
-                if entry.media_type.startswith("text/") or entry.media_type == "application/json":
+                if textual:
                     try:
                         value = {"encoding": "utf-8", "data": raw.decode("utf-8")}
                     except UnicodeError as exc:
                         raise SkillError("resource_encoding") from exc
                 else:
                     value = {"encoding": "base64", "data": base64.b64encode(raw).decode("ascii")}
-                resources.append({"path": path, "sha256": entry.sha256,
-                                  "media_type": entry.media_type, **value})
-            body = parse_skill_body(package.load("SKILL.md"), manifest)
-            provenance = {"name": manifest.name, "version": manifest.version, "package_hash": manifest.hash,
-                          "publisher": manifest.publisher, "source_uri": manifest.source_uri,
-                          "approved_revision": package.approval.approved_revision,
-                          "trust_tier": package.approval.trust_tier}
-            content.append({**provenance, "authority": "context_data", "instructions": body,
-                            "resources": resources})
-            selected.append({**provenance, "reason": request.reason, "mandatory": skill_name in mandatory})
-        payload = canonical({"schema_version": VERSION, "binding": context.binding(),
-                             "consumer_skill_policy_hash": policy.hash,
-                             "policy_layers": layers.to_json(), "skills": content})
-        need(len(payload) <= max_bytes, "context_budget_exceeded")
+                resource = {"path": path, "sha256": entry.sha256,
+                            "media_type": entry.media_type, **value}
+                used_bytes += len(canonical(resource)) + int(bool(item["resources"]))
+                need(used_bytes <= max_bytes, "context_budget_exceeded")
+                item["resources"].append(resource)
+                resource_trace.append({"path": path, "sha256": entry.sha256, "size": entry.size,
+                                       "media_type": entry.media_type, "data_class": entry.data_class})
+            content.append(item)
+            selected.append({**provenance, "reason": request.reason, "mandatory": skill_name in mandatory,
+                             "resources": resource_trace})
+        payload = canonical(envelope)
+        need(len(payload) == used_bytes and len(payload) <= max_bytes, "context_budget_exceeded")
         trace = canonical({"schema_version": VERSION, "binding": context.binding(),
                            "consumer_skill_policy_hash": policy.hash,
                            "selected": selected, "rejected": rejected})

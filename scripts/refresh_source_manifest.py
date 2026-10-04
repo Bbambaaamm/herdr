@@ -2,6 +2,7 @@
 from pathlib import Path
 import hashlib
 import json
+import stat
 
 ROOTS = (
     Path("herdr"),
@@ -50,8 +51,16 @@ def canonical_bytes(path: Path) -> bytes:
 
 entries: list[tuple[str, str]] = []
 for root in ROOTS:
+    if root == Path("skills") and (root.exists() or root.is_symlink()) and not stat.S_ISDIR(root.lstat().st_mode):
+        raise ValueError(f"Non-directory skill source root: {root}")
     for path in sorted(root.rglob("*")):
-        if not path.is_file():
+        if root == Path("skills"):
+            mode = path.lstat().st_mode
+            if stat.S_ISDIR(mode):
+                continue
+            if not stat.S_ISREG(mode):
+                raise ValueError(f"Nonregular skill source entry: {path}")
+        elif not path.is_file():
             continue
         if "__pycache__" in path.parts or "node_modules" in path.parts:
             continue
