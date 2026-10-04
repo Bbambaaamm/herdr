@@ -10,7 +10,7 @@ import fcntl
 import secrets
 import threading
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Callable
@@ -78,8 +78,12 @@ class Experience:
     summary: str
     state: SourceState = SourceState.UNVERIFIED
     unusable_reason: str | None = None
+    # View metadata only. Persisted JSON and content hash omit this field.
+    publication_digest: str | None = None
 
     def __post_init__(self):
+        if self.publication_digest is not None:
+            hash_value(self.publication_digest)
         for key in ("id", "project", "task_class", "series", "variant"):
             token(getattr(self, key))
         require(type(self.attempt) is int and 0 < self.attempt <= 2**31, "experience_attempt")
@@ -95,6 +99,8 @@ class Experience:
         require(isinstance(self.evidence, (list, tuple)) and 0 < len(self.evidence) <= 16
                 and all(isinstance(x, SourceRef) and x.project == self.project for x in self.evidence),
                 "experience_evidence")
+        require(all(x.holdout_series is None or x.holdout_series == self.series for x in self.evidence),
+                "experience_holdout_series")
         object.__setattr__(self, "evidence", tuple(self.evidence))
         if self.unusable_reason is not None:
             token(self.unusable_reason)
@@ -108,11 +114,13 @@ class Experience:
         require(len(canonical(self.to_json())) <= MAX_RECORD, "experience_size")
 
     def to_json(self):
-        return asdict(self)
+        raw = asdict(self)
+        raw.pop("publication_digest")
+        return raw
 
     @classmethod
     def from_dict(cls, raw):
-        require(isinstance(raw, dict) and set(raw) == {x.name for x in fields(cls)}, "experience_schema")
+        require(isinstance(raw, dict) and set(raw) == {x.name for x in fields(cls) if x.name != "publication_digest"}, "experience_schema")
         raw = dict(raw)
         raw["conditions"] = Conditions(**raw["conditions"])
         raw["evidence"] = tuple(SourceRef(**x) for x in raw["evidence"])
@@ -298,17 +306,28 @@ class ExperienceStore:
 
     def load(self):
         with self._locked():
-            return ExperienceMemory(tuple(x.derived(self.redactor) for x in self._load().records))
+            return ExperienceMemory(tuple(replace(x.derived(self.redactor), publication_digest=x.hash)
+                                          for x in self._load().records))
 
     def append(self, record: Experience):
         require(isinstance(record, Experience), "typed_experience")
+        claimed_publication = record.publication_digest
         record = record.derived(self.redactor)
         with self._locked():
             current = self._load()
             previous = next((x for x in current.records if x.id == record.id), None)
             if previous is not None:
-                require(previous.hash == record.hash, "experience_immutable_conflict")
-                return record.hash
+                if previous.hash == record.hash:
+                    require(claimed_publication is None or claimed_publication == previous.hash,
+                            "experience_immutable_conflict")
+                    return previous.hash
+                # Check the entire current redacted view against stored bytes;
+                # the claimed digest by itself never authorizes idempotence.
+                require(claimed_publication == previous.hash
+                        and previous.derived(self.redactor).to_json() == record.to_json(),
+                        "experience_immutable_conflict")
+                return previous.hash
+            require(claimed_publication is None, "unknown_memory_publication")
             require(len(current.records) < MAX_RECORDS, "memory_limit")
             raw = canonical(record.to_json())
             name = hashlib.sha256(raw).hexdigest() + ".json"

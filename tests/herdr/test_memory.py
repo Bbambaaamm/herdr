@@ -279,3 +279,47 @@ def test_rotated_secret_in_immutable_metadata_is_rejected_on_load(tmp_path, fiel
         assert published.read_bytes() == raw
     finally:
         after.close()
+
+
+def test_private_evidence_must_match_declared_experience_series():
+    with pytest.raises(ContextError, match="experience_holdout_series"):
+        record(series="series-2", evidence=(evidence(holdout="series-1"),))
+
+
+def test_rotated_redacted_view_retains_and_replays_original_publication(tmp_path):
+    secret = "newly-classified-private-value"
+    root = tmp_path / "memory"
+    initial = ExperienceStore(root, writable_roots=(), redactor=SecretRedactor())
+    accepted = initial.append(record(summary=secret))
+    initial.close()
+    raw = (root / (accepted + ".json")).read_bytes()
+    current = ExperienceStore(root, writable_roots=(), redactor=SecretRedactor((secret,)))
+    try:
+        loaded = current.load().records[0]
+        assert loaded.summary == "[REDACTED]" and loaded.hash != accepted
+        assert loaded.publication_digest == accepted
+        assert current.append(loaded) == accepted
+        assert (root / (accepted + ".json")).read_bytes() == raw
+        assert len(list(root.glob("*.json"))) == 1
+        with pytest.raises(ContextError, match="experience_immutable_conflict"):
+            current.append(replace(loaded, limitations="altered evidence projection"))
+        with pytest.raises(ContextError, match="experience_immutable_conflict"):
+            current.append(replace(loaded, publication_digest="f"*64))
+        with pytest.raises(ContextError, match="unknown_memory_publication"):
+            current.append(replace(loaded, id="new-unpublished"))
+    finally:
+        current.close()
+
+
+def test_publication_view_metadata_is_not_part_of_persisted_record_schema(tmp_path):
+    store = ExperienceStore(tmp_path / "memory", writable_roots=(), redactor=SecretRedactor())
+    try:
+        accepted = store.append(record())
+        loaded = store.load().records[0]
+        assert loaded.publication_digest == loaded.hash == accepted
+        assert "publication_digest" not in loaded.to_json()
+        assert store.append(loaded) == accepted
+        with pytest.raises(ContextError, match="experience_schema"):
+            Experience.from_dict({**loaded.to_json(), "publication_digest": accepted})
+    finally:
+        store.close()

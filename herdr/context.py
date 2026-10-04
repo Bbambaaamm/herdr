@@ -415,6 +415,9 @@ class ContextCompiler:
         require(isinstance(context, SkillNodeContext) and isinstance(project_map, ProjectMap)
                 and isinstance(controls, ControlState) and isinstance(layers, PolicyLayers)
                 and isinstance(selection, SelectionSnapshot), "typed_context_inputs")
+        binding = context.binding()
+        require(canonical(self.redactor.tree(binding)) == canonical(binding), "secret_context_binding")
+        require(self.redactor.redact(project_map.project) == project_map.project, "secret_context_binding")
         project_map.require_current(current_base_sha, current_file_versions)
         require(type(token_budget) is int and 0 < token_budget <= 1_000_000
                 and type(byte_budget) is int and 0 < byte_budget <= MAX_BYTES, "context_budget")

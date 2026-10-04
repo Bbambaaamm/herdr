@@ -119,3 +119,10 @@ Memory paths reject traversal components before worker-root isolation checks.
 Loading immutable memory revalidates metadata and derives redacted text under
 the current credential configuration without rewriting stored records.
 Bounded recall prioritizes verified comparable trials before unusable notes.
+
+Private holdout evidence must match the experience's exact series as well as
+the evaluator's series. A redacted recall record carries publication_digest
+for the immutable stored bytes separately from its current view content hash.
+Re-appending that exact current redacted view acknowledges the original
+publication; altered views or unknown publication claims fail closed.
+Node binding identities are checked against known secrets before plan creation.

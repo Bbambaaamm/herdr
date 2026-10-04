@@ -407,3 +407,26 @@ def test_capture_rejects_secret_in_returned_reference_metadata():
         capture_output(source(), b"output", b"", exit_code=0, elapsed_ms=1,
             redactor=SecretRedactor((secret,)),
             persist=lambda raw: replace(source(raw), uri="artifact://herdr/"+secret))
+
+
+@pytest.mark.parametrize("field", ["task_id", "run_token", "consumer"])
+def test_known_secret_binding_is_rejected_before_plan_publication(field):
+    secret = "known-private-binding-value"
+    compiler, plan, project, controls, selection = fixture(redactor=SecretRedactor((secret,)))
+    context = replace(plan.context, **{field: secret})
+    binding = {**context.binding(), "executor_id": "a-runtime"}
+    skills = SkillBundle(canonical({"binding": binding, "skills": []}),
+                         canonical({"binding": binding, "selected": [], "rejected": []}))
+    selection = SelectionSnapshot.build((), skills, context, expected_skill_hash=skills.hash,
+                                        executor_id="a-runtime", reason="minimal")
+    with pytest.raises(ContextError, match="secret_context_binding"):
+        compiler.plan(context, project, controls, LAYERS, selection,
+            current_base_sha=BASE, current_file_versions=project.file_versions, token_budget=4096)
+
+
+def test_known_secret_project_identity_cannot_be_rewritten_in_map():
+    secret = "known-private-project-value"
+    compiler, plan, project, controls, selection = fixture(redactor=SecretRedactor((secret,)))
+    with pytest.raises(ContextError, match="secret_context_binding"):
+        compiler.plan(plan.context, replace(project, project=secret), controls, LAYERS, selection,
+            current_base_sha=BASE, current_file_versions=project.file_versions, token_budget=4096)
