@@ -555,6 +555,17 @@ class SecurityGrant:
         return _utc(self.issued_at, "issued_at") <= now < _utc(self.expires_at, "expires_at")
 
     def require_subset_of(self, parent: "SecurityGrant") -> None:
+        self.require_logical_subset_of(parent)
+        observed,ceiling=self.runtime_assurance,parent.runtime_assurance
+        network_order={NetworkAccess.NONE:0,NetworkAccess.PROVIDER_ONLY:1,NetworkAccess.GLOBAL:2}
+        if (network_order[observed.network_access]>network_order[ceiling.network_access]
+                or not _roots_subset(observed.writable_roots,ceiling.writable_roots)
+                or ceiling.credentials_isolated and not observed.credentials_isolated
+                or ceiling.sandbox_verified and not observed.sandbox_verified):
+            raise SecurityError("child runtime assurance escalates above parent")
+
+    def require_logical_subset_of(self, parent: "SecurityGrant") -> None:
+        """Compare an unsealed host proposal; never replace observed launch checks."""
         if not isinstance(parent, SecurityGrant):
             raise SecurityError("typed parent grant required")
         if self.parent_grant_hash != parent.hash:
@@ -571,13 +582,6 @@ class SecurityGrant:
             raise SecurityError("child lifetime exceeds parent interval")
         if not self.process.is_subset_of(parent.process):
             raise SecurityError("child process policy escalates above parent")
-        observed,ceiling=self.runtime_assurance,parent.runtime_assurance
-        network_order={NetworkAccess.NONE:0,NetworkAccess.PROVIDER_ONLY:1,NetworkAccess.GLOBAL:2}
-        if (network_order[observed.network_access]>network_order[ceiling.network_access]
-                or not _roots_subset(observed.writable_roots,ceiling.writable_roots)
-                or ceiling.credentials_isolated and not observed.credentials_isolated
-                or ceiling.sandbox_verified and not observed.sandbox_verified):
-            raise SecurityError("child runtime assurance escalates above parent")
         if not _path_within(Path(self.workspace_root), Path(parent.workspace_root)):
             raise SecurityError("child workspace escalates above parent")
         parent_rules = {rule.tool: rule for rule in parent.tool_rules}

@@ -407,3 +407,11 @@ changed sources deny); the trusted OS init is the ancestry boundary. The FD
 launcher shell and bwrap clear startup controls, the host broker verifies their
 absence in the actual shell and peer, and stage one denies residual controls.
 These checks do not restart or change a live terminal server.
+
+
+The security change now includes the concrete host FrozenTree/bootstrap factory
+and held-FD sandbox construction. A continuation acknowledgement requires an
+explicit durable host sink, and the operator probe exercises the real pinned
+interpreter without a provider. PR #82 owns queue/session wiring, where both
+root and child paths invoke the host spawn-source preflight before pane creation.
+The default policy launch has no parameterized alternate entry point.
