@@ -1087,3 +1087,29 @@ def test_context_first_observed_after_send_binds_once_without_new_economic_send(
     transport.response=task(context="foreign-context")
     with pytest.raises(A2AError,match="binding mismatch"):gateway.poll(identity)
     assert len(transport.sends)==1 and len(gateway.recover(identity))==2
+
+
+@pytest.mark.parametrize("host", ["xn--fa-hia.de", "faß.de", "xn--3xa.example", "ς.example"])
+def test_idna2008_deviation_domains_remain_discoverable(tmp_path, host):
+    raw, *_ = setup(tmp_path)
+    raw["supportedInterfaces"][0]["url"] = f"https://{host}/a2a"
+    assert parse_card(raw).interfaces[0].url == f"https://{host}/a2a"
+
+@pytest.mark.parametrize("host", ["a_b.example", "ab--cd.example", "a\u200db.example",
+                                  "\u0301a.example", "xn--ls8h.example"])
+def test_strict_idna2008_invalid_domains_denied(tmp_path, host):
+    raw, *_ = setup(tmp_path)
+    raw["supportedInterfaces"][0]["url"] = f"https://{host}/a2a"
+    with pytest.raises(A2AError, match="HTTPS"):
+        parse_card(raw)
+
+def test_null_optional_message_task_id_is_direct_and_restart_never_resends(tmp_path):
+    _, card, policy, identity, store = setup(tmp_path)
+    transport = Mock({"message": {"messageId": "reply", "taskId": None,
+        "contextId": "context", "role": "ROLE_AGENT", "parts": [{"text": "answer"}]}})
+    first, = Gateway(transport, store, card, policy).send(identity, "work")
+    assert first.remote_task_id is None and store.read()["delivery"] == "direct"
+    restarted = Gateway(transport, store, card, policy)
+    assert restarted.poll(identity)[0].digest == first.digest
+    assert restarted.recover(identity)[0].digest == first.digest
+    assert len(transport.sends) == 1 and transport.gets == []

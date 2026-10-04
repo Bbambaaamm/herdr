@@ -12,6 +12,8 @@ import re
 import stat
 import unicodedata
 import uuid
+
+import idna
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Protocol
@@ -127,16 +129,11 @@ def _https_url(value: Any,limit: int):
             import ipaddress
             ipaddress.IPv6Address(host)
         else:
-            ascii_host=host.encode("idna").decode("ascii").rstrip(".")
-            if not ascii_host or len(ascii_host)>253 or any(not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?",part) for part in ascii_host.split(".")):
+            # Strict IDNA2008 validates both Unicode and already encoded labels.
+            # The stdlib IDNA2003 codec changes Eszett/final sigma semantics.
+            ascii_host = idna.encode(host, strict=True, uts46=False).decode("ascii").rstrip(".")
+            if not ascii_host or len(ascii_host) > 253:
                 raise ValueError("invalid hostname")
-            for name in ascii_host.split("."):
-                if name.lower().startswith("xn--"):
-                    decoded=name.lower().encode("ascii").decode("idna")
-                    if (decoded.encode("idna").decode("ascii")!=name.lower()
-                            or unicodedata.category(decoded[0]).startswith("M")
-                            or any(c!="-" and not unicodedata.category(c).startswith(("L","M","N")) for c in decoded)):
-                        raise ValueError("invalid IDNA A-label")
         if parsed.scheme!="https" or parsed.username or parsed.password or port is not None and not 1<=port<=65535:
             raise ValueError("invalid HTTPS URL authority or embedded credentials")
     except (ValueError,UnicodeError) as exc:
@@ -802,7 +799,7 @@ def _parse_response(
         if "contextId" not in msg:
             raise A2AError("agent message requires contextId")
         context = _remote_id(msg["contextId"], "contextId")
-        task_id = _remote_id(msg["taskId"], "taskId") if "taskId" in msg else None
+        task_id = _remote_id(msg["taskId"], "taskId") if msg.get("taskId") is not None else None
         observation = "message" if task_id is not None else "direct"
         return observation, task_id, context, (
             _candidate(identity, task_id, context, "message", msg),
