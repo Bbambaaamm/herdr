@@ -15,7 +15,7 @@ from herdr.capability import (CapabilityError, CapabilityRegistry, CapabilitySco
                              RuntimeStateSnapshot, Training)
 from herdr.mcp import (CallContext, CallLedger, ClientAdapter, DeliveryUncertain, GatewayError,
                        GatewayUnavailable, HTTPTransport, McpGateway, META, NodeToolset, PROTOCOL,
-                       PolicyDenied, ServerAdapter, ServerBinding, TASKS, TaskIdentity, ToolBinding,
+                       PolicyDenied, ServerAdapter as StrictHTTPAdapter, ServerBinding, TASKS, TaskIdentity, ToolBinding,
                        decode, encoded, hashed, header_value, request_message, schema_headers, validate_schema)
 
 READ = {"name": "read", "description": "Read declared code",
@@ -29,6 +29,44 @@ UNUSED = {"name": "database", "description": "unused schema must not enter code-
           "inputSchema": {"type": "object"}}
 ARGUMENT_POLICY = hashed({"version": "scoped_fixture_v1", "read_paths": ["source.py", "one.py", "two.py"]})
 NOW = 1791075600.0
+
+
+def wire_headers(raw):
+    """Test HTTP sender encodes required routing headers like HTTPTransport."""
+    try:
+        message = decode(raw)
+        if not isinstance(message, dict):
+            return {}
+        params = message.get("params", {})
+        if not isinstance(params, dict):
+            return {}
+        headers = {"MCP-Protocol-Version": PROTOCOL, "Mcp-Method": message.get("method")}
+        name = params.get("name", params.get("uri", params.get("taskId")))
+        if name is not None:
+            headers["Mcp-Name"] = header_value(name)
+        if message.get("method") == "tools/call" and isinstance(params.get("arguments"), dict):
+            definition = READ if name == "local.read" else WRITE if name == "local.write" else None
+            if definition:
+                for path, header in schema_headers(definition["inputSchema"]):
+                    value = params["arguments"]
+                    for part in path:
+                        if not isinstance(value, dict) or part not in value:
+                            break
+                        value = value[part]
+                    else:
+                        headers["Mcp-Param-" + header] = header_value(value)
+        return headers
+    except GatewayError:
+        return {}
+
+
+_HEADERS_UNSET = object()
+
+
+class ServerAdapter(StrictHTTPAdapter):
+    """Convenient HTTP test sender; explicit missing headers remain missing."""
+    def handle(self, raw, *, headers=_HEADERS_UNSET, **kwargs):
+        return super().handle(raw, headers=wire_headers(raw) if headers is _HEADERS_UNSET else headers, **kwargs)
 
 
 class Clock:
@@ -50,7 +88,7 @@ class FakeTransport:
         self.calls.append((request, kwargs))
         method = request["method"]
         if method == "tools/list":
-            result = {"resultType": "complete", "tools": self.definitions, "ttlMs": 300000}
+            result = {"resultType": "complete", "tools": self.definitions, "ttlMs": 300000, "cacheScope": "private"}
         elif self.fail:
             raise DeliveryUncertain("lost response with private-secret-must-not-be-logged")
         elif self.response is not None:
@@ -355,7 +393,7 @@ def provider_http(*, sse=False, lose_write=False, subscriptions=False, line_endi
                 self.send_error(400)
                 return
             if method == "tools/list":
-                result = {"resultType": "complete", "tools": [READ, WRITE], "ttlMs": 300000}
+                result = {"resultType": "complete", "tools": [READ, WRITE], "ttlMs": 300000, "cacheScope": "private"}
             else:
                 if params.get("name") == "write":
                     observations["writes"] += 1
@@ -546,7 +584,8 @@ def test_malformed_request_metadata_and_extensions_are_bounded_errors(tmp_path):
     gateway, context, transport, *_ = fixture(tmp_path)
     adapter = ServerAdapter(gateway, lambda _: context, origins=())
     for metadata in ([], {META + "protocolVersion": PROTOCOL, META + "clientCapabilities": {"extensions": []}},
-                     {META + "protocolVersion": PROTOCOL, META + "clientCapabilities": {}}):
+                     {META + "protocolVersion": PROTOCOL, META + "clientCapabilities": {},
+                      META + "clientInfo": None}):
         message = request_message(context, "tools/list", {}, "op")
         message["params"]["_meta"] = metadata
         assert adapter.handle(encoded(message), authorization="host")[0] == 400
@@ -760,7 +799,7 @@ def test_malformed_resource_uri_returns_bounded_protocol_error(tmp_path, uri):
 def test_server_distinguishes_policy_outage_and_uncertain_delivery(tmp_path, monkeypatch, error, status, retryable, reconcile):
     gateway, context, *_ = fixture(tmp_path)
     adapter = ServerAdapter(gateway, lambda _: context, origins=())
-    def fail(*a):
+    def fail(*a, **kwargs):
         raise error("private detail must not be returned")
     monkeypatch.setattr(gateway, "call", fail)
     message = request_message(context, "tools/call", {"name": "local.read", "arguments": {"path": "source.py"}}, "request")
@@ -984,7 +1023,7 @@ def test_legacy_eligible_rows_persist_validation_plan_before_transmission(tmp_pa
     if tool == "read":
         routing["Mcp-Param-Path"] = "source.py"
     status, raw = ServerAdapter(gateway, lambda _: context, origins=()).handle(
-        encoded(message), authorization="trusted", headers=routing if headers else None)
+        encoded(message), authorization="trusted", headers=routing if headers else wire_headers(encoded(message)))
     assert status == 200, decode(raw)
     assert ledger.get(key)["state"] == "remote_running"
     clock.value += 2
@@ -1005,7 +1044,7 @@ def test_tool_arguments_are_objects_even_with_permissive_approved_schema(tmp_pat
     message["params"]["arguments"] = args
     routing = {"MCP-Protocol-Version": PROTOCOL, "Mcp-Method": "tools/call", "Mcp-Name": "local.read"}
     status, raw = ServerAdapter(gateway, lambda _: context, origins=()).handle(
-        encoded(message), authorization="trusted", headers=routing if headers else None)
+        encoded(message), authorization="trusted", headers=routing if headers else wire_headers(encoded(message)))
     assert status == 400 and decode(raw)["error"]["message"] == "invalid_request"
     assert transport.calls == []
 
@@ -1599,3 +1638,193 @@ def test_header_shaped_annotation_data_does_not_become_routing_authority(annotat
               "properties": {"path": {"type": "string", "x-mcp-header": "Route"}}}
     assert schema_headers(schema) == ((("path",), "Route"),)
     validate_schema(schema, check_only=True)
+
+def test_removed_resource_policy_race_is_bounded_without_transmission(tmp_path, monkeypatch):
+    gateway, context, transport, _, client, _ = fixture(tmp_path, tools=("docs_read",))
+    original = gateway._execute
+    def execute(*args, **kwargs):
+        client.server = replace(client.server, resources=())
+        return original(*args, **kwargs)
+    monkeypatch.setattr(gateway, "_execute", execute)
+    message = request_message(context, "resources/read", {"uri": "herdr://docs/one"}, "req")
+    message["params"]["_meta"].update({"org.herdr/operation": "op", "org.herdr/provider": "local"})
+    status, raw = ServerAdapter(gateway, lambda _: context, origins=()).handle(encoded(message), authorization="host")
+    assert status == 403 and decode(raw)["error"]["message"] == "policy_denied"
+    assert not semantic_calls(transport)
+
+
+@pytest.mark.parametrize("race", ["fence", "registry", "provider_policy"])
+def test_local_subscription_revocation_does_not_poison_provider_health(tmp_path, race):
+    gateway, context, transport, clock, client, authority = fixture(tmp_path, subscriptions=True)
+    original_snapshot, original_server = gateway.registry.snapshot, client.server
+    def stream(message, **kwargs):
+        metadata = {META + "subscriptionId": message["id"]}
+        yield {"jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged",
+               "params": {"_meta": metadata, "notifications": {"toolsListChanged": True}}}
+        if race == "fence":
+            authority["active"] = False
+        elif race == "registry":
+            gateway.registry.reload(replace(original_snapshot, providers=tuple(
+                replace(x, version=x.version + "-changed") for x in original_snapshot.providers)))
+        else:
+            client.server = replace(original_server, version=original_server.version + "-changed")
+        yield {"jsonrpc": "2.0", "method": "notifications/tools/list_changed", "params": {"_meta": metadata}}
+    transport.stream = stream
+    for i in range(3):
+        authority["active"] = True
+        gateway.registry.reload(original_snapshot)
+        client.server = original_server
+        with pytest.raises(PolicyDenied):
+            gateway.listen(context, "local", {"toolsListChanged": True}, "op-" + str(i))
+    assert gateway.ledger.db.execute("SELECT * FROM health").fetchall() == []
+    assert gateway.ledger.db.execute("SELECT SUM(deliveries) FROM calls").fetchone()[0] == 3
+    assert gateway.ledger.db.execute("SELECT COUNT(*) FROM calls WHERE state='response_rejected'").fetchone()[0] == 3
+
+
+@pytest.mark.parametrize("secret", ["čeština", "x"*8193, "bad\r\nheader", "", "bad space"], ids=[
+    "non-ascii", "oversized", "crlf", "empty", "whitespace"])
+@pytest.mark.parametrize("operation", ["tool", "subscription"])
+def test_actual_http_invalid_credentials_fail_before_delivery_or_cost(tmp_path, secret, operation):
+    with provider_http(subscriptions=True) as (transport, observations):
+        gateway, context, *_ = fixture(tmp_path, subscriptions=True, transport=transport)
+        initial = len(observations["requests"])
+        transport.credential = lambda: secret
+        with pytest.raises(PolicyDenied):
+            if operation == "tool":
+                gateway.call(context, "local", "read", {"path": "source.py"}, "op")
+            else:
+                gateway.listen(context, "local", {"toolsListChanged": True}, "op")
+        row = gateway.ledger.get(operation_key(context))
+        assert row["deliveries"] == row["reserved_cost"] == 0
+        assert len(observations["requests"]) == initial
+        assert gateway.ledger.db.execute("SELECT * FROM health").fetchall() == []
+
+
+def test_prepared_http_credential_is_resolved_once_for_exact_delivery(tmp_path):
+    with provider_http() as (transport, observations):
+        gateway, context, *_ = fixture(tmp_path, transport=transport)
+        calls = []
+        def credential():
+            calls.append(True)
+            return "fixture-private-credential" if len(calls) == 1 else "invalid č"
+        transport.credential = credential
+        assert gateway.call(context, "local", "read", {"path": "source.py"}, "op").state == "observed_complete"
+        assert len(calls) == 1 and not observations["bad_headers"]
+
+
+def test_task_poll_credential_preflight_does_not_consume_poll_budget(tmp_path):
+    gateway, context, transport, clock, client, _ = fixture(tmp_path, tasks=True)
+    transport.task = True
+    gateway.call(context, "local", "read", {"path": "source.py"}, "op")
+    before = len(semantic_calls(transport))
+    clock.value += 2
+    def prepare(*args, **kwargs):
+        raise PolicyDenied("bad credential")
+    transport.prepare = prepare
+    with pytest.raises(PolicyDenied):
+        gateway.poll(context, "op")
+    assert gateway.ledger.get(operation_key(context))["polls"] == 0
+    assert len(semantic_calls(transport)) == before
+    assert gateway.ledger.db.execute("SELECT * FROM health").fetchall() == []
+
+
+@pytest.mark.parametrize("error", [PolicyDenied("secret"), GatewayUnavailable("secret"),
+                                   ValueError("secret"), UnicodeError("secret"), RuntimeError("secret")])
+def test_authentication_resolver_failures_are_bounded(tmp_path, error):
+    gateway, context, transport, *_ = fixture(tmp_path)
+    def resolve(_):
+        raise error
+    message = request_message(context, "tools/list", {}, "op")
+    status, raw = StrictHTTPAdapter(gateway, resolve, origins=()).handle(
+        encoded(message), authorization="host", headers=wire_headers(encoded(message)))
+    assert status == (403 if isinstance(error, (PolicyDenied, ValueError, UnicodeError)) else 503)
+    assert b"secret" not in raw and len(raw) < 128
+    assert not semantic_calls(transport)
+
+
+@pytest.mark.parametrize("headers", [None, {}, {"MCP-Protocol-Version": PROTOCOL},
+    {"Mcp-Method": "tools/call"},
+    {"MCP-Protocol-Version": PROTOCOL, "Mcp-Method": "tools/call"},
+    {"MCP-Protocol-Version": PROTOCOL, "Mcp-Method": "tools/call", "Mcp-Name": "local.read"}])
+def test_http_server_requires_all_standard_and_schema_headers(tmp_path, headers):
+    gateway, context, transport, *_ = fixture(tmp_path)
+    raw = encoded(tool_request(context))
+    status, response = StrictHTTPAdapter(gateway, lambda _: context, origins=()).handle(
+        raw, authorization="host", headers=headers)
+    assert status == 400 and "error" in decode(response)
+    assert not semantic_calls(transport)
+
+
+@pytest.mark.parametrize("method", ["server/discover", "tools/list", "resources/list"])
+def test_cacheable_server_responses_advertise_scope_ttl_and_modern_discovery(tmp_path, method):
+    gateway, context, *_ = fixture(tmp_path, tools=("code_read", "docs_read"))
+    request = request_message(context, method, {}, "req")
+    # ClientInfo is recommended by the protocol, not a required identity grant.
+    del request["params"]["_meta"][META + "clientInfo"]
+    status, raw = ServerAdapter(gateway, lambda _: context, origins=()).handle(encoded(request), authorization="host")
+    assert status == 200
+    result = decode(raw)["result"]
+    assert result["ttlMs"] == 0 and result["cacheScope"] == "private"
+    if method == "server/discover":
+        assert result["supportedVersions"] == [PROTOCOL]
+        assert "serverInfo" not in result and result["_meta"][META + "serverInfo"]["name"] == "herdr"
+
+
+@pytest.mark.parametrize("field,value", [("cacheScope", None), ("cacheScope", "bad"), ("cacheScope", []),
+                                         ("ttlMs", None), ("ttlMs", -1)])
+def test_discovery_rejects_missing_or_invalid_cache_contract(tmp_path, field, value):
+    gateway, context, transport, clock, client, _ = fixture(tmp_path)
+    original = transport.request
+    def request(*args, **kwargs):
+        response = list(original(*args, **kwargs))
+        response[0]["result"][field] = value
+        return response
+    transport.request = request
+    with pytest.raises(GatewayError):
+        client.discover(context, clock())
+
+
+@pytest.mark.parametrize("scope", ["private", "public"])
+def test_discovery_accepts_supported_cache_scopes(tmp_path, scope):
+    gateway, context, transport, clock, client, _ = fixture(tmp_path)
+    original = transport.request
+    def request(*args, **kwargs):
+        response = list(original(*args, **kwargs))
+        response[0]["result"]["cacheScope"] = scope
+        return response
+    transport.request = request
+    assert client.discover(context, clock())
+
+
+@pytest.mark.parametrize("block", [None, 1, {}, {"type": "unknown"}, {"type": "text"},
+    {"type": "text", "text": 1}, {"type": "image", "data": "bad!", "mimeType": "image/png"},
+    {"type": "audio", "data": "AA==", "mimeType": None}, {"type": "resource_link", "uri": "herdr://one"},
+    {"type": "resource", "resource": {"uri": "herdr://one", "text": "data", "blob": "AA=="}}])
+@pytest.mark.parametrize("task", [False, True])
+def test_malformed_content_blocks_cannot_become_observed_complete(tmp_path, block, task):
+    gateway, context, transport, clock, *_ = fixture(tmp_path, tasks=task)
+    bad = {"resultType": "complete", "content": [block]}
+    if task:
+        transport.task = True
+        gateway.call(context, "local", "read", {"path": "source.py"}, "op")
+        clock.value += 2
+        transport.response = {"resultType": "complete", "taskId": "remote-task-1", "status": "completed",
+            "createdAt": "2026-10-03T20:00:00Z", "lastUpdatedAt": "2026-10-03T20:00:01Z",
+            "ttlMs": 60000, "pollIntervalMs": 1000, "result": bad}
+        action = lambda: gateway.poll(context, "op")
+    else:
+        transport.response = bad
+        action = lambda: gateway.call(context, "local", "read", {"path": "source.py"}, "op")
+    with pytest.raises(GatewayError):
+        action()
+    assert gateway.ledger.get(operation_key(context))["state"] != "observed_complete"
+
+
+def test_malformed_mutating_content_retains_uncertainty_without_redelivery(tmp_path):
+    gateway, context, transport, *_ = fixture(tmp_path, tools=("code_write",))
+    transport.response = {"resultType": "complete", "content": [None]}
+    with pytest.raises(DeliveryUncertain):
+        gateway.call(context, "local", "write", {"value": "result"}, "op")
+    with pytest.raises(DeliveryUncertain):
+        gateway.call(context, "local", "write", {"value": "result"}, "op")
+    assert len(semantic_calls(transport)) == 1

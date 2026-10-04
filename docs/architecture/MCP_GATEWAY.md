@@ -182,3 +182,25 @@ Protocol references:
 The disposable schema helper runs from its trusted absolute sibling path with isolated Python imports and a minimal environment; worker current directories, PYTHONPATH and user startup modules cannot replace the validator. This does not assert that a Hermes runtime is credential-isolated.
 
 Wire routing values are bounded after encoding, before delivery/cost reservation. Resource operations persist the logical capability, not raw URIs. Local post-reservation fence/registry/policy denials do not charge provider circuit health. Upstream JSON-RPC rejections become bounded downstream error responses rather than an internal resultType. Schema reference checks inspect actual subschema locations; property names and const/default/example data cannot be mistaken for schema authority. Offline reference retrieval remains denied.
+
+## HTTP preflight and content validation
+
+Every HTTP server request requires protocol-version and method routing headers,
+plus name and schema-declared argument headers where applicable. Missing headers
+never enable an in-process bypass. ClientInfo is optional; malformed supplied
+information is rejected. Modern discovery advertises supportedVersions, with
+server identity in response metadata. Every cacheable result declares ttlMs
+and cacheScope; upstream discovery requires these fields and only accepts
+private or public.
+
+The HTTP client resolves and validates bounded ASCII bearer credentials before
+reserving delivery, cost or poll counters. Prepared credentials remain ephemeral
+host memory and bind the exact request; they are never written to the ledger.
+Local credential/authentication decoder failures return bounded errors without
+private exception text or provider-health penalties. Local fence, registry and
+provider-policy revocation during subscriptions likewise does not mark a remote
+provider unhealthy.
+
+Ordinary and completed-Task tool results validate each content block's declared
+type, required fields and text/binary/resource shape before recording completion.
+Malformed mutation output retains uncertainty and cannot trigger redelivery.

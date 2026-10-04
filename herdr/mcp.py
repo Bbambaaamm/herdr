@@ -185,6 +185,70 @@ def validate_schema(schema: dict, instance=None, *, check_only=False):
         raise GatewayUnavailable("JSON Schema runtime dependency or bounded process unavailable")
 
 
+
+def validate_tool_content(result):
+    if (not isinstance(result, dict) or not isinstance(result.get("content"), list)
+            or len(result["content"]) > 256 or type(result.get("isError", False)) is not bool):
+        raise GatewayError("invalid tool result")
+    for block in result["content"]:
+        if not isinstance(block, dict) or not isinstance(block.get("type"), str):
+            raise GatewayError("invalid tool content block")
+        kind = block["type"]
+        if "_meta" in block and not isinstance(block["_meta"], dict):
+            raise GatewayError("invalid tool content metadata")
+        if "annotations" in block and not isinstance(block["annotations"], dict):
+            raise GatewayError("invalid tool content annotations")
+        if kind == "text":
+            if not isinstance(block.get("text"), str):
+                raise GatewayError("invalid text content")
+        elif kind in {"image", "audio"}:
+            if not isinstance(block.get("data"), str) or not isinstance(block.get("mimeType"), str):
+                raise GatewayError("invalid binary content")
+            identifier(block["mimeType"], maximum=256)
+            try:
+                base64.b64decode(block["data"], validate=True)
+            except (ValueError, UnicodeError) as exc:
+                raise GatewayError("invalid binary content encoding") from exc
+        elif kind == "resource_link":
+            identifier(block.get("uri"), maximum=4096)
+            identifier(block.get("name"))
+            for field in ("title", "description", "mimeType"):
+                if field in block and not isinstance(block[field], str):
+                    raise GatewayError("invalid resource link content")
+            if "size" in block and (type(block["size"]) is not int or not 0 <= block["size"] <= 2**53 - 1):
+                raise GatewayError("invalid resource link size")
+        elif kind == "resource":
+            resource = block.get("resource")
+            if not isinstance(resource, dict):
+                raise GatewayError("invalid embedded resource")
+            identifier(resource.get("uri"), maximum=4096)
+            if ("text" in resource) == ("blob" in resource):
+                raise GatewayError("invalid embedded resource payload")
+            if "text" in resource and not isinstance(resource["text"], str):
+                raise GatewayError("invalid embedded resource text")
+            if "blob" in resource:
+                if not isinstance(resource["blob"], str):
+                    raise GatewayError("invalid embedded resource blob")
+                try:
+                    base64.b64decode(resource["blob"], validate=True)
+                except (ValueError, UnicodeError) as exc:
+                    raise GatewayError("invalid embedded resource encoding") from exc
+            if "mimeType" in resource and not isinstance(resource["mimeType"], str):
+                raise GatewayError("invalid embedded resource MIME")
+            if "_meta" in resource and not isinstance(resource["_meta"], dict):
+                raise GatewayError("invalid embedded resource metadata")
+        else:
+            raise GatewayError("unknown tool content type")
+
+
+class _PreparedHTTP:
+    # Credential-bearing data is ephemeral host state, never ledger/audit content.
+    __slots__ = ("owner", "request_hash", "raw", "headers")
+    def __init__(self, owner, message, raw, headers):
+        self.owner, self.request_hash = owner, hashed(message)
+        self.raw, self.headers = raw, headers
+
+
 @dataclass(frozen=True)
 class TaskIdentity:
     consumer: str
@@ -520,6 +584,14 @@ class CallLedger:
         self.db.execute("DELETE FROM health WHERE server=?", (server,))
 
 
+class CredentialRejected(PolicyDenied):
+    """Local credential preflight denial, never provider health evidence."""
+
+
+class CredentialUnavailable(GatewayUnavailable):
+    """Local credential resolution outage, never provider health evidence."""
+
+
 class HTTPTransport:
     """Fixed host-approved endpoint; no redirects, cookies or discovery URLs."""
     def __init__(self, endpoint: str, credential: Callable[[], str] | None = None, *, allow_loopback=False):
@@ -530,11 +602,8 @@ class HTTPTransport:
             raise PolicyDenied("endpoint must be host-approved credential-free HTTPS")
         self.endpoint, self.parsed, self.credential = endpoint, parsed, credential
 
-    def request(self, message: dict, *, timeout: int, extra_headers: dict | None = None):
-        return tuple(self.stream(message, timeout=timeout, extra_headers=extra_headers))
-
-    def stream(self, message: dict, *, timeout: int, extra_headers: dict | None = None):
-        """Yield bounded response messages; generator close cancels HTTP/SSE."""
+    def prepare(self, message: dict, *, extra_headers: dict | None = None):
+        """Resolve and validate wire headers/credentials before delivery reservation."""
         raw = encoded(message)
         params = message.get("params", {})
         headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
@@ -544,10 +613,27 @@ class HTTPTransport:
             headers["Mcp-Name"] = header_value(name)
         headers.update(extra_headers or {})
         if self.credential:
-            secret = self.credential()
-            if not isinstance(secret, str) or not secret or any(ord(c) < 32 for c in secret):
-                raise PolicyDenied("credential reference did not resolve safely")
+            try:
+                secret = self.credential()
+            except PolicyDenied as exc:
+                raise CredentialRejected("credential resolution denied") from exc
+            except Exception as exc:
+                raise CredentialUnavailable("credential resolver unavailable") from exc
+            if (not isinstance(secret, str) or not re.fullmatch(r"[A-Za-z0-9._~+/=-]{1,8192}", secret)):
+                raise CredentialRejected("credential reference did not resolve to bounded ASCII bearer")
             headers["Authorization"] = "Bearer " + secret
+        return _PreparedHTTP(self, message, raw, headers)
+
+    def request(self, message: dict, *, timeout: int, extra_headers: dict | None = None, prepared=None):
+        return tuple(self.stream(message, timeout=timeout, extra_headers=extra_headers, prepared=prepared))
+
+    def stream(self, message: dict, *, timeout: int, extra_headers: dict | None = None, prepared=None):
+        """Yield bounded response messages; generator close cancels HTTP/SSE."""
+        prepared = prepared or self.prepare(message, extra_headers=extra_headers)
+        if (not isinstance(prepared, _PreparedHTTP) or prepared.owner is not self
+                or prepared.request_hash != hashed(message)):
+            raise PolicyDenied("prepared HTTP request identity mismatch")
+        raw, headers = prepared.raw, prepared.headers
         connection_class = http.client.HTTPSConnection if self.parsed.scheme == "https" else http.client.HTTPConnection
         connection = connection_class(self.parsed.hostname, self.parsed.port, timeout=timeout)
         deadline = time.monotonic() + timeout
@@ -603,7 +689,7 @@ class HTTPTransport:
                             return
         except GatewayError:
             raise
-        except (OSError, http.client.HTTPException) as exc:
+        except (OSError, http.client.HTTPException, UnicodeError, ValueError) as exc:
             raise DeliveryUncertain("provider transport did not yield a known response") from exc
         finally:
             connection.close()
@@ -631,12 +717,21 @@ class ClientAdapter:
             self._catalog_generation += 1
             self.expires_at = 0.0
 
-    def exchange(self, context, method, params, request_id, *, extra_headers=None):
+    def prepare(self, context, method, params, request_id, *, extra_headers=None):
+        prepare = getattr(self.transport, "prepare", None)
+        if not callable(prepare):
+            return None
+        return prepare(request_message(context, method, params, request_id, tasks=self.server.tasks),
+                       extra_headers=extra_headers)
+
+    def exchange(self, context, method, params, request_id, *, extra_headers=None, prepared=None):
         self.ledger.bind(context)
         self.ledger.audit(context.hash, "mcp_request", self.clock())
         message = request_message(context, method, params, request_id, tasks=self.server.tasks)
-        messages = self.transport.request(message, timeout=context.toolset.timeout_seconds,
-                                          extra_headers=extra_headers)
+        transport_args = {"timeout": context.toolset.timeout_seconds, "extra_headers": extra_headers}
+        if prepared is not None:
+            transport_args["prepared"] = prepared
+        messages = self.transport.request(message, **transport_args)
         response, notifications = None, []
         for item in messages:
             if not isinstance(item, dict) or item.get("jsonrpc") != "2.0":
@@ -667,7 +762,7 @@ class ClientAdapter:
             raise GatewayError("unnegotiated asynchronous task result")
         return result, tuple(notifications)
 
-    def listen(self, context, filters, request_id):
+    def listen(self, context, filters, request_id, *, prepared=None):
         self.ledger.bind(context)
         self.ledger.audit(context.hash, "subscription_opened", self.clock())
         message = request_message(context, "subscriptions/listen",
@@ -675,7 +770,10 @@ class ClientAdapter:
         if not callable(getattr(self.transport, "stream", None)):
             raise GatewayUnavailable("subscription transport is unavailable")
         acknowledged = None
-        with closing(self.transport.stream(message, timeout=context.toolset.timeout_seconds)) as stream:
+        transport_args = {"timeout": context.toolset.timeout_seconds}
+        if prepared is not None:
+            transport_args["prepared"] = prepared
+        with closing(self.transport.stream(message, **transport_args)) as stream:
             for index, item in enumerate(stream):
                 if index >= 65:
                     raise GatewayError("subscription event count exceeded")
@@ -724,7 +822,8 @@ class ClientAdapter:
             definitions = self._discover(context, now)
         except GatewayError as exc:
             self.ledger.audit(context.hash, "discovery_failed", self.clock())
-            self.ledger.failure(self.server.id, self.clock())
+            if not isinstance(exc, (CredentialRejected, CredentialUnavailable)):
+                self.ledger.failure(self.server.id, self.clock())
             raise
         self.ledger.healthy(self.server.id)
         return definitions
@@ -765,7 +864,10 @@ class ClientAdapter:
                 if "outputSchema" in row:
                     validate_schema(row["outputSchema"], check_only=True)
                 definitions[row["name"]] = decode(encoded(row))
-            raw_ttl = result.get("ttlMs", 0)
+            cache_scope = result.get("cacheScope")
+            if not isinstance(cache_scope, str) or cache_scope not in {"private", "public"}:
+                raise GatewayError("invalid or absent discovery cache scope")
+            raw_ttl = result.get("ttlMs")
             if type(raw_ttl) is not int or not 0 <= raw_ttl <= 2**53 - 1:
                 raise GatewayError("invalid discovery TTL")
             ttl = min(ttl, raw_ttl / 1000)
@@ -1029,7 +1131,9 @@ class McpGateway:
         if sum(len(k) + len(v) for k, v in (extra_headers or {}).items()) > 32_768:
             raise GatewayError("aggregate routing headers exceed bound")
         persisted_subject = (params["name"] if method == "tools/call"
-                             else dict(client.server.resources)[params["uri"]])
+                             else dict(client.server.resources).get(params["uri"]))
+        if persisted_subject is None:
+            raise PolicyDenied("resource removed by provider policy reload")
         with self.ledger.lock(key):
             validation_plan = None
             if definition is not None:
@@ -1058,17 +1162,22 @@ class McpGateway:
                     if not self.argument_authority(context, client.server.id, logical, params["arguments"]):
                         raise PolicyDenied("argument policy denied immediately before transmission")
                 else:
-                    resource = dict(client.server.resources)[params["uri"]]
+                    resource = dict(client.server.resources).get(params["uri"])
+                    if resource is None:
+                        raise PolicyDenied("resource removed by provider policy reload")
                     _, estimate = self._admit(context, client.server.id, resource, ("resource:read",), tools=False, quote=True)
                 permissions = binding.permissions if logical else ("resource:read",)
                 subject = logical if logical else resource
+                self._static_admit(context, client.server.id, subject, permissions)
+                prepared = client.prepare(context, method, params, key, extra_headers=extra_headers)
                 self._static_admit(context, client.server.id, subject, permissions)
                 self.ledger.sending(key, context, self.clock(), estimate)
                 communication_started = False
                 try:
                     self._static_admit(context, client.server.id, subject, permissions)
                     communication_started = True
-                    result, notifications = client.exchange(context, method, params, key, extra_headers=extra_headers)
+                    result, notifications = client.exchange(context, method, params, key,
+                        extra_headers=extra_headers, prepared=prepared)
                     for _notification in notifications:
                         self.ledger.audit(key, "untrusted_notification", self.clock())
                     if result["resultType"] == "task":
@@ -1085,8 +1194,8 @@ class McpGateway:
                             if not isinstance(contents, list) or not contents or any(
                                     not isinstance(x, dict) or x.get("uri") != params["uri"] for x in contents):
                                 raise PolicyDenied("remote resource contents escaped allowlist")
-                        elif not isinstance(result.get("content"), list) or type(result.get("isError", False)) is not bool:
-                            raise GatewayError("invalid tool result")
+                        else:
+                            validate_tool_content(result)
                         if definition and "outputSchema" in definition:
                             if "structuredContent" not in result:
                                 raise GatewayError("declared structured output is missing")
@@ -1145,6 +1254,7 @@ class McpGateway:
                     or not isinstance(completed.get("content"), list)
                     or type(completed.get("isError", False)) is not bool):
                 raise GatewayError("completed remote task has invalid tool result")
+            validate_tool_content(completed)
             if definition and "outputSchema" in definition:
                 if "structuredContent" not in completed:
                     raise GatewayError("completed task structured result is missing")
@@ -1245,9 +1355,13 @@ class McpGateway:
             # Require the admitted schema BEFORE consuming a possibly short-lived
             # remote terminal result. Never rediscover after tasks/get succeeds.
             self._recorded_definition(row, binding)
+            poll_id = key + ".poll." + str(row["polls"])
+            poll_params = {"taskId": row["remote_task_id"]}
+            prepared = client.prepare(context, "tasks/get", poll_params, poll_id)
+            self._static_admit(context, client.server.id, binding.logical_id, binding.permissions)
             self.ledger.polling(key, self.clock())
             try:
-                result, _ = client.exchange(context, "tasks/get", {"taskId": row["remote_task_id"]}, key + ".poll." + str(row["polls"]))
+                result, _ = client.exchange(context, "tasks/get", poll_params, poll_id, prepared=prepared)
                 if result.get("resultType") == "protocol_error":
                     self.ledger.observed(key, "reconciliation_required", {"code": result["code"]},
                                          self.clock(), row["remote_task_id"])
@@ -1355,24 +1469,31 @@ class McpGateway:
             if row["deliveries"]:
                 raise DeliveryUncertain("subscription window cannot reopen after uncertain delivery")
             admit()
+            prepared = client.prepare(context, "subscriptions/listen", {"notifications": filters}, key)
+            admit()
             self.ledger.sending(key, context, self.clock(), quote)
             events, acknowledged = [], False
+            local_admission = False
             closure = "graceful"
             try:
-                with closing(client.listen(context, filters, key)) as stream:
+                with closing(client.listen(context, filters, key, prepared=prepared)) as stream:
                     for item in stream:
+                        local_admission = True
                         admit()
                         if item["method"] == "notifications/subscriptions/acknowledged":
                             acknowledged = True
+                            local_admission = False
                             continue
                         code = self.observe_event(context, server, item)
+                        local_admission = False
                         events.append({"code": code, "sha256": hashed(item)})
                         if len(events) >= 64:
                             closure = "bounded"
                             break
             except (GatewayUnavailable, DeliveryUncertain) as exc:
                 self.ledger.audit(key, exc.code, self.clock())
-                self.ledger.failure(server, self.clock())
+                if not local_admission:
+                    self.ledger.failure(server, self.clock())
                 if not acknowledged:
                     if isinstance(exc, DeliveryUncertain):
                         raise
@@ -1380,7 +1501,8 @@ class McpGateway:
                 closure = "disconnected"
             except GatewayError as exc:
                 self.ledger.audit(key, exc.code, self.clock())
-                self.ledger.failure(server, self.clock())
+                if not local_admission:
+                    self.ledger.failure(server, self.clock())
                 if not acknowledged:
                     raise DeliveryUncertain("subscription acknowledgment unverified; reconcile window") from exc
                 self.ledger.observed(key, "response_rejected", {"code": exc.code}, self.clock())
@@ -1406,7 +1528,14 @@ class ServerAdapter:
     def handle(self, raw: bytes, *, authorization: str | None, origin: str | None = None, headers: dict | None = None):
         if origin is not None and origin not in self.origins:
             return 403, encoded({"error": "origin_denied"})
-        context = self.resolve_context(authorization)
+        try:
+            context = self.resolve_context(authorization)
+        except PolicyDenied:
+            return 403, encoded({"error": "authentication_required"})
+        except (ValueError, TypeError, UnicodeError):
+            return 403, encoded({"error": "authentication_required"})
+        except Exception:
+            return 503, encoded({"error": "authentication_unavailable"})
         if not isinstance(context, CallContext):
             return 403, encoded({"error": "authentication_required"})
         request_id = None
@@ -1431,26 +1560,25 @@ class ServerAdapter:
             if not isinstance(capabilities.get("extensions", {}), dict):
                 raise GatewayError("invalid client extensions")
             info = meta.get(META + "clientInfo")
-            if not isinstance(info, dict) or not isinstance(info.get("name"), str) or not isinstance(info.get("version"), str):
+            if META + "clientInfo" in meta and (not isinstance(info, dict) or not isinstance(info.get("name"), str) or not isinstance(info.get("version"), str)):
                 raise GatewayError("client information is required")
             if meta.get("org.herdr/task") != {**asdict(context.identity), "toolset_hash": context.toolset.hash}:
                 raise PolicyDenied("request does not bind authenticated task identity")
-            if headers is not None:
-                if not isinstance(headers, dict) or len(headers) > 128:
-                    raise GatewayError("invalid bounded HTTP headers")
-                normalized = {}
-                for name, value in headers.items():
-                    if (not isinstance(name, str) or not re.fullmatch(r"[!#$%&'*+.^_A-Za-z0-9|-]{1,128}", name)
-                            or name.lower() in normalized or not isinstance(value, str)
-                            or len(value) > 8192 or chr(13) in value or chr(10) in value):
-                        raise GatewayError("invalid or ambiguous HTTP header")
-                    normalized[name.lower()] = value
-                headers = normalized
-                if headers.get("mcp-protocol-version") != PROTOCOL or headers.get("mcp-method") != method:
-                    raise GatewayError("HTTP protocol header mismatch")
-                name = params.get("name", params.get("uri", params.get("taskId")))
-                if name is not None and headers.get("mcp-name") != header_value(name):
-                    raise GatewayError("HTTP routing header mismatch")
+            if not isinstance(headers, dict) or len(headers) > 128:
+                raise GatewayError("invalid bounded HTTP headers")
+            normalized = {}
+            for name, value in headers.items():
+                if (not isinstance(name, str) or not re.fullmatch(r"[!#$%&'*+.^_A-Za-z0-9|-]{1,128}", name)
+                        or name.lower() in normalized or not isinstance(value, str)
+                        or len(value) > 8192 or chr(13) in value or chr(10) in value):
+                    raise GatewayError("invalid or ambiguous HTTP header")
+                normalized[name.lower()] = value
+            headers = normalized
+            if headers.get("mcp-protocol-version") != PROTOCOL or headers.get("mcp-method") != method:
+                raise GatewayError("HTTP protocol header mismatch")
+            name = params.get("name", params.get("uri", params.get("taskId")))
+            if name is not None and headers.get("mcp-name") != header_value(name):
+                raise GatewayError("HTTP routing header mismatch")
             if method == "server/discover":
                 if not self.gateway.authority(context):
                     raise PolicyDenied("inactive task")
@@ -1458,10 +1586,10 @@ class ServerAdapter:
                 if any(client.server.tasks for client in self.gateway.clients.values()
                        if client.server.consumer == context.identity.consumer):
                     capabilities["extensions"] = {TASKS: {}}
-                result = {"resultType": "complete", "serverInfo": {"name": "herdr", "version": VERSION},
-                          "capabilities": capabilities}
+                result = {"resultType": "complete", "supportedVersions": [PROTOCOL],
+                          "capabilities": capabilities, "ttlMs": 0, "cacheScope": "private"}
             elif method == "tools/list":
-                result = {"resultType": "complete", "tools": self.gateway.model_context(context)["tools"], "ttlMs": 0}
+                result = {"resultType": "complete", "tools": self.gateway.model_context(context)["tools"], "ttlMs": 0, "cacheScope": "private"}
             elif method == "tools/call":
                 name = params.get("name")
                 if not isinstance(name, str) or "." not in name:
@@ -1475,11 +1603,8 @@ class ServerAdapter:
                         "error": {"code": -32021, "message": "missing_required_client_capability",
                                   "data": {"requiredCapabilities": {"extensions": {TASKS: {}}}}}})
                 operation = identifier(meta.get("org.herdr/operation"))
-                if headers is None:
-                    outcome = self.gateway.call(context, server, tool, params["arguments"], operation)
-                else:
-                    outcome = self.gateway.call(context, server, tool, params["arguments"], operation,
-                                                routing_headers=headers)
+                outcome = self.gateway.call(context, server, tool, params["arguments"], operation,
+                                            routing_headers=headers)
                 if outcome.result is not None and outcome.result.get("resultType") == "protocol_error":
                     raise RemoteProtocolError("upstream tools/call protocol rejection")
                 if outcome.result is None and outcome.state == "remote_running":
@@ -1513,7 +1638,7 @@ class ServerAdapter:
                 result["taskId"] = handle
                 result.setdefault("_meta", {})["org.herdr/outcomeHash"] = outcome.result_hash
             elif method == "resources/list":
-                result = {"resultType": "complete", "resources": self.gateway.resource_context(context), "ttlMs": 0}
+                result = {"resultType": "complete", "resources": self.gateway.resource_context(context), "ttlMs": 0, "cacheScope": "private"}
             elif method == "resources/read":
                 server = identifier(meta.get("org.herdr/provider"))
                 outcome = self.gateway.read_resource(context, server, params.get("uri"), identifier(meta.get("org.herdr/operation")))
