@@ -6,11 +6,15 @@ import sys
 def main():
     try:
         import resource
-        resource.setrlimit(resource.RLIMIT_CPU, (2, 2))
-        resource.setrlimit(resource.RLIMIT_AS, (256_000_000, 256_000_000))
+        for kind, ceiling in ((resource.RLIMIT_CPU, 2), (resource.RLIMIT_AS, 256_000_000)):
+            _, hard = resource.getrlimit(kind)
+            soft = ceiling if hard == resource.RLIM_INFINITY else min(ceiling, hard)
+            resource.setrlimit(kind, (soft, hard))
         from jsonschema import Draft202012Validator
+        from jsonschema.exceptions import SchemaError, ValidationError
         from referencing import Registry
-    except ImportError:
+        from referencing.exceptions import Unresolvable
+    except (ImportError, ValueError, OSError, MemoryError):
         return 78
     try:
         raw = sys.stdin.buffer.read(2_000_001)
@@ -31,7 +35,6 @@ def main():
                     if key in {"$ref", "$dynamicRef"} and (not isinstance(item, str) or not item.startswith("#")):
                         raise ValueError("external reference denied")
                     if key in {"pattern", "patternProperties"}:
-                        # Full regex semantics are supported in the bounded process.
                         if len(json.dumps(item)) > 4096:
                             raise ValueError("regex bounds")
                     walk(item, depth + 1)
@@ -47,8 +50,11 @@ def main():
             return 1
         sys.stdout.buffer.write(b"valid")
         return 0
-    except Exception:
+    except (SchemaError, ValidationError, Unresolvable, ValueError, KeyError, TypeError):
         return 1
+    except Exception:
+        # Resource exhaustion and helper faults do not invalidate the caller's schema.
+        return 78
 
 
 if __name__ == "__main__":

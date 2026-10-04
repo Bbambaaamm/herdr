@@ -91,10 +91,19 @@ operation; SQLite transactions and FULL synchronous WAL persist authority,
 delivery counters, outcome digests and provider health across restart. Approved
 input/output validation schemas are frozen in the protected operation record
 before transmission; they are control data, excluded from audit export.
+Admission uses one immutable registry snapshot, checks for reload after runtime
+observations and rechecks active policy after argument authorization immediately
+before delivery. Region/class requirements come from provider/grant intersection;
+the host remains responsible for actual argument data classification.
 
 An ambiguous side effect is quarantined and never blindly sent again.
 Read-only requests have at most the declared retry count; retries use the same
-operation and recheck policy before every send. Recorded outcomes replay without
+operation and recheck policy before every send. An exhausted read or polling
+budget returns a non-retryable reconciliation outcome, including after restart.
+Every post-send mutation failure retains uncertainty, including output-validator
+timeouts. Eligible legacy prepared/read-retry rows freeze their validation plan
+before transmission; uncertain mutations never receive a retry or a new plan.
+Recorded outcomes replay without
 another provider request. Raw results are not retained in telemetry: a replay
 without its artifact requires explicit reconciliation of its recorded digest.
 
@@ -141,8 +150,12 @@ resource escape attempts and foreign Tasks without completion authority.
 Fresh-process replay is tested with provider discovery and runtime observations
 unavailable. Immediate terminal Tasks use the same result/output-schema checks
 as polling. Successful polls reset consecutive failures. Discovery generation
-checks preserve concurrent invalidation. Rejected mutation responses retain
-delivery uncertainty, and integer routing headers reject unsafe integral floats.
+checks preserve concurrent invalidation. All post-send mutation failures retain delivery uncertainty. Discovery outcomes
+update persisted provider circuit health, and validated refresh clears consecutive
+failures. Tool arguments and annotations require protocol objects; numeric
+overflow is rejected during JSON decoding. Schema subprocesses respect existing
+hard resource limits and distinguish runtime faults from invalid schemas.
+Integer routing headers reject unsafe integral floats.
 
 Protocol references:
 - [MCP 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28)
