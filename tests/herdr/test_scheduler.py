@@ -666,10 +666,21 @@ def test_durable_delegation_survives_uncertainty_and_restart(tmp_path: Path) -> 
                                           child_lease.fencing_token, child_key)
     assert not sched.authorize_child_delivery("unmanaged", child_token, child_lease.agent_id,
                                               child_lease.fencing_token, child_key)
-    assert sched.bind_execution_session(child.id, child_token, "child-agent", "pane-1", "owned-marker")
+    assert sched.bind_execution_session(child.id, child_token, child_lease.agent_id, "pane-1", "owned-marker")
+    row_before = next(row for row in sched.snapshot()["tasks"] if row["task_id"] == child.id)
+    assert row_before["execution_sandbox_verified"] is False
+    assert row_before["execution_sandbox_attestation"] is None
+    assert not sched.attest_execution_sandbox(child.id, "wrong-run", child_lease.agent_id, "pane-1", "owned-marker",
+                                               sandbox_pid=123, policy_sha256="a" * 64)
+    assert sched.attest_execution_sandbox(child.id, child_token, child_lease.agent_id, "pane-1", "owned-marker",
+                                          sandbox_pid=123, policy_sha256="a" * 64)
+    attested = next(row for row in sched.snapshot()["tasks"] if row["task_id"] == child.id)
+    assert attested["execution_sandbox_verified"] is True
+    assert attested["execution_sandbox_attestation"]["authority"] == "herdr-runtime"
+    assert attested["execution_sandbox_attestation"]["fencing_token"] == child_lease.fencing_token
     assert not sched.observe_execution(child.id, child_token, "working", "task-session",
                                        agent_name="other", pane_id="pane-1", marker="owned-marker")
-    owned = dict(agent_name="child-agent", pane_id="pane-1", marker="owned-marker")
+    owned = dict(agent_name=child_lease.agent_id, pane_id="pane-1", marker="owned-marker")
     assert not sched.observe_execution(child.id, child_token, "settled", "caller string", **owned)
     live = ["working"]
     sched.execution_verifier = lambda agent, pane, marker: live[0]
@@ -688,6 +699,8 @@ def test_durable_delegation_survives_uncertainty_and_restart(tmp_path: Path) -> 
     assert recovered.reclaim(child_lease.holder) == []
     row = next(row for row in recovered.snapshot()["tasks"] if row["task_id"] == child.id)
     assert row["observed_execution"] == "working"
+    assert row["execution_sandbox_verified"] is True
+    assert row["execution_sandbox_attestation"]["policy_sha256"] == "a" * 64
     assert row["parent_run_token"] == parent_token
     assert not recovered.publish_child_result(child.id, "wrong-run", child_lease.agent_id,
                                               child_lease.fencing_token, child_key, "a" * 64, "done")

@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import json
 import sys
 from importlib.machinery import SourceFileLoader
@@ -13,6 +14,12 @@ loader = SourceFileLoader("agent_task_worker", str(BIN / "agent-task-worker"))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 worker = importlib.util.module_from_spec(spec)
 loader.exec_module(worker)
+
+
+def _policy_file(tmp_path):
+    path = tmp_path / "policy"
+    path.write_text("policy", encoding="utf-8")
+    return path
 
 
 def configure_paths(tmp_path):
@@ -207,6 +214,47 @@ def test_block_task_quarantines_until_task_pane_cleanup(tmp_path, monkeypatch):
     assert result["status"] == "blocked" and result["run_token"] == task["run_token"]
 
 
+def test_empty_session_result_placeholder_materializes_interactive_blocker(tmp_path):
+    configure_paths(tmp_path)
+    task = base_task()
+    worker.prepare_attempt(task)
+    running = worker.RUNNING / "task-1.json"
+    running.write_text(json.dumps(task), encoding="utf-8")
+    worker.result_path(task["id"]).touch()
+
+    worker.block_task(running, task, "agent_interactive_input_required", "input required")
+
+    assert (worker.BLOCKED / running.name).is_file()
+    result = json.loads(worker.result_path(task["id"]).read_text(encoding="utf-8"))
+    assert result["blocker"] == "agent_interactive_input_required"
+    assert result["run_token"] == task["run_token"]
+    from importlib.machinery import SourceFileLoader
+    intake_loader = SourceFileLoader("agent_github_intake_blocker_test", str(BIN / "agent-github-intake"))
+    intake_spec = importlib.util.spec_from_loader(intake_loader.name, intake_loader)
+    intake = importlib.util.module_from_spec(intake_spec)
+    intake_loader.exec_module(intake)
+    intake.RESULTS = worker.RESULTS
+    assert intake.result_for(task["id"])["blocker"] == "agent_interactive_input_required"
+
+
+def test_block_task_preserves_nonregular_result_path(tmp_path):
+    configure_paths(tmp_path)
+    task = base_task()
+    worker.prepare_attempt(task)
+    running = worker.RUNNING / "task-1.json"
+    running.write_text(json.dumps(task), encoding="utf-8")
+    target = tmp_path / "evidence.json"
+    target.write_text("trusted", encoding="utf-8")
+    worker.result_path(task["id"]).symlink_to(target)
+
+    worker.block_task(running, task, "agent_interactive_input_required", "input required")
+
+    assert worker.result_path(task["id"]).is_symlink()
+    assert target.read_text(encoding="utf-8") == "trusted"
+    saved = json.loads((worker.BLOCKED / running.name).read_text(encoding="utf-8"))
+    assert saved["attempt_state"] == "delivery_uncertain"
+
+
 def test_finish_defers_terminal_move_until_task_pane_cleanup(tmp_path, monkeypatch):
     configure_paths(tmp_path)
     task = base_task()
@@ -358,7 +406,9 @@ def test_create_task_session_uses_fresh_owned_pane_and_named_chat(tmp_path, monk
         boundary_events.append("sandbox_command")
         return ["bwrap", "/bin/bash"]
     monkeypatch.setattr(worker, "start_bridge", start_bridge)
-    monkeypatch.setattr(worker, "frozen_policy", lambda: tmp_path / "policy")
+    policy = tmp_path / "policy"
+    policy.write_text("policy", encoding="utf-8")
+    monkeypatch.setattr(worker, "frozen_policy", lambda: policy)
     monkeypatch.setattr(worker, "sandbox_command", sandbox_command)
     monkeypatch.setattr(worker, "verify_sandbox", lambda *args, **kwargs: True)
     monkeypatch.setattr(worker, "inner_pid", lambda *args, **kwargs: 123)
@@ -395,6 +445,13 @@ def test_create_task_session_uses_fresh_owned_pane_and_named_chat(tmp_path, monk
     assert session["coordinator_pane_id"] == "persistent-pane"
     assert session["pane_id"] == "owned-task-pane"
     assert session["agent_name"] != "quantlab-hermes"
+    assert session["sandbox_verified"] is True
+    att = session["sandbox_attestation"]
+    assert att["authority"] == "agent-task-worker" and att["kind"] == "bwrap"
+    assert att["task_id"] == task["id"] and att["run_token"] == task["run_token"]
+    assert att["pane_id"] == session["pane_id"] and att["marker"] == session["pane_marker"]
+    assert att["sandbox_pid"] == 123
+    assert att["policy_sha256"] == hashlib.sha256(policy.read_bytes()).hexdigest()
     split = next(call for call in calls if call[:2] == ["pane", "split"])
     assert ["--pane", "persistent-pane"] == split[2:4]
     assert "--env" in split
@@ -942,7 +999,7 @@ def test_create_task_session_rejects_wrong_started_agent(tmp_path, monkeypatch):
     monkeypatch.setattr(worker, "_setup_pane_ids", lambda: {"persistent-pane"})
     closed = []
     monkeypatch.setattr(worker, "start_bridge", lambda task, session: None)
-    monkeypatch.setattr(worker, "frozen_policy", lambda: tmp_path / "policy")
+    monkeypatch.setattr(worker, "frozen_policy", lambda: _policy_file(tmp_path))
     monkeypatch.setattr(worker, "sandbox_command", lambda *args, **kwargs: ["bwrap", "/bin/bash"])
     monkeypatch.setattr(worker, "verify_sandbox", lambda *args, **kwargs: True)
     monkeypatch.setattr(worker, "inner_pid", lambda *args, **kwargs: 123)
@@ -999,7 +1056,7 @@ def test_setup_failure_cleanup_proves_pane_identity(
                 routing={"selected_agent": "quantlab-hermes"})
     closed = []
     monkeypatch.setattr(worker, "start_bridge", lambda *args: None)
-    monkeypatch.setattr(worker, "frozen_policy", lambda: tmp_path / "policy")
+    monkeypatch.setattr(worker, "frozen_policy", lambda: _policy_file(tmp_path))
     monkeypatch.setattr(worker, "sandbox_command", lambda *args, **kw: ["bwrap"])
     monkeypatch.setattr(worker, "verify_sandbox", lambda *args, **kw: True)
     monkeypatch.setattr(worker, "inner_pid", lambda *args, **kw: 123)

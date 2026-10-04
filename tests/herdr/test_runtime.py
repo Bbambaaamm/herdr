@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import dataclasses
 import json
 import os
 import re
 import threading
 import time
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 import pytest
+import herdr.runtime as runtime_mod
 
 from herdr.consumer_policies import allow_all_consumer_policy, quantlab_paper_policy
 
@@ -314,8 +317,11 @@ def test_managed_runtime_binds_owned_pane_before_prompt(tmp_path: Path, monkeypa
         events.append("create")
         return "created-pane"
     monkeypatch.setattr(runtime, "_create_pane", create)
-    monkeypatch.setattr(runtime, "_sandbox_child_pane",
-                        lambda pane, marker, real, task_id: events.append("sandbox") or tmp_path / "policy")
+    def sandbox_child(pane, marker, real, task_id):
+        events.append("sandbox")
+        runtime._sandbox_proofs[pane] = {"sandbox_pid": 123, "policy_sha256": "a" * 64}
+        return tmp_path / "policy"
+    monkeypatch.setattr(runtime, "_sandbox_child_pane", sandbox_child)
     monkeypatch.setattr(runtime, "_start_agent", lambda lease, pane: events.append("start"))
     monkeypatch.setattr(runtime, "_verify_live_child",
                         lambda agent, pane, marker, *, require_sandbox=False:
@@ -435,6 +441,209 @@ def test_child_workspace_write_requires_role_tool_and_permission(
     assert runtime._child_workspace_writable(child.id) is expected
 
 
+@pytest.mark.parametrize("tools,expected", [
+    (("read_file", "search_files"), "file"),
+    (("read_file", "patch", "review"), "file"),
+])
+def test_managed_agent_start_uses_explicit_admitted_toolset(tmp_path, tools, expected):
+    scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
+    role = "reviewer" if "review" in tools else "reader"
+    parent_role = "reviewer" if role == "reviewer" else "writer"
+    scheduler.register_external_parent_attempt(
+        task_id="parent", run_token="parent-run", idempotency_key="parent-key",
+        agent_name="parent-agent", pane_id="parent-pane", marker="parent-marker",
+        repo="repo", issue="82", role=parent_role, tools=tools,
+        permissions=("workspace-write",), policy_profile="default")
+    child = scheduler.delegate_child("parent", "parent-run", "scope",
+        ChildProposal(parent_role, tools, role, tools, child_task="inspect"))
+    lease = scheduler.dispatch(task_ids={child.id})[0]
+    runner = FakeHerdrRunner()
+    runtime = HerdrChildRuntime(scheduler, runner, cwd=tmp_path,
+                                env={"HERDR_ENV": "1", "HERDR_PANE_ID": "parent-pane"})
+    runtime._skill_checked = True
+
+    runtime._start_agent(lease, "child-pane")
+
+    call = next(call for call in runner.calls if call[:2] == ("agent", "start"))
+    assert call[call.index("--toolsets") + 1] == expected
+    assert call.index("--toolsets") > call.index("chat")
+    assert not any(value in call for value in (
+        "terminal", "code_execution", "web", "browser", "delegation",
+        "connections", "computer_use", "cron", "mcp", "plugins"))
+
+
+def _write_profile_auth(profile_dir, expires_at):
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    (profile_dir / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    (profile_dir / "auth.json").write_text(json.dumps({
+        "providers": {"nous": {"agent_key_expires_at": expires_at}}}), encoding="utf-8")
+
+
+def test_trusted_provider_preflight_accepts_nous_key_above_runtime_ttl(tmp_path, monkeypatch):
+    binary = tmp_path / "hermes"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    profile_dir = tmp_path / "profiles" / "quantlab"
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    _write_profile_auth(profile_dir, future)
+    calls = []
+
+    class Proc:
+        def __init__(self, out="", rc=0):
+            self.returncode, self.stdout, self.stderr = rc, out, ""
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        tail = argv[-3:]
+        if tail == ["config", "get", "model.provider"]:
+            return Proc("nous\n")
+        if argv[-2:] == ["config", "path"]:
+            return Proc(str(profile_dir / "config.yaml") + "\n")
+        if tail == ["auth", "status", "nous"]:
+            return Proc("nous: logged in\n")
+        if tail == ["auth", "refresh", "nous"]:
+            pytest.fail("fresh credential must not rotate")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(runtime_mod.subprocess, "run", fake_run)
+    runtime_mod._trusted_hermes_profile_preflight(
+        "quantlab", executable=str(binary), env={"HOME": "/home/agentops"})
+    assert not any(call[-3:] == ["auth", "refresh", "nous"] for call in calls)
+
+
+def test_trusted_provider_preflight_refreshes_nous_below_runtime_ttl(tmp_path, monkeypatch):
+    binary = tmp_path / "hermes"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    profile_dir = tmp_path / "profiles" / "quantlab"
+    stale = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    fresh = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    _write_profile_auth(profile_dir, stale)
+    calls = []
+
+    class Proc:
+        def __init__(self, out="", rc=0):
+            self.returncode, self.stdout, self.stderr = rc, out, ""
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        tail = argv[-3:]
+        if tail == ["config", "get", "model.provider"]:
+            return Proc("nous\n")
+        if argv[-2:] == ["config", "path"]:
+            return Proc(str(profile_dir / "config.yaml") + "\n")
+        if tail == ["auth", "status", "nous"]:
+            return Proc("nous: logged in\n")
+        if tail == ["auth", "refresh", "nous"]:
+            _write_profile_auth(profile_dir, fresh)
+            return Proc("Refreshed nous credential #1\n")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(runtime_mod.subprocess, "run", fake_run)
+    runtime_mod._trusted_hermes_profile_preflight(
+        "quantlab", executable=str(binary), env={"HOME": "/home/agentops"})
+    assert sum(call[-3:] == ["auth", "refresh", "nous"] for call in calls) == 1
+    assert sum(call[-3:] == ["auth", "status", "nous"] for call in calls) == 2
+
+
+def test_trusted_provider_preflight_fails_closed_on_short_post_refresh_ttl(tmp_path, monkeypatch):
+    binary = tmp_path / "hermes"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    profile_dir = tmp_path / "profiles" / "quantlab"
+    short = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    _write_profile_auth(profile_dir, short)
+
+    class Proc:
+        def __init__(self, out="", rc=0):
+            self.returncode, self.stdout, self.stderr = rc, out, ""
+
+    def fake_run(argv, **kwargs):
+        tail = argv[-3:]
+        if tail == ["config", "get", "model.provider"]:
+            return Proc("nous\n")
+        if argv[-2:] == ["config", "path"]:
+            return Proc(str(profile_dir / "config.yaml") + "\n")
+        if tail == ["auth", "status", "nous"]:
+            return Proc("nous: logged in\n")
+        if tail == ["auth", "refresh", "nous"]:
+            return Proc("Refreshed nous credential #1\n")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(runtime_mod.subprocess, "run", fake_run)
+    with pytest.raises(HerdrRuntimeError, match="child_provider_preflight_failed"):
+        runtime_mod._trusted_hermes_profile_preflight(
+            "quantlab", executable=str(binary), env={"HOME": "/home/agentops"})
+
+
+def test_trusted_provider_preflight_fails_closed_when_auth_not_logged_in(tmp_path, monkeypatch):
+    binary = tmp_path / "hermes"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    profile_dir = tmp_path / "profiles" / "quantlab"
+    _write_profile_auth(profile_dir, (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat())
+
+    class Proc:
+        def __init__(self, out):
+            self.returncode, self.stdout, self.stderr = 0, out, ""
+
+    def fake_run(argv, **kwargs):
+        tail = argv[-3:]
+        if tail == ["config", "get", "model.provider"]:
+            return Proc("nous\n")
+        if argv[-2:] == ["config", "path"]:
+            return Proc(str(profile_dir / "config.yaml") + "\n")
+        if tail == ["auth", "status", "nous"]:
+            return Proc("nous: logged out\n")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(runtime_mod.subprocess, "run", fake_run)
+    with pytest.raises(HerdrRuntimeError, match="child_provider_preflight_failed"):
+        runtime_mod._trusted_hermes_profile_preflight(
+            "quantlab", executable=str(binary), env={"HOME": "/home/agentops"})
+
+
+def test_managed_agent_start_rejects_unmapped_permission_before_runner(tmp_path):
+    scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
+    scheduler.register_external_parent_attempt(
+        task_id="parent", run_token="parent-run", idempotency_key="parent-key",
+        agent_name="parent-agent", pane_id="parent-pane", marker="parent-marker",
+        repo="repo", issue="82", role="writer", tools=("read_file",),
+        permissions=("future-permission",), policy_profile="default")
+    child = scheduler.delegate_child("parent", "parent-run", "scope-permission",
+        ChildProposal("writer", ("read_file",), "reader", ("read_file",),
+                      parent_permissions=("future-permission",),
+                      child_permissions=("future-permission",), child_task="inspect"))
+    lease = scheduler.dispatch(task_ids={child.id})[0]
+    runner = FakeHerdrRunner()
+    runtime = HerdrChildRuntime(scheduler, runner, cwd=tmp_path,
+                                env={"HERDR_ENV": "1", "HERDR_PANE_ID": "parent-pane"})
+    runtime._skill_checked = True
+
+    with pytest.raises(HerdrRuntimeError, match="child_permission_unmapped"):
+        runtime._start_agent(lease, "child-pane")
+    assert runner.calls == []
+
+
+def test_managed_agent_start_rejects_unmapped_tool_before_runner(tmp_path):
+    scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
+    scheduler.register_external_parent_attempt(
+        task_id="parent", run_token="parent-run", idempotency_key="parent-key",
+        agent_name="parent-agent", pane_id="parent-pane", marker="parent-marker",
+        repo="repo", issue="82", role="writer", tools=("read_file",),
+        permissions=(), policy_profile="default")
+    child = scheduler.delegate_child("parent", "parent-run", "scope",
+        ChildProposal("writer", ("read_file",), "reader", ("read_file",),
+                      child_task="inspect"))
+    lease = scheduler.dispatch(task_ids={child.id})[0]
+    scheduler._tasks[child.id].node = dataclasses.replace(
+        scheduler._tasks[child.id].node, tools=("read_file", "future_tool"))
+    runner = FakeHerdrRunner()
+    runtime = HerdrChildRuntime(scheduler, runner, cwd=tmp_path,
+                                env={"HERDR_ENV": "1", "HERDR_PANE_ID": "parent-pane"})
+    runtime._skill_checked = True
+
+    with pytest.raises(HerdrRuntimeError, match="child_toolset_unmapped"):
+        runtime._start_agent(lease, "child-pane")
+    assert runner.calls == []
+
+
 def test_prompt_invocation_error_preserves_accepted_child(tmp_path: Path, monkeypatch) -> None:
     scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
     scheduler.register_external_parent_attempt(
@@ -460,7 +669,10 @@ def test_prompt_invocation_error_preserves_accepted_child(tmp_path: Path, monkey
         runtime._owned_panes.add("child-pane")
         return "child-pane"
     monkeypatch.setattr(runtime, "_create_pane", create)
-    monkeypatch.setattr(runtime, "_sandbox_child_pane", lambda *args: tmp_path / "policy")
+    def sandbox_child(pane, *args):
+        runtime._sandbox_proofs[pane] = {"sandbox_pid": 123, "policy_sha256": "a" * 64}
+        return tmp_path / "policy"
+    monkeypatch.setattr(runtime, "_sandbox_child_pane", sandbox_child)
     monkeypatch.setattr(runtime, "_start_agent", lambda *args: None)
     monkeypatch.setattr(runtime, "_verify_live_child", lambda *args, **kwargs: "working")
     with pytest.raises(OSError, match="transport lost"):
@@ -585,7 +797,8 @@ def test_two_real_child_contract_parallel_cleanup_and_snapshot(tmp_path: Path) -
     assert any(call == ("--skill",) for call in runner.calls)
     starts = [call for call in runner.calls if call[:2] == ("agent", "start")]
     assert len(starts) == 2
-    assert all("-t" in call and call[call.index("-t") + 1] == "bot_room" for call in starts)
+    assert all("--toolsets" in call and
+               call[call.index("--toolsets") + 1] == "bot_room" for call in starts)
     assert all(
         "--max-turns" in call and call[call.index("--max-turns") + 1] == "1" for call in starts
     )

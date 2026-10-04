@@ -13,7 +13,7 @@ import os
 import subprocess
 import time
 import stat
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -48,6 +48,155 @@ DEFAULT_TELEMETRY = Path("/var/lib/agent-platform-herdr/telemetry.jsonl")
 DEFAULT_ADMISSION_AUDIT = Path("/var/lib/agent-platform-herdr/admission.jsonl")
 DEFAULT_ADMISSION_REGISTRY = Path("/var/lib/agent-platform-herdr/admission-registry.json")
 DEFAULT_PROFILE = "quantlab"
+_CHILD_FILE_TOOLS = frozenset({
+    "read_file", "search_files", "read", "write_file", "write", "patch", "review",
+})
+_CHILD_RUNTIME_PERMISSIONS = frozenset({"workspace-write"})
+
+
+def _child_toolsets(tools: Iterable[str]) -> str:
+    """Map admitted capabilities to an explicit Hermes model-tool allowlist."""
+    selected = frozenset(tools)
+    if selected - _CHILD_FILE_TOOLS:
+        raise HerdrRuntimeError("child_toolset_unmapped", ",".join(sorted(selected)))
+    # Hermes has toolset-level (not per-tool) filtering. The file bundle is
+    # constrained further by the OS workspace mount below. Empty legacy canary
+    # tasks get the zero-tool bot_room bundle.
+    return "file" if selected else "bot_room"
+
+
+def _validate_child_permissions(permissions: Iterable[str]) -> None:
+    """Fail closed unless every admitted permission has a runtime enforcement."""
+    selected = frozenset(permissions)
+    unknown = selected - _CHILD_RUNTIME_PERMISSIONS
+    if unknown:
+        raise HerdrRuntimeError("child_permission_unmapped", ",".join(sorted(unknown)))
+
+
+def _bounded_json_object(path: Path, *, max_bytes: int = 1024 * 1024) -> dict[str, object]:
+    """Read a small trusted control JSON without following a replacement symlink."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise HerdrRuntimeError("child_provider_preflight_failed", str(path)) from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
+            raise HerdrRuntimeError("child_provider_preflight_failed", str(path))
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            raw = handle.read(max_bytes + 1)
+        if len(raw) > max_bytes:
+            raise HerdrRuntimeError("child_provider_preflight_failed", str(path))
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    try:
+        value = json.loads(raw.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HerdrRuntimeError("child_provider_preflight_failed", str(path)) from exc
+    if not isinstance(value, dict):
+        raise HerdrRuntimeError("child_provider_preflight_failed", str(path))
+    return value
+
+
+def _nous_auth_expiry_epoch(profile_config: Path) -> float | None:
+    """Return the durable Nous inference-key expiry without exposing token bytes."""
+    profile_dir = profile_config.parent
+    candidates = [profile_dir / "auth.json"]
+    if profile_dir.parent.name == "profiles":
+        candidates.append(profile_dir.parent.parent / "auth.json")
+    for auth_path in candidates:
+        if not auth_path.is_file():
+            continue
+        store = _bounded_json_object(auth_path)
+        providers = store.get("providers")
+        state = providers.get("nous") if isinstance(providers, dict) else None
+        if not isinstance(state, dict):
+            continue
+        raw = state.get("agent_key_expires_at") or state.get("expires_at")
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        try:
+            parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return parsed.timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def _nous_min_child_ttl_seconds(env: Mapping[str, str]) -> int:
+    """Mirror Hermes' runtime-provider floor plus a handoff margin."""
+    raw = str(env.get("HERMES_NOUS_MIN_KEY_TTL_SECONDS", "1800") or "1800").strip()
+    try:
+        configured = int(raw)
+    except ValueError as exc:
+        raise HerdrRuntimeError("child_provider_preflight_failed", "invalid-nous-min-ttl") from exc
+    if configured < 0 or configured > 86400:
+        raise HerdrRuntimeError("child_provider_preflight_failed", "invalid-nous-min-ttl")
+    return max(60, configured) + 60
+
+
+def _trusted_hermes_profile_preflight(profile: str, *, executable: str, env: Mapping[str, str]) -> None:
+    """Refresh/validate provider auth outside the managed child sandbox.
+
+    The child profile itself stays read-only so model-visible file tools never gain
+    credential-store write authority. For Nous, require a pool key safely above
+    Hermes' own runtime minimum TTL; only then can child startup avoid the
+    auth-store writer/refresh path inside the read-only sandbox.
+    """
+    if not profile or not executable or not Path(executable).is_absolute():
+        raise HerdrRuntimeError("child_provider_preflight_invalid", profile or "missing-profile")
+    binary = Path(executable)
+    if not binary.is_file():
+        raise HerdrRuntimeError("child_provider_preflight_invalid", str(binary))
+    base_env = dict(env)
+    base_env.setdefault("HOME", "/home/agentops")
+
+    def run_checked(args: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                [str(binary), "-p", profile, *args], check=False, capture_output=True,
+                text=True, timeout=timeout, env=base_env)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise HerdrRuntimeError("child_provider_preflight_failed", profile) from exc
+
+    provider_proc = run_checked(["config", "get", "model.provider"], timeout=15.0)
+    provider = provider_proc.stdout.strip() if provider_proc.returncode == 0 else ""
+    if not provider or any(ch.isspace() for ch in provider):
+        raise HerdrRuntimeError("child_provider_preflight_failed", profile)
+
+    config_proc = run_checked(["config", "path"], timeout=15.0)
+    config_text = config_proc.stdout.strip() if config_proc.returncode == 0 else ""
+    profile_config = Path(config_text) if config_text else Path()
+    if not config_text or not profile_config.is_absolute() or profile_config.name != "config.yaml":
+        raise HerdrRuntimeError("child_provider_preflight_failed", provider)
+
+    def require_logged_in() -> None:
+        status_proc = run_checked(["auth", "status", provider], timeout=30.0)
+        status_lines = {line.strip().lower() for line in status_proc.stdout.splitlines()}
+        if status_proc.returncode != 0 or f"{provider.lower()}: logged in" not in status_lines:
+            raise HerdrRuntimeError("child_provider_preflight_failed", provider)
+
+    require_logged_in()
+    if provider.lower() != "nous":
+        return
+
+    threshold = time.time() + _nous_min_child_ttl_seconds(base_env)
+    expiry = _nous_auth_expiry_epoch(profile_config)
+    if expiry is None or expiry < threshold:
+        refresh_proc = run_checked(["auth", "refresh", provider], timeout=45.0)
+        if refresh_proc.returncode != 0:
+            raise HerdrRuntimeError("child_provider_preflight_failed", provider)
+        require_logged_in()
+        expiry = _nous_auth_expiry_epoch(profile_config)
+    if expiry is None or expiry < threshold:
+        raise HerdrRuntimeError("child_provider_preflight_failed", provider)
+
+
 MAX_PROMPT_CHARS = 1200
 
 
@@ -426,6 +575,7 @@ class HerdrChildRuntime:
         self._owned_panes: set[str] = set()
         self._reserved_agents: set[str] = set()
         self._reservation_panes: dict[str, str | None] = {}
+        self._sandbox_proofs: dict[str, dict[str, object]] = {}
         self._skill_checked = False
 
     def _require_context(self) -> None:
@@ -498,6 +648,14 @@ class HerdrChildRuntime:
         self._reserved_agents.add(lease.agent_id)
         self._reservation_panes[lease.agent_id] = None
 
+    def _preflight_child_provider(self) -> None:
+        """Trusted host-side credential refresh before the read-only child profile starts."""
+        if not isinstance(self.runner, SubprocessHerdrRunner):
+            return
+        profile = self.env.get("HERDR_HERMES_PROFILE", DEFAULT_PROFILE)
+        binary = self.env.get("HERDR_HERMES_BINARY", "/home/agentops/.local/bin/hermes")
+        _trusted_hermes_profile_preflight(profile, executable=binary, env=self.env)
+
     def _create_pane(self, index: int, marker: str | None = None,
                      policy_env: Mapping[str, str] | None = None) -> str:
         self._assert_prepared()
@@ -526,6 +684,9 @@ class HerdrChildRuntime:
 
     def _start_agent(self, lease: _Lease, pane_id: str) -> None:
         self._assert_prepared()
+        node = self.scheduler.task_node(lease.task_id)
+        toolsets = _child_toolsets(node.tools)
+        _validate_child_permissions(node.permissions)
         result = self.runner.run(
             [
                 "agent",
@@ -541,8 +702,8 @@ class HerdrChildRuntime:
                 "-p",
                 self.env.get("HERDR_HERMES_PROFILE", DEFAULT_PROFILE),
                 "chat",
-                "-t",
-                "bot_room",
+                "--toolsets",
+                toolsets,
                 "--max-turns",
                 "1",
                 "--run-budget",
@@ -673,13 +834,18 @@ class HerdrChildRuntime:
         sandbox_pid = sandbox.inner_pid(
             dict(process_info) if isinstance(process_info, Mapping) else {}, marker
         )
-        if not sandbox_pid or not sandbox.verify(sandbox_pid, Path(real), marker, policy=policy):
+        if not sandbox_pid or not sandbox.verify(
+                sandbox_pid, Path(real), marker, policy=policy):
             raise HerdrRuntimeError("child_sandbox_unverified", pane_id)
+        self._sandbox_proofs[pane_id] = {
+            "sandbox_pid": sandbox_pid,
+            "policy_sha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
+        }
         return policy
 
     def _child_workspace_writable(self, task_id: str) -> bool:
         node = self.scheduler.task_node(task_id)
-        write_tools = {"write_file", "write", "patch", "edit_file", "apply_patch", "shell"}
+        write_tools = {"write_file", "write", "patch"}
         return (node.role in {"writer", "reviewer"}
                 and "workspace-write" in node.permissions
                 and bool(write_tools.intersection(node.tools)))
@@ -811,6 +977,7 @@ class HerdrChildRuntime:
                 raise HerdrRuntimeError("real_herdr_required", "managed child needs real binary")
             self.prepare()
             self._admit_child(lease)
+            self._preflight_child_provider()
             pane_creation_attempted = True
             pane_id = self._create_pane(0, marker, policy_env)
             self._reservation_panes[lease.agent_id] = pane_id
@@ -818,6 +985,20 @@ class HerdrChildRuntime:
                                                           lease.agent_id, pane_id, marker):
                 raise HerdrRuntimeError("child_bind_denied", lease.task_id)
             policy = self._sandbox_child_pane(pane_id, marker, real, lease.task_id)
+            proof = self._sandbox_proofs.get(pane_id)
+            if (
+                not isinstance(proof, Mapping)
+                or not self.scheduler.attest_execution_sandbox(
+                    lease.task_id,
+                    run_token,
+                    lease.agent_id,
+                    pane_id,
+                    marker,
+                    sandbox_pid=int(proof.get("sandbox_pid") or 0),
+                    policy_sha256=str(proof.get("policy_sha256") or ""),
+                )
+            ):
+                raise HerdrRuntimeError("child_sandbox_attestation_denied", lease.task_id)
             self.scheduler.mark_pre_delivery_agent_start(lease.task_id)
             agent_start_attempted = True
             self._start_agent(lease, pane_id)

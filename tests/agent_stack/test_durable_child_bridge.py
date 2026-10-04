@@ -297,9 +297,13 @@ def test_post_prompt_error_remains_quarantined(tmp_path, monkeypatch):
         def _create_pane(self, *args):
             self._owned_panes.add("child-pane")
             return "child-pane"
-        def _sandbox_child_pane(self, *args):
+        def _sandbox_child_pane(self, pane_id, *args):
             policy = tmp_path / "policy"
-            policy.touch()
+            policy.write_text("policy", encoding="utf-8")
+            self._sandbox_proofs[pane_id] = {
+                "sandbox_pid": 123,
+                "policy_sha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
+            }
             return policy
         def _start_agent(self, *args):
             pass
@@ -832,6 +836,12 @@ def test_child_sandbox_workspace_scope_and_exact_result_mount(tmp_path, monkeypa
                                    pinned_worktree=pin)
         mounts = [(args[i], args[i + 1], args[i + 2])
                   for i in range(len(args) - 2) if args[i] in {"--bind", "--ro-bind"}]
+        # Provider egress + the abstract durable bridge require the host net
+        # namespace; network model-tools are filtered at Hermes toolset level.
+        assert "--unshare-net" not in args
+        assert not any(mode == "--bind" and target in {
+            str(sandbox.HOME / ".hermes"), str(sandbox.HOME / ".cache")}
+            for mode, _, target in mounts)
         assert (("--bind" if allowed else "--ro-bind"), pin.source, str(workspace)) in mounts
         assert ("--bind", str(workspace.parent), str(workspace.parent)) not in mounts
         assert ("--bind", str(mine), str(mine)) in mounts

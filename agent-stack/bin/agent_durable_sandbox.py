@@ -114,7 +114,7 @@ def command(
         "--chdir", str(workspace),
     ]
     seen = {workspace}
-    defaults = DEFAULT_WRITABLE if child_workspace_writable is None else DEFAULT_WRITABLE[:2]
+    defaults = DEFAULT_WRITABLE if child_workspace_writable is None else ()
     for raw in (*defaults, *writable):
         path = Path(raw)
         if not path.exists():
@@ -134,6 +134,18 @@ def command(
             continue
         seen.add(path)
         args += ["--bind", str(path), str(path)]
+
+    if child_workspace_writable is not None:
+        # The host Hermes profile (including credentials/config) stays read-only.
+        # Give a managed chat only ephemeral session and cache state.
+        for runtime_dir in (HOME / ".cache", HOME / ".hermes/sessions",
+                            HOME / ".hermes/cache", HOME / ".hermes/logs"):
+            if runtime_dir.is_dir():
+                args += ["--tmpfs", str(runtime_dir)]
+        # Keep the host network namespace: Hermes needs provider egress and
+        # the durable delegation bridge uses an abstract AF_UNIX socket, which
+        # is scoped by the network namespace. Network-capable model tools are
+        # denied by the explicit Hermes toolset allowlist instead.
 
     args += ["--tmpfs", str(HERDR_CONFIG), "--tmpfs", str(HERDR_RELEASES)]
     for path in {real_binary, real_binary.resolve(strict=True)}:

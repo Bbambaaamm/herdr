@@ -460,6 +460,18 @@ def create_task_session(task: dict) -> dict:
         if not sandbox_pid or not verify_sandbox(sandbox_pid, HERDR, pane_marker, policy=policy):
             raise RuntimeError("durable_sandbox_unverified")
         session["sandbox_pid"] = sandbox_pid
+        session["sandbox_attestation"] = {
+            "authority": "agent-task-worker",
+            "kind": "bwrap",
+            "task_id": str(task["id"]),
+            "run_token": str(task["run_token"]),
+            "agent_name": agent_name,
+            "pane_id": pane_id,
+            "marker": pane_marker,
+            "sandbox_pid": sandbox_pid,
+            "policy_sha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
+            "verified_at": utcnow().isoformat(),
+        }
         session["sandbox_verified"] = True
         write_json(Path(task_file), task)
         agent_start_attempted = True
@@ -930,7 +942,19 @@ def _block_task_locked(task_path: Path, task: dict, blocker: str, summary: str,
                        all_terminal: bool) -> None:
     task_id = str(task["id"])
     rp = result_path(task_id)
-    if not rp.exists():
+    try:
+        info = rp.lstat()
+    except FileNotFoundError:
+        info = None
+    except OSError as exc:
+        _defer_delivery_reconciliation_locked(
+            task_path, task, f"result metadata unavailable: {exc}", all_terminal)
+        return
+    if info is not None and not stat.S_ISREG(info.st_mode):
+        _defer_delivery_reconciliation_locked(
+            task_path, task, "result path is not a regular file", all_terminal)
+        return
+    if info is None or info.st_size == 0:
         write_json(
             rp,
             {

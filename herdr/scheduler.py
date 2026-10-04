@@ -319,6 +319,8 @@ class TaskRecord:
     execution_agent: str | None = None
     execution_pane: str | None = None
     execution_marker: str | None = None
+    execution_sandbox_verified: bool = False
+    execution_sandbox_attestation: dict[str, object] | None = None
     worktree_identity: str = ""
     cleanup_complete: bool = False
     pre_delivery_failure: str | None = None
@@ -1275,6 +1277,69 @@ class DynamicChildScheduler:
         self.audit_log.flush()
         return True
 
+    def attest_execution_sandbox(
+        self,
+        task_id: str,
+        run_token: str,
+        agent_name: str,
+        pane_id: str,
+        marker: str,
+        *,
+        sandbox_pid: int,
+        policy_sha256: str,
+    ) -> bool:
+        """Persist host-produced bwrap proof for the exact bound child session.
+
+        A pane binding is only identity/pre-delivery evidence. This attestation is
+        recorded separately and only after the runtime has proven the bwrap
+        PID/mount/policy boundary. Consumers such as the verification gate must
+        require this flag/attestation rather than infer trust from UI settlement.
+        """
+        rec = self._tasks.get(task_id)
+        identity = (agent_name, pane_id, marker)
+        expected = (rec.execution_agent, rec.execution_pane, rec.execution_marker) if rec else (None, None, None)
+        if (
+            rec is None
+            or rec.state is not LifecycleState.RUNNING
+            or rec.run_token != run_token
+            or rec.agent_id != agent_name
+            or expected != identity
+            or not isinstance(sandbox_pid, int)
+            or sandbox_pid <= 0
+            or not isinstance(policy_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", policy_sha256) is None
+        ):
+            return False
+        attestation = {
+            "authority": "herdr-runtime",
+            "kind": "bwrap",
+            "task_id": task_id,
+            "run_token": run_token,
+            "agent_name": agent_name,
+            "pane_id": pane_id,
+            "marker": marker,
+            "fencing_token": rec.fencing_token,
+            "worktree_identity": rec.worktree_identity,
+            "sandbox_pid": sandbox_pid,
+            "policy_sha256": policy_sha256,
+            "verified_at": datetime.now(UTC).isoformat(),
+        }
+        if rec.execution_sandbox_verified:
+            previous = rec.execution_sandbox_attestation or {}
+            comparable = {k: previous.get(k) for k in attestation if k != "verified_at"}
+            current = {k: v for k, v in attestation.items() if k != "verified_at"}
+            return comparable == current
+        rec.execution_sandbox_verified = True
+        rec.execution_sandbox_attestation = attestation
+        self.audit_log.append({
+            "event": "execution_sandbox_attested",
+            "task_id": task_id,
+            "run_token": run_token,
+            "attestation": attestation,
+        })
+        self.audit_log.flush()
+        return True
+
     def bind_pre_delivery_pane(self, task_id: str, run_token: str,
                                agent_name: str, pane_id: str, marker: str) -> bool:
         """Persist a created pane before starting its agent, for safe recovery."""
@@ -1473,6 +1538,9 @@ class DynamicChildScheduler:
                     "observed_at": rec.observed_at,
                     "execution_agent": rec.execution_agent,
                     "execution_pane": rec.execution_pane,
+                    "execution_marker": rec.execution_marker,
+                    "execution_sandbox_verified": rec.execution_sandbox_verified,
+                    "execution_sandbox_attestation": rec.execution_sandbox_attestation,
                     "worktree_identity": rec.worktree_identity,
                     "cleanup_complete": rec.cleanup_complete,
                     "pre_delivery_failure": rec.pre_delivery_failure,
@@ -1828,6 +1896,31 @@ class DynamicChildScheduler:
                     rec.execution_agent = str(e.get("agent_name", ""))
                     rec.execution_pane = str(e.get("pane_id", ""))
                     rec.execution_marker = str(e.get("marker", ""))
+            elif event_type == "execution_sandbox_attested":
+                rec = self._tasks.get(str(e.get("task_id", "")))
+                attestation = e.get("attestation")
+                if (
+                    rec is None
+                    or rec.run_token != str(e.get("run_token", ""))
+                    or not isinstance(attestation, dict)
+                    or attestation.get("authority") != "herdr-runtime"
+                    or attestation.get("kind") != "bwrap"
+                    or attestation.get("task_id") != rec.id
+                    or attestation.get("run_token") != rec.run_token
+                    or attestation.get("agent_name") != rec.execution_agent
+                    or attestation.get("pane_id") != rec.execution_pane
+                    or attestation.get("marker") != rec.execution_marker
+                    or attestation.get("fencing_token") != rec.fencing_token
+                    or attestation.get("worktree_identity") != rec.worktree_identity
+                    or not isinstance(attestation.get("sandbox_pid"), int)
+                    or int(attestation.get("sandbox_pid", 0)) <= 0
+                    or not isinstance(attestation.get("policy_sha256"), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", str(attestation.get("policy_sha256"))) is None
+                    or not isinstance(attestation.get("verified_at"), str)
+                ):
+                    raise SchedulerError("invalid child sandbox attestation")
+                rec.execution_sandbox_verified = True
+                rec.execution_sandbox_attestation = dict(attestation)
             elif event_type == "child_agent_start_attempted":
                 rec = self._tasks.get(str(e.get("task_id", "")))
                 if rec is None or rec.run_token != e.get("run_token") or not rec.execution_pane:

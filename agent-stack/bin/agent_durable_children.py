@@ -15,6 +15,9 @@ from herdr.taskgraph import LifecycleState
 from herdr.runtime import AdmissionRegistry, HerdrChildRuntime, SubprocessHerdrRunner
 
 LEDGER_REQUIRED = "scheduler.required"
+# Child evidence is a compact JSON envelope. Bound hostile files before decoding
+# so replay cannot grow memory with an untrusted result path.
+MAX_CHILD_RESULT_BYTES = 128 * 1024
 
 
 def attempt_directory(root: Path, parent_task_id: str, run_token: str) -> Path:
@@ -71,11 +74,25 @@ def publish_exact_child_result(scheduler: DynamicChildScheduler, rec, result_pat
     """Publish only a result bound to this delegated child's current attempt."""
     try:
         _require_real_directory(result_path.parent)
-        if not stat.S_ISREG(result_path.lstat().st_mode):
-            raise ValueError("child result is not a regular file")
+        fd = os.open(result_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) |
+                     getattr(os, "O_NONBLOCK", 0))
     except FileNotFoundError:
         return None
-    result = json.loads(result_path.read_text(encoding="utf-8"))
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("child result is not a regular file")
+        if info.st_size > MAX_CHILD_RESULT_BYTES:
+            raise ValueError("child result exceeds size limit")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            raw = handle.read(MAX_CHILD_RESULT_BYTES + 1)
+        if len(raw) > MAX_CHILD_RESULT_BYTES:
+            raise ValueError("child result exceeds size limit")
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    result = json.loads(raw.decode("utf-8", errors="strict"))
     if not isinstance(result, dict):
         raise ValueError("child result invalid")
     evidence = result.get("evidence")
