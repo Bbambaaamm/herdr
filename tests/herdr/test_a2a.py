@@ -155,6 +155,30 @@ def test_direct_message(tmp_path):
         Gateway(transport, store, card, policy).poll(identity)
 
 
+def test_message_response_with_task_id_binds_existing_remote_task(tmp_path):
+    _, card, policy, identity, store = setup(tmp_path)
+    transport = Mock({"message": {
+        "messageId": "reply-task-1",
+        "contextId": "remote-context",
+        "taskId": "remote-task",
+        "role": "ROLE_AGENT",
+        "parts": [{"text": "task accepted"}],
+    }})
+    candidates = Gateway(transport, store, card, policy).send(identity, "question")
+    assert candidates[0].remote_task_id == "remote-task"
+    assert candidates[0].remote_context_id == "remote-context"
+    bound = store.read()
+    assert bound["delivery"] == "bound"
+    assert bound["remote_task_id"] == "remote-task"
+    assert bound["remote_context_id"] == "remote-context"
+    assert bound["last_observation"] == "message"
+
+    transport.response = task("TASK_STATE_WORKING")
+    assert Gateway(transport, store, card, policy).poll(identity) == ()
+    assert transport.gets == [{"id": "remote-task"}]
+    assert len(transport.sends) == 1
+
+
 def test_malformed_and_secret_card_and_results(tmp_path):
     raw, card, policy, identity, store = setup(tmp_path)
     for bad in ({**raw, "supportedInterfaces": [{**raw["supportedInterfaces"][0], "protocolVersion": "1.0.1"}]},

@@ -287,7 +287,7 @@ class BindingStore:
             raise A2AError("invalid remote binding")
         if data["delivery"] != "bound" and data["remote_task_id"] is not None:
             raise A2AError("invalid remote binding")
-        if data["last_observation"] is not None and data["last_observation"] not in _STATES | {"direct"}:
+        if data["last_observation"] is not None and data["last_observation"] not in _STATES | {"direct", "message"}:
             raise A2AError("invalid observation")
         return data
 
@@ -376,9 +376,11 @@ def _parse_response(raw: Any, identity: Identity, binding: dict[str, Any] | None
         if "contextId" not in msg:
             raise A2AError("agent message requires contextId")
         context = _id(msg["contextId"], "contextId")
-        if "taskId" in msg:
-            _id(msg["taskId"], "taskId")
-        return "direct", None, context, (_candidate(identity, None, context, "message", msg),)
+        task_id = _id(msg["taskId"], "taskId") if "taskId" in msg else None
+        observation = "message" if task_id is not None else "direct"
+        return observation, task_id, context, (
+            _candidate(identity, task_id, context, "message", msg),
+        )
     task = _object(envelope["task"], {"id", "contextId", "status", "artifacts", "history", "metadata"}, {"id", "status"})
     task_id = _id(task["id"], "task id")
     context = _id(task["contextId"], "context id") if "contextId" in task else None
