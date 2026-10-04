@@ -146,3 +146,30 @@ def test_search_deadline_applies_during_directory_enumeration(tmp_path,monkeypat
             authority.list_regular_files(str(root),deadline=9)
         assert seen==[0]
     finally: authority.close()
+
+@pytest.mark.parametrize("preimage",["old","stale",""])
+def test_conditional_shared_workspace_replace_denies_without_any_publication(tmp_path,monkeypatch,preimage):
+    import herdr.file_authority as module
+    root=tmp_path/"workspace";root.mkdir();target=root/"file.txt";target.write_text("concurrent data")
+    authority=module.RootFDWorkspace((str(root),))
+    published=[]
+    monkeypatch.setattr(module.os,"replace",lambda *args,**kwargs:published.append(args))
+    try:
+        with pytest.raises(module.FileAuthorityError,match="conditional replacement unavailable"):
+            authority.write_text(str(target),"proposed patch",expected_content=preimage)
+        assert target.read_text()=="concurrent data"
+        assert not published and sorted(item.name for item in root.iterdir())==["file.txt"]
+    finally: authority.close()
+
+@pytest.mark.parametrize("mode",[0o644,0o755])
+def test_explicit_write_preserves_existing_mode_under_restrictive_umask(tmp_path,mode):
+    import os,stat
+    from herdr.file_authority import RootFDWorkspace
+    target=tmp_path/"entry";target.write_text("old");target.chmod(mode)
+    authority=RootFDWorkspace((str(tmp_path),));previous=os.umask(0o077)
+    try:
+        authority.write_text(str(target),"new")
+        assert target.read_text()=="new"
+        assert stat.S_IMODE(target.stat().st_mode)==mode
+    finally:
+        os.umask(previous);authority.close()

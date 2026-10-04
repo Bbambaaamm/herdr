@@ -473,3 +473,77 @@ def test_policy_evidence_replay_rejects_tampering_in_the_protected_log(tmp_path)
     path.write_text("".join(json.dumps(event)+"\n" for event in events))
     with pytest.raises(SchedulerError,match="invocation policy"):
         DynamicChildScheduler(audit_log=AuditLog(path)).replay()
+
+
+def upgraded_proof(evidence):
+    from tests.policy_launch_fakes import policy_fixture
+    identity=InvocationIdentity.from_dict(evidence["identity"])
+    proof=policy_fixture(identity,modern=True)
+    proof.update({key:value for key,value in evidence.items() if key!="schema_version"})
+    proof["bootstrap"]["continuation"]["bundle_sha256"]=evidence["bundle_sha256"]
+    return proof
+
+def attest_proof(scheduler,record,marker,evidence):
+    return scheduler.attest_execution_sandbox(record.id,record.run_token,record.agent_id,
+        "child-pane",marker,sandbox_pid=123,policy_sha256="f"*64,invocation_policy=evidence)
+
+def test_bootstrap_upgrade_flushes_and_replays_same_attempt(tmp_path,monkeypatch):
+    from herdr.scheduler import DynamicChildScheduler,AuditLog
+    scheduler,record,marker,evidence=proof_scheduler(tmp_path)
+    assert attest_proof(scheduler,record,marker,evidence)
+    scheduler.mark_pre_delivery_agent_start(record.id)
+    upgraded=upgraded_proof(evidence)
+    flushed=[];original=scheduler.audit_log.flush
+    def flush():
+        original()
+        # Publication must still expose the shell-only proof until fsync returns.
+        flushed.append(record.execution_sandbox_attestation["invocation_policy"]["schema_version"])
+    monkeypatch.setattr(scheduler.audit_log,"flush",flush)
+    identity=(record.run_token,record.fencing_token,record.idempotency_key,record.attempts)
+    assert attest_proof(scheduler,record,marker,upgraded)
+    assert flushed==["herdr-policy-launch-2"]
+    assert attest_proof(scheduler,record,marker,upgraded) # exact retry is an idempotent read
+    assert len(flushed)==1
+    recovered=DynamicChildScheduler(audit_log=AuditLog(tmp_path/"proof-events"))
+    recovered.replay()
+    replayed=recovered._tasks[record.id]
+    assert replayed.execution_sandbox_attestation["invocation_policy"]==upgraded
+    assert (replayed.run_token,replayed.fencing_token,replayed.idempotency_key,replayed.attempts)==identity
+    events=[json.loads(line) for line in (tmp_path/"proof-events").read_text().splitlines()]
+    assert sum(event["event"]=="execution_bootstrap_attested" for event in events)==1
+
+@pytest.mark.parametrize("fault",["start-intent","bundle","tree","grant","shell","fence","peer-identity"])
+def test_bootstrap_upgrade_cannot_rewrite_sealed_launch(tmp_path,fault):
+    scheduler,record,marker,evidence=proof_scheduler(tmp_path)
+    assert attest_proof(scheduler,record,marker,evidence)
+    if fault!="start-intent": scheduler.mark_pre_delivery_agent_start(record.id)
+    proof=upgraded_proof(evidence)
+    if fault=="bundle":
+        proof["bundle_sha256"]="1"*64
+        proof["bootstrap"]["continuation"]["bundle_sha256"]="1"*64
+    elif fault=="tree": proof["tree_identities"][str(CODE_TARGET)]["inode"]+=1
+    elif fault=="grant":proof["grant_sha256"]="1"*64
+    elif fault=="shell":proof["process_start_ticks"]+=1
+    elif fault=="fence":proof["identity"]["fencing_token"]+=1
+    elif fault=="peer-identity":proof["bootstrap"]["continuation"]["identity"]["run_token"]="foreign"
+    assert not attest_proof(scheduler,record,marker,proof)
+    assert record.execution_sandbox_attestation["invocation_policy"]["schema_version"]=="herdr-policy-launch-2"
+
+def test_bootstrap_upgrade_replay_requires_preexisting_start_intent(tmp_path):
+    from herdr.scheduler import DynamicChildScheduler,AuditLog,SchedulerError
+    scheduler,record,marker,evidence=proof_scheduler(tmp_path)
+    assert attest_proof(scheduler,record,marker,evidence)
+    scheduler.mark_pre_delivery_agent_start(record.id)
+    assert attest_proof(scheduler,record,marker,upgraded_proof(evidence))
+    path=tmp_path/"proof-events"
+    events=[json.loads(line) for line in path.read_text().splitlines()]
+    path.write_text("".join(json.dumps(event)+"\n" for event in events
+                           if event["event"]!="child_agent_start_attempted"))
+    with pytest.raises(SchedulerError,match="bootstrap upgrade"):
+        DynamicChildScheduler(audit_log=AuditLog(path)).replay()
+
+
+def test_fresh_bootstrap_receipt_cannot_skip_shell_and_start_intent(tmp_path):
+    scheduler,record,marker,evidence=proof_scheduler(tmp_path)
+    assert not attest_proof(scheduler,record,marker,upgraded_proof(evidence))
+    assert not record.execution_sandbox_verified

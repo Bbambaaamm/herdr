@@ -728,7 +728,8 @@ class HerdrChildRuntime:
 
     def _verify_live_child(self, agent_id: str, pane_id: str, marker: str,
                            *, require_sandbox: bool = False,
-                           require_owned: bool = True) -> str:
+                           require_owned: bool = True,
+                           require_bootstrap: bool = True) -> str:
         if require_owned and pane_id not in self._owned_panes:
             raise HerdrRuntimeError("child_pane_unowned", pane_id)
         payload = _json_result(self.runner.run(["agent", "get", agent_id]), "agent get")
@@ -786,6 +787,29 @@ class HerdrChildRuntime:
         if not marker_ok:
             raise HerdrRuntimeError("child_sandbox_missing" if require_sandbox
                                     else "child_marker_missing", pane_id)
+        if require_sandbox and require_bootstrap:
+            matching=[rec for rec in self.scheduler._tasks.values()
+                      if (rec.agent_id,rec.execution_agent,rec.execution_pane,rec.execution_marker)
+                         ==(agent_id,agent_id,pane_id,marker)]
+            if len(matching)!=1:
+                raise HerdrRuntimeError("child_bootstrap_identity_missing",pane_id)
+            rec=matching[0]
+            proof=rec.execution_sandbox_attestation
+            if not rec.execution_sandbox_verified or not isinstance(proof,dict):
+                raise HerdrRuntimeError("child_bootstrap_proof_missing",pane_id)
+            from .policy_launch import verify_retained_policy_evidence
+            from .security import InvocationIdentity,SecurityError
+            identity=InvocationIdentity(consumer="github:"+rec.repo,agent_id=rec.agent_id,
+                parent_agent_id=rec.parent_agent_id,parent_task_id=rec.parent_task_id,
+                task_id=rec.id,run_token=rec.run_token,fencing_token=rec.fencing_token)
+            original={key:proof[key] for key in ("authority","task_id","run_token","sandbox_pid",
+                      "fencing_token","agent_name","pane_id","marker","worktree_identity")
+                      if key in proof}
+            try:
+                verify_retained_policy_evidence(proof.get("invocation_policy"),identity=identity,
+                    pid=proof.get("sandbox_pid"),attestation=original)
+            except (SecurityError,OSError,ValueError,TypeError) as exc:
+                raise HerdrRuntimeError("child_bootstrap_unverified",pane_id) from exc
         return str(agent.get("agent_status") or agent.get("status") or "").lower()
 
     def _child_result_writable(self, task_id: str) -> tuple[Path, ...]:
@@ -903,7 +927,7 @@ class HerdrChildRuntime:
                 if not agent or not marker or agent != rec.agent_id:
                     raise HerdrRuntimeError("child_cleanup_unproven", pane_id)
                 self._verify_live_child(agent, pane_id, marker, require_sandbox=True,
-                                        require_owned=False)
+                                        require_owned=False,require_bootstrap=False)
             else:
                 self.admission_registry.release(
                     rec.agent_id, now=self.scheduler.current_time(),
@@ -954,7 +978,7 @@ class HerdrChildRuntime:
             self._verify_created_pane_marker(pane_id, marker)
             if agent_start_attempted:
                 self._verify_live_child(lease.agent_id, pane_id, marker,
-                                        require_sandbox=True)
+                                        require_sandbox=True,require_bootstrap=False)
             result = self.runner.run(["pane", "close", pane_id], timeout_seconds=15.0)
             if result.returncode != 0:
                 listed = _json_result(self.runner.run(["pane", "list"]), "pane list")

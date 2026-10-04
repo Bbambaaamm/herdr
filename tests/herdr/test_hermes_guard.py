@@ -586,3 +586,37 @@ def test_duplicate_v4a_add_targets_deny_before_any_file_effect(tmp_path):
         assert result.error=="duplicate V4A Add target"
         assert applied==[] and not (root/"new.txt").exists()
     finally: authority.close()
+
+
+@pytest.mark.parametrize("expected,actual",[
+    ("https://gateway.example/v1?tenant=approved/","https://gateway.example/v1?tenant=approved"),
+    ("https://gateway.example/v1//","https://gateway.example/v1/"),
+])
+def test_auxiliary_transport_rejects_distinct_query_or_path(expected,actual):
+    route=types.SimpleNamespace(provider="provider-a",base_url=expected,api_mode="openai")
+    guard=types.SimpleNamespace(grant=types.SimpleNamespace(provider_routes=(route,)))
+    client=types.SimpleNamespace(base_url=actual)
+    with pytest.raises(PolicyDenied,match="provider_endpoint_denied"):
+        hermes_guard._effective_aux_route(guard,client,"provider-a","openai")
+    client.base_url=expected
+    assert hermes_guard._effective_aux_route(guard,client,"provider-a","openai") is route
+
+
+def test_v4a_update_denies_before_earlier_add_can_mutate(tmp_path):
+    from herdr.file_authority import RootFDWorkspace
+    root=tmp_path/"workspace";root.mkdir();target=root/"existing";target.write_text("original")
+    class Result:
+        def __init__(self,**kwargs):self.__dict__.update(kwargs)
+    applied=[]
+    parser=types.SimpleNamespace(parse_v4a_patch=lambda raw:([
+        types.SimpleNamespace(file_path=str(root/"new"),operation=types.SimpleNamespace(value="add")),
+        types.SimpleNamespace(file_path=str(target),operation=types.SimpleNamespace(value="update"))],None),
+        apply_v4a_operations=lambda *args:applied.append(args))
+    authority=RootFDWorkspace((str(root),))
+    try:
+        ops=hermes_guard._PolicyFileOps(authority,types.SimpleNamespace(),
+            types.SimpleNamespace(PatchResult=Result),parser)
+        result=ops.patch_v4a("add then unsupported update")
+        assert "conditional replacement unavailable" in result.error
+        assert applied==[] and target.read_text()=="original" and not (root/"new").exists()
+    finally:authority.close()

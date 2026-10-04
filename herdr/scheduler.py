@@ -1357,6 +1357,9 @@ class DynamicChildScheduler:
                     invocation_policy, identity=policy_identity)
             except (SecurityError, TypeError, ValueError):
                 return False
+        if not rec.execution_sandbox_verified and (
+                attestation.get("invocation_policy") or {}).get("schema_version")=="herdr-policy-launch-3":
+            return False
         if rec.execution_sandbox_verified:
             previous = rec.execution_sandbox_attestation or {}
             comparable = {k: previous.get(k) for k in attestation if k != "verified_at"}
@@ -2014,6 +2017,9 @@ class DynamicChildScheduler:
                             task_id=rec.id, run_token=rec.run_token, fencing_token=rec.fencing_token))
                     except (SecurityError, TypeError, ValueError) as exc:
                         raise SchedulerError("invalid child invocation policy evidence") from exc
+                if event_type=="execution_sandbox_attested" and (
+                        attestation.get("invocation_policy") or {}).get("schema_version")=="herdr-policy-launch-3":
+                    raise SchedulerError("bootstrap proof requires attested upgrade")
                 if event_type=="execution_bootstrap_attested" and not self._bootstrap_upgrade_allowed(
                         rec,rec.execution_sandbox_attestation or {},attestation):
                     raise SchedulerError("invalid authenticated bootstrap upgrade")

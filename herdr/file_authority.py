@@ -6,11 +6,53 @@ import errno
 import hashlib
 import os
 import stat
+import fcntl
+import threading
+import weakref
+from contextlib import contextmanager
 import time
 from pathlib import Path
 from typing import Iterable
 
 MAX_FILE_BYTES = 32 * 1024 * 1024
+
+
+_WRITER_LOCKS=weakref.WeakValueDictionary()
+_WRITER_LOCKS_GUARD=threading.Lock()
+
+@contextmanager
+def _writer_locks(*parents):
+    """Serialize cooperating root-FD writers, with a finite wait and stable inodes."""
+    unique={}
+    for parent in parents:
+        info=os.fstat(parent)
+        unique[(info.st_dev,info.st_ino)]=parent
+    locks=[];fds=[]
+    deadline=time.monotonic()+2
+    try:
+        for key,parent in sorted(unique.items()):
+            with _WRITER_LOCKS_GUARD:
+                lock=_WRITER_LOCKS.get(key)
+                if lock is None:
+                    lock=threading.RLock();_WRITER_LOCKS[key]=lock
+            if not lock.acquire(timeout=max(0,deadline-time.monotonic())):
+                raise FileAuthorityError("workspace writer lock unavailable")
+            locks.append(lock)
+            fd=os.open(".",os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC,dir_fd=parent)
+            fds.append(fd)
+            while True:
+                try:
+                    fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);break
+                except BlockingIOError:
+                    if time.monotonic()>=deadline:
+                        raise FileAuthorityError("workspace writer lock unavailable")
+                    time.sleep(0.01)
+        yield
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+        for lock in reversed(locks):
+            lock.release()
 
 
 class FileAuthorityError(OSError):
@@ -265,7 +307,9 @@ class RootFDWorkspace:
         parent, name = self._parent(path, create=True)
         temp = f".herdr-policy-{os.getpid()}-{os.urandom(12).hex()}"
         temp_fd = -1
+        writer=_writer_locks(parent)
         try:
+            writer.__enter__()
             temp_fd = os.open(
                 temp,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
@@ -297,6 +341,7 @@ class RootFDWorkspace:
                 os.unlink(temp, dir_fd=parent)
             except FileNotFoundError:
                 pass
+            writer.__exit__(None,None,None)
             os.close(parent)
 
     def create_text(self, path: str, content: str) -> tuple[int, str]:
@@ -306,13 +351,20 @@ class RootFDWorkspace:
             raise FileAuthorityError("policy-mode text is not UTF-8 encodable") from exc
         return self.create_bytes(path, raw)
 
-    def write_bytes(self, path: str, content: bytes) -> tuple[int, str]:
+    def write_bytes(self, path: str, content: bytes, *, expected_content: bytes|None=None) -> tuple[int, str]:
         if len(content) > MAX_FILE_BYTES:
             raise FileAuthorityError("write exceeds policy-mode bound")
+        if expected_content is not None:
+            # Linux rename cannot atomically compare an arbitrary raw writer's
+            # file preimage. Advisory locks do not establish exclusivity.
+            # Do not report a successful conditional replacement with a race.
+            raise FileAuthorityError("conditional replacement unavailable on shared workspace")
         parent, name = self._parent(path, create=True)
         temp = f".herdr-policy-{os.getpid()}-{os.urandom(12).hex()}"
         temp_fd = -1
+        writer=_writer_locks(parent)
         try:
+            writer.__enter__()
             mode = 0o644
             try:
                 current = os.stat(name, dir_fd=parent, follow_symlinks=False)
@@ -328,6 +380,8 @@ class RootFDWorkspace:
                 mode,
                 dir_fd=parent,
             )
+            if current is not None:
+                os.fchmod(temp_fd,mode)
             view = memoryview(content)
             while view:
                 written = os.write(temp_fd, view)
@@ -347,30 +401,41 @@ class RootFDWorkspace:
                 os.unlink(temp, dir_fd=parent)
             except FileNotFoundError:
                 pass
+            writer.__exit__(None,None,None)
             os.close(parent)
 
-    def write_text(self, path: str, content: str) -> tuple[int, str]:
+    def write_text(self, path: str, content: str, *, expected_content: str|None=None) -> tuple[int, str]:
         try:
             raw = content.encode("utf-8")
         except UnicodeEncodeError as exc:
             raise FileAuthorityError("policy-mode text is not UTF-8 encodable") from exc
-        return self.write_bytes(path, raw)
+        expected=None
+        if expected_content is not None:
+            if not isinstance(expected_content,str):
+                raise FileAuthorityError("text content expectation required")
+            expected=expected_content.encode("utf-8")
+        return self.write_bytes(path, raw, expected_content=expected)
 
     def delete_file(self, path: str) -> None:
         parent, name = self._parent(path)
+        writer=_writer_locks(parent)
         try:
+            writer.__enter__()
             info = os.stat(name, dir_fd=parent, follow_symlinks=False)
             if not stat.S_ISREG(info.st_mode):
                 raise FileAuthorityError("delete target is not a regular file")
             os.unlink(name, dir_fd=parent)
             os.fsync(parent)
         finally:
+            writer.__exit__(None,None,None)
             os.close(parent)
 
     def move_file(self, source: str, destination: str) -> None:
         src_parent, src_name = self._parent(source)
         dst_parent, dst_name = self._parent(destination, create=True)
+        writer=_writer_locks(src_parent,dst_parent)
         try:
+            writer.__enter__()
             source_info = os.stat(src_name, dir_fd=src_parent, follow_symlinks=False)
             if not stat.S_ISREG(source_info.st_mode):
                 raise FileAuthorityError("move source is not a regular file")
@@ -379,6 +444,7 @@ class RootFDWorkspace:
             if dst_parent != src_parent:
                 os.fsync(dst_parent)
         finally:
+            writer.__exit__(None,None,None)
             os.close(src_parent)
             os.close(dst_parent)
 

@@ -248,10 +248,15 @@ class BootstrapAuthority:
         stage1_inspector: Callable[[int, str], tuple[int, int, str]] = inspect_stage1,
         peer_authorizer: Callable[[PeerProcess, BootstrapExpectation], bool] | None = None,
         clock: Callable[[], float] = time.time,
+        require_root_owned_stage0: bool = True,
     ) -> None:
         info = os.stat(stage0_path)
         if not stat.S_ISREG(info.st_mode):
             raise BootstrapAuthorityError("stage-zero interpreter must be regular")
+        if type(require_root_owned_stage0) is not bool:
+            raise BootstrapAuthorityError("explicit host stage-zero ownership requirement")
+        if require_root_owned_stage0 and (info.st_uid != 0 or info.st_mode & 0o022):
+            raise BootstrapAuthorityError("host stage-zero interpreter must be root-owned and immutable")
         if not callable(peer_authorizer):
             raise BootstrapAuthorityError("host peer authorizer required")
         self._stage0 = (info.st_dev, info.st_ino)
@@ -272,6 +277,7 @@ class BootstrapAuthority:
         self._connection_peers: set[int] = set()
         self._connection_threads: set[threading.Thread] = set()
         self._closed = False
+        self._preauthorized: dict[socket.socket, tuple[str,int,int]] = {}
 
     def _prune(self):
         now = self._clock()
@@ -340,10 +346,15 @@ class BootstrapAuthority:
         # The host integration (#82) must independently bind this exact peer
         # to the already-attested launch intent/process identity. Merely being
         # a child of the pane shell with readable public digests is not enough.
-        try:
-            authorized = self._authorize_peer(peer, expectation) is True
-        except Exception as exc:
-            raise BootstrapAuthorityError("host peer authorization failed") from exc
+        with self._lock:
+            preauthorized=self._preauthorized.get(connection)
+        if preauthorized is not None:
+            authorized=preauthorized==(key,peer.pid,peer.start_ticks)
+        else:
+            try:
+                authorized = self._authorize_peer(peer, expectation) is True
+            except Exception as exc:
+                raise BootstrapAuthorityError("host peer authorization failed") from exc
         if not authorized:
             raise BootstrapAuthorityError("stage-one peer not host-authorized")
         stage1_device, stage1_inode, stage1_sha256 = self._inspect_stage1(pid, self._stage1_path)
@@ -423,13 +434,19 @@ class BootstrapAuthority:
                 expected = tuple(self._expected.values())
                 if self._closed or pid in self._connection_peers:
                     raise BootstrapAuthorityError("bootstrap peer already serving")
-            candidate = next((item for item in expected
-                              if item.parent_pid == peer.ppid), None)
-            if candidate is None or self._inspect(candidate.parent_pid).start_ticks != candidate.parent_start_ticks:
-                raise BootstrapAuthorityError("bootstrap peer has no registered parent")
-            if self._inspect_stage1(pid,self._stage1_path) != (
-                    candidate.stage1_device,candidate.stage1_inode,candidate.stage1_sha256):
-                raise BootstrapAuthorityError("ineligible bootstrap source")
+            source=self._inspect_stage1(pid,self._stage1_path)
+            candidate=None
+            for item in expected:
+                if (item.parent_pid!=peer.ppid
+                        or self._inspect(item.parent_pid).start_ticks!=item.parent_start_ticks
+                        or source!=(item.stage1_device,item.stage1_inode,item.stage1_sha256)):
+                    continue
+                try: allowed=self._authorize_peer(peer,item) is True
+                except Exception: allowed=False
+                if allowed:
+                    candidate=item;break
+            if candidate is None:
+                raise BootstrapAuthorityError("bootstrap peer not host-authorized")
             if not self._connection_slots.acquire(blocking=False):
                 raise BootstrapAuthorityError("bootstrap connection capacity exhausted")
             with self._lock:
@@ -437,6 +454,7 @@ class BootstrapAuthority:
                     self._connection_slots.release()
                     raise BootstrapAuthorityError("bootstrap peer already serving")
                 self._connection_peers.add(pid)
+                self._preauthorized[connection]=(identity_key(candidate.identity),pid,peer.start_ticks)
             def run():
                 try:
                     with connection:
@@ -444,6 +462,7 @@ class BootstrapAuthority:
                         self.handle_connection(connection)
                 finally:
                     with self._lock:
+                        self._preauthorized.pop(connection,None)
                         self._connection_peers.discard(pid)
                         self._connection_threads.discard(threading.current_thread())
                     self._connection_slots.release()
@@ -452,6 +471,7 @@ class BootstrapAuthority:
             try: thread.start()
             except BaseException:
                 with self._lock:
+                    self._preauthorized.pop(connection,None)
                     self._connection_peers.discard(pid)
                     self._connection_threads.discard(thread)
                 self._connection_slots.release()

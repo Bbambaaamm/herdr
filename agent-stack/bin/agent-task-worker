@@ -67,7 +67,7 @@ def persist_execution_session(task: dict, *, startup=True) -> None:
         current = dict(task)
     else:
         current = json.loads(canonical.read_text(encoding="utf-8"))
-        for field in ("id", "run_token", "idempotency_key", "attempts"):
+        for field in ("id", "run_token", "idempotency_key", "attempts", "fencing_token"):
             if current.get(field) != task.get(field):
                 raise RuntimeError("task_session_canonical_identity_changed")
         if startup and canonical.parent in (DONE, BLOCKED, FAILED):

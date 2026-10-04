@@ -169,7 +169,7 @@ def test_cleanup_bound_child_proves_live_binding(tmp_path: Path, monkeypatch, ca
     monkeypatch.setattr(runtime.admission_registry, "release",
                         lambda agent, **kw: releases.append(agent))
     verified = []
-    def verify(agent, pane, marker, *, require_sandbox=False, require_owned=True):
+    def verify(agent, pane, marker, *, require_sandbox=False, require_owned=True, require_bootstrap=True):
         verified.append((agent, pane, marker, require_sandbox, require_owned))
         if case in {"reused_pane", "wrong_marker"}:
             raise HerdrRuntimeError("child_marker_missing", pane)

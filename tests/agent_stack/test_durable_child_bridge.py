@@ -300,9 +300,11 @@ def test_post_prompt_error_remains_quarantined(tmp_path, monkeypatch):
         def _sandbox_child_pane(self, pane_id, *args):
             policy = tmp_path / "policy"
             policy.write_text("policy", encoding="utf-8")
+            from tests.policy_launch_fakes import policy_fixture
             self._sandbox_proofs[pane_id] = {
                 "sandbox_pid": 123,
                 "policy_sha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
+                "invocation_policy":policy_fixture(self._policy_launches[args[-1]].identity),
             }
             return policy
         def _start_agent(self, *args):

@@ -145,7 +145,7 @@ class _PolicyFileOps:
 
     def write_file(self, path: str, content: str, pre_content: str | None = None) -> Any:
         try:
-            count, digest = self._workspace.write_text(path, content)
+            count, digest = self._workspace.write_text(path, content, expected_content=pre_content)
         except (OSError, FileAuthorityError) as exc:
             return self._common.WriteResult(error=str(exc))
         return self._common.WriteResult(
@@ -180,6 +180,9 @@ class _PolicyFileOps:
         operations, error = self._patch_parser.parse_v4a_patch(patch_content)
         if error:
             return self._common.PatchResult(error=error)
+
+        if any(getattr(getattr(op,"operation",None),"value",None)=="update" for op in operations):
+            return self._common.PatchResult(error="conditional replacement unavailable on shared workspace")
 
         # V4A Add is create-only. The parser's generic apply path calls
         # write_file for both Add and Update, so interpose only the first write
@@ -342,7 +345,7 @@ def _bind_pool_credential(pool: Any, raw: str, provider: str, refs: tuple[str, .
 
 
 def _endpoint(value: Any) -> str:
-    return str(value or "").rstrip("/")
+    return str(value or "")
 
 
 def _effective_aux_route(guard: InvocationGuard, client: Any, provider: Any, api_mode: Any) -> Any:

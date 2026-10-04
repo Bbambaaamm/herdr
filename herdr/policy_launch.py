@@ -613,7 +613,7 @@ class HostPolicyLaunchFactory:
             _require(identity.parent_task_id == self.parent_grant.identity.task_id
                      and identity.parent_agent_id == self.parent_grant.identity.agent_id,
                      "host parent grant identity mismatch")
-            grant.require_subset_of(self.parent_grant)
+            grant.require_logical_subset_of(self.parent_grant)
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
         snapshots, stage = [], None
         try:

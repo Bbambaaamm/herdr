@@ -27,6 +27,7 @@ PYTHON_PATH = PYTHON_ROOT / "bin/python3.11"
 STAGE0_PYTHON = Path("/usr/bin/python3")
 STAGE2 = POLICY_CODE_ROOT / "agent-stack/bin/agent-hermes-policy-run"
 PYTHON_SHA256 = "1e761eb19d6f2594ab8dc64bd99ad4e1753589f3bf1ec199e4eef3aaa21e3930"
+PYTHON_STDLIB_SHA256 = "330e97044fcb6873bc76ab37b63bfcd8c9a081d64d285adea164d3f72b548c2e"
 PROOF_VERSION = "herdr-policy-bootstrap-1"
 PROOF_AUTHORITY = "herdr-host-frozen-tree"
 PROOF_ENV = "HERDR_POLICY_STAGE1_PROOF_SHA256"
@@ -69,8 +70,12 @@ def _require_independent_stage0() -> None:
         _fail("independent stage-zero interpreter unavailable")
     if (active.st_dev, active.st_ino) != (trusted.st_dev, trusted.st_ino):
         _fail("stage-one did not start from the independent system interpreter")
-    if trusted.st_uid != 0 or trusted.st_mode & 0o022:
-        _fail("independent system interpreter is not root-owned immutable host code")
+    # Linux user namespaces can expose the host root owner as overflow UID.
+    # Guest UID values therefore cannot establish host ownership. The mandatory
+    # host broker verifies root ownership, mode and this exact executable inode
+    # in the initial namespace before issuing stage1-ok.
+    if trusted.st_mode & 0o022:
+        _fail("independent system interpreter is writable by untrusted users")
     if (active.st_dev, active.st_ino) == (pinned.st_dev, pinned.st_ino):
         _fail("stage-zero interpreter is not independent of pinned runtime")
 
@@ -258,6 +263,44 @@ def _tree_manifest_digest(root: Path) -> str:
     return hashlib.sha256(_canonical(dict(sorted(manifest.items())))).hexdigest()
 
 
+def _stdlib_import_digest(root: Path) -> str:
+    """Read audited startup/extension bytes using only independent system stdlib."""
+    manifest={}
+    total=0;entries=0
+    def walk(base,relative="",depth=0):
+        nonlocal total,entries
+        if depth>64: _fail("pinned stdlib depth exceeds bound")
+        with os.scandir(base) as children:
+            for child in children:
+                entries+=1
+                if entries>65536: _fail("pinned stdlib entry count exceeds bound")
+                if child.name=="__pycache__": continue
+                name=relative+child.name
+                info=child.stat(follow_symlinks=False)
+                if stat.S_ISDIR(info.st_mode): walk(Path(base)/child.name,name+"/",depth+1)
+                elif stat.S_ISREG(info.st_mode) and not name.endswith(".pyc"):
+                    if info.st_size>64*1024*1024: _fail("pinned stdlib file exceeds bound")
+                    total+=info.st_size
+                    if total>128*1024*1024: _fail("pinned stdlib bytes exceed bound")
+                    raw=_read_regular(Path(base)/child.name,64*1024*1024)
+                    manifest[name]=hashlib.sha256(raw).digest()
+                else: _fail("pinned stdlib contains unsafe import entry")
+    if root.is_symlink() or not root.is_dir(): _fail("pinned stdlib unavailable")
+    walk(root)
+    digest=hashlib.sha256()
+    for name in sorted(manifest):
+        digest.update(name.encode()+b"\0");digest.update(manifest[name])
+    return digest.hexdigest()
+
+
+def _verify_pinned_startup_imports() -> None:
+    # These audit-known absent paths can redirect Python prefix/ZIP startup.
+    for path in (PYTHON_ROOT/"lib/python311.zip",PYTHON_ROOT/"pyvenv.cfg",PYTHON_ROOT/"bin/pyvenv.cfg"):
+        if os.path.lexists(path): _fail("unaudited Python startup override")
+    if _stdlib_import_digest(PYTHON_ROOT/"lib/python3.11")!=PYTHON_STDLIB_SHA256:
+        _fail("audited pinned stdlib differs before interpreter exec")
+
+
 def _verify_trees(proof: dict, rows: dict[str, set[str]]) -> None:
     trees = proof["trees"]
     for target in (POLICY_CODE_ROOT, HERMES_ROOT, PYTHON_ROOT):
@@ -267,6 +310,7 @@ def _verify_trees(proof: dict, rows: dict[str, set[str]]) -> None:
             _fail(f"immutable trust tree identity mismatch: {target}")
     if _tree_manifest_digest(POLICY_CODE_ROOT) != trees[str(POLICY_CODE_ROOT)]["source_digest"]:
         _fail("policy snapshot digest mismatch")
+    _verify_pinned_startup_imports()
 
 
 def _sha256_fd(fd: int) -> str:

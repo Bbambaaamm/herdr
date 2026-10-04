@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import socket
 import sqlite3
+import struct
+import threading
 from pathlib import Path
 
 from herdr.security import SecurityGrant
@@ -51,29 +53,65 @@ class ApprovalLedger:
             return "replayed"
 
 
-def serve_approvals(listener: socket.socket, ledger: ApprovalLedger) -> None:
-    """Serve a host-created Unix listener; host controls mount and peer access."""
-    while True:
-        connection, _ = listener.accept()
-        with connection:
-            connection.settimeout(2)
+def serve_approvals(listener: socket.socket, ledger: ApprovalLedger, *,
+                    peer_authorizer=None, stop_event=None) -> None:
+    """Serve independently after exact host peer admission; no raw client takes a slot."""
+    if not callable(peer_authorizer):
+        raise ValueError("host approval peer authorizer required")
+    stop_event=stop_event or threading.Event()
+    slots=threading.BoundedSemaphore(16)
+    threads=set();lock=threading.Lock()
+    listener.settimeout(0.1)
+    def handle(connection,pid):
+        try:
+            with connection:
+                connection.settimeout(2)
+                request=bytearray()
+                answer="unavailable"
+                try:
+                    while len(request)<2048 and b"\n" not in request:
+                        chunk=connection.recv(2048-len(request))
+                        if not chunk: break
+                        request.extend(chunk)
+                    if b"\n" not in request: raise ValueError("unterminated approval")
+                    line,tail=bytes(request).split(b"\n",1)
+                    if tail: raise ValueError("multiple approval messages")
+                    payload=json.loads(line)
+                    if (not isinstance(payload,dict)
+                            or set(payload)!={"grant_hash","approval_id","tool","args_sha256"}
+                            or any(not isinstance(value,str) or not 0<len(value)<=512
+                                   for value in payload.values())
+                            or peer_authorizer(pid,payload["grant_hash"]) is not True):
+                        raise ValueError("invalid or unauthorized approval request")
+                    answer=ledger.consume(**payload)
+                except (ValueError,TypeError,OSError,sqlite3.Error):
+                    pass
+                try: connection.sendall((answer+"\n").encode("ascii"))
+                except OSError: pass
+        finally:
+            with lock: threads.discard(threading.current_thread())
+            slots.release()
+    try:
+        while not stop_event.is_set():
+            try: connection,_=listener.accept()
+            except socket.timeout: continue
             try:
-                request = bytearray()
-                while len(request) < 2048 and not request.endswith(b"\n"):
-                    chunk = connection.recv(2048 - len(request))
-                    if not chunk:
-                        break
-                    request.extend(chunk)
-                payload = json.loads(request)
-                if set(payload) != {"grant_hash", "approval_id", "tool", "args_sha256"}:
-                    raise ValueError("invalid request")
-                answer = ledger.consume(**payload)
-            except (ValueError, TypeError, OSError, sqlite3.Error):
-                answer = "unavailable"
-            try:
-                connection.sendall((answer + "\n").encode("ascii"))
-            except OSError:
-                # A sandbox client may disconnect after submitting a request.
-                # Response delivery is per-connection; it must never terminate
-                # the host approval authority's accept loop.
-                continue
+                credentials=connection.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,struct.calcsize("3i"))
+                pid,_uid,_gid=struct.unpack("3i",credentials)
+                if pid<=0 or peer_authorizer(pid,None) is not True:
+                    connection.close();continue
+            except Exception:
+                connection.close();continue
+            if not slots.acquire(blocking=False):
+                connection.close();continue
+            thread=threading.Thread(target=handle,args=(connection,pid),daemon=True,
+                                    name="herdr-approval-peer")
+            with lock: threads.add(thread)
+            try: thread.start()
+            except BaseException:
+                with lock: threads.discard(thread)
+                slots.release();connection.close()
+                raise
+    finally:
+        with lock: remaining=tuple(threads)
+        for thread in remaining: thread.join(2.1)

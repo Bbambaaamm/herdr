@@ -1189,7 +1189,8 @@ def test_canonical_queue_owns_session_before_worker_crash(tmp_path, monkeypatch,
     assert recovered["execution_session"]["closed_at"]
 
 
-def test_session_publication_preserves_canonical_truth_and_rejects_another_attempt(tmp_path):
+@pytest.mark.parametrize("changed_field",["run_token","fencing_token"])
+def test_session_publication_preserves_canonical_truth_and_rejects_another_attempt(tmp_path,changed_field):
     configure_paths(tmp_path)
     task = base_task()
     worker.prepare_attempt(task)
@@ -1205,7 +1206,7 @@ def test_session_publication_preserves_canonical_truth_and_rejects_another_attem
     assert recorded["last_observation"] == "authoritative-current"
     assert recorded["attempt_state"] == "working"
     original = canonical.read_bytes()
-    task["run_token"] = "different-attempt"
+    task[changed_field] = "different-attempt" if changed_field=="run_token" else task["fencing_token"]+1
     with pytest.raises(RuntimeError, match="identity_changed"):
         worker.persist_execution_session(task)
     assert canonical.read_bytes() == original

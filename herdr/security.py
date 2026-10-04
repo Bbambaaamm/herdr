@@ -555,6 +555,17 @@ class SecurityGrant:
         return _utc(self.issued_at, "issued_at") <= now < _utc(self.expires_at, "expires_at")
 
     def require_subset_of(self, parent: "SecurityGrant") -> None:
+        self.require_logical_subset_of(parent)
+        observed,ceiling=self.runtime_assurance,parent.runtime_assurance
+        network_order={NetworkAccess.NONE:0,NetworkAccess.PROVIDER_ONLY:1,NetworkAccess.GLOBAL:2}
+        if (network_order[observed.network_access]>network_order[ceiling.network_access]
+                or not _roots_subset(observed.writable_roots,ceiling.writable_roots)
+                or ceiling.credentials_isolated and not observed.credentials_isolated
+                or ceiling.sandbox_verified and not observed.sandbox_verified):
+            raise SecurityError("child runtime assurance escalates above parent")
+
+    def require_logical_subset_of(self, parent: "SecurityGrant") -> None:
+        """Compare an unsealed host proposal; never replace observed launch checks."""
         if not isinstance(parent, SecurityGrant):
             raise SecurityError("typed parent grant required")
         if self.parent_grant_hash != parent.hash:
@@ -967,8 +978,8 @@ class TaintRestrictions:
         _exact_keys(directives, {"deny_tools", "deny_providers"})
         return cls(
             provenance=tuple(provenance),
-            deny_tools=tuple(directives["deny_tools"]),
-            deny_providers=tuple(directives["deny_providers"]),
+            deny_tools=directives["deny_tools"],
+            deny_providers=directives["deny_providers"],
         )
 
 
