@@ -61,6 +61,10 @@ class RetryExhausted(DeliveryUncertain):
     code = "read_retry_exhausted"
 
 
+class ReconciliationRequired(DeliveryUncertain):
+    code = "remote_task_reconciliation_required"
+
+
 def encoded(value) -> bytes:
     try:
         data = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
@@ -153,8 +157,13 @@ def validate_schema(schema: dict, instance=None, *, check_only=False):
     """
     payload = encoded({"schema": schema, "instance": instance, "check_only": check_only})
     try:
-        result = subprocess.run([sys.executable, "-m", "herdr.mcp_schema"],
-                                input=payload, capture_output=True, timeout=3)
+        # Use the trusted sibling helper and isolated imports; a worker's cwd,
+        # PYTHONPATH and preload/credential environment must not choose its code.
+        environment = {"PATH": os.defpath, "LANG": "C.UTF-8"}
+        if os.name == "nt" and os.environ.get("SYSTEMROOT"):
+            environment["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
+        result = subprocess.run([sys.executable, "-I", str(Path(__file__).with_name("mcp_schema.py"))],
+                                input=payload, capture_output=True, timeout=3, env=environment)
     except (OSError, subprocess.SubprocessError) as exc:
         raise GatewayUnavailable("schema validator unavailable or bounded timeout") from exc
     if result.returncode == 1:
@@ -290,6 +299,7 @@ class Outcome:
     replay: bool = False
     # Observed transport completion is never scheduler/review/merge authority.
     authority: str = "remote_observation"
+    task_metadata: dict | None = None
 
 
 def locked(method):
@@ -329,7 +339,7 @@ class CallLedger:
           state TEXT NOT NULL, deliveries INTEGER NOT NULL DEFAULT 0,
           result_hash TEXT, remote_task_id TEXT, next_poll REAL, polls INTEGER NOT NULL DEFAULT 0,
           method TEXT NOT NULL, subject TEXT NOT NULL, reserved_cost INTEGER NOT NULL DEFAULT 0,
-          unknown_cost INTEGER NOT NULL DEFAULT 0, validation_plan_json TEXT);
+          unknown_cost INTEGER NOT NULL DEFAULT 0, validation_plan_json TEXT, remote_task_json TEXT);
         CREATE TABLE IF NOT EXISTS contexts(
           hash TEXT PRIMARY KEY, identity_json TEXT NOT NULL, toolset_hash TEXT NOT NULL,
           parent_scope_hash TEXT NOT NULL, consumer_scope_hash TEXT NOT NULL);
@@ -342,8 +352,9 @@ class CallLedger:
           server TEXT PRIMARY KEY, failures INTEGER NOT NULL, open_until REAL NOT NULL);
         """)
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(calls)")}
-        if "validation_plan_json" not in columns:
-            self.db.execute("ALTER TABLE calls ADD COLUMN validation_plan_json TEXT")
+        for name in ("validation_plan_json", "remote_task_json"):
+            if name not in columns:
+                self.db.execute(f"ALTER TABLE calls ADD COLUMN {name} TEXT")
         self.db.row_factory = sqlite3.Row
 
     @locked
@@ -462,8 +473,16 @@ class CallLedger:
     def observed(self, key, state, result, now, remote_task_id=None, next_poll=None):
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            self.db.execute("UPDATE calls SET state=?,result_hash=?,remote_task_id=?,next_poll=? WHERE key=?",
-                            (state, hashed(result), remote_task_id, next_poll, key))
+            metadata = None
+            if remote_task_id is not None and all(name in result for name in (
+                    "taskId", "status", "createdAt", "lastUpdatedAt")):
+                metadata = encoded({name: result[name] for name in (
+                    "taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "pollIntervalMs")
+                    if name in result}).decode()
+            self.db.execute(
+                "UPDATE calls SET state=?,result_hash=?,remote_task_id=?,next_poll=?, "
+                "remote_task_json=COALESCE(?,remote_task_json) WHERE key=?",
+                (state, hashed(result), remote_task_id, next_poll, metadata, key))
             self.audit(key, state, now)
             self.db.execute("COMMIT")
         except Exception:
@@ -873,9 +892,12 @@ class McpGateway:
             if row["context_hash"] != context.hash or row["request_hash"] != request_hash:
                 self.ledger.audit(key, "idempotency_conflict", self.clock())
                 raise PolicyDenied("operation key reused for different scope/request")
+            if row["state"] == "reconciliation_required":
+                raise ReconciliationRequired("recorded remote task requires reconciliation")
             if row["state"] in {"observed_complete", "observed_error", "input_required",
                                 "remote_running", "response_rejected"}:
-                return Outcome(row["state"], row["result_hash"], remote_task_id=row["remote_task_id"], replay=True)
+                return Outcome(row["state"], row["result_hash"], remote_task_id=row["remote_task_id"], replay=True,
+                               task_metadata=self._recorded_task_metadata(row))
             if row["deliveries"] and not readonly:
                 raise DeliveryUncertain("recorded side effect remains quarantined")
             if readonly and row["deliveries"] >= 1 + context.toolset.readonly_retries:
@@ -885,11 +907,13 @@ class McpGateway:
     def model_context(self, context: CallContext):
         output = []
         for server, client in sorted(self.clients.items()):
+            definitions = None
             for binding in client.server.tools:
                 if binding.logical_id not in context.toolset.tools:
                     continue
                 self._admit(context, server, binding.logical_id, binding.permissions)
-                definitions = self._catalog(context, client)
+                if definitions is None:
+                    definitions = self._catalog(context, client)
                 if binding.name not in definitions:
                     raise GatewayUnavailable("approved tool missing from discovery")
                 row = decode(encoded(definitions[binding.name]))
@@ -921,7 +945,7 @@ class McpGateway:
                         break
                     value = value[part]
                 else:
-                    if routing_headers.get("Mcp-Param-" + header) != header_value(value):
+                    if routing_headers.get(("Mcp-Param-" + header).lower()) != header_value(value):
                         raise GatewayError("custom routing header mismatch")
         replay = self._replay(context, client, "tools/call", params,
                               operation_key, readonly=binding.read_only)
@@ -997,8 +1021,11 @@ class McpGateway:
             row = self.ledger.reserve(key, context, request_hash, client.server.id, self.clock(),
                                       method, params.get("name", params.get("uri")), validation_plan,
                                       retryable=retryable)
+            if row["state"] == "reconciliation_required":
+                raise ReconciliationRequired("recorded remote task requires reconciliation")
             if row["state"] in {"observed_complete", "observed_error", "input_required", "remote_running", "response_rejected"}:
-                return Outcome(row["state"], row["result_hash"], remote_task_id=row["remote_task_id"], replay=True)
+                return Outcome(row["state"], row["result_hash"], remote_task_id=row["remote_task_id"], replay=True,
+                               task_metadata=self._recorded_task_metadata(row))
             if row["deliveries"] and not readonly:
                 raise DeliveryUncertain("side effect quarantined; reconcile same operation without redispatch")
             for _ in range(maximum - row["deliveries"]):
@@ -1107,6 +1134,19 @@ class McpGateway:
                if state == "remote_running" else None)
         return state, due
 
+    def _recorded_task_metadata(self, row):
+        raw = row.get("remote_task_json")
+        if row["state"] != "remote_running" or not raw:
+            return None
+        try:
+            metadata = decode(raw.encode())
+            self._remote_task(metadata)
+            if metadata["taskId"] != row["remote_task_id"]:
+                raise GatewayError("recorded task identity mismatch")
+            return metadata
+        except GatewayError as exc:
+            raise ReconciliationRequired("recorded remote task metadata requires reconciliation") from exc
+
     @staticmethod
     def _recorded_definition(row, binding):
         raw = row.get("validation_plan_json")
@@ -1158,6 +1198,8 @@ class McpGateway:
             if binding is None:
                 raise PolicyDenied("poll has no approved tool binding")
             self._static_admit(context, client.server.id, binding.logical_id, binding.permissions)
+            if row["state"] == "reconciliation_required":
+                raise ReconciliationRequired("recorded remote task requires reconciliation")
             if row["state"] != "remote_running":
                 return Outcome(row["state"], row["result_hash"], replay=True)
             if self.clock() < row["next_poll"]:
@@ -1179,6 +1221,11 @@ class McpGateway:
             self.ledger.polling(key, self.clock())
             try:
                 result, _ = client.exchange(context, "tasks/get", {"taskId": row["remote_task_id"]}, key + ".poll." + str(row["polls"]))
+                if result.get("resultType") == "protocol_error":
+                    self.ledger.observed(key, "reconciliation_required", {"code": result["code"]},
+                                         self.clock(), row["remote_task_id"])
+                    self.ledger.healthy(client.server.id)
+                    raise ReconciliationRequired("remote task lookup rejected; reconcile protected handle")
                 self._remote_task(result)
                 if result.get("resultType") != "complete" or result["taskId"] != row["remote_task_id"]:
                     raise GatewayError("remote task correlation mismatch")
@@ -1189,7 +1236,8 @@ class McpGateway:
                 return Outcome(state, hashed(result), result, row["remote_task_id"])
             except GatewayError as exc:
                 self.ledger.audit(key, exc.code, self.clock())
-                self.ledger.failure(client.server.id, self.clock())
+                if not isinstance(exc, ReconciliationRequired):
+                    self.ledger.failure(client.server.id, self.clock())
                 raise
 
     def observe_event(self, context: CallContext, server: str, message: dict):
@@ -1305,10 +1353,15 @@ class McpGateway:
                 closure = "disconnected"
             except GatewayError as exc:
                 self.ledger.audit(key, exc.code, self.clock())
+                self.ledger.failure(server, self.clock())
+                if not acknowledged:
+                    raise DeliveryUncertain("subscription acknowledgment unverified; reconcile window") from exc
                 self.ledger.observed(key, "response_rejected", {"code": exc.code}, self.clock())
                 raise
             result = {"kind": "subscription_observation", "events": events, "closure": closure}
             self.ledger.observed(key, "observed_complete", result, self.clock())
+            if closure in {"graceful", "bounded"}:
+                self.ledger.healthy(server)
             return Outcome("observed_complete", hashed(result), result)
 
 
@@ -1334,7 +1387,11 @@ class ServerAdapter:
             request = decode(raw)
             if not isinstance(request, dict) or request.get("jsonrpc") != "2.0" or type(request.get("id")) not in {str, int}:
                 raise GatewayError("invalid JSON-RPC request")
-            request_id = request["id"]
+            incoming_id = request["id"]
+            if (isinstance(incoming_id, str) and len(incoming_id) > 128
+                    or type(incoming_id) is int and not -(2**53 - 1) <= incoming_id <= 2**53 - 1):
+                raise GatewayError("request identity exceeds bounded range")
+            request_id = incoming_id
             params, method = request.get("params"), request.get("method")
             if not isinstance(params, dict) or not isinstance(method, str):
                 raise GatewayError("invalid request parameters")
@@ -1352,10 +1409,20 @@ class ServerAdapter:
             if meta.get("org.herdr/task") != {**asdict(context.identity), "toolset_hash": context.toolset.hash}:
                 raise PolicyDenied("request does not bind authenticated task identity")
             if headers is not None:
-                if headers.get("MCP-Protocol-Version") != PROTOCOL or headers.get("Mcp-Method") != method:
+                if not isinstance(headers, dict) or len(headers) > 128:
+                    raise GatewayError("invalid bounded HTTP headers")
+                normalized = {}
+                for name, value in headers.items():
+                    if (not isinstance(name, str) or not re.fullmatch(r"[!#$%&'*+.^_A-Za-z0-9|-]{1,128}", name)
+                            or name.lower() in normalized or not isinstance(value, str)
+                            or len(value) > 8192 or chr(13) in value or chr(10) in value):
+                        raise GatewayError("invalid or ambiguous HTTP header")
+                    normalized[name.lower()] = value
+                headers = normalized
+                if headers.get("mcp-protocol-version") != PROTOCOL or headers.get("mcp-method") != method:
                     raise GatewayError("HTTP protocol header mismatch")
                 name = params.get("name", params.get("uri", params.get("taskId")))
-                if name is not None and headers.get("Mcp-Name") != header_value(name):
+                if name is not None and headers.get("mcp-name") != header_value(name):
                     raise GatewayError("HTTP routing header mismatch")
             if method == "server/discover":
                 if not self.gateway.authority(context):
@@ -1386,7 +1453,18 @@ class ServerAdapter:
                 else:
                     outcome = self.gateway.call(context, server, tool, params["arguments"], operation,
                                                 routing_headers=headers)
-                if outcome.result is None:
+                if outcome.result is None and outcome.state == "remote_running":
+                    handle = hashed({"consumer": context.identity.consumer, "task_id": context.identity.task_id,
+                                     "operation_key": operation})
+                    if outcome.task_metadata is not None and outcome.task_metadata["status"] == "working":
+                        result = {"resultType": "task", **outcome.task_metadata, "taskId": handle}
+                    else:
+                        # Legacy or input-required descriptors lack retained question payload.
+                        # The protected handle lets clients retrieve the current remote state.
+                        result = {"resultType": "complete", "isError": True,
+                                  "_meta": {"org.herdr/taskHandle": handle},
+                                  "content": [{"type": "text", "text": "Recorded task requires tasks/get using the protected handle."}]}
+                elif outcome.result is None:
                     result = {"resultType": "complete", "isError": True,
                               "content": [{"type": "text", "text": "Recorded outcome requires artifact reconciliation; operation was not repeated."}]}
                 else:
@@ -1394,7 +1472,7 @@ class ServerAdapter:
                     if result.get("resultType") == "task":
                         result["taskId"] = hashed({"consumer": context.identity.consumer,
                             "task_id": context.identity.task_id, "operation_key": operation})
-                    result.setdefault("_meta", {})["org.herdr/outcomeHash"] = outcome.result_hash
+                result.setdefault("_meta", {})["org.herdr/outcomeHash"] = outcome.result_hash
             elif method == "tasks/get":
                 if TASKS not in capabilities.get("extensions", {}):
                     raise PolicyDenied("task capability was not negotiated")

@@ -505,7 +505,11 @@ def test_subscription_cannot_expand_authority_or_skip_ack(tmp_path, fault):
     transport.stream = stream
     with pytest.raises(GatewayError):
         gateway.listen(context, "local", {"toolsListChanged": True}, "op")
-    assert gateway.listen(context, "local", {"toolsListChanged": True}, "op").state == "response_rejected"
+    if fault == "unrequested":
+        assert gateway.listen(context, "local", {"toolsListChanged": True}, "op").state == "response_rejected"
+    else:
+        with pytest.raises(DeliveryUncertain):
+            gateway.listen(context, "local", {"toolsListChanged": True}, "op")
 
 
 def test_subscription_requires_declared_resources_and_explicit_host_approval(tmp_path):
@@ -1277,3 +1281,201 @@ def test_zero_ttl_header_call_uses_one_request_scoped_discovery(tmp_path):
     assert status == 200, decode(raw)
     assert discoveries == 1 and len(semantic_calls(transport)) == 1
     assert client.expires_at == clock()
+
+
+@pytest.mark.parametrize("fault", ["subscription_id", "filter", "method"])
+def test_malformed_pre_ack_subscription_remains_uncertain(tmp_path, fault):
+    gateway, context, transport, *_ = fixture(tmp_path, subscriptions=True)
+    windows = []
+    def stream(message, **kwargs):
+        windows.append(message)
+        ack = {"jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged",
+               "params": {"_meta": {META + "subscriptionId": message["id"]},
+                          "notifications": {"toolsListChanged": True}}}
+        if fault == "subscription_id":
+            ack["params"]["_meta"][META + "subscriptionId"] = "foreign"
+        elif fault == "filter":
+            ack["params"]["notifications"]["resourcesListChanged"] = True
+        else:
+            ack["method"] = "herdr/execute"
+        yield ack
+    transport.stream = stream
+    for _ in range(2):
+        with pytest.raises(DeliveryUncertain):
+            gateway.listen(context, "local", {"toolsListChanged": True}, "window")
+    assert len(windows) == 1
+    assert gateway.ledger.get(operation_key(context, "window"))["state"] == "delivery_uncertain"
+
+
+def test_successful_subscription_resets_failure_streak_but_disconnect_does_not(tmp_path):
+    gateway, context, transport, clock, *_ = fixture(tmp_path, subscriptions=True)
+    mode = "fail"
+    def stream(message, **kwargs):
+        if mode == "fail":
+            raise GatewayUnavailable("pre-ack deadline")
+        metadata = {META + "subscriptionId": message["id"]}
+        yield {"jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged",
+               "params": {"_meta": metadata, "notifications": message["params"]["notifications"]}}
+        if mode == "disconnect":
+            raise GatewayUnavailable("post-ack deadline")
+        yield {"jsonrpc": "2.0", "id": message["id"],
+               "result": {"resultType": "complete", "_meta": metadata}}
+    transport.stream = stream
+    for op in ("failed-one", "failed-two"):
+        with pytest.raises(DeliveryUncertain):
+            gateway.listen(context, "local", {"toolsListChanged": True}, op)
+    assert gateway.ledger.db.execute("SELECT failures FROM health WHERE server='local'").fetchone()[0] == 2
+    mode = "success"
+    assert gateway.listen(context, "local", {"toolsListChanged": True}, "successful").state == "observed_complete"
+    assert gateway.ledger.db.execute("SELECT * FROM health WHERE server='local'").fetchone() is None
+    mode = "fail"
+    with pytest.raises(DeliveryUncertain):
+        gateway.listen(context, "local", {"toolsListChanged": True}, "failed-three")
+    assert gateway.ledger.health("local", clock())
+    mode = "disconnect"
+    observed = gateway.listen(context, "local", {"toolsListChanged": True}, "disconnected")
+    assert observed.result["closure"] == "disconnected"
+    assert gateway.ledger.db.execute("SELECT failures FROM health WHERE server='local'").fetchone()[0] == 2
+
+
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("descriptor", ["working", "legacy", "input_required"])
+def test_running_task_replay_exposes_local_handle_and_remains_pollable(tmp_path, restart, descriptor):
+    gateway, context, transport, clock, client, _ = fixture(tmp_path, tasks=True)
+    transport.task = True
+    if descriptor == "input_required":
+        transport.poll_status = "input_required"
+    adapter = ServerAdapter(gateway, lambda _: context, origins=())
+    message = tool_request(context, tasks=True)
+    first_status, first_raw = adapter.handle(encoded(message), authorization="trusted")
+    assert first_status == 200 and decode(first_raw)["result"]["resultType"] == "task"
+    handle = decode(first_raw)["result"]["taskId"]
+    assert handle == operation_key(context)
+    if descriptor == "legacy":
+        gateway.ledger.db.execute("UPDATE calls SET remote_task_json=NULL")
+    if restart:
+        gateway.ledger.close()
+        ledger = CallLedger(tmp_path / "protected")
+        fresh = ClientAdapter(client.server, transport, ledger, clock=clock)
+        gateway = McpGateway(ledger, gateway.registry, (fresh,), authority=gateway.authority,
+            runtime_states=gateway.runtime_states, argument_authority=gateway.argument_authority,
+            argument_policy_hash=ARGUMENT_POLICY, clock=clock)
+        adapter = ServerAdapter(gateway, lambda _: context, origins=())
+    original = transport.request
+    def request(frame, **kwargs):
+        if frame["method"] == "tools/list":
+            pytest.fail("running task replay/poll must not rediscover")
+        return original(frame, **kwargs)
+    transport.request = request
+    routing = {"mcp-protocol-version": PROTOCOL, "mcp-method": "tools/call",
+               "mcp-name": "local.read", "mcp-param-path": "source.py"}
+    status, raw = adapter.handle(encoded(message), authorization="trusted", headers=routing)
+    assert status == 200, decode(raw)
+    result = decode(raw)["result"]
+    if descriptor == "working":
+        assert result["resultType"] == "task" and result["taskId"] == handle
+        assert result["status"] == "working" and result["createdAt"] and result["lastUpdatedAt"]
+    else:
+        assert result["isError"] is True and result["_meta"]["org.herdr/taskHandle"] == handle
+    clock.value += 2
+    transport.poll_status = "completed"
+    poll = request_message(context, "tasks/get", {"taskId": handle}, "poll", tasks=True)
+    status, raw = adapter.handle(encoded(poll), authorization="trusted")
+    assert status == 200 and decode(raw)["result"]["status"] == "completed"
+    assert len([x for x in semantic_calls(transport) if x[0]["method"] == "tools/call"]) == 1
+    assert len([x for x in semantic_calls(transport) if x[0]["method"] == "tasks/get"]) == 1
+    dump = "\n".join(gateway.ledger.db.iterdump())
+    assert "observed output" not in dump and "inputRequests" not in dump
+
+
+@pytest.mark.parametrize("case", ["lower", "mixed", "duplicate"])
+def test_inbound_routing_header_names_are_case_insensitive_and_unambiguous(tmp_path, case):
+    gateway, context, transport, *_ = fixture(tmp_path)
+    headers = {"mcp-protocol-version": PROTOCOL, "mcp-method": "tools/call",
+               "mcp-name": "local.read", "mcp-param-path": "source.py"}
+    if case == "mixed":
+        headers = {name.swapcase(): value for name, value in headers.items()}
+    elif case == "duplicate":
+        headers["Mcp-Param-Path"] = "foreign.py"
+    status, raw = ServerAdapter(gateway, lambda _: context, origins=()).handle(
+        encoded(tool_request(context)), authorization="trusted", headers=headers)
+    assert status == (400 if case == "duplicate" else 200), decode(raw)
+    assert len(semantic_calls(transport)) == (0 if case == "duplicate" else 1)
+
+
+@pytest.mark.parametrize("request_id", ["x" * 129, "x" * (2_000_000 - 80), 2**53, -(2**53)],
+                         ids=["long", "payload_bound", "large_positive", "large_negative"])
+def test_oversized_request_identity_cannot_escape_error_encoding(tmp_path, request_id):
+    gateway, context, transport, *_ = fixture(tmp_path)
+    raw = encoded({"jsonrpc": "2.0", "id": request_id})
+    status, response = ServerAdapter(gateway, lambda _: context, origins=()).handle(raw, authorization="trusted")
+    assert status == 400 and len(response) < 1024
+    assert decode(response)["id"] is None
+    assert not semantic_calls(transport)
+
+
+def test_valid_remote_poll_error_persists_reconciliation_without_failure_or_redispatch(tmp_path):
+    gateway, context, transport, clock, *_ = fixture(tmp_path, tasks=True)
+    transport.task = True
+    gateway.call(context, "local", "read", {"path": "source.py"}, "op")
+    gateway.ledger.failure("local", clock())
+    gateway.ledger.failure("local", clock())
+    clock.value += 2
+    original = transport.request
+    def request(message, **kwargs):
+        if message["method"] == "tasks/get":
+            transport.calls.append((message, kwargs))
+            return ({"jsonrpc": "2.0", "id": message["id"],
+                     "error": {"code": -32001, "message": "unknown task private detail"}},)
+        return original(message, **kwargs)
+    transport.request = request
+    adapter = ServerAdapter(gateway, lambda _: context, origins=())
+    poll = request_message(context, "tasks/get", {"taskId": operation_key(context)}, "poll", tasks=True)
+    for message in (poll, poll, tool_request(context, tasks=True)):
+        status, raw = adapter.handle(encoded(message), authorization="trusted")
+        assert status == 502
+        assert decode(raw)["error"]["message"] == "remote_task_reconciliation_required"
+        assert decode(raw)["error"]["data"] == {"retryable": False, "reconcileRequired": True}
+        assert b"private detail" not in raw
+    assert gateway.ledger.get(operation_key(context))["state"] == "reconciliation_required"
+    assert gateway.ledger.db.execute("SELECT * FROM health WHERE server='local'").fetchone() is None
+    assert len(semantic_calls(transport)) == 2
+    assert "unknown task private detail" not in "\n".join(gateway.ledger.db.iterdump())
+
+
+def test_zero_ttl_context_assembly_discovers_each_used_provider_once(tmp_path):
+    gateway, context, transport, clock, client, _ = fixture(tmp_path, tools=("code_read", "code_write"))
+    client.expires_at = 0
+    transport.calls.clear()
+    original = transport.request
+    discoveries = 0
+    def request(message, **kwargs):
+        nonlocal discoveries
+        if message["method"] == "tools/list":
+            discoveries += 1
+            if discoveries > 1:
+                pytest.fail("one context assembly must reuse its provider catalog")
+        response = original(message, **kwargs)
+        if message["method"] == "tools/list":
+            response[0]["result"]["ttlMs"] = 0
+        return response
+    transport.request = request
+    assert len(gateway.model_context(context)["tools"]) == 2
+    assert discoveries == 1
+
+
+def test_schema_helper_ignores_worker_import_paths_and_user_startup(tmp_path, monkeypatch):
+    from pathlib import Path
+    canary = tmp_path / "executed"
+    poison = tmp_path / "herdr"
+    poison.mkdir()
+    (poison / "__init__.py").write_text("")
+    payload = "from pathlib import Path\nPath(" + repr(str(canary)) + ").write_text('executed')\nprint('valid', end='')\n"
+    (poison / "mcp_schema.py").write_text(payload)
+    (tmp_path / "sitecustomize.py").write_text(payload)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+    validate_schema({"type": "integer"}, 1)
+    with pytest.raises(GatewayError):
+        validate_schema({"type": "integer"}, "invalid")
+    assert not canary.exists()

@@ -88,7 +88,13 @@ delivery_uncertain before sending bytes. Its operation identity binds consumer,
 task, exact attempt/fence, frozen scopes/toolset and request digest. Reusing a key
 with different arguments or context is denied. A process lock serializes each
 operation; SQLite transactions and FULL synchronous WAL persist authority,
-delivery counters, outcome digests and provider health across restart. Approved
+delivery counters, outcome digests and provider health across restart. Only bounded
+operational Task metadata (identity, status, timestamps, TTL and poll interval)
+is retained alongside remote handles; question/result payloads are excluded.
+A running-task replay exposes the deterministic local handle and its admitted
+descriptor, so the client can continue tasks/get after losing the first response.
+Legacy/input-required replays expose the protected handle for current-state
+retrieval without retaining remote questions. Approved
 input/output validation schemas are frozen in the protected operation record
 before transmission; they are control data, excluded from audit export.
 Admission uses one immutable registry snapshot, checks for reload after runtime
@@ -128,10 +134,15 @@ The server returns 403 for denied authority, 503 for temporary availability
 failure and 502 for uncertain delivery. Error metadata distinguishes retryable
 availability from uncertainty requiring reconciliation; it never authorizes a
 new economic operation. SSE accepts LF, CRLF and bare CR, including delimiters
-split across reads, and media types are compared case-insensitively.
-One inbound call reuses its verified routing definition even with zero discovery
-TTL. Post-send subscription outages before acknowledgment require reconciliation;
-the same window is never reopened. Concurrent processes increment provider
+split across reads, and media types/header names are compared case-insensitively.
+Ambiguous case-duplicate headers and oversized request IDs fail within bounded
+error handling. Valid JSON-RPC poll errors persist reconciliation_required,
+quarantine further polling/delivery, and do not count as provider outages.
+One inbound call or model-context assembly reuses a request-scoped verified
+catalog even with zero discovery TTL. Post-send subscription outages before acknowledgment require reconciliation;
+the same window is never reopened. Malformed pre-ack streams preserve uncertainty
+too. Graceful/bounded subscription success clears the failure streak; a
+disconnected stream retains its availability failure. Concurrent processes increment provider
 failures atomically in SQLite, preserving the circuit threshold.
 
 Audit stores identity hashes, immutable context bindings, reason codes and times.
@@ -167,3 +178,5 @@ Protocol references:
 - [Subscriptions](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/subscriptions)
 - [Resources](https://modelcontextprotocol.io/specification/2026-07-28/server/resources)
 - [Opt-in Tasks extension](https://tasks.extensions.modelcontextprotocol.io/specification/draft/tasks)
+
+The disposable schema helper runs from its trusted absolute sibling path with isolated Python imports and a minimal environment; worker current directories, PYTHONPATH and user startup modules cannot replace the validator. This does not assert that a Hermes runtime is credential-isolated.
