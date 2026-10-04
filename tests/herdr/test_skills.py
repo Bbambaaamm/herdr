@@ -397,7 +397,7 @@ def test_source_manifest_accepts_declared_assets_and_preserves_exact_bytes(tmp_p
     for path in ("configs/consumers/herdr.yaml", "docs/CONSUMERS.md",
                  "docs/architecture/AGENT_SKILLS.md", "docs/architecture/CONTEXT_MEMORY.md",
                  "package.json", "package-lock.json", "requirements-mcp.txt",
-                 "docs/architecture/MCP_GATEWAY.md"):
+                 "docs/architecture/MCP_GATEWAY.md", "docs/architecture/INVOCATION_POLICY_LAUNCH.md"):
         target = workspace / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("{}\n")
@@ -526,7 +526,7 @@ def test_source_manifest_rejects_nonregular_skill_tree_entries(tmp_path, kind):
     for path in ("configs/consumers/herdr.yaml", "docs/CONSUMERS.md",
                  "docs/architecture/AGENT_SKILLS.md", "docs/architecture/CONTEXT_MEMORY.md",
                  "package.json", "package-lock.json", "requirements-mcp.txt",
-                 "docs/architecture/MCP_GATEWAY.md"):
+                 "docs/architecture/MCP_GATEWAY.md", "docs/architecture/INVOCATION_POLICY_LAUNCH.md"):
         target = workspace / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("{}\n")
