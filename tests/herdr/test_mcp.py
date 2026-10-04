@@ -336,7 +336,7 @@ def test_server_resolves_authentication_and_never_accepts_request_scope(tmp_path
 
 
 @contextmanager
-def provider_http(*, sse=False, lose_write=False, subscriptions=False, line_ending=b"\n") :
+def provider_http(*, sse=False, lose_write=False, subscriptions=False, line_ending=b"\n", media_type=None) :
     observations = {"writes": 0, "requests": [], "bad_headers": False}
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -381,7 +381,8 @@ def provider_http(*, sse=False, lose_write=False, subscriptions=False, line_endi
             if sse or method == "subscriptions/listen" and subscriptions:
                 body = body.replace(b"\n", line_ending)
             self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream" if sse or method == "subscriptions/listen" and subscriptions else "application/json")
+            self.send_header("Content-Type", media_type or (
+                "text/event-stream" if sse or method == "subscriptions/listen" and subscriptions else "application/json"))
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -1188,3 +1189,91 @@ def test_exhausted_remote_poll_budget_requires_reconciliation(tmp_path):
     status, raw = ServerAdapter(gateway, lambda _: context, origins=()).handle(encoded(message), authorization="trusted")
     assert status == 502 and decode(raw)["error"]["data"] == {"retryable": False, "reconcileRequired": True}
     assert len(semantic_calls(transport)) == 1
+
+
+def _failure_process(root, barrier, iterations):
+    from pathlib import Path
+    ledger = CallLedger(Path(root))
+    try:
+        barrier.wait(timeout=10)
+        for _ in range(iterations):
+            ledger.failure("shared", NOW)
+    finally:
+        ledger.close()
+
+
+def test_concurrent_process_failures_are_counted_without_lost_increments(tmp_path):
+    import multiprocessing
+    context = multiprocessing.get_context("fork")
+    root = tmp_path / "concurrent-ledger"
+    ledger = CallLedger(root)
+    barrier = context.Barrier(4)
+    processes = [context.Process(target=_failure_process, args=(str(root), barrier, 32)) for _ in range(4)]
+    for process in processes:
+        process.start()
+    try:
+        for process in processes:
+            process.join(timeout=15)
+            assert not process.is_alive() and process.exitcode == 0
+        row = ledger.db.execute("SELECT failures,open_until FROM health WHERE server='shared'").fetchone()
+        assert tuple(row) == (128, NOW + 60)
+        assert not ledger.health("shared", NOW)
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        ledger.close()
+
+
+@pytest.mark.parametrize("sse,media_type", [(False, "Application/JSON; charset=utf-8"),
+                                          (True, "Text/Event-Stream; charset=utf-8")])
+def test_actual_http_media_types_are_case_insensitive_for_reads_and_mutations(tmp_path, sse, media_type):
+    with provider_http(sse=sse, media_type=media_type) as (transport, observations):
+        gateway, context, *_ = fixture(tmp_path, tools=("code_read", "code_write"), transport=transport)
+        assert gateway.call(context, "local", "read", {"path": "source.py"}, "read-op").state == "observed_complete"
+        assert gateway.call(context, "local", "write", {"value": "write once"}, "write-op").state == "observed_complete"
+        assert observations["writes"] == 1
+
+
+def test_pre_ack_subscription_outage_is_quarantined_and_cannot_reopen(tmp_path):
+    gateway, context, transport, *_ = fixture(tmp_path, subscriptions=True)
+    windows = []
+    def stream(message, **kwargs):
+        windows.append(message)
+        if False:
+            yield None
+        raise GatewayUnavailable("SSE deadline after transmission, before acknowledgment")
+    transport.stream = stream
+    for _ in range(2):
+        with pytest.raises(DeliveryUncertain):
+            gateway.listen(context, "local", {"toolsListChanged": True}, "window")
+    assert len(windows) == 1
+    assert gateway.ledger.get(operation_key(context, "window"))["state"] == "delivery_uncertain"
+
+
+def test_zero_ttl_header_call_uses_one_request_scoped_discovery(tmp_path):
+    gateway, context, transport, clock, client, _ = fixture(tmp_path)
+    client.expires_at = 0
+    transport.calls.clear()
+    original = transport.request
+    discoveries = 0
+    def request(message, **kwargs):
+        nonlocal discoveries
+        if message["method"] == "tools/list":
+            discoveries += 1
+            if discoveries > 1:
+                pytest.fail("a zero-TTL definition was redundantly refreshed inside one request")
+        response = original(message, **kwargs)
+        if message["method"] == "tools/list":
+            response[0]["result"]["ttlMs"] = 0
+        return response
+    transport.request = request
+    message = tool_request(context)
+    routing = {"MCP-Protocol-Version": PROTOCOL, "Mcp-Method": "tools/call",
+               "Mcp-Name": "local.read", "Mcp-Param-Path": "source.py"}
+    status, raw = ServerAdapter(gateway, lambda _: context, origins=()).handle(
+        encoded(message), authorization="trusted", headers=routing)
+    assert status == 200, decode(raw)
+    assert discoveries == 1 and len(semantic_calls(transport)) == 1
+    assert client.expires_at == clock()

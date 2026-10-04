@@ -128,7 +128,11 @@ The server returns 403 for denied authority, 503 for temporary availability
 failure and 502 for uncertain delivery. Error metadata distinguishes retryable
 availability from uncertainty requiring reconciliation; it never authorizes a
 new economic operation. SSE accepts LF, CRLF and bare CR, including delimiters
-split across reads.
+split across reads, and media types are compared case-insensitively.
+One inbound call reuses its verified routing definition even with zero discovery
+TTL. Post-send subscription outages before acknowledgment require reconciliation;
+the same window is never reopened. Concurrent processes increment provider
+failures atomically in SQLite, preserving the circuit threshold.
 
 Audit stores identity hashes, immutable context bindings, reason codes and times.
 It excludes raw arguments, prompts, bearer values, raw results and exception

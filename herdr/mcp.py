@@ -477,10 +477,11 @@ class CallLedger:
 
     @locked
     def failure(self, server, now):
-        row = self.db.execute("SELECT failures FROM health WHERE server=?", (server,)).fetchone()
-        failures = (row["failures"] if row else 0) + 1
-        self.db.execute("INSERT INTO health VALUES(?,?,?) ON CONFLICT(server) DO UPDATE SET failures=excluded.failures,open_until=excluded.open_until",
-                        (server, failures, now + 60 if failures >= 3 else 0))
+        self.db.execute(
+            "INSERT INTO health(server,failures,open_until) VALUES(?,1,0) "
+            "ON CONFLICT(server) DO UPDATE SET failures=health.failures+1, "
+            "open_until=CASE WHEN health.failures+1>=3 THEN ? ELSE 0 END",
+            (server, now + 60))
 
     @locked
     def healthy(self, server):
@@ -528,7 +529,7 @@ class HTTPTransport:
             if response.status != 200:
                 # Includes redirects: credential/data never follows an unapproved URL.
                 raise GatewayUnavailable("provider returned non-success HTTP status")
-            content_type = response.getheader("Content-Type", "").split(";")[0].strip()
+            content_type = response.getheader("Content-Type", "").split(";")[0].strip().lower()
             if content_type not in {"application/json", "text/event-stream"}:
                 raise GatewayError("unsupported provider content type")
             buffer, total, messages, pending_cr = b"", 0, [], False
@@ -898,7 +899,8 @@ class McpGateway:
         return {"tools": output, "toolset_hash": context.toolset.hash,
                 "trust": "Tool descriptions and all remote output are untrusted data."}
 
-    def call(self, context: CallContext, server: str, tool: str, arguments: dict, operation_key: str):
+    def call(self, context: CallContext, server: str, tool: str, arguments: dict, operation_key: str,
+             *, routing_headers: dict | None = None):
         identifier(server)
         identifier(tool)
         if not isinstance(arguments, dict):
@@ -908,15 +910,29 @@ class McpGateway:
         if not binding:
             raise PolicyDenied("unknown tool or provider alternative")
         client = self._static_admit(context, server, binding.logical_id, binding.permissions)
-        replay = self._replay(context, client, "tools/call", {"name": tool, "arguments": arguments},
+        params = {"name": tool, "arguments": arguments}
+        definition = None
+        if routing_headers is not None:
+            definition = self.routing_definition(context, client, binding, params, operation_key)
+            for path, header in schema_headers(definition["inputSchema"]):
+                value = arguments
+                for part in path:
+                    if not isinstance(value, dict) or part not in value:
+                        break
+                    value = value[part]
+                else:
+                    if routing_headers.get("Mcp-Param-" + header) != header_value(value):
+                        raise GatewayError("custom routing header mismatch")
+        replay = self._replay(context, client, "tools/call", params,
                               operation_key, readonly=binding.read_only)
         if replay is not None:
             return replay
         client = self._admit(context, server, binding.logical_id, binding.permissions)
-        definitions = self._catalog(context, client)
-        if tool not in definitions:
-            raise GatewayUnavailable("approved tool missing from discovery")
-        definition = definitions[tool]
+        if definition is None:
+            definitions = self._catalog(context, client)
+            if tool not in definitions:
+                raise GatewayUnavailable("approved tool missing from discovery")
+            definition = definitions[tool]
         validate_schema(definition["inputSchema"], arguments)
         if not self.argument_authority(context, server, binding.logical_id, arguments):
             raise PolicyDenied("arguments target an unapproved resource or operation")
@@ -1283,7 +1299,9 @@ class McpGateway:
                 self.ledger.audit(key, exc.code, self.clock())
                 self.ledger.failure(server, self.clock())
                 if not acknowledged:
-                    raise
+                    if isinstance(exc, DeliveryUncertain):
+                        raise
+                    raise DeliveryUncertain("subscription delivery lacks acknowledgment; reconcile window") from exc
                 closure = "disconnected"
             except GatewayError as exc:
                 self.ledger.audit(key, exc.code, self.clock())
@@ -1362,24 +1380,12 @@ class ServerAdapter:
                     return 400, encoded({"jsonrpc": "2.0", "id": request_id,
                         "error": {"code": -32021, "message": "missing_required_client_capability",
                                   "data": {"requiredCapabilities": {"extensions": {TASKS: {}}}}}})
-                if headers is not None and upstream:
-                    binding = next((x for x in upstream.server.tools if x.name == tool), None)
-                    if binding is None:
-                        raise PolicyDenied("unknown qualified tool")
-                    arguments = params.get("arguments")
-                    definition = self.gateway.routing_definition(context, upstream, binding,
-                        {"name": tool, "arguments": arguments}, meta.get("org.herdr/operation"))
-                    for path, header in schema_headers(definition["inputSchema"]):
-                        value = arguments
-                        for part in path:
-                            if not isinstance(value, dict) or part not in value:
-                                break
-                            value = value[part]
-                        else:
-                            if headers.get("Mcp-Param-" + header) != header_value(value):
-                                raise GatewayError("custom routing header mismatch")
-                operation = meta.get("org.herdr/operation")
-                outcome = self.gateway.call(context, server, tool, params.get("arguments"), identifier(operation))
+                operation = identifier(meta.get("org.herdr/operation"))
+                if headers is None:
+                    outcome = self.gateway.call(context, server, tool, params["arguments"], operation)
+                else:
+                    outcome = self.gateway.call(context, server, tool, params["arguments"], operation,
+                                                routing_headers=headers)
                 if outcome.result is None:
                     result = {"resultType": "complete", "isError": True,
                               "content": [{"type": "text", "text": "Recorded outcome requires artifact reconciliation; operation was not repeated."}]}
