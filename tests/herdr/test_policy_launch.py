@@ -206,6 +206,22 @@ def test_actual_bwrap_seals_same_inode_after_mount_and_denies_writes(tmp_path, m
         inside = Path(f"/proc/{pid}/root") / str(BUNDLE_TARGET).lstrip("/")
         assert inside.stat().st_ino == item.stage.inode == sealed.inode
         assert load_policy_bundle(inside,identity).hash == bound.hash
+        from herdr.policy_launch import PreparedPolicyLaunch, process_start_ticks, verify_retained_policy_evidence
+        retained = PreparedPolicyLaunch(item,bound,None,"probe")
+        retained.sealed,retained._process_start_ticks = sealed,process_start_ticks(pid)
+        proof = retained.evidence()
+        assert verify_retained_policy_evidence(proof,identity=identity,pid=pid,attestation=attestation).hash == bound.hash
+        for field in ("bundle_inode","process_start_ticks"):
+            changed = json.loads(json.dumps(proof))
+            changed[field] += 1
+            with pytest.raises(SecurityError):
+                verify_retained_policy_evidence(changed,identity=identity,pid=pid,attestation=attestation)
+        changed = json.loads(json.dumps(proof))
+        changed["tree_identities"][str(CODE_TARGET)]["inode"] += 1
+        with pytest.raises(SecurityError):
+            verify_retained_policy_evidence(changed,identity=identity,pid=pid,attestation=attestation)
+        with pytest.raises(SecurityError,match="attestation"):
+            verify_retained_policy_evidence(proof,identity=identity,pid=pid,attestation={**attestation,"run_token":"foreign"})
         script = """import json,pathlib,sys
 result=pathlib.Path(sys.argv[1]); observed={}
 for target in sys.argv[2:]:
@@ -394,9 +410,11 @@ def proof_scheduler(tmp_path):
     identity=InvocationIdentity(consumer="github:"+record.repo,agent_id=record.agent_id,
         parent_agent_id=record.parent_agent_id,parent_task_id=record.parent_task_id,
         task_id=record.id,run_token=record.run_token,fencing_token=record.fencing_token)
-    evidence={"schema_version":"herdr-policy-launch-1","grant_sha256":"a"*64,"bundle_sha256":"b"*64,
+    evidence={"schema_version":"herdr-policy-launch-2","grant_sha256":"a"*64,"bundle_sha256":"b"*64,
         "bundle_device":1,"bundle_inode":2,"code_sha256":"c"*64,
         "runtime_sha256":dict.fromkeys(map(str,RUNTIME_TARGETS),"d"*64),
+        "tree_identities":{str(x):{"device":1,"inode":2} for x in (CODE_TARGET,*RUNTIME_TARGETS)},
+        "process_start_ticks":123,
         "identity":identity.to_json(),"sandbox_attestation_sha256":"e"*64}
     return scheduler,record,marker,evidence
 

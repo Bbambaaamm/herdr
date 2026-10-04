@@ -20,7 +20,7 @@ from typing import Mapping
 from .security import (
     InvocationIdentity, NetworkAccess, PolicyBundleStage, RuntimeAssurance,
     SecurityError, SecurityGrant, SealedPolicyBundle, canonical_json_bytes,
-    stage_policy_bundle,
+    stage_policy_bundle, load_policy_bundle,
 )
 
 BUNDLE_TARGET = Path("/run/herdr-policy/grant.bundle.json")
@@ -326,10 +326,11 @@ class PolicyMount:
 
 def validate_policy_evidence(evidence, *, identity: InvocationIdentity):
     keys = {"schema_version", "grant_sha256", "bundle_sha256", "bundle_device", "bundle_inode",
-            "code_sha256", "runtime_sha256", "identity", "sandbox_attestation_sha256"}
+            "code_sha256", "runtime_sha256", "identity", "sandbox_attestation_sha256",
+            "tree_identities", "process_start_ticks"}
     _require(isinstance(evidence, dict) and set(evidence) == keys
              and len(canonical_json_bytes(evidence)) <= 16384, "bounded policy evidence required")
-    _require(evidence["schema_version"] == "herdr-policy-launch-1"
+    _require(evidence["schema_version"] == "herdr-policy-launch-2"
              and InvocationIdentity.from_dict(evidence["identity"]) == identity,
              "policy evidence identity mismatch")
     for key in ("grant_sha256", "bundle_sha256", "code_sha256", "sandbox_attestation_sha256"):
@@ -342,7 +343,91 @@ def validate_policy_evidence(evidence, *, identity: InvocationIdentity):
     _require(isinstance(runtime, dict) and set(runtime) == set(map(str, RUNTIME_TARGETS))
              and all(isinstance(value, str) and _SHA.fullmatch(value) for value in runtime.values()),
              "policy evidence runtime incomplete")
+    trees = evidence["tree_identities"]
+    _require(isinstance(trees, dict) and set(trees) == {str(CODE_TARGET), *map(str, RUNTIME_TARGETS)},
+             "policy tree identities incomplete")
+    for tree in trees.values():
+        _require(isinstance(tree, dict) and set(tree) == {"device", "inode"}
+                 and all(type(v) is int and 0 <= v < 2**64 for v in tree.values())
+                 and tree["inode"] > 0, "policy tree inode malformed")
+    _require(type(evidence["process_start_ticks"]) is int
+             and 0 < evidence["process_start_ticks"] < 2**64, "policy process identity malformed")
     return json.loads(canonical_json_bytes(evidence))
+
+
+def process_start_ticks(pid):
+    _require(type(pid) is int and pid > 0, "policy process id invalid")
+    with Path(f"/proc/{pid}/stat").open("rb") as stream:
+        raw = stream.read(4097)
+    _require(len(raw) <= 4096, "process stat exceeds bound")
+    fields = raw.rpartition(b") ")[2].split()
+    _require(len(fields) >= 20 and fields[19].isdigit(), "process stat malformed")
+    return int(fields[19])
+
+
+def verify_retained_policy_evidence(evidence, *, identity, pid, attestation, now=None):
+    """Reopen protected launch proof after restart; never authorize fresh calls."""
+    proof = validate_policy_evidence(evidence, identity=identity)
+    _require(process_start_ticks(pid) == proof["process_start_ticks"], "policy process was replaced")
+    _require(isinstance(attestation, dict) and len(canonical_json_bytes(attestation)) <= 65536
+             and attestation.get("task_id") == identity.task_id
+             and attestation.get("run_token") == identity.run_token
+             and attestation.get("sandbox_pid") == pid
+             and hashlib.sha256(canonical_json_bytes(attestation)).hexdigest()
+                 == proof["sandbox_attestation_sha256"], "retained attestation mismatch")
+    rows = mount_rows(pid)
+    _require("ro" in rows.get("/", set()), "host root is not read-only")
+    _require(os.readlink(f"/proc/{pid}/ns/mnt") != os.readlink("/proc/self/ns/mnt")
+             and os.readlink(f"/proc/{pid}/ns/pid") != os.readlink("/proc/self/ns/pid"),
+             "policy process lacks sandbox namespaces")
+    root = Path(f"/proc/{pid}/root")
+    for target, expected in proof["tree_identities"].items():
+        path = Path(target)
+        info = (root / target.lstrip("/")).stat()
+        _require(stat.S_ISDIR(info.st_mode)
+                 and (info.st_dev, info.st_ino) == (expected["device"], expected["inode"])
+                 and "ro" in rows.get(target, set()), "retained policy tree identity mismatch")
+        _require(not any("rw" in modes and path in Path(name).parents for name,modes in rows.items()),
+                 "writable mount below immutable policy/runtime tree")
+    bundle = root / str(BUNDLE_TARGET).lstrip("/")
+    fd = os.open(bundle, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        _require(stat.S_ISREG(info.st_mode)
+                 and (info.st_dev, info.st_ino) == (proof["bundle_device"],proof["bundle_inode"])
+                 and "ro" in rows.get(str(BUNDLE_TARGET),set()), "retained policy bundle identity mismatch")
+        raw = b""
+        while len(raw) <= 131072:
+            chunk = os.read(fd, 131073-len(raw))
+            if not chunk:
+                break
+            raw += chunk
+        _require(len(raw) <= 131072 and hashlib.sha256(raw).hexdigest() == proof["bundle_sha256"],
+                 "retained policy bundle digest mismatch")
+    finally:
+        os.close(fd)
+    with Path(f"/proc/{pid}/environ").open("rb") as stream:
+        raw_env = stream.read(262145)
+    _require(len(raw_env) <= 262144, "policy process environment exceeds bound")
+    env = {}
+    for entry in raw_env.split(b"\0"):
+        if b"=" in entry:
+            key,value = entry.split(b"=",1)
+            _require(key not in env, "ambiguous policy process environment")
+            env[key] = value
+    for field,key in IDENTITY_ENV.items():
+        _require(env.get(key.encode()) == str(getattr(identity,field)).encode(),
+                 "retained process policy identity mismatch")
+    grant = load_policy_bundle(bundle,identity,expected_attestation_sha256=proof["sandbox_attestation_sha256"],now=now)
+    _require(grant.hash == proof["grant_sha256"], "retained grant digest mismatch")
+    assurance = grant.runtime_assurance
+    network = (NetworkAccess.GLOBAL if os.readlink(f"/proc/{pid}/ns/net") == os.readlink("/proc/self/ns/net")
+               else NetworkAccess.NONE)
+    _require(assurance.network_access == network and not assurance.credentials_isolated
+             and set(assurance.writable_roots) == {name for name,modes in rows.items() if "rw" in modes},
+             "retained runtime assurance mismatch")
+    _require(process_start_ticks(pid) == proof["process_start_ticks"], "policy process changed during verification")
+    return grant
 
 
 @dataclass(frozen=True)
@@ -374,6 +459,7 @@ class PreparedPolicyLaunch:
         self.mount, self.grant = mount, grant
         self._private_key, self._key_id, self._parent = private_key, key_id, parent
         self.sealed = None
+        self._process_start_ticks = None
 
     @property
     def identity(self):
@@ -387,15 +473,19 @@ class PreparedPolicyLaunch:
                                        tools=tools, permissions=permissions, private_key=self._private_key,
                                        key_id=self._key_id, parent=self._parent)
         self.grant, self.sealed = bound, sealed
+        self._process_start_ticks = process_start_ticks(pid)
         self._private_key = None
         return self.evidence()
 
     def evidence(self):
         _require(self.sealed is not None, "launch policy is not sealed")
-        return {"schema_version": "herdr-policy-launch-1", "grant_sha256": self.grant.hash,
+        return {"schema_version": "herdr-policy-launch-2", "grant_sha256": self.grant.hash,
                 "bundle_sha256": self.sealed.sha256, "bundle_device": self.sealed.device,
                 "bundle_inode": self.sealed.inode, "code_sha256": self.mount.code.source_digest,
                 "runtime_sha256": {str(x.target): x.source_digest for x in self.mount.runtime},
+                "tree_identities": {str(x.target): {"device":x.device, "inode":x.inode}
+                                    for x in (self.mount.code, *self.mount.runtime)},
+                "process_start_ticks": self._process_start_ticks,
                 "identity": self.identity.to_json(),
                 "sandbox_attestation_sha256": self.grant.runtime_assurance.sandbox_attestation_sha256}
 
