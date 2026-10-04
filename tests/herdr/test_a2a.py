@@ -11,6 +11,15 @@ from herdr.a2a import (A2AError, Admission, BindingStore, Gateway, HEADER, Ident
 from herdr.scheduler import AuditLog, DenyReason, DynamicChildScheduler
 
 
+
+
+@pytest.fixture(autouse=True)
+def _isolated_economic_claim_root(monkeypatch, tmp_path):
+    """Tests keep the production economic namespace contract without /var writes."""
+    monkeypatch.setattr(
+        a2a_module, "ECONOMIC_CLAIM_ROOT", tmp_path / ".economic-claims"
+    )
+
 def setup(tmp_path):
     raw = {"name": "remote", "description": "bounded executor", "version": "1.0.1", "capabilities": {}, "defaultInputModes": ["text/plain"], "defaultOutputModes": ["text/plain"], "skills": [], "supportedInterfaces": [{"url": "https://remote.example/a2a", "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0"}]}
     card = parse_card(raw)
@@ -675,3 +684,64 @@ def test_gateway_rejects_binding_authority_root_not_in_admission(tmp_path):
     store = BindingStore(other / "binding.json")
     with pytest.raises(A2AError, match="binding authority root not locally admitted"):
         Gateway(Mock(), store, card, policy)
+
+
+def test_same_identity_cannot_redispatch_after_admitted_binding_root_change(tmp_path):
+    raw, card, base_policy, identity, _ = setup(tmp_path)
+    root_a = tmp_path / "bindings-a"
+    root_b = tmp_path / "bindings-b"
+    policy_a = replace(base_policy, binding_root=str(root_a))
+    policy_b = replace(base_policy, binding_root=str(root_b))
+    first = BindingStore(root_a / "attempt.json", authority_root=root_a)
+    second = BindingStore(root_b / "attempt.json", authority_root=root_b)
+    transport = Mock()
+
+    def ambiguous(*args):
+        transport.sends.append(args)
+        raise RuntimeError("lost response")
+
+    transport.send = ambiguous
+    with pytest.raises(RuntimeError, match="lost response"):
+        Gateway(transport, first, card, policy_a).send(identity, "work")
+
+    with pytest.raises(A2AError, match="delivery already started"):
+        Gateway(transport, second, card, policy_b).send(identity, "work")
+    assert len(transport.sends) == 1
+
+
+def test_two_large_valid_responses_preserve_late_cancel_candidate(tmp_path):
+    _, card, policy, identity, store = setup(tmp_path)
+    early = {
+        "artifactId": "early-large",
+        "parts": [{"text": "A" * 100_000}],
+    }
+    late = {
+        "artifactId": "late-large",
+        "parts": [{"text": "B" * 100_000}],
+    }
+    transport = Mock(task("TASK_STATE_WORKING", artifacts=[early]))
+    gateway = Gateway(transport, store, card, policy)
+    first, = gateway.send(identity, "work")
+
+    def completed_cancel(interface, request, headers):
+        transport.cancels.append(request)
+        return task("TASK_STATE_COMPLETED", artifacts=[late])
+
+    transport.cancel = completed_cancel
+    second, = gateway.cancel(identity)
+    recovered = Gateway(transport, store, card, policy).recover(identity)
+    assert {item.digest for item in recovered} == {first.digest, second.digest}
+    assert second.content["artifactId"] == "late-large"
+
+
+def test_response_capacity_exhaustion_fails_before_remote_poll(tmp_path, monkeypatch):
+    _, card, policy, identity, store = setup(tmp_path)
+    artifact = {"artifactId": "one", "parts": [{"text": "candidate"}]}
+    transport = Mock(task("TASK_STATE_WORKING", artifacts=[artifact]))
+    gateway = Gateway(transport, store, card, policy)
+    gateway.send(identity, "work")
+    monkeypatch.setattr(a2a_module, "MAX_CANDIDATES", 1)
+
+    with pytest.raises(A2AError, match="candidate recovery capacity exhausted"):
+        gateway.poll(identity)
+    assert transport.gets == []

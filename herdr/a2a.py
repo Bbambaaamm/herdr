@@ -25,8 +25,14 @@ HEADER = {"A2A-Version": VERSION}
 MAX_CARD = 32_768
 MAX_RESPONSE = 131_072
 MAX_PARTS = 16
-MAX_BINDING = 196_608
 MAX_REMOTE_ID_BYTES = 4096
+MAX_CANDIDATES = 64
+MAX_RESPONSE_CANDIDATES = MAX_PARTS + 1  # status.message + bounded artifacts
+MAX_BINDING = (
+    MAX_CANDIDATES * (MAX_RESPONSE + 2 * MAX_REMOTE_ID_BYTES + 1024)
+    + 64 * 1024
+)
+ECONOMIC_CLAIM_ROOT = Path("/var/lib/herdr/a2a-economic-claims")
 _ID = re.compile(r"^[A-Za-z0-9._:@/+-]{1,256}$")
 _SECRET = re.compile(r"(?i)(secret|password|credential|private.?key|api.?key|access.?token|authorization|cookie|bearer\s|ghp_[a-z0-9]{20,}|sk-[a-z0-9]{20,}|xox[baprs]-)")
 _CARD_SECRET_VALUE = re.compile(
@@ -316,7 +322,7 @@ def _merge_candidate_records(existing: Any, candidates: tuple[Candidate, ...]) -
         if key not in seen:
             records.append(record)
             seen.add(key)
-    if len(records) > 32:
+    if len(records) > MAX_CANDIDATES:
         raise A2AError("candidate recovery count exceeds bound")
     _bounded(records, MAX_BINDING)
     return records
@@ -439,7 +445,7 @@ class BindingStore:
         retry with another binding path under the same admitted root therefore
         cannot create a second remote attempt.
         """
-        root = _open_durable_directory(self.authority_root)
+        root = _open_durable_directory(ECONOMIC_CLAIM_ROOT)
         name = identity.message_id + ".claim"
         payload = _bounded(
             {
@@ -533,7 +539,10 @@ class BindingStore:
         for key in ("remote_task_id", "remote_context_id"):
             if data[key] is not None:
                 _remote_id(data[key], key)
-        if not isinstance(data["candidates"], list) or len(data["candidates"]) > 32:
+        if (
+            not isinstance(data["candidates"], list)
+            or len(data["candidates"]) > MAX_CANDIDATES
+        ):
             raise A2AError("invalid recovery candidates")
         for item in data["candidates"]:
             _candidate_from_record(identity, item)
@@ -551,6 +560,23 @@ class BindingStore:
     def read(self) -> dict[str, Any] | None:
         with self.locked() as directory:
             return self._read(directory)
+
+    @staticmethod
+    def require_response_capacity(data: Mapping[str, Any]) -> None:
+        """Reserve worst-case bounded response capacity before remote effects.
+
+        A valid A2A response may contain one TaskStatus.message plus MAX_PARTS
+        artifacts. We never make GetTask/CancelTask if such a response could
+        overflow the durable recovery ledger after the remote effect occurred.
+        """
+        candidates = data.get("candidates")
+        if not isinstance(candidates, list):
+            raise A2AError("invalid recovery candidates")
+        if len(candidates) + MAX_RESPONSE_CANDIDATES > MAX_CANDIDATES:
+            raise A2AError("candidate recovery capacity exhausted")
+        # MAX_BINDING is dimensioned for MAX_CANDIDATES worst-case candidate
+        # records. This additionally proves the current record itself is sane.
+        _bounded(data, MAX_BINDING, secret_scan=False)
 
     def _write(self, directory: int, data: dict[str, Any], *, create: bool = False) -> None:
         raw = _bounded(data, MAX_BINDING, secret_scan=False)
@@ -757,6 +783,7 @@ class Gateway:
                 return tuple(_candidate_from_record(identity, item) for item in data["candidates"])
             if data["delivery"] != "bound":
                 raise A2AError("no bound remote task; reconciliation required")
+            self.store.require_response_capacity(data)
             request = {"id": data["remote_task_id"], "historyLength": 0}
             if self.interface.tenant is not None:
                 request["tenant"] = self.interface.tenant
@@ -787,6 +814,7 @@ class Gateway:
             data = self._bound(identity, directory)
             if not data["cancel_intent"] or data["delivery"] != "bound":
                 raise A2AError("no durable cancel intent")
+            self.store.require_response_capacity(data)
             request = {"id": data["remote_task_id"]}
             if self.interface.tenant is not None:
                 request["tenant"] = self.interface.tenant
