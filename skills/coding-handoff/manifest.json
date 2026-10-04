@@ -1,0 +1,47 @@
+{
+  "schema_version": "1.0.0",
+  "name": "coding-handoff",
+  "version": "1.0.0",
+  "description": "Prepare a compact coding handoff with acceptance criteria, changed paths and verification evidence.",
+  "publisher": "herdr-maintainers",
+  "source_uri": "https://github.com/Bbambaaamm/herdr",
+  "authoring_base_revision": "8e4da55b3739c5ad5d9061a44eaad1beaa1179d7",
+  "tools": [
+    "read_file"
+  ],
+  "permissions": [
+    "repo:read"
+  ],
+  "capabilities": [],
+  "features": [
+    "reasoning"
+  ],
+  "platforms": [
+    "linux",
+    "windows",
+    "darwin"
+  ],
+  "files": [
+    {
+      "path": "SKILL.md",
+      "size": 544,
+      "sha256": "dfadf9d44c6beb79e4fc3e8e28198494436b6040927e882b77c52dbad5663fa3",
+      "media_type": "text/markdown",
+      "data_class": "internal"
+    },
+    {
+      "path": "references/handoff-template.json",
+      "size": 105,
+      "sha256": "3a78cff109bbd08f969fd5e4f2bbd00e30ad0ec1106306b787377b8a868d1125",
+      "media_type": "application/json",
+      "data_class": "internal"
+    },
+    {
+      "path": "scripts/validate_handoff.py",
+      "size": 446,
+      "sha256": "69d5fed37a84308b7ac428984fdb6a0fdacd0ff5e8d229267da7de2f9c48487a",
+      "media_type": "text/plain",
+      "data_class": "internal"
+    }
+  ]
+}
