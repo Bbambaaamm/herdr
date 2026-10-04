@@ -1110,6 +1110,7 @@ class HerdrChildRuntime:
                     marker,
                     sandbox_pid=int(proof.get("sandbox_pid") or 0),
                     policy_sha256=str(proof.get("policy_sha256") or ""),
+                    invocation_policy=proof.get("invocation_policy"),
                 )
             ):
                 raise HerdrRuntimeError("child_sandbox_attestation_denied", lease.task_id)

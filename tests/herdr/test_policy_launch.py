@@ -376,3 +376,69 @@ def test_policy_mount_rejects_writable_runtime_descendant_before_access(tmp_path
         with pytest.raises(SecurityError,match="writable mount below"):
             item.verify_mounted(os.getpid())
     finally:cleanup(item)
+
+
+def proof_scheduler(tmp_path):
+    from herdr.scheduler import DynamicChildScheduler,AuditLog,ChildProposal
+    scheduler=DynamicChildScheduler(audit_log=AuditLog(tmp_path/"proof-events"))
+    scheduler.register_external_parent_attempt(task_id="parent-task",run_token="parent-run",
+        idempotency_key="parent-key",agent_name="parent-agent",pane_id="parent-pane",marker="marker",
+        repo="Bbambaaamm/herdr",issue="82",role="writer",tools=("read_file",),
+        permissions=(),policy_profile="default")
+    child=scheduler.delegate_child("parent-task","parent-run","inspect",
+        ChildProposal("writer",("read_file",),"reader",("read_file",),child_task="inspect"))
+    lease=scheduler.dispatch(task_ids={child.id})[0]
+    record=scheduler._tasks[child.id]
+    marker="child-"+record.run_token
+    assert scheduler.bind_pre_delivery_pane(child.id,record.run_token,lease.agent_id,"child-pane",marker)
+    identity=InvocationIdentity(consumer="github:"+record.repo,agent_id=record.agent_id,
+        parent_agent_id=record.parent_agent_id,parent_task_id=record.parent_task_id,
+        task_id=record.id,run_token=record.run_token,fencing_token=record.fencing_token)
+    evidence={"schema_version":"herdr-policy-launch-1","grant_sha256":"a"*64,"bundle_sha256":"b"*64,
+        "bundle_device":1,"bundle_inode":2,"code_sha256":"c"*64,
+        "runtime_sha256":dict.fromkeys(map(str,RUNTIME_TARGETS),"d"*64),
+        "identity":identity.to_json(),"sandbox_attestation_sha256":"e"*64}
+    return scheduler,record,marker,evidence
+
+def test_policy_evidence_survives_restart_without_new_claim_or_shared_mutable_data(tmp_path):
+    from herdr.scheduler import DynamicChildScheduler,AuditLog
+    scheduler,record,marker,evidence=proof_scheduler(tmp_path)
+    assert scheduler.attest_execution_sandbox(record.id,record.run_token,record.agent_id,
+        "child-pane",marker,sandbox_pid=123,policy_sha256="f"*64,invocation_policy=evidence)
+    expected=json.loads(json.dumps(evidence))
+    evidence["identity"]["run_token"]="worker-mutation"
+    assert record.execution_sandbox_attestation["invocation_policy"]==expected
+    recovered=DynamicChildScheduler(audit_log=AuditLog(tmp_path/"proof-events"))
+    recovered.replay()
+    replayed=recovered._tasks[record.id]
+    assert replayed.execution_sandbox_attestation["invocation_policy"]==expected
+    assert (replayed.run_token,replayed.fencing_token,replayed.idempotency_key)==(
+        record.run_token,record.fencing_token,record.idempotency_key)
+
+@pytest.mark.parametrize("fault",["run","fence","parent","consumer","digest","runtime","extra","inode"])
+def test_scheduler_rejects_malformed_or_cross_attempt_policy_evidence(tmp_path,fault):
+    scheduler,record,marker,evidence=proof_scheduler(tmp_path)
+    if fault=="run":evidence["identity"]["run_token"]="different"
+    elif fault=="fence":evidence["identity"]["fencing_token"]+=1
+    elif fault=="parent":evidence["identity"]["parent_task_id"]="different"
+    elif fault=="consumer":evidence["identity"]["consumer"]="github:foreign"
+    elif fault=="digest":evidence["bundle_sha256"]="invalid"
+    elif fault=="runtime":evidence["runtime_sha256"].pop(next(iter(evidence["runtime_sha256"])))
+    elif fault=="extra":evidence["untrusted_authority"]="root"
+    elif fault=="inode":evidence["bundle_inode"]=True
+    assert not scheduler.attest_execution_sandbox(record.id,record.run_token,record.agent_id,
+        "child-pane",marker,sandbox_pid=123,policy_sha256="f"*64,invocation_policy=evidence)
+    assert not record.execution_sandbox_verified
+
+def test_policy_evidence_replay_rejects_tampering_in_the_protected_log(tmp_path):
+    from herdr.scheduler import DynamicChildScheduler,AuditLog,SchedulerError
+    scheduler,record,marker,evidence=proof_scheduler(tmp_path)
+    assert scheduler.attest_execution_sandbox(record.id,record.run_token,record.agent_id,
+        "child-pane",marker,sandbox_pid=123,policy_sha256="f"*64,invocation_policy=evidence)
+    path=tmp_path/"proof-events"
+    events=[json.loads(line) for line in path.read_text().splitlines()]
+    event=next(event for event in events if event["event"]=="execution_sandbox_attested")
+    event["attestation"]["invocation_policy"]["identity"]["run_token"]="foreign"
+    path.write_text("".join(json.dumps(event)+"\n" for event in events))
+    with pytest.raises(SchedulerError,match="invocation policy"):
+        DynamicChildScheduler(audit_log=AuditLog(path)).replay()

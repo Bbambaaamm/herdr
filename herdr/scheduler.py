@@ -1289,6 +1289,7 @@ class DynamicChildScheduler:
         *,
         sandbox_pid: int,
         policy_sha256: str,
+        invocation_policy: dict | None = None,
     ) -> bool:
         """Persist host-produced bwrap proof for the exact bound child session.
 
@@ -1306,7 +1307,7 @@ class DynamicChildScheduler:
             or rec.run_token != run_token
             or rec.agent_id != agent_name
             or expected != identity
-            or not isinstance(sandbox_pid, int)
+            or type(sandbox_pid) is not int
             or sandbox_pid <= 0
             or not isinstance(policy_sha256, str)
             or re.fullmatch(r"[0-9a-f]{64}", policy_sha256) is None
@@ -1326,6 +1327,18 @@ class DynamicChildScheduler:
             "policy_sha256": policy_sha256,
             "verified_at": datetime.now(UTC).isoformat(),
         }
+        if invocation_policy is not None:
+            from herdr.policy_launch import validate_policy_evidence
+            from herdr.security import InvocationIdentity, SecurityError
+            try:
+                policy_identity = InvocationIdentity(
+                    consumer="github:" + rec.repo, agent_id=rec.agent_id,
+                    parent_agent_id=rec.parent_agent_id, parent_task_id=rec.parent_task_id,
+                    task_id=rec.id, run_token=rec.run_token, fencing_token=rec.fencing_token)
+                attestation["invocation_policy"] = validate_policy_evidence(
+                    invocation_policy, identity=policy_identity)
+            except (SecurityError, TypeError, ValueError):
+                return False
         if rec.execution_sandbox_verified:
             previous = rec.execution_sandbox_attestation or {}
             comparable = {k: previous.get(k) for k in attestation if k != "verified_at"}
@@ -1958,13 +1971,23 @@ class DynamicChildScheduler:
                     or attestation.get("marker") != rec.execution_marker
                     or attestation.get("fencing_token") != rec.fencing_token
                     or attestation.get("worktree_identity") != rec.worktree_identity
-                    or not isinstance(attestation.get("sandbox_pid"), int)
+                    or type(attestation.get("sandbox_pid")) is not int
                     or int(attestation.get("sandbox_pid", 0)) <= 0
                     or not isinstance(attestation.get("policy_sha256"), str)
                     or re.fullmatch(r"[0-9a-f]{64}", str(attestation.get("policy_sha256"))) is None
                     or not isinstance(attestation.get("verified_at"), str)
                 ):
                     raise SchedulerError("invalid child sandbox attestation")
+                if "invocation_policy" in attestation:
+                    from herdr.policy_launch import validate_policy_evidence
+                    from herdr.security import InvocationIdentity, SecurityError
+                    try:
+                        validate_policy_evidence(attestation["invocation_policy"], identity=InvocationIdentity(
+                            consumer="github:" + rec.repo, agent_id=rec.agent_id,
+                            parent_agent_id=rec.parent_agent_id, parent_task_id=rec.parent_task_id,
+                            task_id=rec.id, run_token=rec.run_token, fencing_token=rec.fencing_token))
+                    except (SecurityError, TypeError, ValueError) as exc:
+                        raise SchedulerError("invalid child invocation policy evidence") from exc
                 rec.execution_sandbox_verified = True
                 rec.execution_sandbox_attestation = dict(attestation)
             elif event_type == "child_pane_creation_attempted":

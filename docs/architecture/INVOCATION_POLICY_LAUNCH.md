@@ -20,7 +20,7 @@ The launch helper reopens each held host descriptor before bwrap creates namespa
 6. Fsync/read back/signature-verify the same inode and recheck its mounted read-only inode and digest.
 7. Publish protected host policy evidence before recording agent-start intent and invoking Hermes.
 
-The private signing key stays in the host object and is discarded after sealing. Only the signed public bundle is exposed to the worker. Evidence records grant/bundle/code/runtime hashes, bundle inode, exact identity and sandbox attestation digest.
+The private signing key stays in the host object and is discarded after sealing. Only the signed public bundle is exposed to the worker. Evidence records grant/bundle/code/runtime hashes, bundle inode, exact identity and sandbox attestation digest. The protected scheduler attestation persists the bounded proof and revalidates exact consumer/parent/task/run/fence and every digest during replay; malformed or cross-attempt records fail closed. A legacy namespace-only record remains distinct from sealed invocation policy and cannot supply semantic acceptance.
 
 Network assurance is measured: the retained host namespace is GLOBAL; an isolated namespace is NONE. This implementation never claims provider-only network enforcement or credential isolation. Enabled process grants therefore deny. Native file tools can operate within admitted scope; privileged operations and an approval broker require their separately proven host embedding.
 

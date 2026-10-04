@@ -324,6 +324,26 @@ class PolicyMount:
         self.verify_mounted(pid, sealed)
         return bound, sealed
 
+def validate_policy_evidence(evidence, *, identity: InvocationIdentity):
+    keys = {"schema_version", "grant_sha256", "bundle_sha256", "bundle_device", "bundle_inode",
+            "code_sha256", "runtime_sha256", "identity", "sandbox_attestation_sha256"}
+    _require(isinstance(evidence, dict) and set(evidence) == keys
+             and len(canonical_json_bytes(evidence)) <= 16384, "bounded policy evidence required")
+    _require(evidence["schema_version"] == "herdr-policy-launch-1"
+             and InvocationIdentity.from_dict(evidence["identity"]) == identity,
+             "policy evidence identity mismatch")
+    for key in ("grant_sha256", "bundle_sha256", "code_sha256", "sandbox_attestation_sha256"):
+        _require(isinstance(evidence[key], str) and bool(_SHA.fullmatch(evidence[key])),
+                 "policy evidence digest malformed")
+    _require(all(type(evidence[key]) is int and 0 <= evidence[key] < 2**64
+                 for key in ("bundle_device", "bundle_inode")) and evidence["bundle_inode"] > 0,
+             "policy evidence inode malformed")
+    runtime = evidence["runtime_sha256"]
+    _require(isinstance(runtime, dict) and set(runtime) == set(map(str, RUNTIME_TARGETS))
+             and all(isinstance(value, str) and _SHA.fullmatch(value) for value in runtime.values()),
+             "policy evidence runtime incomplete")
+    return json.loads(canonical_json_bytes(evidence))
+
 
 @dataclass(frozen=True)
 class ApprovedTree:
