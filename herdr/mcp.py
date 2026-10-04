@@ -190,6 +190,8 @@ def validate_tool_content(result):
     if (not isinstance(result, dict) or not isinstance(result.get("content"), list)
             or len(result["content"]) > 256 or type(result.get("isError", False)) is not bool):
         raise GatewayError("invalid tool result")
+    if "structuredContent" in result and not isinstance(result["structuredContent"], dict):
+        raise GatewayError("invalid structured tool content")
     for block in result["content"]:
         if not isinstance(block, dict) or not isinstance(block.get("type"), str):
             raise GatewayError("invalid tool content block")
@@ -595,7 +597,15 @@ class CredentialUnavailable(GatewayUnavailable):
 class HTTPTransport:
     """Fixed host-approved endpoint; no redirects, cookies or discovery URLs."""
     def __init__(self, endpoint: str, credential: Callable[[], str] | None = None, *, allow_loopback=False):
-        parsed = urlsplit(endpoint)
+        try:
+            if not isinstance(endpoint, str) or any(ord(x) < 32 for x in endpoint):
+                raise ValueError("invalid endpoint")
+            parsed = urlsplit(endpoint)
+            port = parsed.port
+            if port is not None and not 1 <= port <= 65535:
+                raise ValueError("invalid endpoint port")
+        except ValueError as exc:
+            raise PolicyDenied("invalid host-approved endpoint") from exc
         if (parsed.username or parsed.password or parsed.query or parsed.fragment or not parsed.hostname
                 or (parsed.scheme != "https" and not (
                     allow_loopback and parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "::1"}))):
@@ -848,6 +858,9 @@ class ClientAdapter:
                 binding = allowed[row["name"]]
                 if hashed(row) != binding.definition_hash:
                     raise PolicyDenied("tool definition changed; versioned policy replan required")
+                for field in ("title", "description"):
+                    if field in row and not isinstance(row[field], str):
+                        raise GatewayError("invalid optional tool text field")
                 annotations = row.get("annotations", {})
                 if not isinstance(annotations, dict):
                     raise GatewayError("tool annotations must be an object")
@@ -1194,6 +1207,8 @@ class McpGateway:
                             if not isinstance(contents, list) or not contents or any(
                                     not isinstance(x, dict) or x.get("uri") != params["uri"] for x in contents):
                                 raise PolicyDenied("remote resource contents escaped allowlist")
+                            for resource in contents:
+                                validate_tool_content({"content": [{"type": "resource", "resource": resource}]})
                         else:
                             validate_tool_content(result)
                         if definition and "outputSchema" in definition:

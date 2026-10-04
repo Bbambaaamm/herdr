@@ -204,3 +204,10 @@ provider unhealthy.
 Ordinary and completed-Task tool results validate each content block's declared
 type, required fields and text/binary/resource shape before recording completion.
 Malformed mutation output retains uncertainty and cannot trigger redelivery.
+
+Configured endpoint ports and URL shape are validated before the transport can
+participate in discovery or delivery. Pinned discovery bytes still must be
+valid protocol definitions, including optional tool title and description.
+Structured tool output must be an object even without an output schema.
+Resource reads validate text/blob exclusivity, types, encoding and metadata in
+addition to the exact admitted URI.

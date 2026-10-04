@@ -1828,3 +1828,64 @@ def test_malformed_mutating_content_retains_uncertainty_without_redelivery(tmp_p
     with pytest.raises(DeliveryUncertain):
         gateway.call(context, "local", "write", {"value": "result"}, "op")
     assert len(semantic_calls(transport)) == 1
+
+
+@pytest.mark.parametrize("endpoint", ["https://provider:bad", "https://provider:65536", "https://provider:-1",
+    "https://provider:0", "https://[broken", "https://provider\n/path"])
+def test_invalid_endpoint_ports_and_shapes_are_rejected_at_configuration(endpoint):
+    with pytest.raises(PolicyDenied):
+        HTTPTransport(endpoint)
+
+
+@pytest.mark.parametrize("field", ["title", "description"])
+@pytest.mark.parametrize("value", [None, [], 1, True])
+def test_pinned_tool_definition_hash_does_not_excuse_malformed_optional_text(tmp_path, field, value):
+    gateway, context, transport, clock, client, _ = fixture(tmp_path)
+    malformed = {**READ, field: value}
+    transport.definitions = [malformed, WRITE]
+    client.server = replace(client.server, tools=(
+        replace(client.server.tools[0], definition_hash=hashed(malformed)), client.server.tools[1]))
+    with pytest.raises(GatewayError, match="optional tool text"):
+        client.discover(context, clock())
+    assert client.definitions["read"] == READ
+
+
+@pytest.mark.parametrize("content", [[], None, 1, "text", True])
+@pytest.mark.parametrize("task", [False, True])
+def test_structured_content_requires_object_even_without_output_schema(tmp_path, content, task):
+    gateway, context, transport, clock, *_ = fixture(tmp_path, tasks=task)
+    bad = {"resultType": "complete", "content": [{"type": "text", "text": "valid text"}],
+           "structuredContent": content}
+    if task:
+        transport.task = True
+        gateway.call(context, "local", "read", {"path": "source.py"}, "op")
+        clock.value += 2
+        transport.response = {"resultType": "complete", "taskId": "remote-task-1", "status": "completed",
+            "createdAt": "2026-10-03T20:00:00Z", "lastUpdatedAt": "2026-10-03T20:00:01Z",
+            "ttlMs": 60000, "pollIntervalMs": 1000, "result": bad}
+        action = lambda: gateway.poll(context, "op")
+    else:
+        transport.response = bad
+        action = lambda: gateway.call(context, "local", "read", {"path": "source.py"}, "op")
+    with pytest.raises(GatewayError, match="structured tool content"):
+        action()
+    assert gateway.ledger.get(operation_key(context))["state"] != "observed_complete"
+
+
+@pytest.mark.parametrize("payload", [{}, {"text": "a", "blob": "AA=="}, {"text": None}, {"text": []},
+    {"blob": 1}, {"blob": "bad!"}, {"text": "valid", "mimeType": 1}, {"text": "valid", "_meta": []}])
+def test_resource_read_requires_valid_text_or_blob_payload(tmp_path, payload):
+    gateway, context, transport, *_ = fixture(tmp_path, tools=("docs_read",))
+    transport.response = {"resultType": "complete", "contents": [{"uri": "herdr://docs/one", **payload}]}
+    with pytest.raises(GatewayError):
+        gateway.read_resource(context, "local", "herdr://docs/one", "op")
+    assert gateway.ledger.get(operation_key(context))["state"] == "response_rejected"
+    assert gateway.ledger.db.execute("SELECT failures FROM health").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("payload", [{"text": "valid", "mimeType": "text/plain", "_meta": {}},
+                                    {"blob": "AA==", "mimeType": "application/octet-stream"}])
+def test_valid_resource_payloads_remain_supported(tmp_path, payload):
+    gateway, context, transport, *_ = fixture(tmp_path, tools=("docs_read",))
+    transport.response = {"resultType": "complete", "contents": [{"uri": "herdr://docs/one", **payload}]}
+    assert gateway.read_resource(context, "local", "herdr://docs/one", "op").state == "observed_complete"
