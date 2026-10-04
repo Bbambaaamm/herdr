@@ -419,12 +419,16 @@ HOST_POLICY_LAUNCHES = {}
 def _root_policy_factory():
     global HOST_POLICY_LAUNCH_FACTORY
     from herdr.policy_launch import HostPolicyLaunchFactory
-    if HOST_POLICY_LAUNCH_FACTORY is None:
+    from herdr.security import SecurityError
+    factory=HOST_POLICY_LAUNCH_FACTORY
+    if factory is None:
         from herdr.host_configuration import build_host_policy_factory
-        return build_host_policy_factory()
-    if not isinstance(HOST_POLICY_LAUNCH_FACTORY,HostPolicyLaunchFactory):
+        try:factory=build_host_policy_factory()
+        except (OSError,SecurityError,ValueError,KeyError,TypeError) as exc:
+            raise RuntimeError("task_invocation_policy_missing") from exc
+    if not isinstance(factory,HostPolicyLaunchFactory):
         raise RuntimeError("task_invocation_policy_missing")
-    return HOST_POLICY_LAUNCH_FACTORY
+    return factory
 
 
 def _preflight_root_provider(profile):
