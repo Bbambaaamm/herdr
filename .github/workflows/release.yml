@@ -45,7 +45,7 @@ jobs:
         run: |
           python scripts/validate_repo.py
           sha256sum -c provenance/CANONICAL_SOURCE_MANIFEST.sha256
-          python -m pip install --disable-pip-version-check pytest==8.4.2
+          python -m pip install --disable-pip-version-check pytest==8.4.2 -r requirements-mcp.txt
           python -m compileall -q herdr deploy agent_platform_dashboard tests integrations/search-router
           python -m pytest -q tests
           npm install --global "npm@${NPM_VERSION}"

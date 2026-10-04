@@ -118,13 +118,18 @@ data, not copied into audit.
 Core Herdr remains importable without optional schema packages. Activating this
 adapter requires the exact packages in requirements-mcp.txt in the approved
 runtime environment. The release payload includes that lock and this contract;
-CI installs the pinned optional packages. A missing validator fails closed.
+Both CI and tagged-release jobs install the pinned optional packages. A missing validator fails closed.
 
 Tests include actual loopback HTTP JSON/SSE, authenticated routing metadata,
 side-effect response loss and restart without duplicate execution, a correlated
 subscription stream, persisted circuit state, cost/call ceilings, scope/fence
 denials, path authorization, malformed/external schemas, omitted tool context,
 resource escape attempts and foreign Tasks without completion authority.
+Fresh-process replay is tested with provider discovery and runtime observations
+unavailable. Immediate terminal Tasks use the same result/output-schema checks
+as polling. Successful polls reset consecutive failures. Discovery generation
+checks preserve concurrent invalidation. Rejected mutation responses retain
+delivery uncertainty, and integer routing headers reject unsafe integral floats.
 
 Protocol references:
 - [MCP 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28)

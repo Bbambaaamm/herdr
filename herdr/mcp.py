@@ -10,6 +10,7 @@ import base64
 import hashlib
 import http.client
 import json
+import math
 import os
 import re
 import sqlite3
@@ -95,8 +96,11 @@ def identifier(value, *, maximum=128):
 
 
 def header_value(value) -> str:
-    if type(value) is int and not -(2**53 - 1) <= value <= 2**53 - 1:
-        raise GatewayError("routing header integer exceeds safe range")
+    if type(value) in {int, float}:
+        if (type(value) is float and (not math.isfinite(value) or not value.is_integer())
+                or not -(2**53 - 1) <= value <= 2**53 - 1):
+            raise GatewayError("routing header integer exceeds safe range")
+        value = int(value)
     value = str(value).lower() if type(value) is bool else str(value)
     if (value != value.strip() or any(ord(c) < 32 or ord(c) > 126 for c in value)
             or (value.startswith("=?base64?") and value.endswith("?="))):
@@ -556,6 +560,13 @@ class ClientAdapter:
         self.definitions = {}
         self.catalog_hash = None
         self.expires_at = 0.0
+        self._catalog_mutex = threading.RLock()
+        self._catalog_generation = 0
+
+    def invalidate(self):
+        with self._catalog_mutex:
+            self._catalog_generation += 1
+            self.expires_at = 0.0
 
     def exchange(self, context, method, params, request_id, *, extra_headers=None):
         self.ledger.bind(context)
@@ -643,6 +654,8 @@ class ClientAdapter:
             raise DeliveryUncertain("subscription closed without acknowledgment")
 
     def discover(self, context: CallContext, now: float):
+        with self._catalog_mutex:
+            generation = self._catalog_generation
         definitions, cursor, cursors, ttl = {}, None, set(), 300
         allowed = {x.name: x for x in self.server.tools}
         for page in range(16):
@@ -683,9 +696,12 @@ class ClientAdapter:
             raise GatewayError("discovery page budget exhausted")
         if set(definitions) != set(allowed):
             raise GatewayUnavailable("approved tool missing from provider discovery")
-        self.definitions = definitions
-        self.catalog_hash = hashed(definitions)
-        self.expires_at = now + ttl
+        with self._catalog_mutex:
+            if generation != self._catalog_generation:
+                raise GatewayUnavailable("discovery invalidated during refresh")
+            self.definitions = definitions
+            self.catalog_hash = hashed(definitions)
+            self.expires_at = now + ttl
         return definitions
 
     @property
@@ -745,7 +761,7 @@ class McpGateway:
             self.ledger.audit(context.hash, "discovery_refreshed", self.clock())
         return client.definitions
 
-    def _admit(self, context: CallContext, server: str, logical: str, permissions: tuple[str, ...], *, tools=True, quote=False):
+    def _static_admit(self, context: CallContext, server: str, logical: str, permissions: tuple[str, ...]):
         if isinstance(context, CallContext):
             self.ledger.bind(context)
         if not isinstance(context, CallContext) or not self.authority(context):
@@ -762,6 +778,12 @@ class McpGateway:
             raise PolicyDenied("provider endpoint or execution policy changed; replan required")
         if logical not in context.toolset.tools:
             raise PolicyDenied("tool omitted from declared minimal node toolset")
+        if not set(permissions) <= set(context.toolset.scope.permissions):
+            raise PolicyDenied("required permissions outside frozen scope")
+        return client
+
+    def _admit(self, context: CallContext, server: str, logical: str, permissions: tuple[str, ...], *, tools=True, quote=False):
+        client = self._static_admit(context, server, logical, permissions)
         scope, data = context.toolset.scope, client.server.data_policy
         req = CapabilityRequirement(
             "mcp." + server + "." + logical,
@@ -777,6 +799,25 @@ class McpGateway:
             raise GatewayUnavailable("provider circuit is open")
         selected = next((state for state in states if state.executor_id == found.matches[0].executor_id), None)
         return (client, selected.estimated_cost_microusd if selected else None) if quote else client
+
+    def _replay(self, context, client, method, params, operation_key, *, readonly):
+        identifier(operation_key)
+        key = hashed({"consumer": context.identity.consumer, "task_id": context.identity.task_id,
+                      "operation_key": operation_key})
+        request_hash = hashed({"server": client.server.id, "method": method, "params": params})
+        with self.ledger.lock(key):
+            row = self.ledger.get(key)
+            if row is None:
+                return None
+            if row["context_hash"] != context.hash or row["request_hash"] != request_hash:
+                self.ledger.audit(key, "idempotency_conflict", self.clock())
+                raise PolicyDenied("operation key reused for different scope/request")
+            if row["state"] in {"observed_complete", "observed_error", "input_required",
+                                "remote_running", "response_rejected"}:
+                return Outcome(row["state"], row["result_hash"], remote_task_id=row["remote_task_id"], replay=True)
+            if row["deliveries"] and not readonly:
+                raise DeliveryUncertain("recorded side effect remains quarantined")
+        return None
 
     def model_context(self, context: CallContext):
         output = []
@@ -800,6 +841,11 @@ class McpGateway:
         binding = next((x for x in client.server.tools if x.name == tool), None) if client else None
         if not binding:
             raise PolicyDenied("unknown tool or provider alternative")
+        client = self._static_admit(context, server, binding.logical_id, binding.permissions)
+        replay = self._replay(context, client, "tools/call", {"name": tool, "arguments": arguments},
+                              operation_key, readonly=binding.read_only)
+        if replay is not None:
+            return replay
         client = self._admit(context, server, binding.logical_id, binding.permissions)
         definitions = self._catalog(context, client)
         if tool not in definitions:
@@ -841,7 +887,11 @@ class McpGateway:
         logical = dict(client.server.resources).get(uri) if client else None
         if logical is None:
             raise PolicyDenied("resource URI is outside explicit allowlist")
-        client = self._admit(context, server, logical, ("resource:read",), tools=False)
+        self._static_admit(context, server, logical, ("resource:read",))
+        replay = self._replay(context, client, "resources/read", {"uri": uri}, operation_key, readonly=True)
+        if replay is not None:
+            return replay
+        self._admit(context, server, logical, ("resource:read",), tools=False)
         return self._execute(context, client, "resources/read", {"uri": uri}, operation_key, readonly=True)
 
     def _execute(self, context, client, method, params, operation_key, *, readonly, extra_headers=None, definition=None):
@@ -875,9 +925,8 @@ class McpGateway:
                     for _notification in notifications:
                         self.ledger.audit(key, "untrusted_notification", self.clock())
                     if result["resultType"] == "task":
-                        self._remote_task(result)
-                        state, remote = "remote_running", result["taskId"]
-                        due = self.clock() + max(1, result.get("pollIntervalMs", 1000) / 1000)
+                        state, due = self._task_state(result, definition)
+                        remote = result["taskId"]
                     elif result["resultType"] == "input_required":
                         # No automatic elicitation, OAuth, callback or tool expansion.
                         state, remote, due = "input_required", None, None
@@ -904,6 +953,9 @@ class McpGateway:
                     self.ledger.audit(key, exc.code, self.clock())
                     self.ledger.failure(client.server.id, self.clock())
                     permanent = not isinstance(exc, (GatewayUnavailable, DeliveryUncertain))
+                    if permanent and not readonly:
+                        self.ledger.audit(key, "mutation_response_unverified", self.clock())
+                        raise DeliveryUncertain("mutation response rejected; reconcile unknown side effect") from exc
                     if permanent:
                         self.ledger.observed(key, "response_rejected", {"code": exc.code}, self.clock())
                     if not readonly or permanent:
@@ -930,6 +982,31 @@ class McpGateway:
         if "pollIntervalMs" in result and (type(result["pollIntervalMs"]) is not int or not 0 <= result["pollIntervalMs"] <= 86_400_000):
             raise GatewayError("invalid bounded polling interval")
 
+    def _task_state(self, result, definition):
+        self._remote_task(result)
+        status = result["status"]
+        if status == "completed":
+            completed = result.get("result")
+            if (not isinstance(completed, dict) or completed.get("resultType") != "complete"
+                    or not isinstance(completed.get("content"), list)
+                    or type(completed.get("isError", False)) is not bool):
+                raise GatewayError("completed remote task has invalid tool result")
+            if definition and "outputSchema" in definition:
+                if "structuredContent" not in completed:
+                    raise GatewayError("completed task structured result is missing")
+                validate_schema(definition["outputSchema"], completed["structuredContent"])
+            if completed.get("isError"):
+                status = "failed"
+        elif status == "input_required" and not isinstance(result.get("inputRequests"), dict):
+            raise GatewayError("remote task input requests are missing")
+        elif status == "failed" and not isinstance(result.get("error"), dict):
+            raise GatewayError("failed remote task error is missing")
+        state = {"working": "remote_running", "input_required": "remote_running",
+                 "completed": "observed_complete", "failed": "observed_error", "cancelled": "observed_error"}[status]
+        due = (self.clock() + max(1, result.get("pollIntervalMs", 1000) / 1000)
+               if state == "remote_running" else None)
+        return state, due
+
     def poll(self, context: CallContext, operation_key: str):
         key = hashed({"consumer": context.identity.consumer, "task_id": context.identity.task_id, "operation_key": operation_key})
         return self.poll_record(context, key)
@@ -941,6 +1018,11 @@ class McpGateway:
             row = self.ledger.get(key)
             if not row or row["context_hash"] != context.hash:
                 raise PolicyDenied("remote task does not belong to this exact context")
+            client = self.clients[row["server"]]
+            binding = next((x for x in client.server.tools if x.name == row["subject"]), None)
+            if binding is None:
+                raise PolicyDenied("poll has no approved tool binding")
+            self._static_admit(context, client.server.id, binding.logical_id, binding.permissions)
             if row["state"] != "remote_running":
                 return Outcome(row["state"], row["result_hash"], replay=True)
             if self.clock() < row["next_poll"]:
@@ -960,29 +1042,10 @@ class McpGateway:
                 self._remote_task(result)
                 if result.get("resultType") != "complete" or result["taskId"] != row["remote_task_id"]:
                     raise GatewayError("remote task correlation mismatch")
-                status = result["status"]
-                if status == "completed":
-                    completed = result.get("result")
-                    binding = next((x for x in client.server.tools if x.name == row["subject"]), None)
-                    if (not isinstance(completed, dict) or completed.get("resultType") != "complete"
-                            or not isinstance(completed.get("content"), list)
-                            or type(completed.get("isError", False)) is not bool or binding is None):
-                        raise GatewayError("completed remote task has invalid tool result")
-                    definition = self._catalog(context, client)[binding.name]
-                    if "outputSchema" in definition:
-                        if "structuredContent" not in completed:
-                            raise GatewayError("completed task structured result is missing")
-                        validate_schema(definition["outputSchema"], completed["structuredContent"])
-                    if completed.get("isError"):
-                        status = "failed"
-                elif status == "input_required" and not isinstance(result.get("inputRequests"), dict):
-                    raise GatewayError("remote task input requests are missing")
-                elif status == "failed" and not isinstance(result.get("error"), dict):
-                    raise GatewayError("failed remote task error is missing")
-                state = {"working": "remote_running", "input_required": "remote_running",
-                         "completed": "observed_complete", "failed": "observed_error", "cancelled": "observed_error"}[status]
-                due = self.clock() + max(1, result.get("pollIntervalMs", 1000) / 1000)
+                definition = self._catalog(context, client)[binding.name]
+                state, due = self._task_state(result, definition)
                 self.ledger.observed(key, state, result, self.clock(), row["remote_task_id"], due)
+                self.ledger.healthy(client.server.id)
                 return Outcome(state, hashed(result), result, row["remote_task_id"])
             except GatewayError as exc:
                 self.ledger.audit(key, exc.code, self.clock())
@@ -1003,7 +1066,7 @@ class McpGateway:
         if message.get("jsonrpc") != "2.0" or "id" in message:
             raise GatewayError("invalid event")
         if method in {"notifications/tools/list_changed", "notifications/resources/list_changed"}:
-            self.clients[server].expires_at = 0
+            self.clients[server].invalidate()
             code = "discovery_invalidated"
         elif method == "notifications/resources/updated":
             uri = message.get("params", {}).get("uri")
@@ -1056,9 +1119,20 @@ class McpGateway:
                     _, estimate = self._admit(context, server, chosen[0], ("resource:read",), tools=False, quote=True)
                     estimates.append(estimate)
             quote = None if any(value is None for value in estimates) else max(estimates)
+        declared = [x for x in client.server.tools if x.logical_id in context.toolset.tools]
+        resources = [logical for _, logical in client.server.resources if logical in context.toolset.tools]
+        if declared:
+            self._static_admit(context, server, declared[0].logical_id, declared[0].permissions)
+        elif resources:
+            self._static_admit(context, server, resources[0], ("resource:read",))
+        else:
+            raise PolicyDenied("subscription requires a declared capability")
+        replay = self._replay(context, client, "subscriptions/listen", {"filters": filters}, operation_key, readonly=False)
+        if replay is not None:
+            return replay
         admit()
         key = hashed({"consumer": context.identity.consumer, "task_id": context.identity.task_id, "operation_key": operation_key})
-        request_hash = hashed({"server": server, "method": "subscriptions/listen", "filters": filters})
+        request_hash = hashed({"server": server, "method": "subscriptions/listen", "params": {"filters": filters}})
         with self.ledger.lock(key):
             row = self.ledger.reserve(key, context, request_hash, server, self.clock(), "subscriptions/listen", hashed(filters))
             if row["state"] in {"observed_complete", "response_rejected"}:

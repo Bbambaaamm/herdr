@@ -582,3 +582,155 @@ def test_server_maps_remote_task_handle_to_exact_durable_attempt(tmp_path):
     assert len([x for x in semantic_calls(transport) if x[0]["method"] == "tools/call"]) == 1
     poll["params"]["taskId"] = "f" * 64
     assert adapter.handle(encoded(poll), authorization="host")[0] == 403
+
+
+@pytest.mark.parametrize("kind", ["read", "write", "resource", "subscription"])
+def test_fresh_client_replays_offline_without_runtime_or_discovery(tmp_path, kind):
+    tools = ("code_write",) if kind == "write" else ("docs_read",) if kind == "resource" else ("code_read",)
+    gateway, context, transport, clock, client, _ = fixture(tmp_path, tools=tools, subscriptions=True)
+    if kind == "subscription":
+        def stream(message, **kwargs):
+            metadata = {META + "subscriptionId": message["id"]}
+            yield {"jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged",
+                   "params": {"_meta": metadata, "notifications": {"toolsListChanged": True}}}
+            yield {"jsonrpc": "2.0", "id": message["id"],
+                   "result": {"resultType": "complete", "_meta": metadata}}
+        transport.stream = stream
+        first = gateway.listen(context, "local", {"toolsListChanged": True}, "op")
+    elif kind == "resource":
+        first = gateway.read_resource(context, "local", "herdr://docs/one", "op")
+    else:
+        first = gateway.call(context, "local", kind, {"value": "output"} if kind == "write" else {"path": "source.py"}, "op")
+    gateway.ledger.close()
+    ledger = CallLedger(tmp_path / "protected")
+    class Offline:
+        def request(self, *args, **kwargs):
+            pytest.fail("durable replay must not contact offline provider")
+    fresh_client = ClientAdapter(client.server, Offline(), ledger, clock=clock)
+    restored = McpGateway(ledger, gateway.registry, (fresh_client,), authority=gateway.authority,
+        runtime_states=lambda *a: pytest.fail("durable replay must not require live runtime"),
+        argument_authority=gateway.argument_authority, argument_policy_hash=ARGUMENT_POLICY, clock=clock)
+    assert fresh_client.definitions == {} and fresh_client.expires_at == 0
+    if kind == "subscription":
+        replay = restored.listen(context, "local", {"toolsListChanged": True}, "op")
+    elif kind == "resource":
+        replay = restored.read_resource(context, "local", "herdr://docs/one", "op")
+    else:
+        replay = restored.call(context, "local", kind, {"value": "output"} if kind == "write" else {"path": "source.py"}, "op")
+    assert replay.replay and replay.result is None and replay.result_hash == first.result_hash
+    ledger.close()
+
+
+@pytest.mark.parametrize("status,state", [("completed", "observed_complete"), ("failed", "observed_error"),
+                                         ("cancelled", "observed_error")])
+def test_initial_terminal_remote_task_is_validated_without_poll(tmp_path, status, state):
+    gateway, context, transport, _, *_ = fixture(tmp_path, tasks=True)
+    transport.task = True
+    transport.poll_status = status
+    outcome = gateway.call(context, "local", "read", {"path": "source.py"}, "op")
+    assert outcome.state == state
+    replay = gateway.call(context, "local", "read", {"path": "source.py"}, "op")
+    assert replay.state == state and replay.replay
+    assert len(semantic_calls(transport)) == 1
+
+
+@pytest.mark.parametrize("mutation", [False, True])
+def test_initial_completed_task_cannot_bypass_result_validation(tmp_path, mutation):
+    kind = "write" if mutation else "read"
+    gateway, context, transport, _, *_ = fixture(tmp_path, tools=("code_write",) if mutation else ("code_read",), tasks=True)
+    transport.response = {"resultType": "task", "taskId": "done", "status": "completed",
+        "createdAt": "2026-10-03T20:00:00Z", "lastUpdatedAt": "2026-10-03T20:00:01Z", "ttlMs": 0}
+    args = {"value": "output"} if mutation else {"path": "source.py"}
+    with pytest.raises(DeliveryUncertain if mutation else GatewayError):
+        gateway.call(context, "local", kind, args, "op")
+    row = gateway.ledger.get(hashed({"consumer": context.identity.consumer, "task_id": context.identity.task_id, "operation_key": "op"}))
+    assert row["state"] == ("delivery_uncertain" if mutation else "response_rejected")
+    if mutation:
+        with pytest.raises(DeliveryUncertain):
+            gateway.call(context, "local", kind, args, "op")
+    assert len(semantic_calls(transport)) == 1
+
+
+def test_successful_task_poll_resets_persisted_failure_streak(tmp_path):
+    gateway, context, transport, clock, *_ = fixture(tmp_path, tasks=True)
+    transport.task = True
+    gateway.call(context, "local", "read", {"path": "source.py"}, "op")
+    clock.value += 2
+    transport.fail = True
+    for _ in range(2):
+        with pytest.raises(DeliveryUncertain):
+            gateway.poll(context, "op")
+    transport.fail = False
+    gateway.poll(context, "op")
+    assert gateway.ledger.db.execute("SELECT * FROM health WHERE server='local'").fetchone() is None
+    clock.value += 2
+    transport.fail = True
+    with pytest.raises(DeliveryUncertain):
+        gateway.poll(context, "op")
+    row = gateway.ledger.db.execute("SELECT failures,open_until FROM health WHERE server='local'").fetchone()
+    assert row["failures"] == 1 and row["open_until"] == 0
+
+
+def test_discovery_cannot_overwrite_concurrent_subscription_invalidation(tmp_path, monkeypatch):
+    import herdr.mcp as module
+    gateway, context, transport, clock, client, _ = fixture(tmp_path)
+    original = module.validate_schema
+    invalidated = False
+    def validate(*args, **kwargs):
+        nonlocal invalidated
+        if not invalidated:
+            invalidated = True
+            gateway.observe_event(context, "local", {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+        return original(*args, **kwargs)
+    monkeypatch.setattr(module, "validate_schema", validate)
+    with pytest.raises(GatewayUnavailable, match="invalidated during"):
+        client.discover(context, clock())
+    assert client.expires_at == 0
+    gateway.model_context(context)
+    assert client.expires_at > clock()
+    assert not semantic_calls(transport)
+
+
+@pytest.mark.parametrize("value", [float(2**53), -float(2**53), 1.5])
+def test_integral_float_routing_headers_cannot_bypass_safe_integer_range(value):
+    with pytest.raises(GatewayError):
+        header_value(value)
+    assert header_value(1.0) == "1"
+
+
+@pytest.mark.parametrize("bad", [{"resultType": "unknown"},
+                               {"resultType": "complete", "content": "malformed"}])
+def test_rejected_mutating_response_retains_uncertainty_and_never_resends(tmp_path, bad):
+    gateway, context, transport, _, *_ = fixture(tmp_path, tools=("code_write",))
+    transport.response = bad
+    for _ in range(2):
+        with pytest.raises(DeliveryUncertain):
+            gateway.call(context, "local", "write", {"value": "actual side effect"}, "op")
+    row = gateway.ledger.get(hashed({"consumer": context.identity.consumer, "task_id": context.identity.task_id, "operation_key": "op"}))
+    assert row["state"] == "delivery_uncertain" and row["deliveries"] == 1
+    assert len(semantic_calls(transport)) == 1
+
+
+@pytest.mark.parametrize("mutation", [False, True])
+@pytest.mark.parametrize("valid", [False, True])
+def test_initial_completed_task_enforces_approved_output_schema(tmp_path, monkeypatch, mutation, valid):
+    definition = WRITE if mutation else READ
+    monkeypatch.setitem(definition, "outputSchema", {
+        "type": "object", "properties": {"count": {"type": "integer"}},
+        "required": ["count"], "additionalProperties": False})
+    gateway, context, transport, _, *_ = fixture(
+        tmp_path, tools=("code_write",) if mutation else ("code_read",), tasks=True)
+    transport.response = {"resultType": "task", "taskId": "immediate", "status": "completed",
+        "createdAt": "2026-10-03T20:00:00Z", "lastUpdatedAt": "2026-10-03T20:00:01Z", "ttlMs": 0,
+        "result": {"resultType": "complete", "content": [{"type": "text", "text": "observed"}],
+                   "structuredContent": {"count": 1 if valid else "invalid"}}}
+    args = {"value": "output"} if mutation else {"path": "source.py"}
+    if valid:
+        assert gateway.call(context, "local", "write" if mutation else "read", args, "op").state == "observed_complete"
+    else:
+        with pytest.raises(DeliveryUncertain if mutation else GatewayError):
+            gateway.call(context, "local", "write" if mutation else "read", args, "op")
+        row = gateway.ledger.get(hashed({"consumer": context.identity.consumer,
+            "task_id": context.identity.task_id, "operation_key": "op"}))
+        assert row["state"] == ("delivery_uncertain" if mutation else "response_rejected")
+    assert len(semantic_calls(transport)) == 1
