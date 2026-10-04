@@ -20,6 +20,8 @@ HEX64 = re.compile(r"[0-9a-f]{64}")
 CONSUMERS = ("heating", "herdr", "majak", "quantlab")
 PAYLOAD_PATHS = (
     "README.md",
+    "requirements-mcp.txt",
+    "docs/architecture/MCP_GATEWAY.md",
     "agent-stack",
     "agent_platform_dashboard/__init__.py",
     "agent_platform_dashboard/production_auth.py",
