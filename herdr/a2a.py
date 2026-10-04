@@ -36,7 +36,7 @@ ECONOMIC_CLAIM_ROOT = Path("/var/lib/herdr/a2a-economic-claims")
 _ID = re.compile(r"^[A-Za-z0-9._:@/+-]{1,256}$")
 _SECRET = re.compile(r"(?i)(secret|password|credential|private.?key|api.?key|access.?token|authorization|cookie|bearer\s|ghp_[a-z0-9]{20,}|sk-[a-z0-9]{20,}|xox[baprs]-)")
 _CARD_SECRET_VALUE = re.compile(
-    r"(?i)(bearer\s+\S{12,}|ghp_[a-z0-9]{20,}|sk-[a-z0-9]{20,}|xox[baprs]-[a-z0-9-]{12,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|(?:password|api.?key|access.?token|authorization)\s*[:=]\s*\S{4,})"
+    r"(?i)(bearer\s+\S{12,}|ghp_[a-z0-9]{20,}|sk-[a-z0-9]{20,}|xox[baprs]-[a-z0-9-]{12,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|(?:password|api.?key|access.?token|authorization)\s*[:=]\s*\S+)"
 )
 _STATES = frozenset("TASK_STATE_UNSPECIFIED TASK_STATE_SUBMITTED TASK_STATE_WORKING TASK_STATE_COMPLETED TASK_STATE_FAILED TASK_STATE_CANCELED TASK_STATE_REJECTED TASK_STATE_INPUT_REQUIRED TASK_STATE_AUTH_REQUIRED".split())
 _TERMINAL = frozenset("TASK_STATE_COMPLETED TASK_STATE_FAILED TASK_STATE_CANCELED TASK_STATE_REJECTED".split())
@@ -54,7 +54,7 @@ def _id(value: Any, label: str) -> str:
 
 
 def _label(value: Any, label: str) -> str:
-    if not isinstance(value, str) or not 1 <= len(value) <= 256 or any(ord(c) < 32 for c in value) or _SECRET.search(value):
+    if not isinstance(value, str) or not 1 <= len(value) <= 256 or any(unicodedata.category(c) in {"Cc","Cf","Cs"} for c in value):
         raise A2AError(f"invalid {label}")
     return value
 
@@ -111,8 +111,12 @@ def _object(value: Any, keys: set[str], required: set[str]) -> Mapping[str, Any]
 def _url(value: Any) -> str:
     if not isinstance(value, str) or len(value) > 2048:
         raise A2AError("invalid interface URL")
-    parsed = urlsplit(value)
-    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.fragment or parsed.query:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise A2AError("invalid interface URL port") from exc
+    if (port is not None and not 1 <= port <= 65535) or parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.fragment or parsed.query:
         raise A2AError("interface requires a plain HTTPS URL")
     return value
 
@@ -165,6 +169,12 @@ class AgentCard:
     name: str
     interfaces: tuple[Interface, ...]
     fingerprint: str
+    input_modes: tuple[str,...] = ()
+
+    @property
+    def supports_text_input(self):
+        return any(mode.split(";",1)[0].strip().lower() in
+                   {"text","text/plain","text/*","*/*"} for mode in self.input_modes)
 
 
 def parse_card(raw: Any) -> AgentCard:
@@ -192,9 +202,20 @@ def parse_card(raw: Any) -> AgentCard:
             raise A2AError("unsupported required extension")
     if not isinstance(card["skills"], list) or not 1 <= len(card["skills"]) <= 32:
         raise A2AError("invalid skills")
+    skill_ids=set()
+    skill_input_modes=[]
     for skill in card["skills"]:
         item = _object(skill, {"id", "name", "description", "tags", "examples", "inputModes", "outputModes", "securityRequirements"}, {"id", "name", "description", "tags"})
-        _id(item["id"], "skill id")
+        skill_id=_remote_id(item["id"], "skill id")
+        if skill_id in skill_ids:raise A2AError("duplicate remote skill id")
+        skill_ids.add(skill_id)
+        for mode_key in ("inputModes","outputModes"):
+            if mode_key in item:
+                modes=item[mode_key]
+                if not isinstance(modes,list) or not modes or len(modes)>32:
+                    raise A2AError("invalid skill modes")
+                for mode in modes:_label(mode,"skill mode")
+        skill_input_modes.extend(item.get("inputModes",[]))
         _label(item["name"], "skill name")
         _label(item["description"], "skill description")
         if not isinstance(item["tags"], list) or not item["tags"] or any(not isinstance(tag, str) or not tag for tag in item["tags"]):
@@ -203,6 +224,7 @@ def parse_card(raw: Any) -> AgentCard:
         modes = card[mode_key]
         if not isinstance(modes, list) or not modes or len(modes) > 32 or any(not isinstance(mode, str) or not mode for mode in modes):
             raise A2AError("invalid modes")
+        for mode in modes:_label(mode,"mode")
     entries = card["supportedInterfaces"]
     if not isinstance(entries, list) or not 1 <= len(entries) <= 8:
         raise A2AError("invalid interfaces")
@@ -218,7 +240,8 @@ def parse_card(raw: Any) -> AgentCard:
             _tenant(entry["tenant"]) if "tenant" in entry else None,
             VERSION,
         ))
-    return AgentCard(name, tuple(interfaces), hashlib.sha256(_bounded(raw, MAX_CARD, secret_scan=False)).hexdigest())
+    return AgentCard(name, tuple(interfaces), hashlib.sha256(_bounded(raw, MAX_CARD, secret_scan=False)).hexdigest(),
+                     tuple(sorted(set(card["defaultInputModes"]+skill_input_modes))))
 
 
 @dataclass(frozen=True)
@@ -714,7 +737,22 @@ def _parse_response(
     binding: dict[str, Any] | None = None,
     *,
     allow_bare_task: bool = False,
+    discard_history: bool = False,
 ) -> tuple[str, str | None, str | None, tuple[Candidate, ...]]:
+    if discard_history and isinstance(raw,dict):
+        # CancelTask has no historyLength parameter. History is not a candidate
+        # or authority input; discard it before bounding/scanning persisted data.
+        if isinstance(raw.get("task"),dict):
+            task=dict(raw["task"])
+            if "history" in task and not isinstance(task["history"],list):
+                raise A2AError("invalid task history")
+            task.pop("history",None)
+            raw={**raw,"task":task}
+        elif "message" not in raw:
+            raw=dict(raw)
+            if "history" in raw and not isinstance(raw["history"],list):
+                raise A2AError("invalid task history")
+            raw.pop("history",None)
     _bounded(raw, MAX_RESPONSE, secret_scan=False)
     _reject_secret_values(raw)
     if not isinstance(raw, dict):
@@ -801,6 +839,8 @@ class Gateway:
         return data
 
     def send(self, identity: Identity, text: str) -> tuple[Candidate, ...]:
+        if not self.card.supports_text_input:
+            raise A2AError("remote card does not support text input")
         if not isinstance(text, str) or not text or len(text.encode()) > 8192 or _SECRET.search(text):
             raise A2AError("invalid message text")
         with self.store.locked() as directory:
@@ -873,7 +913,7 @@ class Gateway:
                 request["tenant"] = self.interface.tenant
             response = self.transport.cancel(self.interface, request, HEADER)
             state, _, _, candidates = _parse_response(
-                response, identity, data, allow_bare_task=True
+                response, identity, data, allow_bare_task=True, discard_history=True
             )
             data["last_observation"] = state
             if candidates:

@@ -910,3 +910,65 @@ def test_existing_binding_ancestor_chain_is_fsynced_before_send(tmp_path, monkey
             return super().send(interface, message, headers)
 
     Gateway(CheckBeforeSend(), store, card, policy).send(identity, "work")
+
+
+@pytest.mark.parametrize("port",["99999","abc","0","-1"])
+def test_card_invalid_https_port_rejected_before_admission(tmp_path,port):
+    raw,*_=setup(tmp_path)
+    raw["supportedInterfaces"][0]["url"]="https://remote.example:"+port+"/a2a"
+    with pytest.raises(A2AError,match="URL"):
+        parse_card(raw)
+
+def test_card_security_descriptions_and_unicode_skill_id_are_metadata(tmp_path):
+    raw,*_=setup(tmp_path)
+    raw["description"]="Credential rotation and password reset assistance"
+    raw["skills"][0]["id"]="skill=翻訳"
+    raw["skills"][0]["name"]="Password reset assistance"
+    raw["skills"][0]["description"]="Credential rotation"
+    card=parse_card(raw)
+    assert card.name=="remote" and card.supports_text_input
+    raw["skills"][0]["description"]="api_key=sk-"+("a"*32)
+    with pytest.raises(A2AError,match="secret"):
+        parse_card(raw)
+
+def test_duplicate_remote_skill_ids_denied(tmp_path):
+    raw,*_=setup(tmp_path)
+    raw["skills"].append(dict(raw["skills"][0]))
+    with pytest.raises(A2AError,match="duplicate"):
+        parse_card(raw)
+
+def test_non_text_card_denied_before_economic_claim(tmp_path):
+    raw,_,admission,identity,store=setup(tmp_path)
+    raw["defaultInputModes"]=["image/png"]
+    raw["skills"][0]["inputModes"]=["application/json"]
+    card=parse_card(raw)
+    admission=replace(admission,card_fingerprint=card.fingerprint)
+    transport=Mock();gateway=Gateway(transport,store,card,admission)
+    with pytest.raises(A2AError,match="text input"):
+        gateway.send(identity,"work")
+    assert transport.sends==[] and store.read() is None
+    assert not a2a_module.ECONOMIC_CLAIM_ROOT.exists()
+
+def test_declared_skill_text_mode_can_override_image_default(tmp_path):
+    raw,_,admission,identity,store=setup(tmp_path)
+    raw["defaultInputModes"]=["image/png"]
+    raw["skills"][0]["inputModes"]=["text/plain"]
+    card=parse_card(raw);admission=replace(admission,card_fingerprint=card.fingerprint)
+    transport=Mock()
+    Gateway(transport,store,card,admission).send(identity,"work")
+    assert len(transport.sends)==1
+
+@pytest.mark.parametrize("bare",[False,True])
+def test_cancel_large_ignored_history_preserves_late_artifacts(tmp_path,bare):
+    _,card,admission,identity,store=setup(tmp_path)
+    transport=Mock();gateway=Gateway(transport,store,card,admission)
+    gateway.send(identity,"work")
+    artifact={"artifactId":"late-result","parts":[{"text":"completed before cancellation"}]}
+    response=task("TASK_STATE_CANCELED",artifacts=[artifact])
+    response["task"]["history"]=[{"parts":[{"text":"x"*200000}]}]
+    transport.cancel=lambda *args:response["task"] if bare else response
+    candidates=gateway.cancel(identity)
+    assert len(candidates)==1 and candidates[0].content==artifact
+    recovered=Gateway(Mock(),BindingStore(store.path),card,admission).recover(identity)
+    assert len(recovered)==1 and recovered[0].content==artifact
+    assert store.read()["last_observation"]=="TASK_STATE_CANCELED"
