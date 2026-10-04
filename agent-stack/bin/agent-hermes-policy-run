@@ -1,0 +1,163 @@
+#!/home/agentops/.hermes/hermes-agent/venv/bin/python -I
+"""Fixed-path Hermes bootstrap reached through the pane's policy-bin PATH.
+
+Production authority comes from the host-pinned bundle inode on a read-only
+bind and exact host-controlled pane identity. Hermes argv/environment cannot
+select a grant, key, policy module, or executable.
+"""
+from __future__ import annotations
+
+import importlib
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+BUNDLE_PATH = Path("/run/herdr-policy/grant.bundle.json")
+POLICY_CODE_ROOT = Path("/run/herdr/policy-code")
+HERMES_ROOT = Path("/home/agentops/.hermes/hermes-agent")
+IDENTITY_ENV = {
+    "consumer": "HERDR_POLICY_CONSUMER",
+    "agent_id": "HERDR_POLICY_AGENT_ID",
+    "parent_agent_id": "HERDR_POLICY_PARENT_AGENT_ID",
+    "parent_task_id": "HERDR_POLICY_PARENT_TASK_ID",
+    "task_id": "HERDR_POLICY_TASK_ID",
+    "run_token": "HERDR_POLICY_RUN_TOKEN",
+    "fencing_token": "HERDR_POLICY_FENCING_TOKEN",
+}
+
+
+def _within(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def _unescape_mount(value: str) -> str:
+    for old, new in ((r"\040", " "), (r"\011", "\t"), (r"\012", "\n"), (r"\134", "\\")):
+        value = value.replace(old, new)
+    return value
+
+
+def _covering_mount(path: Path) -> tuple[Path, set[str]]:
+    """Return the longest mount covering path from this process' mount namespace."""
+    target = path.absolute()
+    best: tuple[Path, set[str]] | None = None
+    try:
+        rows = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise SystemExit("cannot verify policy mount namespace") from exc
+    for line in rows:
+        fields = line.split(" - ", 1)[0].split()
+        if len(fields) < 6:
+            continue
+        mount = Path(_unescape_mount(fields[4]))
+        try:
+            covered = target == mount or mount in target.parents
+        except ValueError:
+            covered = False
+        if covered and (best is None or len(mount.parts) > len(best[0].parts)):
+            best = (mount, set(fields[5].split(",")))
+    if best is None:
+        raise SystemExit(f"no mount covers security path: {path}")
+    return best
+
+
+def _require_production_mount(path: Path, *, exact: bool = False) -> None:
+    mount, options = _covering_mount(path)
+    if "ro" not in options or mount == Path("/") or (exact and mount != path):
+        raise SystemExit(f"security path is not on a dedicated read-only trust mount: {path}")
+
+
+def _reset_import_path(policy_code_root: Path, hermes_root: Path) -> None:
+    """Drop cwd/PYTHONPATH/user-site influence before importing policy or Hermes code."""
+    os.environ.pop("PYTHONPATH", None)
+    os.environ.pop("PYTHONHOME", None)
+    os.environ["PYTHONNOUSERSITE"] = "1"
+    venv = (hermes_root / "venv").resolve()
+    base = Path(sys.base_prefix).resolve()
+    trusted: list[str] = []
+    for raw in list(sys.path):
+        if not raw:
+            continue
+        try:
+            candidate = Path(raw).resolve()
+        except OSError:
+            continue
+        if _within(candidate, venv) or _within(candidate, base):
+            text = str(candidate)
+            if text not in trusted:
+                trusted.append(text)
+    sys.path[:] = [str(policy_code_root.resolve()), str(hermes_root.resolve()), *trusted]
+
+
+def _require_module_origin(module: Any, root: Path, label: str) -> None:
+    source = getattr(module, "__file__", None)
+    if not isinstance(source, str):
+        raise SystemExit(f"{label} import has no source identity")
+    try:
+        resolved = Path(source).resolve(strict=True)
+        trusted = root.resolve(strict=True)
+    except OSError as exc:
+        raise SystemExit(f"{label} import source unavailable") from exc
+    if not _within(resolved, trusted):
+        raise SystemExit(f"{label} import escaped trusted root")
+
+
+def bootstrap(
+    hermes_args: list[str],
+    *,
+    bundle_path: Path = BUNDLE_PATH,
+    policy_code_root: Path = POLICY_CODE_ROOT,
+    hermes_root: Path = HERMES_ROOT,
+) -> int:
+    """Verify host authority and install guards before Hermes can make a model call."""
+    production = (
+        bundle_path == BUNDLE_PATH
+        and policy_code_root == POLICY_CODE_ROOT
+        and hermes_root == HERMES_ROOT
+    )
+    if production:
+        _require_production_mount(bundle_path, exact=True)
+        _require_production_mount(policy_code_root)
+
+    if Path(sys.prefix).resolve() != (hermes_root / "venv").resolve():
+        raise SystemExit("bootstrap requires audited Hermes Python interpreter")
+    if policy_code_root.is_symlink() or not policy_code_root.is_dir():
+        raise SystemExit("trusted policy code root unavailable")
+    if not (hermes_root / "model_tools.py").is_file() or not (hermes_root / "hermes").is_file():
+        raise SystemExit("audited Hermes runtime unavailable")
+
+    _reset_import_path(policy_code_root, hermes_root)
+
+    security_module = importlib.import_module("herdr.security")
+    guard_module = importlib.import_module("herdr.hermes_guard")
+    _require_module_origin(security_module, policy_code_root, "herdr.security")
+    _require_module_origin(guard_module, policy_code_root, "herdr.hermes_guard")
+
+    try:
+        identity_fields = {name: os.environ[env_name] for name, env_name in IDENTITY_ENV.items()}
+        identity_fields["fencing_token"] = int(identity_fields["fencing_token"])
+        identity = security_module.InvocationIdentity.from_dict(identity_fields)
+        grant = security_module.load_policy_bundle(
+            bundle_path,
+            identity,
+        )
+        guard = security_module.InvocationGuard(grant)
+    except (security_module.SecurityError, KeyError, TypeError, ValueError) as exc:
+        raise SystemExit(f"signed Herdr grant rejected: {exc}") from exc
+
+    guard_module.install_hermes_guard(guard)
+
+    hermes_main_module = importlib.import_module("hermes_cli.main")
+    _require_module_origin(hermes_main_module, hermes_root, "hermes_cli.main")
+    sys.argv = [str(hermes_root / "hermes"), *hermes_args]
+    result = hermes_main_module.main()
+    return 0 if result is None else int(result)
+
+
+def main() -> int:
+    # No policy path, identity, key, code root, or executable override is parsed from argv.
+    return bootstrap(sys.argv[1:])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
