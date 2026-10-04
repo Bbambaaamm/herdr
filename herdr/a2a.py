@@ -39,6 +39,15 @@ _CARD_SECRET_VALUE = re.compile(
     r"(?i)(bearer\s+\S{12,}|ghp_[a-z0-9]{20,}|sk-[a-z0-9]{20,}|xox[baprs]-[a-z0-9-]{12,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|(?:password|api.?key|access.?token|authorization)\s*[:=]\s*\S+)"
 )
 _STATES = frozenset("TASK_STATE_UNSPECIFIED TASK_STATE_SUBMITTED TASK_STATE_WORKING TASK_STATE_COMPLETED TASK_STATE_FAILED TASK_STATE_CANCELED TASK_STATE_REJECTED TASK_STATE_INPUT_REQUIRED TASK_STATE_AUTH_REQUIRED".split())
+# Released v1.0.1 ProtoJSON enum values; bool is not an integer enum.
+_STATE_NUMBERS=dict(enumerate("TASK_STATE_UNSPECIFIED TASK_STATE_SUBMITTED TASK_STATE_WORKING TASK_STATE_COMPLETED TASK_STATE_FAILED TASK_STATE_CANCELED TASK_STATE_INPUT_REQUIRED TASK_STATE_REJECTED TASK_STATE_AUTH_REQUIRED".split()))
+def _task_state(value):
+    if type(value) is int:value=_STATE_NUMBERS.get(value)
+    if not isinstance(value,str) or value not in _STATES:raise A2AError("invalid task state")
+    return value
+def _agent_role(value):
+    return value=="ROLE_AGENT" or type(value) is int and value==2
+
 _TERMINAL = frozenset("TASK_STATE_COMPLETED TASK_STATE_FAILED TASK_STATE_CANCELED TASK_STATE_REJECTED".split())
 _BINDINGS = frozenset({"JSONRPC", "GRPC", "HTTP+JSON"})
 
@@ -108,27 +117,35 @@ def _object(value: Any, keys: set[str], required: set[str]) -> Mapping[str, Any]
     return value
 
 
-def _url(value: Any) -> str:
-    if not isinstance(value, str) or len(value) > 2048:
-        raise A2AError("invalid interface URL")
+def _https_url(value: Any,limit: int):
+    if not isinstance(value,str) or len(value)>limit or any(c.isspace() or unicodedata.category(c) in {"Cc","Cf","Cs"} for c in value):
+        raise A2AError("invalid HTTPS URL")
     try:
-        parsed = urlsplit(value)
-        port = parsed.port
-    except ValueError as exc:
-        raise A2AError("invalid interface URL port") from exc
-    if (port is not None and not 1 <= port <= 65535) or parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.fragment or parsed.query:
+        parsed=urlsplit(value);port=parsed.port;host=parsed.hostname
+        if not host:raise ValueError("missing hostname")
+        if ":" in host:
+            import ipaddress
+            ipaddress.IPv6Address(host)
+        else:
+            ascii_host=host.encode("idna").decode("ascii").rstrip(".")
+            if not ascii_host or len(ascii_host)>253 or any(not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?",part) for part in ascii_host.split(".")):
+                raise ValueError("invalid hostname")
+        if parsed.scheme!="https" or parsed.username or parsed.password or port is not None and not 1<=port<=65535:
+            raise ValueError("invalid HTTPS URL authority or embedded credentials")
+    except (ValueError,UnicodeError) as exc:
+        raise A2AError("invalid HTTPS URL authority or embedded credentials") from exc
+    return parsed
+
+def _url(value: Any) -> str:
+    parsed=_https_url(value,2048)
+    if parsed.fragment or parsed.query:
         raise A2AError("interface requires a plain HTTPS URL")
     return value
 
-
 def _part_url(value: Any) -> str:
-    if not isinstance(value, str) or len(value) > 4096:
-        raise A2AError("invalid part URL")
-    parsed = urlsplit(value)
-    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
-        raise A2AError("part URL requires HTTPS without embedded credentials")
+    try:_https_url(value,4096)
+    except A2AError as exc:raise A2AError("invalid part URL: "+str(exc)) from exc
     return value
-
 
 def _interface_address(value: Any, binding: str) -> str:
     # A2A v1.0.1 requires AgentInterface.url to be an absolute HTTPS URL for
@@ -215,7 +232,7 @@ def parse_card(raw: Any) -> AgentCard:
                 if not isinstance(modes,list) or not modes or len(modes)>32:
                     raise A2AError("invalid skill modes")
                 for mode in modes:_label(mode,"skill mode")
-        skill_input_modes.extend(item.get("inputModes",[]))
+        skill_input_modes.extend(item.get("inputModes",card["defaultInputModes"]))
         _label(item["name"], "skill name")
         _label(item["description"], "skill description")
         if not isinstance(item["tags"], list) or not item["tags"] or any(not isinstance(tag, str) or not tag for tag in item["tags"]):
@@ -241,7 +258,7 @@ def parse_card(raw: Any) -> AgentCard:
             VERSION,
         ))
     return AgentCard(name, tuple(interfaces), hashlib.sha256(_bounded(raw, MAX_CARD, secret_scan=False)).hexdigest(),
-                     tuple(sorted(set(card["defaultInputModes"]+skill_input_modes))))
+                     tuple(sorted(set(skill_input_modes))))
 
 
 @dataclass(frozen=True)
@@ -771,7 +788,7 @@ def _parse_response(
             raise A2AError("bound task cannot become direct message")
         msg = _response_object(envelope["message"], {"messageId", "role", "parts"})
         _remote_id(msg["messageId"], "messageId")
-        if msg["role"] != "ROLE_AGENT":
+        if not _agent_role(msg["role"]):
             raise A2AError("expected agent message")
         _parts(msg["parts"])
         if "contextId" not in msg:
@@ -785,12 +802,8 @@ def _parse_response(
     task = _response_object(envelope["task"], {"id", "status"})
     task_id = _remote_id(task["id"], "task id")
     context = _remote_id(task["contextId"], "context id") if "contextId" in task else None
-    if binding and (binding["remote_task_id"] != task_id or binding["remote_context_id"] != context):
-        raise A2AError("remote binding mismatch")
     status = _response_object(task["status"], {"state"})
-    state = status["state"]
-    if not isinstance(state, str) or state not in _STATES:
-        raise A2AError("invalid task state")
+    state = _task_state(status["state"])
     artifacts = task.get("artifacts", [])
     if not isinstance(artifacts, list) or len(artifacts) > MAX_PARTS:
         raise A2AError("invalid artifacts")
@@ -798,7 +811,7 @@ def _parse_response(
     if "message" in status:
         msg = _response_object(status["message"], {"messageId", "role", "parts"})
         _remote_id(msg["messageId"], "messageId")
-        if msg["role"] != "ROLE_AGENT":
+        if not _agent_role(msg["role"]):
             raise A2AError("expected agent status message")
         _parts(msg["parts"])
         if "contextId" not in msg:
@@ -808,6 +821,7 @@ def _parse_response(
             raise A2AError("status message context mismatch")
         if "taskId" in msg and _remote_id(msg["taskId"], "taskId") != task_id:
             raise A2AError("status message task mismatch")
+        context=message_context if context is None else context
         candidates.append(
             _candidate(
                 identity,
@@ -817,9 +831,14 @@ def _parse_response(
                 msg,
             )
         )
+    if binding and (binding["remote_task_id"] != task_id or binding["remote_context_id"] != context):
+        raise A2AError("remote binding mismatch")
+    artifact_ids=set()
     for artifact in artifacts:
         item = _response_object(artifact, {"artifactId", "parts"})
-        _remote_id(item["artifactId"], "artifactId")
+        artifact_id=_remote_id(item["artifactId"], "artifactId")
+        if artifact_id in artifact_ids:raise A2AError("duplicate artifact id")
+        artifact_ids.add(artifact_id)
         _parts(item["parts"])
         candidates.append(_candidate(identity, task_id, context, "artifact", item))
     return state, task_id, context, tuple(candidates)

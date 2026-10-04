@@ -972,3 +972,68 @@ def test_cancel_large_ignored_history_preserves_late_artifacts(tmp_path,bare):
     recovered=Gateway(Mock(),BindingStore(store.path),card,admission).recover(identity)
     assert len(recovered)==1 and recovered[0].content==artifact
     assert store.read()["last_observation"]=="TASK_STATE_CANCELED"
+
+
+@pytest.mark.parametrize("number,name",list(enumerate(
+    "TASK_STATE_UNSPECIFIED TASK_STATE_SUBMITTED TASK_STATE_WORKING TASK_STATE_COMPLETED TASK_STATE_FAILED TASK_STATE_CANCELED TASK_STATE_INPUT_REQUIRED TASK_STATE_REJECTED TASK_STATE_AUTH_REQUIRED".split())))
+def test_numeric_protojson_task_state_is_normalized(tmp_path,number,name):
+    _,card,policy,identity,store=setup(tmp_path)
+    Gateway(Mock(task(number)),store,card,policy).send(identity,"work")
+    assert store.read()["last_observation"]==name
+
+@pytest.mark.parametrize("value",[True,False,9,-1,1.0,"UNKNOWN"])
+def test_invalid_protojson_state_is_rejected(tmp_path,value):
+    _,card,policy,identity,store=setup(tmp_path)
+    with pytest.raises(A2AError,match="state"):
+        Gateway(Mock(task(value)),store,card,policy).send(identity,"work")
+
+@pytest.mark.parametrize("url",["https://remote example/a2a","https://remote\nexample/a2a",
+    "https://bad-.example/a2a","https://.example/a2a","https://remote.example:bad/a2a"])
+def test_malformed_https_authority_denied_before_admission(tmp_path,url):
+    raw,*_=setup(tmp_path)
+    raw["supportedInterfaces"][0]["url"]=url
+    with pytest.raises(A2AError,match="HTTPS"):parse_card(raw)
+
+@pytest.mark.parametrize("url",["https://[::1]:443/a2a","https://xn--p1ai.example/a2a",
+                               "https://翻訳.example/a2a"])
+def test_valid_https_authorities_remain_discoverable(tmp_path,url):
+    raw,*_=setup(tmp_path);raw["supportedInterfaces"][0]["url"]=url
+    assert parse_card(raw).interfaces[0].url==url
+
+def test_every_skill_override_removes_default_text_before_economic_claim(tmp_path):
+    raw,_,_,identity,store=setup(tmp_path)
+    raw["skills"][0]["inputModes"]=["image/png"]
+    card=parse_card(raw)
+    policy=Admission(card.fingerprint,card.interfaces[0].fingerprint,"remote-exec",
+        "remote-provider","remote-cap","remote-runtime",("read_file",),str(tmp_path))
+    transport=Mock()
+    with pytest.raises(A2AError,match="text input"):
+        Gateway(transport,store,card,policy).send(identity,"work")
+    assert transport.sends==[] and store.read() is None
+
+def test_inherited_skill_default_retains_text(tmp_path):
+    raw,*_=setup(tmp_path)
+    raw["skills"].append({**raw["skills"][0],"id":"image","inputModes":["image/png"]})
+    assert parse_card(raw).supports_text_input
+
+def test_context_from_status_message_is_durable_and_cannot_change(tmp_path):
+    _,card,policy,identity,store=setup(tmp_path)
+    payload=task(context=None)
+    payload["task"]["status"]["message"]={"messageId":"status-1","role":2,
+        "parts":[{"text":"working"}],"contextId":"context-from-message"}
+    transport=Mock(payload);gateway=Gateway(transport,store,card,policy)
+    candidate=gateway.send(identity,"work")[0]
+    assert candidate.remote_context_id=="context-from-message"
+    assert store.read()["remote_context_id"]=="context-from-message"
+    changed=json.loads(json.dumps(payload))
+    changed["task"]["status"]["message"].update(messageId="status-2",contextId="other-context")
+    transport.response=changed
+    with pytest.raises(A2AError,match="binding mismatch"):gateway.poll(identity)
+    assert len(gateway.recover(identity))==1
+
+def test_duplicate_task_artifact_ids_are_rejected(tmp_path):
+    _,card,policy,identity,store=setup(tmp_path)
+    response=task(artifacts=[{"artifactId":"same","parts":[{"text":"one"}]},
+                             {"artifactId":"same","parts":[{"text":"two"}]}])
+    with pytest.raises(A2AError,match="duplicate artifact"):
+        Gateway(Mock(response),store,card,policy).send(identity,"work")
