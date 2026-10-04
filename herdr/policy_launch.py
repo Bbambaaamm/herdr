@@ -258,9 +258,8 @@ class PolicyMount:
         for entry in self.descriptors():
             if entry["kind"] == "directory":
                 target = Path(entry["target"])
-                _require(not any("rw" in modes and target in Path(path).parents
-                                 for path, modes in rows.items()),
-                         "writable mount below immutable policy/runtime tree")
+                _require(not any(target in Path(path).parents for path in rows),
+                         "unexpected mount below immutable policy/runtime tree")
             path = root / entry["target"].lstrip("/")
             info = path.stat()
             expected_kind = stat.S_ISREG if entry["kind"] == "file" else stat.S_ISDIR
@@ -387,8 +386,8 @@ def verify_retained_policy_evidence(evidence, *, identity, pid, attestation, now
         _require(stat.S_ISDIR(info.st_mode)
                  and (info.st_dev, info.st_ino) == (expected["device"], expected["inode"])
                  and "ro" in rows.get(target, set()), "retained policy tree identity mismatch")
-        _require(not any("rw" in modes and path in Path(name).parents for name,modes in rows.items()),
-                 "writable mount below immutable policy/runtime tree")
+        _require(not any(path in Path(name).parents for name in rows),
+                 "unexpected mount below immutable policy/runtime tree")
     bundle = root / str(BUNDLE_TARGET).lstrip("/")
     fd = os.open(bundle, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
     try:

@@ -134,7 +134,8 @@ def test_fd_launcher_rejects_ambiguous_or_changed_mounts(tmp_path, mutation):
     finally:
         cleanup(item)
 
-def test_actual_bwrap_seals_same_inode_after_mount_and_denies_writes(tmp_path, monkeypatch):
+@pytest.mark.parametrize("shadow",[False,True])
+def test_actual_bwrap_seals_same_inode_after_mount_and_denies_writes(tmp_path, monkeypatch,shadow):
     sandbox = sandbox_module()
     if not sandbox.BWRAP.is_file():
         pytest.skip("bwrap prerequisite unavailable")
@@ -166,6 +167,11 @@ def test_actual_bwrap_seals_same_inode_after_mount_and_denies_writes(tmp_path, m
            **{key:str(getattr(identity,field)) for field,key in IDENTITY_ENV.items()}}
     args = sandbox.command(workspace, real, writable=(mine,), policy=policy,
                            child_workspace_writable=True, pinned_worktree=pin, policy_mount=item)
+    if shadow:
+        unrelated=tmp_path/"unrelated-shadow.py"
+        unrelated.write_text("unrelated = True")
+        index=args.index("--")
+        args[index:index]=["--ro-bind",str(unrelated),str(CODE_TARGET/"module.py")]
     process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                stderr=subprocess.PIPE, env=env)
     try:
@@ -189,6 +195,13 @@ def test_actual_bwrap_seals_same_inode_after_mount_and_denies_writes(tmp_path, m
                 break
             time.sleep(0.02)
         assert pid
+        if shadow:
+            assert not sandbox.verify(pid,real,marker,policy=policy,pinned_worktree=pin,
+                                      child_workspace_writable=True,policy_mount=item)
+            with pytest.raises(SecurityError,match="unexpected mount"):
+                item.verify_mounted(pid)
+            assert os.fstat(item.stage.fd).st_size==0
+            return
         assert sandbox.verify(pid,real,marker,policy=policy,pinned_worktree=pin,
                               child_workspace_writable=True,policy_mount=item)
         attestation={"task_id":identity.task_id,"run_token":identity.run_token,"sandbox_pid":pid}
@@ -389,7 +402,7 @@ def test_policy_mount_rejects_writable_runtime_descendant_before_access(tmp_path
         # validate the directory rule directly by placing code first.
         original=item.descriptors
         monkeypatch.setattr(item,"descriptors",lambda:sorted(original(),key=lambda x:x["kind"]=="file"))
-        with pytest.raises(SecurityError,match="writable mount below"):
+        with pytest.raises(SecurityError,match="unexpected mount below"):
             item.verify_mounted(os.getpid())
     finally:cleanup(item)
 
