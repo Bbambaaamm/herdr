@@ -41,6 +41,7 @@ PAYLOAD_PATHS = (
     "herdr",
     "skills",
     "docs/architecture/AGENT_SKILLS.md",
+    "docs/architecture/CONTEXT_MEMORY.md",
     "integrations/search-router",
     "provenance/external-runtime-dependency.txt",
 )
