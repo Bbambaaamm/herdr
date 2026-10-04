@@ -33,6 +33,7 @@ jobs:
       - name: Validate repository and provenance contracts
         run: |
           python scripts/validate_repo.py
+          python scripts/lint-skills.py --all skills
           sha256sum -c provenance/CANONICAL_SOURCE_MANIFEST.sha256
       - name: Validate Python dashboard and telemetry
         run: |

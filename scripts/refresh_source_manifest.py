@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 from pathlib import Path
 import hashlib
+import json
+import stat
 
 ROOTS = (
     Path("herdr"),
+    Path("skills"),
     Path("agent_platform_dashboard"),
     Path("tests"),
     Path("agent-stack"),
@@ -15,6 +18,7 @@ ROOTS = (
 FILES = (
     Path("configs/consumers/herdr.yaml"),
     Path("docs/CONSUMERS.md"),
+    Path("docs/architecture/AGENT_SKILLS.md"),
     Path("package.json"),
     Path("package-lock.json"),
 )
@@ -27,6 +31,17 @@ TEXT_SUFFIXES = {
 
 def canonical_bytes(path: Path) -> bytes:
     data = path.read_bytes()
+    if path.parts[:1] == ("skills",):
+        # Skill hashes bind exact resource bytes, including binary assets and
+        # text line endings; their contract is independent of filename suffix.
+        manifest_path = Path(*path.parts[:2]) / "manifest.json"
+        if path != manifest_path:
+            manifest = json.loads(manifest_path.read_bytes())
+            relative = path.relative_to(manifest_path.parent).as_posix()
+            entry = next((x for x in manifest["files"] if x["path"] == relative), None)
+            if entry is None or entry["size"] != len(data) or entry["sha256"] != hashlib.sha256(data).hexdigest():
+                raise ValueError(f"Undeclared or changed skill source file: {path}")
+        return data
     if path.suffix in TEXT_SUFFIXES or not path.suffix:
         data.decode("utf-8")
         return data.replace(b"\r\n", b"\n")
@@ -36,8 +51,16 @@ def canonical_bytes(path: Path) -> bytes:
 
 entries: list[tuple[str, str]] = []
 for root in ROOTS:
+    if root == Path("skills") and (root.exists() or root.is_symlink()) and not stat.S_ISDIR(root.lstat().st_mode):
+        raise ValueError(f"Non-directory skill source root: {root}")
     for path in sorted(root.rglob("*")):
-        if not path.is_file():
+        if root == Path("skills"):
+            mode = path.lstat().st_mode
+            if stat.S_ISDIR(mode):
+                continue
+            if not stat.S_ISREG(mode):
+                raise ValueError(f"Nonregular skill source entry: {path}")
+        elif not path.is_file():
             continue
         if "__pycache__" in path.parts or "node_modules" in path.parts:
             continue
