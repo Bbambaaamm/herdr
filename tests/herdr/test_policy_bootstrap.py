@@ -2,10 +2,11 @@
 from __future__ import annotations
 import importlib.machinery
 import importlib.util
-import subprocess
 import sys
 import types
 from pathlib import Path
+
+import pytest
 
 from herdr import security
 
@@ -34,10 +35,18 @@ def test_fixed_production_entry_preserves_argv_without_policy_override(monkeypat
 def test_policy_bin_hermes_invokes_guarded_launcher():
     assert POLICY_BIN.is_symlink()
     assert POLICY_BIN.resolve() == LAUNCHER
-    result = subprocess.run([str(POLICY_BIN), '--version'], text=True,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    assert result.returncode != 0
-    assert 'security path is not on a dedicated read-only trust mount' in result.stdout
+    # Production intentionally uses the pinned staging-host Hermes interpreter.
+    # Generic CI does not have that absolute interpreter, so executing the symlink
+    # would fail in the kernel before any policy code runs. Verify the launcher
+    # identity statically and exercise its production mount gate in-process.
+    assert LAUNCHER.read_text(encoding="utf-8").splitlines()[0] == (
+        "#!/home/agentops/.hermes/hermes-agent/venv/bin/python -I"
+    )
+    module = _launcher()
+    with pytest.raises(
+        SystemExit, match="security path is not on a dedicated read-only trust mount"
+    ):
+        module._require_production_mount(module.BUNDLE_PATH, exact=True)
 
 
 def test_same_process_guard_precedes_hermes_main(monkeypatch, tmp_path):
