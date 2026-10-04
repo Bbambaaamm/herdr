@@ -15,6 +15,7 @@ ROOTS = (
 FILES = (
     Path("configs/consumers/herdr.yaml"),
     Path("docs/CONSUMERS.md"),
+    Path("docs/architecture/A2A_GATEWAY_71.md"),
     Path("package.json"),
     Path("package-lock.json"),
 )
