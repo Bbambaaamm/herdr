@@ -69,7 +69,7 @@ def main():
             raise ValueError("external reference denied")
         import base64, re
         from urllib.parse import urlsplit
-        checker = FormatChecker()
+        checker = FormatChecker(formats=[])
         @checker.checks("byte", raises=(ValueError, TypeError, UnicodeError))
         def valid_byte(value):
             if not isinstance(value, str):
@@ -90,7 +90,8 @@ def main():
             if parsed.netloc:
                 parsed.port
             return True
-        validator = Draft202012Validator(schema, registry=Registry(retrieve=denied), format_checker=checker)
+        validator = Draft202012Validator(schema, registry=Registry(retrieve=denied),
+                                        format_checker=checker if data.get("protocol_formats") is True else None)
         if not data["check_only"] and not validator.is_valid(data["instance"]):
             return 1
         sys.stdout.buffer.write(b"valid")

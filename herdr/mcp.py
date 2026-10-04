@@ -176,13 +176,14 @@ def schema_headers(schema: dict) -> tuple:
     return tuple(result)
 
 
-def validate_schema(schema: dict, instance=None, *, check_only=False):
+def validate_schema(schema: dict, instance=None, *, check_only=False, protocol_formats=False):
     """Run full JSON Schema validation in a bounded disposable process.
 
     External references are always denied. The subprocess deadline bounds
     pathological regex, recursive refs and composition complexity.
     """
-    payload = encoded({"schema": schema, "instance": instance, "check_only": check_only})
+    payload = encoded({"schema": schema, "instance": instance, "check_only": check_only,
+                       "protocol_formats": protocol_formats})
     try:
         # Use the trusted sibling helper and isolated imports; a worker's cwd,
         # PYTHONPATH and preload/credential environment must not choose its code.
@@ -246,7 +247,8 @@ def validate_protocol_shape(name, value):
         if key not in selected:
             selected[key] = source["$defs"][key]
             pending.extend(references(selected[key]))
-    validate_schema({"$schema": source["$schema"], "$defs": selected, "$ref": "#/$defs/" + name}, value)
+    validate_schema({"$schema": source["$schema"], "$defs": selected, "$ref": "#/$defs/" + name}, value,
+                    protocol_formats=True)
 
 
 def validate_cacheable(result):
@@ -362,6 +364,36 @@ def require_output_modalities(result, binding_modalities, scope_modalities):
             observed.add(Modality.TEXT)
     if not observed <= set(binding_modalities) or not observed <= set(scope_modalities):
         raise PolicyDenied("tool output modality outside approved binding or frozen scope")
+
+def require_input_modalities(result, binding_modalities, scope_modalities):
+    blocks, nodes = [], 0
+    def content(value, depth=0):
+        nonlocal nodes
+        nodes += 1
+        if nodes > 4096 or depth > 16:
+            raise GatewayError("sampling content bounds exceeded")
+        if isinstance(value, list):
+            for block in value:
+                content(block, depth+1)
+        elif isinstance(value, dict):
+            if value.get("type") == "tool_result":
+                content(value.get("content", ()), depth+1)
+            elif value.get("type") == "tool_use":
+                blocks.append({"type":"text","text":""})
+            else:
+                blocks.append(value)
+        else:
+            raise GatewayError("sampling content shape invalid")
+    for request in result.get("inputRequests", {}).values():
+        if request["method"] == "sampling/createMessage":
+            messages = request["params"]["messages"]
+            if len(messages) > 128:
+                raise GatewayError("sampling message bound exceeded")
+            for message in messages:
+                content(message["content"])
+        else:
+            blocks.append({"type":"text","text":""})
+    require_output_modalities({"content":blocks},binding_modalities,scope_modalities)
 
 
 class _PreparedHTTP:
@@ -779,10 +811,16 @@ def connect_resolved(addresses, deadline, source_address=None):
             if source_address is not None:
                 sock.bind(source_address)
             sock.connect(address)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise GatewayUnavailable("provider TLS deadline exceeded")
+            sock.settimeout(remaining)
             return sock
-        except OSError as exc:
-            last_error = exc
+        except (OSError, GatewayUnavailable) as exc:
             sock.close()
+            if isinstance(exc, GatewayUnavailable):
+                raise
+            last_error = exc
     raise GatewayUnavailable("provider connection unavailable") from last_error
 
 
@@ -1437,6 +1475,8 @@ class McpGateway:
                         state, due = self._task_state(result, definition, binding.output_modalities, context.toolset.scope.output_modalities)
                         remote = result["taskId"]
                     elif result["resultType"] == "input_required":
+                        require_input_modalities(result, binding.output_modalities,
+                                                 context.toolset.scope.output_modalities)
                         # No automatic elicitation, OAuth, callback or tool expansion.
                         state, remote, due = "input_required", None, None
                     elif result["resultType"] == "protocol_error":
@@ -1523,6 +1563,7 @@ class McpGateway:
                 status = "failed"
         elif status == "input_required":
             validate_input_required(result)
+            require_input_modalities(result, binding_modalities, scope_modalities)
         elif status == "failed":
             validate_protocol_error(result.get("error"))
         state = {"working": "remote_running", "input_required": "remote_running",
@@ -1752,6 +1793,10 @@ class McpGateway:
                             break
             except (GatewayUnavailable, DeliveryUncertain) as exc:
                 self.ledger.audit(key, exc.code, self.clock())
+                if local_admission:
+                    # Host authority outages cannot certify a remote closure.
+                    # Retain uncertain one-shot state and propagate bounded 503.
+                    raise
                 if not local_admission:
                     self.ledger.failure(server, self.clock())
                 if not acknowledged:

@@ -2292,3 +2292,94 @@ def test_actual_stalled_dns_helper_is_terminated_within_deadline(tmp_path,monkey
     with pytest.raises(GatewayUnavailable,match="DNS"):
         module.resolve_addresses("provider.example.invalid",443,start+0.1)
     assert time.monotonic()-start<1
+
+
+@pytest.mark.parametrize("format_name,value", [
+    ("email", "ordinary annotation"), ("date-time", "ordinary annotation"),
+    ("uri", "ordinary annotation"), ("byte", "ordinary annotation"),
+])
+def test_user_schema_formats_remain_draft202012_annotations(format_name, value):
+    validate_schema({"type":"string", "format":format_name}, value)
+
+
+@pytest.mark.parametrize("kind", ["image", "audio"])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("task", [False, True])
+def test_sampling_media_hold_cannot_expand_text_only_grant(tmp_path, kind, nested, task):
+    gateway, context, transport, clock, *_ = fixture(tmp_path, tasks=task)
+    content = {"type":kind, "data":"AA==", "mimeType":kind+"/fixture"}
+    if nested:
+        content = {"type":"tool_result", "toolUseId":"previous-use", "content":[content]}
+    request = {"sample":{"method":"sampling/createMessage", "params":{
+        "messages":[{"role":"user", "content":content}], "maxTokens":1}}}
+    if task:
+        transport.task = True
+        gateway.call(context, "local", "read", {"path":"source.py"}, "op")
+        clock.value += 2
+        transport.response = {"resultType":"complete", "taskId":"remote-task-1", "status":"input_required",
+            "createdAt":"2026-10-03T20:00:00Z", "lastUpdatedAt":"2026-10-03T20:00:01Z",
+            "ttlMs":60000, "inputRequests":request}
+        action = lambda: gateway.poll(context, "op")
+    else:
+        transport.response = {"resultType":"input_required", "inputRequests":request}
+        action = lambda: gateway.call(context, "local", "read", {"path":"source.py"}, "op")
+    with pytest.raises(PolicyDenied, match="modality"):
+        action()
+    assert gateway.ledger.get(operation_key(context))["state"] not in {"input_required", "observed_complete"}
+    assert [r["method"] for r, _ in semantic_calls(transport)] == (
+        ["tools/call", "tasks/get"] if task else ["tools/call"])
+
+
+@pytest.mark.parametrize("port", ["authority", "runtime"])
+def test_post_ack_host_outage_retains_uncertain_window_and_provider_health(tmp_path, port):
+    gateway, context, transport, _, _, _ = fixture(tmp_path, subscriptions=True)
+    def unavailable(*args):
+        raise OSError("private-host-authority-database")
+    windows = []
+    def stream(message, **kwargs):
+        windows.append(message)
+        metadata = {META+"subscriptionId":message["id"]}
+        yield {"jsonrpc":"2.0", "method":"notifications/subscriptions/acknowledged",
+            "params":{"_meta":metadata, "notifications":message["params"]["notifications"]}}
+        if port == "authority":
+            gateway.authority = unavailable
+        else:
+            gateway.runtime_states = unavailable
+        yield {"jsonrpc":"2.0", "method":"notifications/tools/list_changed", "params":{"_meta":metadata}}
+    transport.stream = stream
+    with pytest.raises(GatewayUnavailable):
+        gateway.listen(context, "local", {"toolsListChanged":True}, "window")
+    row = gateway.ledger.get(operation_key(context, "window"))
+    assert row["state"] == "delivery_uncertain" and row["deliveries"] == 1
+    assert gateway.ledger.db.execute("SELECT * FROM health").fetchall() == []
+    gateway.authority = lambda *_: True
+    with pytest.raises((DeliveryUncertain, GatewayUnavailable)):
+        gateway.listen(context, "local", {"toolsListChanged":True}, "window")
+    assert len(windows) == 1
+
+
+@pytest.mark.parametrize("elapsed", [0.8, 1.1])
+def test_connect_recomputes_remaining_timeout_before_tls(monkeypatch, elapsed):
+    import herdr.mcp as module
+    times = iter([10.0, 10.0+elapsed])
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(times))
+    class Socket:
+        def __init__(self):
+            self.timeouts, self.closed = [], False
+        def settimeout(self, timeout):
+            self.timeouts.append(timeout)
+        def connect(self, address):
+            assert address == ("127.0.0.1", 443)
+        def close(self):
+            self.closed = True
+    sock = Socket()
+    monkeypatch.setattr(module.socket, "socket", lambda *args: sock)
+    addresses = ((socket.AF_INET, 0, ("127.0.0.1", 443)),)
+    if elapsed >= 1:
+        with pytest.raises(GatewayUnavailable, match="TLS deadline"):
+            module.connect_resolved(addresses, 11.0)
+        assert sock.closed and sock.timeouts == [1.0]
+    else:
+        assert module.connect_resolved(addresses, 11.0) is sock
+        assert sock.timeouts == pytest.approx([1.0, 0.2])
+        assert not sock.closed
