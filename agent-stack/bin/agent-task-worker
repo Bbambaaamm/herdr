@@ -7,6 +7,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -39,10 +40,43 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 def write_json(path: Path, data: dict) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    fd, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def persist_execution_session(task: dict, *, startup=True) -> None:
+    """Publish ownership in the canonical queue BEFORE launching more resources."""
+    sidecar = Path(str(task["task_file"]))
+    canonical = current_task_path(task)
+    if canonical is None:
+        canonical = RUNNING / (str(task["id"]) + ".json")
+        current = dict(task)
+    else:
+        current = json.loads(canonical.read_text(encoding="utf-8"))
+        for field in ("id", "run_token", "idempotency_key", "attempts"):
+            if current.get(field) != task.get(field):
+                raise RuntimeError("task_session_canonical_identity_changed")
+        if startup and canonical.parent in (DONE, BLOCKED, FAILED):
+            raise RuntimeError("task_session_canonical_already_terminal")
+    current["execution_session"] = dict(task["execution_session"])
+    current["task_file"] = str(sidecar)
+    write_json(canonical, current)
+    if sidecar != canonical:
+        write_json(sidecar, task)
 
 def log(task_id: str, message: str) -> None:
     line = f"{utcnow().isoformat(timespec='seconds')} {message}"
@@ -242,7 +276,7 @@ def start_bridge(task: dict, session: dict) -> None:
     session["bridge_socket"] = name
     session["bridge_task_id"] = str(task["id"])
     session["bridge_run_token"] = str(task["run_token"])
-    write_json(task_file, task)
+    persist_execution_session(task)
     for _ in range(30):
         if process.poll() is not None:
             break
@@ -442,10 +476,11 @@ def create_task_session(task: dict) -> dict:
             "created_at": utcnow().isoformat(),
         }
         task["execution_session"] = session
-        write_json(Path(task_file), task)
+        persist_execution_session(task)
         start_bridge(task, session)
         policy = frozen_policy()
         session["policy_file"] = str(policy)
+        persist_execution_session(task)
         task_result = result_path(str(task["id"]))
         task_result.parent.mkdir(parents=True, exist_ok=True)
         if not task_result.exists():
@@ -473,8 +508,10 @@ def create_task_session(task: dict) -> dict:
             "verified_at": utcnow().isoformat(),
         }
         session["sandbox_verified"] = True
-        write_json(Path(task_file), task)
+        persist_execution_session(task)
         agent_start_attempted = True
+        session["agent_start_attempted"] = True
+        persist_execution_session(task)
         started = _herdr_json(
             [
                 "agent", "start", agent_name,
@@ -494,6 +531,8 @@ def create_task_session(task: dict) -> dict:
         started_pane = str(started_agent.get("pane_id") or "")
         if started_pane and started_pane != pane_id:
             raise RuntimeError("task_session_agent_wrong_pane")
+        session["agent_started"] = True
+        persist_execution_session(task)
         return session
     except Exception as exc:
         if pane_id and pane_id != coordinator_pane:
@@ -533,8 +572,12 @@ def create_task_session(task: dict) -> dict:
                 session["cleanup_status"] = "closed"
         if cleanup_failed:
             raise RuntimeError("task_session_cleanup_failed") from exc
-        if isinstance(task.get("execution_session"), dict) and task["execution_session"].get("closed_at"):
-            stop_bridge(task["execution_session"])
+        if isinstance(task.get("execution_session"), dict):
+            if task["execution_session"].get("closed_at"):
+                stop_bridge(task["execution_session"])
+                if task["execution_session"].get("policy_file"):
+                    Path(task["execution_session"]["policy_file"]).unlink(missing_ok=True)
+            persist_execution_session(task, startup=False)
         raise
 
 

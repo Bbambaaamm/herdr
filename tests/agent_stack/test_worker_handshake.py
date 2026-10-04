@@ -1114,3 +1114,112 @@ def test_task_session_agent_name_respects_herdr_limit_for_all_coordinators(tmp_p
         names.append(agent_name)
 
     assert names[0] != names[1]
+
+
+@pytest.mark.parametrize("phase", ["bridge", "sandbox", "agent"])
+def test_canonical_queue_owns_session_before_worker_crash(tmp_path, monkeypatch, phase):
+    configure_paths(tmp_path)
+    task = base_task()
+    worker.prepare_attempt(task)
+    task["workspace"] = str(tmp_path / "workspace")
+    task["routing"] = {"selected_agent": "quantlab-hermes"}
+    sidecar = tmp_path / "attempts" / "immutable-attempt.json"
+    sidecar.parent.mkdir()
+    task["task_file"] = str(sidecar)
+    canonical = worker.RUNNING / (task["id"] + ".json")
+    worker.write_json(canonical, task)
+    policy = _policy_file(tmp_path)
+    monkeypatch.setattr(worker, "frozen_policy", lambda: policy)
+    monkeypatch.setattr(worker, "sandbox_command", lambda *a, **k: ["bwrap", "/bin/bash"])
+    monkeypatch.setattr(worker, "verify_sandbox", lambda *a, **k: True)
+    monkeypatch.setattr(worker, "inner_pid", lambda *a, **k: 123)
+    monkeypatch.setattr(worker, "_setup_pane_ids", lambda: {"coordinator"})
+    def crash_if(expected):
+        recorded = json.loads(canonical.read_text())
+        assert recorded["run_token"] == task["run_token"]
+        assert recorded["execution_session"]["pane_id"] == "owned"
+        assert json.loads(sidecar.read_text())["execution_session"]["pane_id"] == "owned"
+        if phase == expected:
+            raise SystemExit("simulated worker death")
+    def bridge(current, session):
+        crash_if("bridge")
+        session.update(bridge_pid=1234, bridge_socket="@fixture",
+                       bridge_task_id=current["id"], bridge_run_token=current["run_token"])
+        worker.persist_execution_session(current)
+    def herdr(args, **kwargs):
+        if args[:2] == ["agent", "get"]:
+            return {"result": {"agent": {"kind": "hermes", "pane_id": "coordinator", "workspace_id": "workspace"}}}
+        if args[:2] == ["pane", "split"]:
+            return {"result": {"pane": {"pane_id": "owned"}}}
+        if args[:2] == ["pane", "run"]:
+            crash_if("sandbox")
+            return {"result": {}}
+        if args[:2] == ["pane", "process-info"]:
+            return {"result": {"process_info": {}}}
+        if args[:2] == ["agent", "start"]:
+            crash_if("agent")
+        raise AssertionError(args)
+    monkeypatch.setattr(worker, "start_bridge", bridge)
+    monkeypatch.setattr(worker, "_herdr_json", herdr)
+    with pytest.raises(SystemExit, match="worker death"):
+        worker.create_task_session(task)
+    recovered = json.loads(canonical.read_text())
+    session = recovered["execution_session"]
+    assert session["owned_pane"] and not session.get("closed_at")
+    if phase != "bridge":
+        assert session["bridge_pid"] == 1234 and session["policy_file"] == str(policy)
+    if phase == "agent":
+        assert session["sandbox_verified"] and session["agent_start_attempted"]
+        assert session["sandbox_attestation"]["run_token"] == task["run_token"]
+    # Recovery uses the actual canonical record, not the attempts sidecar.
+    recovery_loader = SourceFileLoader("session_crash_recovery", str(BIN / "agent-stack-recovery"))
+    recovery_spec = importlib.util.spec_from_loader(recovery_loader.name, recovery_loader)
+    recovery = importlib.util.module_from_spec(recovery_spec)
+    recovery_loader.exec_module(recovery)
+    closed, stopped = [], []
+    monkeypatch.setattr(recovery, "_pane_presence", lambda _: True)
+    monkeypatch.setattr(recovery, "_pane_has_marker", lambda pane, marker: pane == "owned" and marker == session["pane_marker"])
+    def close(args, **kwargs):
+        closed.append(args)
+        return worker.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+    monkeypatch.setattr(recovery.subprocess, "run", close)
+    monkeypatch.setattr(recovery, "stop_task_bridge", lambda current: stopped.append(current.get("bridge_pid")))
+    assert recovery.cleanup_task_owned_pane(recovered)
+    assert closed[0][-1] == "owned" and stopped
+    assert recovered["execution_session"]["closed_at"]
+
+
+def test_session_publication_preserves_canonical_truth_and_rejects_another_attempt(tmp_path):
+    configure_paths(tmp_path)
+    task = base_task()
+    worker.prepare_attempt(task)
+    sidecar = tmp_path / "attempts" / "attempt.json"
+    sidecar.parent.mkdir()
+    task["task_file"] = str(sidecar)
+    task["execution_session"] = {"owned_pane": True, "pane_id": "owned"}
+    canonical = worker.RUNNING / (task["id"] + ".json")
+    current = dict(task, last_observation="authoritative-current", attempt_state="working")
+    worker.write_json(canonical, current)
+    worker.persist_execution_session(task)
+    recorded = json.loads(canonical.read_text())
+    assert recorded["last_observation"] == "authoritative-current"
+    assert recorded["attempt_state"] == "working"
+    original = canonical.read_bytes()
+    task["run_token"] = "different-attempt"
+    with pytest.raises(RuntimeError, match="identity_changed"):
+        worker.persist_execution_session(task)
+    assert canonical.read_bytes() == original
+
+
+def test_worker_session_writes_fsync_file_then_directory(tmp_path, monkeypatch):
+    import os, stat
+    observed = []
+    original = os.fsync
+    def fsync(fd):
+        observed.append(os.fstat(fd).st_mode)
+        original(fd)
+    monkeypatch.setattr(worker.os, "fsync", fsync)
+    worker.write_json(tmp_path / "record.json", {"session": "owned"})
+    assert len(observed) == 2 and stat.S_ISREG(observed[0]) and stat.S_ISDIR(observed[1])
+    assert (tmp_path / "record.json").stat().st_mode & 0o777 == 0o600
+    assert not list(tmp_path.glob("*.tmp"))

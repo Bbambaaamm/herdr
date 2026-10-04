@@ -1173,3 +1173,42 @@ mine.write_text(json.dumps(observed))
             os.close(directory_fd)
             if policy is not None:
                 policy.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("phase", ["result", "construct", "launch", "inspect", "verify"])
+def test_child_sandbox_failure_removes_frozen_policy(tmp_path, monkeypatch, phase):
+    from importlib.machinery import SourceFileLoader
+    scheduler = _canary(tmp_path)
+    policy = tmp_path / "frozen-policy"
+    policy.write_text("frozen")
+    original = SourceFileLoader.exec_module
+    def load(loader, module):
+        original(loader, module)
+        if loader.name != "agent_durable_sandbox_runtime":
+            return
+        module.frozen_policy = lambda: policy
+        def command(*a, **k):
+            if phase == "construct":
+                raise RuntimeError("construction failed")
+            return ["bwrap", "/bin/bash"]
+        module.command = command
+        module.inner_pid = lambda *a: 123
+        module.verify = lambda *a, **k: phase != "verify"
+    monkeypatch.setattr(SourceFileLoader, "exec_module", load)
+    class Runner:
+        def run(self, args, **kwargs):
+            if (phase == "launch" and args[:2] == ["pane", "run"]
+                    or phase == "inspect" and args[:2] == ["pane", "process-info"]):
+                raise RuntimeError("transport failed")
+            return CommandResult(0, json.dumps({"result": {"process_info": {}}}), "")
+    runtime = HerdrChildRuntime(scheduler, Runner(), cwd=tmp_path, snapshot_path=tmp_path / "scheduler.json")
+    def result(*a):
+        if phase == "result":
+            raise RuntimeError("result failed")
+        return (tmp_path / "result.json",)
+    monkeypatch.setattr(runtime, "_child_result_writable", result)
+    monkeypatch.setattr(runtime, "_child_workspace_writable", lambda *a: False)
+    with pytest.raises(RuntimeError):
+        runtime._sandbox_child_pane("owned", "marker", "/bin/true", "task")
+    assert not policy.exists()
+    assert "owned" not in runtime._sandbox_proofs

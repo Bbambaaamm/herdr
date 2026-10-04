@@ -818,33 +818,37 @@ class HerdrChildRuntime:
         sandbox = importlib.util.module_from_spec(spec)
         loader.exec_module(sandbox)
         policy = sandbox.frozen_policy()
-        writable = self._child_result_writable(task_id)
-        sandbox_args = sandbox.command(
-            self.cwd,
-            Path(real),
-            writable=writable,
-            policy=policy,
-            child_workspace_writable=self._child_workspace_writable(task_id),
-            pinned_worktree=self.pinned_worktree,
-        )
-        _json_result(self.runner.run(["pane", "run", pane_id,
-                                      sandbox.shell_command(sandbox_args)]), "child sandbox start")
-        info = _json_result(self.runner.run(["pane", "process-info", "--pane", pane_id]),
-                            "child sandbox process-info")
-        process_info = (info.get("result") or {}).get("process_info")
-        sandbox_pid = sandbox.inner_pid(
-            dict(process_info) if isinstance(process_info, Mapping) else {}, marker
-        )
-        if not sandbox_pid or not sandbox.verify(
-                sandbox_pid, Path(real), marker, policy=policy,
+        try:
+            writable = self._child_result_writable(task_id)
+            sandbox_args = sandbox.command(
+                self.cwd,
+                Path(real),
+                writable=writable,
+                policy=policy,
+                child_workspace_writable=self._child_workspace_writable(task_id),
                 pinned_worktree=self.pinned_worktree,
-                child_workspace_writable=self._child_workspace_writable(task_id)):
-            raise HerdrRuntimeError("child_sandbox_unverified", pane_id)
-        self._sandbox_proofs[pane_id] = {
-            "sandbox_pid": sandbox_pid,
-            "policy_sha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
-        }
-        return policy
+            )
+            _json_result(self.runner.run(["pane", "run", pane_id,
+                                          sandbox.shell_command(sandbox_args)]), "child sandbox start")
+            info = _json_result(self.runner.run(["pane", "process-info", "--pane", pane_id]),
+                                "child sandbox process-info")
+            process_info = (info.get("result") or {}).get("process_info")
+            sandbox_pid = sandbox.inner_pid(
+                dict(process_info) if isinstance(process_info, Mapping) else {}, marker
+            )
+            if not sandbox_pid or not sandbox.verify(
+                    sandbox_pid, Path(real), marker, policy=policy,
+                    pinned_worktree=self.pinned_worktree,
+                    child_workspace_writable=self._child_workspace_writable(task_id)):
+                raise HerdrRuntimeError("child_sandbox_unverified", pane_id)
+            self._sandbox_proofs[pane_id] = {
+                "sandbox_pid": sandbox_pid,
+                "policy_sha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
+            }
+            return policy
+        except BaseException:
+            policy.unlink(missing_ok=True)
+            raise
 
     def _child_workspace_writable(self, task_id: str) -> bool:
         node = self.scheduler.task_node(task_id)

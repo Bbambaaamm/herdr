@@ -76,12 +76,16 @@ class PinnedWorktree:
 
 def frozen_policy() -> Path:
     fd, name = tempfile.mkstemp(prefix="herdr-durable-policy-", dir="/tmp")
-    with os.fdopen(fd, "wb") as target, POLICY.open("rb") as source:
-        shutil.copyfileobj(source, target)
-        target.flush()
-        os.fsync(target.fileno())
-    os.chmod(name, 0o555)
-    return Path(name)
+    try:
+        with os.fdopen(fd, "wb") as target, POLICY.open("rb") as source:
+            shutil.copyfileobj(source, target)
+            target.flush()
+            os.fsync(target.fileno())
+        os.chmod(name, 0o555)
+        return Path(name)
+    except BaseException:
+        Path(name).unlink(missing_ok=True)
+        raise
 
 
 def command(

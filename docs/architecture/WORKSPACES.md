@@ -30,3 +30,14 @@ result denial, and attestation replay without contacting a model provider.
 Hermes toolset selection is a separate boundary: its file bundle contains
 multiple tools. Exact invocation grants and credential/egress containment must
 be enforced by the security envelope; schema omission alone is insufficient.
+
+
+Root pane ownership is published to the canonical task queue before starting
+the bridge, then mirrored to the attempt sidecar. Bridge identity, frozen policy
+path, verified sandbox attestation and agent-start intent are persisted as
+startup advances. Publishing a session cannot overwrite another run/idempotency
+identity or authoritative lifecycle observations. Task writes use an atomic
+replacement with file and parent-directory fsync. Crash regressions recover the
+canonical record at bridge, sandbox and agent-start boundaries and close only
+the owned pane. Failed child setup removes its frozen policy at every failure
+stage; policy-copy failures also remove the incomplete temporary file.
