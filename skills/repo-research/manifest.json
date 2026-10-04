@@ -1,0 +1,40 @@
+{
+  "schema_version": "1.0.0",
+  "name": "repo-research",
+  "version": "1.0.0",
+  "description": "Inspect a repository and report source-grounded findings within the current task scope.",
+  "publisher": "herdr-maintainers",
+  "source_uri": "https://github.com/Bbambaaamm/herdr",
+  "authoring_base_revision": "8e4da55b3739c5ad5d9061a44eaad1beaa1179d7",
+  "tools": [
+    "read_file"
+  ],
+  "permissions": [
+    "repo:read"
+  ],
+  "capabilities": [],
+  "features": [
+    "reasoning"
+  ],
+  "platforms": [
+    "linux",
+    "windows",
+    "darwin"
+  ],
+  "files": [
+    {
+      "path": "SKILL.md",
+      "size": 630,
+      "sha256": "b341d1dd907620b3c935a418d953b248e90bf6b2395f138673d2e2ef815672fd",
+      "media_type": "text/markdown",
+      "data_class": "internal"
+    },
+    {
+      "path": "references/report-template.md",
+      "size": 129,
+      "sha256": "d6c151c46afc5426b8d0c7752d94bcba1ac9abf147a99a05dc4df22003c4098b",
+      "media_type": "text/markdown",
+      "data_class": "internal"
+    }
+  ]
+}
