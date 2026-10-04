@@ -33,6 +33,9 @@ def main():
     parser.add_argument("--repo-root",default=str(Path(__file__).resolve().parents[1]))
     parser.add_argument("--tamper-stdlib",action="store_true")
     parser.add_argument("--deny-continuation",action="store_true")
+    parser.add_argument("--tamper-runtime-library",action="store_true")
+    parser.add_argument("--poison-loader",action="store_true")
+    parser.add_argument("--stale-fence",action="store_true")
     ns=parser.parse_args()
     repo=Path(ns.repo_root).resolve()
     sys.path.insert(0,str(repo))
@@ -89,7 +92,7 @@ def main():
               False,None,NetworkAccess.NONE,(),False),provider_routes=(),credential_refs=(),
             approvals=(),approval_required_for=(),issued_at="2026-01-01T00:00:00+00:00",
             expires_at="2030-01-01T00:00:00+00:00")
-        if ns.tamper_stdlib:
+        if ns.tamper_stdlib or ns.tamper_runtime_library:
             # Change only a private source copy and approve its changed snapshot
             # hash. The audit-known independent stdlib pin must still reject it.
             changed=host/"tampered-python";changed.mkdir()
@@ -97,9 +100,11 @@ def main():
             for name in python.files:
                 destination=changed/name;destination.parent.mkdir(parents=True,exist_ok=True)
                 shutil.copy2(python.source/name,destination)
-            entry=changed/"lib/python3.11/encodings/__init__.py"
-            entry.write_bytes(entry.read_bytes()+bytes([10])+b"raise RuntimeError('HERDR_CORRUPT_STDLIB_EXECUTED')"+bytes([10]))
-            files=dict(python.files);files["lib/python3.11/encodings/__init__.py"]=hashlib.sha256(entry.read_bytes()).hexdigest()
+            relative=("lib/python3.11/encodings/__init__.py" if ns.tamper_stdlib
+                      else "lib/libpython3.11.so.1.0")
+            entry=changed/relative
+            entry.write_bytes(entry.read_bytes()+bytes([10])+b"HERDR_PRIVATE_RUNTIME_CORRUPTION"+bytes([10]))
+            files=dict(python.files);files[relative]=hashlib.sha256(entry.read_bytes()).hexdigest()
             runtime=[replace(definition,source=changed,files=files) if definition is python else definition
                      for definition in runtime]
         factory=HostPolicyLaunchFactory(code=code,runtime=tuple(runtime),storage=storage,
@@ -111,6 +116,17 @@ def main():
         marker="physical-"+uuid.uuid4().hex
         env={**os.environ,**launch.environment(),"HERDR_DURABLE_TASK_PANE":marker,
              "HERMES_HOME":"/tmp/herdr-isolated-home"}
+        poison_marker=host/"results"/"native-constructor-executed"
+        if ns.poison_loader:
+            source=host/"loader-poison.c";library=host/"loader-poison.so"
+            source.write_text('#include <stdio.h>\n__attribute__((constructor)) static void run(void){FILE *f=fopen('+
+                              json.dumps(str(poison_marker))+',"w");if(f){fputs("executed",f);fclose(f);}}\n')
+            subprocess.run(["/usr/bin/cc","-shared","-fPIC",str(source),"-o",str(library)],
+                           check=True,capture_output=True,timeout=10)
+            env.update(LD_PRELOAD=str(library),LD_AUDIT=str(library),
+                       LD_LIBRARY_PATH=str(host),LD_TRACE_LOADED_OBJECTS="1",GLIBC_TUNABLES="unsafe")
+        from herdr.launch_environment import sanitize_environment,require_clean_environment
+        env=sanitize_environment(env);require_clean_environment(env)
         args=sandbox.command(workspace,cli,writable=(result,),policy=policy,
              child_workspace_writable=False,pinned_worktree=pin,policy_mount=launch.mount)
         process=subprocess.Popen(args,stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,
@@ -152,38 +168,47 @@ def main():
                 observations.append(proof)
                 return True
             launch.set_continuation_sink(publish);launch.arm_bootstrap()
-            script="mkdir -p /tmp/herdr-isolated-home; hermes --version > "+shlex.quote(str(result))+" 2>&1\n"
+            script=("export HERDR_POLICY_FENCING_TOKEN=2; " if ns.stale_fence else "")
+            script+="mkdir -p /tmp/herdr-isolated-home; hermes --version > "+shlex.quote(str(result))+" 2>&1\n"
             process.stdin.write(script.encode());process.stdin.flush()
             output=None
-            for _ in range(200):
-                if result.stat().st_size and (observations or ns.tamper_stdlib or ns.deny_continuation):
-                    output=result.read_text();break
+            denial=ns.tamper_stdlib or ns.tamper_runtime_library or ns.deny_continuation or ns.stale_fence
+            expected=("before interpreter exec" if ns.tamper_stdlib or ns.tamper_runtime_library
+                      else "identity mismatch" if ns.stale_fence else "authority")
+            for _ in range(400):
+                output=result.read_text() if result.stat().st_size else None
+                if output and ((denial and expected in output) or (not denial and observations and "0.21.5" in output)):
+                    break
                 if process.poll() is not None: raise RuntimeError(process.stderr.read(8192).decode())
                 time.sleep(.05)
-            if ns.tamper_stdlib or ns.deny_continuation:
-                expected="before interpreter exec" if ns.tamper_stdlib else "authority"
+            if denial:
                 if (output is None or expected not in output or "HERDR_CORRUPT_STDLIB_EXECUTED" in output
                         or "0.21.5" in output or observations or durable.exists()
                         or launch._published_bootstrap_receipt is not None):
                     raise RuntimeError("invalid bootstrap denial evidence: "+str(output)[:4096])
                 print(json.dumps({"status":"PASS","denied_before_hermes":True,
-                    "case":"tampered_stdlib" if ns.tamper_stdlib else "durable_sink_denied",
+                    "case":("tampered_stdlib" if ns.tamper_stdlib else
+                            "tampered_runtime_library" if ns.tamper_runtime_library else
+                            "stale_fence" if ns.stale_fence else "durable_sink_denied"),
                     "live_provider_used":False,"live_config_changed":False},sort_keys=True))
                 return 0
             if not observations or output is None or "0.21.5" not in output:
                 raise RuntimeError("physical continuation/version probe failed: "+result.read_text()[:4096])
+            if poison_marker.exists(): raise RuntimeError("native loader code executed before sanitization")
             receipt=launch._published_bootstrap_receipt
             if receipt is None or json.loads(durable.read_bytes())!=observations[0]:
                 raise RuntimeError("durable continuation did not precede Hermes startup")
             print(json.dumps({"status":"PASS","physical_bootstrap":True,"socket_fd_bind":True,
                 "schema_version":observations[0]["schema_version"],
                 "pre_ack_physical_verification":True,"durable_receipt":True,
-                "same_process_pinned_interpreter":True,"live_provider_used":False,
+                "same_process_pinned_interpreter":True,"native_loader_controls_removed":True,
+                "poison_loader":ns.poison_loader,"live_provider_used":False,
                 "live_config_changed":False},sort_keys=True))
         finally:
-            process.stdin.close()
-            try: process.wait(timeout=3)
-            except subprocess.TimeoutExpired: process.kill();process.wait(timeout=3)
+            if process is not None:
+                process.stdin.close()
+                try: process.wait(timeout=3)
+                except subprocess.TimeoutExpired: process.kill();process.wait(timeout=3)
             pin.close();launch.cleanup_after_pane_closed()
     return 0
 

@@ -182,6 +182,8 @@ class HostBootstrap:
         from .policy_launch import process_start_ticks
         _require(self.launch.sealed is not None and self._shell_pid is None,
                  "bootstrap requires a newly sealed physical launch")
+        from .launch_environment import process_environment, require_clean_environment
+        require_clean_environment(process_environment(shell_pid))
         self.launch.mount.verify_mounted(shell_pid, self.launch.sealed)
         self._shell_pid, self._shell_ticks = shell_pid, process_start_ticks(shell_pid)
         self._attestation = json.loads(canonical_json_bytes(attestation))
@@ -234,6 +236,8 @@ class HostBootstrap:
                     key, value = item.split(b"=", 1)
                     _require(key not in env, "ambiguous bootstrap identity environment")
                     env[key] = value
+            from .launch_environment import require_clean_environment
+            require_clean_environment({key.decode("utf-8"):value.decode("utf-8") for key,value in env.items()})
             for field, key in IDENTITY_ENV.items():
                 if env.get(key.encode()) != str(getattr(self.launch.identity, field)).encode():
                     return False

@@ -189,6 +189,9 @@ def command(
         args += ["--tmpfs", "/run", "--dir", "/run/herdr", "--dir", "/run/herdr-policy"]
         for entry in descriptors:
             args += ["--ro-bind-fd", str(entry["fd"]), entry["target"]]
+        from herdr.launch_environment import STARTUP_CONTROLS
+        for name in sorted(set(STARTUP_CONTROLS)|{key for key in os.environ if key.startswith("LD_")}):
+            args += ["--unsetenv",name]
         args += ["--setenv", "PATH", "/run/herdr-bootstrap:/usr/bin:/bin"]
     args += [
         "--setenv", "HERDR_DURABLE_SANDBOX", "1",
@@ -209,7 +212,10 @@ def command(
 
 
 def shell_command(args: list[str]) -> str:
-    return "exec " + shlex.join(args)
+    from herdr.launch_environment import STARTUP_CONTROLS
+    controls=sorted(set(STARTUP_CONTROLS)|{key for key in os.environ
+                    if key.startswith("LD_") and key.replace("_","").isalnum()})
+    return "unset " + " ".join(map(shlex.quote,controls)) + "; exec " + shlex.join(args)
 
 
 def _env(pid: int) -> set[bytes]:

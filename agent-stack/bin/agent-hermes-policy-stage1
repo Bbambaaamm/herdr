@@ -28,6 +28,7 @@ STAGE0_PYTHON = Path("/usr/bin/python3")
 STAGE2 = POLICY_CODE_ROOT / "agent-stack/bin/agent-hermes-policy-run"
 PYTHON_SHA256 = "1e761eb19d6f2594ab8dc64bd99ad4e1753589f3bf1ec199e4eef3aaa21e3930"
 PYTHON_STDLIB_SHA256 = "330e97044fcb6873bc76ab37b63bfcd8c9a081d64d285adea164d3f72b548c2e"
+PYTHON_RUNTIME_TREE_SHA256 = "d35e6083e474e8d049bad69c46bd84d97c8d4cfc650bcf32fce44e2e6299f0ef"
 PROOF_VERSION = "herdr-policy-bootstrap-1"
 PROOF_AUTHORITY = "herdr-host-frozen-tree"
 PROOF_ENV = "HERDR_POLICY_STAGE1_PROOF_SHA256"
@@ -297,6 +298,8 @@ def _verify_pinned_startup_imports() -> None:
     # These audit-known absent paths can redirect Python prefix/ZIP startup.
     for path in (PYTHON_ROOT/"lib/python311.zip",PYTHON_ROOT/"pyvenv.cfg",PYTHON_ROOT/"bin/pyvenv.cfg"):
         if os.path.lexists(path): _fail("unaudited Python startup override")
+    if _tree_manifest_digest(PYTHON_ROOT)!=PYTHON_RUNTIME_TREE_SHA256:
+        _fail("audited complete Python runtime tree differs before interpreter exec")
     if _stdlib_import_digest(PYTHON_ROOT/"lib/python3.11")!=PYTHON_STDLIB_SHA256:
         _fail("audited pinned stdlib differs before interpreter exec")
 
@@ -418,6 +421,10 @@ def _open_verified_python() -> int:
 def main(argv: list[str] | None = None) -> int:
     args = list(os.sys.argv[1:] if argv is None else argv)
     _require_independent_stage0()
+    if any(name.startswith("LD_") or name in {
+            "GLIBC_TUNABLES","GCONV_PATH","LOCPATH","NLSPATH","BASH_ENV","ENV"}
+            for name in os.environ):
+        raise SystemExit("unsafe startup environment before interpreter exec")
     rows = _mount_rows()
     _require_exact_ro_tree(BOOTSTRAP_ROOT, rows)
     proof, raw = _read_proof()

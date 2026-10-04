@@ -5,6 +5,7 @@ children only, owned panes only, and fail-closed Herdr admission.
 """
 
 from __future__ import annotations
+from .launch_environment import sanitize_environment
 
 import argparse
 import fcntl
@@ -224,7 +225,8 @@ class SubprocessHerdrRunner:
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
-            env=dict(self.env) if self.env is not None else None,
+            env=sanitize_environment(
+                dict(self.env) if self.env is not None else dict(os.environ)),
         )
         return CommandResult(proc.returncode, proc.stdout, proc.stderr)
 
@@ -1116,6 +1118,14 @@ class HerdrChildRuntime:
             if not self.scheduler.record_child_pane_intent(
                     lease.task_id, run_token, lease.agent_id, lease.fencing_token, idempotency_key, marker):
                 raise HerdrRuntimeError("child_pane_intent_denied", lease.task_id)
+            def inspect_startup_source():
+                source = _json_result(self.runner.run(["pane","process-info","--current"]),
+                                      "pane startup source")
+                process_source = (source.get("result") or {}).get("process_info")
+                if not isinstance(process_source, Mapping):
+                    raise HerdrRuntimeError("child_startup_source_missing",lease.task_id)
+                return process_source.get("shell_pid")
+            launch.verify_spawn_source(inspect_startup_source)
             pane_creation_attempted = True
             pane_id = self._create_pane(0, marker, policy_env)
             self._reservation_panes[lease.agent_id] = pane_id

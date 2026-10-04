@@ -346,26 +346,6 @@ def _fresh_startup_pycache_prefix() -> str:
     return str(prefix)
 
 
-def _exec_verified_interpreter(
-    script: Path, args: list[str], *, require_trust_mount: bool = True
-) -> None:
-    if require_trust_mount:
-        _require_production_mount(PYTHON_ROOT, exact=True)
-    fd = _verified_interpreter_fd()
-    if _digest_site_packages(PYTHON_ROOT / "lib/python3.11") != PYTHON_STDLIB_SHA256:
-        raise SystemExit("audited Python standard library differs from executor pin")
-    os.set_inheritable(fd, True)
-    env = dict(os.environ)
-    env[_INTERPRETER_FD_ENV] = str(fd)
-    path = f"/proc/self/fd/{fd}"
-    pycache_prefix = _fresh_startup_pycache_prefix()
-    os.execve(
-        path,
-        [path, "-I", "-S", "-X", f"pycache_prefix={pycache_prefix}", str(script), *args],
-        env,
-    )
-
-
 def _require_startup_pycache_prefix() -> None:
     prefix = str(BOOTSTRAP_ROOT / "no-bytecode-cache")
     if sys.pycache_prefix != prefix:
@@ -482,30 +462,16 @@ def _verify_hermes_build(root: Path) -> str:
     return HERMES_EXECUTOR
 
 
-def bootstrap(
-    hermes_args: list[str],
-    *,
-    bundle_path: Path = BUNDLE_PATH,
-    policy_code_root: Path = POLICY_CODE_ROOT,
-    hermes_root: Path = HERMES_ROOT,
-) -> int:
-    """Verify host authority and install guards before Hermes can make a model call."""
-    production = (
-        bundle_path == BUNDLE_PATH
-        and policy_code_root == POLICY_CODE_ROOT
-        and hermes_root == HERMES_ROOT
-    )
-    if production:
-        # A connected host-authenticated SO_PEERCRED session is the stage-one
-        # provenance authority. Public env vars and inherited FD NUMBERS alone
-        # are reproducible and therefore never sufficient.
-        _require_host_bootstrap_authority()
-        _require_stage1_continuity()
-        _require_production_mount(bundle_path, exact=True)
-        _require_production_mount(policy_code_root, exact=True)
-        _require_production_mount(hermes_root, exact=True)
-        _require_production_mount(PYTHON_ROOT, exact=True)
-        _verify_runtime(hermes_root)
+def bootstrap(hermes_args: list[str]) -> int:
+    """Every entry uses the fixed authenticated production path."""
+    bundle_path,policy_code_root,hermes_root=BUNDLE_PATH,POLICY_CODE_ROOT,HERMES_ROOT
+    _require_host_bootstrap_authority()
+    _require_stage1_continuity()
+    _require_production_mount(bundle_path, exact=True)
+    _require_production_mount(policy_code_root, exact=True)
+    _require_production_mount(hermes_root, exact=True)
+    _require_production_mount(PYTHON_ROOT, exact=True)
+    _verify_runtime(hermes_root)
     if policy_code_root.is_symlink() or not policy_code_root.is_dir():
         raise SystemExit("trusted policy code root unavailable")
     executor = _verify_hermes_build(hermes_root)

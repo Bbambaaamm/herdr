@@ -503,7 +503,14 @@ class PreparedPolicyLaunch:
         return self.grant.identity
 
     def environment(self):
+        from .launch_environment import require_clean_environment
+        require_clean_environment(os.environ)
         return {key: str(getattr(self.identity, field)) for field, key in IDENTITY_ENV.items()}
+
+    def verify_spawn_source(self, inspect_source):
+        from .launch_environment import require_clean_spawn_source
+        _require(callable(inspect_source),"host startup source inspector required")
+        require_clean_spawn_source(inspect_source())
 
     def seal(self, pid, attestation, *, tools, permissions):
         bound, sealed = self.mount.seal(pid, self.grant, identity=self.identity, attestation=attestation,
