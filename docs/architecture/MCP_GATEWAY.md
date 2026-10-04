@@ -88,7 +88,9 @@ delivery_uncertain before sending bytes. Its operation identity binds consumer,
 task, exact attempt/fence, frozen scopes/toolset and request digest. Reusing a key
 with different arguments or context is denied. A process lock serializes each
 operation; SQLite transactions and FULL synchronous WAL persist authority,
-delivery counters, outcome digests and provider health across restart.
+delivery counters, outcome digests and provider health across restart. Approved
+input/output validation schemas are frozen in the protected operation record
+before transmission; they are control data, excluded from audit export.
 
 An ambiguous side effect is quarantined and never blindly sent again.
 Read-only requests have at most the declared retry count; retries use the same
@@ -107,6 +109,17 @@ Remote polling records its reservation before a request, respects advertised
 poll intervals and is bounded to 32 polls. Task/consumer/fencing and changed
 argument/provider policies are checked before polling. A provider's repeated
 failures open its persisted circuit without blocking independent providers.
+Terminal task results validate against the admitted schema even after a fresh
+process restart, cache expiry or discovery outage. Polling never refreshes
+discovery after consuming a short-lived terminal result. A legacy task lacking
+its protected plan requires explicit reconciliation before another poll.
+
+Malformed resource URIs and oversized TTLs produce bounded protocol errors.
+The server returns 403 for denied authority, 503 for temporary availability
+failure and 502 for uncertain delivery. Error metadata distinguishes retryable
+availability from uncertainty requiring reconciliation; it never authorizes a
+new economic operation. SSE accepts LF, CRLF and bare CR, including delimiters
+split across reads.
 
 Audit stores identity hashes, immutable context bindings, reason codes and times.
 It excludes raw arguments, prompts, bearer values, raw results and exception

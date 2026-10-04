@@ -336,7 +336,7 @@ def test_server_resolves_authentication_and_never_accepts_request_scope(tmp_path
 
 
 @contextmanager
-def provider_http(*, sse=False, lose_write=False, subscriptions=False):
+def provider_http(*, sse=False, lose_write=False, subscriptions=False, line_ending=b"\n") :
     observations = {"writes": 0, "requests": [], "bad_headers": False}
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -378,6 +378,8 @@ def provider_http(*, sse=False, lose_write=False, subscriptions=False):
                 body = b"data: " + encoded(progress) + b"\n\n" + b"data: " + encoded(response) + b"\n\n"
             else:
                 body = encoded(response)
+            if sse or method == "subscriptions/listen" and subscriptions:
+                body = body.replace(b"\n", line_ending)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream" if sse or method == "subscriptions/listen" and subscriptions else "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -734,3 +736,168 @@ def test_initial_completed_task_enforces_approved_output_schema(tmp_path, monkey
             "task_id": context.identity.task_id, "operation_key": "op"}))
         assert row["state"] == ("delivery_uncertain" if mutation else "response_rejected")
     assert len(semantic_calls(transport)) == 1
+
+
+@pytest.mark.parametrize("uri", [{}, [], 1, None, "", "x" * 4097])
+def test_malformed_resource_uri_returns_bounded_protocol_error(tmp_path, uri):
+    gateway, context, transport, *_ = fixture(tmp_path, tools=("docs_read",))
+    adapter = ServerAdapter(gateway, lambda _: context, origins=())
+    message = request_message(context, "resources/read", {"uri": uri}, "request")
+    message["params"]["_meta"].update({"org.herdr/provider": "local", "org.herdr/operation": "resource"})
+    status, raw = adapter.handle(encoded(message), authorization="trusted")
+    assert status == 400 and decode(raw)["error"]["message"] == "invalid_request"
+    assert not semantic_calls(transport)
+
+
+@pytest.mark.parametrize("error,status,retryable,reconcile", [
+    (PolicyDenied, 403, False, False), (GatewayUnavailable, 503, True, False),
+    (DeliveryUncertain, 502, False, True)])
+def test_server_distinguishes_policy_outage_and_uncertain_delivery(tmp_path, monkeypatch, error, status, retryable, reconcile):
+    gateway, context, *_ = fixture(tmp_path)
+    adapter = ServerAdapter(gateway, lambda _: context, origins=())
+    def fail(*a):
+        raise error("private detail must not be returned")
+    monkeypatch.setattr(gateway, "call", fail)
+    message = request_message(context, "tools/call", {"name": "local.read", "arguments": {"path": "source.py"}}, "request")
+    message["params"]["_meta"]["org.herdr/operation"] = "op"
+    actual, raw = adapter.handle(encoded(message), authorization="trusted")
+    assert actual == status
+    assert decode(raw)["error"]["data"] == {"retryable": retryable, "reconcileRequired": reconcile}
+    assert b"private detail" not in raw
+
+
+@pytest.mark.parametrize("ttl", [10**500, -1, True, 1.5])
+def test_discovery_ttl_is_rejected_before_float_conversion(tmp_path, ttl):
+    gateway, context, transport, clock, client, _ = fixture(tmp_path)
+    original = transport.request
+    def request(message, **kwargs):
+        result = original(message, **kwargs)
+        if message["method"] == "tools/list":
+            result[0]["result"]["ttlMs"] = ttl
+        return result
+    transport.request = request
+    with pytest.raises(GatewayError, match="TTL"):
+        client.discover(context, clock())
+
+
+@pytest.mark.parametrize("line_ending", [b"\n", b"\r\n", b"\r"])
+def test_actual_http_sse_supports_all_standard_line_endings(tmp_path, line_ending):
+    with provider_http(sse=True, line_ending=line_ending) as (transport, observations):
+        gateway, context, *_ = fixture(tmp_path, transport=transport)
+        assert gateway.call(context, "local", "read", {"path": "source.py"}, "op").state == "observed_complete"
+        assert len([x for x in observations["requests"] if x["method"] == "tools/call"]) == 1
+
+
+def test_sse_crlf_split_between_reads_is_not_a_second_newline(tmp_path, monkeypatch):
+    import herdr.mcp as module
+    gateway, context, *_ = fixture(tmp_path)
+    message = request_message(context, "tools/call", {"name": "read"}, "correlation")
+    progress = {"jsonrpc": "2.0", "method": "notifications/progress", "params": {}}
+    response = {"jsonrpc": "2.0", "id": "correlation",
+                "result": {"resultType": "complete", "content": []}}
+    chunks = iter([b"data: " + encoded(progress) + b"\r", b"\n\r",
+                   b"\ndata: " + encoded(response) + b"\r", b"\n\r", b"\n", b""])
+    class Response:
+        status = 200
+        def getheader(self, *a):
+            return "text/event-stream"
+        def read1(self, *a):
+            return next(chunks)
+        def isclosed(self):
+            return False
+    class Socket:
+        def settimeout(self, *a):
+            pass
+    class Connection:
+        sock = Socket()
+        def connect(self):
+            pass
+        def request(self, *a, **k):
+            pass
+        def getresponse(self):
+            return Response()
+        def close(self):
+            pass
+    monkeypatch.setattr(module.http.client, "HTTPConnection", lambda *a, **k: Connection())
+    transport = HTTPTransport("http://127.0.0.1:9/mcp", allow_loopback=True)
+    assert transport.request(message, timeout=2) == (progress, response)
+
+
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("valid", [False, True])
+def test_terminal_poll_uses_durable_admitted_schema_without_discovery(tmp_path, monkeypatch, restart, valid):
+    monkeypatch.setitem(READ, "outputSchema", {"type": "object", "properties": {"count": {"type": "integer"}},
+        "required": ["count"], "additionalProperties": False})
+    gateway, context, transport, clock, client, _ = fixture(tmp_path, tasks=True)
+    transport.task = True
+    gateway.call(context, "local", "read", {"path": "source.py"}, "op")
+    clock.value += 301
+    original = transport.request
+    def request(message, **kwargs):
+        if message["method"] == "tools/list":
+            pytest.fail("terminal poll must not refresh discovery")
+        response = original(message, **kwargs)
+        response[0]["result"]["result"]["structuredContent"] = {"count": 1 if valid else "invalid"}
+        response[0]["result"]["ttlMs"] = 0
+        return response
+    transport.request = request
+    transport.poll_status = "completed"
+    if restart:
+        gateway.ledger.close()
+        ledger = CallLedger(tmp_path / "protected")
+        fresh = ClientAdapter(client.server, transport, ledger, clock=clock)
+        gateway = McpGateway(ledger, gateway.registry, (fresh,), authority=gateway.authority,
+            runtime_states=gateway.runtime_states, argument_authority=gateway.argument_authority,
+            argument_policy_hash=ARGUMENT_POLICY, clock=clock)
+        assert fresh.definitions == {}
+    if valid:
+        assert gateway.poll(context, "op").state == "observed_complete"
+        assert gateway.poll(context, "op").replay
+    else:
+        with pytest.raises(GatewayError):
+            gateway.poll(context, "op")
+    assert len([x for x in semantic_calls(transport) if x[0]["method"] == "tools/call"]) == 1
+
+
+def test_missing_legacy_task_plan_fails_before_consuming_remote_result(tmp_path):
+    gateway, context, transport, clock, *_ = fixture(tmp_path, tasks=True)
+    transport.task = True
+    gateway.call(context, "local", "read", {"path": "source.py"}, "op")
+    gateway.ledger.db.execute("UPDATE calls SET validation_plan_json=NULL")
+    clock.value += 2
+    with pytest.raises(GatewayUnavailable, match="validation plan"):
+        gateway.poll(context, "op")
+    assert len(semantic_calls(transport)) == 1
+
+
+def test_authenticated_header_replay_uses_pinned_plan_after_restart(tmp_path):
+    gateway, context, transport, clock, client, _ = fixture(tmp_path)
+    gateway.call(context, "local", "read", {"path": "source.py"}, "op")
+    gateway.ledger.close()
+    ledger = CallLedger(tmp_path / "protected")
+    class Offline:
+        def request(self, *a, **k):
+            pytest.fail("header replay must not contact provider")
+    fresh = ClientAdapter(client.server, Offline(), ledger, clock=clock)
+    restored = McpGateway(ledger, gateway.registry, (fresh,), authority=gateway.authority,
+        runtime_states=lambda *a: pytest.fail("header replay must not require runtime"),
+        argument_authority=gateway.argument_authority, argument_policy_hash=ARGUMENT_POLICY, clock=clock)
+    adapter = ServerAdapter(restored, lambda _: context, origins=())
+    message = request_message(context, "tools/call", {"name": "local.read", "arguments": {"path": "source.py"}}, "request")
+    message["params"]["_meta"]["org.herdr/operation"] = "op"
+    headers = {"MCP-Protocol-Version": PROTOCOL, "Mcp-Method": "tools/call",
+               "Mcp-Name": "local.read", "Mcp-Param-Path": "source.py"}
+    status, raw = adapter.handle(encoded(message), authorization="trusted", headers=headers)
+    assert status == 200 and decode(raw)["result"]["isError"] is True
+    headers["Mcp-Param-Path"] = "foreign.py"
+    assert adapter.handle(encoded(message), authorization="trusted", headers=headers)[0] == 400
+
+
+@pytest.mark.parametrize("field,value", [("resultType", {}), ("resultType", []), ("status", []), ("status", {})])
+def test_unhashable_provider_tags_raise_protocol_error_without_escaping(tmp_path, field, value):
+    gateway, context, transport, *_ = fixture(tmp_path, tasks=True)
+    transport.response = {"resultType": "task", "taskId": "remote", "status": "working",
+        "createdAt": "2026-10-03T20:00:00Z", "lastUpdatedAt": "2026-10-03T20:00:01Z", "ttlMs": 0}
+    transport.response[field] = value
+    with pytest.raises(GatewayError):
+        gateway.call(context, "local", "read", {"path": "source.py"}, "op")

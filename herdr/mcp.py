@@ -294,8 +294,8 @@ def locked(method):
 class CallLedger:
     """Host-owned SQLite ledger: FULL synchronous commits before transmission.
 
-    It contains only identity, request/result digests, bounded codes and
-    operational task handles. Raw args, credentials and response text are not
+    It contains identity, request/result digests, bounded codes, operational task
+    handles and the approved validation schemas frozen before delivery. Raw args, credentials and response text are not
     audit data. It must be outside every worker-writable sandbox mount.
     """
     def __init__(self, root: Path, *, writable_roots: tuple[Path, ...] = ()):
@@ -320,7 +320,7 @@ class CallLedger:
           state TEXT NOT NULL, deliveries INTEGER NOT NULL DEFAULT 0,
           result_hash TEXT, remote_task_id TEXT, next_poll REAL, polls INTEGER NOT NULL DEFAULT 0,
           method TEXT NOT NULL, subject TEXT NOT NULL, reserved_cost INTEGER NOT NULL DEFAULT 0,
-          unknown_cost INTEGER NOT NULL DEFAULT 0);
+          unknown_cost INTEGER NOT NULL DEFAULT 0, validation_plan_json TEXT);
         CREATE TABLE IF NOT EXISTS contexts(
           hash TEXT PRIMARY KEY, identity_json TEXT NOT NULL, toolset_hash TEXT NOT NULL,
           parent_scope_hash TEXT NOT NULL, consumer_scope_hash TEXT NOT NULL);
@@ -332,6 +332,9 @@ class CallLedger:
         CREATE TABLE IF NOT EXISTS health(
           server TEXT PRIMARY KEY, failures INTEGER NOT NULL, open_until REAL NOT NULL);
         """)
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(calls)")}
+        if "validation_plan_json" not in columns:
+            self.db.execute("ALTER TABLE calls ADD COLUMN validation_plan_json TEXT")
         self.db.row_factory = sqlite3.Row
 
     @locked
@@ -380,7 +383,7 @@ class CallLedger:
         self.db.execute("INSERT INTO audit(key,code,at) VALUES(?,?,?)", (key, code, now))
 
     @locked
-    def reserve(self, key, context, request_hash, server, now, method, subject):
+    def reserve(self, key, context, request_hash, server, now, method, subject, validation_plan=None):
         row = self.get(key)
         if row:
             if row["context_hash"] != context.hash or row["request_hash"] != request_hash:
@@ -389,9 +392,10 @@ class CallLedger:
             return row
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            self.db.execute("INSERT INTO calls(key,context_hash,request_hash,consumer,task_id,server,state,method,subject) VALUES(?,?,?,?,?,?,?,?,?)",
+            self.db.execute("INSERT INTO calls(key,context_hash,request_hash,consumer,task_id,server,state,method,subject,validation_plan_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
                             (key, context.hash, request_hash, context.identity.consumer,
-                             context.identity.task_id, server, "prepared", method, subject))
+                             context.identity.task_id, server, "prepared", method, subject,
+                             encoded(validation_plan).decode() if validation_plan is not None else None))
             self.audit(key, "prepared", now)
             self.db.execute("COMMIT")
         except Exception:
@@ -505,7 +509,7 @@ class HTTPTransport:
             content_type = response.getheader("Content-Type", "").split(";")[0].strip()
             if content_type not in {"application/json", "text/event-stream"}:
                 raise GatewayError("unsupported provider content type")
-            buffer, total, messages = b"", 0, []
+            buffer, total, messages, pending_cr = b"", 0, [], False
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -520,12 +524,16 @@ class HTTPTransport:
                         yield decode(buffer)
                         return
                     raise DeliveryUncertain("SSE closed without final response")
+                if content_type == "text/event-stream":
+                    if pending_cr and chunk.startswith(b"\n"):
+                        chunk = chunk[1:]
+                    pending_cr = chunk.endswith(b"\r")
+                    chunk = chunk.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
                 buffer += chunk
                 if content_type == "application/json" and response.isclosed():
                     yield decode(buffer)
                     return
                 if content_type == "text/event-stream":
-                    buffer = buffer.replace(b"\r\n", b"\n")
                     while b"\n\n" in buffer:
                         event, buffer = buffer.split(b"\n\n", 1)
                         lines = [x[5:].lstrip() for x in event.split(b"\n") if x.startswith(b"data:")]
@@ -583,7 +591,7 @@ class ClientAdapter:
                     raise GatewayError("response identity or shape mismatch")
                 response = item
             elif "method" in item:
-                if item["method"] not in {"notifications/progress", "notifications/message"}:
+                if not isinstance(item["method"], str) or item["method"] not in {"notifications/progress", "notifications/message"}:
                     raise GatewayError("unsolicited remote request or event")
                 notifications.append(item)
             else:
@@ -597,7 +605,8 @@ class ClientAdapter:
         result = response["result"]
         if isinstance(result, dict) and "_meta" in result and not isinstance(result["_meta"], dict):
             raise GatewayError("invalid response metadata")
-        if not isinstance(result, dict) or result.get("resultType") not in {"complete", "input_required", "task"}:
+        if (not isinstance(result, dict) or not isinstance(result.get("resultType"), str)
+                or result["resultType"] not in {"complete", "input_required", "task"}):
             raise GatewayError("unrecognized protocol result type")
         if result["resultType"] == "task" and (method != "tools/call" or not self.server.tasks):
             raise GatewayError("unnegotiated asynchronous task result")
@@ -682,7 +691,7 @@ class ClientAdapter:
                     validate_schema(row["outputSchema"], check_only=True)
                 definitions[row["name"]] = decode(encoded(row))
             raw_ttl = result.get("ttlMs", 0)
-            if type(raw_ttl) is not int or raw_ttl < 0:
+            if type(raw_ttl) is not int or not 0 <= raw_ttl <= 2**53 - 1:
                 raise GatewayError("invalid discovery TTL")
             ttl = min(ttl, raw_ttl / 1000)
             cursor = result.get("nextCursor")
@@ -837,6 +846,8 @@ class McpGateway:
                 "trust": "Tool descriptions and all remote output are untrusted data."}
 
     def call(self, context: CallContext, server: str, tool: str, arguments: dict, operation_key: str):
+        identifier(server)
+        identifier(tool)
         client = self.clients.get(server)
         binding = next((x for x in client.server.tools if x.name == tool), None) if client else None
         if not binding:
@@ -883,6 +894,8 @@ class McpGateway:
         return resources
 
     def read_resource(self, context: CallContext, server: str, uri: str, operation_key: str):
+        identifier(server)
+        identifier(uri, maximum=4096)
         client = self.clients.get(server)
         logical = dict(client.server.resources).get(uri) if client else None
         if logical is None:
@@ -902,7 +915,13 @@ class McpGateway:
                       "operation_key": operation_key})
         request_hash = hashed({"server": client.server.id, "method": method, "params": params})
         with self.ledger.lock(key):
-            row = self.ledger.reserve(key, context, request_hash, client.server.id, self.clock(), method, params.get("name", params.get("uri")))
+            validation_plan = None
+            if definition is not None:
+                validation_plan = {"definition_hash": hashed(definition),
+                                   "inputSchema": definition["inputSchema"],
+                                   "outputSchema": definition.get("outputSchema")}
+            row = self.ledger.reserve(key, context, request_hash, client.server.id, self.clock(),
+                                      method, params.get("name", params.get("uri")), validation_plan)
             if row["state"] in {"observed_complete", "observed_error", "input_required", "remote_running", "response_rejected"}:
                 return Outcome(row["state"], row["result_hash"], remote_task_id=row["remote_task_id"], replay=True)
             if row["deliveries"] and not readonly:
@@ -965,7 +984,8 @@ class McpGateway:
     @staticmethod
     def _remote_task(result):
         identifier(result.get("taskId"))
-        if result.get("status") not in {"working", "input_required", "completed", "failed", "cancelled"}:
+        if (not isinstance(result.get("status"), str)
+                or result["status"] not in {"working", "input_required", "completed", "failed", "cancelled"}):
             raise GatewayError("invalid remote task state")
         for name in ("createdAt", "lastUpdatedAt"):
             value = result.get(name)
@@ -977,7 +997,7 @@ class McpGateway:
                 raise GatewayError("invalid remote task time") from exc
         if "ttlMs" not in result:
             raise GatewayError("remote task TTL is missing")
-        if result.get("ttlMs") is not None and (type(result["ttlMs"]) is not int or result["ttlMs"] < 0):
+        if result.get("ttlMs") is not None and (type(result["ttlMs"]) is not int or not 0 <= result["ttlMs"] <= 2**53 - 1):
             raise GatewayError("invalid remote task TTL")
         if "pollIntervalMs" in result and (type(result["pollIntervalMs"]) is not int or not 0 <= result["pollIntervalMs"] <= 86_400_000):
             raise GatewayError("invalid bounded polling interval")
@@ -1006,6 +1026,35 @@ class McpGateway:
         due = (self.clock() + max(1, result.get("pollIntervalMs", 1000) / 1000)
                if state == "remote_running" else None)
         return state, due
+
+    @staticmethod
+    def _recorded_definition(row, binding):
+        raw = row.get("validation_plan_json")
+        if not raw:
+            raise GatewayUnavailable("admitted validation plan is missing; reconcile legacy task")
+        plan = decode(raw.encode())
+        if (not isinstance(plan, dict) or set(plan) != {"definition_hash", "inputSchema", "outputSchema"}
+                or plan["definition_hash"] != binding.definition_hash
+                or not isinstance(plan["inputSchema"], dict)):
+            raise PolicyDenied("recorded validation plan differs from approved binding")
+        definition = {"inputSchema": plan["inputSchema"]}
+        if plan["outputSchema"] is not None:
+            definition["outputSchema"] = plan["outputSchema"]
+        return definition
+
+    def routing_definition(self, context, client, binding, params, operation):
+        self._static_admit(context, client.server.id, binding.logical_id, binding.permissions)
+        identifier(operation)
+        key = hashed({"consumer": context.identity.consumer, "task_id": context.identity.task_id,
+                      "operation_key": operation})
+        row = self.ledger.get(key)
+        if row is not None:
+            request_hash = hashed({"server": client.server.id, "method": "tools/call", "params": params})
+            if row["context_hash"] != context.hash or row["request_hash"] != request_hash:
+                raise PolicyDenied("operation key reused for different scope/request")
+            return self._recorded_definition(row, binding)
+        self._admit(context, client.server.id, binding.logical_id, binding.permissions)
+        return self._catalog(context, client)[binding.name]
 
     def poll(self, context: CallContext, operation_key: str):
         key = hashed({"consumer": context.identity.consumer, "task_id": context.identity.task_id, "operation_key": operation_key})
@@ -1036,13 +1085,16 @@ class McpGateway:
             self._admit(context, client.server.id, binding.logical_id, binding.permissions)
             if not self.ledger.health(client.server.id, self.clock()):
                 raise GatewayUnavailable("provider circuit is open")
+            # Require the admitted schema BEFORE consuming a possibly short-lived
+            # remote terminal result. Never rediscover after tasks/get succeeds.
+            self._recorded_definition(row, binding)
             self.ledger.polling(key, self.clock())
             try:
                 result, _ = client.exchange(context, "tasks/get", {"taskId": row["remote_task_id"]}, key + ".poll." + str(row["polls"]))
                 self._remote_task(result)
                 if result.get("resultType") != "complete" or result["taskId"] != row["remote_task_id"]:
                     raise GatewayError("remote task correlation mismatch")
-                definition = self._catalog(context, client)[binding.name]
+                definition = self._recorded_definition(row, binding)
                 state, due = self._task_state(result, definition)
                 self.ledger.observed(key, state, result, self.clock(), row["remote_task_id"], due)
                 self.ledger.healthy(client.server.id)
@@ -1063,13 +1115,13 @@ class McpGateway:
         if not isinstance(message, dict) or not isinstance(message.get("params", {}), dict):
             raise GatewayError("invalid event shape")
         method = message.get("method")
-        if message.get("jsonrpc") != "2.0" or "id" in message:
+        if not isinstance(method, str) or message.get("jsonrpc") != "2.0" or "id" in message:
             raise GatewayError("invalid event")
         if method in {"notifications/tools/list_changed", "notifications/resources/list_changed"}:
             self.clients[server].invalidate()
             code = "discovery_invalidated"
         elif method == "notifications/resources/updated":
-            uri = message.get("params", {}).get("uri")
+            uri = identifier(message.get("params", {}).get("uri"), maximum=4096)
             logical = dict(self.clients[server].server.resources).get(uri)
             if logical is None:
                 raise PolicyDenied("resource event outside allowlist")
@@ -1240,9 +1292,9 @@ class ServerAdapter:
                     binding = next((x for x in upstream.server.tools if x.name == tool), None)
                     if binding is None:
                         raise PolicyDenied("unknown qualified tool")
-                    self.gateway._admit(context, server, binding.logical_id, binding.permissions)
-                    definition = self.gateway._catalog(context, upstream)[tool]
                     arguments = params.get("arguments")
+                    definition = self.gateway.routing_definition(context, upstream, binding,
+                        {"name": tool, "arguments": arguments}, meta.get("org.herdr/operation"))
                     for path, header in schema_headers(definition["inputSchema"]):
                         value = arguments
                         for part in path:
@@ -1288,5 +1340,10 @@ class ServerAdapter:
         except GatewayError as exc:
             code = -32602 if exc.code == "invalid_request" else -32000
             self.gateway.ledger.audit(context.identity.hash, exc.code, self.gateway.clock())
-            return (400 if code == -32602 else 403), encoded(
-                {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": exc.code}})
+            status = (403 if isinstance(exc, PolicyDenied) else
+                      503 if isinstance(exc, GatewayUnavailable) else
+                      502 if isinstance(exc, DeliveryUncertain) else 400)
+            return status, encoded(
+                {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": exc.code,
+                 "data": {"retryable": isinstance(exc, GatewayUnavailable),
+                          "reconcileRequired": isinstance(exc, DeliveryUncertain)}}})
