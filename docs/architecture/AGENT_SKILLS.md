@@ -60,7 +60,7 @@ Replacing the original directory name cannot redirect the held package.
 Tampered selected content fails; unneeded content never enters the model request.
 
 The output is an immutable SkillBundle. Its provider-independent envelope carries:
-- exact node/registry/grant binding and consumer skill policy hash;
+- exact node/platform/registry/grant binding and consumer skill policy hash;
 - host-supplied policy layers in stable Herdr → consumer → node order;
 - selected bodies/resources explicitly marked context_data;
 - exact package version/hash and external approval provenance.
@@ -107,3 +107,5 @@ platforms are independent of the host reader. Unsupported host primitives must
 not be emulated by unsafe path-following reads.
 
 Reference: [Agent Skills specification](https://agentskills.io/specification).
+
+Authoring lint decodes every declared textual resource, including application/json, before approval. The source manifest hashes exact skill bytes and declared media independently of filename extension, including PNG/JPEG/octet-stream assets and text line endings. Undeclared or changed skill source files cannot be included by the source-manifest generator. Legacy tools feature spelling normalizes to tool_use before compatibility and hashing, matching the shared registry.

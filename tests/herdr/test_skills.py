@@ -333,3 +333,72 @@ def test_migrated_packages_lint_and_render_without_provider_logic(skill_name):
         assert len(bundle.render()["skills"]) == 1
     finally:
         registry.close()
+
+
+def test_platform_is_part_of_frozen_bundle_and_trace(tmp_path, registry_factory):
+    item = package(tmp_path)
+    registry = registry_factory(item)
+    ctx = context()
+    bundles = [registry.resolve((SkillRequest("sample", "need"),), replace(ctx, platform=platform),
+                                policy(item[1]), LAYERS, executor_id="a-runtime")
+               for platform in ("linux", "windows")]
+    assert bundles[0].hash != bundles[1].hash and bundles[0].trace != bundles[1].trace
+    for platform, bundle in zip(("linux", "windows"), bundles):
+        assert bundle.render()["binding"]["platform"] == platform
+        assert bundle.telemetry()["binding"]["platform"] == platform
+
+
+@pytest.mark.parametrize("media_type", ["text/plain", "text/markdown", "application/json"])
+def test_lint_rejects_invalid_utf8_in_every_textual_resource(tmp_path, media_type):
+    root, _, manifest = package(tmp_path, resources={"references/invalid": b"\xff"})
+    files = tuple(replace(x, media_type=media_type) if x.path == "references/invalid" else x for x in manifest.files)
+    manifest = replace(manifest, files=files)
+    (root / "manifest.json").write_bytes(canonical(manifest.to_json()))
+    with pytest.raises(SkillError, match="resource_encoding"):
+        lint_package(root)
+
+
+def test_legacy_tools_alias_normalizes_to_registry_tool_use(tmp_path, registry_factory):
+    item = package(tmp_path, manifest_changes={"features": ("tools",)})
+    registry = registry_factory(item)
+    equivalent = replace(item[2], features=("tool_use",))
+    assert equivalent.hash == item[2].hash
+    bundle = registry.resolve((SkillRequest("sample", "need"),), context(), policy(item[1]),
+                              LAYERS, executor_id="a-runtime")
+    assert len(bundle.render()["skills"]) == 1
+    with pytest.raises(SkillError, match="duplicate"):
+        replace(item[2], features=("tools", "tool_use"))
+
+
+@pytest.mark.parametrize("suffix,media_type,raw", [
+    (".png", "image/png", b"\x89PNG\r\n\x1a\n"),
+    (".jpg", "image/jpeg", b"\xff\xd8\xff"),
+    (".unusual", "application/octet-stream", b"\x00\xff\r\n"),
+    (".txt", "text/plain", b"exact text\r\n"),
+])
+def test_source_manifest_accepts_declared_assets_and_preserves_exact_bytes(tmp_path, suffix, media_type, raw):
+    import subprocess
+    import sys
+    script = Path(__file__).resolve().parents[2] / "scripts/refresh_source_manifest.py"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    root, _, manifest = package(workspace, resources={"assets/resource" + suffix: raw})
+    skill_root = workspace / "skills"
+    skill_root.mkdir()
+    root.rename(skill_root / "sample")
+    root = skill_root / "sample"
+    manifest = replace(manifest, files=tuple(
+        replace(x, media_type=media_type) if x.path.startswith("assets/") else x for x in manifest.files))
+    (root / "manifest.json").write_bytes(canonical(manifest.to_json()))
+    for path in ("configs/consumers/herdr.yaml", "docs/CONSUMERS.md", "docs/architecture/AGENT_SKILLS.md",
+                 "package.json", "package-lock.json"):
+        target = workspace / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("{}\n")
+    result = subprocess.run([sys.executable, str(script)], cwd=workspace, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    observed = (workspace / "provenance/CANONICAL_SOURCE_MANIFEST.sha256").read_text()
+    assert hashlib.sha256(raw).hexdigest() + "  skills/sample/assets/resource" + suffix in observed
+    (root / "assets/unlisted").write_text("must not enter release")
+    result = subprocess.run([sys.executable, str(script)], cwd=workspace, capture_output=True, text=True)
+    assert result.returncode != 0

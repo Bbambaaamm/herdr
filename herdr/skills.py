@@ -206,7 +206,9 @@ class SkillManifest:
         for key in ("tools", "permissions", "capabilities"):
             object.__setattr__(self, key, values(getattr(self, key)))
         try:
-            features = values(self.features, Feature)
+            features = values(self.features, lambda x: Feature.TOOL_USE if Feature(x) == Feature.TOOLS else Feature(x))
+        except SkillError:
+            raise
         except (ValueError, TypeError) as exc:
             raise SkillError("unknown_feature") from exc
         object.__setattr__(self, "features", features)
@@ -428,7 +430,7 @@ class SkillNodeContext:
     def binding(self):
         return {"consumer": self.consumer, "task_id": self.task_id, "run_token": self.run_token,
                 "attempt": self.attempt, "fencing_token": self.fencing_token,
-                "spec_policy_hash": self.spec_policy_hash, "scope_hash": self.scope.hash,
+                "spec_policy_hash": self.spec_policy_hash, "platform": self.platform, "scope_hash": self.scope.hash,
                 "parent_scope_hash": self.parent_scope.hash, "consumer_scope_hash": self.consumer_scope.hash,
                 "registry_hash": self.registry.hash}
 
@@ -642,6 +644,11 @@ def lint_package(root: Path):
             raw = _read_at(fd, entry.path, entry.size)
             need(len(raw) == entry.size and hashlib.sha256(raw).hexdigest() == entry.sha256,
                  "resource_digest_mismatch")
+            if entry.media_type.startswith("text/") or entry.media_type == "application/json":
+                try:
+                    raw.decode("utf-8")
+                except UnicodeError as exc:
+                    raise SkillError("resource_encoding") from exc
             if entry.path == "SKILL.md":
                 parse_skill_body(raw, manifest)
         return {"name": manifest.name, "version": manifest.version, "package_hash": manifest.hash,
