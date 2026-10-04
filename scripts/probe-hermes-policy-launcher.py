@@ -135,7 +135,7 @@ def main() -> int:
             "loader=importlib.machinery.SourceFileLoader('policy_bootstrap',str(p)); "
             "spec=importlib.util.spec_from_loader(loader.name,loader); "
             "m=importlib.util.module_from_spec(spec); loader.exec_module(m); "
-            "m._exec_verified_interpreter(pathlib.Path(sys.argv[1]), [])"
+            "m._exec_verified_interpreter(pathlib.Path(sys.argv[1]), [], require_trust_mount=False)"
         )
         def invoke(fence: int) -> subprocess.CompletedProcess[str]:
             env[fields["fencing_token"]] = str(fence)

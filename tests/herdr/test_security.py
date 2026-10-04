@@ -16,7 +16,7 @@ import pytest
 
 from herdr.capability import CapabilityScope, DataClass, Egress, Retention, Training
 from herdr import security
-from herdr.approval_broker import ApprovalLedger
+from herdr.approval_broker import ApprovalLedger, serve_approvals
 from herdr.security import (
     ApprovalEvidence,
     ContentProvenance,
@@ -522,8 +522,18 @@ def test_child_lifetime_and_credential_identity_constraints(tmp_path):
             ("credential_ref", "target"),
         ),),
     )
-    with pytest.raises(SecurityError, match="credential argument ceiling"):
-        credential_child.require_subset_of(credential_parent)
+    # A child may add credential-reference constraints because that only narrows
+    # authority, but it may never drop a parent constraint while keeping the
+    # corresponding argument available.
+    credential_child.require_subset_of(credential_parent)
+    dropped_credential_constraint = replace(
+        credential_child,
+        tool_rules=(ToolRule(
+            "custom_ref", RiskClass.READ, ("target", "credential_ref"), (), (), (),
+        ),),
+    )
+    with pytest.raises(SecurityError, match="weakens parent credential constraint"):
+        dropped_credential_constraint.require_subset_of(credential_parent)
     for raw in ("sk-abcdefghijklmnopqrstuvwxyz123456", "sha256:" + "a" * 64, "raw-secret"):
         with pytest.raises(SecurityError):
             replace(parent, credential_refs=(raw,))
@@ -532,6 +542,91 @@ def test_child_lifetime_and_credential_identity_constraints(tmp_path):
         with pytest.raises(SecurityError):
             ProviderRequest("provider-a", "eu-central", DataClass.INTERNAL, Egress.REGION_BOUND,
                             Retention.LIMITED, Training.EXCLUDED, raw)
+
+
+def test_credential_ref_fields_are_explicit_opaque_authority(tmp_path):
+    ref = "pool:provider-a:entry-1"
+    rule = ToolRule(
+        "custom_ref", RiskClass.READ, ("target", "auth"), (), (), ("auth",)
+    )
+    item = grant(tmp_path, tools=("custom_ref",), rules=(rule,), providers=())
+    item = replace(item, credential_refs=(ref,))
+    guard = InvocationGuard(item, assurance())
+    assert guard.authorize_tool_call(
+        "custom_ref", {"target": "x", "auth": ref}
+    )[1]["auth"] == ref
+    for args in (
+        {"target": "x"},
+        {"target": "x", "auth": None},
+        {"target": "x", "auth": 7},
+        {"target": "x", "auth": {}},
+        {"target": "x", "auth": []},
+        {"target": "x", "auth": ""},
+        {"target": "x", "auth": "ghp_abcdefghijklmnopqrstuvwxyz123456"},
+        {"target": "x", "auth": "pool:provider-a:other"},
+    ):
+        with pytest.raises(PolicyDenied, match="credential_ref"):
+            guard.authorize_tool("custom_ref", args)
+
+
+def test_approval_broker_survives_disconnected_response_client(tmp_path):
+    class Connection:
+        def __init__(self, request, *, broken=False):
+            self.request = request
+            self.broken = broken
+            self.sent = []
+            self.timeout = None
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def settimeout(self, value):
+            self.timeout = value
+        def recv(self, size):
+            data, self.request = self.request[:size], self.request[size:]
+            return data
+        def sendall(self, data):
+            if self.broken:
+                raise BrokenPipeError("client closed")
+            self.sent.append(data)
+
+    class StopAccept(RuntimeError):
+        pass
+
+    item = grant(
+        tmp_path,
+        tools=("deploy_prod",),
+        rules=(ToolRule("deploy_prod", RiskClass.EXTERNAL_SIDE_EFFECT, ("target",)),),
+        approvals=(ApprovalEvidence(
+            "broker-survive", identity(), "deploy_prod",
+            canonical_digest({"tool": "deploy_prod", "args": {"target": "external"}}),
+        ),),
+        approval_required_for=(RiskClass.EXTERNAL_SIDE_EFFECT,),
+    )
+    ledger = ApprovalLedger(tmp_path / "broker.db")
+    ledger.register(item)
+    payload = canonical_json_bytes({
+        "grant_hash": item.hash,
+        "approval_id": "broker-survive",
+        "tool": "deploy_prod",
+        "args_sha256": item.approvals[0].args_sha256,
+    }) + b"\n"
+    first = Connection(payload, broken=True)
+    second = Connection(payload)
+
+    class Listener:
+        def __init__(self):
+            self.items = [first, second]
+        def accept(self):
+            if self.items:
+                return self.items.pop(0), None
+            raise StopAccept()
+
+    with pytest.raises(StopAccept):
+        serve_approvals(Listener(), ledger)
+    # First request consumed the one-use evidence even though its response was
+    # lost; the broker remained alive and answered the next client deterministically.
+    assert second.sent == [b"replayed\n"]
 
 
 def test_one_use_approval_is_atomic_under_concurrent_dispatch(tmp_path):
@@ -745,3 +840,28 @@ def test_signed_envelope_round_trip_is_deterministic(tmp_path):
     decoded = SignedGrantEnvelope.from_dict(json.loads(encoded))
     assert decoded.to_json() == envelope.to_json()
     assert decoded.grant.hash == item.hash
+
+
+def test_approval_response_fragmentation_is_read_through_newline(monkeypatch, tmp_path):
+    args = {"path": str((tmp_path / "out.txt").resolve()), "content": "ok"}
+    digest = canonical_digest({"tool": "write_file", "args": args})
+    item = grant(
+        tmp_path, tools=("write_file",),
+        approvals=(ApprovalEvidence("fragmented", identity(), "write_file", digest),),
+        approval_required_for=(RiskClass.WORKSPACE_WRITE,),
+    )
+
+    class FakeSocket:
+        def __init__(self, *unused):
+            self.parts = [b"con", b"sum", b"ed", b"\n"]
+        def __enter__(self): return self
+        def __exit__(self, *unused): return False
+        def settimeout(self, value): pass
+        def connect(self, path): pass
+        def sendall(self, data): assert data.endswith(b"\n")
+        def recv(self, size): return self.parts.pop(0) if self.parts else b""
+
+    monkeypatch.setattr(security.socket, "socket", FakeSocket)
+    assert InvocationGuard(item, assurance(), approval_socket=tmp_path / "authority.sock").authorize_tool(
+        "write_file", args
+    ) == "write_file"

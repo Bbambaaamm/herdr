@@ -8,22 +8,33 @@ select a grant, key, policy module, or executable.
 from __future__ import annotations
 
 import importlib
+import importlib.machinery
+import importlib.util
 import hashlib
 import os
 import re
+import socket
 import stat
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
 BUNDLE_PATH = Path("/run/herdr-policy/grant.bundle.json")
+BOOTSTRAP_ROOT = Path("/run/herdr-bootstrap")
+BOOTSTRAP_STAGE1 = BOOTSTRAP_ROOT / "agent-hermes-policy-stage1"
+BOOTSTRAP_PROOF = BOOTSTRAP_ROOT / "immutable-trees.json"
+STAGE1_PROOF_ENV = "HERDR_POLICY_STAGE1_PROOF_SHA256"
+STAGE2_FD_ENV = "HERDR_VERIFIED_STAGE2_FD"
+BOOTSTRAP_AUTH_FD_ENV = "HERDR_BOOTSTRAP_AUTH_FD"
+MAX_AUTH_RESPONSE = 128
+MAX_BUNDLE = 2 * 1024 * 1024
 POLICY_CODE_ROOT = Path("/run/herdr/policy-code")
 HERMES_ROOT = Path("/home/agentops/.hermes/hermes-agent")
 HERMES_HEAD = "ee5ee84a345204a3b1d6ef6ba1ab747e602867b9"
 HERMES_SOURCE_SHA256 = "525219e866137f43c8c8b068488e07d97f14529d2d67497cd52fbfd1197da4f4"
 PYTHON_PATH = Path("/home/agentops/.local/share/uv/python/cpython-3.11.16-linux-x86_64-gnu/bin/python3.11")
+PYTHON_ROOT = PYTHON_PATH.parents[1]
 PYTHON_SHA256 = "1e761eb19d6f2594ab8dc64bd99ad4e1753589f3bf1ec199e4eef3aaa21e3930"
 PYTHON_STDLIB_SHA256 = "330e97044fcb6873bc76ab37b63bfcd8c9a081d64d285adea164d3f72b548c2e"
 SITE_SHA256 = "61bbcc21c6f429974c9e6d10258a93056b439cb3a4afd5548e112694f5e0fea0"
@@ -79,10 +90,210 @@ def _covering_mount(path: Path) -> tuple[Path, set[str]]:
     return best
 
 
+def _mount_rows() -> dict[str, set[str]]:
+    try:
+        raw = Path("/proc/self/mountinfo").read_bytes()
+    except OSError as exc:
+        raise SystemExit("cannot verify policy mount namespace") from exc
+    if len(raw) > 1_048_576:
+        raise SystemExit("policy mount evidence exceeds bound")
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise SystemExit("policy mount evidence malformed") from exc
+    if len(lines) > 4096:
+        raise SystemExit("policy mount count exceeds bound")
+    rows: dict[str, set[str]] = {}
+    for line in lines:
+        fields = line.split(" - ", 1)[0].split()
+        if len(fields) < 6:
+            raise SystemExit("policy mount evidence malformed")
+        mountpoint = _unescape_mount(fields[4])
+        rows[mountpoint] = set(fields[5].split(","))
+    return rows
+
+
+def _mountpoint_count(path: Path) -> int:
+    target = str(path)
+    try:
+        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise SystemExit("cannot verify policy mount namespace") from exc
+    count = 0
+    for line in lines:
+        fields = line.split(" - ", 1)[0].split()
+        if len(fields) < 6:
+            raise SystemExit("policy mount evidence malformed")
+        if _unescape_mount(fields[4]) == target:
+            count += 1
+    return count
+
+
 def _require_production_mount(path: Path, *, exact: bool = False) -> None:
+    if exact and _mountpoint_count(path) != 1:
+        raise SystemExit(f"security path must have exactly one mountpoint: {path}")
     mount, options = _covering_mount(path)
     if "ro" not in options or mount == Path("/") or (exact and mount != path):
         raise SystemExit(f"security path is not on a dedicated read-only trust mount: {path}")
+    target = Path(path)
+    for name in _mount_rows():
+        candidate = Path(name)
+        if candidate != target and target in candidate.parents:
+            # A nested mount can shadow verified FrozenTree bytes even when
+            # that nested mount is locally read-only. No descendant mount is
+            # trusted unless it is part of a separately versioned proof.
+            raise SystemExit(f"unexpected descendant mount below immutable trust root: {path}")
+
+
+def _load_stage1_module() -> Any:
+    if BOOTSTRAP_STAGE1.is_symlink() or not BOOTSTRAP_STAGE1.is_file():
+        raise SystemExit("immutable stage-one unavailable")
+    loader = importlib.machinery.SourceFileLoader("herdr_policy_stage1_verified", str(BOOTSTRAP_STAGE1))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise SystemExit("immutable stage-one import unavailable")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    _require_module_origin(module, BOOTSTRAP_ROOT, "policy stage-one")
+    return module
+
+
+def _require_held_stage2_source(source_path: str | None = None) -> None:
+    """Prove this trusted stage-two source was held open by verified stage one."""
+    raw = os.environ.get(STAGE2_FD_ENV, "")
+    try:
+        fd = int(raw)
+    except (TypeError, ValueError):
+        raise SystemExit("verified stage-two source FD is required")
+    actual_source = source_path if source_path is not None else __file__
+    if source_path is None and not str(actual_source).startswith("/proc/self/fd/"):
+        raise SystemExit("stage-two must execute from the held source FD")
+    try:
+        held = os.fstat(fd)
+        loaded = os.stat(actual_source)
+    except OSError as exc:
+        raise SystemExit("cannot verify held stage-two source") from exc
+    if not stat.S_ISREG(held.st_mode) or (held.st_dev, held.st_ino) != (loaded.st_dev, loaded.st_ino):
+        raise SystemExit("stage-two source differs from stage-one held inode")
+
+
+def _require_stage1_continuity() -> None:
+    # Environment markers are only integrity hints. Authority comes from stage
+    # one executing this already-verified source inode through an inherited FD,
+    # plus a fresh physical revalidation of the immutable bootstrap/tree proof.
+    _require_held_stage2_source()
+    proof_digest = os.environ.get(STAGE1_PROOF_ENV, "")
+    if not re.fullmatch(r"[0-9a-f]{64}", proof_digest):
+        raise SystemExit("verified stage-one proof is required")
+    _require_production_mount(BOOTSTRAP_ROOT, exact=True)
+    stage1 = _load_stage1_module()
+    proof, raw = stage1._read_proof(BOOTSTRAP_PROOF)
+    if hashlib.sha256(raw).hexdigest() != proof_digest:
+        raise SystemExit("stage-one proof changed after verification")
+    rows = stage1._mount_rows()
+    stage1._require_exact_ro_tree(BOOTSTRAP_ROOT, rows)
+    stage1._verify_trees(proof, rows)
+
+
+def _raw_identity_from_env() -> dict[str, object]:
+    identity: dict[str, object] = {}
+    for name, env_name in IDENTITY_ENV.items():
+        raw = os.environ.get(env_name)
+        if raw is None or not raw or len(raw) > 512:
+            raise SystemExit("bootstrap identity environment incomplete")
+        if name == "fencing_token":
+            try:
+                value = int(raw)
+            except ValueError as exc:
+                raise SystemExit("bootstrap fencing token malformed") from exc
+            if not 0 <= value < 2**63:
+                raise SystemExit("bootstrap fencing token malformed")
+            identity[name] = value
+        else:
+            identity[name] = raw
+    return identity
+
+
+def _sha256_regular_path(path: Path, limit: int) -> str:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as exc:
+        raise SystemExit("bootstrap authority file unavailable") from exc
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            raise SystemExit("bootstrap authority file invalid")
+        while True:
+            chunk = os.read(fd, min(65536, limit + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise SystemExit("bootstrap authority file exceeds bound")
+            digest.update(chunk)
+        return digest.hexdigest()
+    finally:
+        os.close(fd)
+
+
+def _canonical_bootstrap(value: object) -> bytes:
+    try:
+        raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                         allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise SystemExit("bootstrap authority request invalid") from exc
+    if len(raw) > 8191:
+        raise SystemExit("bootstrap authority request exceeds bound")
+    return raw
+
+
+def _recv_bootstrap_status(connection: socket.socket, expected: bytes) -> None:
+    data = bytearray()
+    while len(data) < MAX_AUTH_RESPONSE:
+        chunk = connection.recv(min(64, MAX_AUTH_RESPONSE - len(data)))
+        if not chunk:
+            break
+        data.extend(chunk)
+        if b"\n" in data:
+            line, tail = bytes(data).split(b"\n", 1)
+            if tail or line + b"\n" != expected:
+                raise SystemExit("host bootstrap authority denied stage two")
+            return
+    raise SystemExit("host bootstrap authority response incomplete")
+
+
+def _require_host_bootstrap_authority() -> None:
+    raw_fd = os.environ.pop(BOOTSTRAP_AUTH_FD_ENV, "")
+    try:
+        fd = int(raw_fd)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit("host bootstrap authority session required") from exc
+    proof_digest = os.environ.get(STAGE1_PROOF_ENV, "")
+    if not re.fullmatch(r"[0-9a-f]{64}", proof_digest):
+        raise SystemExit("verified stage-one proof is required")
+    request = _canonical_bootstrap({
+        "op": "stage2",
+        "identity": _raw_identity_from_env(),
+        "proof_sha256": proof_digest,
+        "bundle_sha256": _sha256_regular_path(BUNDLE_PATH, MAX_BUNDLE),
+    }) + b"\n"
+    try:
+        connection = socket.socket(fileno=fd)
+        connection.settimeout(5)
+        connection.sendall(request)
+        _recv_bootstrap_status(connection, b"stage2-ok\n")
+    except (OSError, TimeoutError) as exc:
+        raise SystemExit("host bootstrap authority unavailable") from exc
+    finally:
+        try:
+            connection.close()
+        except (UnboundLocalError, OSError):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def _reset_import_path(policy_code_root: Path, hermes_root: Path) -> None:
@@ -127,19 +338,56 @@ def _verified_interpreter_fd() -> int:
         raise
 
 
-def _exec_verified_interpreter(script: Path, args: list[str]) -> None:
+def _fresh_startup_pycache_prefix() -> str:
+    for _ in range(8):
+        token = hashlib.sha256(os.urandom(32)).hexdigest()[:24]
+        path = Path("/tmp") / f"herdr-policy-pycache-{os.getpid()}-{token}"
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            continue
+        info = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or (info.st_mode & 0o077):
+            raise SystemExit("fresh startup pycache prefix is not private")
+        return str(path)
+    raise SystemExit("cannot create fresh startup pycache prefix")
+
+
+def _exec_verified_interpreter(
+    script: Path, args: list[str], *, require_trust_mount: bool = True
+) -> None:
+    if require_trust_mount:
+        _require_production_mount(PYTHON_ROOT, exact=True)
     fd = _verified_interpreter_fd()
-    if _digest_site_packages(PYTHON_PATH.parents[1] / "lib/python3.11") != PYTHON_STDLIB_SHA256:
+    if _digest_site_packages(PYTHON_ROOT / "lib/python3.11") != PYTHON_STDLIB_SHA256:
         raise SystemExit("audited Python standard library differs from executor pin")
     os.set_inheritable(fd, True)
     env = dict(os.environ)
     env[_INTERPRETER_FD_ENV] = str(fd)
     path = f"/proc/self/fd/{fd}"
-    os.execve(path, [path, "-I", "-S", str(script), *args], env)
+    pycache_prefix = _fresh_startup_pycache_prefix()
+    os.execve(
+        path,
+        [path, "-I", "-S", "-X", f"pycache_prefix={pycache_prefix}", str(script), *args],
+        env,
+    )
+
+
+def _require_startup_pycache_prefix() -> None:
+    prefix = sys.pycache_prefix
+    if not isinstance(prefix, str) or not prefix.startswith("/tmp/herdr-policy-pycache-"):
+        raise SystemExit("trusted startup pycache prefix is required")
+    try:
+        info = os.stat(prefix, follow_symlinks=False)
+    except OSError as exc:
+        raise SystemExit("trusted startup pycache prefix unavailable") from exc
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or (info.st_mode & 0o077):
+        raise SystemExit("trusted startup pycache prefix is not private")
 
 
 def _verify_runtime(hermes_root: Path) -> None:
     """Stage two: recheck the inherited ELF and closed import surface."""
+    _require_startup_pycache_prefix()
     if not sys.flags.isolated or not sys.flags.no_site or sys.version_info[:2] != (3, 11):
         raise SystemExit("audited Python requires isolated no-site startup")
     try:
@@ -161,12 +409,10 @@ def _verify_runtime(hermes_root: Path) -> None:
             except OSError:
                 pass
     site = hermes_root / "venv/lib/python3.11/site-packages"
-    if _digest_site_packages(PYTHON_PATH.parents[1] / "lib/python3.11") != PYTHON_STDLIB_SHA256:
+    if _digest_site_packages(PYTHON_ROOT / "lib/python3.11") != PYTHON_STDLIB_SHA256:
         raise SystemExit("audited Python standard library differs from executor pin")
     if _digest_site_packages(site) != SITE_SHA256:
         raise SystemExit("venv import surface differs from executor pin")
-    # CPython never consults conventional __pycache__ with this fresh prefix.
-    sys.pycache_prefix = tempfile.mkdtemp(prefix=f"herdr-pycache-{os.getpid()}-", dir="/tmp")
 
 
 def _digest_site_packages(site: Path) -> str:
@@ -209,15 +455,20 @@ def _verify_hermes_build(root: Path) -> str:
         project = (root / "pyproject.toml").read_text(encoding="utf-8")
         version = re.search(r'(?m)^version = "([^"]+)"$', project).group(1)
         env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent",
-               "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+               "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+               "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_OPTIONAL_LOCKS": "0",
+               "GIT_NO_REPLACE_OBJECTS": "1", "GIT_ATTR_NOSYSTEM": "1"}
+        command = ["/usr/bin/git", "-c", "core.fsmonitor=false",
+                   "-c", "core.untrackedCache=false", "-c", "core.hooksPath=/dev/null",
+                   "-C", str(root)]
         def git(*args: str) -> str:
-            return subprocess.run(["/usr/bin/git", "-C", str(root), *args],
+            return subprocess.run([*command, *args],
                                   env=env, capture_output=True, text=True,
                                   check=True, timeout=30).stdout.strip()
         head = git("rev-parse", "HEAD")
         if head != HERMES_HEAD:
             raise ValueError("Hermes revision changed")
-        names = subprocess.run(["/usr/bin/git", "-C", str(root), "ls-files", "-z"],
+        names = subprocess.run([*command, "ls-files", "-z"],
                                env=env, capture_output=True, check=True, timeout=30).stdout
         digest = hashlib.sha256()
         tracked = set()
@@ -256,16 +507,27 @@ def bootstrap(
         and hermes_root == HERMES_ROOT
     )
     if production:
+        # A connected host-authenticated SO_PEERCRED session is the stage-one
+        # provenance authority. Public env vars and inherited FD NUMBERS alone
+        # are reproducible and therefore never sufficient.
+        _require_host_bootstrap_authority()
+        _require_stage1_continuity()
         _require_production_mount(bundle_path, exact=True)
-        _require_production_mount(policy_code_root)
-
-    if production:
+        _require_production_mount(policy_code_root, exact=True)
+        _require_production_mount(hermes_root, exact=True)
+        _require_production_mount(PYTHON_ROOT, exact=True)
         _verify_runtime(hermes_root)
     if policy_code_root.is_symlink() or not policy_code_root.is_dir():
         raise SystemExit("trusted policy code root unavailable")
     executor = _verify_hermes_build(hermes_root)
 
     _reset_import_path(policy_code_root, hermes_root)
+
+    # Policy mode executes only the hashed Hermes core/import surface. Disable
+    # directory, project and entry-point plugin discovery before importing any
+    # Hermes-facing guard/runtime module.
+    os.environ["HERMES_SAFE_MODE"] = "1"
+    os.environ["HERMES_ENABLE_PROJECT_PLUGINS"] = "0"
 
     security_module = importlib.import_module("herdr.security")
     guard_module = importlib.import_module("herdr.hermes_guard")
@@ -296,11 +558,15 @@ def bootstrap(
 
 
 def main() -> int:
-    # No policy path, identity, key, code root, or executable override is parsed from argv.
-    if _INTERPRETER_FD_ENV not in os.environ:
-        if Path(sys.executable).resolve() != Path("/usr/bin/python3").resolve() or not sys.flags.isolated or not sys.flags.no_site:
-            raise SystemExit("bootstrap requires trusted system Python -I -S")
-        _exec_verified_interpreter(POLICY_CODE_ROOT / "agent-stack/bin/agent-hermes-policy-run", sys.argv[1:])
+    # Production stage two is reachable only through the independently frozen
+    # stage-one bootstrap. Direct execution of policy-code is never authority.
+    if (
+        _INTERPRETER_FD_ENV not in os.environ
+        or STAGE1_PROOF_ENV not in os.environ
+        or STAGE2_FD_ENV not in os.environ
+        or BOOTSTRAP_AUTH_FD_ENV not in os.environ
+    ):
+        raise SystemExit("verified immutable stage-one bootstrap required")
     return bootstrap(sys.argv[1:])
 
 

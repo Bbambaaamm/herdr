@@ -16,14 +16,212 @@ authority.
 """
 from __future__ import annotations
 
+import base64
+import difflib
 import functools
+import fnmatch
+import time
 import inspect
 import json
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from herdr.file_authority import FileAuthorityError, RootFDWorkspace
 from herdr.security import InvocationGuard, PolicyDenied, SecurityError, ProviderRequest, canonical_digest
+
+
+class _PolicyFileOps:
+    """Hermes FileOperations facade backed by pinned nofollow root FDs."""
+
+    def __init__(self, workspace: RootFDWorkspace, delegate: Any, common: Any, patch_parser: Any) -> None:
+        self._workspace = workspace
+        self._delegate = delegate
+        self._common = common
+        self._patch_parser = patch_parser
+
+    def __getattr__(self, name: str) -> Any:
+        if name not in {"env","_add_line_numbers"}:
+            raise PolicyDenied("file_operation_unattested",name[:64])
+        return getattr(self._delegate, name)
+
+    def read_file_raw(self, path: str) -> Any:
+        try:
+            content = self._workspace.read_text(path)
+        except (OSError, FileAuthorityError) as exc:
+            return self._common.ReadResult(error=str(exc))
+        return self._common.ReadResult(
+            content=content, total_lines=len(content.splitlines()),
+            file_size=len(content.encode("utf-8")),
+        )
+
+    def read_file_bytes(self, path: str, max_bytes: int | None = None) -> Any:
+        limit = self._workspace_max_file_bytes() if max_bytes is None else max_bytes
+        if type(limit) is not int or limit < 0:
+            return self._common.ReadResult(error="invalid binary read limit")
+        limit=min(limit,self._workspace_max_file_bytes())
+        try:
+            raw = self._workspace.read_bytes(path, limit=limit)
+        except (OSError, FileAuthorityError) as exc:
+            return self._common.ReadResult(error=str(exc))
+        return self._common.ReadResult(
+            base64_content=base64.b64encode(raw).decode("ascii"),
+            file_size=len(raw),
+            is_binary=True,
+        )
+
+    @staticmethod
+    def _workspace_max_file_bytes() -> int:
+        from herdr.file_authority import MAX_FILE_BYTES
+        return MAX_FILE_BYTES
+
+    def read_file(self, path: str, offset: int = 1, limit: int = 2000) -> Any:
+        result = self.read_file_raw(path)
+        if result.error:
+            return result
+        if type(offset) is not int or type(limit) is not int or offset < 1 or limit < 1:
+            return self._common.ReadResult(error="invalid read pagination")
+        lines = result.content.splitlines(keepends=True)
+        page = "".join(lines[offset - 1:offset - 1 + limit])
+        numbered = self._delegate._add_line_numbers(page, offset)
+        return self._common.ReadResult(
+            content=numbered, total_lines=len(lines), file_size=result.file_size,
+            truncated=(offset - 1 + limit) < len(lines),
+        )
+
+    def search(self,pattern,path=".",target="content",file_glob=None,limit=50,offset=0,
+               output_mode="content",context=0,order="discovery"):
+        """No shell/backend delegation. This attested profile supports literals
+        and file globs; regex/context profiles require separate host admission.
+        """
+        common=self._common
+        if (not isinstance(pattern,str) or not 0<len(pattern)<=1024 or
+            type(limit) is not int or not 1<=limit<=200 or type(offset) is not int or not 0<=offset<=1000
+            or target not in {"content","files"} or output_mode not in {"content","files_only","count"}
+            or type(context) is not int or context!=0 or order!="discovery" or file_glob is not None and (not isinstance(file_glob,str) or len(file_glob)>256)):
+            return common.SearchResult(error="unsupported bounded policy-mode search profile")
+        if target=="content" and any(x in pattern for x in "[]()*+?{}|^$\\"):
+            return common.SearchResult(error="policy-mode search supports literal content; regex needs an admitted search profile")
+        # A regex dot is also unsupported rather than silently changed to literal.
+        if target=="content" and "." in pattern:
+            return common.SearchResult(error="policy-mode search supports literal content; regex dot is unsupported")
+        result=common.SearchResult();total_bytes=0;deadline=time.monotonic()+2
+        try:
+            paths=self._workspace.list_regular_files(path)
+            matches=[];files=[];counts={}
+            for name in paths:
+                if time.monotonic()>deadline: raise FileAuthorityError("search elapsed bound exceeded")
+                if file_glob and not fnmatch.fnmatchcase(name,file_glob) and not fnmatch.fnmatchcase(Path(name).name,file_glob): continue
+                if target=="files":
+                    if fnmatch.fnmatchcase(name,pattern) or fnmatch.fnmatchcase(Path(name).name,pattern): files.append(name)
+                    continue
+                raw=self._workspace.read_bytes(name,limit=524288)
+                total_bytes+=len(raw)
+                if total_bytes>8388608: raise FileAuthorityError("search bytes exceed bound")
+                try: text=raw.decode("utf-8")
+                except UnicodeDecodeError: continue
+                hit=0
+                for number,line in enumerate(text.splitlines(),1):
+                    if pattern in line:
+                        hit+=1
+                        if output_mode=="content":
+                            if len(line.encode())>4096: raise FileAuthorityError("search line exceeds bound")
+                            matches.append(common.SearchMatch(name,number,line))
+                if hit: counts[name]=hit;files.append(name)
+                if sum(len(x.content.encode()) for x in matches)>262144:
+                    raise FileAuthorityError("search output exceeds bound")
+            result.total_count=len(files) if target=="files" or output_mode=="files_only" else sum(counts.values())
+            if target=="files" or output_mode=="files_only": result.files=files[offset:offset+limit]
+            elif output_mode=="count": result.counts=dict(list(counts.items())[offset:offset+limit])
+            else: result.matches=matches[offset:offset+limit]
+            result.truncated=result.total_count>offset+limit
+            if result.truncated: result.limit_reason="pagination"
+            return result
+        except (OSError,FileAuthorityError) as exc:
+            return common.SearchResult(error=str(exc))
+
+    def write_file(self, path: str, content: str, pre_content: str | None = None) -> Any:
+        try:
+            count, digest = self._workspace.write_text(path, content)
+        except (OSError, FileAuthorityError) as exc:
+            return self._common.WriteResult(error=str(exc))
+        return self._common.WriteResult(
+            bytes_written=count, dirs_created=bool(Path(path).parent), verified=True,
+            _content_sha256=digest,
+        )
+
+    def patch_replace(self, path: str, old_string: str, new_string: str, replace_all: bool = False) -> Any:
+        read = self.read_file_raw(path)
+        if read.error:
+            return self._common.PatchResult(error=read.error)
+        from tools.fuzzy_match import fuzzy_find_and_replace, is_already_applied
+        updated, count, _strategy, error = fuzzy_find_and_replace(
+            read.content, old_string, new_string, replace_all
+        )
+        if error or count == 0:
+            if is_already_applied(read.content, old_string, new_string):
+                return self._common.PatchResult(
+                    success=True, no_change=True, note="edit already applied"
+                )
+            return self._common.PatchResult(error=error or "old_string not found")
+        write = self.write_file(path, updated, pre_content=read.content)
+        if write.error:
+            return self._common.PatchResult(error=write.error)
+        diff = "".join(difflib.unified_diff(
+            read.content.splitlines(keepends=True), updated.splitlines(keepends=True),
+            fromfile=f"a/{path}", tofile=f"b/{path}",
+        ))
+        return self._common.PatchResult(success=True, diff=diff, files_modified=[path])
+
+    def patch_v4a(self, patch_content: str) -> Any:
+        operations, error = self._patch_parser.parse_v4a_patch(patch_content)
+        if error:
+            return self._common.PatchResult(error=error)
+
+        # V4A Add is create-only. The parser's generic apply path calls
+        # write_file for both Add and Update, so interpose only the first write
+        # for each Add target with an atomic no-clobber create.
+        add_targets = {
+            op.file_path
+            for op in operations
+            if getattr(getattr(op, "operation", None), "value", None) == "add"
+        }
+        parent = self
+
+        class _V4AApplyOps:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(parent, name)
+
+            def write_file(
+                self, path: str, content: str, pre_content: str | None = None
+            ) -> Any:
+                if path in add_targets:
+                    add_targets.remove(path)
+                    try:
+                        count, digest = parent._workspace.create_text(path, content)
+                    except (OSError, FileAuthorityError) as exc:
+                        return parent._common.WriteResult(error=str(exc))
+                    return parent._common.WriteResult(
+                        bytes_written=count, verified=True, _content_sha256=digest
+                    )
+                return parent.write_file(path, content, pre_content=pre_content)
+
+        return self._patch_parser.apply_v4a_operations(operations, _V4AApplyOps())
+
+    def delete_file(self, path: str) -> Any:
+        try:
+            self._workspace.delete_file(path)
+            return self._common.WriteResult(verified=True)
+        except (OSError, FileAuthorityError) as exc:
+            return self._common.WriteResult(error=str(exc))
+
+    def move_file(self, source: str, destination: str) -> Any:
+        try:
+            self._workspace.move_file(source, destination)
+            return self._common.WriteResult(verified=True)
+        except (OSError, FileAuthorityError) as exc:
+            return self._common.WriteResult(error=str(exc))
 
 
 class HermesCompatibilityError(RuntimeError):
@@ -36,6 +234,25 @@ _AUTHORIZED_CALL: ContextVar[tuple[str, str] | None] = ContextVar(
 _ACTIVE_AGENT: ContextVar[Any | None] = ContextVar("herdr_active_provider_agent", default=None)
 _META_READ_TOOLS = frozenset({"tool_search", "tool_describe"})
 _BRIDGE_TOOL = "tool_call"
+_POLICY_ENV = {
+    "HERMES_SAFE_MODE": "1",
+    "HERMES_ENABLE_PROJECT_PLUGINS": "0",
+}
+
+
+def _reassert_policy_environment() -> None:
+    import os
+    for key, value in _POLICY_ENV.items():
+        os.environ[key] = value
+
+
+def _require_local_backend(env_type: Any, env: Any | None = None) -> None:
+    if env_type != "local":
+        raise PolicyDenied("process_backend_unattested", str(env_type)[:64])
+    if env is not None:
+        observed = getattr(env, "env_type", None)
+        if observed != "local":
+            raise PolicyDenied("process_backend_unattested", str(observed)[:64])
 
 
 def _call_digest(tool: str, args: Mapping[str, Any] | None) -> str:
@@ -94,28 +311,105 @@ def _actual_provider_credential_ref(agent: Any, route: Any) -> str | None:
             raise PolicyDenied("provider_credential_missing")
         return None
     pool = getattr(agent, "_credential_pool", None)
-    resolver = getattr(pool, "entry_id_for_api_key", None)
-    if not callable(resolver) or getattr(pool, "provider", None) != route.provider:
+    if getattr(pool, "provider", None) != route.provider:
+        raise PolicyDenied("provider_credential_identity_unknown")
+    return _bind_pool_credential(pool, raw, route.provider, refs)
+
+
+def _bind_pool_credential(pool: Any, raw: str, provider: str, refs: tuple[str, ...]) -> str:
+    """Bind the effective key to exactly one entry; a pool cursor is not proof."""
+    entries = getattr(pool, "entries", None)
+    if not callable(entries):
         raise PolicyDenied("provider_credential_identity_unknown")
     try:
-        entry_id = resolver(raw)
+        matches = [item for item in entries() if getattr(item, "runtime_api_key", None) == raw]
     except Exception as exc:
         raise PolicyDenied("provider_credential_identity_unknown") from exc
+    if len(matches) != 1:
+        raise PolicyDenied("provider_credential_identity_unknown")
+    entry_id = getattr(matches[0], "id", None)
     if not isinstance(entry_id, str) or not entry_id:
         raise PolicyDenied("provider_credential_identity_unknown")
-    actual = f"pool:{route.provider}:{entry_id}"
+    actual = f"pool:{provider}:{entry_id}"
     if actual not in refs:
         raise PolicyDenied("provider_credential_mismatch")
     return actual
+
+
+def _endpoint(value: Any) -> str:
+    return str(value or "").rstrip("/")
+
+
+def _effective_aux_route(guard: InvocationGuard, client: Any, provider: Any, api_mode: Any) -> Any:
+    """Resolve the actual auxiliary transport to exactly one signed provider route."""
+    routes = tuple(getattr(getattr(guard, "grant", None), "provider_routes", ()) or ())
+    actual_endpoint = _endpoint(getattr(client, "base_url", None))
+    actual_mode = str(api_mode or "")
+    named = [route for route in routes if route.provider == provider]
+    if named:
+        candidates = named
+    elif provider in (None, "", "auto", "auxiliary", "actual"):
+        candidates = [
+            route for route in routes
+            if _endpoint(route.base_url) == actual_endpoint and route.api_mode == actual_mode
+        ]
+    else:
+        candidates = []
+    if len(candidates) != 1:
+        raise PolicyDenied("provider_not_granted", str(provider)[:100])
+    route = candidates[0]
+    if _endpoint(route.base_url) != actual_endpoint or route.api_mode != actual_mode:
+        raise PolicyDenied("provider_endpoint_denied", str(route.provider)[:100])
+    return route
+
+
+def _actual_aux_credential_ref(client: Any, route: Any) -> str | None:
+    """Resolve the final auxiliary client's actual key through Hermes' trusted pool."""
+    refs = tuple(getattr(route, "credential_refs", ()) or ())
+    raw = getattr(client, "api_key", None)
+    if raw is None:
+        raw = ""
+    if not isinstance(raw, str):
+        raise PolicyDenied("provider_credential_identity_unknown")
+    if not raw:
+        if refs:
+            raise PolicyDenied("provider_credential_missing")
+        return None
+    try:
+        from agent.credential_pool import load_pool
+        pool = load_pool(route.provider)
+    except Exception as exc:
+        raise PolicyDenied("provider_credential_identity_unknown") from exc
+    if getattr(pool, "provider", None) != route.provider:
+        raise PolicyDenied("provider_credential_identity_unknown")
+    return _bind_pool_credential(pool, raw, route.provider, refs)
+
+
+def _authorize_aux_transport(
+    guard: InvocationGuard, client: Any, provider: Any, api_mode: Any
+) -> None:
+    route = _effective_aux_route(guard, client, provider, api_mode)
+    if len(route.regions) != 1 or len(route.data_classes) != 1:
+        raise PolicyDenied("provider_route_ambiguous", str(route.provider))
+    guard.authorize_provider(ProviderRequest(
+        provider=route.provider,
+        region=route.regions[0],
+        data_class=_effective_request_data_class(guard),
+        egress=route.max_egress,
+        retention=route.max_retention,
+        training=route.training,
+        credential_ref=_actual_aux_credential_ref(client, route),
+    ))
 
 
 def inspect_hermes_security_surface() -> dict[str, Any]:
     """Fail-closed compatibility probe for the installed Hermes import surface."""
     try:
         import model_tools
-        from hermes_cli import middleware, plugins
-        from agent import turn_api_call, conversation_loop, tool_executor
-        from tools import connectors, read_extract
+        from hermes_cli import env_loader, middleware, plugins
+        from agent import auxiliary_client, turn_api_call, conversation_loop, tool_executor
+        from agent.client_lifecycle import ClientLifecycleMixin
+        from tools import code_execution_tool, connectors, file_tools, file_tools_read_tracking, read_extract, terminal_tool, terminal_tool_backends
         from tools.file_tools_paths import _resolve_path_for_task
         from tools.registry import registry
         from toolsets import resolve_toolset
@@ -168,6 +462,35 @@ def inspect_hermes_security_surface() -> dict[str, Any]:
         raise HermesCompatibilityError("provider execution seam drifted")
     if not callable(getattr(middleware, "run_llm_execution_middleware", None)):
         raise HermesCompatibilityError("provider middleware seam unavailable")
+    for name in ("_relay_sync_completion", "_relay_async_completion", "_relay_sync_stream"):
+        if not callable(getattr(auxiliary_client, name, None)):
+            raise HermesCompatibilityError(f"auxiliary provider seam unavailable: {name}")
+    codex_adapter = getattr(auxiliary_client, "_CodexCompletionsAdapter", None)
+    if codex_adapter is None or not callable(getattr(codex_adapter, "create", None)):
+        raise HermesCompatibilityError("Codex auxiliary Responses seam unavailable")
+    if not callable(getattr(ClientLifecycleMixin, "_try_refresh_anthropic_client_credentials", None)):
+        raise HermesCompatibilityError("Anthropic credential-refresh seam unavailable")
+    if not callable(getattr(env_loader, "_load_dotenv_with_fallback", None)) or not callable(
+        getattr(env_loader, "load_hermes_dotenv", None)
+    ):
+        raise HermesCompatibilityError("dotenv policy seam unavailable")
+    if not isinstance(getattr(plugins, "PluginManager", None), type) or not callable(
+        getattr(plugins.PluginManager, "discover_and_load", None)
+    ):
+        raise HermesCompatibilityError("plugin discovery seam unavailable")
+    if not callable(getattr(terminal_tool, "_get_env_config", None)) or not callable(
+        getattr(terminal_tool, "_acquire_env", None)
+    ):
+        raise HermesCompatibilityError("terminal backend seam unavailable")
+    if not callable(getattr(code_execution_tool, "_get_or_create_env", None)):
+        raise HermesCompatibilityError("execute_code backend seam unavailable")
+    if not callable(getattr(terminal_tool_backends, "_create_environment", None)):
+        raise HermesCompatibilityError("terminal environment creation seam unavailable")
+    if not callable(getattr(file_tools, "_get_file_ops", None)):
+        raise HermesCompatibilityError("file operations seam unavailable")
+    if not all(callable(getattr(file_tools_read_tracking, name, None))
+               for name in ("_file_metadata", "_file_version")):
+        raise HermesCompatibilityError("file read-tracking seam unavailable")
     if not callable(_resolve_path_for_task):
         raise HermesCompatibilityError("Hermes task path resolver unavailable")
     if not callable(getattr(read_extract, "_hosted_ocr_config", None)):
@@ -197,6 +520,11 @@ def inspect_hermes_security_surface() -> dict[str, Any]:
         "tool_request_middleware_supported": True,
         "tool_execution_middleware_supported": True,
         "agent_tool_execution_seam": True,
+        "auxiliary_provider_seams": True,
+        "anthropic_refresh_disabled_under_guard": True,
+        "dotenv_policy_locked": True,
+        "dynamic_plugins_disabled_under_guard": True,
+        "local_process_backend_enforced": True,
         "task_path_resolver": True,
         "hosted_ocr_disabled_under_guard": True,
         "security_authority": "herdr_dispatch_guard",
@@ -210,6 +538,7 @@ class GuardInstallation:
     guard: InvocationGuard
     originals: list[tuple[Any, str, Any]] = field(default_factory=list)
     surface: dict[str, Any] = field(default_factory=dict)
+    finalizers: list[Callable[[], Any]] = field(default_factory=list)
     installed: bool = True
 
     def _remember(self, owner: Any, name: str, replacement: Any) -> None:
@@ -222,6 +551,11 @@ class GuardInstallation:
             return
         for owner, name, original in reversed(self.originals):
             setattr(owner, name, original)
+        for finalizer in reversed(self.finalizers):
+            try:
+                finalizer()
+            except Exception:
+                pass
         self.installed = False
 
 
@@ -235,9 +569,10 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
     surface = inspect_hermes_security_surface()
 
     import model_tools
-    from agent import conversation_loop, turn_api_call, tool_executor
-    from hermes_cli import middleware
-    from tools import connectors, read_extract
+    from agent import auxiliary_client, conversation_loop, turn_api_call, tool_executor
+    from agent.client_lifecycle import ClientLifecycleMixin
+    from hermes_cli import env_loader, middleware, plugins
+    from tools import code_execution_tool, connectors, file_tools, file_tools_read_tracking, read_extract, terminal_tool, terminal_tool_backends
     from tools.connectors import dispatch as connector_dispatch_module
     from tools.file_tools_paths import _resolve_path_for_task
     from tools.registry import ToolRegistry, registry
@@ -249,12 +584,271 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
     )
     installation = GuardInstallation(guard=guard, surface=surface)
 
+    # Pin local file authority to the granted directory inodes. Hermes may keep
+    # its higher-level formatting/search helpers, but physical read/write/patch
+    # goes through RootFDWorkspace so a path/symlink swap after authorization
+    # cannot redirect an open or rename outside the signed roots.
+    file_rules = {rule.tool: rule for rule in getattr(guard.grant, "tool_rules", ())}
+    file_roots = {
+        root
+        for tool in ("read_file", "write_file", "patch", "search_files")
+        for root in getattr(file_rules.get(tool), "allowed_roots", ())
+    }
+    file_workspace = RootFDWorkspace(file_roots) if file_roots else None
+    if file_workspace is not None:
+        from tools import file_operations_common, patch_parser
+        original_get_file_ops = file_tools._get_file_ops
+        proxies: dict[int, _PolicyFileOps] = {}
+
+        @functools.wraps(original_get_file_ops)
+        def guarded_get_file_ops(task_id: str = "default") -> Any:
+            # Check the configured backend BEFORE original_get_file_ops can
+            # provision/connect a Docker/SSH/Modal/plugin environment.
+            config = terminal_tool._get_env_config()
+            _require_local_backend(config.get("env_type"))
+            delegate = original_get_file_ops(task_id)
+            env = getattr(delegate, "env", None)
+            _require_local_backend(getattr(env, "env_type", "local"), env)
+            key = id(delegate)
+            proxy = proxies.get(key)
+            if proxy is None:
+                proxy = proxies[key] = _PolicyFileOps(
+                    file_workspace, delegate, file_operations_common, patch_parser
+                )
+            return proxy
+
+        installation._remember(file_tools, "_get_file_ops", guarded_get_file_ops)
+
+        def guarded_file_metadata(path: str) -> tuple | None:
+            try:
+                return file_workspace.file_metadata(path)
+            except (OSError, FileAuthorityError):
+                return None
+
+        def guarded_file_version(path: str) -> tuple | None:
+            try:
+                return file_workspace.file_version(path)
+            except (OSError, FileAuthorityError):
+                return None
+
+        # Hermes imports these functions into file_tools at module import time,
+        # while the tracking module also calls its own globals. Patch both
+        # references so dedup/staleness hashing cannot reopen a raced symlink.
+        installation._remember(file_tools, "_file_metadata", guarded_file_metadata)
+        installation._remember(file_tools, "_file_version", guarded_file_version)
+        installation._remember(
+            file_tools_read_tracking, "_file_metadata", guarded_file_metadata
+        )
+        installation._remember(
+            file_tools_read_tracking, "_file_version", guarded_file_version
+        )
+        # The original special-file precheck follows pathname symlinks with
+        # os.stat. RootFDWorkspace uses O_NONBLOCK+O_NOFOLLOW and rejects
+        # non-regular targets at the actual open seam, so avoid that unsafe
+        # preliminary dereference in policy mode.
+        installation._remember(file_tools, "_special_file_kind", lambda path: None)
+        installation.finalizers.append(file_workspace.close)
+
+    # Policy suppression is authority, not user config. Hermes reloads profile
+    # dotenv files with override=True after profile selection, so reassert the
+    # protected values after every dotenv layer and disable plugin discovery at
+    # the manager method itself. A .env cannot turn policy mode back off.
+    _reassert_policy_environment()
+    original_dotenv_layer = env_loader._load_dotenv_with_fallback
+    @functools.wraps(original_dotenv_layer)
+    def guarded_dotenv_layer(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return original_dotenv_layer(*args, **kwargs)
+        finally:
+            _reassert_policy_environment()
+    installation._remember(env_loader, "_load_dotenv_with_fallback", guarded_dotenv_layer)
+
+    original_dotenv_load = env_loader.load_hermes_dotenv
+    @functools.wraps(original_dotenv_load)
+    def guarded_dotenv_load(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return original_dotenv_load(*args, **kwargs)
+        finally:
+            _reassert_policy_environment()
+    installation._remember(env_loader, "load_hermes_dotenv", guarded_dotenv_load)
+
+    def disabled_plugin_discovery(self: Any, force: bool = False) -> None:
+        _reassert_policy_environment()
+        self._discovered = True
+        return None
+    installation._remember(plugins.PluginManager, "discover_and_load", disabled_plugin_discovery)
+
+    # #76 only attests the local process backend. Model-visible terminal and
+    # execute_code must not escape to SSH/Docker/Modal/Daytona/plugin backends.
+    original_terminal_config = terminal_tool._get_env_config
+    @functools.wraps(original_terminal_config)
+    def guarded_terminal_config() -> dict[str, Any]:
+        config = dict(original_terminal_config())
+        config["env_type"] = "local"
+        return config
+    installation._remember(terminal_tool, "_get_env_config", guarded_terminal_config)
+
+    original_acquire_env = terminal_tool._acquire_env
+    @functools.wraps(original_acquire_env)
+    def guarded_acquire_env(plan: Any, task_id: Any) -> Any:
+        _require_local_backend(getattr(plan, "env_type", None))
+        env = original_acquire_env(plan, task_id)
+        _require_local_backend(getattr(plan, "env_type", None), env)
+        return env
+    installation._remember(terminal_tool, "_acquire_env", guarded_acquire_env)
+
+    # Guard the shared physical backend constructor itself. execute_code imports
+    # this symbol immediately before provisioning; rejecting here prevents
+    # Docker/SSH/Modal/Daytona/plugin setup, network use, or credential lookup
+    # from occurring before the policy verdict.
+    original_create_environment = terminal_tool_backends._create_environment
+    @functools.wraps(original_create_environment)
+    def guarded_create_environment(env_type: str, *args: Any, **kwargs: Any) -> Any:
+        _require_local_backend(env_type)
+        env = original_create_environment(env_type, *args, **kwargs)
+        _require_local_backend(env_type, env)
+        return env
+    installation._remember(
+        terminal_tool_backends, "_create_environment", guarded_create_environment
+    )
+
+    original_code_env = code_execution_tool._get_or_create_env
+    @functools.wraps(original_code_env)
+    def guarded_code_env(task_id: str) -> Any:
+        env, env_type = original_code_env(task_id)
+        _require_local_backend(env_type, env)
+        return env, env_type
+    installation._remember(code_execution_tool, "_get_or_create_env", guarded_code_env)
+
     # A read_file PDF fallback can otherwise consume FIRECRAWL_API_KEY and send
     # document bytes to hosted OCR while the model only invoked a READ-class
     # tool. Under #76, cloud OCR must be an explicit separately granted tool.
     installation._remember(
         read_extract, "_hosted_ocr_config", lambda: (False, None, None)
     )
+
+    # Native Anthropic rotates OAuth/pool credentials while constructing the
+    # request-local client. That happens after the main provider precheck. In
+    # policy mode rotation is disabled rather than accepting an unverified key;
+    # a future brokered refresh must re-bind the resulting pool identity.
+    installation._remember(
+        ClientLifecycleMixin,
+        "_try_refresh_anthropic_client_credentials",
+        lambda self: False,
+    )
+
+    original_aux_sync = auxiliary_client._relay_sync_completion
+    original_aux_async = auxiliary_client._relay_async_completion
+    original_aux_stream = auxiliary_client._relay_sync_stream
+
+    @functools.wraps(original_aux_sync)
+    def guarded_aux_sync(
+        client: Any,
+        kwargs: dict[str, Any],
+        *,
+        provider: str | None = None,
+        api_mode: str | None = None,
+        create: Callable[[dict[str, Any]], Any] | None = None,
+    ) -> Any:
+        _authorize_aux_transport(guard, client, provider, api_mode)
+        callback = create or (lambda request: auxiliary_client._create_with_progress(client, request))
+        def checked_create(request: dict[str, Any]) -> Any:
+            _authorize_aux_transport(guard, client, provider, api_mode)
+            return callback(request)
+        return original_aux_sync(
+            client, kwargs, provider=provider, api_mode=api_mode, create=checked_create
+        )
+
+    @functools.wraps(original_aux_async)
+    async def guarded_aux_async(
+        client: Any,
+        kwargs: dict[str, Any],
+        *,
+        provider: str | None = None,
+        api_mode: str | None = None,
+        create: Callable[[dict[str, Any]], Any] | None = None,
+    ) -> Any:
+        _authorize_aux_transport(guard, client, provider, api_mode)
+        async def checked_create(request: dict[str, Any]) -> Any:
+            _authorize_aux_transport(guard, client, provider, api_mode)
+            if create is not None:
+                return await create(request)
+            return await auxiliary_client._acreate_with_progress(client, request)
+        return await original_aux_async(
+            client, kwargs, provider=provider, api_mode=api_mode, create=checked_create
+        )
+
+    @functools.wraps(original_aux_stream)
+    def guarded_aux_stream(
+        client: Any,
+        kwargs: dict[str, Any],
+        *,
+        provider: str | None = None,
+        api_mode: str | None = None,
+    ) -> Any:
+        # v0.21.5 Relay may defer stream_factory until first iteration, after
+        # middleware/fallback state has changed. Reproduce the audited wrapper
+        # but put authorization immediately around the physical create().
+        _authorize_aux_transport(guard, client, provider, api_mode)
+        from agent.auxiliary_wire import prepare_chat_messages
+        from agent import relay_llm
+        from agent.auxiliary_hooks import run_with_aux_hooks
+
+        prepared = prepare_chat_messages(client, kwargs)
+        def checked_create(request: dict[str, Any]) -> Any:
+            _authorize_aux_transport(guard, client, provider, api_mode)
+            transformed = auxiliary_client.bypass_chat_sdk_request_transform(request, client)
+            return client.chat.completions.create(**transformed)
+
+        route = auxiliary_client._relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+        if route is None:
+            return checked_create(prepared)
+        provider_name, fallback_model, metadata = route
+        model_name = str(prepared.get("model") or fallback_model)
+        return run_with_aux_hooks(
+            lambda: relay_llm.stream_current(
+                prepared, checked_create, name=provider_name, model_name=model_name,
+                finalizer=dict, metadata=metadata,
+                completed_response_predicate=lambda value: hasattr(value, "choices"),
+            ),
+            aux_task=str(metadata.get("auxiliary_task") or ""),
+            metadata=metadata,
+            client=client,
+            kwargs=prepared,
+            provider=provider_name,
+            model=model_name,
+            api_mode=str(metadata.get("api_mode") or ""),
+            streaming=True,
+        )
+
+    installation._remember(
+        auxiliary_client, "_relay_sync_completion", guarded_aux_sync
+    )
+    installation._remember(
+        auxiliary_client, "_relay_async_completion", guarded_aux_async
+    )
+    installation._remember(
+        auxiliary_client, "_relay_sync_stream", guarded_aux_stream
+    )
+
+    # MoA has one special Codex streaming branch that calls the Responses
+    # adapter directly instead of _relay_sync_stream. Guard its physical
+    # create() method as well so every provider attempt shares the same policy.
+    codex_adapter = auxiliary_client._CodexCompletionsAdapter
+    original_codex_create = codex_adapter.create
+
+    @functools.wraps(original_codex_create)
+    def guarded_codex_create(self: Any, **kwargs: Any) -> Any:
+        real_client = getattr(self, "_client", None)
+        if real_client is None:
+            raise PolicyDenied("provider_context_missing")
+        provider = getattr(real_client, "_hermes_aux_effective_provider", None)
+        _authorize_aux_transport(
+            guard, real_client, provider, "codex_responses"
+        )
+        return original_codex_create(self, **kwargs)
+
+    installation._remember(codex_adapter, "create", guarded_codex_create)
 
     def authorize_agent_provider(agent: Any) -> None:
         provider = getattr(agent, "provider", None)

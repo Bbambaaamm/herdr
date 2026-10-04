@@ -585,8 +585,8 @@ class SecurityGrant:
                 raise SecurityError("child weakens parent path constraint")
             if not _roots_subset(child_rule.allowed_roots, parent_rule.allowed_roots):
                 raise SecurityError("child filesystem ceiling escalates above parent")
-            if not set(child_rule.credential_ref_fields) <= set(parent_rule.credential_ref_fields):
-                raise SecurityError("child credential argument ceiling escalates above parent")
+            if not set(parent_rule.credential_ref_fields) <= set(child_rule.credential_ref_fields):
+                raise SecurityError("child weakens parent credential constraint")
             if parent_rule.requires_process and not child_rule.requires_process:
                 raise SecurityError("child weakens parent process requirement")
             if parent_rule.requires_sandbox and not child_rule.requires_sandbox:
@@ -1014,6 +1014,22 @@ class ProviderCircuitBreaker:
             raise PolicyDenied("provider_isolated", reason)
 
 
+def _recv_bounded_line(stream: socket.socket, *, limit: int = 256) -> bytes:
+    """Read exactly one bounded newline-terminated authority response."""
+    data = bytearray()
+    while len(data) < limit:
+        chunk = stream.recv(min(64, limit - len(data)))
+        if not chunk:
+            break
+        data.extend(chunk)
+        if b"\n" in data:
+            line, tail = bytes(data).split(b"\n", 1)
+            if tail:
+                raise OSError("approval authority sent trailing data")
+            return line + b"\n"
+    raise OSError("approval authority response incomplete or oversized")
+
+
 @dataclass
 class InvocationGuard:
     grant: SecurityGrant
@@ -1149,7 +1165,7 @@ class InvocationGuard:
                     client.settimeout(2)
                     client.connect(str(self.approval_socket))
                     client.sendall(request)
-                    answer = client.recv(256)
+                    answer = _recv_bounded_line(client, limit=256)
             except (OSError, TimeoutError) as exc:
                 raise PolicyDenied("approval_authority_unavailable") from exc
             if answer == b"consumed\n":
@@ -1208,6 +1224,17 @@ def _validate_args(
         raise PolicyDenied("raw_credential_material_denied")
     if not keys <= set(rule.allowed_arg_keys):
         raise PolicyDenied("tool_arg_not_granted", ",".join(sorted(keys - set(rule.allowed_arg_keys))))
+    # Credential-reference fields are authority-bearing. They may never be
+    # omitted or replaced with None/scalars/containers that let a downstream
+    # tool fall back to ambient/default credentials.
+    for field in rule.credential_ref_fields:
+        if field not in args:
+            raise PolicyDenied("credential_ref_required", field)
+        value = args[field]
+        if not isinstance(value, str) or not value:
+            raise PolicyDenied("credential_ref_invalid", field)
+        if value not in credential_refs:
+            raise PolicyDenied("credential_ref_denied", value[:128])
     budget = [0]
     checked = _validate_value(dict(args), rule, credential_refs, depth=0, budget=budget, parent_key="")
     for field in rule.path_fields:
@@ -1309,6 +1336,12 @@ def _validate_value(
     budget[0] += 1
     if budget[0] > _MAX_ARG_ITEMS:
         raise PolicyDenied("tool_args_too_large")
+    if parent_key in rule.credential_ref_fields:
+        if not isinstance(value, str) or not value:
+            raise PolicyDenied("credential_ref_invalid", parent_key)
+        if value not in credential_refs:
+            raise PolicyDenied("credential_ref_denied", value[:128])
+        return value
     if value is None or type(value) in (bool, int, float):
         if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
             raise PolicyDenied("tool_arg_nonfinite")
@@ -1316,10 +1349,6 @@ def _validate_value(
     if isinstance(value, str):
         if len(value) > _MAX_ARG_STRING:
             raise PolicyDenied("tool_arg_string_too_large")
-        if parent_key in rule.credential_ref_fields:
-            if value not in credential_refs:
-                raise PolicyDenied("credential_ref_denied", value[:128])
-            return value
         if _SECRET_KEY.search(parent_key) or any(pattern.search(value) for pattern in _SECRET_VALUE):
             raise PolicyDenied("raw_credential_material_denied", parent_key[:128])
         return value

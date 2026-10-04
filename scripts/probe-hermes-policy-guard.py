@@ -57,8 +57,12 @@ def main() -> int:
 
         sys.path.insert(0, str(hermes_root))
         import model_tools
+        from agent import auxiliary_client
+        from agent.client_lifecycle import ClientLifecycleMixin
+        from hermes_cli import env_loader, plugins
         from hermes_cli.middleware import RequestMiddlewareResult
         import hermes_cli.middleware as middleware
+        from tools import terminal_tool
         from tools.registry import registry
         from toolsets import resolve_toolset
 
@@ -118,6 +122,23 @@ def main() -> int:
         )
         guard = InvocationGuard(grant)
         installation = install_hermes_guard(guard)
+
+        # Profile dotenv is explicitly allowed to override ordinary shell
+        # values in Hermes. Policy-mode controls are different: the guard
+        # reasserts them after every dotenv layer and disables plugin discovery
+        # independently of those environment variables.
+        poison_env = Path(hermes_home) / ".env"
+        poison_env.write_text(
+            "HERMES_SAFE_MODE=0\nHERMES_ENABLE_PROJECT_PLUGINS=1\n",
+            encoding="utf-8",
+        )
+        env_loader.load_hermes_dotenv(
+            hermes_home=hermes_home, load_external_secrets=False
+        )
+        assert os.environ["HERMES_SAFE_MODE"] == "1"
+        assert os.environ["HERMES_ENABLE_PROJECT_PLUGINS"] == "0"
+        plugins.get_plugin_manager().discover_and_load(force=True)
+        assert terminal_tool._get_env_config()["env_type"] == "local"
 
         file_toolset = set(resolve_toolset("file"))
         required_bundle = {"read_file", "write_file", "patch", "search_files"}
@@ -207,7 +228,87 @@ def main() -> int:
         assert "HERDR_SECURITY_DENIED[path_outside_grant]" in str(poisoned), poisoned
         assert "HERDR76_OUTSIDE_SECRET" not in str(poisoned)
 
+        # Actual installed auxiliary transport seam is denied before its
+        # provider callback because this probe grant carries no provider route.
+        aux_executed = []
+        dummy_aux = type("AuxClient", (), {
+            "base_url": "https://ungranted.example.invalid/v1",
+            "api_key": "",
+        })()
+        try:
+            auxiliary_client._relay_sync_completion(
+                dummy_aux,
+                {"messages": []},
+                provider="ungranted",
+                api_mode="openai",
+                create=lambda request: aux_executed.append(True) or object(),
+            )
+        except Exception as exc:
+            assert type(exc).__name__ == "PolicyDenied", type(exc).__name__
+            assert "provider_not_granted" in str(exc), str(exc)
+        else:
+            raise AssertionError("ungranted auxiliary provider reached callback")
+        assert aux_executed == []
+
+        # Hermes has one direct MoA/Codex Responses branch outside _relay_*.
+        # The installed adapter class is guarded too, before responses.create.
+        dummy_codex_real = type("CodexReal", (), {
+            "base_url": "https://ungranted.example.invalid/v1",
+            "api_key": "",
+            "_hermes_aux_effective_provider": "actual",
+        })()
+        codex_adapter = auxiliary_client._CodexCompletionsAdapter(
+            dummy_codex_real, "codex-probe"
+        )
+        try:
+            codex_adapter.create(messages=[])
+        except Exception as exc:
+            assert type(exc).__name__ == "PolicyDenied", type(exc).__name__
+            assert "provider_not_granted" in str(exc), str(exc)
+        else:
+            raise AssertionError("direct Codex auxiliary branch bypassed provider guard")
+
+        # The real installed ClientLifecycleMixin method is replaced in this
+        # guarded process, so native Anthropic refresh cannot rotate a key
+        # after provider authorization.
+        lifecycle = object.__new__(ClientLifecycleMixin)
+        assert lifecycle._try_refresh_anthropic_client_credentials() is False
+
         installation.uninstall()
+
+        # A granted local write goes through the pinned RootFDWorkspace facade,
+        # not a re-opened model pathname. This proves the installed Hermes
+        # registry/file_tools seam actually uses the #76 nofollow adapter.
+        write_scope = replace(
+            scope,
+            tools=("write_file",),
+            permissions=("workspace-write",),
+        )
+        write_grant = replace(
+            grant,
+            grant_id="hermes-v0215-write-probe",
+            scope=write_scope,
+            tool_rules=(
+                ToolRule(
+                    tool="write_file",
+                    risk=RiskClass.WORKSPACE_WRITE,
+                    allowed_arg_keys=("path", "content"),
+                    path_fields=("path",),
+                    allowed_roots=(str(workspace),),
+                ),
+            ),
+        )
+        installation = install_hermes_guard(InvocationGuard(write_grant))
+        allowed_write = workspace / "rootfd-write.txt"
+        write_result = model_tools.handle_function_call(
+            "write_file",
+            {"path": str(allowed_write), "content": "ROOTFD_OK\n"},
+            **common,
+        )
+        assert "HERDR_SECURITY_DENIED" not in str(write_result), write_result
+        assert allowed_write.read_text(encoding="utf-8") == "ROOTFD_OK\n"
+        installation.uninstall()
+
         patch_scope = replace(
             scope,
             tools=("patch",),
@@ -251,6 +352,7 @@ def main() -> int:
             "status": "PASS",
             "hermes_file_toolset": sorted(file_toolset),
             "read_file_allowed": True,
+            "rootfd_write_allowed": True,
             "write_file_skip_flags_denied": True,
             "direct_registry_write_denied": True,
             "legacy_alias_denied": True,
@@ -258,6 +360,12 @@ def main() -> int:
             "bridge_connector_denied_before_dispatch": True,
             "post_middleware_path_poisoning_denied": True,
             "v4a_embedded_target_denied": True,
+            "auxiliary_provider_denied_before_callback": True,
+            "direct_codex_auxiliary_guarded": True,
+            "anthropic_refresh_disabled_under_guard": True,
+            "dotenv_policy_controls_locked": True,
+            "dynamic_plugin_discovery_disabled": True,
+            "terminal_backend_forced_local": True,
             "live_config_changed": False,
         }
         print(json.dumps(result, sort_keys=True))
