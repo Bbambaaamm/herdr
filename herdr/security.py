@@ -1208,6 +1208,17 @@ def _validate_args(
         raise PolicyDenied("raw_credential_material_denied")
     if not keys <= set(rule.allowed_arg_keys):
         raise PolicyDenied("tool_arg_not_granted", ",".join(sorted(keys - set(rule.allowed_arg_keys))))
+    # Credential-reference fields are authority-bearing. They may never be
+    # omitted or replaced with None/scalars/containers that let a downstream
+    # tool fall back to ambient/default credentials.
+    for field in rule.credential_ref_fields:
+        if field not in args:
+            raise PolicyDenied("credential_ref_required", field)
+        value = args[field]
+        if not isinstance(value, str) or not value:
+            raise PolicyDenied("credential_ref_invalid", field)
+        if value not in credential_refs:
+            raise PolicyDenied("credential_ref_denied", value[:128])
     budget = [0]
     checked = _validate_value(dict(args), rule, credential_refs, depth=0, budget=budget, parent_key="")
     for field in rule.path_fields:
@@ -1309,6 +1320,12 @@ def _validate_value(
     budget[0] += 1
     if budget[0] > _MAX_ARG_ITEMS:
         raise PolicyDenied("tool_args_too_large")
+    if parent_key in rule.credential_ref_fields:
+        if not isinstance(value, str) or not value:
+            raise PolicyDenied("credential_ref_invalid", parent_key)
+        if value not in credential_refs:
+            raise PolicyDenied("credential_ref_denied", value[:128])
+        return value
     if value is None or type(value) in (bool, int, float):
         if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
             raise PolicyDenied("tool_arg_nonfinite")
@@ -1316,10 +1333,6 @@ def _validate_value(
     if isinstance(value, str):
         if len(value) > _MAX_ARG_STRING:
             raise PolicyDenied("tool_arg_string_too_large")
-        if parent_key in rule.credential_ref_fields:
-            if value not in credential_refs:
-                raise PolicyDenied("credential_ref_denied", value[:128])
-            return value
         if _SECRET_KEY.search(parent_key) or any(pattern.search(value) for pattern in _SECRET_VALUE):
             raise PolicyDenied("raw_credential_material_denied", parent_key[:128])
         return value

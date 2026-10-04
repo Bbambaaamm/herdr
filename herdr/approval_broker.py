@@ -70,4 +70,10 @@ def serve_approvals(listener: socket.socket, ledger: ApprovalLedger) -> None:
                 answer = ledger.consume(**payload)
             except (ValueError, TypeError, OSError, sqlite3.Error):
                 answer = "unavailable"
-            connection.sendall((answer + "\n").encode("ascii"))
+            try:
+                connection.sendall((answer + "\n").encode("ascii"))
+            except OSError:
+                # A sandbox client may disconnect after submitting a request.
+                # Response delivery is per-connection; it must never terminate
+                # the host approval authority's accept loop.
+                continue

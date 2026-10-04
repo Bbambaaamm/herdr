@@ -127,7 +127,10 @@ V4A patch mode checks and normalizes every Update, Add, Delete and Move
 source/destination header. Its top-level `path` is optional; when supplied it
 is checked too. The normalized arguments are the ones passed to Hermes.
 Relative paths use Hermes' task path resolver, and unavailable resolution
-denies execution.
+denies execution. Every `credential_ref_fields` argument is mandatory when the
+tool is invoked and must be an explicit non-empty opaque string already present
+in the signed grant. Omission, `null`, numbers, containers, empty strings and
+ambient/default credential fallback all fail closed.
 This logical check complements, and does not replace, #82's inode/mount
 physical boundary.
 
@@ -224,25 +227,52 @@ Hermes version banner never appeared, and the probe pane was closed. This proves
 the supported path is `herdr server → pane shell → policy-bin/hermes → guarded
 Hermes`; it does not claim #82 has integrated the bundle yet.
 
-`agent-stack/policy-bin/hermes` is a regular executable shell entry (not a
-symlink). It starts the fixed policy-code launcher with `/usr/bin/python3 -I -S`.
-This host system Python and its standard library are the first-stage trust base.
-The launcher reads only the fixed bundle path and exact host-controlled pane env:
-`HERDR_POLICY_CONSUMER`, `HERDR_POLICY_AGENT_ID`,
-`HERDR_POLICY_PARENT_AGENT_ID`, `HERDR_POLICY_PARENT_TASK_ID`,
-`HERDR_POLICY_TASK_ID`, `HERDR_POLICY_RUN_TOKEN`, and
-`HERDR_POLICY_FENCING_TOKEN`. It checks the exact readonly file bind and
-verifies the canonical signed bundle, identity/fence and attested runtime. It
-opens and hashes the pinned Hermes Python ELF, verifies its standard library,
-then executes that held file
-descriptor with `-I -S`. Stage two rechecks the inherited descriptor against
-`/proc/self/exe`, hashes the venv site-packages import surface, installs a fresh
-`sys.pycache_prefix`, and adds the verified site-packages without processing
-`.pth` files. Conventional `__pycache__` and sourceless `.pyc` files have no
-execution authority. It installs the guard before importing and
-calling `hermes_cli.main`, passing ordinary Hermes argv through. Empty,
-truncated, noncanonical or invalid bundles fail closed. CLI/env-selected grant,
-key, bundle, policy code and Hermes root paths have no authority.
+Production has an independent stage-one trust root at
+`/run/herdr-bootstrap`; **PATH must resolve `hermes` from that frozen tree, not
+from `/run/herdr/policy-code`**. The repository's regular
+`agent-stack/policy-bin/hermes` is source material that #82 copies into this
+host-owned bootstrap snapshot. Its only action is an absolute exec of the
+pinned CPython runtime with `-I -S` and the fixed
+`/run/herdr-bootstrap/agent-hermes-policy-stage1`. The stage-one verifier is
+stdlib-only and reads no policy Python.
+
+Before stage two, stage one requires a bounded fixed
+`/run/herdr-bootstrap/immutable-trees.json` with
+`schema_version=herdr-policy-bootstrap-1` and
+`authority=herdr-host-frozen-tree`. The proof is created by the host from the
+same independently copied `FrozenTree` objects that #82 retains. It binds the
+exact seven task/run/fence identity fields and, for each of
+`/run/herdr/policy-code`, `/home/agentops/.hermes/hermes-agent`, and the pinned
+CPython root, the exact device, inode, `FrozenTree.source_digest`, and
+`snapshot_kind=host-frozen-copy`. Stage one requires the bootstrap root and all
+three trees to be exact dedicated read-only mounts and rejects **any writable
+descendant mount**. It checks the mounted tree inode identities and independently
+recomputes the policy-code FrozenTree manifest digest before executing any
+policy byte. A read-only alias of an ordinary worker-writable tree is therefore
+not acceptable host evidence.
+
+Only after those checks does stage one open the pinned Python ELF with
+`O_NOFOLLOW`, verify its SHA256, retain the FD, and `execve` stage two through
+`/proc/self/fd/<fd>` while passing only the SHA256 of the verified bootstrap
+proof as continuity evidence. Direct execution of
+`/run/herdr/policy-code/agent-stack/bin/agent-hermes-policy-run` without both
+the held interpreter FD and stage-one proof is denied. Stage two reopens the
+fixed bootstrap proof, verifies its digest, identity, tree inodes and
+read-only/no-RW-descendant state again before importing `herdr.security`,
+`herdr.hermes_guard`, or any Hermes module.
+
+The guarded launcher then reads only the fixed bundle path and exact
+host-controlled pane env: `HERDR_POLICY_CONSUMER`,
+`HERDR_POLICY_AGENT_ID`, `HERDR_POLICY_PARENT_AGENT_ID`,
+`HERDR_POLICY_PARENT_TASK_ID`, `HERDR_POLICY_TASK_ID`,
+`HERDR_POLICY_RUN_TOKEN`, and `HERDR_POLICY_FENCING_TOKEN`. It verifies the
+canonical signed bundle, identity/fence and attested runtime. Stage two rechecks
+the inherited interpreter descriptor against `/proc/self/exe`, hashes the venv
+site-packages import surface, installs a fresh `sys.pycache_prefix`, and adds
+the verified site-packages without processing `.pth` files. Conventional
+`__pycache__` and sourceless `.pyc` files have no execution authority. Empty,
+truncated, noncanonical or invalid proofs/bundles fail closed. CLI/env-selected
+grant, key, bundle, policy code and Hermes root paths have no authority.
 Before importing Hermes modules, bootstrap checks version 0.21.5, the audited
 Git HEAD `ee5ee84a345204a3b1d6ef6ba1ab747e602867b9`, a clean tree and the
 deterministic digest of actual tracked bytes. Every pre-guard Git command uses
@@ -268,10 +298,17 @@ The guard also owns the installed Hermes v0.21.5 auxiliary provider seams
 must match an exact signed provider endpoint/API mode and trusted pool
 credential before the provider callback runs. Native Anthropic credential
 rotation is disabled in policy mode; a future refresh requires a trusted broker
-that re-binds the new credential identity before use. Before any Hermes-facing
-module import, the launcher sets `HERMES_SAFE_MODE=1` and
-`HERMES_ENABLE_PROJECT_PLUGINS=0`; unpinned user/project/entry-point plugins
-and user shell/webhook hooks therefore have no execution authority.
+that re-binds the new credential identity before use. Before any Hermes-facing module import, policy mode sets
+`HERMES_SAFE_MODE=1` and `HERMES_ENABLE_PROJECT_PLUGINS=0`. Because Hermes
+loads profile/project dotenv with override semantics, the guard also wraps the
+dotenv loader and reasserts these values after every layer, while
+`PluginManager.discover_and_load` is independently disabled. A `.env` cannot
+re-enable user/project/entry-point Python. Process-capable tools are similarly
+restricted to the attested local backend: terminal config is forced to
+`env_type=local`, cached environments are checked before execution, and
+`execute_code` rejects any non-local backend object. SSH, Docker, Modal,
+Daytona, Vercel and plugin terminal backends require a future separately
+attested policy and are not authorized by #76.
 
 ## #82 integration interface
 
@@ -279,39 +316,42 @@ and user shell/webhook hooks therefore have no execution authority.
 implement #82 integration yet or duplicate its split-intent and
 scheduler/sentinel recovery fixes. Required integration steps:
 
-1. Precreate an empty bundle inode through `stage_policy_bundle` on the host;
-   retain its FD and device/inode. Readonly-bind that inode to
-   `/run/herdr-policy/grant.bundle.json` before bwrap starts. Mount #76 policy
-   code and `agent-stack/policy-bin` read-only; ensure that directory leads PATH
-   inside the pane and that `hermes` resolves to the guarded launcher. In the
-   same bwrap lifetime, bind the exact
-   `/home/agentops/.hermes/hermes-agent` root and exact
-   `/home/agentops/.local/share/uv/python/cpython-3.11.16-linux-x86_64-gnu`
-   root as dedicated read-only mounts. The launcher rejects a writable mount,
-   the host root mount, or a parent-only mount; these roots must remain
-   read-only until the guarded process exits.
-2. Supply all seven `HERDR_POLICY_*` identity env fields through host-controlled
+1. Freeze four host-owned sources outside worker-writable roots: an independent
+   bootstrap tree containing only the reviewed `hermes` entry and stage-one
+   verifier, the approved #76 policy-code tree, the exact Hermes tree, and the
+   exact CPython runtime tree. Retain their directory FDs. Bind them as exact
+   read-only mounts at `/run/herdr-bootstrap`, `/run/herdr/policy-code`, the
+   fixed Hermes root and fixed Python root, with no writable descendant mount.
+   PATH inside the pane must begin with `/run/herdr-bootstrap`, never the policy
+   tree. Before bwrap, generate the bounded `immutable-trees.json` from those
+   retained FrozenTree identities/digests and include it in the independent
+   bootstrap snapshot. A mutable checkout merely re-bound read-only is not an
+   accepted source.
+2. Precreate an empty bundle inode through `stage_policy_bundle` on the host;
+   retain its FD and device/inode and readonly-bind that same inode to
+   `/run/herdr-policy/grant.bundle.json` before bwrap starts.
+3. Supply all seven `HERDR_POLICY_*` identity env fields through host-controlled
    `PaneSplitParams.env` before bwrap. #82 already supplies task ID and run
    token in its own launch context; it must additionally supply consumer,
    agent ID, parent agent/task IDs and fencing token in the names above.
-3. Verify actual bwrap state and produce its host attestation. Set
+4. Verify actual bwrap state and produce its host attestation. Set
    `RuntimeAssurance` from observed writable mounts and network access. Set
    `credentials_isolated=true` only after raw credential files and env are
    physically inaccessible to tool-spawned processes. Read-only credential
    exposure is still exposure. Process tools fail closed otherwise.
-4. Build the exact grant, including current/parent identity, process ceilings,
+5. Build the exact grant, including current/parent identity, process ceilings,
    exact tool rules and any delegated `parent_grant_hash`; call
    `child.require_subset_of(parent)` for children. Seal once through the held
    FD with the actual attestation digest. Do not rename the inode.
-5. Register verified approval evidence with `ApprovalLedger` on the host and
+6. Register verified approval evidence with `ApprovalLedger` on the host and
    serve a host-created Unix listener at `/run/herdr-policy/approval.sock`.
    Keep its SQLite database and WAL outside all pane writable mounts; expose
    only the socket to the guarded pane. Start Hermes only after this authority
    is ready. If the broker is lost, high-risk calls fail closed.
-6. Independently recheck the sandbox readonly bind, same device/inode and
+7. Independently recheck the sandbox readonly bind, same device/inode and
    SHA256 returned by `seal`. Only after this check may `herdr agent start`
    occur. A stale/failed seal or mismatch must deny launch.
-7. Kill/quarantine a superseded process before a newer fence is authoritative;
+8. Kill/quarantine a superseded process before a newer fence is authoritative;
    the grant is scoped to one exact process/run/fence.
 
 No #82 runtime or deployment change is made by #76.

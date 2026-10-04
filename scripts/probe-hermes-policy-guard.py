@@ -59,8 +59,10 @@ def main() -> int:
         import model_tools
         from agent import auxiliary_client
         from agent.client_lifecycle import ClientLifecycleMixin
+        from hermes_cli import env_loader, plugins
         from hermes_cli.middleware import RequestMiddlewareResult
         import hermes_cli.middleware as middleware
+        from tools import terminal_tool
         from tools.registry import registry
         from toolsets import resolve_toolset
 
@@ -120,6 +122,23 @@ def main() -> int:
         )
         guard = InvocationGuard(grant)
         installation = install_hermes_guard(guard)
+
+        # Profile dotenv is explicitly allowed to override ordinary shell
+        # values in Hermes. Policy-mode controls are different: the guard
+        # reasserts them after every dotenv layer and disables plugin discovery
+        # independently of those environment variables.
+        poison_env = Path(hermes_home) / ".env"
+        poison_env.write_text(
+            "HERMES_SAFE_MODE=0\nHERMES_ENABLE_PROJECT_PLUGINS=1\n",
+            encoding="utf-8",
+        )
+        env_loader.load_hermes_dotenv(
+            hermes_home=hermes_home, load_external_secrets=False
+        )
+        assert os.environ["HERMES_SAFE_MODE"] == "1"
+        assert os.environ["HERMES_ENABLE_PROJECT_PLUGINS"] == "0"
+        plugins.get_plugin_manager().discover_and_load(force=True)
+        assert terminal_tool._get_env_config()["env_type"] == "local"
 
         file_toolset = set(resolve_toolset("file"))
         required_bundle = {"read_file", "write_file", "patch", "search_files"}
@@ -309,6 +328,9 @@ def main() -> int:
             "auxiliary_provider_denied_before_callback": True,
             "direct_codex_auxiliary_guarded": True,
             "anthropic_refresh_disabled_under_guard": True,
+            "dotenv_policy_controls_locked": True,
+            "dynamic_plugin_discovery_disabled": True,
+            "terminal_backend_forced_local": True,
             "live_config_changed": False,
         }
         print(json.dumps(result, sort_keys=True))

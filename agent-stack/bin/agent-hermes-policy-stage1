@@ -1,0 +1,283 @@
+#!/usr/bin/python3 -I -S
+"""Immutable stage-one bootstrap for Herdr #76 policy mode.
+
+This file is executed only from the host-owned /run/herdr-bootstrap FrozenTree.
+It uses stdlib only, validates the independently frozen policy/runtime mounts,
+then execs stage two through the exact pinned Python inode. No code from the
+policy tree is imported or executed before these checks succeed.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import stat
+from pathlib import Path
+
+BOOTSTRAP_ROOT = Path("/run/herdr-bootstrap")
+PROOF_PATH = BOOTSTRAP_ROOT / "immutable-trees.json"
+POLICY_CODE_ROOT = Path("/run/herdr/policy-code")
+HERMES_ROOT = Path("/home/agentops/.hermes/hermes-agent")
+PYTHON_ROOT = Path("/home/agentops/.local/share/uv/python/cpython-3.11.16-linux-x86_64-gnu")
+PYTHON_PATH = PYTHON_ROOT / "bin/python3.11"
+STAGE2 = POLICY_CODE_ROOT / "agent-stack/bin/agent-hermes-policy-run"
+PYTHON_SHA256 = "1e761eb19d6f2594ab8dc64bd99ad4e1753589f3bf1ec199e4eef3aaa21e3930"
+PROOF_VERSION = "herdr-policy-bootstrap-1"
+PROOF_AUTHORITY = "herdr-host-frozen-tree"
+PROOF_ENV = "HERDR_POLICY_STAGE1_PROOF_SHA256"
+INTERPRETER_FD_ENV = "HERDR_VERIFIED_PYTHON_FD"
+MAX_PROOF = 65536
+MAX_MOUNTINFO = 1048576
+MAX_POLICY_FILES = 65536
+MAX_POLICY_BYTES = 2147483648
+_SHA = re.compile(r"^[0-9a-f]{64}$")
+IDENTITY_ENV = {
+    "consumer": "HERDR_POLICY_CONSUMER",
+    "agent_id": "HERDR_POLICY_AGENT_ID",
+    "parent_agent_id": "HERDR_POLICY_PARENT_AGENT_ID",
+    "parent_task_id": "HERDR_POLICY_PARENT_TASK_ID",
+    "task_id": "HERDR_POLICY_TASK_ID",
+    "run_token": "HERDR_POLICY_RUN_TOKEN",
+    "fencing_token": "HERDR_POLICY_FENCING_TOKEN",
+}
+
+
+def _fail(message: str):
+    raise SystemExit(message)
+
+
+def _unescape(value: str) -> str:
+    for old, new in ((r"\040", " "), (r"\011", "\t"), (r"\012", "\n"), (r"\134", "\\")):
+        value = value.replace(old, new)
+    return value
+
+
+def _mount_rows(path: Path = Path("/proc/self/mountinfo")) -> dict[str, set[str]]:
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(MAX_MOUNTINFO + 1)
+    except OSError as exc:
+        _fail("cannot verify bootstrap mount namespace")
+    if len(raw) > MAX_MOUNTINFO:
+        _fail("bootstrap mount evidence exceeds bound")
+    rows: dict[str, set[str]] = {}
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError:
+        _fail("bootstrap mount evidence malformed")
+    if len(lines) > 4096:
+        _fail("bootstrap mount count exceeds bound")
+    for line in lines:
+        fields = line.split(" - ", 1)[0].split()
+        if len(fields) < 6:
+            _fail("bootstrap mount evidence malformed")
+        rows[_unescape(fields[4])] = set(fields[5].split(","))
+    return rows
+
+
+def _require_exact_ro_tree(path: Path, rows: dict[str, set[str]]) -> os.stat_result:
+    target = str(path)
+    modes = rows.get(target)
+    if modes is None or "ro" not in modes or path == Path("/"):
+        _fail(f"security path is not an exact read-only trust mount: {path}")
+    for name, child_modes in rows.items():
+        if "rw" not in child_modes or name == target:
+            continue
+        try:
+            if path in Path(name).parents:
+                _fail(f"writable mount below immutable trust root: {path}")
+        except (OSError, ValueError):
+            _fail("bootstrap mount evidence malformed")
+    try:
+        info = os.stat(path, follow_symlinks=False)
+    except OSError:
+        _fail(f"immutable trust root unavailable: {path}")
+    if not stat.S_ISDIR(info.st_mode):
+        _fail(f"immutable trust root is not a directory: {path}")
+    return info
+
+
+def _read_regular(path: Path, limit: int) -> bytes:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        _fail(f"trusted bootstrap file unavailable: {path}")
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            _fail(f"trusted bootstrap file invalid: {path}")
+        chunks: list[bytes] = []
+        remaining = limit + 1
+        while remaining:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > limit:
+            _fail(f"trusted bootstrap file exceeds bound: {path}")
+        return raw
+    finally:
+        os.close(fd)
+
+
+def _identity_from_env() -> dict[str, object]:
+    result: dict[str, object] = {}
+    for field, env_name in IDENTITY_ENV.items():
+        value = os.environ.get(env_name)
+        if value is None or not value or len(value) > 512:
+            _fail("bootstrap identity environment incomplete")
+        if field == "fencing_token":
+            try:
+                number = int(value)
+            except ValueError:
+                _fail("bootstrap fencing token malformed")
+            if not 0 <= number < 2**63:
+                _fail("bootstrap fencing token malformed")
+            result[field] = number
+        else:
+            result[field] = value
+    return result
+
+
+def _canonical(value: object) -> bytes:
+    try:
+        return json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        _fail("bootstrap proof is not canonical JSON")
+
+
+def _read_proof(path: Path = PROOF_PATH) -> tuple[dict, bytes]:
+    raw = _read_regular(path, MAX_PROOF)
+    try:
+        proof = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        _fail("bootstrap proof malformed")
+    expected_keys = {"schema_version", "authority", "identity", "trees"}
+    if not isinstance(proof, dict) or set(proof) != expected_keys:
+        _fail("bootstrap proof fields differ")
+    if proof["schema_version"] != PROOF_VERSION or proof["authority"] != PROOF_AUTHORITY:
+        _fail("bootstrap proof authority/version mismatch")
+    identity = proof["identity"]
+    if identity != _identity_from_env():
+        _fail("bootstrap proof identity mismatch")
+    expected = {str(POLICY_CODE_ROOT), str(HERMES_ROOT), str(PYTHON_ROOT)}
+    trees = proof["trees"]
+    if not isinstance(trees, dict) or set(trees) != expected:
+        _fail("bootstrap proof tree set incomplete")
+    for target, value in trees.items():
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"device", "inode", "source_digest", "snapshot_kind"}
+            or type(value["device"]) is not int
+            or type(value["inode"]) is not int
+            or not 0 <= value["device"] < 2**64
+            or not 0 < value["inode"] < 2**64
+            or not isinstance(value["source_digest"], str)
+            or not _SHA.fullmatch(value["source_digest"])
+            or value["snapshot_kind"] != "host-frozen-copy"
+        ):
+            _fail(f"bootstrap proof tree malformed: {target}")
+    return proof, raw
+
+
+def _tree_manifest_digest(root: Path) -> str:
+    """Recompute FrozenTree.source_digest for the policy tree only."""
+    manifest: dict[str, str] = {}
+    total = 0
+    try:
+        paths = sorted(root.rglob("*"), key=lambda p: p.relative_to(root).as_posix())
+    except OSError:
+        _fail("policy snapshot traversal failed")
+    for path in paths:
+        relative = path.relative_to(root).as_posix()
+        try:
+            info = path.lstat()
+        except OSError:
+            _fail("policy snapshot changed during verification")
+        if stat.S_ISDIR(info.st_mode):
+            continue
+        if not stat.S_ISREG(info.st_mode) or path.is_symlink():
+            _fail("policy snapshot contains non-regular entry")
+        if len(manifest) >= MAX_POLICY_FILES:
+            _fail("policy snapshot file count exceeds bound")
+        total += info.st_size
+        if total > MAX_POLICY_BYTES:
+            _fail("policy snapshot bytes exceed bound")
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb", buffering=0) as stream:
+                while True:
+                    chunk = stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+        except OSError:
+            _fail("policy snapshot changed during verification")
+        manifest[relative] = digest.hexdigest()
+    return hashlib.sha256(_canonical(dict(sorted(manifest.items())))).hexdigest()
+
+
+def _verify_trees(proof: dict, rows: dict[str, set[str]]) -> None:
+    trees = proof["trees"]
+    for target in (POLICY_CODE_ROOT, HERMES_ROOT, PYTHON_ROOT):
+        info = _require_exact_ro_tree(target, rows)
+        expected = trees[str(target)]
+        if (info.st_dev, info.st_ino) != (expected["device"], expected["inode"]):
+            _fail(f"immutable trust tree identity mismatch: {target}")
+    if _tree_manifest_digest(POLICY_CODE_ROOT) != trees[str(POLICY_CODE_ROOT)]["source_digest"]:
+        _fail("policy snapshot digest mismatch")
+
+
+def _open_verified_python() -> int:
+    try:
+        fd = os.open(PYTHON_PATH, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        _fail("pinned Python interpreter unavailable")
+    digest = hashlib.sha256()
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            _fail("pinned Python interpreter is not regular")
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        if digest.hexdigest() != PYTHON_SHA256:
+            _fail("pinned Python interpreter digest mismatch")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(os.sys.argv[1:] if argv is None else argv)
+    rows = _mount_rows()
+    _require_exact_ro_tree(BOOTSTRAP_ROOT, rows)
+    proof, raw = _read_proof()
+    _verify_trees(proof, rows)
+    stage2 = POLICY_CODE_ROOT / "agent-stack/bin/agent-hermes-policy-run"
+    try:
+        info = stage2.lstat()
+    except OSError:
+        _fail("policy stage-two unavailable")
+    if not stat.S_ISREG(info.st_mode) or stage2.is_symlink():
+        _fail("policy stage-two is not a regular file")
+    fd = _open_verified_python()
+    os.set_inheritable(fd, True)
+    env = dict(os.environ)
+    env[PROOF_ENV] = hashlib.sha256(raw).hexdigest()
+    env[INTERPRETER_FD_ENV] = str(fd)
+    executable = f"/proc/self/fd/{fd}"
+    os.execve(executable, [executable, "-I", "-S", str(stage2), *args], env)
+    return 127
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -14,6 +15,7 @@ import pytest
 from herdr import security
 
 LAUNCHER = Path(__file__).resolve().parents[2] / 'agent-stack/bin/agent-hermes-policy-run'
+STAGE1 = Path(__file__).resolve().parents[2] / 'agent-stack/bin/agent-hermes-policy-stage1'
 POLICY_BIN = LAUNCHER.parents[1] / 'policy-bin/hermes'
 
 
@@ -25,11 +27,20 @@ def _launcher():
     return module
 
 
+def _stage1():
+    loader = importlib.machinery.SourceFileLoader('herdr76_policy_stage1_test', str(STAGE1))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
 def test_fixed_production_entry_preserves_argv_without_policy_override(monkeypatch):
     module = _launcher()
     seen = []
     monkeypatch.setattr(module, 'bootstrap', lambda args: seen.append(args) or 0)
     monkeypatch.setenv(module._INTERPRETER_FD_ENV, 'test-stage-two')
+    monkeypatch.setenv(module.STAGE1_PROOF_ENV, 'a' * 64)
     monkeypatch.setattr(sys, 'argv', [str(LAUNCHER), '--grant', '/model/choice', '--key-fd', '3'])
     assert module.main() == 0
     assert seen == [['--grant', '/model/choice', '--key-fd', '3']]
@@ -39,7 +50,12 @@ def test_fixed_production_entry_preserves_argv_without_policy_override(monkeypat
 def test_policy_bin_hermes_invokes_guarded_launcher():
     assert POLICY_BIN.is_file()
     assert not POLICY_BIN.is_symlink()
-    assert POLICY_BIN.read_text() == '#!/bin/sh\nexec /usr/bin/python3 -I -S /run/herdr/policy-code/agent-stack/bin/agent-hermes-policy-run "$@"\n'
+    assert POLICY_BIN.read_text() == (
+        '#!/bin/sh\n'
+        'exec /home/agentops/.local/share/uv/python/cpython-3.11.16-linux-x86_64-gnu/bin/python3.11 '
+        '-I -S /run/herdr-bootstrap/agent-hermes-policy-stage1 "$@"\n'
+    )
+    assert "/run/herdr/policy-code" not in POLICY_BIN.read_text()
     assert POLICY_BIN.stat().st_mode & 0o111
     assert LAUNCHER.read_text(encoding="utf-8").splitlines()[0] == (
         "#!/usr/bin/python3 -I -S"
@@ -231,7 +247,16 @@ def test_production_trust_mount_requires_dedicated_readonly_exact_root(monkeypat
     trusted = tmp_path / "trusted"
 
     monkeypatch.setattr(module, "_covering_mount", lambda path: (trusted, {"ro", "nosuid"}))
+    monkeypatch.setattr(module, "_mount_rows", lambda: {str(trusted): {"ro", "nosuid"}})
     module._require_production_mount(trusted, exact=True)
+
+    monkeypatch.setattr(
+        module, "_mount_rows",
+        lambda: {str(trusted): {"ro"}, str(trusted / "nested"): {"rw"}},
+    )
+    with pytest.raises(SystemExit, match="writable mount below immutable trust root"):
+        module._require_production_mount(trusted, exact=True)
+    monkeypatch.setattr(module, "_mount_rows", lambda: {str(trusted): {"ro"}})
 
     monkeypatch.setattr(module, "_covering_mount", lambda path: (Path("/"), {"ro"}))
     with pytest.raises(SystemExit, match="dedicated read-only trust mount"):
@@ -256,12 +281,85 @@ def test_production_bootstrap_checks_all_lifetime_trust_roots_before_hashing(mon
         if path == module.PYTHON_ROOT:
             raise RuntimeError("stop-after-trust-roots")
 
+    monkeypatch.setattr(module, "_require_stage1_continuity", lambda: calls.append(("stage1", True)))
     monkeypatch.setattr(module, "_require_production_mount", require)
     with pytest.raises(RuntimeError, match="stop-after-trust-roots"):
         module.bootstrap([])
     assert calls == [
+        ("stage1", True),
         (module.BUNDLE_PATH, True),
-        (module.POLICY_CODE_ROOT, False),
+        (module.POLICY_CODE_ROOT, True),
         (module.HERMES_ROOT, True),
         (module.PYTHON_ROOT, True),
     ]
+
+
+def test_stage1_verifies_frozen_identity_digest_and_rw_descendants(monkeypatch, tmp_path):
+    module = _stage1()
+    bootstrap = tmp_path / "bootstrap"
+    policy = tmp_path / "policy"
+    hermes = tmp_path / "hermes"
+    python_root = tmp_path / "python"
+    for root in (bootstrap, policy, hermes, python_root):
+        root.mkdir()
+    (policy / "herdr").mkdir()
+    (policy / "herdr/security.py").write_text("VALUE = 1\\n", encoding="utf-8")
+    (hermes / "marker").write_text("h", encoding="utf-8")
+    (python_root / "marker").write_text("p", encoding="utf-8")
+
+    monkeypatch.setattr(module, "BOOTSTRAP_ROOT", bootstrap)
+    monkeypatch.setattr(module, "POLICY_CODE_ROOT", policy)
+    monkeypatch.setattr(module, "HERMES_ROOT", hermes)
+    monkeypatch.setattr(module, "PYTHON_ROOT", python_root)
+    identity = {
+        "consumer": "github:Bbambaaamm/herdr",
+        "agent_id": "agent",
+        "parent_agent_id": "parent",
+        "parent_task_id": "parent-task",
+        "task_id": "task",
+        "run_token": "run",
+        "fencing_token": 9,
+    }
+    for field, env_name in module.IDENTITY_ENV.items():
+        monkeypatch.setenv(env_name, str(identity[field]))
+
+    rows = {str(root): {"ro"} for root in (bootstrap, policy, hermes, python_root)}
+    policy_digest = module._tree_manifest_digest(policy)
+    proof = {
+        "schema_version": module.PROOF_VERSION,
+        "authority": module.PROOF_AUTHORITY,
+        "identity": identity,
+        "trees": {},
+    }
+    for index, root in enumerate((policy, hermes, python_root)):
+        info = root.stat()
+        proof["trees"][str(root)] = {
+            "device": info.st_dev,
+            "inode": info.st_ino,
+            "source_digest": policy_digest if root == policy else str(index + 1) * 64,
+            "snapshot_kind": "host-frozen-copy",
+        }
+    proof_path = bootstrap / "immutable-trees.json"
+    proof_path.write_text(
+        json.dumps(proof, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    parsed, _ = module._read_proof(proof_path)
+    module._verify_trees(parsed, rows)
+
+    poisoned = dict(rows)
+    poisoned[str(policy / "nested")] = {"rw"}
+    with pytest.raises(SystemExit, match="writable mount below immutable trust root"):
+        module._verify_trees(parsed, poisoned)
+
+    (policy / "herdr/security.py").write_text("VALUE = 2\\n", encoding="utf-8")
+    with pytest.raises(SystemExit, match="policy snapshot digest mismatch"):
+        module._verify_trees(parsed, rows)
+
+
+def test_stage2_direct_execution_without_stage1_proof_is_rejected(monkeypatch):
+    module = _launcher()
+    monkeypatch.delenv(module._INTERPRETER_FD_ENV, raising=False)
+    monkeypatch.delenv(module.STAGE1_PROOF_ENV, raising=False)
+    with pytest.raises(SystemExit, match="verified immutable stage-one bootstrap required"):
+        module.main()

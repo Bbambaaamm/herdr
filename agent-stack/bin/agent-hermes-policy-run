@@ -8,6 +8,8 @@ select a grant, key, policy module, or executable.
 from __future__ import annotations
 
 import importlib
+import importlib.machinery
+import importlib.util
 import hashlib
 import os
 import re
@@ -19,6 +21,10 @@ from pathlib import Path
 from typing import Any
 
 BUNDLE_PATH = Path("/run/herdr-policy/grant.bundle.json")
+BOOTSTRAP_ROOT = Path("/run/herdr-bootstrap")
+BOOTSTRAP_STAGE1 = BOOTSTRAP_ROOT / "agent-hermes-policy-stage1"
+BOOTSTRAP_PROOF = BOOTSTRAP_ROOT / "immutable-trees.json"
+STAGE1_PROOF_ENV = "HERDR_POLICY_STAGE1_PROOF_SHA256"
 POLICY_CODE_ROOT = Path("/run/herdr/policy-code")
 HERMES_ROOT = Path("/home/agentops/.hermes/hermes-agent")
 HERMES_HEAD = "ee5ee84a345204a3b1d6ef6ba1ab747e602867b9"
@@ -80,10 +86,66 @@ def _covering_mount(path: Path) -> tuple[Path, set[str]]:
     return best
 
 
+def _mount_rows() -> dict[str, set[str]]:
+    try:
+        raw = Path("/proc/self/mountinfo").read_bytes()
+    except OSError as exc:
+        raise SystemExit("cannot verify policy mount namespace") from exc
+    if len(raw) > 1_048_576:
+        raise SystemExit("policy mount evidence exceeds bound")
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise SystemExit("policy mount evidence malformed") from exc
+    if len(lines) > 4096:
+        raise SystemExit("policy mount count exceeds bound")
+    rows: dict[str, set[str]] = {}
+    for line in lines:
+        fields = line.split(" - ", 1)[0].split()
+        if len(fields) < 6:
+            raise SystemExit("policy mount evidence malformed")
+        rows[_unescape_mount(fields[4])] = set(fields[5].split(","))
+    return rows
+
+
 def _require_production_mount(path: Path, *, exact: bool = False) -> None:
     mount, options = _covering_mount(path)
     if "ro" not in options or mount == Path("/") or (exact and mount != path):
         raise SystemExit(f"security path is not on a dedicated read-only trust mount: {path}")
+    target = Path(path)
+    for name, modes in _mount_rows().items():
+        if "rw" not in modes:
+            continue
+        candidate = Path(name)
+        if candidate != target and target in candidate.parents:
+            raise SystemExit(f"writable mount below immutable trust root: {path}")
+
+
+def _load_stage1_module() -> Any:
+    if BOOTSTRAP_STAGE1.is_symlink() or not BOOTSTRAP_STAGE1.is_file():
+        raise SystemExit("immutable stage-one unavailable")
+    loader = importlib.machinery.SourceFileLoader("herdr_policy_stage1_verified", str(BOOTSTRAP_STAGE1))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise SystemExit("immutable stage-one import unavailable")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    _require_module_origin(module, BOOTSTRAP_ROOT, "policy stage-one")
+    return module
+
+
+def _require_stage1_continuity() -> None:
+    proof_digest = os.environ.get(STAGE1_PROOF_ENV, "")
+    if not re.fullmatch(r"[0-9a-f]{64}", proof_digest):
+        raise SystemExit("verified stage-one proof is required")
+    _require_production_mount(BOOTSTRAP_ROOT, exact=True)
+    stage1 = _load_stage1_module()
+    proof, raw = stage1._read_proof(BOOTSTRAP_PROOF)
+    if hashlib.sha256(raw).hexdigest() != proof_digest:
+        raise SystemExit("stage-one proof changed after verification")
+    rows = stage1._mount_rows()
+    stage1._require_exact_ro_tree(BOOTSTRAP_ROOT, rows)
+    stage1._verify_trees(proof, rows)
 
 
 def _reset_import_path(policy_code_root: Path, hermes_root: Path) -> None:
@@ -266,12 +328,11 @@ def bootstrap(
         and hermes_root == HERMES_ROOT
     )
     if production:
+        _require_stage1_continuity()
         _require_production_mount(bundle_path, exact=True)
-        _require_production_mount(policy_code_root)
+        _require_production_mount(policy_code_root, exact=True)
         _require_production_mount(hermes_root, exact=True)
         _require_production_mount(PYTHON_ROOT, exact=True)
-
-    if production:
         _verify_runtime(hermes_root)
     if policy_code_root.is_symlink() or not policy_code_root.is_dir():
         raise SystemExit("trusted policy code root unavailable")
@@ -314,11 +375,10 @@ def bootstrap(
 
 
 def main() -> int:
-    # No policy path, identity, key, code root, or executable override is parsed from argv.
-    if _INTERPRETER_FD_ENV not in os.environ:
-        if Path(sys.executable).resolve() != Path("/usr/bin/python3").resolve() or not sys.flags.isolated or not sys.flags.no_site:
-            raise SystemExit("bootstrap requires trusted system Python -I -S")
-        _exec_verified_interpreter(POLICY_CODE_ROOT / "agent-stack/bin/agent-hermes-policy-run", sys.argv[1:])
+    # Production stage two is reachable only through the independently frozen
+    # stage-one bootstrap. Direct execution of policy-code is never authority.
+    if _INTERPRETER_FD_ENV not in os.environ or STAGE1_PROOF_ENV not in os.environ:
+        raise SystemExit("verified immutable stage-one bootstrap required")
     return bootstrap(sys.argv[1:])
 
 

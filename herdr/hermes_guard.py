@@ -36,6 +36,25 @@ _AUTHORIZED_CALL: ContextVar[tuple[str, str] | None] = ContextVar(
 _ACTIVE_AGENT: ContextVar[Any | None] = ContextVar("herdr_active_provider_agent", default=None)
 _META_READ_TOOLS = frozenset({"tool_search", "tool_describe"})
 _BRIDGE_TOOL = "tool_call"
+_POLICY_ENV = {
+    "HERMES_SAFE_MODE": "1",
+    "HERMES_ENABLE_PROJECT_PLUGINS": "0",
+}
+
+
+def _reassert_policy_environment() -> None:
+    import os
+    for key, value in _POLICY_ENV.items():
+        os.environ[key] = value
+
+
+def _require_local_backend(env_type: Any, env: Any | None = None) -> None:
+    if env_type != "local":
+        raise PolicyDenied("process_backend_unattested", str(env_type)[:64])
+    if env is not None:
+        observed = getattr(env, "env_type", None)
+        if observed != "local":
+            raise PolicyDenied("process_backend_unattested", str(observed)[:64])
 
 
 def _call_digest(tool: str, args: Mapping[str, Any] | None) -> str:
@@ -189,10 +208,10 @@ def inspect_hermes_security_surface() -> dict[str, Any]:
     """Fail-closed compatibility probe for the installed Hermes import surface."""
     try:
         import model_tools
-        from hermes_cli import middleware, plugins
+        from hermes_cli import env_loader, middleware, plugins
         from agent import auxiliary_client, turn_api_call, conversation_loop, tool_executor
         from agent.client_lifecycle import ClientLifecycleMixin
-        from tools import connectors, read_extract
+        from tools import code_execution_tool, connectors, read_extract, terminal_tool
         from tools.file_tools_paths import _resolve_path_for_task
         from tools.registry import registry
         from toolsets import resolve_toolset
@@ -253,6 +272,20 @@ def inspect_hermes_security_surface() -> dict[str, Any]:
         raise HermesCompatibilityError("Codex auxiliary Responses seam unavailable")
     if not callable(getattr(ClientLifecycleMixin, "_try_refresh_anthropic_client_credentials", None)):
         raise HermesCompatibilityError("Anthropic credential-refresh seam unavailable")
+    if not callable(getattr(env_loader, "_load_dotenv_with_fallback", None)) or not callable(
+        getattr(env_loader, "load_hermes_dotenv", None)
+    ):
+        raise HermesCompatibilityError("dotenv policy seam unavailable")
+    if not isinstance(getattr(plugins, "PluginManager", None), type) or not callable(
+        getattr(plugins.PluginManager, "discover_and_load", None)
+    ):
+        raise HermesCompatibilityError("plugin discovery seam unavailable")
+    if not callable(getattr(terminal_tool, "_get_env_config", None)) or not callable(
+        getattr(terminal_tool, "_acquire_env", None)
+    ):
+        raise HermesCompatibilityError("terminal backend seam unavailable")
+    if not callable(getattr(code_execution_tool, "_get_or_create_env", None)):
+        raise HermesCompatibilityError("execute_code backend seam unavailable")
     if not callable(_resolve_path_for_task):
         raise HermesCompatibilityError("Hermes task path resolver unavailable")
     if not callable(getattr(read_extract, "_hosted_ocr_config", None)):
@@ -284,6 +317,9 @@ def inspect_hermes_security_surface() -> dict[str, Any]:
         "agent_tool_execution_seam": True,
         "auxiliary_provider_seams": True,
         "anthropic_refresh_disabled_under_guard": True,
+        "dotenv_policy_locked": True,
+        "dynamic_plugins_disabled_under_guard": True,
+        "local_process_backend_enforced": True,
         "task_path_resolver": True,
         "hosted_ocr_disabled_under_guard": True,
         "security_authority": "herdr_dispatch_guard",
@@ -324,8 +360,8 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
     import model_tools
     from agent import auxiliary_client, conversation_loop, turn_api_call, tool_executor
     from agent.client_lifecycle import ClientLifecycleMixin
-    from hermes_cli import middleware
-    from tools import connectors, read_extract
+    from hermes_cli import env_loader, middleware, plugins
+    from tools import code_execution_tool, connectors, read_extract, terminal_tool
     from tools.connectors import dispatch as connector_dispatch_module
     from tools.file_tools_paths import _resolve_path_for_task
     from tools.registry import ToolRegistry, registry
@@ -336,6 +372,62 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
         value, task_id
     )
     installation = GuardInstallation(guard=guard, surface=surface)
+
+    # Policy suppression is authority, not user config. Hermes reloads profile
+    # dotenv files with override=True after profile selection, so reassert the
+    # protected values after every dotenv layer and disable plugin discovery at
+    # the manager method itself. A .env cannot turn policy mode back off.
+    _reassert_policy_environment()
+    original_dotenv_layer = env_loader._load_dotenv_with_fallback
+    @functools.wraps(original_dotenv_layer)
+    def guarded_dotenv_layer(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return original_dotenv_layer(*args, **kwargs)
+        finally:
+            _reassert_policy_environment()
+    installation._remember(env_loader, "_load_dotenv_with_fallback", guarded_dotenv_layer)
+
+    original_dotenv_load = env_loader.load_hermes_dotenv
+    @functools.wraps(original_dotenv_load)
+    def guarded_dotenv_load(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return original_dotenv_load(*args, **kwargs)
+        finally:
+            _reassert_policy_environment()
+    installation._remember(env_loader, "load_hermes_dotenv", guarded_dotenv_load)
+
+    def disabled_plugin_discovery(self: Any, force: bool = False) -> None:
+        _reassert_policy_environment()
+        self._discovered = True
+        return None
+    installation._remember(plugins.PluginManager, "discover_and_load", disabled_plugin_discovery)
+
+    # #76 only attests the local process backend. Model-visible terminal and
+    # execute_code must not escape to SSH/Docker/Modal/Daytona/plugin backends.
+    original_terminal_config = terminal_tool._get_env_config
+    @functools.wraps(original_terminal_config)
+    def guarded_terminal_config() -> dict[str, Any]:
+        config = dict(original_terminal_config())
+        config["env_type"] = "local"
+        return config
+    installation._remember(terminal_tool, "_get_env_config", guarded_terminal_config)
+
+    original_acquire_env = terminal_tool._acquire_env
+    @functools.wraps(original_acquire_env)
+    def guarded_acquire_env(plan: Any, task_id: Any) -> Any:
+        _require_local_backend(getattr(plan, "env_type", None))
+        env = original_acquire_env(plan, task_id)
+        _require_local_backend(getattr(plan, "env_type", None), env)
+        return env
+    installation._remember(terminal_tool, "_acquire_env", guarded_acquire_env)
+
+    original_code_env = code_execution_tool._get_or_create_env
+    @functools.wraps(original_code_env)
+    def guarded_code_env(task_id: str) -> Any:
+        env, env_type = original_code_env(task_id)
+        _require_local_backend(env_type, env)
+        return env, env_type
+    installation._remember(code_execution_tool, "_get_or_create_env", guarded_code_env)
 
     # A read_file PDF fallback can otherwise consume FIRECRAWL_API_KEY and send
     # document bytes to hosted OCR while the model only invoked a READ-class
@@ -403,9 +495,39 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
         provider: str | None = None,
         api_mode: str | None = None,
     ) -> Any:
+        # v0.21.5 Relay may defer stream_factory until first iteration, after
+        # middleware/fallback state has changed. Reproduce the audited wrapper
+        # but put authorization immediately around the physical create().
         _authorize_aux_transport(guard, client, provider, api_mode)
-        return original_aux_stream(
-            client, kwargs, provider=provider, api_mode=api_mode
+        from agent.auxiliary_wire import prepare_chat_messages
+        from agent import relay_llm
+        from agent.auxiliary_hooks import run_with_aux_hooks
+
+        prepared = prepare_chat_messages(client, kwargs)
+        def checked_create(request: dict[str, Any]) -> Any:
+            _authorize_aux_transport(guard, client, provider, api_mode)
+            transformed = auxiliary_client.bypass_chat_sdk_request_transform(request, client)
+            return client.chat.completions.create(**transformed)
+
+        route = auxiliary_client._relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+        if route is None:
+            return checked_create(prepared)
+        provider_name, fallback_model, metadata = route
+        model_name = str(prepared.get("model") or fallback_model)
+        return run_with_aux_hooks(
+            lambda: relay_llm.stream_current(
+                prepared, checked_create, name=provider_name, model_name=model_name,
+                finalizer=dict, metadata=metadata,
+                completed_response_predicate=lambda value: hasattr(value, "choices"),
+            ),
+            aux_task=str(metadata.get("auxiliary_task") or ""),
+            metadata=metadata,
+            client=client,
+            kwargs=prepared,
+            provider=provider_name,
+            model=model_name,
+            api_mode=str(metadata.get("api_mode") or ""),
+            streaming=True,
         )
 
     installation._remember(
