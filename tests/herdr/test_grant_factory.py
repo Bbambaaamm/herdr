@@ -113,3 +113,10 @@ def test_narrow_scope_does_not_relabel_a_broader_provider_guarantee(tmp_path):
     broader=replace(registry.providers[0],data_policy=policy)
     with pytest.raises(SecurityError,match="exceeds admitted scope"):
         build_host_grant(**{**kwargs,"registry":RegistrySnapshot(registry.capabilities,(broader,),registry.executors)})
+
+
+def test_host_grant_rejects_other_provider_pool_reference(tmp_path):
+    kwargs=inputs(tmp_path)
+    broker=replace(kwargs["broker_inventory"][0],credential_refs=("pool:provider-b:entry-1",))
+    with pytest.raises(SecurityError,match="another provider"):
+        build_host_grant(**{**kwargs,"broker_inventory":(broker,)})

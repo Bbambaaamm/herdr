@@ -586,3 +586,9 @@ def test_duplicate_v4a_add_targets_deny_before_any_file_effect(tmp_path):
         assert result.error=="duplicate V4A Add target"
         assert applied==[] and not (root/"new.txt").exists()
     finally: authority.close()
+
+
+def test_auxiliary_endpoint_preserves_query_and_path_slashes():
+    from herdr.hermes_guard import _endpoint
+    assert _endpoint("https://gateway.example/v1?tenant=approved/")!="https://gateway.example/v1?tenant=approved"
+    assert _endpoint("https://gateway.example/v1//")!="https://gateway.example/v1/"

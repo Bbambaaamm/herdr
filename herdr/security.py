@@ -974,8 +974,8 @@ class TaintRestrictions:
         _exact_keys(directives, {"deny_tools", "deny_providers"})
         return cls(
             provenance=tuple(provenance),
-            deny_tools=tuple(directives["deny_tools"]),
-            deny_providers=tuple(directives["deny_providers"]),
+            deny_tools=directives["deny_tools"],
+            deny_providers=directives["deny_providers"],
         )
 
 

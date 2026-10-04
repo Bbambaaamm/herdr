@@ -925,3 +925,11 @@ def test_approval_broker_real_stalled_peer_does_not_block_other_connection(tmp_p
 def test_approval_broker_requires_host_peer_authority(tmp_path):
     with pytest.raises(ValueError,match="host approval peer"):
         serve_approvals(None,ApprovalLedger(tmp_path/"a.db"))
+
+
+@pytest.mark.parametrize("key",["deny_tools","deny_providers"])
+@pytest.mark.parametrize("scalar",["terminal",None,123,{"terminal":True}])
+def test_untrusted_taint_arrays_reject_scalar_or_object(key,scalar):
+    directives={"deny_tools":[],"deny_providers":[]};directives[key]=scalar
+    with pytest.raises(SecurityError):
+        TaintRestrictions.from_untrusted_directives((),directives)

@@ -314,6 +314,10 @@ def test_stage1_verifies_frozen_identity_digest_and_rw_descendants(monkeypatch, 
     (policy / "herdr/security.py").write_text("VALUE = 1\\n", encoding="utf-8")
     (hermes / "marker").write_text("h", encoding="utf-8")
     (python_root / "marker").write_text("p", encoding="utf-8")
+    stdlib=python_root / "lib/python3.11"
+    stdlib.mkdir(parents=True)
+    (stdlib / "approved.py").write_text("approved=True\n")
+    monkeypatch.setattr(module,"PYTHON_STDLIB_SHA256",module._stdlib_import_digest(stdlib))
 
     monkeypatch.setattr(module, "BOOTSTRAP_ROOT", bootstrap)
     monkeypatch.setattr(module, "POLICY_CODE_ROOT", policy)
@@ -498,3 +502,27 @@ def test_actual_user_namespace_keeps_stage0_verification_before_host_handshake()
         pytest.skip("kernel user-namespace prerequisite unavailable")
     assert result.returncode==0,result.stderr
     assert "ready-for-host-auth" in result.stdout
+
+
+def test_stage_two_bootstrap_json_encoder_is_available():
+    module=_launcher()
+    assert module._canonical_bootstrap({"op":"stage2"})==b'{"op":"stage2"}'
+
+def test_independent_stage1_rejects_changed_startup_stdlib_before_exec(tmp_path,monkeypatch):
+    module=_stage1();root=tmp_path/"python";stdlib=root/"lib/python3.11"
+    (stdlib/"encodings").mkdir(parents=True)
+    entry=stdlib/"encodings/__init__.py";entry.write_text("audited=True\n")
+    expected=module._stdlib_import_digest(stdlib)
+    monkeypatch.setattr(module,"PYTHON_ROOT",root)
+    monkeypatch.setattr(module,"PYTHON_STDLIB_SHA256",expected)
+    module._verify_pinned_startup_imports()
+    entry.write_text("raise RuntimeError('must never execute')\n")
+    with pytest.raises(SystemExit,match="before interpreter exec"):
+        module._verify_pinned_startup_imports()
+
+@pytest.mark.parametrize("name",["lib/python311.zip","pyvenv.cfg","bin/pyvenv.cfg"])
+def test_stage1_denies_unaudited_startup_prefix_or_zip(tmp_path,monkeypatch,name):
+    module=_stage1();root=tmp_path/"python";path=root/name
+    path.parent.mkdir(parents=True);path.write_text("untrusted")
+    monkeypatch.setattr(module,"PYTHON_ROOT",root)
+    with pytest.raises(SystemExit,match="startup override"):module._verify_pinned_startup_imports()

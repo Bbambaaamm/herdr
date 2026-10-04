@@ -342,7 +342,7 @@ def _bind_pool_credential(pool: Any, raw: str, provider: str, refs: tuple[str, .
 
 
 def _endpoint(value: Any) -> str:
-    return str(value or "").rstrip("/")
+    return str(value or "")
 
 
 def _effective_aux_route(guard: InvocationGuard, client: Any, provider: Any, api_mode: Any) -> Any:

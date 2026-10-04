@@ -127,6 +127,11 @@ def build_host_grant(
         route_training = _most_restrictive(
             [row.training for row in policy_rows], _TRAINING_ORDER, "training"
         )
+        for credential_ref in broker.credential_refs:
+            if isinstance(credential_ref,str) and credential_ref.startswith("pool:"):
+                parts=credential_ref.split(":",2)
+                if len(parts)!=3 or parts[1]!=provider_id:
+                    raise SecurityError("broker credential reference belongs to another provider")
         route = ProviderRoute(
             provider=provider_id, base_url=broker.base_url, api_mode=broker.api_mode,
             regions=tuple(regions), data_classes=tuple(classes),

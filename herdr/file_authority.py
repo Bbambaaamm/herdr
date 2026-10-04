@@ -354,6 +354,11 @@ class RootFDWorkspace:
     def write_bytes(self, path: str, content: bytes, *, expected_content: bytes|None=None) -> tuple[int, str]:
         if len(content) > MAX_FILE_BYTES:
             raise FileAuthorityError("write exceeds policy-mode bound")
+        if expected_content is not None:
+            # Linux rename cannot atomically compare an arbitrary raw writer's
+            # file preimage. Advisory locks do not establish exclusivity.
+            # Do not report a successful conditional replacement with a race.
+            raise FileAuthorityError("conditional replacement unavailable on shared workspace")
         parent, name = self._parent(path, create=True)
         temp = f".herdr-policy-{os.getpid()}-{os.urandom(12).hex()}"
         temp_fd = -1
@@ -375,6 +380,8 @@ class RootFDWorkspace:
                 mode,
                 dir_fd=parent,
             )
+            if current is not None:
+                os.fchmod(temp_fd,mode)
             view = memoryview(content)
             while view:
                 written = os.write(temp_fd, view)
@@ -384,22 +391,6 @@ class RootFDWorkspace:
             os.fsync(temp_fd)
             os.close(temp_fd)
             temp_fd = -1
-            if expected_content is not None:
-                try:
-                    current_fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC,dir_fd=parent)
-                except FileNotFoundError as exc:
-                    raise FileAuthorityError("stale file content expectation") from exc
-                try:
-                    before=os.fstat(current_fd)
-                    observed=self._read_fd(current_fd,MAX_FILE_BYTES)
-                    after=os.fstat(current_fd)
-                    named=os.stat(name,dir_fd=parent,follow_symlinks=False)
-                    fields=("st_dev","st_ino","st_size","st_mtime_ns","st_ctime_ns")
-                    if (observed!=expected_content
-                            or tuple(getattr(before,key) for key in fields)!=tuple(getattr(after,key) for key in fields)
-                            or (named.st_dev,named.st_ino)!=(after.st_dev,after.st_ino)):
-                        raise FileAuthorityError("stale file content expectation")
-                finally: os.close(current_fd)
             os.replace(temp, name, src_dir_fd=parent, dst_dir_fd=parent)
             os.fsync(parent)
             return len(content), hashlib.sha256(content).hexdigest()
