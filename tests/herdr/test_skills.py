@@ -581,3 +581,56 @@ def test_requested_images_require_granted_and_selected_executor_image_input(
     bundle = registry.resolve((SkillRequest("sample", "text only"),), context(), policy(item[1]),
                               LAYERS, executor_id="a-runtime")
     assert bundle.render()["skills"] and loaded == ["SKILL.md"]
+
+
+def test_unrequested_sensitive_asset_does_not_block_internal_skill(tmp_path, registry_factory):
+    item = package(tmp_path, resources={"assets/private.txt": b"sensitive data"})
+    manifest = replace(item[2], files=tuple(replace(x, data_class=DataClass.SENSITIVE)
+        if x.path == "assets/private.txt" else x for x in item[2].files))
+    (item[0] / "manifest.json").write_bytes(canonical(manifest.to_json()))
+    item = (item[0], replace(item[1], package_hash=manifest.hash), manifest)
+    registry = registry_factory(item)
+    original = registry.packages[0].load
+    loaded = []
+    def load(path):
+        loaded.append(path)
+        assert path != "assets/private.txt"
+        return original(path)
+    registry.packages[0].load = load
+    assert registry.discovery(context(), policy(item[1]), executor_id="a-runtime")["index"]
+    bundle = registry.resolve((SkillRequest("sample", "body only"),), context(), policy(item[1]),
+                              LAYERS, executor_id="a-runtime")
+    assert bundle.render()["skills"] and loaded == ["SKILL.md"]
+    loaded.clear()
+    bundle = registry.resolve((SkillRequest("sample", "private resource", ("assets/private.txt",)),),
+                              context(), policy(item[1]), LAYERS, executor_id="a-runtime")
+    assert not loaded and bundle.telemetry()["rejected"][0]["code"] == "data_class_incompatible"
+    with pytest.raises(SkillError, match="mandatory_skill_unavailable"):
+        registry.resolve((SkillRequest("sample", "private", ("assets/private.txt",)),), context(),
+            policy(item[1], mandatory=(item[1],)), LAYERS, executor_id="a-runtime")
+
+
+@pytest.mark.parametrize("kind", ["file", "broken_link", "directory_link", "fifo", "directory"])
+def test_lint_rejects_every_undeclared_or_nonregular_package_entry(tmp_path, kind):
+    root, _, _ = package(tmp_path)
+    extra = root / "extra"
+    if kind == "file":
+        extra.write_text("must not ship outside manifests")
+    elif kind == "broken_link":
+        extra.symlink_to("missing")
+    elif kind == "directory_link":
+        extra.symlink_to(tmp_path, target_is_directory=True)
+    elif kind == "fifo":
+        os.mkfifo(extra)
+    else:
+        extra.mkdir()
+    with pytest.raises(SkillError, match="(undeclared|nonregular)_package_entry"):
+        lint_package(root)
+
+
+def test_ci_regenerates_manifest_and_requires_no_provenance_diff():
+    workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml").read_text()
+    regenerate = workflow.index("python scripts/refresh_source_manifest.py")
+    verify_diff = workflow.index("git diff --exit-code -- provenance/CANONICAL_SOURCE_MANIFEST.sha256")
+    verify_hash = workflow.index("sha256sum -c provenance/CANONICAL_SOURCE_MANIFEST.sha256")
+    assert regenerate < verify_diff < verify_hash

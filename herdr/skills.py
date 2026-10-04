@@ -481,7 +481,7 @@ class SkillBundle:
         return decode(self.trace)
 
 
-def compatibility(manifest, context, executor_id):
+def compatibility(manifest, context, executor_id, resources=()):
     scope = context.scope
     if context.platform not in manifest.platforms:
         return "platform_incompatible"
@@ -509,7 +509,7 @@ def compatibility(manifest, context, executor_id):
                 or list(Training).index(policy.training) > list(Training).index(scope.training)):
             return "data_policy_incompatible"
         if any(x.data_class not in set(scope.data_classes) & set(policy.data_classes)
-               for x in manifest.files):
+               for x in manifest.files if x.path == "SKILL.md" or x.path in resources):
             return "data_class_incompatible"
     return None
 
@@ -534,13 +534,13 @@ class SkillRegistry:
         for package in self.packages:
             package.close()
 
-    def _reason(self, package, context, policy, executor_id):
+    def _reason(self, package, context, policy, executor_id, resources=()):
         if (package.manifest.hash not in policy.allowed_hashes
                 or package.approval.trust_tier not in policy.trust_tiers):
             return "consumer_unapproved"
         if package.manifest.name in policy.disabled_names:
             return "consumer_disabled"
-        return compatibility(package.manifest, context, executor_id)
+        return compatibility(package.manifest, context, executor_id, resources)
 
     def discovery(self, context: SkillNodeContext, policy: ConsumerSkillPolicy, *, executor_id: str):
         self._check(context, policy)
@@ -599,7 +599,8 @@ class SkillRegistry:
                 rejected.append({"name": package.manifest.name, "code": reason})
         for skill_name, request in sorted(requested.items()):
             package = by_name.get(skill_name)
-            reason = "unknown_skill" if package is None else self._reason(package, context, policy, executor_id)
+            reason = "unknown_skill" if package is None else self._reason(
+                package, context, policy, executor_id, request.resources)
             if reason is None:
                 declared = {x.path for x in package.manifest.files}
                 if not set(request.resources) <= declared:
@@ -657,6 +658,39 @@ class SkillRegistry:
         return SkillBundle(payload, trace)
 
 
+def _lint_tree(fd, manifest):
+    """Enumerate through held descriptors; every packaged entry is declared."""
+    allowed = {"manifest.json", *(x.path for x in manifest.files)}
+    directories = {"/".join(path.split("/")[:i]) for path in allowed
+                   for i in range(1, len(path.split("/")))}
+    seen, inspected = set(), 0
+    def walk(directory_fd, prefix=""):
+        nonlocal inspected
+        names = os.listdir(directory_fd)
+        need(len(names) <= 256, "package_tree_size")
+        for name in names:
+            inspected += 1
+            need(inspected <= 256, "package_tree_size")
+            path = prefix + name
+            info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if stat.S_ISREG(info.st_mode):
+                need(path in allowed, "undeclared_package_entry")
+                seen.add(path)
+            elif stat.S_ISDIR(info.st_mode):
+                need(path in directories, "undeclared_package_entry")
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
+                try:
+                    held = os.fstat(child)
+                    need((held.st_dev, held.st_ino) == (info.st_dev, info.st_ino), "package_path_changed")
+                    walk(child, path + "/")
+                finally:
+                    os.close(child)
+            else:
+                raise SkillError("nonregular_package_entry")
+    walk(fd)
+    need(seen == allowed, "missing_package_entry")
+
+
 def lint_package(root: Path):
     """Authoring validation, without granting trust or executing declared scripts."""
     fd = -1
@@ -664,6 +698,7 @@ def lint_package(root: Path):
         fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         manifest = SkillManifest.from_dict(decode(_read_at(fd, "manifest.json", MAX_MANIFEST)))
         need(Path(root).name == manifest.name, "directory_name_mismatch")
+        _lint_tree(fd, manifest)
         for entry in manifest.files:
             raw = _read_at(fd, entry.path, entry.size)
             need(len(raw) == entry.size and hashlib.sha256(raw).hexdigest() == entry.sha256,

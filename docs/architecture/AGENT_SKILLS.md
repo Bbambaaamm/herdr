@@ -130,3 +130,9 @@ A provider switch re-resolves and binds the same portable content to the new
 executor. Requested image resources require image input in both the grant and
 selected capability before any body or resource is opened. Unrequested images
 remain lazy and do not impose image input on a text-only use.
+
+Data-class admission covers SKILL.md and explicitly requested resources. A
+sensitive unrequested asset does not block safe text use. Authoring lint enumerates
+the entire package through held directory descriptors and rejects undeclared
+files/directories and nonregular entries. CI also regenerates the canonical
+source manifest and requires no diff before verifying its recorded digests.
