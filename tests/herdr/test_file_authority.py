@@ -104,3 +104,45 @@ def test_search_directory_walk_never_follows_replaced_root_or_symlink_entry(tmp_
         with pytest.raises((OSError,FileAuthorityError)):
             authority.list_regular_files(str(root/"link"))
     finally: authority.close()
+
+def test_search_streams_entry_bound_before_materializing_names(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from contextlib import contextmanager
+    import herdr.file_authority as module
+    root=tmp_path/"workspace";root.mkdir()
+    authority=module.RootFDWorkspace((str(root),))
+    seen=[]
+    @contextmanager
+    def scan(fd):
+        def entries():
+            for number in range(100000):
+                seen.append(number)
+                yield SimpleNamespace(name=f"entry-{number}")
+        yield entries()
+    try:
+        monkeypatch.setattr(module.os,"scandir",scan)
+        with pytest.raises(module.FileAuthorityError,match="entry count"):
+            authority.list_regular_files(str(root))
+        assert len(seen)==4097
+    finally: authority.close()
+
+def test_search_deadline_applies_during_directory_enumeration(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from contextlib import contextmanager
+    import herdr.file_authority as module
+    root=tmp_path/"workspace";root.mkdir()
+    authority=module.RootFDWorkspace((str(root),));seen=[]
+    @contextmanager
+    def scan(fd):
+        def entries():
+            for number in range(100000):
+                seen.append(number)
+                yield SimpleNamespace(name=f"entry-{number}")
+        yield entries()
+    try:
+        monkeypatch.setattr(module.os,"scandir",scan)
+        monkeypatch.setattr(module.time,"monotonic",lambda:10)
+        with pytest.raises(module.FileAuthorityError,match="elapsed"):
+            authority.list_regular_files(str(root),deadline=9)
+        assert seen==[0]
+    finally: authority.close()

@@ -16,6 +16,8 @@ authority.
 """
 from __future__ import annotations
 
+import os
+
 import base64
 import difflib
 import functools
@@ -108,7 +110,7 @@ class _PolicyFileOps:
             return common.SearchResult(error="policy-mode search supports literal content; regex dot is unsupported")
         result=common.SearchResult();total_bytes=0;deadline=time.monotonic()+2
         try:
-            paths=self._workspace.list_regular_files(path)
+            paths=self._workspace.list_regular_files(path,deadline=deadline)
             matches=[];files=[];counts={}
             for name in paths:
                 if time.monotonic()>deadline: raise FileAuthorityError("search elapsed bound exceeded")
@@ -182,11 +184,14 @@ class _PolicyFileOps:
         # V4A Add is create-only. The parser's generic apply path calls
         # write_file for both Add and Update, so interpose only the first write
         # for each Add target with an atomic no-clobber create.
-        add_targets = {
-            op.file_path
-            for op in operations
+        add_rows = [
+            op.file_path for op in operations
             if getattr(getattr(op, "operation", None), "value", None) == "add"
-        }
+        ]
+        canonical_adds = [os.path.normpath(path) for path in add_rows]
+        if len(canonical_adds) != len(set(canonical_adds)):
+            return self._common.PatchResult(error="duplicate V4A Add target")
+        add_targets = set(add_rows)
         parent = self
 
         class _V4AApplyOps:

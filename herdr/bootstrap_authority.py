@@ -17,7 +17,7 @@ import struct
 import threading
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping
 from types import MappingProxyType
@@ -83,6 +83,7 @@ class BootstrapExpectation:
     stage1_inode: int
     python_device: int
     python_inode: int
+    valid_until: float = field(default_factory=lambda: time.time() + 60)
 
     def __post_init__(self) -> None:
         try:
@@ -91,6 +92,8 @@ class BootstrapExpectation:
             raise BootstrapAuthorityError("full admitted bootstrap identity required") from exc
         object.__setattr__(self,"identity",MappingProxyType(identity))
         _canonical(dict(self.identity))
+        if type(self.valid_until) not in (float,int) or not math.isfinite(self.valid_until):
+            raise BootstrapAuthorityError("finite bootstrap deadline required")
         for name in ("proof_sha256", "stage1_sha256", "stage2_sha256", "python_sha256", "bundle_sha256"):
             _sha(getattr(self, name), name)
         for name in ("parent_pid", "parent_start_ticks", "stage1_device", "stage1_inode", "python_device", "python_inode"):
@@ -244,6 +247,7 @@ class BootstrapAuthority:
         peer_inspector: Callable[[int], PeerProcess] = inspect_peer,
         stage1_inspector: Callable[[int, str], tuple[int, int, str]] = inspect_stage1,
         peer_authorizer: Callable[[PeerProcess, BootstrapExpectation], bool] | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         info = os.stat(stage0_path)
         if not stat.S_ISREG(info.st_mode):
@@ -258,14 +262,38 @@ class BootstrapAuthority:
         self._authorize_peer = peer_authorizer
         self._expected: dict[str, BootstrapExpectation] = {}
         self._sessions: dict[str, _Session] = {}
-        self._consumed: set[str] = set()
+        self._consumed: dict[str, float] = {}
         self._lock = threading.Lock()
         self._changed = threading.Condition(self._lock)
         self._continuations: dict[str, BootstrapContinuation] = {}
+        if not callable(clock): raise BootstrapAuthorityError("host clock required")
+        self._clock = clock
+        self._connection_slots = threading.BoundedSemaphore(16)
+        self._connection_peers: set[int] = set()
+        self._connection_threads: set[threading.Thread] = set()
+        self._closed = False
+
+    def _prune(self):
+        now = self._clock()
+        if type(now) not in (float,int) or not math.isfinite(now):
+            raise BootstrapAuthorityError("finite host clock required")
+        for key, deadline in tuple(self._consumed.items()):
+            if deadline <= now:
+                self._consumed.pop(key, None)
+                self._sessions.pop(key, None)
+                self._continuations.pop(key, None)
+        for key, expected in tuple(self._expected.items()):
+            if expected.valid_until <= now:
+                self._expected.pop(key, None)
+        return now
 
     def register(self, expectation: BootstrapExpectation) -> str:
         key = identity_key(expectation.identity)
         with self._lock:
+            now = self._prune()
+            if self._closed: raise BootstrapAuthorityError("bootstrap authority closed")
+            if not 0 < expectation.valid_until - now <= 60:
+                raise BootstrapAuthorityError("expired or excessive bootstrap deadline")
             if key in self._expected or key in self._sessions or key in self._consumed:
                 raise BootstrapAuthorityError("bootstrap identity already registered or consumed")
             if len(self._expected)+len(self._sessions)+len(self._consumed)>=4096:
@@ -284,6 +312,7 @@ class BootstrapAuthority:
             raise BootstrapAuthorityError("invalid stage-one identity")
         key = identity_key(identity)
         with self._lock:
+            self._prune()
             expectation = self._expected.get(key)
         if expectation is None or dict(identity) != dict(expectation.identity):
             raise BootstrapAuthorityError("stage-one identity not registered")
@@ -334,10 +363,12 @@ class BootstrapAuthority:
             expectation=expectation,
         )
         with self._lock:
-            if key in self._sessions:
-                raise BootstrapAuthorityError("bootstrap identity already claimed")
+            now = self._prune()
+            if (self._expected.get(key) is not expectation or key in self._consumed
+                    or expectation.valid_until <= now):
+                raise BootstrapAuthorityError("bootstrap identity already claimed or expired")
             self._expected.pop(key, None)
-            self._consumed.add(key)
+            self._consumed[key] = expectation.valid_until
             self._sessions[key] = session
         return key, session
 
@@ -350,6 +381,7 @@ class BootstrapAuthority:
         if not isinstance(identity, Mapping) or identity_key(identity) != key:
             raise BootstrapAuthorityError("stage-two identity mismatch")
         with self._lock:
+            self._prune()
             current = self._sessions.get(key)
         if current is not session or session.continued:
             raise BootstrapAuthorityError("bootstrap session is not active")
@@ -378,6 +410,69 @@ class BootstrapAuthority:
             self._continuations[key] = receipt
             self._changed.notify_all()
 
+    def dispatch_connection(self, connection: socket.socket) -> bool:
+        """Reject irrelevant peers before request reads; serve eligible peers concurrently."""
+        try:
+            pid = _peer_pid(connection)
+            peer = self._inspect(pid)
+            if (peer.pid != pid or (peer.exe_device,peer.exe_inode) != self._stage0
+                    or peer.argv[:4] != (self._stage0_path,"-I","-S",self._stage1_path)):
+                raise BootstrapAuthorityError("ineligible bootstrap peer")
+            with self._lock:
+                self._prune()
+                expected = tuple(self._expected.values())
+                if self._closed or pid in self._connection_peers:
+                    raise BootstrapAuthorityError("bootstrap peer already serving")
+            candidate = next((item for item in expected
+                              if item.parent_pid == peer.ppid), None)
+            if candidate is None or self._inspect(candidate.parent_pid).start_ticks != candidate.parent_start_ticks:
+                raise BootstrapAuthorityError("bootstrap peer has no registered parent")
+            if self._inspect_stage1(pid,self._stage1_path) != (
+                    candidate.stage1_device,candidate.stage1_inode,candidate.stage1_sha256):
+                raise BootstrapAuthorityError("ineligible bootstrap source")
+            if not self._connection_slots.acquire(blocking=False):
+                raise BootstrapAuthorityError("bootstrap connection capacity exhausted")
+            with self._lock:
+                if self._closed or pid in self._connection_peers:
+                    self._connection_slots.release()
+                    raise BootstrapAuthorityError("bootstrap peer already serving")
+                self._connection_peers.add(pid)
+            def run():
+                try:
+                    with connection:
+                        connection.settimeout(5)
+                        self.handle_connection(connection)
+                finally:
+                    with self._lock:
+                        self._connection_peers.discard(pid)
+                        self._connection_threads.discard(threading.current_thread())
+                    self._connection_slots.release()
+            thread = threading.Thread(target=run,name="herdr-bootstrap-peer",daemon=True)
+            with self._lock: self._connection_threads.add(thread)
+            try: thread.start()
+            except BaseException:
+                with self._lock:
+                    self._connection_peers.discard(pid)
+                    self._connection_threads.discard(thread)
+                self._connection_slots.release()
+                raise
+            return True
+        except (BootstrapAuthorityError, OSError, ValueError):
+            connection.close()
+            return False
+
+    def close(self, *, timeout_seconds: float = 6) -> None:
+        if type(timeout_seconds) not in (int,float) or not math.isfinite(timeout_seconds) or not 0 <= timeout_seconds <= 6:
+            raise BootstrapAuthorityError("bounded bootstrap shutdown required")
+        with self._lock:
+            self._closed = True
+            threads = tuple(self._connection_threads)
+        deadline = time.monotonic() + timeout_seconds
+        for thread in threads:
+            thread.join(max(0,deadline-time.monotonic()))
+        if any(thread.is_alive() for thread in threads):
+            raise BootstrapAuthorityError("bootstrap connections still active")
+
     def handle_connection(self, connection: socket.socket) -> None:
         key: str | None = None
         try:
@@ -401,6 +496,7 @@ class BootstrapAuthority:
         if not isinstance(identity, InvocationIdentity):
             raise BootstrapAuthorityError("typed admitted continuation identity required")
         with self._lock:
+            self._prune()
             return self._continuations.get(identity_key(identity.to_json()))
 
     def wait_for_continuation(self, identity: InvocationIdentity, *,
@@ -412,15 +508,18 @@ class BootstrapAuthority:
         key = identity_key(identity.to_json())
         deadline = time.monotonic() + timeout_seconds
         with self._changed:
+            self._prune()
             while key not in self._continuations:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise BootstrapAuthorityError("authenticated continuation unavailable")
                 self._changed.wait(remaining)
+                self._prune()
             return self._continuations[key]
 
     def pending(self) -> int:
         with self._lock:
+            self._prune()
             return len(self._expected)
 
 
@@ -428,9 +527,7 @@ def serve_bootstrap_authority(listener: socket.socket, authority: BootstrapAutho
     """Serve registered launches; one malformed/disconnected peer never kills the broker."""
     while True:
         connection, _ = listener.accept()
-        with connection:
-            connection.settimeout(5)
-            authority.handle_connection(connection)
+        authority.dispatch_connection(connection)
 
 
 __all__ = [

@@ -322,18 +322,14 @@ def _connect_host_authority(proof_raw: bytes, stage2_fd: int, python_fd: int) ->
 
 
 def _fresh_pycache_prefix() -> str:
-    for _ in range(8):
-        token = hashlib.sha256(os.urandom(32)).hexdigest()[:24]
-        path = Path("/tmp") / f"herdr-policy-pycache-{os.getpid()}-{token}"
-        try:
-            os.mkdir(path, 0o700)
-        except FileExistsError:
-            continue
-        info = os.stat(path, follow_symlinks=False)
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or (info.st_mode & 0o077):
-            _fail("fresh pycache prefix is not private")
-        return str(path)
-    _fail("cannot create fresh pycache prefix")
+    # No cache directory exists beneath the independently frozen RO tree.
+    # Same-UID sandbox peers cannot populate this path before interpreter
+    # startup; permissions on shared /tmp would not provide that guarantee.
+    prefix = BOOTSTRAP_ROOT / "no-bytecode-cache"
+    if os.path.lexists(prefix):
+        _fail("immutable startup cache prefix must remain absent")
+    _require_exact_ro_tree(BOOTSTRAP_ROOT, _mount_rows())
+    return str(prefix)
 
 
 def _open_verified_stage2() -> int:

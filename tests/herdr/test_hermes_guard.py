@@ -565,3 +565,24 @@ def test_policy_search_cannot_delegate_shell_or_follow_a_raced_file(tmp_path,mon
         with pytest.raises(PolicyDenied,match="file_operation_unattested"):
             ops._execute
     finally: authority.close()
+
+def test_duplicate_v4a_add_targets_deny_before_any_file_effect(tmp_path):
+    from herdr.file_authority import RootFDWorkspace
+    from types import SimpleNamespace
+    root=tmp_path/"workspace";root.mkdir()
+    target=str(root/"new.txt");applied=[]
+    class Result:
+        def __init__(self,**kwargs): self.__dict__.update(kwargs)
+    parser=SimpleNamespace(
+        parse_v4a_patch=lambda raw:(
+            [SimpleNamespace(file_path=target,operation=SimpleNamespace(value="add")),
+             SimpleNamespace(file_path=str(root/"./new.txt"),operation=SimpleNamespace(value="add"))],None),
+        apply_v4a_operations=lambda *args:applied.append(args))
+    authority=RootFDWorkspace((str(root),))
+    try:
+        ops=hermes_guard._PolicyFileOps(authority,SimpleNamespace(),
+                                       SimpleNamespace(PatchResult=Result),parser)
+        result=ops.patch_v4a("two adds")
+        assert result.error=="duplicate V4A Add target"
+        assert applied==[] and not (root/"new.txt").exists()
+    finally: authority.close()
