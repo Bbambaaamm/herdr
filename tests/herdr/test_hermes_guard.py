@@ -176,14 +176,21 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
             plugin_calls.append(force)
     plugins.PluginManager = PluginManager
 
-    terminal_state = {"cached": "local", "code": "local"}
+    terminal_state = {"cached": "local", "code": "local", "created": []}
     terminal_tool = types.ModuleType("tools.terminal_tool")
     terminal_tool._get_env_config = lambda: {"env_type": "ssh", "timeout": 30}
     terminal_tool._acquire_env = lambda plan, task_id: types.SimpleNamespace(env_type=terminal_state["cached"])
+    terminal_backends = types.ModuleType("tools.terminal_tool_backends")
+    def create_environment(env_type, *args, **kwargs):
+        terminal_state["created"].append(env_type)
+        return types.SimpleNamespace(env_type=env_type)
+    terminal_backends._create_environment = create_environment
     code_execution = types.ModuleType("tools.code_execution_tool")
-    code_execution._get_or_create_env = lambda task_id: (
-        types.SimpleNamespace(env_type=terminal_state["code"]), terminal_state["code"]
-    )
+    def get_or_create_env(task_id):
+        env_type = terminal_state["code"]
+        env = terminal_backends._create_environment(env_type)
+        return env, env_type
+    code_execution._get_or_create_env = get_or_create_env
 
     middleware = types.ModuleType("hermes_cli.middleware")
     callbacks = []
@@ -223,11 +230,13 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
     tools_pkg.registry = registry_module
     tools_pkg.connectors = connector_module
     tools_pkg.terminal_tool = terminal_tool
+    tools_pkg.terminal_tool_backends = terminal_backends
     tools_pkg.code_execution_tool = code_execution
     monkeypatch.setitem(sys.modules, "tools", tools_pkg)
     monkeypatch.setitem(sys.modules, "tools.registry", registry_module)
     monkeypatch.setitem(sys.modules, "tools.connectors", connector_module)
     monkeypatch.setitem(sys.modules, "tools.terminal_tool", terminal_tool)
+    monkeypatch.setitem(sys.modules, "tools.terminal_tool_backends", terminal_backends)
     monkeypatch.setitem(sys.modules, "tools.code_execution_tool", code_execution)
     monkeypatch.setitem(sys.modules, "tools.connectors.dispatch", connector_dispatch)
     monkeypatch.setitem(sys.modules, "tools.tool_search", tool_search)
@@ -297,9 +306,16 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
             terminal_tool._acquire_env(plan, "task")
         terminal_state["cached"] = "local"
         terminal_state["code"] = "docker"
+        created_before = list(terminal_state["created"])
         with pytest.raises(PolicyDenied, match="process_backend_unattested"):
             code_execution._get_or_create_env("task")
+        # The lower creation seam denies before Docker/SSH/Modal/Daytona/plugin
+        # provisioning can perform network or credential-bearing setup.
+        assert terminal_state["created"] == created_before
         terminal_state["code"] = "local"
+        env, env_type = code_execution._get_or_create_env("task")
+        assert env_type == "local" and env.env_type == "local"
+        assert terminal_state["created"][-1] == "local"
         flags = dict(task_id="task", skip_pre_tool_call_hook=True,
                      skip_tool_request_middleware=True, skip_tool_execution_middleware=True)
         assert "ok" in model.handle_function_call("read_file", {"path": "/scoped/file"}, **flags)

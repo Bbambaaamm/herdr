@@ -211,7 +211,7 @@ def inspect_hermes_security_surface() -> dict[str, Any]:
         from hermes_cli import env_loader, middleware, plugins
         from agent import auxiliary_client, turn_api_call, conversation_loop, tool_executor
         from agent.client_lifecycle import ClientLifecycleMixin
-        from tools import code_execution_tool, connectors, read_extract, terminal_tool
+        from tools import code_execution_tool, connectors, read_extract, terminal_tool, terminal_tool_backends
         from tools.file_tools_paths import _resolve_path_for_task
         from tools.registry import registry
         from toolsets import resolve_toolset
@@ -286,6 +286,8 @@ def inspect_hermes_security_surface() -> dict[str, Any]:
         raise HermesCompatibilityError("terminal backend seam unavailable")
     if not callable(getattr(code_execution_tool, "_get_or_create_env", None)):
         raise HermesCompatibilityError("execute_code backend seam unavailable")
+    if not callable(getattr(terminal_tool_backends, "_create_environment", None)):
+        raise HermesCompatibilityError("terminal environment creation seam unavailable")
     if not callable(_resolve_path_for_task):
         raise HermesCompatibilityError("Hermes task path resolver unavailable")
     if not callable(getattr(read_extract, "_hosted_ocr_config", None)):
@@ -361,7 +363,7 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
     from agent import auxiliary_client, conversation_loop, turn_api_call, tool_executor
     from agent.client_lifecycle import ClientLifecycleMixin
     from hermes_cli import env_loader, middleware, plugins
-    from tools import code_execution_tool, connectors, read_extract, terminal_tool
+    from tools import code_execution_tool, connectors, read_extract, terminal_tool, terminal_tool_backends
     from tools.connectors import dispatch as connector_dispatch_module
     from tools.file_tools_paths import _resolve_path_for_task
     from tools.registry import ToolRegistry, registry
@@ -420,6 +422,21 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
         _require_local_backend(getattr(plan, "env_type", None), env)
         return env
     installation._remember(terminal_tool, "_acquire_env", guarded_acquire_env)
+
+    # Guard the shared physical backend constructor itself. execute_code imports
+    # this symbol immediately before provisioning; rejecting here prevents
+    # Docker/SSH/Modal/Daytona/plugin setup, network use, or credential lookup
+    # from occurring before the policy verdict.
+    original_create_environment = terminal_tool_backends._create_environment
+    @functools.wraps(original_create_environment)
+    def guarded_create_environment(env_type: str, *args: Any, **kwargs: Any) -> Any:
+        _require_local_backend(env_type)
+        env = original_create_environment(env_type, *args, **kwargs)
+        _require_local_backend(env_type, env)
+        return env
+    installation._remember(
+        terminal_tool_backends, "_create_environment", guarded_create_environment
+    )
 
     original_code_env = code_execution_tool._get_or_create_env
     @functools.wraps(original_code_env)

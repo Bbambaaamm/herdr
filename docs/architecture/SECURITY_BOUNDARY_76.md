@@ -232,9 +232,11 @@ Production has an independent stage-one trust root at
 from `/run/herdr/policy-code`**. The repository's regular
 `agent-stack/policy-bin/hermes` is source material that #82 copies into this
 host-owned bootstrap snapshot. Its only action is an absolute exec of the
-pinned CPython runtime with `-I -S` and the fixed
-`/run/herdr-bootstrap/agent-hermes-policy-stage1`. The stage-one verifier is
-stdlib-only and reads no policy Python.
+independent host-OS `/usr/bin/python3` with `-I -S` and the fixed
+`/run/herdr-bootstrap/agent-hermes-policy-stage1`. That stage-zero interpreter
+is a separate trust anchor from the pinned CPython runtime being verified: it
+must be root-owned, non-group/world-writable and outside worker-writable roots.
+The stage-one verifier is stdlib-only and reads no policy Python.
 
 Before stage two, stage one requires a bounded fixed
 `/run/herdr-bootstrap/immutable-trees.json` with
@@ -245,21 +247,25 @@ exact seven task/run/fence identity fields and, for each of
 `/run/herdr/policy-code`, `/home/agentops/.hermes/hermes-agent`, and the pinned
 CPython root, the exact device, inode, `FrozenTree.source_digest`, and
 `snapshot_kind=host-frozen-copy`. Stage one requires the bootstrap root and all
-three trees to be exact dedicated read-only mounts and rejects **any writable
-descendant mount**. It checks the mounted tree inode identities and independently
+three trees to be exact dedicated read-only mounts and rejects **every
+unexpected descendant mount, read-only or writable**. A nested read-only bind
+can shadow FrozenTree bytes just as effectively as a writable bind. It checks
+the mounted tree inode identities and independently
 recomputes the policy-code FrozenTree manifest digest before executing any
 policy byte. A read-only alias of an ordinary worker-writable tree is therefore
 not acceptable host evidence.
 
-Only after those checks does stage one open the pinned Python ELF with
-`O_NOFOLLOW`, verify its SHA256, retain the FD, and `execve` stage two through
-`/proc/self/fd/<fd>` while passing only the SHA256 of the verified bootstrap
-proof as continuity evidence. Direct execution of
-`/run/herdr/policy-code/agent-stack/bin/agent-hermes-policy-run` without both
-the held interpreter FD and stage-one proof is denied. Stage two reopens the
-fixed bootstrap proof, verifies its digest, identity, tree inodes and
-read-only/no-RW-descendant state again before importing `herdr.security`,
-`herdr.hermes_guard`, or any Hermes module.
+Only after those checks does stage one open both the verified stage-two
+source inode and the pinned Python ELF with `O_NOFOLLOW`. It verifies the
+Python SHA256, retains both FDs, and `execve`s the pinned interpreter while
+supplying the stage-two script as `/proc/self/fd/<stage2-fd>`. The interpreter
+therefore never reopens mutable policy code by pathname. Stage two requires
+the inherited interpreter FD, the inherited source FD and the verified proof
+digest; it checks that the loaded source inode is exactly the held stage-two
+inode, then reopens the fixed bootstrap proof and revalidates its digest,
+identity, exact tree inodes and no-descendant-mount state before importing
+`herdr.security`, `herdr.hermes_guard`, or any Hermes module. Environment
+markers alone are not continuity authority.
 
 The guarded launcher then reads only the fixed bundle path and exact
 host-controlled pane env: `HERDR_POLICY_CONSUMER`,
@@ -305,10 +311,12 @@ dotenv loader and reasserts these values after every layer, while
 `PluginManager.discover_and_load` is independently disabled. A `.env` cannot
 re-enable user/project/entry-point Python. Process-capable tools are similarly
 restricted to the attested local backend: terminal config is forced to
-`env_type=local`, cached environments are checked before execution, and
-`execute_code` rejects any non-local backend object. SSH, Docker, Modal,
-Daytona, Vercel and plugin terminal backends require a future separately
-attested policy and are not authorized by #76.
+`env_type=local`, cached environments are checked before execution, and the
+shared physical environment-construction seam rejects any non-local
+`env_type` **before** SSH/Docker/Modal/Daytona/Vercel/plugin provisioning can
+perform network or credential-bearing setup. `execute_code` is checked again
+after acquisition as defense in depth. Those backends require a future
+separately attested policy and are not authorized by #76.
 
 ## #82 integration interface
 
@@ -316,12 +324,17 @@ attested policy and are not authorized by #76.
 implement #82 integration yet or duplicate its split-intent and
 scheduler/sentinel recovery fixes. Required integration steps:
 
-1. Freeze four host-owned sources outside worker-writable roots: an independent
-   bootstrap tree containing only the reviewed `hermes` entry and stage-one
-   verifier, the approved #76 policy-code tree, the exact Hermes tree, and the
-   exact CPython runtime tree. Retain their directory FDs. Bind them as exact
+1. Keep the host-OS `/usr/bin/python3` stage-zero interpreter root-owned and
+   outside every worker-writable root; it is independent of the pinned runtime
+   being verified. Freeze four additional host-owned sources outside
+   worker-writable roots: an independent bootstrap tree containing only the
+   reviewed `hermes` entry and stage-one verifier, the approved #76 policy-code
+   tree, the exact Hermes tree, and the exact pinned CPython runtime tree.
+   Retain their directory FDs. Bind them as exact
    read-only mounts at `/run/herdr-bootstrap`, `/run/herdr/policy-code`, the
-   fixed Hermes root and fixed Python root, with no writable descendant mount.
+   fixed Hermes root and fixed Python root, with **no descendant mount at all**
+inside any trusted tree unless a future proof schema explicitly binds that
+descendant's identity and digest.
    PATH inside the pane must begin with `/run/herdr-bootstrap`, never the policy
    tree. Before bwrap, generate the bounded `immutable-trees.json` from those
    retained FrozenTree identities/digests and include it in the independent

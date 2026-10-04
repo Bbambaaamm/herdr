@@ -25,6 +25,7 @@ BOOTSTRAP_ROOT = Path("/run/herdr-bootstrap")
 BOOTSTRAP_STAGE1 = BOOTSTRAP_ROOT / "agent-hermes-policy-stage1"
 BOOTSTRAP_PROOF = BOOTSTRAP_ROOT / "immutable-trees.json"
 STAGE1_PROOF_ENV = "HERDR_POLICY_STAGE1_PROOF_SHA256"
+STAGE2_FD_ENV = "HERDR_VERIFIED_STAGE2_FD"
 POLICY_CODE_ROOT = Path("/run/herdr/policy-code")
 HERMES_ROOT = Path("/home/agentops/.hermes/hermes-agent")
 HERMES_HEAD = "ee5ee84a345204a3b1d6ef6ba1ab747e602867b9"
@@ -113,12 +114,13 @@ def _require_production_mount(path: Path, *, exact: bool = False) -> None:
     if "ro" not in options or mount == Path("/") or (exact and mount != path):
         raise SystemExit(f"security path is not on a dedicated read-only trust mount: {path}")
     target = Path(path)
-    for name, modes in _mount_rows().items():
-        if "rw" not in modes:
-            continue
+    for name in _mount_rows():
         candidate = Path(name)
         if candidate != target and target in candidate.parents:
-            raise SystemExit(f"writable mount below immutable trust root: {path}")
+            # A nested mount can shadow verified FrozenTree bytes even when
+            # that nested mount is locally read-only. No descendant mount is
+            # trusted unless it is part of a separately versioned proof.
+            raise SystemExit(f"unexpected descendant mount below immutable trust root: {path}")
 
 
 def _load_stage1_module() -> Any:
@@ -134,7 +136,30 @@ def _load_stage1_module() -> Any:
     return module
 
 
+def _require_held_stage2_source(source_path: str | None = None) -> None:
+    """Prove this trusted stage-two source was held open by verified stage one."""
+    raw = os.environ.get(STAGE2_FD_ENV, "")
+    try:
+        fd = int(raw)
+    except (TypeError, ValueError):
+        raise SystemExit("verified stage-two source FD is required")
+    actual_source = source_path if source_path is not None else __file__
+    if source_path is None and not str(actual_source).startswith("/proc/self/fd/"):
+        raise SystemExit("stage-two must execute from the held source FD")
+    try:
+        held = os.fstat(fd)
+        loaded = os.stat(actual_source)
+    except OSError as exc:
+        raise SystemExit("cannot verify held stage-two source") from exc
+    if not stat.S_ISREG(held.st_mode) or (held.st_dev, held.st_ino) != (loaded.st_dev, loaded.st_ino):
+        raise SystemExit("stage-two source differs from stage-one held inode")
+
+
 def _require_stage1_continuity() -> None:
+    # Environment markers are only integrity hints. Authority comes from stage
+    # one executing this already-verified source inode through an inherited FD,
+    # plus a fresh physical revalidation of the immutable bootstrap/tree proof.
+    _require_held_stage2_source()
     proof_digest = os.environ.get(STAGE1_PROOF_ENV, "")
     if not re.fullmatch(r"[0-9a-f]{64}", proof_digest):
         raise SystemExit("verified stage-one proof is required")
@@ -377,7 +402,11 @@ def bootstrap(
 def main() -> int:
     # Production stage two is reachable only through the independently frozen
     # stage-one bootstrap. Direct execution of policy-code is never authority.
-    if _INTERPRETER_FD_ENV not in os.environ or STAGE1_PROOF_ENV not in os.environ:
+    if (
+        _INTERPRETER_FD_ENV not in os.environ
+        or STAGE1_PROOF_ENV not in os.environ
+        or STAGE2_FD_ENV not in os.environ
+    ):
         raise SystemExit("verified immutable stage-one bootstrap required")
     return bootstrap(sys.argv[1:])
 

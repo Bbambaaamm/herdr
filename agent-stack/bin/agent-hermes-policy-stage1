@@ -21,12 +21,14 @@ POLICY_CODE_ROOT = Path("/run/herdr/policy-code")
 HERMES_ROOT = Path("/home/agentops/.hermes/hermes-agent")
 PYTHON_ROOT = Path("/home/agentops/.local/share/uv/python/cpython-3.11.16-linux-x86_64-gnu")
 PYTHON_PATH = PYTHON_ROOT / "bin/python3.11"
+STAGE0_PYTHON = Path("/usr/bin/python3")
 STAGE2 = POLICY_CODE_ROOT / "agent-stack/bin/agent-hermes-policy-run"
 PYTHON_SHA256 = "1e761eb19d6f2594ab8dc64bd99ad4e1753589f3bf1ec199e4eef3aaa21e3930"
 PROOF_VERSION = "herdr-policy-bootstrap-1"
 PROOF_AUTHORITY = "herdr-host-frozen-tree"
 PROOF_ENV = "HERDR_POLICY_STAGE1_PROOF_SHA256"
 INTERPRETER_FD_ENV = "HERDR_VERIFIED_PYTHON_FD"
+STAGE2_FD_ENV = "HERDR_VERIFIED_STAGE2_FD"
 MAX_PROOF = 65536
 MAX_MOUNTINFO = 1048576
 MAX_POLICY_FILES = 65536
@@ -45,6 +47,24 @@ IDENTITY_ENV = {
 
 def _fail(message: str):
     raise SystemExit(message)
+
+
+def _require_independent_stage0() -> None:
+    """Require the host OS interpreter, independent of the runtime being verified."""
+    if not os.sys.flags.isolated or not os.sys.flags.no_site:
+        _fail("stage-one requires isolated no-site system Python")
+    try:
+        active = os.stat("/proc/self/exe")
+        trusted = os.stat(STAGE0_PYTHON)
+        pinned = os.stat(PYTHON_PATH)
+    except OSError:
+        _fail("independent stage-zero interpreter unavailable")
+    if (active.st_dev, active.st_ino) != (trusted.st_dev, trusted.st_ino):
+        _fail("stage-one did not start from the independent system interpreter")
+    if trusted.st_uid != 0 or trusted.st_mode & 0o022:
+        _fail("independent system interpreter is not root-owned immutable host code")
+    if (active.st_dev, active.st_ino) == (pinned.st_dev, pinned.st_ino):
+        _fail("stage-zero interpreter is not independent of pinned runtime")
 
 
 def _unescape(value: str) -> str:
@@ -81,12 +101,14 @@ def _require_exact_ro_tree(path: Path, rows: dict[str, set[str]]) -> os.stat_res
     modes = rows.get(target)
     if modes is None or "ro" not in modes or path == Path("/"):
         _fail(f"security path is not an exact read-only trust mount: {path}")
-    for name, child_modes in rows.items():
-        if "rw" not in child_modes or name == target:
+    for name in rows:
+        if name == target:
             continue
         try:
             if path in Path(name).parents:
-                _fail(f"writable mount below immutable trust root: {path}")
+                # Any nested mount can shadow bytes from the FrozenTree. A
+                # locally read-only child is still an unproven backing source.
+                _fail(f"unexpected descendant mount below immutable trust root: {path}")
         except (OSError, ValueError):
             _fail("bootstrap mount evidence malformed")
     try:
@@ -233,6 +255,22 @@ def _verify_trees(proof: dict, rows: dict[str, set[str]]) -> None:
         _fail("policy snapshot digest mismatch")
 
 
+def _open_verified_stage2() -> int:
+    """Hold the already-verified stage-two source inode across execve."""
+    try:
+        fd = os.open(STAGE2, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        _fail("policy stage-two unavailable")
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            _fail("policy stage-two is not a regular file")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def _open_verified_python() -> int:
     try:
         fd = os.open(PYTHON_PATH, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -258,24 +296,26 @@ def _open_verified_python() -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = list(os.sys.argv[1:] if argv is None else argv)
+    _require_independent_stage0()
     rows = _mount_rows()
     _require_exact_ro_tree(BOOTSTRAP_ROOT, rows)
     proof, raw = _read_proof()
     _verify_trees(proof, rows)
-    stage2 = POLICY_CODE_ROOT / "agent-stack/bin/agent-hermes-policy-run"
-    try:
-        info = stage2.lstat()
-    except OSError:
-        _fail("policy stage-two unavailable")
-    if not stat.S_ISREG(info.st_mode) or stage2.is_symlink():
-        _fail("policy stage-two is not a regular file")
-    fd = _open_verified_python()
-    os.set_inheritable(fd, True)
+
+    # The policy tree has now been proven as the exact host FrozenTree. Hold the
+    # stage-two source inode itself so the pinned interpreter never re-opens a
+    # mutable pathname after stage one.
+    stage2_fd = _open_verified_stage2()
+    python_fd = _open_verified_python()
+    os.set_inheritable(stage2_fd, True)
+    os.set_inheritable(python_fd, True)
     env = dict(os.environ)
     env[PROOF_ENV] = hashlib.sha256(raw).hexdigest()
-    env[INTERPRETER_FD_ENV] = str(fd)
-    executable = f"/proc/self/fd/{fd}"
-    os.execve(executable, [executable, "-I", "-S", str(stage2), *args], env)
+    env[INTERPRETER_FD_ENV] = str(python_fd)
+    env[STAGE2_FD_ENV] = str(stage2_fd)
+    executable = f"/proc/self/fd/{python_fd}"
+    stage2_source = f"/proc/self/fd/{stage2_fd}"
+    os.execve(executable, [executable, "-I", "-S", stage2_source, *args], env)
     return 127
 
 

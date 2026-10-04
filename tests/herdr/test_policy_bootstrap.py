@@ -41,6 +41,7 @@ def test_fixed_production_entry_preserves_argv_without_policy_override(monkeypat
     monkeypatch.setattr(module, 'bootstrap', lambda args: seen.append(args) or 0)
     monkeypatch.setenv(module._INTERPRETER_FD_ENV, 'test-stage-two')
     monkeypatch.setenv(module.STAGE1_PROOF_ENV, 'a' * 64)
+    monkeypatch.setenv(module.STAGE2_FD_ENV, '9')
     monkeypatch.setattr(sys, 'argv', [str(LAUNCHER), '--grant', '/model/choice', '--key-fd', '3'])
     assert module.main() == 0
     assert seen == [['--grant', '/model/choice', '--key-fd', '3']]
@@ -52,8 +53,7 @@ def test_policy_bin_hermes_invokes_guarded_launcher():
     assert not POLICY_BIN.is_symlink()
     assert POLICY_BIN.read_text() == (
         '#!/bin/sh\n'
-        'exec /home/agentops/.local/share/uv/python/cpython-3.11.16-linux-x86_64-gnu/bin/python3.11 '
-        '-I -S /run/herdr-bootstrap/agent-hermes-policy-stage1 "$@"\n'
+        'exec /usr/bin/python3 -I -S /run/herdr-bootstrap/agent-hermes-policy-stage1 "$@"\n'
     )
     assert "/run/herdr/policy-code" not in POLICY_BIN.read_text()
     assert POLICY_BIN.stat().st_mode & 0o111
@@ -250,12 +250,15 @@ def test_production_trust_mount_requires_dedicated_readonly_exact_root(monkeypat
     monkeypatch.setattr(module, "_mount_rows", lambda: {str(trusted): {"ro", "nosuid"}})
     module._require_production_mount(trusted, exact=True)
 
-    monkeypatch.setattr(
-        module, "_mount_rows",
-        lambda: {str(trusted): {"ro"}, str(trusted / "nested"): {"rw"}},
-    )
-    with pytest.raises(SystemExit, match="writable mount below immutable trust root"):
-        module._require_production_mount(trusted, exact=True)
+    for nested_mode in ("rw", "ro"):
+        monkeypatch.setattr(
+            module, "_mount_rows",
+            lambda mode=nested_mode: {
+                str(trusted): {"ro"}, str(trusted / "nested"): {mode}
+            },
+        )
+        with pytest.raises(SystemExit, match="unexpected descendant mount below immutable trust root"):
+            module._require_production_mount(trusted, exact=True)
     monkeypatch.setattr(module, "_mount_rows", lambda: {str(trusted): {"ro"}})
 
     monkeypatch.setattr(module, "_covering_mount", lambda path: (Path("/"), {"ro"}))
@@ -347,10 +350,11 @@ def test_stage1_verifies_frozen_identity_digest_and_rw_descendants(monkeypatch, 
     parsed, _ = module._read_proof(proof_path)
     module._verify_trees(parsed, rows)
 
-    poisoned = dict(rows)
-    poisoned[str(policy / "nested")] = {"rw"}
-    with pytest.raises(SystemExit, match="writable mount below immutable trust root"):
-        module._verify_trees(parsed, poisoned)
+    for nested_mode in ("rw", "ro"):
+        poisoned = dict(rows)
+        poisoned[str(policy / "nested")] = {nested_mode}
+        with pytest.raises(SystemExit, match="unexpected descendant mount below immutable trust root"):
+            module._verify_trees(parsed, poisoned)
 
     (policy / "herdr/security.py").write_text("VALUE = 2\\n", encoding="utf-8")
     with pytest.raises(SystemExit, match="policy snapshot digest mismatch"):
@@ -361,5 +365,48 @@ def test_stage2_direct_execution_without_stage1_proof_is_rejected(monkeypatch):
     module = _launcher()
     monkeypatch.delenv(module._INTERPRETER_FD_ENV, raising=False)
     monkeypatch.delenv(module.STAGE1_PROOF_ENV, raising=False)
+    monkeypatch.delenv(module.STAGE2_FD_ENV, raising=False)
     with pytest.raises(SystemExit, match="verified immutable stage-one bootstrap required"):
         module.main()
+
+
+def test_stage1_execs_verified_stage2_source_fd(monkeypatch):
+    module = _stage1()
+    monkeypatch.setattr(module, "_require_independent_stage0", lambda: None)
+    monkeypatch.setattr(module, "_mount_rows", lambda: {})
+    monkeypatch.setattr(module, "_require_exact_ro_tree", lambda *args: None)
+    monkeypatch.setattr(module, "_read_proof", lambda *args: ({}, b"proof"))
+    monkeypatch.setattr(module, "_verify_trees", lambda *args: None)
+    monkeypatch.setattr(module, "_open_verified_stage2", lambda: 41)
+    monkeypatch.setattr(module, "_open_verified_python", lambda: 42)
+    monkeypatch.setattr(module.os, "set_inheritable", lambda *args: None)
+    seen = {}
+
+    def fake_execve(executable, argv, env):
+        seen.update(executable=executable, argv=argv, env=env)
+        raise RuntimeError("execve captured")
+
+    monkeypatch.setattr(module.os, "execve", fake_execve)
+    with pytest.raises(RuntimeError, match="execve captured"):
+        module.main(["chat", "--profile", "test"])
+    assert seen["executable"] == "/proc/self/fd/42"
+    assert seen["argv"] == [
+        "/proc/self/fd/42", "-I", "-S", "/proc/self/fd/41",
+        "chat", "--profile", "test",
+    ]
+    assert seen["env"][module.INTERPRETER_FD_ENV] == "42"
+    assert seen["env"][module.STAGE2_FD_ENV] == "41"
+    assert seen["env"][module.PROOF_ENV] == hashlib.sha256(b"proof").hexdigest()
+
+
+def test_stage2_continuity_binds_loaded_source_to_held_fd(monkeypatch):
+    module = _launcher()
+    fd = os.open(LAUNCHER, os.O_RDONLY)
+    try:
+        monkeypatch.setenv(module.STAGE2_FD_ENV, str(fd))
+        module._require_held_stage2_source(str(LAUNCHER))
+        other = LAUNCHER.parent / "agent-hermes-policy-stage1"
+        with pytest.raises(SystemExit, match="stage-two source differs"):
+            module._require_held_stage2_source(str(other))
+    finally:
+        os.close(fd)

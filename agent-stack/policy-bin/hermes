@@ -1,2 +1,2 @@
 #!/bin/sh
-exec /home/agentops/.local/share/uv/python/cpython-3.11.16-linux-x86_64-gnu/bin/python3.11 -I -S /run/herdr-bootstrap/agent-hermes-policy-stage1 "$@"
+exec /usr/bin/python3 -I -S /run/herdr-bootstrap/agent-hermes-policy-stage1 "$@"
