@@ -725,8 +725,8 @@ def test_pinned_writable_worktree_survives_path_swap(tmp_path, monkeypatch):
         command = sandbox.command(original, real, writable=(result,), policy=policy,
                                   child_workspace_writable=True, pinned_worktree=pin)
         mounts = [(command[i], command[i + 1], command[i + 2])
-                  for i in range(len(command) - 2) if command[i] in {"--bind", "--ro-bind"}]
-        assert ("--bind", pin.source, str(original)) in mounts
+                  for i in range(len(command) - 2) if command[i] in {"--bind", "--ro-bind", "--bind-fd", "--ro-bind-fd"}]
+        assert ("--bind-fd", str(pin.fd), str(original)) in mounts
         assert command.index(pin.source) < command.index("--proc")
         assert os.stat(pin.source).st_ino == moved.stat().st_ino
         assert os.stat(pin.source).st_ino != outside.stat().st_ino
@@ -835,14 +835,14 @@ def test_child_sandbox_workspace_scope_and_exact_result_mount(tmp_path, monkeypa
                                    child_workspace_writable=allowed,
                                    pinned_worktree=pin)
         mounts = [(args[i], args[i + 1], args[i + 2])
-                  for i in range(len(args) - 2) if args[i] in {"--bind", "--ro-bind"}]
+                  for i in range(len(args) - 2) if args[i] in {"--bind", "--ro-bind", "--bind-fd", "--ro-bind-fd"}]
         # Provider egress + the abstract durable bridge require the host net
         # namespace; network model-tools are filtered at Hermes toolset level.
         assert "--unshare-net" not in args
         assert not any(mode == "--bind" and target in {
             str(sandbox.HOME / ".hermes"), str(sandbox.HOME / ".cache")}
             for mode, _, target in mounts)
-        assert (("--bind" if allowed else "--ro-bind"), pin.source, str(workspace)) in mounts
+        assert (("--bind-fd" if allowed else "--ro-bind-fd"), str(pin.fd), str(workspace)) in mounts
         assert ("--bind", str(workspace.parent), str(workspace.parent)) not in mounts
         assert ("--bind", str(mine), str(mine)) in mounts
         assert not any(mode == "--bind" and target == str(sibling)

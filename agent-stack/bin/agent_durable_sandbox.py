@@ -3,6 +3,7 @@ import os
 import shlex
 import shutil
 import stat
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -18,6 +19,26 @@ DEFAULT_WRITABLE = (
     HOME / ".cache",
     HOME / "worktrees",
 )
+
+
+# Duplicate the bridge's held directory BEFORE bwrap enters a user namespace.
+# Reopening its /proc FD refers to the held inode, never the mutable logical path.
+# --bind-fd consumes that inherited descriptor without a cross-namespace proc read.
+_PINNED_LAUNCHER = """
+import os, stat, sys
+source, original_fd, device, inode = sys.argv[1:5]
+args = sys.argv[5:]
+fd = os.open(source, os.O_PATH | os.O_DIRECTORY)
+held = os.fstat(fd)
+if not stat.S_ISDIR(held.st_mode) or (held.st_dev, held.st_ino) != (int(device), int(inode)):
+    raise SystemExit("pinned_worktree_identity_mismatch")
+positions = [i for i, arg in enumerate(args) if arg in ("--bind-fd", "--ro-bind-fd")]
+if len(positions) != 1 or args[positions[0] + 1] != original_fd:
+    raise SystemExit("pinned_worktree_launch_invalid")
+args[positions[0] + 1] = str(fd)
+os.set_inheritable(fd, True)
+os.execv(args[0], args)
+"""
 
 
 @dataclass
@@ -108,8 +129,12 @@ def command(
         "--dev", "/dev",
         "--unshare-pid",
         "--tmpfs", "/tmp",
-        "--bind" if child_workspace_writable is not False else "--ro-bind",
-        pinned_worktree.source if pinned_worktree else str(workspace), str(workspace),
+        *([] if pinned_worktree is None else
+          ["--tmpfs", str(workspace.parent), "--dir", str(workspace)]),
+        (("--bind-fd" if child_workspace_writable is not False else "--ro-bind-fd")
+         if pinned_worktree else
+         ("--bind" if child_workspace_writable is not False else "--ro-bind")),
+        str(pinned_worktree.fd) if pinned_worktree else str(workspace), str(workspace),
         "--proc", "/proc",
         "--chdir", str(workspace),
     ]
@@ -154,6 +179,10 @@ def command(
         "--setenv", "HERDR_DURABLE_SANDBOX", "1",
         "--", "/bin/bash", "-i",
     ]
+    if pinned_worktree is not None:
+        return [sys.executable, "-I", "-c", _PINNED_LAUNCHER,
+                pinned_worktree.source, str(pinned_worktree.fd),
+                str(pinned_worktree.device), str(pinned_worktree.inode), *args]
     return args
 
 
@@ -210,22 +239,42 @@ def verify(
     *,
     policy: Path = POLICY,
     attempts: int = 30,
+    pinned_worktree: PinnedWorktree | None = None,
+    child_workspace_writable: bool | None = None,
 ) -> bool:
     """Require expected mounts, hidden Herdr paths and non-host namespaces."""
-    expected = {str(real_binary.absolute()), str(real_binary.resolve()),
-                str(HERDR_CONFIG), str(HERDR_RELEASES)}
+    # The kernel records the canonical destination when the CLI is a symlink.
+    canonical_binary = real_binary.resolve(strict=True)
+    expected = {str(canonical_binary), str(HERDR_CONFIG), str(HERDR_RELEASES)}
+    if pinned_worktree is not None:
+        expected.add(str(pinned_worktree.logical))
     for _ in range(attempts):
         try:
             root = Path(f"/proc/{pid}/root")
             mounts = Path(f"/proc/{pid}/mountinfo").read_text(encoding="utf-8")
-            targets = {line.split(" - ", 1)[0].split()[4] for line in mounts.splitlines()}
+            rows = [line.split(" - ", 1)[0].split() for line in mounts.splitlines()]
+            def unescape(value):
+                for old, new in ((r"\040", " "), (r"\011", "\t"),
+                                 (r"\012", "\n"), (r"\134", "\\")):
+                    value = value.replace(old, new)
+                return value
+            modes = {unescape(row[4]): set(row[5].split(",")) for row in rows}
+            targets = set(modes)
+            workspace_matches = True
+            if pinned_worktree is not None:
+                pinned_worktree.verify()
+                mounted = (root / str(pinned_worktree.logical).lstrip("/")).stat()
+                expected_mode = "rw" if child_workspace_writable is True else "ro"
+                workspace_matches = (
+                    (mounted.st_dev, mounted.st_ino) == (pinned_worktree.device, pinned_worktree.inode)
+                    and expected_mode in modes.get(str(pinned_worktree.logical), set()))
             env = _env(pid)
             config = root / str(HERDR_CONFIG).lstrip("/")
             releases = root / str(HERDR_RELEASES).lstrip("/")
             hidden = (config.is_dir() and not any(config.iterdir())
                       and releases.is_dir() and not any(releases.iterdir()))
             policy_matches = (
-                root / str(real_binary).lstrip("/")
+                root / str(canonical_binary).lstrip("/")
             ).read_bytes() == policy.read_bytes()
             ns = (
                 os.readlink(f"/proc/{pid}/ns/pid") != os.readlink("/proc/self/ns/pid")
@@ -233,6 +282,8 @@ def verify(
             )
             if (
                 expected <= targets
+                and "ro" in modes.get("/", set())
+                and workspace_matches
                 and hidden
                 and policy_matches
                 and ns

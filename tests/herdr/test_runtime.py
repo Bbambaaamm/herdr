@@ -1008,3 +1008,168 @@ def test_admission_registry_fsyncs_file_and_directory(tmp_path: Path, monkeypatc
     assert os.path.isdir(registry.path.parent)
     import stat
     assert stat.S_ISREG(calls[0]) and stat.S_ISDIR(calls[1])
+
+
+@pytest.mark.parametrize("writable", [False, True])
+@pytest.mark.parametrize("swap_path", [False, True])
+def test_actual_child_sandbox_proof_persists_exact_attestation(tmp_path, monkeypatch, writable, swap_path):
+    """Exercise production sandbox construction/verify/digest, without a provider."""
+    import shutil
+    import subprocess
+    import tempfile
+    from importlib.machinery import SourceFileLoader
+    if not shutil.which("bwrap"):
+        pytest.skip("bubblewrap unavailable on this host")
+    probe = subprocess.run(["bwrap", "--ro-bind", "/", "/", "--unshare-pid", "--", "/bin/true"],
+                           capture_output=True)
+    if probe.returncode:
+        pytest.skip("host user namespace policy denies bubblewrap")
+    base = Path(os.environ.get("HERDR_BOUNDARY_TEST_ROOT", "/home/agentops/tmp"))
+    if not base.is_dir() or not os.access(base, os.W_OK):
+        pytest.skip("physical sandbox fixture root unavailable")
+    with tempfile.TemporaryDirectory(prefix="child-attestation-", dir=base) as directory:
+        root = Path(directory)
+        workspace = root / "worktrees" / "workspace"
+        workspace.mkdir(parents=True)
+        (workspace / "identity.txt").write_text("held")
+        siblings = root / "results" / "sibling.result.json"
+        siblings.parent.mkdir()
+        siblings.write_text("foreign-result")
+        fake_home = root / "home"
+        config = fake_home / ".config/herdr"
+        releases = root / "releases"
+        config.mkdir(parents=True)
+        releases.mkdir()
+        old_exec = SourceFileLoader.exec_module
+        loaded = {}
+        def load(loader, module):
+            old_exec(loader, module)
+            if loader.name == "agent_durable_sandbox_runtime":
+                module.HOME = fake_home
+                module.HERDR_CONFIG = config
+                module.HERDR_RELEASES = releases
+                module.DEFAULT_WRITABLE = ()
+                loaded["sandbox"] = module
+        monkeypatch.setattr(SourceFileLoader, "exec_module", load)
+        scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(root / "events.jsonl"))
+        scheduler.register_external_parent_attempt(
+            task_id="parent", run_token="parent-run", idempotency_key="parent-key",
+            agent_name="parent-agent", pane_id="parent-pane", marker="parent-marker",
+            repo="repo", issue="82", role="writer", tools=("read_file", "write_file"),
+            permissions=("workspace-write",), policy_profile="default")
+        child = scheduler.delegate_child("parent", "parent-run", "attestation",
+            ChildProposal("writer", ("read_file", "write_file"),
+                          "writer" if writable else "reader",
+                          ("write_file",) if writable else ("read_file",),
+                          parent_permissions=("workspace-write",),
+                          child_permissions=("workspace-write",) if writable else (), child_task="inspect"))
+        lease = scheduler.dispatch(task_ids={child.id})[0]
+        record = scheduler._tasks[child.id]
+        marker = "child-" + record.run_token
+        sandbox_process = None
+        class Runner:
+            def run(self, args, **kwargs):
+                nonlocal sandbox_process
+                if args[:2] == ["pane", "run"]:
+                    sandbox_process = subprocess.Popen(
+                        ["/bin/bash", "-c", args[3]], stdin=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                        env={"PATH": "/usr/bin:/bin", "HOME": str(fake_home),
+                             "HERDR_DURABLE_TASK_PANE": marker})
+                    return CommandResult(0, json.dumps({"result": {}}), "")
+                assert args[:2] == ["pane", "process-info"]
+                processes = []
+                for _ in range(50):
+                    assert sandbox_process.poll() is None, sandbox_process.stderr.read(8192).decode()
+                    for proc in Path("/proc").iterdir():
+                        if not proc.name.isdigit():
+                            continue
+                        try:
+                            env = (proc / "environ").read_bytes().split(b"\0")
+                            if f"HERDR_DURABLE_TASK_PANE={marker}".encode() in env:
+                                processes.append({"pid": int(proc.name)})
+                        except OSError:
+                            continue
+                    if loaded["sandbox"].inner_pid({"foreground_processes": processes}, marker):
+                        break
+                    time.sleep(0.02)
+                return CommandResult(0, json.dumps({"result": {"process_info":
+                    {"foreground_processes": processes}}}), "")
+        from types import SimpleNamespace
+        directory_fd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        directory_stat = os.fstat(directory_fd)
+        if swap_path:
+            outside = root / "foreign"
+            outside.mkdir()
+            (outside / "identity.txt").write_text("foreign")
+            workspace.rename(workspace.with_name("held-original"))
+            workspace.symlink_to(outside, target_is_directory=True)
+        pinned = SimpleNamespace(logical=workspace, fd=directory_fd, root=workspace.parent,
+            source=f"/proc/{os.getpid()}/fd/{directory_fd}",
+            device=directory_stat.st_dev, inode=directory_stat.st_ino)
+        def verify_pin():
+            current = os.fstat(directory_fd)
+            assert (current.st_dev, current.st_ino) == (pinned.device, pinned.inode)
+        pinned.verify = verify_pin
+        pinned.identity = f"{workspace}|{pinned.device}:{pinned.inode}"
+        runtime = HerdrChildRuntime(scheduler, Runner(), cwd=workspace,
+                                    pinned_worktree=pinned, snapshot_path=root / "swarm.json")
+        assert scheduler.bind_pre_delivery_pane(child.id, record.run_token, lease.agent_id, "owned-pane", marker)
+        policy = None
+        try:
+            policy = runtime._sandbox_child_pane("owned-pane", marker, "/bin/true", child.id)
+            proof = runtime._sandbox_proofs["owned-pane"]
+            assert proof["sandbox_pid"] > 0
+            assert proof["policy_sha256"] == hashlib.sha256(policy.read_bytes()).hexdigest()
+            # Execute actual filesystem operations in the established namespace.
+            # Record observations only through the one admitted result file.
+            import shlex
+            import sys
+            script = """import json, pathlib, sys
+workspace, mine, sibling = map(pathlib.Path, sys.argv[1:])
+observed = {"identity": (workspace / "identity.txt").read_text()}
+for name, target in (("workspace_write", workspace / "probe.txt"), ("sibling_write", sibling)):
+    try:
+        target.write_text("effect")
+        observed[name] = True
+    except OSError:
+        observed[name] = False
+mine.write_text(json.dumps(observed))
+"""
+            mine = root / "results" / (child.id + ".result.json")
+            sandbox_process.stdin.write((shlex.join([sys.executable, "-I", "-c", script,
+                                        str(workspace), str(mine), str(siblings)]) + "\n").encode())
+            sandbox_process.stdin.flush()
+            observed = None
+            for _ in range(100):
+                try:
+                    observed = json.loads(mine.read_text())
+                    break
+                except (OSError, ValueError):
+                    time.sleep(0.01)
+            assert observed == {"identity": "held", "workspace_write": writable, "sibling_write": False}
+            assert siblings.read_text() == "foreign-result"
+            physical = workspace.with_name("held-original") if swap_path else workspace
+            assert (physical / "probe.txt").exists() is writable
+            if swap_path:
+                assert not (outside / "probe.txt").exists()
+            assert scheduler.attest_execution_sandbox(child.id, record.run_token, lease.agent_id,
+                "owned-pane", marker, sandbox_pid=proof["sandbox_pid"], policy_sha256=proof["policy_sha256"])
+            replay = DynamicChildScheduler(audit_log=SchedulerAuditLog(root / "events.jsonl"))
+            replay.replay()
+            recovered = replay._tasks[child.id]
+            assert recovered.execution_sandbox_verified
+            assert recovered.execution_sandbox_attestation["run_token"] == record.run_token
+            assert recovered.execution_sandbox_attestation["policy_sha256"] == proof["policy_sha256"]
+        finally:
+            if sandbox_process is not None:
+                if sandbox_process.stdin:
+                    sandbox_process.stdin.close()
+                try:
+                    sandbox_process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    sandbox_process.kill()
+                    sandbox_process.wait(timeout=2)
+            os.close(directory_fd)
+            if policy is not None:
+                policy.unlink(missing_ok=True)

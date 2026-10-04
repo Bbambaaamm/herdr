@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import subprocess
@@ -835,7 +836,9 @@ class HerdrChildRuntime:
             dict(process_info) if isinstance(process_info, Mapping) else {}, marker
         )
         if not sandbox_pid or not sandbox.verify(
-                sandbox_pid, Path(real), marker, policy=policy):
+                sandbox_pid, Path(real), marker, policy=policy,
+                pinned_worktree=self.pinned_worktree,
+                child_workspace_writable=self._child_workspace_writable(task_id)):
             raise HerdrRuntimeError("child_sandbox_unverified", pane_id)
         self._sandbox_proofs[pane_id] = {
             "sandbox_pid": sandbox_pid,
