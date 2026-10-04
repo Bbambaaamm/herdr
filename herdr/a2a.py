@@ -324,7 +324,11 @@ def _merge_candidate_records(existing: Any, candidates: tuple[Candidate, ...]) -
             seen.add(key)
     if len(records) > MAX_CANDIDATES:
         raise A2AError("candidate recovery count exceeds bound")
-    _bounded(records, MAX_BINDING)
+    # Every candidate has already passed _candidate/_parse_response's targeted
+    # raw-secret validation. Do not apply the broader metadata keyword scan
+    # here: benign result prose such as "password reset instructions" must not
+    # become unpersistable after the remote effect has already happened.
+    _bounded(records, MAX_BINDING, secret_scan=False)
     return records
 
 

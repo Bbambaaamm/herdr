@@ -745,3 +745,38 @@ def test_response_capacity_exhaustion_fails_before_remote_poll(tmp_path, monkeyp
     with pytest.raises(A2AError, match="candidate recovery capacity exhausted"):
         gateway.poll(identity)
     assert transport.gets == []
+
+
+def test_benign_security_words_remain_durable_candidates(tmp_path):
+    _, card, policy, identity, direct_store = setup(tmp_path)
+    direct_message = {
+        "messageId": "direct-benign-security",
+        "contextId": "context",
+        "role": "ROLE_AGENT",
+        "parts": [{"text": "Password reset instructions are available in the runbook."}],
+    }
+    direct_gateway = Gateway(
+        Mock({"message": direct_message}), direct_store, card, policy
+    )
+    direct_candidate, = direct_gateway.send(identity, "help")
+    assert direct_gateway.recover(identity)[0].digest == direct_candidate.digest
+
+    late_identity = replace(identity, idempotency_key="benign-late-cancel")
+    late_store = BindingStore(tmp_path / "benign-late.json")
+    late_transport = Mock()
+    late_gateway = Gateway(late_transport, late_store, card, policy)
+    late_gateway.send(late_identity, "work")
+    late_artifact = {
+        "artifactId": "late-benign-security",
+        "parts": [{"text": "Credential rotation procedure completed without exposing secrets."}],
+    }
+
+    def completed_cancel(interface, request, headers):
+        late_transport.cancels.append(request)
+        return task("TASK_STATE_COMPLETED", artifacts=[late_artifact])
+
+    late_transport.cancel = completed_cancel
+    late_candidate, = late_gateway.cancel(late_identity)
+    recovered = late_gateway.recover(late_identity)
+    assert recovered[-1].digest == late_candidate.digest
+    assert recovered[-1].content == late_artifact
