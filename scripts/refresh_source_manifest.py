@@ -19,6 +19,7 @@ FILES = (
     Path("configs/consumers/herdr.yaml"),
     Path("docs/CONSUMERS.md"),
     Path("docs/architecture/AGENT_SKILLS.md"),
+    Path("docs/architecture/CONTEXT_MEMORY.md"),
     Path("package.json"),
     Path("package-lock.json"),
 )
