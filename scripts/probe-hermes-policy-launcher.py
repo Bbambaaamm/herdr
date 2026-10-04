@@ -122,13 +122,25 @@ def main() -> int:
             "loader=importlib.machinery.SourceFileLoader('policy_bootstrap', '",
             str(repo / "agent-stack/bin/agent-hermes-policy-run"),
             "'); spec=importlib.util.spec_from_loader(loader.name,loader); m=importlib.util.module_from_spec(spec); loader.exec_module(m); "
+            "m._verify_runtime(pathlib.Path('", str(hermes), "')); "
             "raise SystemExit(m.bootstrap(['--version'], bundle_path=pathlib.Path('",
             str(bundle), "'), policy_code_root=pathlib.Path('", str(repo),
             "'), hermes_root=pathlib.Path('", str(hermes), "')))"
         )
+        stage_two = root_path / "stage-two.py"
+        stage_two.write_text("".join(loader), encoding="utf-8")
+        stage_one = (
+            "import importlib.machinery, importlib.util, pathlib, sys; "
+            f"p=pathlib.Path({str(launcher_path)!r}); "
+            "loader=importlib.machinery.SourceFileLoader('policy_bootstrap',str(p)); "
+            "spec=importlib.util.spec_from_loader(loader.name,loader); "
+            "m=importlib.util.module_from_spec(spec); loader.exec_module(m); "
+            "m._exec_verified_interpreter(pathlib.Path(sys.argv[1]), [])"
+        )
         def invoke(fence: int) -> subprocess.CompletedProcess[str]:
             env[fields["fencing_token"]] = str(fence)
-            return subprocess.run([str(hermes / "venv/bin/python"), "-c", "".join(loader)],
+            return subprocess.run(["/usr/bin/python3", "-I", "-S", "-c", stage_one,
+                                   str(stage_two)],
                                   env=env, text=True, stdout=subprocess.PIPE,
                                   stderr=subprocess.STDOUT, timeout=60, check=False)
         good = invoke(identity.fencing_token)

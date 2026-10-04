@@ -28,6 +28,7 @@ def test_fixed_production_entry_preserves_argv_without_policy_override(monkeypat
     module = _launcher()
     seen = []
     monkeypatch.setattr(module, 'bootstrap', lambda args: seen.append(args) or 0)
+    monkeypatch.setenv(module._INTERPRETER_FD_ENV, 'test-stage-two')
     monkeypatch.setattr(sys, 'argv', [str(LAUNCHER), '--grant', '/model/choice', '--key-fd', '3'])
     assert module.main() == 0
     assert seen == [['--grant', '/model/choice', '--key-fd', '3']]
@@ -37,14 +38,10 @@ def test_fixed_production_entry_preserves_argv_without_policy_override(monkeypat
 def test_policy_bin_hermes_invokes_guarded_launcher():
     assert POLICY_BIN.is_file()
     assert not POLICY_BIN.is_symlink()
-    assert POLICY_BIN.read_bytes() == LAUNCHER.read_bytes()
+    assert POLICY_BIN.read_text() == '#!/bin/sh\nexec /usr/bin/python3 -I -S /run/herdr/policy-code/agent-stack/bin/agent-hermes-policy-run "$@"\n'
     assert POLICY_BIN.stat().st_mode & 0o111
-    # Production intentionally uses the pinned staging-host Hermes interpreter.
-    # Generic CI does not have that absolute interpreter, so executing the symlink
-    # would fail in the kernel before any policy code runs. Verify the launcher
-    # identity statically and exercise its production mount gate in-process.
     assert LAUNCHER.read_text(encoding="utf-8").splitlines()[0] == (
-        "#!/home/agentops/.hermes/hermes-agent/venv/bin/python -I"
+        "#!/usr/bin/python3 -I -S"
     )
     module = _launcher()
     with pytest.raises(
@@ -89,7 +86,6 @@ def test_same_process_guard_precedes_hermes_main(monkeypatch, tmp_path):
                             events.append('verified') if root == tmp_path / 'bundle' and got == identity
                             else (_ for _ in ()).throw(AssertionError('alternate authority used'))
                         ) or types.SimpleNamespace(scope=types.SimpleNamespace(executors=(module.HERMES_EXECUTOR,))))
-    monkeypatch.setattr(sys, 'prefix', str(hermes / 'venv'))
     saved_path, saved_argv = sys.path[:], sys.argv[:]
     try:
         assert module.bootstrap(['chat', '--profile', 'test'], bundle_path=tmp_path / 'bundle',
@@ -108,7 +104,6 @@ def test_launcher_requires_exact_pane_identity(monkeypatch, tmp_path):
     (hermes / 'venv').mkdir(parents=True)
     (hermes / 'model_tools.py').write_text('')
     (hermes / 'hermes').write_text('')
-    monkeypatch.setattr(sys, 'prefix', str(hermes / 'venv'))
     monkeypatch.delenv(module.IDENTITY_ENV['fencing_token'], raising=False)
     saved_path = sys.path[:]
     try:
@@ -144,8 +139,36 @@ def test_preimport_executor_verifier_checks_actual_bytes(monkeypatch, tmp_path):
             digest.update(hashlib.sha256((root / name.decode()).read_bytes()).digest())
     expected = f'hermes:0.21.5:sha256:{digest.hexdigest()}'
     monkeypatch.setattr(module, 'HERMES_HEAD', git('rev-parse', 'HEAD'))
-    monkeypatch.setattr(module, 'HERMES_EXECUTOR', expected)
-    assert module._verify_hermes_build(root) == expected
+    monkeypatch.setattr(module, '_SOURCE_EXECUTOR', expected)
+    assert module._verify_hermes_build(root) == module.HERMES_EXECUTOR
     (root / 'model_tools.py').write_text('audited = False\n')
     with pytest.raises(SystemExit, match='cannot verify audited Hermes build|differs from signed executor'):
         module._verify_hermes_build(root)
+    (root / 'model_tools.py').write_text('audited = True\n')
+    (root / '.git/info/exclude').write_text('injected.py\n')
+    (root / 'injected.py').write_text('raise RuntimeError("imported")\n')
+    with pytest.raises(SystemExit, match='cannot verify audited Hermes build'):
+        module._verify_hermes_build(root)
+
+
+def test_venv_import_surface_hash_excludes_only_unreachable_cache(tmp_path):
+    module = _launcher()
+    site = tmp_path / 'site-packages'
+    package = site / 'package'
+    package.mkdir(parents=True)
+    source = package / '__init__.py'
+    source.write_text('value = 1\n')
+    original = module._digest_site_packages(site)
+    cache = package / '__pycache__'
+    cache.mkdir()
+    (cache / '__init__.cpython-311.pyc').write_bytes(b'attacker bytecode')
+    assert module._digest_site_packages(site) == original
+    (package / 'module.pyc').write_bytes(b'also unreachable with pycache_prefix')
+    with pytest.raises(SystemExit, match='sourceless venv bytecode'):
+        module._digest_site_packages(site)
+    (package / 'module.pyc').unlink()
+    source.write_text('value = 2\n')
+    assert module._digest_site_packages(site) != original
+    source.write_text('value = 1\n')
+    (site / 'startup.pth').write_text('import attacker\n')
+    assert module._digest_site_packages(site) != original

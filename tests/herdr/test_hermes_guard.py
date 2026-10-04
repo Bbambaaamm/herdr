@@ -51,6 +51,12 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
     model = types.ModuleType("model_tools")
 
     def handle(name, args, task_id=None, **kw):
+        if kw.pop("through_middleware", False):
+            return executor._run_agent_tool_execution_middleware(
+                None, function_name=name, function_args=args,
+                effective_task_id=task_id, tool_call_id="approval-probe",
+                execute=lambda final: registry.dispatch(name, final, task_id=task_id),
+            )
         if name == "tool_call":
             return model.handle_function_call(args["name"], args["arguments"], task_id=task_id, **kw)
         if name.startswith("connectors__"):
@@ -65,6 +71,8 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
                  execute, **kwargs):
         # The real seam invokes execute only after request middleware and the
         # pre_tool_call hook have both had a chance to replace the arguments.
+        if function_args.get("block"):
+            return "blocked-before-execution"
         effective = {"path": function_args["rewrite"]} if "rewrite" in function_args else function_args
         return execute(effective)
     executor._run_agent_tool_execution_middleware = run_tool
@@ -106,6 +114,8 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
     class Guard:
         aliases = {}
         checks = []
+        approval_required = False
+        approval_used = False
         grant = types.SimpleNamespace(identity=types.SimpleNamespace(task_id="task"), scope=types.SimpleNamespace(data_classes=(DataClass.INTERNAL,)), provider_routes=(types.SimpleNamespace(provider="provider-a", base_url="https://provider-a.example.invalid/v1", api_mode="openai", regions=("eu-central",), data_classes=("internal",), max_egress="region_bound", max_retention="limited", training="excluded", credential_refs=()),))
 
         def authorize_provider(self, request):
@@ -124,6 +134,12 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
             canonical = self.canonical_tool(name)
             if canonical != "read_file":
                 raise PolicyDenied("tool_not_granted")
+            if self.approval_required and args.get("path") == "/scoped/file":
+                if consume_approval:
+                    if self.approval_used:
+                        raise PolicyDenied("approval_replayed")
+                    self.approval_used = True
+                return canonical
             if args != {"path": "/scoped/file"}:
                 raise PolicyDenied("path_outside_grant")
             return canonical
@@ -186,6 +202,22 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
         assert "HERDR_SECURITY_DENIED[security_contract_invalid]" in malformed["error"]
         malformed_registry = json.loads(registry.dispatch("", {}, task_id="task"))
         assert "HERDR_SECURITY_DENIED[security_contract_invalid]" in malformed_registry["error"]
+        policy.approval_required = True
+        assert model.handle_function_call("read_file", {"path": "/scoped/file", "block": True},
+                                          task_id="task", through_middleware=True) == "blocked-before-execution"
+        assert not policy.approval_used
+        rewritten = model.handle_function_call("read_file", {"path": "/scoped/file", "rewrite": "/outside"},
+                                               task_id="task", through_middleware=True)
+        assert "HERDR_SECURITY_DENIED" in rewritten
+        assert not policy.approval_used
+        before = len(policy.checks)
+        assert "ok" in model.handle_function_call("read_file", {"path": "/scoped/file"},
+                                                   task_id="task", through_middleware=True)
+        assert policy.approval_used
+        assert [check[2] for check in policy.checks[before:]] == [False, True, False]
+        replay = model.handle_function_call("read_file", {"path": "/scoped/file"},
+                                            task_id="task", through_middleware=True)
+        assert "HERDR_SECURITY_DENIED[approval_replayed]" in replay
         agent = types.SimpleNamespace(provider="provider-b", base_url="https://provider-a.example.invalid/v1", api_mode="openai")
         with pytest.raises(PolicyDenied, match="provider_not_granted"):
             loop.perform_api_call(agent)
@@ -211,6 +243,6 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
         with pytest.raises(PolicyDenied, match="provider_not_granted"):
             loop.perform_api_call(agent)
         assert callbacks == ["switch_callback"]
-        assert called == ["read_file", "read_file"]
+        assert called == ["read_file", "read_file", "read_file"]
     finally:
         installation.uninstall()

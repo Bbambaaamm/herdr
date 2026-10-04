@@ -1,4 +1,4 @@
-#!/home/agentops/.hermes/hermes-agent/venv/bin/python -I
+#!/usr/bin/python3 -I -S
 """Fixed-path Hermes bootstrap reached through the pane's policy-bin PATH.
 
 Production authority comes from the host-pinned bundle inode on a read-only
@@ -11,8 +11,10 @@ import importlib
 import hashlib
 import os
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +22,18 @@ BUNDLE_PATH = Path("/run/herdr-policy/grant.bundle.json")
 POLICY_CODE_ROOT = Path("/run/herdr/policy-code")
 HERMES_ROOT = Path("/home/agentops/.hermes/hermes-agent")
 HERMES_HEAD = "ee5ee84a345204a3b1d6ef6ba1ab747e602867b9"
-HERMES_EXECUTOR = "hermes:0.21.5:sha256:525219e866137f43c8c8b068488e07d97f14529d2d67497cd52fbfd1197da4f4"
+HERMES_SOURCE_SHA256 = "525219e866137f43c8c8b068488e07d97f14529d2d67497cd52fbfd1197da4f4"
+PYTHON_PATH = Path("/home/agentops/.local/share/uv/python/cpython-3.11.16-linux-x86_64-gnu/bin/python3.11")
+PYTHON_SHA256 = "1e761eb19d6f2594ab8dc64bd99ad4e1753589f3bf1ec199e4eef3aaa21e3930"
+PYTHON_STDLIB_SHA256 = "330e97044fcb6873bc76ab37b63bfcd8c9a081d64d285adea164d3f72b548c2e"
+SITE_SHA256 = "61bbcc21c6f429974c9e6d10258a93056b439cb3a4afd5548e112694f5e0fea0"
+_INTERPRETER_FD_ENV = "HERDR_VERIFIED_PYTHON_FD"
+_SOURCE_EXECUTOR = f"hermes:0.21.5:sha256:{HERMES_SOURCE_SHA256}"
+HERMES_EXECUTOR = "hermes:0.21.5:sha256:" + hashlib.sha256(
+    b"herdr-hermes-executor-v2\0" + bytes.fromhex(HERMES_SOURCE_SHA256)
+    + bytes.fromhex(PYTHON_SHA256) + bytes.fromhex(PYTHON_STDLIB_SHA256)
+    + bytes.fromhex(SITE_SHA256)
+).hexdigest()
 IDENTITY_ENV = {
     "consumer": "HERDR_POLICY_CONSUMER",
     "agent_id": "HERDR_POLICY_AGENT_ID",
@@ -77,7 +90,6 @@ def _reset_import_path(policy_code_root: Path, hermes_root: Path) -> None:
     os.environ.pop("PYTHONPATH", None)
     os.environ.pop("PYTHONHOME", None)
     os.environ["PYTHONNOUSERSITE"] = "1"
-    venv = (hermes_root / "venv").resolve()
     base = Path(sys.base_prefix).resolve()
     trusted: list[str] = []
     for raw in list(sys.path):
@@ -87,11 +99,95 @@ def _reset_import_path(policy_code_root: Path, hermes_root: Path) -> None:
             candidate = Path(raw).resolve()
         except OSError:
             continue
-        if _within(candidate, venv) or _within(candidate, base):
+        if _within(candidate, base):
             text = str(candidate)
             if text not in trusted:
                 trusted.append(text)
-    sys.path[:] = [str(policy_code_root.resolve()), str(hermes_root.resolve()), *trusted]
+    site = hermes_root / "venv/lib/python3.11/site-packages"
+    sys.path[:] = [str(policy_code_root.resolve()), str(hermes_root.resolve()), str(site), *trusted]
+
+
+def _sha256_fd(fd: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    while chunk := os.read(fd, 1024 * 1024):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _verified_interpreter_fd() -> int:
+    """Open and hash the executable that will be passed to execve."""
+    fd = os.open(PYTHON_PATH, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode) or _sha256_fd(fd) != PYTHON_SHA256:
+            raise SystemExit("audited Python binary differs from executor pin")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _exec_verified_interpreter(script: Path, args: list[str]) -> None:
+    fd = _verified_interpreter_fd()
+    if _digest_site_packages(PYTHON_PATH.parents[1] / "lib/python3.11") != PYTHON_STDLIB_SHA256:
+        raise SystemExit("audited Python standard library differs from executor pin")
+    os.set_inheritable(fd, True)
+    env = dict(os.environ)
+    env[_INTERPRETER_FD_ENV] = str(fd)
+    path = f"/proc/self/fd/{fd}"
+    os.execve(path, [path, "-I", "-S", str(script), *args], env)
+
+
+def _verify_runtime(hermes_root: Path) -> None:
+    """Stage two: recheck the inherited ELF and closed import surface."""
+    if not sys.flags.isolated or not sys.flags.no_site or sys.version_info[:2] != (3, 11):
+        raise SystemExit("audited Python requires isolated no-site startup")
+    try:
+        fd = int(os.environ.pop(_INTERPRETER_FD_ENV))
+        inherited = os.fstat(fd)
+        active = os.stat("/proc/self/exe")
+        if (inherited.st_dev, inherited.st_ino) != (active.st_dev, active.st_ino):
+            raise ValueError("active interpreter differs from held executable")
+        if not stat.S_ISREG(inherited.st_mode) or _sha256_fd(fd) != PYTHON_SHA256:
+            raise ValueError("audited interpreter bytes changed")
+        if os.path.realpath(f"/proc/self/fd/{fd}") != str(PYTHON_PATH):
+            raise ValueError("interpreter path changed")
+    except (OSError, ValueError, TypeError) as exc:
+        raise SystemExit("cannot verify inherited Hermes interpreter") from exc
+    finally:
+        if 'fd' in locals():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    site = hermes_root / "venv/lib/python3.11/site-packages"
+    if _digest_site_packages(PYTHON_PATH.parents[1] / "lib/python3.11") != PYTHON_STDLIB_SHA256:
+        raise SystemExit("audited Python standard library differs from executor pin")
+    if _digest_site_packages(site) != SITE_SHA256:
+        raise SystemExit("venv import surface differs from executor pin")
+    # CPython never consults conventional __pycache__ with this fresh prefix.
+    sys.pycache_prefix = tempfile.mkdtemp(prefix=f"herdr-pycache-{os.getpid()}-", dir="/tmp")
+
+
+def _digest_site_packages(site: Path) -> str:
+    if site.is_symlink() or not site.is_dir():
+        raise SystemExit("venv import surface unavailable")
+    digest = hashlib.sha256()
+    for path in sorted(site.rglob("*"), key=lambda p: p.relative_to(site).as_posix()):
+        if "__pycache__" in path.relative_to(site).parts:
+            continue
+        if path.suffix == ".pyc":
+            raise SystemExit("sourceless venv bytecode is forbidden")
+        if path.is_symlink():
+            raise SystemExit("venv import surface contains a symlink")
+        if not path.is_file() and not path.is_dir():
+            raise SystemExit("venv import surface contains a special file")
+        if path.is_file():
+            if not stat.S_ISREG(path.stat().st_mode):
+                raise SystemExit("venv import surface contains a special file")
+            digest.update(path.relative_to(site).as_posix().encode() + b"\0")
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
 
 
 def _require_module_origin(module: Any, root: Path, label: str) -> None:
@@ -124,18 +220,26 @@ def _verify_hermes_build(root: Path) -> str:
         names = subprocess.run(["/usr/bin/git", "-C", str(root), "ls-files", "-z"],
                                env=env, capture_output=True, check=True, timeout=30).stdout
         digest = hashlib.sha256()
+        tracked = set()
         for name in names.split(b"\0"):
             if name:
+                tracked.add(os.fsdecode(name))
                 digest.update(name + b"\0")
                 digest.update(hashlib.sha256((root / os.fsdecode(name)).read_bytes()).digest())
         if git("status", "--porcelain", "--untracked-files=all"):
             raise ValueError("Hermes source tree is not clean")
+        for path in root.rglob("*"):
+            relative = path.relative_to(root)
+            if any(part in {"venv", ".git", "__pycache__", "node_modules"} for part in relative.parts):
+                continue
+            if path.suffix in {".py", ".pyc", ".so", ".pth"} and relative.as_posix() not in tracked:
+                raise ValueError("untracked importable Hermes file")
     except (OSError, AttributeError, ValueError, subprocess.SubprocessError) as exc:
         raise SystemExit("cannot verify audited Hermes build") from exc
     actual = f"hermes:{version}:sha256:{digest.hexdigest()}"
-    if actual != HERMES_EXECUTOR:
+    if actual != _SOURCE_EXECUTOR:
         raise SystemExit("Hermes build differs from signed executor pin")
-    return actual
+    return HERMES_EXECUTOR
 
 
 def bootstrap(
@@ -155,8 +259,8 @@ def bootstrap(
         _require_production_mount(bundle_path, exact=True)
         _require_production_mount(policy_code_root)
 
-    if Path(sys.prefix).resolve() != (hermes_root / "venv").resolve():
-        raise SystemExit("bootstrap requires audited Hermes Python interpreter")
+    if production:
+        _verify_runtime(hermes_root)
     if policy_code_root.is_symlink() or not policy_code_root.is_dir():
         raise SystemExit("trusted policy code root unavailable")
     executor = _verify_hermes_build(hermes_root)
@@ -193,6 +297,10 @@ def bootstrap(
 
 def main() -> int:
     # No policy path, identity, key, code root, or executable override is parsed from argv.
+    if _INTERPRETER_FD_ENV not in os.environ:
+        if Path(sys.executable).resolve() != Path("/usr/bin/python3").resolve() or not sys.flags.isolated or not sys.flags.no_site:
+            raise SystemExit("bootstrap requires trusted system Python -I -S")
+        _exec_verified_interpreter(POLICY_CODE_ROOT / "agent-stack/bin/agent-hermes-policy-run", sys.argv[1:])
     return bootstrap(sys.argv[1:])
 
 

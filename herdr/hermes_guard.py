@@ -365,29 +365,18 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
             return original_handle(function_name, function_args, task_id, *args, **kwargs)
 
         try:
-            canonical_name = guard.canonical_tool(function_name)
-            digest = _call_digest(canonical_name, function_args)
-            already = _AUTHORIZED_CALL.get()
-            canonical, checked = guard.authorize_tool_call(
+            _, checked = guard.authorize_tool_call(
                 function_name,
                 function_args,
                 caller_task_id=task_id,
-                consume_approval=(already != (canonical_name, digest)),
+                consume_approval=False,
             )
         except PolicyDenied as exc:
             return _denied_result(exc.reason, exc.detail)
         except SecurityError:
             return _denied_result("security_contract_invalid")
 
-        try:
-            call_digest = _call_digest(canonical, checked)
-        except (SecurityError, TypeError, ValueError):
-            return _denied_result("security_contract_invalid")
-        token = _AUTHORIZED_CALL.set((canonical, call_digest))
-        try:
-            return original_handle(function_name, checked, task_id, *args, **kwargs)
-        finally:
-            _AUTHORIZED_CALL.reset(token)
+        return original_handle(function_name, checked, task_id, *args, **kwargs)
 
     installation._remember(model_tools, "handle_function_call", guarded_handle)
 

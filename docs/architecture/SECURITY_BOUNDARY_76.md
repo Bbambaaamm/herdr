@@ -202,23 +202,39 @@ Hermes version banner never appeared, and the probe pane was closed. This proves
 the supported path is `herdr server → pane shell → policy-bin/hermes → guarded
 Hermes`; it does not claim #82 has integrated the bundle yet.
 
-`agent-stack/policy-bin/hermes` is a regular executable, byte-identical copy of
-`agent-hermes-policy-run` (not a symlink, because release payload extraction is
-fail-closed on links). The launcher reads only the fixed bundle path and exact host-controlled pane env:
+`agent-stack/policy-bin/hermes` is a regular executable shell entry (not a
+symlink). It starts the fixed policy-code launcher with `/usr/bin/python3 -I -S`.
+This host system Python and its standard library are the first-stage trust base.
+The launcher reads only the fixed bundle path and exact host-controlled pane env:
 `HERDR_POLICY_CONSUMER`, `HERDR_POLICY_AGENT_ID`,
 `HERDR_POLICY_PARENT_AGENT_ID`, `HERDR_POLICY_PARENT_TASK_ID`,
 `HERDR_POLICY_TASK_ID`, `HERDR_POLICY_RUN_TOKEN`, and
 `HERDR_POLICY_FENCING_TOKEN`. It checks the exact readonly file bind and
 verifies the canonical signed bundle, identity/fence and attested runtime. It
-installs the guard in the audited Hermes interpreter before importing and
+opens and hashes the pinned Hermes Python ELF, verifies its standard library,
+then executes that held file
+descriptor with `-I -S`. Stage two rechecks the inherited descriptor against
+`/proc/self/exe`, hashes the venv site-packages import surface, installs a fresh
+`sys.pycache_prefix`, and adds the verified site-packages without processing
+`.pth` files. Conventional `__pycache__` and sourceless `.pyc` files have no
+execution authority. It installs the guard before importing and
 calling `hermes_cli.main`, passing ordinary Hermes argv through. Empty,
 truncated, noncanonical or invalid bundles fail closed. CLI/env-selected grant,
 key, bundle, policy code and Hermes root paths have no authority.
 Before importing Hermes modules, bootstrap checks version 0.21.5, the audited
 Git HEAD `ee5ee84a345204a3b1d6ef6ba1ab747e602867b9`, a clean tree and the
-deterministic digest of actual tracked bytes. The signed scope must contain the
-exact `hermes:0.21.5:sha256:525219e866137f43c8c8b068488e07d97f14529d2d67497cd52fbfd1197da4f4`
-executor identifier.
+deterministic digest of actual tracked bytes. It rejects unexpected untracked
+importable source outside the venv. The executor identity combines that source
+digest with pinned Python SHA256
+`1e761eb19d6f2594ab8dc64bd99ad4e1753589f3bf1ec199e4eef3aaa21e3930`
+and its standard-library SHA256
+`330e97044fcb6873bc76ab37b63bfcd8c9a081d64d285adea164d3f72b548c2e`,
+and site-packages SHA256
+`61bbcc21c6f429974c9e6d10258a93056b439cb3a4afd5548e112694f5e0fea0`.
+The signed scope must contain exactly
+`hermes:0.21.5:sha256:2e622affe56086408e159ec08c36fd8171d1181da3f4f5ba5259d1de160a9e34`.
+Outer tool authorization checks the proposed call without spending approval;
+the final inline, registry, or connector seam consumes it for effective args.
 
 ## #82 integration interface
 
