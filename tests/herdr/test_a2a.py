@@ -1144,3 +1144,66 @@ def test_null_optional_status_message_task_id_keeps_candidates_and_binding(tmp_p
 def test_invalid_fence_rejected_before_gateway_or_economic_claim(fence):
     with pytest.raises(A2AError, match="fence"):
         Identity("parent","child","task","run",fence,"key")
+
+
+@pytest.mark.parametrize("operation", ["send","poll","cancel"])
+@pytest.mark.parametrize("scalar", ["filename","mediaType","media_type"])
+def test_optional_null_part_strings_are_unset_without_losing_response(tmp_path,operation,scalar):
+    _,card,policy,identity,store=setup(tmp_path)
+    response=task()
+    response["task"]["artifacts"]=[{"artifact_id":"answer","parts":[
+        {"text":"findings",scalar:None,"metadata":None}]}]
+    transport=Mock(response);gateway=Gateway(transport,store,card,policy)
+    if operation=="send": candidate,=gateway.send(identity,"work")
+    else:
+        transport.response=task();gateway.send(identity,"work");transport.response=response
+        if operation=="poll":candidate,=gateway.poll(identity)
+        else:
+            response["task"]["status"]["state"]="TASK_STATE_CANCELED"
+            transport.cancel=lambda *args:response["task"]
+            candidate,=gateway.cancel(identity)
+    assert candidate.content["parts"]==[{"text":"findings"}]
+    assert len(gateway.recover(identity))==1 and len(transport.sends)==1
+
+@pytest.mark.parametrize("operation", ["send","poll","cancel"])
+@pytest.mark.parametrize("bare", [False,True])
+def test_original_proto_names_normalize_only_protocol_objects(tmp_path,operation,bare):
+    _,card,policy,identity,store=setup(tmp_path)
+    opaque={"message_id":"payload","context_id":"data-not-authority","media_type":None}
+    value={"id":"remote-task","context_id":"remote-context","status":{
+        "state":"TASK_STATE_WORKING","message":{"message_id":"status","role":2,
+            "context_id":"remote-context","task_id":None,"parts":[{"data":opaque,"media_type":"application/json"}]}},
+        "artifacts":[{"artifact_id":"report","parts":[{"text":"report","media_type":"text/plain"}]}]}
+    transport=Mock();gateway=Gateway(transport,store,card,policy)
+    if operation=="send":
+        transport.response={"task":value};results=gateway.send(identity,"work")
+    else:
+        gateway.send(identity,"work");transport.response=value if bare else {"task":value}
+        if operation=="poll":results=gateway.poll(identity)
+        else:
+            value["status"]["state"]="TASK_STATE_CANCELED"
+            transport.cancel=lambda *args:value if bare else {"task":value}
+            results=gateway.cancel(identity)
+    assert len(results)==2 and results[0].content["messageId"]=="status"
+    assert results[0].content["parts"][0]["data"]==opaque
+    assert results[1].content["artifactId"]=="report"
+    assert results[1].content["parts"][0]["mediaType"]=="text/plain"
+    assert store.read()["remote_context_id"]=="remote-context"
+    assert len(transport.sends)==1
+
+def test_direct_original_proto_names_and_null_scalar_oneof_do_not_rewrite_data_null(tmp_path):
+    _,card,policy,identity,store=setup(tmp_path)
+    response={"message":{"message_id":"direct","context_id":"ctx","task_id":None,"role":2,
+        "parts":[{"text":None,"raw":None,"url":None,"data":None,"media_type":None}]}}
+    candidate,=Gateway(Mock(response),store,card,policy).send(identity,"work")
+    assert candidate.content["parts"]==[{"data":None}]
+    assert candidate.remote_task_id is None
+
+def test_duplicate_proto_aliases_are_ambiguous_and_never_resend(tmp_path):
+    _,card,policy,identity,store=setup(tmp_path)
+    transport=Mock({"message":{"messageId":"a","message_id":"a","contextId":"ctx","role":2,"parts":[{"text":"reply"}]}})
+    gateway=Gateway(transport,store,card,policy)
+    with pytest.raises(A2AError,match="duplicate proto"):gateway.send(identity,"work")
+    assert len(transport.sends)==1
+    with pytest.raises(A2AError):gateway.send(identity,"work")
+    assert len(transport.sends)==1

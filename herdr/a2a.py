@@ -113,8 +113,23 @@ def _remote_id(value: Any, label: str) -> str:
     return value
 
 
+def _proto_keys(value: Mapping[str, Any], keys: set[str]) -> dict[str, Any]:
+    """Normalize declared protocol fields, preserving opaque metadata/data."""
+    result = dict(value)
+    for canonical in keys:
+        original = re.sub(r"(?<!^)(?=[A-Z])", "_", canonical).lower()
+        if original != canonical and original in result:
+            if canonical in result:
+                raise A2AError("duplicate proto field aliases")
+            result[canonical] = result.pop(original)
+    return result
+
+
 def _object(value: Any, keys: set[str], required: set[str]) -> Mapping[str, Any]:
-    if not isinstance(value, dict) or not required <= value.keys() or value.keys() - keys:
+    if not isinstance(value, dict):
+        raise A2AError("invalid object fields")
+    value = _proto_keys(value, keys)
+    if not required <= value.keys() or value.keys() - keys:
         raise A2AError("invalid object fields")
     return value
 
@@ -708,9 +723,15 @@ class BindingStore:
 def _parts(raw: Any) -> Any:
     if not isinstance(raw, list) or not 1 <= len(raw) <= MAX_PARTS:
         raise A2AError("invalid parts")
+    normalized_parts = []
     for part in raw:
         if not isinstance(part, dict):
             raise A2AError("invalid part")
+        part = _proto_keys(part, {"mediaType"})
+        # google.protobuf.Value data:null is a real value; null scalar/bytes
+        # content and optional strings/maps are unset under ProtoJSON.
+        for key in ("text", "raw", "url", "filename", "mediaType", "metadata"):
+            if part.get(key) is None: part.pop(key, None)
         if sum(k in part for k in ("text", "raw", "url", "data")) != 1:
             raise A2AError("invalid part content")
         if "url" in part:
@@ -738,7 +759,8 @@ def _parts(raw: Any) -> Any:
                 raise A2AError("invalid part metadata")
         if part.get("metadata") is not None and not isinstance(part["metadata"], dict):
             raise A2AError("invalid part metadata")
-    return raw
+        normalized_parts.append(part)
+    return normalized_parts
 
 
 def _candidate(identity: Identity, task: str | None, context: str | None, kind: str, content: Any) -> Candidate:
@@ -748,7 +770,10 @@ def _candidate(identity: Identity, task: str | None, context: str | None, kind: 
 
 
 def _response_object(value: Any, required: set[str]) -> Mapping[str, Any]:
-    if not isinstance(value, dict) or not required <= value.keys():
+    if not isinstance(value, dict):
+        raise A2AError("invalid response object")
+    value = _proto_keys(value, {"messageId", "contextId", "taskId", "artifactId", "referenceTaskIds"})
+    if not required <= value.keys():
         raise A2AError("invalid response object")
     return value
 
@@ -795,7 +820,7 @@ def _parse_response(
         _remote_id(msg["messageId"], "messageId")
         if not _agent_role(msg["role"]):
             raise A2AError("expected agent message")
-        _parts(msg["parts"])
+        msg["parts"] = _parts(msg["parts"])
         if "contextId" not in msg:
             raise A2AError("agent message requires contextId")
         context = _remote_id(msg["contextId"], "contextId")
@@ -819,7 +844,7 @@ def _parse_response(
         _remote_id(msg["messageId"], "messageId")
         if not _agent_role(msg["role"]):
             raise A2AError("expected agent status message")
-        _parts(msg["parts"])
+        msg["parts"] = _parts(msg["parts"])
         if "contextId" not in msg:
             raise A2AError("agent status message requires contextId")
         message_context = _remote_id(msg["contextId"], "contextId")
@@ -850,7 +875,7 @@ def _parse_response(
         artifact_id=_remote_id(item["artifactId"], "artifactId")
         if artifact_id in artifact_ids:raise A2AError("duplicate artifact id")
         artifact_ids.add(artifact_id)
-        _parts(item["parts"])
+        item["parts"] = _parts(item["parts"])
         candidates.append(_candidate(identity, task_id, context, "artifact", item))
     return state, task_id, context, tuple(candidates)
 
