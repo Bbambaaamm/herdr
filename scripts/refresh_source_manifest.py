@@ -25,6 +25,7 @@ FILES = (
     Path("package-lock.json"),
     Path("requirements-mcp.txt"),
     Path("docs/architecture/MCP_GATEWAY.md"),
+    Path("docs/architecture/INVOCATION_POLICY_LAUNCH.md"),
 )
 OUTPUT = Path("provenance/CANONICAL_SOURCE_MANIFEST.sha256")
 TEXT_SUFFIXES = {
