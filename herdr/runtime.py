@@ -1114,9 +1114,18 @@ class HerdrChildRuntime:
                 )
             ):
                 raise HerdrRuntimeError("child_sandbox_attestation_denied", lease.task_id)
+            def publish_continuation(evidence):
+                return self.scheduler.attest_execution_sandbox(
+                    lease.task_id,run_token,lease.agent_id,pane_id,marker,
+                    sandbox_pid=int(proof["sandbox_pid"]),policy_sha256=str(proof["policy_sha256"]),
+                    invocation_policy=evidence)
+            launch.set_continuation_sink(publish_continuation)
+            launch.arm_bootstrap()
             self.scheduler.mark_pre_delivery_agent_start(lease.task_id)
             agent_start_attempted = True
             self._start_agent(lease, pane_id)
+            proof["invocation_policy"]=launch.confirm_bootstrap()
+            launch.verify_bootstrap()
             self._verify_live_child(lease.agent_id, pane_id, marker, require_sandbox=True)
             if not self.scheduler.bind_execution_session(lease.task_id, run_token,
                                                          lease.agent_id, pane_id, marker):

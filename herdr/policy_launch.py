@@ -223,7 +223,11 @@ def mount_rows(pid):
         path = fields[4]
         for old, new in ((r"\040", " "), (r"\011", "\t"), (r"\012", "\n"), (r"\134", "\\")):
             path = path.replace(old, new)
-        rows[path] = set(fields[5].split(","))
+        modes=set(fields[5].split(","))
+        if path in rows:
+            rows[path].update(modes)
+            rows[path].add("__stacked__")
+        else: rows[path]=modes
     _require(len(rows) <= 4096, "mount count exceeds bound")
     return rows
 
@@ -237,6 +241,7 @@ class PolicyMount:
         _require({x.target for x in runtime} == RUNTIME_TARGETS and len(runtime) == 2,
                  "exact immutable Hermes/Python snapshots required")
         self.stage, self.code, self.runtime = stage, code, tuple(runtime)
+        self.bootstrap = None
         targets = [str(BUNDLE_TARGET), str(code.target), *(str(x.target) for x in runtime)]
         _require(len(targets) == len(set(targets)), "duplicate policy mount target")
 
@@ -250,6 +255,10 @@ class PolicyMount:
             tree.verify()
             result.append({"source": tree.source, "fd": tree.fd, "device": tree.device,
                            "inode": tree.inode, "kind": "directory", "target": str(tree.target)})
+        if self.bootstrap is not None:
+            from .host_bootstrap import HostBootstrap
+            _require(isinstance(self.bootstrap,HostBootstrap),"typed host bootstrap required")
+            result.extend(self.bootstrap.descriptors())
         return result
 
     def verify_mounted(self, pid, sealed: SealedPolicyBundle | None = None):
@@ -262,10 +271,13 @@ class PolicyMount:
                          "unexpected mount below immutable policy/runtime tree")
             path = root / entry["target"].lstrip("/")
             info = path.stat()
-            expected_kind = stat.S_ISREG if entry["kind"] == "file" else stat.S_ISDIR
+            expected_kind = {"file":stat.S_ISREG,"directory":stat.S_ISDIR,
+                             "socket":stat.S_ISSOCK}[entry["kind"]]
             _require(expected_kind(info.st_mode)
                      and (info.st_dev, info.st_ino) == (entry["device"], entry["inode"])
-                     and "ro" in rows.get(entry["target"], set()), "policy mount identity/readonly mismatch")
+                     and "ro" in rows.get(entry["target"], set())
+                     and "__stacked__" not in rows.get(entry["target"],set()),
+                     "policy mount identity/readonly mismatch")
         if sealed is not None:
             _require((sealed.device, sealed.inode) == (self.stage.device, self.stage.inode),
                      "sealed policy inode mismatch")
@@ -327,9 +339,11 @@ def validate_policy_evidence(evidence, *, identity: InvocationIdentity):
     keys = {"schema_version", "grant_sha256", "bundle_sha256", "bundle_device", "bundle_inode",
             "code_sha256", "runtime_sha256", "identity", "sandbox_attestation_sha256",
             "tree_identities", "process_start_ticks"}
+    modern=isinstance(evidence,dict) and evidence.get("schema_version")=="herdr-policy-launch-3"
+    if modern: keys.add("bootstrap")
     _require(isinstance(evidence, dict) and set(evidence) == keys
              and len(canonical_json_bytes(evidence)) <= 16384, "bounded policy evidence required")
-    _require(evidence["schema_version"] == "herdr-policy-launch-2"
+    _require(evidence["schema_version"] in {"herdr-policy-launch-2","herdr-policy-launch-3"}
              and InvocationIdentity.from_dict(evidence["identity"]) == identity,
              "policy evidence identity mismatch")
     for key in ("grant_sha256", "bundle_sha256", "code_sha256", "sandbox_attestation_sha256"):
@@ -351,6 +365,18 @@ def validate_policy_evidence(evidence, *, identity: InvocationIdentity):
                  and tree["inode"] > 0, "policy tree inode malformed")
     _require(type(evidence["process_start_ticks"]) is int
              and 0 < evidence["process_start_ticks"] < 2**64, "policy process identity malformed")
+    if modern:
+        from .host_bootstrap import validate_continuation
+        bootstrap=evidence["bootstrap"]
+        _require(isinstance(bootstrap,dict) and set(bootstrap)=={"continuation","bootstrap_tree"},
+                 "bootstrap proof incomplete")
+        validate_continuation(bootstrap["continuation"],identity=identity,
+                              bundle_sha256=evidence["bundle_sha256"])
+        tree=bootstrap["bootstrap_tree"]
+        _require(isinstance(tree,dict) and set(tree)=={"device","inode","source_digest"}
+                 and all(type(tree[key]) is int and 0<tree[key]<2**64 for key in ("device","inode"))
+                 and isinstance(tree["source_digest"],str) and _SHA.fullmatch(tree["source_digest"]),
+                 "bootstrap tree evidence malformed")
     return json.loads(canonical_json_bytes(evidence))
 
 
@@ -364,7 +390,7 @@ def process_start_ticks(pid):
     return int(fields[19])
 
 
-def verify_retained_policy_evidence(evidence, *, identity, pid, attestation, now=None):
+def verify_retained_policy_evidence(evidence, *, identity, pid, attestation, now=None, require_bootstrap=True):
     """Reopen protected launch proof after restart; never authorize fresh calls."""
     proof = validate_policy_evidence(evidence, identity=identity)
     _require(process_start_ticks(pid) == proof["process_start_ticks"], "policy process was replaced")
@@ -385,7 +411,8 @@ def verify_retained_policy_evidence(evidence, *, identity, pid, attestation, now
         info = (root / target.lstrip("/")).stat()
         _require(stat.S_ISDIR(info.st_mode)
                  and (info.st_dev, info.st_ino) == (expected["device"], expected["inode"])
-                 and "ro" in rows.get(target, set()), "retained policy tree identity mismatch")
+                 and "ro" in rows.get(target, set()) and "__stacked__" not in rows.get(target,set()),
+                 "retained policy tree identity mismatch")
         _require(not any(path in Path(name).parents for name in rows),
                  "unexpected mount below immutable policy/runtime tree")
     bundle = root / str(BUNDLE_TARGET).lstrip("/")
@@ -394,7 +421,9 @@ def verify_retained_policy_evidence(evidence, *, identity, pid, attestation, now
         info = os.fstat(fd)
         _require(stat.S_ISREG(info.st_mode)
                  and (info.st_dev, info.st_ino) == (proof["bundle_device"],proof["bundle_inode"])
-                 and "ro" in rows.get(str(BUNDLE_TARGET),set()), "retained policy bundle identity mismatch")
+                 and "ro" in rows.get(str(BUNDLE_TARGET),set())
+                 and "__stacked__" not in rows.get(str(BUNDLE_TARGET),set()),
+                 "retained policy bundle identity mismatch")
         raw = b""
         while len(raw) <= 131072:
             chunk = os.read(fd, 131073-len(raw))
@@ -426,6 +455,12 @@ def verify_retained_policy_evidence(evidence, *, identity, pid, attestation, now
              and set(assurance.writable_roots) == {name for name,modes in rows.items() if "rw" in modes},
              "retained runtime assurance mismatch")
     _require(process_start_ticks(pid) == proof["process_start_ticks"], "policy process changed during verification")
+    if require_bootstrap:
+        _require(proof["schema_version"]=="herdr-policy-launch-3",
+                 "authenticated agent bootstrap proof required")
+    if proof["schema_version"]=="herdr-policy-launch-3":
+        from .host_bootstrap import verify_retained_bootstrap
+        verify_retained_bootstrap(proof,identity=identity,shell_pid=pid)
     return grant
 
 
@@ -459,6 +494,9 @@ class PreparedPolicyLaunch:
         self._private_key, self._key_id, self._parent = private_key, key_id, parent
         self.sealed = None
         self._process_start_ticks = None
+        self._bootstrap_receipt = None
+        self._published_bootstrap_receipt = None
+        self._continuation_sink = None
 
     @property
     def identity(self):
@@ -474,11 +512,43 @@ class PreparedPolicyLaunch:
         self.grant, self.sealed = bound, sealed
         self._process_start_ticks = process_start_ticks(pid)
         self._private_key = None
+        _require(self.mount.bootstrap is not None,"immutable host bootstrap unavailable")
+        self.mount.bootstrap.register(pid,attestation)
         return self.evidence()
+
+    def set_continuation_sink(self, sink):
+        _require(callable(sink) and self._continuation_sink is None,
+                 "one durable host continuation sink required")
+        self._continuation_sink=sink
+
+    def _observe_bootstrap_continuation(self, receipt):
+        _require(callable(self._continuation_sink),"durable host continuation sink unavailable")
+        self._bootstrap_receipt=receipt
+        try:
+            _require(self._continuation_sink(self.evidence()) is True,
+                     "durable host continuation publication denied")
+            self._published_bootstrap_receipt=receipt
+        except BaseException:
+            self._bootstrap_receipt=None
+            raise
+
+    def arm_bootstrap(self):
+        _require(self.mount.bootstrap is not None,"immutable host bootstrap unavailable")
+        self.mount.bootstrap.arm()
+
+    def confirm_bootstrap(self):
+        _require(self.mount.bootstrap is not None,"immutable host bootstrap unavailable")
+        self._bootstrap_receipt=self.mount.bootstrap.confirm()
+        return self.evidence()
+
+    def verify_bootstrap(self):
+        _require(self._bootstrap_receipt is not None,"authenticated agent bootstrap unavailable")
+        _require(self.mount.bootstrap.confirm(timeout_seconds=0) is self._bootstrap_receipt,
+                 "authenticated agent bootstrap changed")
 
     def evidence(self):
         _require(self.sealed is not None, "launch policy is not sealed")
-        return {"schema_version": "herdr-policy-launch-2", "grant_sha256": self.grant.hash,
+        proof={"schema_version": "herdr-policy-launch-2", "grant_sha256": self.grant.hash,
                 "bundle_sha256": self.sealed.sha256, "bundle_device": self.sealed.device,
                 "bundle_inode": self.sealed.inode, "code_sha256": self.mount.code.source_digest,
                 "runtime_sha256": {str(x.target): x.source_digest for x in self.mount.runtime},
@@ -487,11 +557,17 @@ class PreparedPolicyLaunch:
                 "process_start_ticks": self._process_start_ticks,
                 "identity": self.identity.to_json(),
                 "sandbox_attestation_sha256": self.grant.runtime_assurance.sandbox_attestation_sha256}
+        if self._bootstrap_receipt is not None:
+            proof["schema_version"]="herdr-policy-launch-3"
+            proof["bootstrap"]=self.mount.bootstrap.evidence(self._bootstrap_receipt)
+        return proof
 
     def cleanup_after_pane_closed(self):
         # No invocation data, model argument or environment variable selects
         # these paths. The factory created every retained object itself.
         self.mount.stage._same_inode()
+        if self.mount.bootstrap is not None:
+            self.mount.bootstrap.cleanup_after_pane_closed()
         self.mount.stage.close()
         self.mount.stage.path.unlink()
         for tree in (self.mount.code, *self.mount.runtime):
@@ -545,8 +621,12 @@ class HostPolicyLaunchFactory:
                 snapshots.append(definition.freeze(self.storage, (*self.writable_roots, path)))
             import uuid
             stage = stage_policy_bundle(self.storage / ("grant-" + uuid.uuid4().hex + ".json"))
-            return PreparedPolicyLaunch(PolicyMount(stage, snapshots[0], snapshots[1:]),
-                                        grant, Ed25519PrivateKey.generate(), "host-launch", self.parent_grant)
+            prepared=PreparedPolicyLaunch(PolicyMount(stage, snapshots[0], snapshots[1:]),
+                                          grant, Ed25519PrivateKey.generate(), "host-launch", self.parent_grant)
+            from .host_bootstrap import HostBootstrap
+            prepared.mount.bootstrap=HostBootstrap.create(
+                prepared,storage=self.storage,writable_roots=(*self.writable_roots,path))
+            return prepared
         except BaseException:
             if stage is not None:
                 stage.close()

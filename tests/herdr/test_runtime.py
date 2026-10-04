@@ -319,7 +319,10 @@ def test_managed_runtime_binds_owned_pane_before_prompt(tmp_path: Path, monkeypa
     monkeypatch.setattr(runtime, "_create_pane", create)
     def sandbox_child(pane, marker, real, task_id):
         events.append("sandbox")
-        runtime._sandbox_proofs[pane] = {"sandbox_pid": 123, "policy_sha256": "a" * 64}
+        from tests.policy_launch_fakes import policy_fixture
+        launch=next(iter(runtime._policy_launches.values()))
+        runtime._sandbox_proofs[pane] = {"sandbox_pid":123,"policy_sha256":"a"*64,
+                                        "invocation_policy":policy_fixture(launch.identity)}
         return tmp_path / "policy"
     monkeypatch.setattr(runtime, "_sandbox_child_pane", sandbox_child)
     monkeypatch.setattr(runtime, "_start_agent", lambda lease, pane: events.append("start"))
@@ -670,7 +673,10 @@ def test_prompt_invocation_error_preserves_accepted_child(tmp_path: Path, monkey
         return "child-pane"
     monkeypatch.setattr(runtime, "_create_pane", create)
     def sandbox_child(pane, *args):
-        runtime._sandbox_proofs[pane] = {"sandbox_pid": 123, "policy_sha256": "a" * 64}
+        from tests.policy_launch_fakes import policy_fixture
+        launch=next(iter(runtime._policy_launches.values()))
+        runtime._sandbox_proofs[pane] = {"sandbox_pid":123,"policy_sha256":"a"*64,
+                                        "invocation_policy":policy_fixture(launch.identity)}
         return tmp_path / "policy"
     monkeypatch.setattr(runtime, "_sandbox_child_pane", sandbox_child)
     monkeypatch.setattr(runtime, "_start_agent", lambda *args: None)

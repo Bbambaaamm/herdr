@@ -538,6 +538,12 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
             permissions=tuple(task.get("parent_permissions") or ()))
         session["sandbox_verified"] = True
         persist_execution_session(task)
+        def publish_continuation(evidence):
+            session["invocation_policy"]=evidence
+            persist_execution_session(task)
+            return True
+        launch.set_continuation_sink(publish_continuation)
+        launch.arm_bootstrap()
         agent_start_attempted = True
         session["agent_start_attempted"] = True
         persist_execution_session(task)
@@ -560,6 +566,7 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         started_pane = str(started_agent.get("pane_id") or "")
         if started_pane and started_pane != pane_id:
             raise RuntimeError("task_session_agent_wrong_pane")
+        session["invocation_policy"] = launch.confirm_bootstrap()
         session["agent_started"] = True
         persist_execution_session(task)
         return session

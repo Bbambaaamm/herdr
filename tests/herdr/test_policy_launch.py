@@ -223,7 +223,7 @@ def test_actual_bwrap_seals_same_inode_after_mount_and_denies_writes(tmp_path, m
         retained = PreparedPolicyLaunch(item,bound,None,"probe")
         retained.sealed,retained._process_start_ticks = sealed,process_start_ticks(pid)
         proof = retained.evidence()
-        assert verify_retained_policy_evidence(proof,identity=identity,pid=pid,attestation=attestation).hash == bound.hash
+        assert verify_retained_policy_evidence(proof,identity=identity,pid=pid,attestation=attestation,require_bootstrap=False).hash == bound.hash
         for field in ("bundle_inode","process_start_ticks"):
             changed = json.loads(json.dumps(proof))
             changed[field] += 1

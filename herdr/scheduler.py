@@ -1279,6 +1279,24 @@ class DynamicChildScheduler:
         self.audit_log.flush()
         return True
 
+    @staticmethod
+    def _bootstrap_upgrade_allowed(rec, previous, current):
+        if (not rec.execution_sandbox_verified or not rec.pre_delivery_agent_start_attempted
+                or rec.state is not LifecycleState.RUNNING):
+            return False
+        old,new=previous.get("invocation_policy"),current.get("invocation_policy")
+        if (not isinstance(old,dict) or not isinstance(new,dict)
+                or old.get("schema_version")!="herdr-policy-launch-2"
+                or new.get("schema_version")!="herdr-policy-launch-3"):
+            return False
+        base={key:value for key,value in new.items() if key!="bootstrap"}
+        base["schema_version"]="herdr-policy-launch-2"
+        if base!=old: return False
+        return ({key:value for key,value in previous.items()
+                 if key not in {"verified_at","invocation_policy"}}
+                =={key:value for key,value in current.items()
+                   if key not in {"verified_at","invocation_policy"}})
+
     def attest_execution_sandbox(
         self,
         task_id: str,
@@ -1343,7 +1361,15 @@ class DynamicChildScheduler:
             previous = rec.execution_sandbox_attestation or {}
             comparable = {k: previous.get(k) for k in attestation if k != "verified_at"}
             current = {k: v for k, v in attestation.items() if k != "verified_at"}
-            return comparable == current
+            if comparable == current:
+                return True
+            if not self._bootstrap_upgrade_allowed(rec,previous,attestation):
+                return False
+            self.audit_log.append({"event":"execution_bootstrap_attested","task_id":task_id,
+                                   "run_token":run_token,"attestation":attestation})
+            self.audit_log.flush()
+            rec.execution_sandbox_attestation=json.loads(json.dumps(attestation))
+            return True
         rec.execution_sandbox_verified = True
         rec.execution_sandbox_attestation = attestation
         self.audit_log.append({
@@ -1955,7 +1981,7 @@ class DynamicChildScheduler:
                     rec.execution_agent = str(e.get("agent_name", ""))
                     rec.execution_pane = str(e.get("pane_id", ""))
                     rec.execution_marker = str(e.get("marker", ""))
-            elif event_type == "execution_sandbox_attested":
+            elif event_type in {"execution_sandbox_attested","execution_bootstrap_attested"}:
                 rec = self._tasks.get(str(e.get("task_id", "")))
                 attestation = e.get("attestation")
                 if (
@@ -1988,8 +2014,11 @@ class DynamicChildScheduler:
                             task_id=rec.id, run_token=rec.run_token, fencing_token=rec.fencing_token))
                     except (SecurityError, TypeError, ValueError) as exc:
                         raise SchedulerError("invalid child invocation policy evidence") from exc
+                if event_type=="execution_bootstrap_attested" and not self._bootstrap_upgrade_allowed(
+                        rec,rec.execution_sandbox_attestation or {},attestation):
+                    raise SchedulerError("invalid authenticated bootstrap upgrade")
                 rec.execution_sandbox_verified = True
-                rec.execution_sandbox_attestation = dict(attestation)
+                rec.execution_sandbox_attestation = json.loads(json.dumps(attestation))
             elif event_type == "child_pane_creation_attempted":
                 rec = self._tasks.get(str(e.get("task_id", "")))
                 if (rec is None or rec.delegation_key is None or rec.state is not LifecycleState.RUNNING
