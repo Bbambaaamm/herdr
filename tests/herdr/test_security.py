@@ -522,8 +522,18 @@ def test_child_lifetime_and_credential_identity_constraints(tmp_path):
             ("credential_ref", "target"),
         ),),
     )
-    with pytest.raises(SecurityError, match="credential argument ceiling"):
-        credential_child.require_subset_of(credential_parent)
+    # A child may add credential-reference constraints because that only narrows
+    # authority, but it may never drop a parent constraint while keeping the
+    # corresponding argument available.
+    credential_child.require_subset_of(credential_parent)
+    dropped_credential_constraint = replace(
+        credential_child,
+        tool_rules=(ToolRule(
+            "custom_ref", RiskClass.READ, ("target", "credential_ref"), (), (), (),
+        ),),
+    )
+    with pytest.raises(SecurityError, match="weakens parent credential constraint"):
+        dropped_credential_constraint.require_subset_of(credential_parent)
     for raw in ("sk-abcdefghijklmnopqrstuvwxyz123456", "sha256:" + "a" * 64, "raw-secret"):
         with pytest.raises(SecurityError):
             replace(parent, credential_refs=(raw,))

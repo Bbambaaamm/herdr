@@ -33,6 +33,28 @@ If a child retains a custom tool, it must retain every parent path and
 credential-reference field constraint, even when the argument is omitted from
 the child's allowed keys: Hermes runtime defaults can still supply it.
 
+`herdr/grant_factory.py:build_host_grant` is the host construction boundary.
+Its inputs are trusted scheduler identity/lifetime/workspace, an admitted
+`CapabilityScope`, exact `ToolRule` and `ProcessPolicy` values, the exact parent
+grant for a child, a typed Capability Registry snapshot, host credential broker
+inventory, and observed `RuntimeAssurance`. It derives each signed provider
+route's endpoint and API mode from broker inventory, checks the mode against
+registry executor metadata, and derives region/data policy from registry
+provider metadata intersected with the admitted scope. It rejects unknown or
+ambiguous routes. A root has no parent hash; a child receives the exact parent
+hash and must pass `require_subset_of(parent)` before sealing. Model/prompt/tool
+arguments have no factory input capable of adding a provider, URL, API mode,
+region, credential ref, tool, permission, executor, or runtime assurance.
+Broker refs are opaque identifiers, never bearer tokens. The request-local
+resolver must bind the *effective* key after any refresh/rotation to exactly
+one broker-verifiable signed ref; grant cardinality never supplies identity.
+For the production Hermes lane, the Capability Registry must expose the exact
+audited `HERMES_EXECUTOR` build identity as `ExecutorDescriptor.id`, and the
+admitted `CapabilityScope.executors` must contain that exact id. Stable human
+labels belong in `runtime_id` / `adapter_id`; they are not substitutes for
+the signed executable identity. The bootstrap independently recomputes the
+same build identity before importing Hermes and requires exact equality.
+
 ## Installed Hermes v0.21.5 finding
 
 The audited host runs Hermes Agent v0.21.5. It supports:
@@ -223,8 +245,13 @@ truncated, noncanonical or invalid bundles fail closed. CLI/env-selected grant,
 key, bundle, policy code and Hermes root paths have no authority.
 Before importing Hermes modules, bootstrap checks version 0.21.5, the audited
 Git HEAD `ee5ee84a345204a3b1d6ef6ba1ab747e602867b9`, a clean tree and the
-deterministic digest of actual tracked bytes. It rejects unexpected untracked
-importable source outside the venv. The executor identity combines that source
+deterministic digest of actual tracked bytes. Every pre-guard Git command uses
+a sterile environment plus command-line overrides disabling repository-local
+`core.fsmonitor`, untracked cache and hooks, so repository configuration is not
+an execution authority. It rejects unexpected untracked importable source
+outside the venv. Production additionally requires the exact Hermes source/venv
+root and pinned CPython runtime root to be dedicated read-only mounts for the
+whole process lifetime; hashing alone is not a TOCTOU boundary. The executor identity combines that source
 digest with pinned Python SHA256
 `1e761eb19d6f2594ab8dc64bd99ad4e1753589f3bf1ec199e4eef3aaa21e3930`
 and its standard-library SHA256
@@ -235,6 +262,16 @@ The signed scope must contain exactly
 `hermes:0.21.5:sha256:2e622affe56086408e159ec08c36fd8171d1181da3f4f5ba5259d1de160a9e34`.
 Outer tool authorization checks the proposed call without spending approval;
 the final inline, registry, or connector seam consumes it for effective args.
+The guard also owns the installed Hermes v0.21.5 auxiliary provider seams
+(`_relay_sync_completion`, `_relay_async_completion`,
+`_relay_sync_stream`), so compression, vision, memory and fallback attempts
+must match an exact signed provider endpoint/API mode and trusted pool
+credential before the provider callback runs. Native Anthropic credential
+rotation is disabled in policy mode; a future refresh requires a trusted broker
+that re-binds the new credential identity before use. Before any Hermes-facing
+module import, the launcher sets `HERMES_SAFE_MODE=1` and
+`HERMES_ENABLE_PROJECT_PLUGINS=0`; unpinned user/project/entry-point plugins
+and user shell/webhook hooks therefore have no execution authority.
 
 ## #82 integration interface
 
@@ -246,7 +283,13 @@ scheduler/sentinel recovery fixes. Required integration steps:
    retain its FD and device/inode. Readonly-bind that inode to
    `/run/herdr-policy/grant.bundle.json` before bwrap starts. Mount #76 policy
    code and `agent-stack/policy-bin` read-only; ensure that directory leads PATH
-   inside the pane and that `hermes` resolves to the guarded launcher.
+   inside the pane and that `hermes` resolves to the guarded launcher. In the
+   same bwrap lifetime, bind the exact
+   `/home/agentops/.hermes/hermes-agent` root and exact
+   `/home/agentops/.local/share/uv/python/cpython-3.11.16-linux-x86_64-gnu`
+   root as dedicated read-only mounts. The launcher rejects a writable mount,
+   the host root mount, or a parent-only mount; these roots must remain
+   read-only until the guarded process exits.
 2. Supply all seven `HERDR_POLICY_*` identity env fields through host-controlled
    `PaneSplitParams.env` before bwrap. #82 already supplies task ID and run
    token in its own launch context; it must additionally supply consumer,

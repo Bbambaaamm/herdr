@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import hashlib
+import os
 import subprocess
 import sys
 import types
@@ -65,12 +66,18 @@ def test_same_process_guard_precedes_hermes_main(monkeypatch, tmp_path):
     events = []
     fake_guard = types.ModuleType('herdr.hermes_guard')
     fake_guard.__file__ = str(LAUNCHER.parents[2] / 'herdr/hermes_guard.py')
-    fake_guard.install_hermes_guard = lambda guard: events.append('installed')
+    def install_guard(guard):
+        assert os.environ["HERMES_SAFE_MODE"] == "1"
+        assert os.environ["HERMES_ENABLE_PROJECT_PLUGINS"] == "0"
+        events.append('installed')
+    fake_guard.install_hermes_guard = install_guard
     fake_guard.InvocationGuard = lambda grant: grant
     fake_main = types.ModuleType('hermes_cli.main')
     fake_main.__file__ = str(hermes / 'hermes')
     def main():
         assert events == ['verified', 'installed']
+        assert os.environ["HERMES_SAFE_MODE"] == "1"
+        assert os.environ["HERMES_ENABLE_PROJECT_PLUGINS"] == "0"
         assert sys.argv == [str(hermes / 'hermes'), 'chat', '--profile', 'test']
         events.append('main')
         return 0
@@ -172,3 +179,89 @@ def test_venv_import_surface_hash_excludes_only_unreachable_cache(tmp_path):
     source.write_text('value = 1\n')
     (site / 'startup.pth').write_text('import attacker\n')
     assert module._digest_site_packages(site) != original
+
+
+def test_preimport_git_ignores_repo_local_fsmonitor(monkeypatch, tmp_path):
+    module = _launcher()
+    root = tmp_path / "hermes"
+    root.mkdir()
+    (root / "pyproject.toml").write_text('[project]\nversion = "0.21.5"\n')
+    (root / "model_tools.py").write_text("audited = True\n")
+
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    git("init")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.invalid")
+    git("add", ".")
+    git("commit", "-m", "audited")
+
+    digest = hashlib.sha256()
+    for name in subprocess.check_output(
+        ["git", "-C", str(root), "ls-files", "-z"]
+    ).split(b"\0"):
+        if name:
+            digest.update(name + b"\0")
+            digest.update(hashlib.sha256((root / name.decode()).read_bytes()).digest())
+    monkeypatch.setattr(module, "HERMES_HEAD", git("rev-parse", "HEAD"))
+    monkeypatch.setattr(
+        module, "_SOURCE_EXECUTOR",
+        f"hermes:0.21.5:sha256:{digest.hexdigest()}",
+    )
+
+    marker = tmp_path / "fsmonitor-executed"
+    hook = tmp_path / "malicious-fsmonitor.sh"
+    hook.write_text(
+        "#!/bin/sh\nprintf executed >> " + str(marker) + "\nprintf '{}\\n'\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    git("config", "core.fsmonitor", str(hook))
+
+    assert module._verify_hermes_build(root) == module.HERMES_EXECUTOR
+    assert not marker.exists()
+
+
+def test_production_trust_mount_requires_dedicated_readonly_exact_root(monkeypatch, tmp_path):
+    module = _launcher()
+    trusted = tmp_path / "trusted"
+
+    monkeypatch.setattr(module, "_covering_mount", lambda path: (trusted, {"ro", "nosuid"}))
+    module._require_production_mount(trusted, exact=True)
+
+    monkeypatch.setattr(module, "_covering_mount", lambda path: (Path("/"), {"ro"}))
+    with pytest.raises(SystemExit, match="dedicated read-only trust mount"):
+        module._require_production_mount(trusted, exact=True)
+
+    monkeypatch.setattr(module, "_covering_mount", lambda path: (trusted, {"rw", "nosuid"}))
+    with pytest.raises(SystemExit, match="dedicated read-only trust mount"):
+        module._require_production_mount(trusted, exact=True)
+
+    parent = trusted.parent
+    monkeypatch.setattr(module, "_covering_mount", lambda path: (parent, {"ro"}))
+    with pytest.raises(SystemExit, match="dedicated read-only trust mount"):
+        module._require_production_mount(trusted, exact=True)
+
+
+def test_production_bootstrap_checks_all_lifetime_trust_roots_before_hashing(monkeypatch):
+    module = _launcher()
+    calls = []
+
+    def require(path, *, exact=False):
+        calls.append((path, exact))
+        if path == module.PYTHON_ROOT:
+            raise RuntimeError("stop-after-trust-roots")
+
+    monkeypatch.setattr(module, "_require_production_mount", require)
+    with pytest.raises(RuntimeError, match="stop-after-trust-roots"):
+        module.bootstrap([])
+    assert calls == [
+        (module.BUNDLE_PATH, True),
+        (module.POLICY_CODE_ROOT, False),
+        (module.HERMES_ROOT, True),
+        (module.PYTHON_ROOT, True),
+    ]

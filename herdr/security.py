@@ -585,8 +585,8 @@ class SecurityGrant:
                 raise SecurityError("child weakens parent path constraint")
             if not _roots_subset(child_rule.allowed_roots, parent_rule.allowed_roots):
                 raise SecurityError("child filesystem ceiling escalates above parent")
-            if not set(child_rule.credential_ref_fields) <= set(parent_rule.credential_ref_fields):
-                raise SecurityError("child credential argument ceiling escalates above parent")
+            if not set(parent_rule.credential_ref_fields) <= set(child_rule.credential_ref_fields):
+                raise SecurityError("child weakens parent credential constraint")
             if parent_rule.requires_process and not child_rule.requires_process:
                 raise SecurityError("child weakens parent process requirement")
             if parent_rule.requires_sandbox and not child_rule.requires_sandbox:

@@ -1,4 +1,5 @@
 """Invocation seam tests without importing or mutating installed Hermes."""
+import asyncio
 import json
 import sys
 import types
@@ -11,7 +12,9 @@ from herdr.security import PolicyDenied, SecurityError
 
 def test_provider_credential_identity_comes_from_actual_pool_entry():
     route = types.SimpleNamespace(provider="provider-a", credential_refs=("pool:provider-a:entry-1",))
-    pool = types.SimpleNamespace(provider="provider-a", entry_id_for_api_key=lambda key: "entry-1" if key == "actual" else None)
+    pool = types.SimpleNamespace(provider="provider-a", entries=lambda: [
+        types.SimpleNamespace(id="entry-1", runtime_api_key="actual")
+    ])
     agent = types.SimpleNamespace(api_key="actual", api_mode="openai", _credential_pool=pool)
     assert hermes_guard._actual_provider_credential_ref(agent, route) == "pool:provider-a:entry-1"
     agent.api_key = "other"
@@ -24,6 +27,32 @@ def test_provider_credential_identity_comes_from_actual_pool_entry():
     agent._credential_pool = None
     with pytest.raises(PolicyDenied, match="provider_credential_identity_unknown"):
         hermes_guard._actual_provider_credential_ref(agent, route)
+    agent._credential_pool = pool
+    pool.entries = lambda: [
+        types.SimpleNamespace(id="entry-1", runtime_api_key="actual"),
+        types.SimpleNamespace(id="entry-2", runtime_api_key="actual"),
+    ]
+    with pytest.raises(PolicyDenied, match="provider_credential_identity_unknown"):
+        hermes_guard._actual_provider_credential_ref(agent, route)
+
+
+def test_auxiliary_credential_is_bound_to_effective_key_after_rotation(monkeypatch):
+    route = types.SimpleNamespace(provider="provider-a", credential_refs=("pool:provider-a:entry-1",))
+    pool = types.SimpleNamespace(provider="provider-a", entries=lambda: [
+        types.SimpleNamespace(id="entry-1", runtime_api_key="original"),
+        types.SimpleNamespace(id="entry-2", runtime_api_key="rotated"),
+    ])
+    module = types.ModuleType("agent.credential_pool")
+    module.load_pool = lambda provider: pool
+    monkeypatch.setitem(sys.modules, "agent.credential_pool", module)
+    client = types.SimpleNamespace(api_key="original")
+    assert hermes_guard._actual_aux_credential_ref(client, route) == "pool:provider-a:entry-1"
+    client.api_key = "rotated"
+    with pytest.raises(PolicyDenied, match="provider_credential_mismatch"):
+        hermes_guard._actual_aux_credential_ref(client, route)
+    client.api_key = "unbound"
+    with pytest.raises(PolicyDenied, match="provider_credential_identity_unknown"):
+        hermes_guard._actual_aux_credential_ref(client, route)
 
 
 def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
@@ -76,6 +105,41 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
         effective = {"path": function_args["rewrite"]} if "rewrite" in function_args else function_args
         return execute(effective)
     executor._run_agent_tool_execution_middleware = run_tool
+
+    auxiliary = types.ModuleType("agent.auxiliary_client")
+    aux_calls = []
+    def aux_sync(client, request, *, provider=None, api_mode=None, create=None):
+        aux_calls.append(("sync", provider, str(client.base_url)))
+        if request.get("rotate_before_create"):
+            client.api_key = "unbound"
+        return create(request) if create else "aux-sync"
+    async def aux_async(client, request, *, provider=None, api_mode=None, create=None):
+        aux_calls.append(("async", provider, str(client.base_url)))
+        return await create(request) if create else "aux-async"
+    def aux_stream(client, request, *, provider=None, api_mode=None):
+        aux_calls.append(("stream", provider, str(client.base_url)))
+        return "aux-stream"
+    auxiliary._relay_sync_completion = aux_sync
+    auxiliary._relay_async_completion = aux_async
+    auxiliary._relay_sync_stream = aux_stream
+    class CodexAdapter:
+        def __init__(self, client):
+            self._client = client
+        def create(self, **kwargs):
+            aux_calls.append(("codex-direct", getattr(self._client, "_hermes_aux_effective_provider", None),
+                              str(self._client.base_url)))
+            return "codex-direct"
+    auxiliary._CodexCompletionsAdapter = CodexAdapter
+
+    lifecycle = types.ModuleType("agent.client_lifecycle")
+    class ClientLifecycleMixin:
+        def __init__(self):
+            self.refresh_calls = 0
+        def _try_refresh_anthropic_client_credentials(self):
+            self.refresh_calls += 1
+            return True
+    lifecycle.ClientLifecycleMixin = ClientLifecycleMixin
+
     middleware = types.ModuleType("hermes_cli.middleware")
     callbacks = []
     middleware.run_llm_execution_middleware = lambda request, next_call, **context: (callbacks.append("callback"), next_call(request))[1]
@@ -88,12 +152,15 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
     agent_pkg.turn_api_call = turn
     agent_pkg.conversation_loop = loop
     agent_pkg.tool_executor = executor
+    agent_pkg.auxiliary_client = auxiliary
     cli_pkg = types.ModuleType("hermes_cli")
     cli_pkg.middleware = middleware
     monkeypatch.setitem(sys.modules, "agent", agent_pkg)
     monkeypatch.setitem(sys.modules, "agent.turn_api_call", turn)
     monkeypatch.setitem(sys.modules, "agent.conversation_loop", loop)
     monkeypatch.setitem(sys.modules, "agent.tool_executor", executor)
+    monkeypatch.setitem(sys.modules, "agent.auxiliary_client", auxiliary)
+    monkeypatch.setitem(sys.modules, "agent.client_lifecycle", lifecycle)
     monkeypatch.setitem(sys.modules, "hermes_cli", cli_pkg)
     monkeypatch.setitem(sys.modules, "hermes_cli.middleware", middleware)
     monkeypatch.setitem(sys.modules, "model_tools", model)
@@ -243,6 +310,62 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
         with pytest.raises(PolicyDenied, match="provider_not_granted"):
             loop.perform_api_call(agent)
         assert callbacks == ["switch_callback"]
+
+        # The guarded process never rotates native Anthropic credentials after
+        # authorization. A future refresh must be brokered and re-attested.
+        lifecycle_instance = ClientLifecycleMixin()
+        assert lifecycle_instance._try_refresh_anthropic_client_credentials() is False
+        assert lifecycle_instance.refresh_calls == 0
+
+        # Auxiliary compression/vision/memory attempts reach separate final
+        # transport seams. Every physical primary/retry/fallback/stream attempt
+        # is authorized from its resolved endpoint before its callback executes.
+        aux_client = types.SimpleNamespace(
+            base_url="https://provider-a.example.invalid/v1", api_key=""
+        )
+        executed = []
+        assert auxiliary._relay_sync_completion(
+            aux_client, {"messages": []}, provider="provider-a", api_mode="openai",
+            create=lambda request: executed.append("sync") or "sync-ok",
+        ) == "sync-ok"
+        with pytest.raises(PolicyDenied, match="provider_credential_identity_unknown"):
+            auxiliary._relay_sync_completion(
+                aux_client, {"rotate_before_create": True}, provider="provider-a",
+                api_mode="openai", create=lambda request: executed.append("rotated"),
+            )
+        aux_client.api_key = ""
+        async def async_create(request):
+            return "async-ok"
+        assert asyncio.run(auxiliary._relay_async_completion(
+            aux_client, {"messages": []}, provider="provider-a", api_mode="openai",
+            create=async_create,
+        )) == "async-ok"
+        assert auxiliary._relay_sync_stream(
+            aux_client, {"messages": []}, provider=None, api_mode="openai"
+        ) == "aux-stream"
+        with pytest.raises(PolicyDenied, match="provider_not_granted"):
+            auxiliary._relay_sync_completion(
+                aux_client, {"messages": []}, provider="provider-b", api_mode="openai",
+                create=lambda request: executed.append("denied") or "must-not-run",
+            )
+        with pytest.raises(PolicyDenied, match="provider_endpoint_denied"):
+            auxiliary._relay_sync_completion(
+                types.SimpleNamespace(base_url="https://wrong.example.invalid/v1", api_key=""),
+                {"messages": []}, provider="provider-a", api_mode="openai",
+                create=lambda request: executed.append("wrong") or "must-not-run",
+            )
+
+        # The special MoA Codex branch bypasses _relay_sync_stream in Hermes,
+        # so its physical Responses adapter is guarded independently.
+        policy.grant.provider_routes[0].api_mode = "codex_responses"
+        real_codex = types.SimpleNamespace(
+            base_url="https://provider-a.example.invalid/v1",
+            api_key="",
+            _hermes_aux_effective_provider="actual",
+        )
+        assert CodexAdapter(real_codex).create(model="codex") == "codex-direct"
+        assert aux_calls[-1][0] == "codex-direct"
+        assert executed == ["sync"]
         assert called == ["read_file", "read_file", "read_file"]
     finally:
         installation.uninstall()

@@ -57,6 +57,8 @@ def main() -> int:
 
         sys.path.insert(0, str(hermes_root))
         import model_tools
+        from agent import auxiliary_client
+        from agent.client_lifecycle import ClientLifecycleMixin
         from hermes_cli.middleware import RequestMiddlewareResult
         import hermes_cli.middleware as middleware
         from tools.registry import registry
@@ -207,6 +209,52 @@ def main() -> int:
         assert "HERDR_SECURITY_DENIED[path_outside_grant]" in str(poisoned), poisoned
         assert "HERDR76_OUTSIDE_SECRET" not in str(poisoned)
 
+        # Actual installed auxiliary transport seam is denied before its
+        # provider callback because this probe grant carries no provider route.
+        aux_executed = []
+        dummy_aux = type("AuxClient", (), {
+            "base_url": "https://ungranted.example.invalid/v1",
+            "api_key": "",
+        })()
+        try:
+            auxiliary_client._relay_sync_completion(
+                dummy_aux,
+                {"messages": []},
+                provider="ungranted",
+                api_mode="openai",
+                create=lambda request: aux_executed.append(True) or object(),
+            )
+        except Exception as exc:
+            assert type(exc).__name__ == "PolicyDenied", type(exc).__name__
+            assert "provider_not_granted" in str(exc), str(exc)
+        else:
+            raise AssertionError("ungranted auxiliary provider reached callback")
+        assert aux_executed == []
+
+        # Hermes has one direct MoA/Codex Responses branch outside _relay_*.
+        # The installed adapter class is guarded too, before responses.create.
+        dummy_codex_real = type("CodexReal", (), {
+            "base_url": "https://ungranted.example.invalid/v1",
+            "api_key": "",
+            "_hermes_aux_effective_provider": "actual",
+        })()
+        codex_adapter = auxiliary_client._CodexCompletionsAdapter(
+            dummy_codex_real, "codex-probe"
+        )
+        try:
+            codex_adapter.create(messages=[])
+        except Exception as exc:
+            assert type(exc).__name__ == "PolicyDenied", type(exc).__name__
+            assert "provider_not_granted" in str(exc), str(exc)
+        else:
+            raise AssertionError("direct Codex auxiliary branch bypassed provider guard")
+
+        # The real installed ClientLifecycleMixin method is replaced in this
+        # guarded process, so native Anthropic refresh cannot rotate a key
+        # after provider authorization.
+        lifecycle = object.__new__(ClientLifecycleMixin)
+        assert lifecycle._try_refresh_anthropic_client_credentials() is False
+
         installation.uninstall()
         patch_scope = replace(
             scope,
@@ -258,6 +306,9 @@ def main() -> int:
             "bridge_connector_denied_before_dispatch": True,
             "post_middleware_path_poisoning_denied": True,
             "v4a_embedded_target_denied": True,
+            "auxiliary_provider_denied_before_callback": True,
+            "direct_codex_auxiliary_guarded": True,
+            "anthropic_refresh_disabled_under_guard": True,
             "live_config_changed": False,
         }
         print(json.dumps(result, sort_keys=True))

@@ -94,19 +94,95 @@ def _actual_provider_credential_ref(agent: Any, route: Any) -> str | None:
             raise PolicyDenied("provider_credential_missing")
         return None
     pool = getattr(agent, "_credential_pool", None)
-    resolver = getattr(pool, "entry_id_for_api_key", None)
-    if not callable(resolver) or getattr(pool, "provider", None) != route.provider:
+    if getattr(pool, "provider", None) != route.provider:
+        raise PolicyDenied("provider_credential_identity_unknown")
+    return _bind_pool_credential(pool, raw, route.provider, refs)
+
+
+def _bind_pool_credential(pool: Any, raw: str, provider: str, refs: tuple[str, ...]) -> str:
+    """Bind the effective key to exactly one entry; a pool cursor is not proof."""
+    entries = getattr(pool, "entries", None)
+    if not callable(entries):
         raise PolicyDenied("provider_credential_identity_unknown")
     try:
-        entry_id = resolver(raw)
+        matches = [item for item in entries() if getattr(item, "runtime_api_key", None) == raw]
     except Exception as exc:
         raise PolicyDenied("provider_credential_identity_unknown") from exc
+    if len(matches) != 1:
+        raise PolicyDenied("provider_credential_identity_unknown")
+    entry_id = getattr(matches[0], "id", None)
     if not isinstance(entry_id, str) or not entry_id:
         raise PolicyDenied("provider_credential_identity_unknown")
-    actual = f"pool:{route.provider}:{entry_id}"
+    actual = f"pool:{provider}:{entry_id}"
     if actual not in refs:
         raise PolicyDenied("provider_credential_mismatch")
     return actual
+
+
+def _endpoint(value: Any) -> str:
+    return str(value or "").rstrip("/")
+
+
+def _effective_aux_route(guard: InvocationGuard, client: Any, provider: Any, api_mode: Any) -> Any:
+    """Resolve the actual auxiliary transport to exactly one signed provider route."""
+    routes = tuple(getattr(getattr(guard, "grant", None), "provider_routes", ()) or ())
+    actual_endpoint = _endpoint(getattr(client, "base_url", None))
+    actual_mode = str(api_mode or "")
+    named = [route for route in routes if route.provider == provider]
+    if named:
+        candidates = named
+    elif provider in (None, "", "auto", "auxiliary", "actual"):
+        candidates = [
+            route for route in routes
+            if _endpoint(route.base_url) == actual_endpoint and route.api_mode == actual_mode
+        ]
+    else:
+        candidates = []
+    if len(candidates) != 1:
+        raise PolicyDenied("provider_not_granted", str(provider)[:100])
+    route = candidates[0]
+    if _endpoint(route.base_url) != actual_endpoint or route.api_mode != actual_mode:
+        raise PolicyDenied("provider_endpoint_denied", str(route.provider)[:100])
+    return route
+
+
+def _actual_aux_credential_ref(client: Any, route: Any) -> str | None:
+    """Resolve the final auxiliary client's actual key through Hermes' trusted pool."""
+    refs = tuple(getattr(route, "credential_refs", ()) or ())
+    raw = getattr(client, "api_key", None)
+    if raw is None:
+        raw = ""
+    if not isinstance(raw, str):
+        raise PolicyDenied("provider_credential_identity_unknown")
+    if not raw:
+        if refs:
+            raise PolicyDenied("provider_credential_missing")
+        return None
+    try:
+        from agent.credential_pool import load_pool
+        pool = load_pool(route.provider)
+    except Exception as exc:
+        raise PolicyDenied("provider_credential_identity_unknown") from exc
+    if getattr(pool, "provider", None) != route.provider:
+        raise PolicyDenied("provider_credential_identity_unknown")
+    return _bind_pool_credential(pool, raw, route.provider, refs)
+
+
+def _authorize_aux_transport(
+    guard: InvocationGuard, client: Any, provider: Any, api_mode: Any
+) -> None:
+    route = _effective_aux_route(guard, client, provider, api_mode)
+    if len(route.regions) != 1 or len(route.data_classes) != 1:
+        raise PolicyDenied("provider_route_ambiguous", str(route.provider))
+    guard.authorize_provider(ProviderRequest(
+        provider=route.provider,
+        region=route.regions[0],
+        data_class=_effective_request_data_class(guard),
+        egress=route.max_egress,
+        retention=route.max_retention,
+        training=route.training,
+        credential_ref=_actual_aux_credential_ref(client, route),
+    ))
 
 
 def inspect_hermes_security_surface() -> dict[str, Any]:
@@ -114,7 +190,8 @@ def inspect_hermes_security_surface() -> dict[str, Any]:
     try:
         import model_tools
         from hermes_cli import middleware, plugins
-        from agent import turn_api_call, conversation_loop, tool_executor
+        from agent import auxiliary_client, turn_api_call, conversation_loop, tool_executor
+        from agent.client_lifecycle import ClientLifecycleMixin
         from tools import connectors, read_extract
         from tools.file_tools_paths import _resolve_path_for_task
         from tools.registry import registry
@@ -168,6 +245,14 @@ def inspect_hermes_security_surface() -> dict[str, Any]:
         raise HermesCompatibilityError("provider execution seam drifted")
     if not callable(getattr(middleware, "run_llm_execution_middleware", None)):
         raise HermesCompatibilityError("provider middleware seam unavailable")
+    for name in ("_relay_sync_completion", "_relay_async_completion", "_relay_sync_stream"):
+        if not callable(getattr(auxiliary_client, name, None)):
+            raise HermesCompatibilityError(f"auxiliary provider seam unavailable: {name}")
+    codex_adapter = getattr(auxiliary_client, "_CodexCompletionsAdapter", None)
+    if codex_adapter is None or not callable(getattr(codex_adapter, "create", None)):
+        raise HermesCompatibilityError("Codex auxiliary Responses seam unavailable")
+    if not callable(getattr(ClientLifecycleMixin, "_try_refresh_anthropic_client_credentials", None)):
+        raise HermesCompatibilityError("Anthropic credential-refresh seam unavailable")
     if not callable(_resolve_path_for_task):
         raise HermesCompatibilityError("Hermes task path resolver unavailable")
     if not callable(getattr(read_extract, "_hosted_ocr_config", None)):
@@ -197,6 +282,8 @@ def inspect_hermes_security_surface() -> dict[str, Any]:
         "tool_request_middleware_supported": True,
         "tool_execution_middleware_supported": True,
         "agent_tool_execution_seam": True,
+        "auxiliary_provider_seams": True,
+        "anthropic_refresh_disabled_under_guard": True,
         "task_path_resolver": True,
         "hosted_ocr_disabled_under_guard": True,
         "security_authority": "herdr_dispatch_guard",
@@ -235,7 +322,8 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
     surface = inspect_hermes_security_surface()
 
     import model_tools
-    from agent import conversation_loop, turn_api_call, tool_executor
+    from agent import auxiliary_client, conversation_loop, turn_api_call, tool_executor
+    from agent.client_lifecycle import ClientLifecycleMixin
     from hermes_cli import middleware
     from tools import connectors, read_extract
     from tools.connectors import dispatch as connector_dispatch_module
@@ -255,6 +343,99 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
     installation._remember(
         read_extract, "_hosted_ocr_config", lambda: (False, None, None)
     )
+
+    # Native Anthropic rotates OAuth/pool credentials while constructing the
+    # request-local client. That happens after the main provider precheck. In
+    # policy mode rotation is disabled rather than accepting an unverified key;
+    # a future brokered refresh must re-bind the resulting pool identity.
+    installation._remember(
+        ClientLifecycleMixin,
+        "_try_refresh_anthropic_client_credentials",
+        lambda self: False,
+    )
+
+    original_aux_sync = auxiliary_client._relay_sync_completion
+    original_aux_async = auxiliary_client._relay_async_completion
+    original_aux_stream = auxiliary_client._relay_sync_stream
+
+    @functools.wraps(original_aux_sync)
+    def guarded_aux_sync(
+        client: Any,
+        kwargs: dict[str, Any],
+        *,
+        provider: str | None = None,
+        api_mode: str | None = None,
+        create: Callable[[dict[str, Any]], Any] | None = None,
+    ) -> Any:
+        _authorize_aux_transport(guard, client, provider, api_mode)
+        callback = create or (lambda request: auxiliary_client._create_with_progress(client, request))
+        def checked_create(request: dict[str, Any]) -> Any:
+            _authorize_aux_transport(guard, client, provider, api_mode)
+            return callback(request)
+        return original_aux_sync(
+            client, kwargs, provider=provider, api_mode=api_mode, create=checked_create
+        )
+
+    @functools.wraps(original_aux_async)
+    async def guarded_aux_async(
+        client: Any,
+        kwargs: dict[str, Any],
+        *,
+        provider: str | None = None,
+        api_mode: str | None = None,
+        create: Callable[[dict[str, Any]], Any] | None = None,
+    ) -> Any:
+        _authorize_aux_transport(guard, client, provider, api_mode)
+        async def checked_create(request: dict[str, Any]) -> Any:
+            _authorize_aux_transport(guard, client, provider, api_mode)
+            if create is not None:
+                return await create(request)
+            return await auxiliary_client._acreate_with_progress(client, request)
+        return await original_aux_async(
+            client, kwargs, provider=provider, api_mode=api_mode, create=checked_create
+        )
+
+    @functools.wraps(original_aux_stream)
+    def guarded_aux_stream(
+        client: Any,
+        kwargs: dict[str, Any],
+        *,
+        provider: str | None = None,
+        api_mode: str | None = None,
+    ) -> Any:
+        _authorize_aux_transport(guard, client, provider, api_mode)
+        return original_aux_stream(
+            client, kwargs, provider=provider, api_mode=api_mode
+        )
+
+    installation._remember(
+        auxiliary_client, "_relay_sync_completion", guarded_aux_sync
+    )
+    installation._remember(
+        auxiliary_client, "_relay_async_completion", guarded_aux_async
+    )
+    installation._remember(
+        auxiliary_client, "_relay_sync_stream", guarded_aux_stream
+    )
+
+    # MoA has one special Codex streaming branch that calls the Responses
+    # adapter directly instead of _relay_sync_stream. Guard its physical
+    # create() method as well so every provider attempt shares the same policy.
+    codex_adapter = auxiliary_client._CodexCompletionsAdapter
+    original_codex_create = codex_adapter.create
+
+    @functools.wraps(original_codex_create)
+    def guarded_codex_create(self: Any, **kwargs: Any) -> Any:
+        real_client = getattr(self, "_client", None)
+        if real_client is None:
+            raise PolicyDenied("provider_context_missing")
+        provider = getattr(real_client, "_hermes_aux_effective_provider", None)
+        _authorize_aux_transport(
+            guard, real_client, provider, "codex_responses"
+        )
+        return original_codex_create(self, **kwargs)
+
+    installation._remember(codex_adapter, "create", guarded_codex_create)
 
     def authorize_agent_provider(agent: Any) -> None:
         provider = getattr(agent, "provider", None)
