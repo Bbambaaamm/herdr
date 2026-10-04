@@ -155,7 +155,7 @@ def _trusted_hermes_profile_preflight(profile: str, *, executable: str, env: Map
     binary = Path(executable)
     if not binary.is_file():
         raise HerdrRuntimeError("child_provider_preflight_invalid", str(binary))
-    base_env = dict(env)
+    base_env = sanitize_environment(dict(env))
     base_env.setdefault("HOME", "/home/agentops")
 
     def run_checked(args: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
