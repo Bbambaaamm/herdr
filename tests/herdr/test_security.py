@@ -570,6 +570,8 @@ def test_credential_ref_fields_are_explicit_opaque_authority(tmp_path):
 
 
 def test_approval_broker_survives_disconnected_response_client(tmp_path):
+    import os,struct,threading
+    first_finished=threading.Event()
     class Connection:
         def __init__(self, request, *, broken=False):
             self.request = request
@@ -582,11 +584,13 @@ def test_approval_broker_survives_disconnected_response_client(tmp_path):
             return False
         def settimeout(self, value):
             self.timeout = value
+        def getsockopt(self,*args): return struct.pack('3i',os.getpid(),os.getuid(),os.getgid())
         def recv(self, size):
             data, self.request = self.request[:size], self.request[size:]
             return data
         def sendall(self, data):
             if self.broken:
+                first_finished.set()
                 raise BrokenPipeError("client closed")
             self.sent.append(data)
 
@@ -617,13 +621,15 @@ def test_approval_broker_survives_disconnected_response_client(tmp_path):
     class Listener:
         def __init__(self):
             self.items = [first, second]
+        def settimeout(self,value): pass
         def accept(self):
             if self.items:
+                if len(self.items)==1: assert first_finished.wait(2)
                 return self.items.pop(0), None
             raise StopAccept()
 
     with pytest.raises(StopAccept):
-        serve_approvals(Listener(), ledger)
+        serve_approvals(Listener(), ledger,peer_authorizer=lambda pid,sha: pid==os.getpid() and sha in (None,item.hash))
     # First request consumed the one-use evidence even though its response was
     # lost; the broker remained alive and answered the next client deterministically.
     assert second.sent == [b"replayed\n"]
@@ -865,3 +871,57 @@ def test_approval_response_fragmentation_is_read_through_newline(monkeypatch, tm
     assert InvocationGuard(item, assurance(), approval_socket=tmp_path / "authority.sock").authorize_tool(
         "write_file", args
     ) == "write_file"
+
+@pytest.mark.parametrize("field,value",[
+    ("network_access",NetworkAccess.GLOBAL),
+    ("writable_roots",("/tmp",)),
+    ("credentials_isolated",False),
+    ("sandbox_verified",False),
+])
+def test_child_runtime_assurance_cannot_widen_even_for_non_process_tool(tmp_path,field,value):
+    parent=grant(tmp_path,tools=("custom_file",),
+        rules=(ToolRule("custom_file",RiskClass.READ,()),),
+        runtime=RuntimeAssurance(True,"a"*64,NetworkAccess.NONE,(),True))
+    child_identity=identity(agent_id="child",parent_agent_id=parent.identity.agent_id,
+                            parent_task_id=parent.identity.task_id,task_id="child-task")
+    child=replace(parent,grant_id="child",identity=child_identity,parent_grant_hash=parent.hash,
+                  runtime_assurance=replace(parent.runtime_assurance,sandbox_attestation_sha256="b"*64))
+    child.require_subset_of(parent)
+    changed=replace(child.runtime_assurance,**{field:value,
+        **({"sandbox_attestation_sha256":None} if field=="sandbox_verified" else {})})
+    with pytest.raises(SecurityError,match="runtime assurance"):
+        replace(child,runtime_assurance=changed).require_subset_of(parent)
+
+def test_approval_broker_real_stalled_peer_does_not_block_other_connection(tmp_path):
+    import os,socket,threading,uuid
+    from pathlib import Path
+    path=Path("/tmp")/("herdr-approval-test-"+uuid.uuid4().hex+".sock")
+    listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);listener.bind(str(path));listener.listen(8)
+    stopped=threading.Event();calls=[]
+    class Ledger:
+        def consume(self,**kwargs): calls.append(kwargs);return "consumed"
+    thread=threading.Thread(target=serve_approvals,args=(listener,Ledger()),
+        kwargs={"stop_event":stopped,"peer_authorizer":lambda pid,sha:pid==os.getpid() and sha in (None,"host-grant")},
+        daemon=True)
+    thread.start();idle=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+    try:
+        idle.connect(str(path))
+        with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as client:
+            client.settimeout(0.5);client.connect(str(path))
+            client.sendall(canonical_json_bytes({"grant_hash":"host-grant","approval_id":"one",
+                "tool":"approved","args_sha256":"a"*64})+bytes([10]))
+            assert client.recv(64)==b"consumed\n"
+        assert len(calls)==1 and thread.is_alive()
+        with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as client:
+            client.settimeout(0.5);client.connect(str(path))
+            client.sendall(canonical_json_bytes({"grant_hash":"another-grant","approval_id":"two",
+                "tool":"approved","args_sha256":"b"*64})+bytes([10]))
+            assert client.recv(64)==b"unavailable\n"
+        assert len(calls)==1
+    finally:
+        idle.close();stopped.set();thread.join(3);listener.close();path.unlink(missing_ok=True)
+    assert not thread.is_alive()
+
+def test_approval_broker_requires_host_peer_authority(tmp_path):
+    with pytest.raises(ValueError,match="host approval peer"):
+        serve_approvals(None,ApprovalLedger(tmp_path/"a.db"))

@@ -146,3 +146,74 @@ def test_search_deadline_applies_during_directory_enumeration(tmp_path,monkeypat
             authority.list_regular_files(str(root),deadline=9)
         assert seen==[0]
     finally: authority.close()
+
+def test_stale_expected_content_preserves_concurrent_write_at_publication(tmp_path,monkeypatch):
+    import herdr.file_authority as module
+    root=tmp_path/"workspace";root.mkdir();target=root/"file.txt";target.write_text("old")
+    authority=module.RootFDWorkspace((str(root),));original=module.os.fsync;changed=[False]
+    def changed_during_preparation(fd):
+        original(fd)
+        if not changed[0]:
+            changed[0]=True;target.write_text("concurrent edit")
+    try:
+        monkeypatch.setattr(module.os,"fsync",changed_during_preparation)
+        with pytest.raises(module.FileAuthorityError,match="stale"):
+            authority.write_text(str(target),"my patch",expected_content="old")
+        assert target.read_text()=="concurrent edit"
+        assert sorted(item.name for item in root.iterdir())==["file.txt"]
+    finally: authority.close()
+
+def test_concurrent_root_fd_writers_cannot_both_replace_one_preimage(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    import herdr.file_authority as module
+    root=tmp_path/"workspace";root.mkdir();target=root/"file.txt";target.write_text("old")
+    authorities=[module.RootFDWorkspace((str(root),)) for _ in range(2)]
+    def write(number):
+        try:
+            authorities[number].write_text(str(target),f"writer-{number}",expected_content="old")
+            return "written"
+        except module.FileAuthorityError: return "stale"
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool: results=list(pool.map(write,range(2)))
+        assert sorted(results)==["stale","written"]
+        assert target.read_text() in {"writer-0","writer-1"}
+    finally:
+        for authority in authorities: authority.close()
+
+
+def test_conditional_write_serializes_independent_processes(tmp_path):
+    import subprocess,sys
+    from pathlib import Path
+    path=tmp_path/"shared.txt"
+    path.write_text("original")
+    code="""import sys
+from herdr.file_authority import RootFDWorkspace,FileAuthorityError
+root,path,value=sys.argv[1:]
+workspace=RootFDWorkspace((root,))
+print('ready',flush=True)
+sys.stdin.readline()
+try:
+    workspace.write_text(path,value,expected_content='original')
+    print('published',flush=True)
+except FileAuthorityError as exc:
+    if 'stale file content' not in str(exc): raise
+    print('stale',flush=True)
+finally: workspace.close()
+"""
+    children=[subprocess.Popen([sys.executable,"-c",code,str(tmp_path),str(path),value],
+        cwd=Path(__file__).resolve().parents[2],stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,text=True) for value in ('first','second')]
+    try:
+        for child in children: assert child.stdout.readline().strip()=='ready'
+        for child in children: child.stdin.write('go\n');child.stdin.flush()
+        outcomes=[]
+        for child in children:
+            out,err=child.communicate(timeout=5)
+            assert child.returncode==0,err
+            outcomes.append(out.strip())
+        assert sorted(outcomes)==['published','stale']
+        assert path.read_text() in ('first','second')
+        assert not list(tmp_path.glob('.herdr-policy-*'))
+    finally:
+        for child in children:
+            if child.poll() is None: child.kill();child.wait(timeout=5)

@@ -346,12 +346,13 @@ def test_unregistered_stalled_socket_peer_is_rejected_before_read(tmp_path):
         authority.close(timeout_seconds=0)
     finally: server.close();client.close()
 
+
 def test_stalled_authenticated_peer_cannot_block_another_launch(tmp_path):
     import subprocess,sys,uuid
     from herdr.security import InvocationIdentity
     stage0=tmp_path/"stage0";stage0.write_bytes(b"system")
     pinned=tmp_path/"pinned";pinned.write_bytes(b"pinned")
-    s0,pin=stage0.stat(),pinned.stat();parent=os.getpid();counts={}
+    s0,pin=stage0.stat(),pinned.stat();parent=os.getpid();counts={};allowed={}
     def inspect(pid):
         if pid==parent: return PeerProcess(parent,1,7,1,1,("shell",))
         counts[pid]=counts.get(pid,0)+1
@@ -359,7 +360,8 @@ def test_stalled_authenticated_peer_cannot_block_another_launch(tmp_path):
         return PeerProcess(pid,parent,8,info.st_dev,info.st_ino,
                  (str(stage0),"-I","-S","/run/herdr-bootstrap/agent-hermes-policy-stage1"))
     authority=BootstrapAuthority(stage0_path=stage0,peer_inspector=inspect,
-        stage1_inspector=lambda *args:(3,4,"b"*64),peer_authorizer=lambda *args:True)
+        stage1_inspector=lambda *args:(3,4,"b"*64),
+        peer_authorizer=lambda peer,expected:allowed.get(peer.pid)==dict(expected.identity))
     identities=[]
     for number in range(2):
         identity={"consumer":"github:owner/repo","agent_id":f"agent-{number}","parent_agent_id":"parent",
@@ -374,35 +376,71 @@ def test_stalled_authenticated_peer_cannot_block_another_launch(tmp_path):
             connection,_=listener.accept()
             assert authority.dispatch_connection(connection)
     thread=threading.Thread(target=accept,daemon=True);thread.start()
-    idle=None
+    idle=active=None
     try:
         idle=subprocess.Popen([sys.executable,"-c",
-            "import socket,sys,time;s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);print('ready',flush=True);time.sleep(10)",
-            str(path)],stdout=subprocess.PIPE,text=True)
+            "import socket,sys,time;sys.stdin.buffer.read(1);s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);print('ready',flush=True);time.sleep(10)",
+            str(path)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+        allowed[idle.pid]=identities[0];idle.stdin.write("x");idle.stdin.flush()
         assert idle.stdout.readline().strip()=="ready"
         request={"op":"stage1","identity":identities[1],"proof_sha256":"a"*64,
                  "stage1_sha256":"b"*64,"stage2_sha256":"c"*64,"python_sha256":"d"*64,
                  "bundle_sha256":"e"*64}
         continuation={"op":"stage2","identity":identities[1],"proof_sha256":"a"*64,"bundle_sha256":"e"*64}
-        code="""import socket,sys,json
+        code="""import socket,sys
+sys.stdin.buffer.read(1)
 s=socket.socket(socket.AF_UNIX);s.settimeout(2);s.connect(sys.argv[1])
-s.sendall(sys.argv[2].encode()+b'\\n')
-assert s.recv(64)==b'stage1-ok\\n'
-s.sendall(sys.argv[3].encode()+b'\\n')
-assert s.recv(64)==b'stage2-ok\\n'
+s.sendall(sys.argv[2].encode()+bytes([10]))
+assert s.recv(64)==b'stage1-ok'+bytes([10])
+s.sendall(sys.argv[3].encode()+bytes([10]))
+assert s.recv(64)==b'stage2-ok'+bytes([10])
 """
-        # The source uses ordinary escaped newlines, not literal backslash bytes.
-        code=code.replace("\\\\n","\\n")
-        done=subprocess.run([sys.executable,"-c",code,str(path),
-                             json.dumps(request),json.dumps(continuation)],
-                            capture_output=True,text=True,timeout=3)
-        assert done.returncode==0,done.stderr
+        active=subprocess.Popen([sys.executable,"-c",code,str(path),json.dumps(request),json.dumps(continuation)],
+                               stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        allowed[active.pid]=identities[1]
+        out,error=active.communicate(input="x",timeout=3)
+        assert active.returncode==0,error
         receipt=authority.wait_for_continuation(InvocationIdentity.from_dict(identities[1]),timeout_seconds=0)
-        assert receipt.peer_pid>0
-        assert idle.poll() is None
+        assert receipt.peer_pid==active.pid and idle.poll() is None
     finally:
-        if idle is not None:
-            idle.terminate();idle.wait(timeout=2);idle.stdout.close()
-        thread.join(2);listener.close()
-        authority.close(timeout_seconds=3)
-        path.unlink(missing_ok=True)
+        for process in (idle,active):
+            if process is not None:
+                if process.poll() is None: process.terminate();process.wait(timeout=2)
+                for stream in (process.stdin,process.stdout,process.stderr):
+                    if stream is not None and not stream.closed: stream.close()
+        thread.join(2);listener.close();authority.close(timeout_seconds=3);path.unlink(missing_ok=True)
+
+def test_unauthorized_bootstrap_peers_cannot_reserve_connection_capacity(tmp_path):
+    stage0=tmp_path/"stage0";stage0.write_bytes(b"s")
+    pinned=tmp_path/"pinned";pinned.write_bytes(b"p")
+    s0,pin=stage0.stat(),pinned.stat();pid=os.getpid();parent=pid+10000
+    phase={"allowed":False,"stage2":False}
+    def inspect(value):
+        if value==parent: return PeerProcess(parent,1,7,1,1,("shell",))
+        info=pin if phase["stage2"] else s0
+        return PeerProcess(pid,parent,8,info.st_dev,info.st_ino,
+                 (str(stage0),"-I","-S","/run/herdr-bootstrap/agent-hermes-policy-stage1"))
+    authority=BootstrapAuthority(stage0_path=stage0,peer_inspector=inspect,
+        stage1_inspector=lambda *args:(3,4,"b"*64),
+        peer_authorizer=lambda *args:phase["allowed"])
+    identity={"consumer":"github:owner/repo","agent_id":"a","parent_agent_id":"p",
+              "parent_task_id":"parent","task_id":"task","run_token":"run","fencing_token":1}
+    expected=BootstrapExpectation(identity,"a"*64,"b"*64,"c"*64,"d"*64,"e"*64,
+                                   parent,7,3,4,pin.st_dev,pin.st_ino)
+    authority.register(expected)
+    for _ in range(20):
+        server,client=socket.socketpair()
+        try: assert authority.dispatch_connection(server) is False
+        finally: server.close();client.close()
+    phase["allowed"]=True;server,client=socket.socketpair()
+    try:
+        assert authority.dispatch_connection(server)
+        client.settimeout(0.5)
+        client.sendall(_line({"op":"stage1","identity":identity,"proof_sha256":"a"*64,
+            "stage1_sha256":"b"*64,"stage2_sha256":"c"*64,"python_sha256":"d"*64,"bundle_sha256":"e"*64}))
+        assert client.recv(64)==b"stage1-ok"+bytes([10])
+        phase["stage2"]=True
+        client.sendall(_line({"op":"stage2","identity":identity,"proof_sha256":"a"*64,"bundle_sha256":"e"*64}))
+        assert client.recv(64)==b"stage2-ok"+bytes([10])
+    finally:
+        client.close();authority.close(timeout_seconds=2);server.close()

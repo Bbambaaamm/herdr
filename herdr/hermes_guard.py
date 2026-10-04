@@ -145,7 +145,7 @@ class _PolicyFileOps:
 
     def write_file(self, path: str, content: str, pre_content: str | None = None) -> Any:
         try:
-            count, digest = self._workspace.write_text(path, content)
+            count, digest = self._workspace.write_text(path, content, expected_content=pre_content)
         except (OSError, FileAuthorityError) as exc:
             return self._common.WriteResult(error=str(exc))
         return self._common.WriteResult(
