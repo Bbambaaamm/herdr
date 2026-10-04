@@ -14,7 +14,10 @@ from herdr.scheduler import AuditLog, DenyReason, DynamicChildScheduler
 def setup(tmp_path):
     raw = {"name": "remote", "description": "bounded executor", "version": "1.0.1", "capabilities": {}, "defaultInputModes": ["text/plain"], "defaultOutputModes": ["text/plain"], "skills": [], "supportedInterfaces": [{"url": "https://remote.example/a2a", "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0"}]}
     card = parse_card(raw)
-    policy = Admission(card.fingerprint, card.interfaces[0].fingerprint, "remote-exec", "remote-provider", "remote-cap", "remote-runtime", ("read_file",))
+    policy = Admission(
+        card.fingerprint, card.interfaces[0].fingerprint, "remote-exec",
+        "remote-provider", "remote-cap", "remote-runtime", ("read_file",), str(tmp_path),
+    )
     identity = Identity("parent", "child", "task-1", "run-1", 7, "idem-1")
     return raw, card, policy, identity, BindingStore(tmp_path / "binding.json")
 
@@ -193,11 +196,16 @@ def test_malformed_and_secret_card_and_results(tmp_path):
                 {**raw, "description": "x" * 33000}):
         with pytest.raises(A2AError):
             parse_card(bad)
-    for bad in (task(artifacts=[{"artifactId": "a", "parts": [{"text": "x" * 132000}]}]),
-                task(artifacts=[{"artifactId": "a", "parts": [{"raw": "x", "text": "y"}]}]),
-                task(state="BOGUS")):
+    for index, bad in enumerate((
+        task(artifacts=[{"artifactId": "a", "parts": [{"text": "x" * 132000}]}]),
+        task(artifacts=[{"artifactId": "a", "parts": [{"raw": "x", "text": "y"}]}]),
+        task(state="BOGUS"),
+    )):
+        attempt = replace(identity, idempotency_key=f"bad-{index}")
         with pytest.raises(A2AError):
-            Gateway(Mock(bad), BindingStore(tmp_path / ("bad-" + str(len(json.dumps(bad))) + ".json")), card, policy).send(identity, "work")
+            Gateway(
+                Mock(bad), BindingStore(tmp_path / f"bad-{index}.json"), card, policy
+            ).send(attempt, "work")
 
 
 def test_child_proposal_is_data_only(tmp_path):
@@ -240,7 +248,10 @@ def test_tenant_sent_in_service_requests(tmp_path):
     raw, _, _, identity, store = setup(tmp_path)
     raw["supportedInterfaces"][0]["tenant"] = "team-1"
     card = parse_card(raw)
-    policy = Admission(card.fingerprint, card.interfaces[0].fingerprint, "remote-exec", "remote-provider", "remote-cap", "remote-runtime", ())
+    policy = Admission(
+        card.fingerprint, card.interfaces[0].fingerprint, "remote-exec",
+        "remote-provider", "remote-cap", "remote-runtime", (), str(tmp_path),
+    )
     transport = Mock()
     gateway = Gateway(transport, store, card, policy)
     gateway.send(identity, "work")
@@ -255,12 +266,25 @@ def test_parts_and_agent_context(tmp_path):
     _, card, policy, identity, _ = setup(tmp_path)
     valid_parts = ({"data": {"answer": 1}}, {"data": [1, "x"]}, {"data": "scalar"}, {"data": 7}, {"data": True}, {"data": None}, {"raw": "YQ==", "mediaType": "application/octet-stream"})
     for index, part in enumerate(valid_parts):
-        Gateway(Mock(task(artifacts=[{"artifactId": "a", "parts": [part]}])), BindingStore(tmp_path / f"valid-{index}.json"), card, policy).send(identity, "work")
-    for part in ({"raw": "!!!"}, {"raw": "YQ="}, {"raw": "YQ==", "data": {}}, {"data": object()}):
+        attempt = replace(identity, idempotency_key=f"valid-part-{index}")
+        Gateway(
+            Mock(task(artifacts=[{"artifactId": "a", "parts": [part]}])),
+            BindingStore(tmp_path / f"valid-{index}.json"), card, policy,
+        ).send(attempt, "work")
+    for index, part in enumerate((
+        {"raw": "!!!"}, {"raw": "YQ="}, {"raw": "YQ==", "data": {}}, {"data": object()},
+    )):
+        attempt = replace(identity, idempotency_key=f"invalid-part-{index}")
         with pytest.raises(A2AError):
-            Gateway(Mock(task(artifacts=[{"artifactId": "a", "parts": [part]}])), BindingStore(tmp_path / ("invalid-" + str(len(list(tmp_path.iterdir()))) + ".json")), card, policy).send(identity, "work")
+            Gateway(
+                Mock(task(artifacts=[{"artifactId": "a", "parts": [part]}])),
+                BindingStore(tmp_path / f"invalid-{index}.json"), card, policy,
+            ).send(attempt, "work")
     with pytest.raises(A2AError, match="contextId"):
-        Gateway(Mock({"message": {"messageId": "reply", "role": "ROLE_AGENT", "parts": [{"text": "answer"}]}}), BindingStore(tmp_path / "no-context.json"), card, policy).send(identity, "work")
+        Gateway(
+            Mock({"message": {"messageId": "reply", "role": "ROLE_AGENT", "parts": [{"text": "answer"}]}}),
+            BindingStore(tmp_path / "no-context.json"), card, policy,
+        ).send(replace(identity, idempotency_key="no-context"), "work")
 
 
 def test_binding_symlink_and_nonregular_rejected(tmp_path):
@@ -426,14 +450,18 @@ def test_part_url_allows_signed_query_but_not_embedded_credentials(tmp_path):
     response = task("TASK_STATE_COMPLETED", artifacts=[
         {"artifactId": "file", "parts": [{"url": signed, "mediaType": "application/octet-stream"}]}
     ])
-    candidate, = Gateway(Mock(response), BindingStore(tmp_path / "signed-url.json"), card, policy).send(identity, "work")
+    candidate, = Gateway(
+        Mock(response), BindingStore(tmp_path / "signed-url.json"), card, policy
+    ).send(replace(identity, idempotency_key="signed-url"), "work")
     assert candidate.content["parts"][0]["url"] == signed
 
     bad = task("TASK_STATE_COMPLETED", artifacts=[
         {"artifactId": "file", "parts": [{"url": "https://user:pass@files.example/download?x=1"}]}
     ])
     with pytest.raises(A2AError, match="part URL"):
-        Gateway(Mock(bad), BindingStore(tmp_path / "bad-url.json"), card, policy).send(identity, "work")
+        Gateway(
+            Mock(bad), BindingStore(tmp_path / "bad-url.json"), card, policy
+        ).send(replace(identity, idempotency_key="bad-url"), "work")
 
 
 def test_remote_task_and_context_ids_are_bounded_opaque_strings(tmp_path):
@@ -450,8 +478,10 @@ def test_remote_task_and_context_ids_are_bounded_opaque_strings(tmp_path):
     assert transport.gets == [{"id": task_id, "historyLength": 0}]
 
     with pytest.raises(A2AError, match="task id"):
-        Gateway(Mock(task(task_id="bad\nremote", context=context_id)),
-                BindingStore(tmp_path / "control-id.json"), card, policy).send(identity, "work")
+        Gateway(
+            Mock(task(task_id="bad\nremote", context=context_id)),
+            BindingStore(tmp_path / "control-id.json"), card, policy,
+        ).send(replace(identity, idempotency_key="control-id"), "work")
 
 
 def test_oauth_card_metadata_is_not_mistaken_for_raw_secret(tmp_path):
@@ -499,7 +529,9 @@ def test_unknown_bounded_service_response_fields_are_ignored(tmp_path):
 
 def test_binding_parent_directories_are_fsynced_before_economic_send(tmp_path, monkeypatch):
     _, card, policy, identity, _ = setup(tmp_path)
-    store = BindingStore(tmp_path / "new-a" / "new-b" / "binding.json")
+    store = BindingStore(
+        tmp_path / "new-a" / "new-b" / "binding.json", authority_root=tmp_path
+    )
     real_fsync = a2a_module.os.fsync
     directory_syncs = []
     dispatched = []
@@ -561,3 +593,85 @@ def test_direct_candidate_is_atomic_with_direct_delivery_state(tmp_path):
     assert raw["delivery"] == "direct"
     assert len(raw["candidates"]) == 1
     assert Gateway(Mock(), store, card, policy).recover(identity)[0].content["messageId"] == "direct-reply"
+
+
+def test_same_identity_cannot_redispatch_through_different_binding_file(tmp_path):
+    _, card, policy, identity, first_store = setup(tmp_path)
+    transport = Mock()
+
+    def ambiguous(*args):
+        transport.sends.append(args)
+        raise RuntimeError("lost response")
+
+    transport.send = ambiguous
+    with pytest.raises(RuntimeError, match="lost response"):
+        Gateway(transport, first_store, card, policy).send(identity, "work")
+    assert first_store.read()["delivery"] == "send_started"
+
+    second_store = BindingStore(tmp_path / "different-binding.json")
+    with pytest.raises(A2AError, match="delivery already started"):
+        Gateway(transport, second_store, card, policy).send(identity, "work")
+    assert len(transport.sends) == 1
+
+
+def test_binding_store_rejects_ancestor_symlink(tmp_path):
+    _, card, policy, identity, _ = setup(tmp_path)
+    outside = tmp_path.parent / (tmp_path.name + "-outside")
+    outside.mkdir()
+    link = tmp_path / "redirect"
+    link.symlink_to(outside, target_is_directory=True)
+    store = BindingStore(
+        link / "binding.json", authority_root=tmp_path
+    )
+    with pytest.raises(A2AError, match="binding directory"):
+        Gateway(Mock(), store, card, policy).send(identity, "work")
+    assert not (outside / "binding.json").exists()
+
+
+def test_task_status_message_is_preserved_as_candidate(tmp_path):
+    _, card, policy, identity, store = setup(tmp_path)
+    status_message = {
+        "messageId": "status-message",
+        "taskId": "remote-task",
+        "contextId": "remote-context",
+        "role": "ROLE_AGENT",
+        "parts": [{"text": "working answer"}],
+    }
+    response = {
+        "task": {
+            "id": "remote-task",
+            "contextId": "remote-context",
+            "status": {
+                "state": "TASK_STATE_WORKING",
+                "message": status_message,
+            },
+            "artifacts": [],
+        }
+    }
+    candidate, = Gateway(Mock(response), store, card, policy).send(identity, "work")
+    assert candidate.kind == "message"
+    assert candidate.remote_task_id == "remote-task"
+    assert candidate.remote_context_id == "remote-context"
+    assert candidate.content == status_message
+    assert Gateway(Mock(), store, card, policy).recover(identity)[0].digest == candidate.digest
+
+
+def test_remote_ids_reject_unicode_control_characters(tmp_path):
+    _, card, policy, identity, _ = setup(tmp_path)
+    for index, remote_task in enumerate(("bad\u0085id", "bad\u202eid")):
+        attempt = replace(identity, idempotency_key=f"unicode-control-{index}")
+        with pytest.raises(A2AError, match="task id"):
+            Gateway(
+                Mock(task(task_id=remote_task)),
+                BindingStore(tmp_path / f"unicode-control-{index}.json"),
+                card,
+                policy,
+            ).send(attempt, "work")
+
+
+def test_gateway_rejects_binding_authority_root_not_in_admission(tmp_path):
+    _, card, policy, identity, _ = setup(tmp_path)
+    other = tmp_path / "other-root"
+    store = BindingStore(other / "binding.json")
+    with pytest.raises(A2AError, match="binding authority root not locally admitted"):
+        Gateway(Mock(), store, card, policy)

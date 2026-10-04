@@ -10,6 +10,7 @@ import json
 import os
 import re
 import stat
+import unicodedata
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -87,7 +88,10 @@ def _remote_id(value: Any, label: str) -> str:
     if not isinstance(value, str) or not value:
         raise A2AError(f"invalid {label}")
     raw = value.encode("utf-8")
-    if len(raw) > MAX_REMOTE_ID_BYTES or any(ord(c) < 32 or ord(c) == 127 for c in value):
+    if (
+        len(raw) > MAX_REMOTE_ID_BYTES
+        or any(unicodedata.category(c) in {"Cc", "Cf", "Cs"} for c in value)
+    ):
         raise A2AError(f"invalid {label}")
     return value
 
@@ -195,6 +199,7 @@ class Admission:
     capability_id: str
     runtime_id: str
     tools: tuple[str, ...]
+    binding_root: str
 
     def __post_init__(self) -> None:
         for value in (self.card_fingerprint, self.interface_fingerprint):
@@ -206,6 +211,16 @@ class Admission:
             raise A2AError("invalid tools")
         for tool in self.tools:
             _id(tool, "tool")
+        if (
+            not isinstance(self.binding_root, str)
+            or not self.binding_root
+            or "\x00" in self.binding_root
+        ):
+            raise A2AError("invalid binding root")
+        root = Path(self.binding_root)
+        if not root.is_absolute() or ".." in root.parts:
+            raise A2AError("invalid binding root")
+        object.__setattr__(self, "binding_root", str(root))
 
 
 def authorize(card: AgentCard, policy: Admission) -> Interface:
@@ -323,71 +338,91 @@ def discover_card(transport: Transport, origin: str) -> AgentCard:
     return parse_card(transport.discover(url.rstrip("/") + "/.well-known/agent-card.json", HEADER))
 
 
-def _ensure_durable_directory(path: Path) -> None:
+def _open_durable_directory(path: Path) -> int:
+    """Open/create an absolute directory component-wise without following symlinks.
+
+    Every new directory entry is fsynced in its parent before descending. The
+    returned FD pins the final directory inode, so later binding/lock operations
+    never re-resolve an attacker-swappable ancestor pathname.
+    """
     path = Path(path)
-    missing: list[Path] = []
-    current = path
-    while True:
-        try:
-            info = current.lstat()
-        except FileNotFoundError:
-            missing.append(current)
-            if current.parent == current:
-                raise A2AError("binding directory has no durable ancestor")
-            current = current.parent
-            continue
-        if not stat.S_ISDIR(info.st_mode) or current.is_symlink():
-            raise A2AError("invalid binding directory")
-        break
-    for directory in reversed(missing):
-        try:
-            os.mkdir(directory, 0o700)
-        except FileExistsError:
-            info = directory.lstat()
-            if not stat.S_ISDIR(info.st_mode) or directory.is_symlink():
+    if not path.is_absolute() or ".." in path.parts:
+        raise A2AError("invalid binding directory")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    current = os.open("/", flags)
+    try:
+        for part in path.parts[1:]:
+            if not part or part in {".", ".."}:
                 raise A2AError("invalid binding directory")
-        parent_fd = os.open(directory.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
-        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    # Even when the directory pre-existed, sync its parent entry before the
-    # first economic dispatch; this closes the recently-created-parent crash gap.
-    parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        os.fsync(parent_fd)
-    finally:
-        os.close(parent_fd)
-    directory_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
+            created = False
+            try:
+                next_fd = os.open(part, flags, dir_fd=current)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=current)
+                    created = True
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    raise A2AError("cannot create binding directory") from exc
+                if created:
+                    os.fsync(current)
+                try:
+                    next_fd = os.open(part, flags, dir_fd=current)
+                except OSError as exc:
+                    raise A2AError("invalid binding directory") from exc
+            except OSError as exc:
+                raise A2AError("invalid binding directory") from exc
+            info = os.fstat(next_fd)
+            if not stat.S_ISDIR(info.st_mode):
+                os.close(next_fd)
+                raise A2AError("invalid binding directory")
+            if created:
+                os.fsync(next_fd)
+            os.close(current)
+            current = next_fd
+        os.fsync(current)
+        return current
+    except BaseException:
+        os.close(current)
+        raise
 
 
 class BindingStore:
-    """Single dispatch binding with durable, serialized state transitions."""
-    def __init__(self, path: Path):
+    """Durable dispatch state plus a host-admitted per-identity economic claim."""
+
+    def __init__(self, path: Path, *, authority_root: Path | None = None):
         self.path = Path(path)
+        if not self.path.is_absolute() or not self.path.name or ".." in self.path.parts:
+            raise A2AError("invalid binding path")
+        self.authority_root = Path(authority_root) if authority_root is not None else self.path.parent
+        if not self.authority_root.is_absolute() or ".." in self.authority_root.parts:
+            raise A2AError("invalid binding authority root")
+        try:
+            self.path.relative_to(self.authority_root)
+        except ValueError as exc:
+            raise A2AError("binding path outside authority root") from exc
 
     @contextlib.contextmanager
     def locked(self):
-        _ensure_durable_directory(self.path.parent)
-        directory = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        directory = _open_durable_directory(self.path.parent)
         lock_name = self.path.name + ".lock"
         try:
-            lock = os.open(lock_name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+            lock = os.open(
+                lock_name,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+                dir_fd=directory,
+            )
             try:
                 if not stat.S_ISREG(os.fstat(lock).st_mode):
                     raise A2AError("invalid binding lock")
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 current = os.stat(lock_name, dir_fd=directory, follow_symlinks=False)
-                if (current.st_dev, current.st_ino) != (os.fstat(lock).st_dev, os.fstat(lock).st_ino):
+                if (current.st_dev, current.st_ino) != (
+                    os.fstat(lock).st_dev,
+                    os.fstat(lock).st_ino,
+                ):
                     raise A2AError("binding lock changed")
                 yield directory
             finally:
@@ -395,9 +430,61 @@ class BindingStore:
         finally:
             os.close(directory)
 
+    def claim_economic(
+        self, identity: Identity, card_fingerprint: str, interface_fingerprint: str
+    ) -> None:
+        """Permanently claim this Herdr economic identity before remote dispatch.
+
+        The claim is independent of the caller-selected binding filename. A
+        retry with another binding path under the same admitted root therefore
+        cannot create a second remote attempt.
+        """
+        root = _open_durable_directory(self.authority_root)
+        name = identity.message_id + ".claim"
+        payload = _bounded(
+            {
+                "identity": asdict(identity),
+                "message_id": identity.message_id,
+                "card_fingerprint": card_fingerprint,
+                "interface_fingerprint": interface_fingerprint,
+            },
+            8192,
+            secret_scan=False,
+        )
+        fd = -1
+        try:
+            try:
+                fd = os.open(
+                    name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    0o600,
+                    dir_fd=root,
+                )
+            except FileExistsError as exc:
+                raise A2AError("delivery already started; reconcile ambiguous send") from exc
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise A2AError("invalid economic claim")
+            view = memoryview(payload)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise A2AError("short economic claim write")
+                view = view[written:]
+            os.fsync(fd)
+            os.fsync(root)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            os.close(root)
+
     def _read(self, directory: int) -> dict[str, Any] | None:
         try:
-            fd = os.open(self.path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            fd = os.open(
+                self.path.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                dir_fd=directory,
+            )
         except FileNotFoundError:
             return None
         except OSError as exc:
@@ -406,17 +493,40 @@ class BindingStore:
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_BINDING:
                 raise A2AError("invalid or oversized binding")
-            raw = os.read(fd, MAX_BINDING + 1)
-            if len(raw) > MAX_BINDING:
+            chunks = bytearray()
+            while len(chunks) <= MAX_BINDING:
+                chunk = os.read(fd, min(65536, MAX_BINDING + 1 - len(chunks)))
+                if not chunk:
+                    break
+                chunks.extend(chunk)
+            if len(chunks) > MAX_BINDING:
                 raise A2AError("oversized binding")
-            data = json.loads(raw)
+            data = json.loads(bytes(chunks))
         finally:
             os.close(fd)
-        _object(data, {"identity", "message_id", "card_fingerprint", "interface_fingerprint", "delivery", "remote_task_id", "remote_context_id", "cancel_intent", "last_observation", "candidates"}, {"identity", "message_id", "card_fingerprint", "interface_fingerprint", "delivery", "remote_task_id", "remote_context_id", "cancel_intent", "last_observation", "candidates"})
+        _object(
+            data,
+            {
+                "identity", "message_id", "card_fingerprint", "interface_fingerprint",
+                "delivery", "remote_task_id", "remote_context_id", "cancel_intent",
+                "last_observation", "candidates",
+            },
+            {
+                "identity", "message_id", "card_fingerprint", "interface_fingerprint",
+                "delivery", "remote_task_id", "remote_context_id", "cancel_intent",
+                "last_observation", "candidates",
+            },
+        )
         identity = Identity(**data["identity"])
-        if identity.message_id != data["message_id"] or data["delivery"] not in {"send_started", "bound", "direct"}:
+        if (
+            identity.message_id != data["message_id"]
+            or data["delivery"] not in {"send_started", "bound", "direct"}
+        ):
             raise A2AError("invalid binding")
-        if not all(isinstance(data[key], str) and re.fullmatch(r"[0-9a-f]{64}", data[key]) for key in ("card_fingerprint", "interface_fingerprint")):
+        if not all(
+            isinstance(data[key], str) and re.fullmatch(r"[0-9a-f]{64}", data[key])
+            for key in ("card_fingerprint", "interface_fingerprint")
+        ):
             raise A2AError("invalid binding fingerprint")
         if type(data["cancel_intent"]) is not bool:
             raise A2AError("invalid cancel intent")
@@ -431,7 +541,10 @@ class BindingStore:
             raise A2AError("invalid remote binding")
         if data["delivery"] != "bound" and data["remote_task_id"] is not None:
             raise A2AError("invalid remote binding")
-        if data["last_observation"] is not None and data["last_observation"] not in _STATES | {"direct", "message"}:
+        if (
+            data["last_observation"] is not None
+            and data["last_observation"] not in _STATES | {"direct", "message"}
+        ):
             raise A2AError("invalid observation")
         return data
 
@@ -442,7 +555,12 @@ class BindingStore:
     def _write(self, directory: int, data: dict[str, Any], *, create: bool = False) -> None:
         raw = _bounded(data, MAX_BINDING, secret_scan=False)
         tmp = ".a2a-" + uuid.uuid4().hex
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+        fd = os.open(
+            tmp,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=directory,
+        )
         try:
             with os.fdopen(fd, "wb") as stream:
                 stream.write(raw)
@@ -450,11 +568,22 @@ class BindingStore:
                 os.fsync(stream.fileno())
             if create:
                 try:
-                    os.link(tmp, self.path.name, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
+                    os.link(
+                        tmp,
+                        self.path.name,
+                        src_dir_fd=directory,
+                        dst_dir_fd=directory,
+                        follow_symlinks=False,
+                    )
                 except FileExistsError as exc:
                     raise A2AError("delivery already started; reconcile ambiguous send") from exc
             else:
-                os.replace(tmp, self.path.name, src_dir_fd=directory, dst_dir_fd=directory)
+                os.replace(
+                    tmp,
+                    self.path.name,
+                    src_dir_fd=directory,
+                    dst_dir_fd=directory,
+                )
             os.fsync(directory)
         finally:
             try:
@@ -551,6 +680,28 @@ def _parse_response(raw: Any, identity: Identity, binding: dict[str, Any] | None
     if not isinstance(artifacts, list) or len(artifacts) > MAX_PARTS:
         raise A2AError("invalid artifacts")
     candidates = []
+    if "message" in status:
+        msg = _response_object(status["message"], {"messageId", "role", "parts"})
+        _remote_id(msg["messageId"], "messageId")
+        if msg["role"] != "ROLE_AGENT":
+            raise A2AError("expected agent status message")
+        _parts(msg["parts"])
+        if "contextId" not in msg:
+            raise A2AError("agent status message requires contextId")
+        message_context = _remote_id(msg["contextId"], "contextId")
+        if context is not None and message_context != context:
+            raise A2AError("status message context mismatch")
+        if "taskId" in msg and _remote_id(msg["taskId"], "taskId") != task_id:
+            raise A2AError("status message task mismatch")
+        candidates.append(
+            _candidate(
+                identity,
+                task_id,
+                context if context is not None else message_context,
+                "message",
+                msg,
+            )
+        )
     for artifact in artifacts:
         item = _response_object(artifact, {"artifactId", "parts"})
         _remote_id(item["artifactId"], "artifactId")
@@ -563,6 +714,8 @@ class Gateway:
     def __init__(self, transport: Transport, store: BindingStore, card: AgentCard, policy: Admission):
         self.transport, self.store, self.card, self.policy = transport, store, card, policy
         self.interface = authorize(card, policy)
+        if self.store.authority_root != Path(self.policy.binding_root):
+            raise A2AError("binding authority root not locally admitted")
 
     def _bound(self, identity: Identity, directory: int) -> dict[str, Any]:
         data = self.store._read(directory)
@@ -576,6 +729,11 @@ class Gateway:
         with self.store.locked() as directory:
             if self.store._read(directory) is not None:
                 raise A2AError("delivery already started; reconcile ambiguous send")
+            # The durable identity claim is independent of this binding filename,
+            # so switching paths cannot create a second economic attempt.
+            self.store.claim_economic(
+                identity, self.card.fingerprint, self.interface.fingerprint
+            )
             data = {"identity": asdict(identity), "message_id": identity.message_id, "card_fingerprint": self.card.fingerprint, "interface_fingerprint": self.interface.fingerprint, "delivery": "send_started", "remote_task_id": None, "remote_context_id": None, "cancel_intent": False, "last_observation": None, "candidates": []}
             self.store._write(directory, data, create=True)
             request = {
