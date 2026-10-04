@@ -23,10 +23,12 @@ FILES = (
     Path("docs/architecture/CONTEXT_MEMORY.md"),
     Path("package.json"),
     Path("package-lock.json"),
+    Path("requirements-mcp.txt"),
+    Path("docs/architecture/MCP_GATEWAY.md"),
 )
 OUTPUT = Path("provenance/CANONICAL_SOURCE_MANIFEST.sha256")
 TEXT_SUFFIXES = {
-    ".css", ".html", ".in", ".js", ".json", ".md", ".mjs", ".py",
+    ".txt", ".css", ".html", ".in", ".js", ".json", ".md", ".mjs", ".py",
     ".service", ".sh", ".sha256", ".yaml",
 }
 
