@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import hashlib
+import dataclasses
 import json
+import os
 import re
 import threading
 import time
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 import pytest
+import herdr.runtime as runtime_mod
 
 from herdr.consumer_policies import allow_all_consumer_policy, quantlab_paper_policy
 
@@ -19,12 +24,14 @@ from herdr.admission import (
     TaskGraphSpec,
 )
 from herdr.scheduler import _Lease
+from herdr.scheduler import AuditLog as SchedulerAuditLog, ChildProposal, DynamicChildScheduler
 from herdr.runtime import (
     HERDR_CONTEXT_BLOCKER,
     AdmissionRegistry,
     CommandResult,
     HerdrChildRuntime,
     HerdrRuntimeError,
+    PreDeliveryFailure,
     build_two_child_canary,
 )
 
@@ -89,6 +96,594 @@ def _admission(tmp_path: Path) -> AdmissionControl:
 
 def _registry(tmp_path: Path) -> AdmissionRegistry:
     return AdmissionRegistry(tmp_path / "admission-registry.json")
+
+
+def test_managed_admission_release_requires_exact_claim(tmp_path: Path):
+    registry = _registry(tmp_path)
+    entry = {"agent_id": "child-agent", "repo": "repo", "issue": "82",
+             "task_id": "other-child", "fencing_token": 7, "lease_until": 9999999999}
+    registry._write([entry])
+    registry.release("child-agent", task_id="child", fencing_token=8)
+    assert registry._read() == [entry]
+    registry.release("child-agent", task_id="other-child", fencing_token=7)
+    assert registry._read() == []
+
+
+def test_managed_observation_rejects_wrong_live_pane(tmp_path: Path) -> None:
+    class WrongPaneRunner:
+        def run(self, args, timeout_seconds=30.0):
+            return CommandResult(0, json.dumps({"result": {"agent": {
+                "pane_id": "someone-elses-pane", "agent_status": "done"}}}), "")
+
+    scheduler = _canary(tmp_path)[0]
+    runtime = HerdrChildRuntime(scheduler, WrongPaneRunner(), cwd=tmp_path)
+    runtime._owned_panes.add("owned-pane")
+    with pytest.raises(HerdrRuntimeError, match="child_wrong_pane"):
+        runtime._verify_live_child("child", "owned-pane", "marker")
+    with pytest.raises(HerdrRuntimeError, match="child_pane_unowned"):
+        runtime._verify_live_child("child", "unowned-pane", "marker")
+
+
+@pytest.mark.parametrize("case", ["reused_pane", "wrong_agent", "wrong_marker",
+                                  "absent", "exact"])
+def test_cleanup_bound_child_proves_live_binding(tmp_path: Path, monkeypatch, case):
+    scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
+    scheduler.register_external_parent_attempt(
+        task_id="parent", run_token="parent-run", idempotency_key="parent-key",
+        agent_name="parent-agent", pane_id="parent-pane", marker="parent-marker",
+        repo="repo", issue="82", role="writer", tools=("read_file",),
+        permissions=(), policy_profile="default")
+    child = scheduler.delegate_child("parent", "parent-run", "cleanup",
+        ChildProposal("writer", ("read_file",), "reader", ("read_file",),
+                      child_task="inspect"))
+    lease = scheduler.dispatch(task_ids={child.id})[0]
+    rec = scheduler._tasks[child.id]
+    assert scheduler.bind_execution_session(child.id, rec.run_token, lease.agent_id,
+                                            "child-pane", "child-marker")
+    evidence = [{"artifact": "exact"}]
+    digest = hashlib.sha256(json.dumps(evidence, sort_keys=True,
+        ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+    assert scheduler.publish_child_result(child.id, rec.run_token, lease.agent_id,
+                                          lease.fencing_token, rec.idempotency_key,
+                                          digest, evidence)
+    assert rec.attempt_state == "terminal"
+    if case == "wrong_agent":
+        rec.execution_agent = "other-agent"
+
+    class Runner:
+        def __init__(self):
+            self.closed = []
+        def run(self, args, timeout_seconds=30.0):
+            if args[:2] == ["pane", "list"]:
+                panes = [] if case == "absent" else [{"pane_id": "child-pane"}]
+                return CommandResult(0, json.dumps({"result": {"panes": panes}}), "")
+            if args[:2] == ["pane", "close"]:
+                self.closed.append(args[2])
+                return CommandResult(0, json.dumps({"result": {"closed": True}}), "")
+            raise AssertionError(args)
+
+    runner = Runner()
+    runtime = HerdrChildRuntime(scheduler, runner, cwd=tmp_path,
+                                admission_registry=_registry(tmp_path))
+    releases = []
+    monkeypatch.setattr(runtime.admission_registry, "release",
+                        lambda agent, **kw: releases.append(agent))
+    verified = []
+    def verify(agent, pane, marker, *, require_sandbox=False, require_owned=True):
+        verified.append((agent, pane, marker, require_sandbox, require_owned))
+        if case in {"reused_pane", "wrong_marker"}:
+            raise HerdrRuntimeError("child_marker_missing", pane)
+        return "done"
+    monkeypatch.setattr(runtime, "_verify_live_child", verify)
+    if case in {"reused_pane", "wrong_agent", "wrong_marker"}:
+        with pytest.raises(HerdrRuntimeError):
+            runtime.cleanup_bound_child(child.id)
+        assert runner.closed == []
+    else:
+        runtime.cleanup_bound_child(child.id)
+        assert runner.closed == ([] if case == "absent" else ["child-pane"])
+    assert releases == ([lease.agent_id] if case in {"absent", "exact"} else [])
+    if case in {"exact", "reused_pane", "wrong_marker"}:
+        assert verified == [(lease.agent_id, "child-pane", "child-marker", True, False)]
+
+
+@pytest.mark.parametrize("case", ["absent", "exact", "wrong_marker", "wrong_agent"])
+def test_managed_pre_delivery_cleanup_requires_created_identity(tmp_path, monkeypatch, case):
+    scheduler = _canary(tmp_path)[0]
+    runner = FakeHerdrRunner()
+    runtime = HerdrChildRuntime(scheduler, runner, cwd=tmp_path,
+                                admission_registry=_registry(tmp_path))
+    lease = _Lease(task_id="child", agent_id="child-agent", holder="test",
+                   fencing_token=1, lease_until=100)
+    runtime._owned_panes.add("child-pane")
+    runtime._reserved_agents.add(lease.agent_id)
+    runtime._reservation_panes[lease.agent_id] = "child-pane"
+    def run(args, timeout_seconds=30.0):
+        if args[:2] == ["pane", "list"]:
+            panes = [] if case == "absent" else [{"pane_id": "child-pane"}]
+            return CommandResult(0, json.dumps({"result": {"panes": panes}}), "")
+        if args[:2] == ["pane", "close"]:
+            runner.closed.append(args[2])
+            return CommandResult(0, "{}", "")
+        raise AssertionError(args)
+    monkeypatch.setattr(runner, "run", run)
+    monkeypatch.setattr(runtime, "_verify_created_pane_marker", lambda pane, marker:
+        (_ for _ in ()).throw(HerdrRuntimeError("child_cleanup_unproven", pane))
+        if case == "wrong_marker" else None)
+    monkeypatch.setattr(runtime, "_verify_live_child", lambda agent, pane, marker, **kw:
+        (_ for _ in ()).throw(HerdrRuntimeError("child_wrong_pane", pane))
+        if case == "wrong_agent" else "done")
+    monkeypatch.setattr(runtime.admission_registry, "release", lambda *args, **kw: None)
+    if case in {"wrong_marker", "wrong_agent"}:
+        with pytest.raises(HerdrRuntimeError):
+            runtime.cleanup_managed_pre_delivery(lease, "child-pane", "child-marker",
+                                                 agent_start_attempted=True)
+    else:
+        runtime.cleanup_managed_pre_delivery(lease, "child-pane", "child-marker",
+                                             agent_start_attempted=True)
+    assert runner.closed == (["child-pane"] if case == "exact" else [])
+
+
+def test_managed_pre_delivery_unknown_pane_preserves_reservation(tmp_path, monkeypatch):
+    scheduler = _canary(tmp_path)[0]
+    runtime = HerdrChildRuntime(scheduler, FakeHerdrRunner(), cwd=tmp_path,
+                                admission_registry=_registry(tmp_path))
+    lease = _Lease(task_id="child", agent_id="child-agent", holder="test",
+                   fencing_token=1, lease_until=100)
+    released = []
+    monkeypatch.setattr(runtime.admission_registry, "release",
+                        lambda *args, **kw: released.append(args))
+    with pytest.raises(HerdrRuntimeError, match="child_cleanup_unproven"):
+        runtime.cleanup_managed_pre_delivery(lease, None, "marker",
+                                             agent_start_attempted=False)
+    assert released == []
+
+
+def test_managed_child_writable_is_exact_result_file_only(tmp_path: Path):
+    scheduler = _canary(tmp_path)[0]
+    runtime = HerdrChildRuntime(
+        scheduler, FakeHerdrRunner(), cwd=tmp_path,
+        snapshot_path=tmp_path / "attempt" / "swarm.json",
+        admission_registry=_registry(tmp_path),
+    )
+    target, = runtime._child_result_writable("child-a")
+    assert target == tmp_path / "attempt" / "results" / "child-a.result.json"
+    assert target.is_file()
+    assert target.stat().st_mode & 0o777 == 0o600
+    assert target.parent != target
+    assert not (target.parent / "child-b.result.json").exists()
+    with pytest.raises(HerdrRuntimeError, match="child_result_target_exists"):
+        runtime._child_result_writable("child-a")
+
+
+def test_quantlab_profile_admission_is_paper_only(tmp_path: Path, monkeypatch):
+    scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
+    scheduler.register_external_parent_attempt(
+        task_id="parent", run_token="root-run", idempotency_key="root-key",
+        agent_name="parent-agent", pane_id="parent-pane", marker="parent-marker",
+        repo="Bbambaaamm/herdr", issue="82", role="writer",
+        tools=("read_file",), permissions=(), policy_profile="quantlab")
+    child = scheduler.delegate_child("parent", "root-run", "paper",
+        ChildProposal("writer", ("read_file",), "reader", ("read_file",),
+                      child_task="inspect"))
+    lease = scheduler.dispatch(task_ids={child.id})[0]
+    runtime = HerdrChildRuntime(
+        scheduler, FakeHerdrRunner(), cwd=tmp_path,
+        env={"HERDR_ENV": "1", "HERDR_PANE_ID": "parent-pane", "HERDR_PROFILE": "quantlab"},
+        admission_registry=_registry(tmp_path), resource_usage_factory=lambda *_: _healthy_usage(),
+    )
+    runtime._skill_checked = True
+    captured = []
+    monkeypatch.setattr(runtime.admission_registry, "reserve",
+                        lambda admission, identity, spec, usage, tools, lease, **kw:
+                        captured.append(identity))
+    runtime._admit_child(lease)
+    assert captured and captured[0].paper_only is True
+
+
+def test_managed_runtime_binds_owned_pane_before_prompt(tmp_path: Path, monkeypatch) -> None:
+    scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
+    scheduler.register_external_parent_attempt(
+        task_id="parent", run_token="root-run", idempotency_key="root-key",
+        agent_name="parent-agent", pane_id="parent-pane", marker="parent-marker",
+        repo="Bbambaaamm/herdr", issue="82", role="writer",
+        tools=("read_file",), permissions=(), policy_profile="herdr-core")
+    child = scheduler.delegate_child("parent", "root-run", "research",
+        ChildProposal("writer", ("read_file",), "reader", ("read_file",),
+                      child_task="inspect"))
+    lease = scheduler.dispatch(task_ids={child.id})[0]
+    rec = scheduler._tasks[child.id]
+    scheduler.bind_child_prompt(child.id, "inspect now")
+    events = []
+
+    class Runner:
+        executable = "/bin/true"
+        def run(self, args, timeout_seconds=30.0):
+            assert args[:2] == ["agent", "prompt"]
+            assert rec.execution_pane == "created-pane"
+            assert scheduler.authorize_child_delivery(child.id, rec.run_token,
+                lease.agent_id, lease.fencing_token, rec.idempotency_key)
+            events.append("prompt")
+            return CommandResult(0, json.dumps({"result": {"agent": {
+                "agent_status": "done"}}}), "")
+
+    runtime = HerdrChildRuntime(scheduler, Runner(), cwd=tmp_path)
+    monkeypatch.setattr(runtime, "prepare", lambda: events.append("prepare"))
+    monkeypatch.setattr(runtime, "_admit_child", lambda lease: events.append("admit"))
+    def create(index, marker, policy_env):
+        assert policy_env["HERDR_DURABLE_TASK_ID"] == child.id
+        assert "agent-stack/policy-bin" in policy_env["PATH"]
+        runtime._owned_panes.add("created-pane")
+        events.append("create")
+        return "created-pane"
+    monkeypatch.setattr(runtime, "_create_pane", create)
+    def sandbox_child(pane, marker, real, task_id):
+        events.append("sandbox")
+        runtime._sandbox_proofs[pane] = {"sandbox_pid": 123, "policy_sha256": "a" * 64}
+        return tmp_path / "policy"
+    monkeypatch.setattr(runtime, "_sandbox_child_pane", sandbox_child)
+    monkeypatch.setattr(runtime, "_start_agent", lambda lease, pane: events.append("start"))
+    monkeypatch.setattr(runtime, "_verify_live_child",
+                        lambda agent, pane, marker, *, require_sandbox=False:
+                        "done" if pane == "created-pane" and require_sandbox else "unavailable")
+    monkeypatch.setattr(runtime, "cleanup", lambda: events.append("cleanup"))
+    assert runtime.run_managed_child(lease, "inspect now", run_token=rec.run_token,
+                                     idempotency_key=rec.idempotency_key) == "settled"
+    assert events == ["prepare", "admit", "create", "sandbox", "start", "prompt"]
+    assert rec.execution_agent == lease.agent_id
+    assert rec.execution_pane == "created-pane"
+    assert rec.observed_execution == "settled"
+    assert rec.state.value == "running"
+
+
+def test_managed_done_without_inner_sandbox_cannot_settle(tmp_path: Path, monkeypatch) -> None:
+    scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
+    scheduler.register_external_parent_attempt(
+        task_id="parent", run_token="parent-run", idempotency_key="parent-key",
+        agent_name="parent-agent", pane_id="parent-pane", marker="parent-marker",
+        repo="repo", issue="82", role="writer", tools=("read_file",),
+        permissions=(), policy_profile="default")
+    child = scheduler.delegate_child("parent", "parent-run", "research",
+        ChildProposal("writer", ("read_file",), "reader", ("read_file",),
+                      child_task="inspect"))
+    lease = scheduler.dispatch(task_ids={child.id})[0]
+    rec = scheduler._tasks[child.id]
+
+    class Runner:
+        executable = "/bin/true"
+        def run(self, args, timeout_seconds=30.0):
+            if args[:2] == ["agent", "get"]:
+                return CommandResult(0, json.dumps({"result": {"agent": {
+                    "name": lease.agent_id, "pane_id": "child-pane",
+                    "agent_status": "done"}}}), "")
+            return CommandResult(0, json.dumps({"result": {"process_info": {
+                "shell_pid": 1, "foreground_processes": []}}}), "")
+
+    runtime = HerdrChildRuntime(scheduler, Runner(), cwd=tmp_path)
+    monkeypatch.setattr(runtime, "prepare", lambda: None)
+    monkeypatch.setattr(runtime, "_admit_child", lambda lease: None)
+    monkeypatch.setattr(runtime, "_create_pane", lambda *args: "child-pane")
+    monkeypatch.setattr(runtime, "_sandbox_child_pane", lambda *args: tmp_path / "policy")
+    monkeypatch.setattr(runtime, "_start_agent", lambda *args: None)
+    runtime._owned_panes.add("child-pane")
+    monkeypatch.setattr(runtime, "cleanup", lambda: None)
+    with pytest.raises(HerdrRuntimeError, match="child_pre_delivery_failed"):
+        runtime.run_managed_child(lease, "inspect", run_token=rec.run_token,
+                                  idempotency_key=rec.idempotency_key)
+    assert rec.observed_execution == "unavailable"
+    assert not any(e.get("event") == "execution_observed"
+                   for e in scheduler.audit_log.replay())
+
+
+@pytest.mark.parametrize("phase", ["host_guard", "admission", "pane", "agent_start"])
+def test_managed_pre_delivery_boundary(tmp_path: Path, monkeypatch, phase) -> None:
+    scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
+    scheduler.register_external_parent_attempt(
+        task_id="parent", run_token="parent-run", idempotency_key="parent-key",
+        agent_name="parent-agent", pane_id="parent-pane", marker="parent-marker",
+        repo="repo", issue="82", role="writer", tools=("read_file",),
+        permissions=(), policy_profile="default")
+    child = scheduler.delegate_child("parent", "parent-run", "research",
+        ChildProposal("writer", ("read_file",), "reader", ("read_file",),
+                      child_task="inspect"))
+    lease = scheduler.dispatch(task_ids={child.id})[0]
+    rec = scheduler._tasks[child.id]
+    class Runner(FakeHerdrRunner):
+        executable = "/bin/true"
+    runner = Runner()
+    runtime = HerdrChildRuntime(
+        scheduler, runner, cwd=tmp_path,
+        env={"HERDR_ENV": "1", "HERDR_PANE_ID": "parent-pane"},
+        host_guard=lambda: phase != "host_guard",
+        admission=_admission(tmp_path), admission_registry=_registry(tmp_path),
+        resource_usage_factory=(_global_cap_usage if phase == "admission" else _healthy_usage))
+    if phase == "pane":
+        monkeypatch.setattr(runtime, "_admit_child", lambda lease: None)
+        monkeypatch.setattr(runtime, "_create_pane", lambda *args: (_ for _ in ()).throw(
+            HerdrRuntimeError("herdr_command_failed", "pane uncertain")))
+    if phase == "agent_start":
+        monkeypatch.setattr(runtime, "_admit_child", lambda lease: None)
+        monkeypatch.setattr(runtime, "_sandbox_child_pane",
+                            lambda *args: tmp_path / "policy")
+        monkeypatch.setattr(runtime, "_start_agent", lambda *args: (_ for _ in ()).throw(
+            HerdrRuntimeError("herdr_command_failed", "agent start denied")))
+    with pytest.raises(PreDeliveryFailure) as failure:
+        runtime.run_managed_child(lease, "inspect", run_token=rec.run_token,
+                                  idempotency_key=rec.idempotency_key)
+    assert failure.value.cleanup_complete is (phase not in {"pane", "agent_start"})
+    assert not any(call[:2] == ("agent", "prompt") for call in runner.calls)
+    assert rec.observed_execution == "unavailable"
+    assert rec.state.value == "blocked" and rec.lease is None
+    replay = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
+    replay.replay()
+    assert replay._tasks[child.id].pre_delivery_failure
+    assert replay._tasks[child.id].cleanup_complete is (phase not in {"pane", "agent_start"})
+
+
+@pytest.mark.parametrize("role,tools,permissions,expected", [
+    ("reader", ("read_file",), ("workspace-write",), False),
+    ("writer", ("write_file",), (), False),
+    ("writer", ("read_file",), ("workspace-write",), False),
+    ("writer", ("write_file",), ("workspace-write",), True),
+])
+def test_child_workspace_write_requires_role_tool_and_permission(
+        tmp_path, role, tools, permissions, expected):
+    scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
+    scheduler.register_external_parent_attempt(
+        task_id="parent", run_token="parent-run", idempotency_key="parent-key",
+        agent_name="parent-agent", pane_id="parent-pane", marker="parent-marker",
+        repo="repo", issue="82", role="writer", tools=("read_file", "write_file"),
+        permissions=("workspace-write",), policy_profile="default")
+    child = scheduler.delegate_child("parent", "parent-run", "scope",
+        ChildProposal("writer", ("read_file", "write_file"), role, tools,
+                      child_permissions=permissions, child_task="inspect"))
+    runtime = HerdrChildRuntime(scheduler, FakeHerdrRunner(), cwd=tmp_path)
+    assert runtime._child_workspace_writable(child.id) is expected
+
+
+@pytest.mark.parametrize("tools,expected", [
+    (("read_file", "search_files"), "file"),
+    (("read_file", "patch", "review"), "file"),
+])
+def test_managed_agent_start_uses_explicit_admitted_toolset(tmp_path, tools, expected):
+    scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
+    role = "reviewer" if "review" in tools else "reader"
+    parent_role = "reviewer" if role == "reviewer" else "writer"
+    scheduler.register_external_parent_attempt(
+        task_id="parent", run_token="parent-run", idempotency_key="parent-key",
+        agent_name="parent-agent", pane_id="parent-pane", marker="parent-marker",
+        repo="repo", issue="82", role=parent_role, tools=tools,
+        permissions=("workspace-write",), policy_profile="default")
+    child = scheduler.delegate_child("parent", "parent-run", "scope",
+        ChildProposal(parent_role, tools, role, tools, child_task="inspect"))
+    lease = scheduler.dispatch(task_ids={child.id})[0]
+    runner = FakeHerdrRunner()
+    runtime = HerdrChildRuntime(scheduler, runner, cwd=tmp_path,
+                                env={"HERDR_ENV": "1", "HERDR_PANE_ID": "parent-pane"})
+    runtime._skill_checked = True
+
+    runtime._start_agent(lease, "child-pane")
+
+    call = next(call for call in runner.calls if call[:2] == ("agent", "start"))
+    assert call[call.index("--toolsets") + 1] == expected
+    assert call.index("--toolsets") > call.index("chat")
+    assert not any(value in call for value in (
+        "terminal", "code_execution", "web", "browser", "delegation",
+        "connections", "computer_use", "cron", "mcp", "plugins"))
+
+
+def _write_profile_auth(profile_dir, expires_at):
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    (profile_dir / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    (profile_dir / "auth.json").write_text(json.dumps({
+        "providers": {"nous": {"agent_key_expires_at": expires_at}}}), encoding="utf-8")
+
+
+def test_trusted_provider_preflight_accepts_nous_key_above_runtime_ttl(tmp_path, monkeypatch):
+    binary = tmp_path / "hermes"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    profile_dir = tmp_path / "profiles" / "quantlab"
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    _write_profile_auth(profile_dir, future)
+    calls = []
+
+    class Proc:
+        def __init__(self, out="", rc=0):
+            self.returncode, self.stdout, self.stderr = rc, out, ""
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        tail = argv[-3:]
+        if tail == ["config", "get", "model.provider"]:
+            return Proc("nous\n")
+        if argv[-2:] == ["config", "path"]:
+            return Proc(str(profile_dir / "config.yaml") + "\n")
+        if tail == ["auth", "status", "nous"]:
+            return Proc("nous: logged in\n")
+        if tail == ["auth", "refresh", "nous"]:
+            pytest.fail("fresh credential must not rotate")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(runtime_mod.subprocess, "run", fake_run)
+    runtime_mod._trusted_hermes_profile_preflight(
+        "quantlab", executable=str(binary), env={"HOME": "/home/agentops"})
+    assert not any(call[-3:] == ["auth", "refresh", "nous"] for call in calls)
+
+
+def test_trusted_provider_preflight_refreshes_nous_below_runtime_ttl(tmp_path, monkeypatch):
+    binary = tmp_path / "hermes"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    profile_dir = tmp_path / "profiles" / "quantlab"
+    stale = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    fresh = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    _write_profile_auth(profile_dir, stale)
+    calls = []
+
+    class Proc:
+        def __init__(self, out="", rc=0):
+            self.returncode, self.stdout, self.stderr = rc, out, ""
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        tail = argv[-3:]
+        if tail == ["config", "get", "model.provider"]:
+            return Proc("nous\n")
+        if argv[-2:] == ["config", "path"]:
+            return Proc(str(profile_dir / "config.yaml") + "\n")
+        if tail == ["auth", "status", "nous"]:
+            return Proc("nous: logged in\n")
+        if tail == ["auth", "refresh", "nous"]:
+            _write_profile_auth(profile_dir, fresh)
+            return Proc("Refreshed nous credential #1\n")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(runtime_mod.subprocess, "run", fake_run)
+    runtime_mod._trusted_hermes_profile_preflight(
+        "quantlab", executable=str(binary), env={"HOME": "/home/agentops"})
+    assert sum(call[-3:] == ["auth", "refresh", "nous"] for call in calls) == 1
+    assert sum(call[-3:] == ["auth", "status", "nous"] for call in calls) == 2
+
+
+def test_trusted_provider_preflight_fails_closed_on_short_post_refresh_ttl(tmp_path, monkeypatch):
+    binary = tmp_path / "hermes"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    profile_dir = tmp_path / "profiles" / "quantlab"
+    short = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    _write_profile_auth(profile_dir, short)
+
+    class Proc:
+        def __init__(self, out="", rc=0):
+            self.returncode, self.stdout, self.stderr = rc, out, ""
+
+    def fake_run(argv, **kwargs):
+        tail = argv[-3:]
+        if tail == ["config", "get", "model.provider"]:
+            return Proc("nous\n")
+        if argv[-2:] == ["config", "path"]:
+            return Proc(str(profile_dir / "config.yaml") + "\n")
+        if tail == ["auth", "status", "nous"]:
+            return Proc("nous: logged in\n")
+        if tail == ["auth", "refresh", "nous"]:
+            return Proc("Refreshed nous credential #1\n")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(runtime_mod.subprocess, "run", fake_run)
+    with pytest.raises(HerdrRuntimeError, match="child_provider_preflight_failed"):
+        runtime_mod._trusted_hermes_profile_preflight(
+            "quantlab", executable=str(binary), env={"HOME": "/home/agentops"})
+
+
+def test_trusted_provider_preflight_fails_closed_when_auth_not_logged_in(tmp_path, monkeypatch):
+    binary = tmp_path / "hermes"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    profile_dir = tmp_path / "profiles" / "quantlab"
+    _write_profile_auth(profile_dir, (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat())
+
+    class Proc:
+        def __init__(self, out):
+            self.returncode, self.stdout, self.stderr = 0, out, ""
+
+    def fake_run(argv, **kwargs):
+        tail = argv[-3:]
+        if tail == ["config", "get", "model.provider"]:
+            return Proc("nous\n")
+        if argv[-2:] == ["config", "path"]:
+            return Proc(str(profile_dir / "config.yaml") + "\n")
+        if tail == ["auth", "status", "nous"]:
+            return Proc("nous: logged out\n")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(runtime_mod.subprocess, "run", fake_run)
+    with pytest.raises(HerdrRuntimeError, match="child_provider_preflight_failed"):
+        runtime_mod._trusted_hermes_profile_preflight(
+            "quantlab", executable=str(binary), env={"HOME": "/home/agentops"})
+
+
+def test_managed_agent_start_rejects_unmapped_permission_before_runner(tmp_path):
+    scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
+    scheduler.register_external_parent_attempt(
+        task_id="parent", run_token="parent-run", idempotency_key="parent-key",
+        agent_name="parent-agent", pane_id="parent-pane", marker="parent-marker",
+        repo="repo", issue="82", role="writer", tools=("read_file",),
+        permissions=("future-permission",), policy_profile="default")
+    child = scheduler.delegate_child("parent", "parent-run", "scope-permission",
+        ChildProposal("writer", ("read_file",), "reader", ("read_file",),
+                      parent_permissions=("future-permission",),
+                      child_permissions=("future-permission",), child_task="inspect"))
+    lease = scheduler.dispatch(task_ids={child.id})[0]
+    runner = FakeHerdrRunner()
+    runtime = HerdrChildRuntime(scheduler, runner, cwd=tmp_path,
+                                env={"HERDR_ENV": "1", "HERDR_PANE_ID": "parent-pane"})
+    runtime._skill_checked = True
+
+    with pytest.raises(HerdrRuntimeError, match="child_permission_unmapped"):
+        runtime._start_agent(lease, "child-pane")
+    assert runner.calls == []
+
+
+def test_managed_agent_start_rejects_unmapped_tool_before_runner(tmp_path):
+    scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
+    scheduler.register_external_parent_attempt(
+        task_id="parent", run_token="parent-run", idempotency_key="parent-key",
+        agent_name="parent-agent", pane_id="parent-pane", marker="parent-marker",
+        repo="repo", issue="82", role="writer", tools=("read_file",),
+        permissions=(), policy_profile="default")
+    child = scheduler.delegate_child("parent", "parent-run", "scope",
+        ChildProposal("writer", ("read_file",), "reader", ("read_file",),
+                      child_task="inspect"))
+    lease = scheduler.dispatch(task_ids={child.id})[0]
+    scheduler._tasks[child.id].node = dataclasses.replace(
+        scheduler._tasks[child.id].node, tools=("read_file", "future_tool"))
+    runner = FakeHerdrRunner()
+    runtime = HerdrChildRuntime(scheduler, runner, cwd=tmp_path,
+                                env={"HERDR_ENV": "1", "HERDR_PANE_ID": "parent-pane"})
+    runtime._skill_checked = True
+
+    with pytest.raises(HerdrRuntimeError, match="child_toolset_unmapped"):
+        runtime._start_agent(lease, "child-pane")
+    assert runner.calls == []
+
+
+def test_prompt_invocation_error_preserves_accepted_child(tmp_path: Path, monkeypatch) -> None:
+    scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
+    scheduler.register_external_parent_attempt(
+        task_id="parent", run_token="parent-run", idempotency_key="parent-key",
+        agent_name="parent-agent", pane_id="parent-pane", marker="parent-marker",
+        repo="repo", issue="82", role="writer", tools=("read_file",),
+        permissions=(), policy_profile="default")
+    child = scheduler.delegate_child("parent", "parent-run", "research",
+        ChildProposal("writer", ("read_file",), "reader", ("read_file",),
+                      child_task="inspect"))
+    lease = scheduler.dispatch(task_ids={child.id})[0]
+    rec = scheduler._tasks[child.id]
+    scheduler.bind_child_prompt(child.id, "inspect")
+    class Runner:
+        executable = "/bin/true"
+        def run(self, args, **kwargs):
+            assert args[:2] == ["agent", "prompt"]
+            raise OSError("transport lost after invocation")
+    runtime = HerdrChildRuntime(scheduler, Runner(), cwd=tmp_path)
+    monkeypatch.setattr(runtime, "prepare", lambda: None)
+    monkeypatch.setattr(runtime, "_admit_child", lambda lease: None)
+    def create(*args):
+        runtime._owned_panes.add("child-pane")
+        return "child-pane"
+    monkeypatch.setattr(runtime, "_create_pane", create)
+    def sandbox_child(pane, *args):
+        runtime._sandbox_proofs[pane] = {"sandbox_pid": 123, "policy_sha256": "a" * 64}
+        return tmp_path / "policy"
+    monkeypatch.setattr(runtime, "_sandbox_child_pane", sandbox_child)
+    monkeypatch.setattr(runtime, "_start_agent", lambda *args: None)
+    monkeypatch.setattr(runtime, "_verify_live_child", lambda *args, **kwargs: "working")
+    with pytest.raises(OSError, match="transport lost"):
+        runtime.run_managed_child(lease, "inspect", run_token=rec.run_token,
+                                  idempotency_key=rec.idempotency_key)
+    assert rec.state.value == "running" and rec.lease is lease
+    assert rec.pre_delivery_failure is None and rec.execution_pane == "child-pane"
+    replay = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
+    replay.replay()
+    assert replay._tasks[child.id].state.value == "running"
+    assert replay._tasks[child.id].pre_delivery_failure is None
 
 
 def _healthy_usage(*_args) -> ResourceUsage:
@@ -202,7 +797,8 @@ def test_two_real_child_contract_parallel_cleanup_and_snapshot(tmp_path: Path) -
     assert any(call == ("--skill",) for call in runner.calls)
     starts = [call for call in runner.calls if call[:2] == ("agent", "start")]
     assert len(starts) == 2
-    assert all("-t" in call and call[call.index("-t") + 1] == "bot_room" for call in starts)
+    assert all("--toolsets" in call and
+               call[call.index("--toolsets") + 1] == "bot_room" for call in starts)
     assert all(
         "--max-turns" in call and call[call.index("--max-turns") + 1] == "1" for call in starts
     )
@@ -354,7 +950,7 @@ def test_admission_registry_enforces_global_limit_across_runtimes(tmp_path: Path
     assert [row["agent_id"] for row in state["entries"]] == ["q3-a-f1"]
 
 
-def test_admission_registry_prunes_expired_crash_slot(tmp_path: Path) -> None:
+def test_admission_registry_keeps_expired_slot_until_explicit_release(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
     admission = AdmissionControl(
         budget=PlanBudget(max_global_agents=1, max_agents_per_repo=1, max_agents_per_issue=1),
@@ -374,9 +970,359 @@ def test_admission_registry_prunes_expired_crash_slot(tmp_path: Path) -> None:
     fresh = _Lease("fresh", "h2", "q3-fresh-f2", 1200.0, 2)
 
     registry.reserve(admission, identity, spec, _healthy_usage(), (), stale, now=1000.0)
-    registry.reserve(admission, identity, spec, _healthy_usage(), (), fresh, now=1006.0)
+    with pytest.raises(HerdrRuntimeError, match="child_admission_denied"):
+        registry.reserve(admission, identity, spec, _healthy_usage(), (), fresh, now=1006.0)
 
     state = json.loads((tmp_path / "admission-registry.json").read_text())
-    assert [row["agent_id"] for row in state["entries"]] == ["q3-fresh-f2"]
+    assert [row["agent_id"] for row in state["entries"]] == ["q3-stale-f1"]
     registry.release("q3-fresh-f2", now=1006.0)
+    assert [row["agent_id"] for row in json.loads(
+        (tmp_path / "admission-registry.json").read_text())["entries"]] == ["q3-stale-f1"]
+    registry.release("q3-stale-f1", now=1006.0)
     assert json.loads((tmp_path / "admission-registry.json").read_text())["entries"] == []
+
+
+def test_admission_registry_release_preserves_other_expired_reservations(tmp_path: Path):
+    registry = _registry(tmp_path)
+    registry._write([
+        {"agent_id": agent, "repo": "repo", "issue": "1", "task_id": agent,
+         "fencing_token": 1, "lease_until": 1.0}
+        for agent in ("expired-a", "expired-b", "target")
+    ])
+    registry.release("target", now=100.0)
+    assert [entry["agent_id"] for entry in registry._read()] == ["expired-a", "expired-b"]
+
+
+def test_admission_registry_fsyncs_file_and_directory(tmp_path: Path, monkeypatch):
+    registry = _registry(tmp_path)
+    calls = []
+    actual_fsync = os.fsync
+    def track_fsync(fd):
+        calls.append(os.fstat(fd).st_mode)
+        actual_fsync(fd)
+    monkeypatch.setattr(os, "fsync", track_fsync)
+    registry._write([])
+    assert len(calls) == 2
+    assert os.path.isfile(registry.path)
+    assert registry.path.stat().st_mode & 0o777 == 0o640
+    assert os.path.isdir(registry.path.parent)
+    import stat
+    assert stat.S_ISREG(calls[0]) and stat.S_ISDIR(calls[1])
+
+
+@pytest.mark.parametrize("writable", [False, True])
+@pytest.mark.parametrize("swap_path", [False, True])
+def test_actual_child_sandbox_proof_persists_exact_attestation(tmp_path, monkeypatch, writable, swap_path):
+    """Exercise production sandbox construction/verify/digest, without a provider."""
+    import shutil
+    import subprocess
+    import tempfile
+    from importlib.machinery import SourceFileLoader
+    if not shutil.which("bwrap"):
+        pytest.skip("bubblewrap unavailable on this host")
+    probe = subprocess.run(["bwrap", "--ro-bind", "/", "/", "--unshare-pid", "--", "/bin/true"],
+                           capture_output=True)
+    if probe.returncode:
+        pytest.skip("host user namespace policy denies bubblewrap")
+    base = Path(os.environ.get("HERDR_BOUNDARY_TEST_ROOT", "/home/agentops/tmp"))
+    if not base.is_dir() or not os.access(base, os.W_OK):
+        pytest.skip("physical sandbox fixture root unavailable")
+    with tempfile.TemporaryDirectory(prefix="child-attestation-", dir=base) as directory:
+        root = Path(directory)
+        workspace = root / "worktrees" / "workspace"
+        workspace.mkdir(parents=True)
+        (workspace / "identity.txt").write_text("held")
+        siblings = root / "results" / "sibling.result.json"
+        siblings.parent.mkdir()
+        siblings.write_text("foreign-result")
+        fake_home = root / "home"
+        config = fake_home / ".config/herdr"
+        releases = root / "releases"
+        config.mkdir(parents=True)
+        releases.mkdir()
+        old_exec = SourceFileLoader.exec_module
+        loaded = {}
+        def load(loader, module):
+            old_exec(loader, module)
+            if loader.name == "agent_durable_sandbox_runtime":
+                module.HOME = fake_home
+                module.HERDR_CONFIG = config
+                module.HERDR_RELEASES = releases
+                module.DEFAULT_WRITABLE = ()
+                loaded["sandbox"] = module
+        monkeypatch.setattr(SourceFileLoader, "exec_module", load)
+        scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(root / "events.jsonl"))
+        scheduler.register_external_parent_attempt(
+            task_id="parent", run_token="parent-run", idempotency_key="parent-key",
+            agent_name="parent-agent", pane_id="parent-pane", marker="parent-marker",
+            repo="repo", issue="82", role="writer", tools=("read_file", "write_file"),
+            permissions=("workspace-write",), policy_profile="default")
+        child = scheduler.delegate_child("parent", "parent-run", "attestation",
+            ChildProposal("writer", ("read_file", "write_file"),
+                          "writer" if writable else "reader",
+                          ("write_file",) if writable else ("read_file",),
+                          parent_permissions=("workspace-write",),
+                          child_permissions=("workspace-write",) if writable else (), child_task="inspect"))
+        lease = scheduler.dispatch(task_ids={child.id})[0]
+        record = scheduler._tasks[child.id]
+        marker = "child-" + record.run_token
+        sandbox_process = None
+        class Runner:
+            def run(self, args, **kwargs):
+                nonlocal sandbox_process
+                if args[:2] == ["pane", "run"]:
+                    sandbox_process = subprocess.Popen(
+                        ["/bin/bash", "-c", args[3]], stdin=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                        env={"PATH": "/usr/bin:/bin", "HOME": str(fake_home),
+                             "HERDR_DURABLE_TASK_PANE": marker})
+                    return CommandResult(0, json.dumps({"result": {}}), "")
+                assert args[:2] == ["pane", "process-info"]
+                processes = []
+                for _ in range(50):
+                    assert sandbox_process.poll() is None, sandbox_process.stderr.read(8192).decode()
+                    for proc in Path("/proc").iterdir():
+                        if not proc.name.isdigit():
+                            continue
+                        try:
+                            env = (proc / "environ").read_bytes().split(b"\0")
+                            if f"HERDR_DURABLE_TASK_PANE={marker}".encode() in env:
+                                processes.append({"pid": int(proc.name)})
+                        except OSError:
+                            continue
+                    if loaded["sandbox"].inner_pid({"foreground_processes": processes}, marker):
+                        break
+                    time.sleep(0.02)
+                return CommandResult(0, json.dumps({"result": {"process_info":
+                    {"foreground_processes": processes}}}), "")
+        from types import SimpleNamespace
+        directory_fd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        directory_stat = os.fstat(directory_fd)
+        if swap_path:
+            outside = root / "foreign"
+            outside.mkdir()
+            (outside / "identity.txt").write_text("foreign")
+            workspace.rename(workspace.with_name("held-original"))
+            workspace.symlink_to(outside, target_is_directory=True)
+        pinned = SimpleNamespace(logical=workspace, fd=directory_fd, root=workspace.parent,
+            source=f"/proc/{os.getpid()}/fd/{directory_fd}",
+            device=directory_stat.st_dev, inode=directory_stat.st_ino)
+        def verify_pin():
+            current = os.fstat(directory_fd)
+            assert (current.st_dev, current.st_ino) == (pinned.device, pinned.inode)
+        pinned.verify = verify_pin
+        pinned.identity = f"{workspace}|{pinned.device}:{pinned.inode}"
+        runtime = HerdrChildRuntime(scheduler, Runner(), cwd=workspace,
+                                    pinned_worktree=pinned, snapshot_path=root / "swarm.json")
+        assert scheduler.bind_pre_delivery_pane(child.id, record.run_token, lease.agent_id, "owned-pane", marker)
+        policy = None
+        try:
+            policy = runtime._sandbox_child_pane("owned-pane", marker, "/bin/true", child.id)
+            proof = runtime._sandbox_proofs["owned-pane"]
+            assert proof["sandbox_pid"] > 0
+            assert proof["policy_sha256"] == hashlib.sha256(policy.read_bytes()).hexdigest()
+            # Execute actual filesystem operations in the established namespace.
+            # Record observations only through the one admitted result file.
+            import shlex
+            import sys
+            script = """import json, pathlib, sys
+workspace, mine, sibling = map(pathlib.Path, sys.argv[1:])
+observed = {"identity": (workspace / "identity.txt").read_text()}
+for name, target in (("workspace_write", workspace / "probe.txt"), ("sibling_write", sibling)):
+    try:
+        target.write_text("effect")
+        observed[name] = True
+    except OSError:
+        observed[name] = False
+mine.write_text(json.dumps(observed))
+"""
+            mine = root / "results" / (child.id + ".result.json")
+            sandbox_process.stdin.write((shlex.join([sys.executable, "-I", "-c", script,
+                                        str(workspace), str(mine), str(siblings)]) + "\n").encode())
+            sandbox_process.stdin.flush()
+            observed = None
+            for _ in range(100):
+                try:
+                    observed = json.loads(mine.read_text())
+                    break
+                except (OSError, ValueError):
+                    time.sleep(0.01)
+            assert observed == {"identity": "held", "workspace_write": writable, "sibling_write": False}
+            assert siblings.read_text() == "foreign-result"
+            physical = workspace.with_name("held-original") if swap_path else workspace
+            assert (physical / "probe.txt").exists() is writable
+            if swap_path:
+                assert not (outside / "probe.txt").exists()
+            assert scheduler.attest_execution_sandbox(child.id, record.run_token, lease.agent_id,
+                "owned-pane", marker, sandbox_pid=proof["sandbox_pid"], policy_sha256=proof["policy_sha256"])
+            replay = DynamicChildScheduler(audit_log=SchedulerAuditLog(root / "events.jsonl"))
+            replay.replay()
+            recovered = replay._tasks[child.id]
+            assert recovered.execution_sandbox_verified
+            assert recovered.execution_sandbox_attestation["run_token"] == record.run_token
+            assert recovered.execution_sandbox_attestation["policy_sha256"] == proof["policy_sha256"]
+        finally:
+            if sandbox_process is not None:
+                if sandbox_process.stdin:
+                    sandbox_process.stdin.close()
+                try:
+                    sandbox_process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    sandbox_process.kill()
+                    sandbox_process.wait(timeout=2)
+            os.close(directory_fd)
+            if policy is not None:
+                policy.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("phase", ["result", "construct", "launch", "inspect", "verify"])
+def test_child_sandbox_failure_removes_frozen_policy(tmp_path, monkeypatch, phase):
+    from importlib.machinery import SourceFileLoader
+    scheduler = _canary(tmp_path)
+    policy = tmp_path / "frozen-policy"
+    policy.write_text("frozen")
+    original = SourceFileLoader.exec_module
+    def load(loader, module):
+        original(loader, module)
+        if loader.name != "agent_durable_sandbox_runtime":
+            return
+        module.frozen_policy = lambda: policy
+        def command(*a, **k):
+            if phase == "construct":
+                raise RuntimeError("construction failed")
+            return ["bwrap", "/bin/bash"]
+        module.command = command
+        module.inner_pid = lambda *a: 123
+        module.verify = lambda *a, **k: phase != "verify"
+    monkeypatch.setattr(SourceFileLoader, "exec_module", load)
+    class Runner:
+        def run(self, args, **kwargs):
+            if (phase == "launch" and args[:2] == ["pane", "run"]
+                    or phase == "inspect" and args[:2] == ["pane", "process-info"]):
+                raise RuntimeError("transport failed")
+            return CommandResult(0, json.dumps({"result": {"process_info": {}}}), "")
+    runtime = HerdrChildRuntime(scheduler, Runner(), cwd=tmp_path, snapshot_path=tmp_path / "scheduler.json")
+    def result(*a):
+        if phase == "result":
+            raise RuntimeError("result failed")
+        return (tmp_path / "result.json",)
+    monkeypatch.setattr(runtime, "_child_result_writable", result)
+    monkeypatch.setattr(runtime, "_child_workspace_writable", lambda *a: False)
+    with pytest.raises(RuntimeError):
+        runtime._sandbox_child_pane("owned", "marker", "/bin/true", "task")
+    assert not policy.exists()
+    assert "owned" not in runtime._sandbox_proofs
+
+
+@pytest.mark.parametrize("phase,ownership", [("created", "exact"), ("bound", "exact"),
+                                          ("created", "duplicate"), ("created", "wrong_fence")])
+def test_split_crash_recovers_durable_intent_with_actual_process_identity(tmp_path, monkeypatch, phase, ownership):
+    import os
+    import subprocess
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "agent-stack/bin"))
+    import agent_durable_children as children
+    from herdr.consumer_policies import policy_for_profile
+    root = tmp_path / "state"
+    root.mkdir()
+    directory = children.ensure_attempt_directory(root, "parent", "parent-run")
+    scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(directory / "scheduler.jsonl"))
+    scheduler.register_external_parent_attempt(
+        task_id="parent", run_token="parent-run", idempotency_key="parent-key",
+        agent_name="parent-agent", pane_id="parent-pane", marker="parent-marker",
+        repo="Bbambaaamm/herdr", issue="82", role="writer", tools=("read_file",), permissions=(), policy_profile="herdr-core")
+    children.mark_ledger_required(directory)
+    child = scheduler.delegate_child("parent", "parent-run", "research",
+        ChildProposal("writer", ("read_file",), "reader", ("read_file",), child_task="inspect"))
+    lease = scheduler.dispatch(task_ids={child.id})[0]
+    record = scheduler._tasks[child.id]
+    registry = _registry(tmp_path)
+    processes = {}
+    closed = []
+    class Runner(FakeHerdrRunner):
+        executable = "/bin/true"
+        def run(self, args, timeout_seconds=30.0):
+            if args == ["pane", "list"]:
+                result = {"panes": [{"pane_id": pane} for pane, process in processes.items()
+                                    if process.poll() is None]}
+            elif args[:2] == ["pane", "process-info"]:
+                result = {"process_info": {"shell_pid": processes[args[-1]].pid}}
+            elif args[:2] == ["pane", "close"]:
+                pane = args[-1]
+                closed.append(pane)
+                processes[pane].terminate()
+                processes[pane].wait(timeout=5)
+                result = {}
+            else:
+                assert args[:2] not in (["agent", "start"], ["agent", "prompt"])
+                return super().run(args, timeout_seconds=timeout_seconds)
+            return CommandResult(0, json.dumps({"result": result}), "")
+    runner = Runner()
+    runtime = HerdrChildRuntime(scheduler, runner, cwd=tmp_path,
+        env={"HERDR_ENV": "1", "HERDR_PANE_ID": "parent-pane", "HERDR_PROFILE": "herdr-core"},
+        host_guard=lambda: True,
+        admission=AdmissionControl(audit_log=AdmissionAuditLog(tmp_path / "admission.jsonl"),
+            consumer_policy_hook=policy_for_profile("herdr-core")),
+        admission_registry=registry, resource_usage_factory=_healthy_usage)
+    def create(index, marker, policy_env):
+        replay = DynamicChildScheduler(audit_log=SchedulerAuditLog(directory / "scheduler.jsonl"))
+        replay.replay()
+        intent = replay._tasks[child.id]
+        assert intent.pre_delivery_pane_creation_attempted and intent.execution_pane is None
+        assert intent.execution_marker == marker and intent.execution_agent == lease.agent_id
+        assert replay.audit_log.replay()[-1]["event"] == "child_pane_creation_attempted"
+        for pane in ("owned-pane", "foreign-pane"):
+            env = {**os.environ, **policy_env, "HERDR_DURABLE_TASK_PANE": marker}
+            if pane == "foreign-pane" and ownership != "duplicate":
+                env["HERDR_DURABLE_FENCING_TOKEN"] = str(lease.fencing_token + 1)
+            if pane == "owned-pane" and ownership == "wrong_fence":
+                env["HERDR_DURABLE_FENCING_TOKEN"] = str(lease.fencing_token + 2)
+            processes[pane] = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], env=env)
+        if phase == "created":
+            raise SystemExit("bridge killed after pane creation before returned identity")
+        runtime._owned_panes.add("owned-pane")
+        return "owned-pane"
+    monkeypatch.setattr(runtime, "_create_pane", create)
+    original_bind = scheduler.bind_pre_delivery_pane
+    def bind(*args):
+        assert original_bind(*args)
+        raise SystemExit("bridge killed after durable pane binding")
+    monkeypatch.setattr(scheduler, "bind_pre_delivery_pane", bind)
+    monkeypatch.setattr(runtime, "_sandbox_child_pane",
+        lambda *a: pytest.fail("crashed split cannot reach agent/sandbox startup"))
+    try:
+        with pytest.raises(SystemExit):
+            runtime.run_managed_child(lease, "inspect", run_token=record.run_token,
+                                       idempotency_key=record.idempotency_key)
+        entries = registry._read()
+        assert len(entries) == 1 and entries[0]["task_id"] == child.id
+        foreign_reservation = {**entries[0], "agent_id": "foreign-agent", "task_id": "foreign-task",
+                               "fencing_token": 999}
+        registry._write(entries + [foreign_reservation])
+        monkeypatch.setattr(children, "SubprocessHerdrRunner", lambda *a: runner)
+        monkeypatch.setattr(children, "AdmissionRegistry", lambda: registry)
+        with children.parent_attempt_guard(root, "parent", "parent-run", reconcile_results=True) as terminal:
+            assert terminal is (ownership == "exact")
+        replay = DynamicChildScheduler(audit_log=SchedulerAuditLog(directory / "scheduler.jsonl"))
+        replay.replay()
+        recovered = replay._tasks[child.id]
+        assert (recovered.run_token, recovered.fencing_token, recovered.idempotency_key) == (
+            record.run_token, record.fencing_token, record.idempotency_key)
+        assert sum(e["event"] == "spawn_child" for e in replay.audit_log.replay()) == 1
+        if ownership == "exact":
+            assert closed == ["owned-pane"] and recovered.cleanup_complete
+            assert recovered.state.value == "blocked" and recovered.lease is None
+            assert registry._read() == [foreign_reservation]
+            assert processes["foreign-pane"].poll() is None
+            with children.parent_attempt_guard(root, "parent", "parent-run", reconcile_results=True) as terminal:
+                assert terminal
+            assert closed == ["owned-pane"]
+        else:
+            assert closed == [] and recovered.state.value == "running" and recovered.lease is not None
+            assert not recovered.cleanup_complete and len(registry._read()) == 2
+            assert all(process.poll() is None for process in processes.values())
+    finally:
+        for process in processes.values():
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5)

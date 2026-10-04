@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""Narrow outer Herdr delegation server for one durable parent attempt."""
+import argparse
+import importlib.util
+import json
+import os
+import socket
+import struct
+import sys
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+
+HERE = Path(__file__).resolve().parent
+loader = SourceFileLoader("agent_durable_child_server", str(HERE / "agent-durable-child"))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+child = importlib.util.module_from_spec(spec)
+loader.exec_module(child)
+
+FIELDS = {
+    "operation", "task_id", "run_token", "agent", "pane", "marker",
+    "key", "role", "objective", "prompt", "tool", "permission", "cwd",
+}
+ACTIVE_STATES = {"running", "blocked"}
+TERMINAL_STATES = {"done", "failed"}
+MAX_CONNECTIONS = 1024
+
+
+def socket_name(task_id: str, run_token: str) -> str:
+    import hashlib
+    return "@herdr-durable-" + hashlib.sha256(
+        f"{task_id}:{run_token}".encode()
+    ).hexdigest()[:40]
+
+
+def validate_request(request: object, identity: dict) -> argparse.Namespace:
+    if (
+        not isinstance(request, dict)
+        or set(request) != FIELDS
+        or request.get("operation") != "delegate"
+    ):
+        raise ValueError("invalid delegation request schema")
+    for field in ("task_id", "run_token", "agent", "pane", "marker"):
+        if request[field] != identity[field]:
+            raise ValueError("parent identity mismatch")
+    for field, limit in (
+        ("key", 128),
+        ("role", 32),
+        ("objective", 8192),
+        ("prompt", child.MAX_PROMPT_CHARS),
+    ):
+        if not isinstance(request[field], str) or not 0 < len(request[field]) <= limit:
+            raise ValueError("invalid delegation field")
+    if not isinstance(request["cwd"], str) or len(request["cwd"]) > 4096:
+        raise ValueError("invalid child cwd")
+    for field in ("tool", "permission"):
+        value = request[field]
+        if (
+            not isinstance(value, list)
+            or len(value) > 64
+            or any(not isinstance(item, str) or not item or len(item) > 128 for item in value)
+        ):
+            raise ValueError("invalid delegation scope")
+    return argparse.Namespace(
+        **{key: request[key] for key in ("key", "role", "objective", "prompt", "tool", "permission", "cwd")}
+    )
+
+
+def _current_task_file(root: Path, task_id: str, run_token: str) -> Path:
+    matches: list[Path] = []
+    terminal: list[Path] = []
+    for state in (*ACTIVE_STATES, *TERMINAL_STATES):
+        path = root / state / f"{task_id}.json"
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if payload.get("id") != task_id or payload.get("run_token") != run_token:
+            continue
+        (terminal if state in TERMINAL_STATES else matches).append(path.resolve())
+    if terminal:
+        raise ValueError("parent task is terminal")
+    if len(matches) != 1:
+        raise ValueError("parent task location is ambiguous")
+    return matches[0]
+
+
+def _proc_env(pid: int) -> set[bytes]:
+    return set(Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"))
+
+
+def _peer_in_pane(connection: socket.socket, process_info: dict, marker: str) -> bool:
+    credentials = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+    peer_pid, uid, _ = struct.unpack("3i", credentials)
+    if uid != os.getuid() or peer_pid <= 0:
+        return False
+    try:
+        peer_pid_ns = os.readlink(f"/proc/{peer_pid}/ns/pid")
+        peer_mnt_ns = os.readlink(f"/proc/{peer_pid}/ns/mnt")
+        env = _proc_env(peer_pid)
+    except OSError:
+        return False
+    if (
+        b"HERDR_DURABLE_SANDBOX=1" not in env
+        or f"HERDR_DURABLE_TASK_PANE={marker}".encode() not in env
+    ):
+        return False
+
+    # Herdr's shell_pid is the outer bwrap process. The foreground process is
+    # inside the sandbox PID/mount namespaces; compare the RPC client to that.
+    for row in process_info.get("foreground_processes") or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            pid = int(row.get("pid") or 0)
+            if pid <= 0:
+                continue
+            if (
+                os.readlink(f"/proc/{pid}/ns/pid") == peer_pid_ns
+                and os.readlink(f"/proc/{pid}/ns/mnt") == peer_mnt_ns
+            ):
+                return True
+        except (OSError, TypeError, ValueError):
+            continue
+    return False
+
+
+def serve(task_file: Path, identity: dict, real_binary: Path) -> None:
+    if not real_binary.is_absolute() or not real_binary.is_file():
+        raise ValueError("real Herdr binary unavailable")
+    startup_path = task_file.resolve(strict=True)
+    root = startup_path.parent.parent.resolve()
+    startup_task = json.loads(startup_path.read_text(encoding="utf-8"))
+    pinned = {
+        field: startup_task.get(field)
+        for field in (
+            "id", "run_token", "idempotency_key", "repo", "issue", "workspace",
+            "safety_profile", "hermes_profile", "parent_role", "parent_tools", "parent_permissions",
+            "worktree_root",
+        )
+    }
+    if (
+        pinned["id"] != identity["task_id"]
+        or pinned["run_token"] != identity["run_token"]
+        or not pinned["idempotency_key"]
+    ):
+        raise ValueError("startup task identity mismatch")
+
+    os.environ.update(
+        {
+            "HERDR_REAL_BINARY": str(real_binary),
+            "HERDR_DURABLE_TASK_ID": identity["task_id"],
+            "HERDR_DURABLE_RUN_TOKEN": identity["run_token"],
+            "HERDR_DURABLE_AGENT": identity["agent"],
+            "HERDR_DURABLE_MARKER": identity["marker"],
+            "HERDR_DURABLE_TASK_PANE": identity["marker"],
+            "HERDR_PANE_ID": identity["pane"],
+        }
+    )
+
+    address = "\0" + socket_name(identity["task_id"], identity["run_token"])[1:]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(address)
+        listener.listen(8)
+        for _ in range(MAX_CONNECTIONS):
+            connection, _ = listener.accept()
+            with connection:
+                connection.settimeout(3600)
+                try:
+                    length = int.from_bytes(child._receive(connection, 4), "big")
+                    if not 0 < length <= child.MAX_REQUEST:
+                        raise ValueError("invalid request length")
+                    request = json.loads(child._receive(connection, length))
+                    args = validate_request(request, identity)
+
+                    current_path = _current_task_file(
+                        root, identity["task_id"], identity["run_token"]
+                    )
+                    os.environ["HERDR_DURABLE_TASK_FILE"] = str(current_path)
+
+                    runner = child.SubprocessHerdrRunner(str(real_binary))
+                    task, pane, _, marker = child._parent_context(runner)
+                    if task["id"] != identity["task_id"] or pane != identity["pane"]:
+                        raise ValueError("parent context changed")
+                    if any(task.get(field) != value for field, value in pinned.items()):
+                        raise ValueError("parent task scope changed")
+
+                    info = child._json_result(
+                        runner.run(["pane", "process-info", "--pane", pane]),
+                        "parent pane process-info",
+                    )
+                    process_info = (info.get("result") or {}).get("process_info")
+                    if not isinstance(process_info, dict) or not _peer_in_pane(
+                        connection, process_info, marker
+                    ):
+                        raise ValueError("request outside parent sandbox")
+
+                    result = child.delegate(args, runner=runner)
+                    response = {"ok": True, "result": result, "error": None}
+                except Exception as exc:
+                    response = {"ok": False, "result": None, "error": str(exc)[:1000]}
+
+                payload = json.dumps(response, allow_nan=False).encode("utf-8")
+                if len(payload) <= child.MAX_REQUEST:
+                    try:
+                        connection.sendall(len(payload).to_bytes(4, "big") + payload)
+                    except OSError:
+                        # Worker readiness probes connect without sending a request.
+                        pass
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    for field in ("task-file", "task-id", "run-token", "agent", "pane", "marker", "real-binary"):
+        parser.add_argument("--" + field, required=True)
+    args = parser.parse_args()
+    identity = {
+        "task_id": args.task_id,
+        "run_token": args.run_token,
+        "agent": args.agent,
+        "pane": args.pane,
+        "marker": args.marker,
+    }
+    serve(Path(args.task_file), identity, Path(args.real_binary))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"durable bridge stopped: {exc}", file=sys.stderr)
+        raise SystemExit(1)
