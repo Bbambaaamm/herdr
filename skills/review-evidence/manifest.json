@@ -1,0 +1,40 @@
+{
+  "schema_version": "1.0.0",
+  "name": "review-evidence",
+  "version": "1.0.0",
+  "description": "Assess code changes against acceptance criteria and assemble reproducible review evidence.",
+  "publisher": "herdr-maintainers",
+  "source_uri": "https://github.com/Bbambaaamm/herdr",
+  "authoring_base_revision": "8e4da55b3739c5ad5d9061a44eaad1beaa1179d7",
+  "tools": [
+    "read_file"
+  ],
+  "permissions": [
+    "repo:read"
+  ],
+  "capabilities": [],
+  "features": [
+    "reasoning"
+  ],
+  "platforms": [
+    "linux",
+    "windows",
+    "darwin"
+  ],
+  "files": [
+    {
+      "path": "SKILL.md",
+      "size": 536,
+      "sha256": "bf0e6952af59d249a682c2b4650aed014f94ff41249941bbbd6777f491f3af95",
+      "media_type": "text/markdown",
+      "data_class": "internal"
+    },
+    {
+      "path": "references/evidence-template.md",
+      "size": 145,
+      "sha256": "0dbf6122aec891603a228be22d1cd1b4f4efa1dea6227e945d40e0d656dbe99e",
+      "media_type": "text/markdown",
+      "data_class": "internal"
+    }
+  ]
+}
