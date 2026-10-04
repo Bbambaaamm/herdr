@@ -54,6 +54,7 @@ def test_policy_bin_hermes_invokes_guarded_launcher():
     assert not POLICY_BIN.is_symlink()
     assert POLICY_BIN.read_text() == (
         '#!/bin/sh\n'
+        'unset LD_PRELOAD LD_AUDIT LD_LIBRARY_PATH GLIBC_TUNABLES GCONV_PATH LOCPATH NLSPATH BASH_ENV ENV\n'
         'exec /usr/bin/python3 -I -S /run/herdr-bootstrap/agent-hermes-policy-stage1 "$@"\n'
     )
     assert "/run/herdr/policy-code" not in POLICY_BIN.read_text()
@@ -71,6 +72,13 @@ def test_policy_bin_hermes_invokes_guarded_launcher():
 def test_same_process_guard_precedes_hermes_main(monkeypatch, tmp_path):
     module = _launcher()
     monkeypatch.setattr(module, '_verify_hermes_build', lambda root: module.HERMES_EXECUTOR)
+    monkeypatch.setattr(module,'_require_host_bootstrap_authority',lambda:None)
+    monkeypatch.setattr(module,'_require_stage1_continuity',lambda:None)
+    monkeypatch.setattr(module,'_require_production_mount',lambda *args,**kwargs:None)
+    monkeypatch.setattr(module,'_verify_runtime',lambda root:None)
+    monkeypatch.setattr(module,'BUNDLE_PATH',tmp_path/'bundle')
+    monkeypatch.setattr(module,'POLICY_CODE_ROOT',LAUNCHER.parents[2])
+    monkeypatch.setattr(module,'HERMES_ROOT',tmp_path/'hermes')
     hermes = tmp_path / 'hermes'
     (hermes / 'venv').mkdir(parents=True)
     (hermes / 'model_tools.py').write_text('')
@@ -112,9 +120,7 @@ def test_same_process_guard_precedes_hermes_main(monkeypatch, tmp_path):
                         ) or types.SimpleNamespace(scope=types.SimpleNamespace(executors=(module.HERMES_EXECUTOR,))))
     saved_path, saved_argv = sys.path[:], sys.argv[:]
     try:
-        assert module.bootstrap(['chat', '--profile', 'test'], bundle_path=tmp_path / 'bundle',
-                                policy_code_root=LAUNCHER.parents[2],
-                                hermes_root=hermes) == 0
+        assert module.bootstrap(['chat', '--profile', 'test']) == 0
     finally:
         sys.path[:] = saved_path
         sys.argv[:] = saved_argv
@@ -124,6 +130,13 @@ def test_same_process_guard_precedes_hermes_main(monkeypatch, tmp_path):
 def test_launcher_requires_exact_pane_identity(monkeypatch, tmp_path):
     module = _launcher()
     monkeypatch.setattr(module, '_verify_hermes_build', lambda root: module.HERMES_EXECUTOR)
+    monkeypatch.setattr(module,'_require_host_bootstrap_authority',lambda:None)
+    monkeypatch.setattr(module,'_require_stage1_continuity',lambda:None)
+    monkeypatch.setattr(module,'_require_production_mount',lambda *args,**kwargs:None)
+    monkeypatch.setattr(module,'_verify_runtime',lambda root:None)
+    monkeypatch.setattr(module,'BUNDLE_PATH',tmp_path/'bundle')
+    monkeypatch.setattr(module,'POLICY_CODE_ROOT',LAUNCHER.parents[2])
+    monkeypatch.setattr(module,'HERMES_ROOT',tmp_path/'hermes')
     hermes = tmp_path / 'hermes'
     (hermes / 'venv').mkdir(parents=True)
     (hermes / 'model_tools.py').write_text('')
@@ -132,8 +145,7 @@ def test_launcher_requires_exact_pane_identity(monkeypatch, tmp_path):
     saved_path = sys.path[:]
     try:
         try:
-            module.bootstrap([], bundle_path=tmp_path / 'bundle',
-                             policy_code_root=LAUNCHER.parents[2], hermes_root=hermes)
+            module.bootstrap([])
         except SystemExit as exc:
             assert 'signed Herdr grant rejected' in str(exc)
         else:
@@ -318,6 +330,7 @@ def test_stage1_verifies_frozen_identity_digest_and_rw_descendants(monkeypatch, 
     stdlib.mkdir(parents=True)
     (stdlib / "approved.py").write_text("approved=True\n")
     monkeypatch.setattr(module,"PYTHON_STDLIB_SHA256",module._stdlib_import_digest(stdlib))
+    monkeypatch.setattr(module,"PYTHON_RUNTIME_TREE_SHA256",module._tree_manifest_digest(python_root))
 
     monkeypatch.setattr(module, "BOOTSTRAP_ROOT", bootstrap)
     monkeypatch.setattr(module, "POLICY_CODE_ROOT", policy)
@@ -515,6 +528,7 @@ def test_independent_stage1_rejects_changed_startup_stdlib_before_exec(tmp_path,
     expected=module._stdlib_import_digest(stdlib)
     monkeypatch.setattr(module,"PYTHON_ROOT",root)
     monkeypatch.setattr(module,"PYTHON_STDLIB_SHA256",expected)
+    monkeypatch.setattr(module,"PYTHON_RUNTIME_TREE_SHA256",module._tree_manifest_digest(root))
     module._verify_pinned_startup_imports()
     entry.write_text("raise RuntimeError('must never execute')\n")
     with pytest.raises(SystemExit,match="before interpreter exec"):
@@ -526,3 +540,24 @@ def test_stage1_denies_unaudited_startup_prefix_or_zip(tmp_path,monkeypatch,name
     path.parent.mkdir(parents=True);path.write_text("untrusted")
     monkeypatch.setattr(module,"PYTHON_ROOT",root)
     with pytest.raises(SystemExit,match="startup override"):module._verify_pinned_startup_imports()
+
+
+def test_no_parameterized_bootstrap_or_custom_script_exec_escape(tmp_path):
+    module=_launcher()
+    with pytest.raises(TypeError):
+        module.bootstrap([],bundle_path=tmp_path/"self-signed.json")
+    assert not hasattr(module,"_exec_verified_interpreter")
+    with pytest.raises(SystemExit,match="authority"):
+        module.bootstrap([])
+
+def test_stage1_checks_native_libraries_outside_stdlib_before_exec(tmp_path,monkeypatch):
+    module=_stage1();root=tmp_path/"python";stdlib=root/"lib/python3.11"
+    stdlib.mkdir(parents=True);(stdlib/"audited.py").write_text("approved")
+    shared=root/"lib/libpython3.11.so.1.0";shared.write_bytes(b"audited-native")
+    monkeypatch.setattr(module,"PYTHON_ROOT",root)
+    monkeypatch.setattr(module,"PYTHON_RUNTIME_TREE_SHA256",module._tree_manifest_digest(root))
+    monkeypatch.setattr(module,"PYTHON_STDLIB_SHA256",module._stdlib_import_digest(stdlib))
+    module._verify_pinned_startup_imports()
+    shared.write_bytes(b"malicious-native")
+    with pytest.raises(SystemExit,match="complete Python runtime tree"):
+        module._verify_pinned_startup_imports()

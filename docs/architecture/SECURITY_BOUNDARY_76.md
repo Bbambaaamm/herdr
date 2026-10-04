@@ -395,3 +395,15 @@ Host ownership of the independent system interpreter is verified by the mandator
 The independent stage-zero process verifies the audit-known pinned stdlib source/native-extension digest and rejects unaudited ZIP/prefix overrides before execing pinned Python; stage two repeats these checks. Auxiliary endpoints remain exact, including path slashes/query bytes. Broker pool refs must identify their own provider; untrusted directive collections reject scalar/object coercion. Explicit replacement preserves observed file modes through fchmod.
 
 Conditional pre_content replacement on a shared POSIX workspace is unsupported and fails before any publication. Directory locks alone cannot protect against a raw writer, so this closed profile no longer claims atomic compare-and-replace. Explicit full-file writes, no-clobber creates/moves and bounded local reads/search remain available; patch operations requiring existing-file conditional replacement return a clear denial. Enabling conditional replacement requires a separately proven exclusive mutation authority, not an advisory lock or a prompt claim.
+
+The host clears native-loader/locale/shell startup controls before creating the pane or FD-launcher process; the immutable shim repeats the relevant clearing before system Python. Stage one verifies the independent complete pinned Python runtime tree digest d35e6083e474e8d049bad69c46bd84d97c8d4cfc650bcf32fce44e2e6299f0ef, including native libraries outside lib/python3.11, before exec. The shipped stage-two bootstrap exposes only fixed host-authenticated paths; parameterized roots and custom-script interpreter execution are removed. Unit fixtures substitute components in tests only; the launcher probe now proves direct/parameterized denial, while #82 owns the real physical positive/negative startup probes.
+
+
+Native startup requires environment sanitation before the first native
+executable. Presence-based controls such as LD_TRACE_LOADED_OBJECTS are removed
+rather than assigned empty strings. The host spawn port checks the existing
+terminal-server parent chain before creating a managed pane (unreadable or
+changed sources deny); the trusted OS init is the ancestry boundary. The FD
+launcher shell and bwrap clear startup controls, the host broker verifies their
+absence in the actual shell and peer, and stage one denies residual controls.
+These checks do not restart or change a live terminal server.

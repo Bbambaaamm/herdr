@@ -446,8 +446,17 @@ def test_unauthorized_bootstrap_peers_cannot_reserve_connection_capacity(tmp_pat
         client.close();authority.close(timeout_seconds=2);server.close()
 
 
-def test_production_authority_requires_actual_host_root_ownership(tmp_path):
+def test_production_authority_requires_actual_host_root_ownership(tmp_path,monkeypatch):
     stage0=tmp_path/"user-python";stage0.write_bytes(b"not a trusted system executable")
+    import herdr.bootstrap_authority as module
+    original=module.os.stat
+    def non_root_owner(path,*args,**kwargs):
+        info=original(path,*args,**kwargs)
+        if Path(path)==stage0:
+            fields=list(info);fields[4]=1001
+            return os.stat_result(fields)
+        return info
+    monkeypatch.setattr(module.os,"stat",non_root_owner)
     with pytest.raises(BootstrapAuthorityError,match="root-owned"):
         BootstrapAuthority(stage0_path=stage0,peer_authorizer=lambda *args:True)
     # The real host interpreter meets this condition outside the remapped pane.
