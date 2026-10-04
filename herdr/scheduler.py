@@ -1267,7 +1267,9 @@ class DynamicChildScheduler:
             return False
         identity = (agent_name, pane_id, marker)
         previous = (rec.execution_agent, rec.execution_pane, rec.execution_marker)
-        if any(previous) and previous != identity:
+        partial_intent = (rec.pre_delivery_pane_creation_attempted and previous[1] is None
+                          and previous[0] == agent_name and previous[2] == marker)
+        if any(previous) and previous != identity and not partial_intent:
             return False
         rec.execution_agent, rec.execution_pane, rec.execution_marker = identity
         self.audit_log.append({"event": "execution_session_bound", "task_id": task_id,
@@ -1340,6 +1342,47 @@ class DynamicChildScheduler:
         self.audit_log.flush()
         return True
 
+    def record_child_pane_intent(self, task_id: str, run_token: str, agent_id: str,
+                                  fencing_token: int, idempotency_key: str, marker: str) -> bool:
+        """Commit deterministic ownership before an external split can create a pane."""
+        rec = self._tasks.get(task_id)
+        if (rec is None or rec.delegation_key is None or rec.state is not LifecycleState.RUNNING
+                or rec.lease is None or rec.pre_delivery_pane_creation_attempted
+                or any((rec.execution_agent, rec.execution_pane, rec.execution_marker))
+                or marker != f"child-{run_token}"
+                or (rec.run_token, rec.agent_id, rec.fencing_token, rec.idempotency_key) !=
+                   (run_token, agent_id, fencing_token, idempotency_key)):
+            return False
+        self.audit_log.append({"event": "child_pane_creation_attempted", "task_id": task_id,
+                               "run_token": run_token, "agent_id": agent_id,
+                               "fencing_token": fencing_token, "idempotency_key": idempotency_key,
+                               "marker": marker})
+        self.audit_log.flush()
+        rec.pre_delivery_pane_creation_attempted = True
+        rec.execution_agent, rec.execution_marker = agent_id, marker
+        return True
+
+    def bind_recovered_pre_delivery_pane(self, task_id: str, pane_id: str) -> bool:
+        rec = self._tasks.get(task_id)
+        if (rec is None or not rec.pre_delivery_pane_creation_attempted
+                or rec.pre_delivery_agent_start_attempted
+                or not all((rec.run_token, rec.agent_id, rec.idempotency_key, rec.fencing_token))
+                or rec.execution_agent != rec.agent_id
+                or rec.execution_marker != f"child-{rec.run_token}"
+                or not isinstance(pane_id, str) or not pane_id or len(pane_id) > 256
+                or (rec.state is not LifecycleState.RUNNING and not rec.pre_delivery_failure)
+                or rec.execution_pane not in {None, pane_id}):
+            return False
+        if rec.execution_pane == pane_id:
+            return True
+        self.audit_log.append({"event": "child_pane_recovered", "task_id": task_id,
+                               "run_token": rec.run_token, "agent_id": rec.agent_id,
+                               "fencing_token": rec.fencing_token, "idempotency_key": rec.idempotency_key,
+                               "marker": rec.execution_marker, "pane_id": pane_id})
+        self.audit_log.flush()
+        rec.execution_pane = pane_id
+        return True
+
     def bind_pre_delivery_pane(self, task_id: str, run_token: str,
                                agent_name: str, pane_id: str, marker: str) -> bool:
         """Persist a created pane before starting its agent, for safe recovery."""
@@ -1371,6 +1414,7 @@ class DynamicChildScheduler:
                 or cleanup_complete
                 ):
             return False
+        pane_creation_attempted = pane_creation_attempted or rec.pre_delivery_pane_creation_attempted
         self.audit_log.append({"event": "child_pre_delivery_failed", "task_id": task_id,
                                "run_token": run_token, "agent_id": agent_id,
                                "fencing_token": fencing_token,
@@ -1651,6 +1695,8 @@ class DynamicChildScheduler:
                 "child_cleanup_complete",
                 "child_pre_delivery_cleanup_complete",
                 "child_agent_start_attempted",
+                "child_pane_creation_attempted",
+                "child_pane_recovered",
                 "child_pre_delivery_failed",
                 "fail",
                 "cancel",
@@ -1921,6 +1967,30 @@ class DynamicChildScheduler:
                     raise SchedulerError("invalid child sandbox attestation")
                 rec.execution_sandbox_verified = True
                 rec.execution_sandbox_attestation = dict(attestation)
+            elif event_type == "child_pane_creation_attempted":
+                rec = self._tasks.get(str(e.get("task_id", "")))
+                if (rec is None or rec.delegation_key is None or rec.state is not LifecycleState.RUNNING
+                        or rec.lease is None or rec.pre_delivery_pane_creation_attempted
+                        or any((rec.execution_agent, rec.execution_pane, rec.execution_marker))
+                        or (rec.run_token, rec.agent_id, rec.fencing_token, rec.idempotency_key) !=
+                           (e.get("run_token"), e.get("agent_id"), e.get("fencing_token"), e.get("idempotency_key"))
+                        or e.get("marker") != f"child-{rec.run_token}"):
+                    raise SchedulerError("invalid child pane intent")
+                rec.pre_delivery_pane_creation_attempted = True
+                rec.execution_agent, rec.execution_marker = rec.agent_id, str(e["marker"])
+            elif event_type == "child_pane_recovered":
+                rec = self._tasks.get(str(e.get("task_id", "")))
+                pane = e.get("pane_id")
+                if (rec is None or not rec.pre_delivery_pane_creation_attempted
+                        or rec.pre_delivery_agent_start_attempted
+                        or not isinstance(pane, str) or not pane or len(pane) > 256
+                        or rec.execution_pane not in {None, pane}
+                        or (rec.state is not LifecycleState.RUNNING and not rec.pre_delivery_failure)
+                        or (rec.run_token, rec.agent_id, rec.fencing_token, rec.idempotency_key, rec.execution_marker) !=
+                           (e.get("run_token"), e.get("agent_id"), e.get("fencing_token"), e.get("idempotency_key"),
+                            e.get("marker"))):
+                    raise SchedulerError("invalid recovered child pane evidence")
+                rec.execution_pane = pane
             elif event_type == "child_agent_start_attempted":
                 rec = self._tasks.get(str(e.get("task_id", "")))
                 if rec is None or rec.run_token != e.get("run_token") or not rec.execution_pane:

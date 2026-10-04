@@ -1212,3 +1212,117 @@ def test_child_sandbox_failure_removes_frozen_policy(tmp_path, monkeypatch, phas
         runtime._sandbox_child_pane("owned", "marker", "/bin/true", "task")
     assert not policy.exists()
     assert "owned" not in runtime._sandbox_proofs
+
+
+@pytest.mark.parametrize("phase,ownership", [("created", "exact"), ("bound", "exact"),
+                                          ("created", "duplicate"), ("created", "wrong_fence")])
+def test_split_crash_recovers_durable_intent_with_actual_process_identity(tmp_path, monkeypatch, phase, ownership):
+    import os
+    import subprocess
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "agent-stack/bin"))
+    import agent_durable_children as children
+    from herdr.consumer_policies import policy_for_profile
+    root = tmp_path / "state"
+    root.mkdir()
+    directory = children.ensure_attempt_directory(root, "parent", "parent-run")
+    scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(directory / "scheduler.jsonl"))
+    scheduler.register_external_parent_attempt(
+        task_id="parent", run_token="parent-run", idempotency_key="parent-key",
+        agent_name="parent-agent", pane_id="parent-pane", marker="parent-marker",
+        repo="Bbambaaamm/herdr", issue="82", role="writer", tools=("read_file",), permissions=(), policy_profile="herdr-core")
+    children.mark_ledger_required(directory)
+    child = scheduler.delegate_child("parent", "parent-run", "research",
+        ChildProposal("writer", ("read_file",), "reader", ("read_file",), child_task="inspect"))
+    lease = scheduler.dispatch(task_ids={child.id})[0]
+    record = scheduler._tasks[child.id]
+    registry = _registry(tmp_path)
+    processes = {}
+    closed = []
+    class Runner(FakeHerdrRunner):
+        executable = "/bin/true"
+        def run(self, args, timeout_seconds=30.0):
+            if args == ["pane", "list"]:
+                result = {"panes": [{"pane_id": pane} for pane, process in processes.items()
+                                    if process.poll() is None]}
+            elif args[:2] == ["pane", "process-info"]:
+                result = {"process_info": {"shell_pid": processes[args[-1]].pid}}
+            elif args[:2] == ["pane", "close"]:
+                pane = args[-1]
+                closed.append(pane)
+                processes[pane].terminate()
+                processes[pane].wait(timeout=5)
+                result = {}
+            else:
+                assert args[:2] not in (["agent", "start"], ["agent", "prompt"])
+                return super().run(args, timeout_seconds=timeout_seconds)
+            return CommandResult(0, json.dumps({"result": result}), "")
+    runner = Runner()
+    runtime = HerdrChildRuntime(scheduler, runner, cwd=tmp_path,
+        env={"HERDR_ENV": "1", "HERDR_PANE_ID": "parent-pane", "HERDR_PROFILE": "herdr-core"},
+        host_guard=lambda: True,
+        admission=AdmissionControl(audit_log=AdmissionAuditLog(tmp_path / "admission.jsonl"),
+            consumer_policy_hook=policy_for_profile("herdr-core")),
+        admission_registry=registry, resource_usage_factory=_healthy_usage)
+    def create(index, marker, policy_env):
+        replay = DynamicChildScheduler(audit_log=SchedulerAuditLog(directory / "scheduler.jsonl"))
+        replay.replay()
+        intent = replay._tasks[child.id]
+        assert intent.pre_delivery_pane_creation_attempted and intent.execution_pane is None
+        assert intent.execution_marker == marker and intent.execution_agent == lease.agent_id
+        assert replay.audit_log.replay()[-1]["event"] == "child_pane_creation_attempted"
+        for pane in ("owned-pane", "foreign-pane"):
+            env = {**os.environ, **policy_env, "HERDR_DURABLE_TASK_PANE": marker}
+            if pane == "foreign-pane" and ownership != "duplicate":
+                env["HERDR_DURABLE_FENCING_TOKEN"] = str(lease.fencing_token + 1)
+            if pane == "owned-pane" and ownership == "wrong_fence":
+                env["HERDR_DURABLE_FENCING_TOKEN"] = str(lease.fencing_token + 2)
+            processes[pane] = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], env=env)
+        if phase == "created":
+            raise SystemExit("bridge killed after pane creation before returned identity")
+        runtime._owned_panes.add("owned-pane")
+        return "owned-pane"
+    monkeypatch.setattr(runtime, "_create_pane", create)
+    original_bind = scheduler.bind_pre_delivery_pane
+    def bind(*args):
+        assert original_bind(*args)
+        raise SystemExit("bridge killed after durable pane binding")
+    monkeypatch.setattr(scheduler, "bind_pre_delivery_pane", bind)
+    monkeypatch.setattr(runtime, "_sandbox_child_pane",
+        lambda *a: pytest.fail("crashed split cannot reach agent/sandbox startup"))
+    try:
+        with pytest.raises(SystemExit):
+            runtime.run_managed_child(lease, "inspect", run_token=record.run_token,
+                                       idempotency_key=record.idempotency_key)
+        entries = registry._read()
+        assert len(entries) == 1 and entries[0]["task_id"] == child.id
+        foreign_reservation = {**entries[0], "agent_id": "foreign-agent", "task_id": "foreign-task",
+                               "fencing_token": 999}
+        registry._write(entries + [foreign_reservation])
+        monkeypatch.setattr(children, "SubprocessHerdrRunner", lambda *a: runner)
+        monkeypatch.setattr(children, "AdmissionRegistry", lambda: registry)
+        with children.parent_attempt_guard(root, "parent", "parent-run", reconcile_results=True) as terminal:
+            assert terminal is (ownership == "exact")
+        replay = DynamicChildScheduler(audit_log=SchedulerAuditLog(directory / "scheduler.jsonl"))
+        replay.replay()
+        recovered = replay._tasks[child.id]
+        assert (recovered.run_token, recovered.fencing_token, recovered.idempotency_key) == (
+            record.run_token, record.fencing_token, record.idempotency_key)
+        assert sum(e["event"] == "spawn_child" for e in replay.audit_log.replay()) == 1
+        if ownership == "exact":
+            assert closed == ["owned-pane"] and recovered.cleanup_complete
+            assert recovered.state.value == "blocked" and recovered.lease is None
+            assert registry._read() == [foreign_reservation]
+            assert processes["foreign-pane"].poll() is None
+            with children.parent_attempt_guard(root, "parent", "parent-run", reconcile_results=True) as terminal:
+                assert terminal
+            assert closed == ["owned-pane"]
+        else:
+            assert closed == [] and recovered.state.value == "running" and recovered.lease is not None
+            assert not recovered.cleanup_complete and len(registry._read()) == 2
+            assert all(process.poll() is None for process in processes.values())
+    finally:
+        for process in processes.values():
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5)

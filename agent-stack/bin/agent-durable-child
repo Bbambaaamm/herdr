@@ -19,7 +19,8 @@ from herdr.scheduler import (AuditLog, ChildProposal, DenyDecision,
                              DynamicChildScheduler, SchedulerError)
 from herdr.taskgraph import LifecycleState
 from agent_durable_children import (attempt_directory, ledger_required,
-                                    mark_ledger_required, parent_attempt_guard,
+                                    mark_ledger_required, initialization_pending, initialize_parent_scheduler,
+                                    parent_attempt_guard,
                                     publish_exact_child_result)
 from agent_durable_sandbox import PinnedWorktree
 
@@ -37,7 +38,7 @@ def _delivery_prompt(prompt, result_path, child_id, run_token, fencing_token,
             "Evidence binds the result identity; it does not prove tests passed.")
 
 
-def _validate_delivery_prompt(prompt, directory, child_id):
+def _validate_delivery_prompt(prompt, directory, child_id, *, parent_task_id="", run_token=""):
     """Bound the complete prompt before the attempt directory can be created.
 
     A replayed ledger may start at a higher fencing token. At most 256 nodes
@@ -46,11 +47,13 @@ def _validate_delivery_prompt(prompt, directory, child_id):
     """
     ledger = directory / "scheduler.jsonl"
     scheduler = DynamicChildScheduler(audit_log=AuditLog(ledger))
+    pending = (bool(parent_task_id and run_token) and
+               initialization_pending(directory, parent_task_id, run_token))
     if ledger.is_file():
-        if not ledger_required(directory):
+        if not ledger_required(directory) and not pending:
             raise SchedulerError("durable child scheduler sentinel missing")
         scheduler.replay()
-    elif ledger_required(directory):
+    elif ledger_required(directory) and not pending:
         raise SchedulerError("durable child scheduler ledger missing")
     existing = scheduler._tasks.get(child_id)
     if existing is not None:
@@ -240,7 +243,7 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned):
     predicted_id = (f"{parent_id}-child-"
                     f"{hashlib.sha256(f'{parent_id}:{token}:{args.key}'.encode()).hexdigest()[:16]}")
     result_path = directory / "results" / f"{predicted_id}.result.json"
-    _validate_delivery_prompt(args.prompt, directory, predicted_id)
+    _validate_delivery_prompt(args.prompt, directory, predicted_id, parent_task_id=parent_id, run_token=token)
     with parent_attempt_guard(state_root, parent_id, token):
         # Recheck while holding the same lock as parent terminalization.
         current = json.loads(Path(_required_env("HERDR_DURABLE_TASK_FILE")).read_text(
@@ -291,16 +294,19 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned):
             and rec.delegation_key == args.key for rec in scheduler._tasks.values()
         ):
             raise ValueError("parent result already published; new child denied")
-        scheduler.register_external_parent_attempt(
+        parent_binding = dict(
             task_id=parent_id, run_token=token,
             idempotency_key=task["idempotency_key"], agent_name=agent,
             pane_id=pane, marker=marker, repo=task["repo"],
             issue=str(task.get("issue") or ""), role=task["parent_role"],
             tools=task["parent_tools"], permissions=task["parent_permissions"],
             policy_profile=task["safety_profile"])
-        if not ledger.is_file():
-            raise SchedulerError("durable child scheduler ledger missing")
-        mark_ledger_required(directory)
+        if ledger_preexisting:
+            scheduler.register_external_parent_attempt(**parent_binding)
+        else:
+            scheduler = initialize_parent_scheduler(directory, **parent_binding)
+        if not ledger.is_file() or not ledger_required(directory):
+            raise SchedulerError("durable child scheduler initialization missing")
         proposal = ChildProposal(parent_role=task["parent_role"],
                                  parent_tools=tuple(task["parent_tools"]),
                                  parent_permissions=tuple(task["parent_permissions"]),

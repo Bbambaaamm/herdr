@@ -957,3 +957,36 @@ def test_bridge_follows_task_move_without_trusting_client_path(tmp_path):
     blocked.replace(done)
     with pytest.raises(ValueError, match="terminal"):
         server._current_task_file(root, "parent", "run-1")
+
+
+def test_bridge_resumes_first_ledger_initialization_without_duplicate_delivery(tmp_path, monkeypatch):
+    import agent_durable_children
+    task, path = _task(tmp_path)
+    _env(monkeypatch, path)
+    monkeypatch.setattr(bridge, "_parent_context", lambda runner: (task, "parent-pane", "parent-agent", "marker"))
+    calls = []
+    class Runtime:
+        def __init__(self, scheduler, runner, **kwargs):
+            self.scheduler = scheduler
+        def run_managed_child(self, lease, prompt, **kwargs):
+            calls.append(lease.task_id)
+            return "settled"
+    monkeypatch.setattr(bridge, "HerdrChildRuntime", Runtime)
+    args = argparse.Namespace(key="research", role="reader", objective="inspect",
+                              prompt="read files", tool=["read_file"], permission=[])
+    original = agent_durable_children._atomic_control_file
+    def atomic(target, raw):
+        original(target, raw)
+        if target.name == "scheduler.jsonl":
+            raise SystemExit("crash between ledger and sentinel")
+    with monkeypatch.context() as patch:
+        patch.setattr(agent_durable_children, "_atomic_control_file", atomic)
+        with pytest.raises(SystemExit):
+            bridge.delegate(args)
+    directory = attempt_directory(path.parent.parent, "parent", "run-1")
+    assert not ledger_required(directory) and calls == []
+    first = bridge.delegate(args)
+    assert bridge.delegate(args)["task_id"] == first["task_id"]
+    assert calls == [first["task_id"]]
+    assert ledger_required(directory)
+    assert json.loads((directory / agent_durable_children.INITIALIZATION).read_text())["state"] == "committed"

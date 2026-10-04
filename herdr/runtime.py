@@ -29,7 +29,7 @@ from herdr.admission import (
     ResourceUsage,
     TaskGraphSpec,
 )
-from herdr.taskgraph import GRAPH_VERSION, TaskGraphEnvelope
+from herdr.taskgraph import GRAPH_VERSION, TaskGraphEnvelope, LifecycleState
 from herdr.telemetry import TelemetryStore
 from herdr.consumer_policies import policy_for_profile
 from herdr.scheduler import (
@@ -944,6 +944,62 @@ class HerdrChildRuntime:
         self._reserved_agents.discard(lease.agent_id)
         self._reservation_panes.pop(lease.agent_id, None)
 
+    def _find_pre_delivery_pane(self, rec) -> str:
+        """Discover only the unique pane matching all durable split identity fields."""
+        listed = _json_result(self.runner.run(["pane", "list"]), "pane list")
+        panes = (listed.get("result") or {}).get("panes")
+        if (not isinstance(panes, list) or len(panes) > 4096
+                or any(not isinstance(row, Mapping) or not isinstance(row.get("pane_id"), str)
+                       or not row["pane_id"] for row in panes)):
+            raise HerdrRuntimeError("child_cleanup_unproven", rec.id)
+        expected = {
+            f"HERDR_DURABLE_TASK_PANE={rec.execution_marker}",
+            f"HERDR_DURABLE_TASK_ID={rec.id}",
+            f"HERDR_DURABLE_RUN_TOKEN={rec.run_token}",
+            f"HERDR_DURABLE_FENCING_TOKEN={rec.fencing_token}",
+            f"HERDR_DURABLE_IDEMPOTENCY_KEY={rec.idempotency_key}",
+        }
+        matches = []
+        for row in panes:
+            pane = row["pane_id"]
+            info = _json_result(self.runner.run(["pane", "process-info", "--pane", pane]),
+                                "pane process-info")
+            process = (info.get("result") or {}).get("process_info")
+            pid = int(process.get("shell_pid") or 0) if isinstance(process, Mapping) else 0
+            if pid <= 0:
+                raise HerdrRuntimeError("child_cleanup_unproven", pane)
+            with Path(f"/proc/{pid}/environ").open("rb") as handle:
+                raw = handle.read(262145)
+            if len(raw) > 262144:
+                raise HerdrRuntimeError("child_cleanup_unproven", pane)
+            environ = {entry.decode("utf-8", errors="replace") for entry in raw.split(bytes([0]))}
+            if expected <= environ:
+                matches.append(pane)
+        if len(matches) != 1:
+            # No match or duplicate ownership remains quarantined; never guess or resplit.
+            raise HerdrRuntimeError("child_cleanup_unproven", rec.id)
+        return matches[0]
+
+    def recover_interrupted_child_start(self, task_id: str) -> None:
+        rec = self.scheduler._tasks[task_id]
+        if (not rec.pre_delivery_pane_creation_attempted or rec.pre_delivery_agent_start_attempted
+                or rec.execution_agent != rec.agent_id or rec.execution_marker != f"child-{rec.run_token}"
+                or (rec.state is not LifecycleState.RUNNING and not rec.pre_delivery_failure)):
+            raise HerdrRuntimeError("child_cleanup_unproven", task_id)
+        if not rec.execution_pane:
+            pane = self._find_pre_delivery_pane(rec)
+            if not self.scheduler.bind_recovered_pre_delivery_pane(task_id, pane):
+                raise HerdrRuntimeError("child_cleanup_unproven", task_id)
+        if rec.state is LifecycleState.RUNNING:
+            if not self.scheduler.fail_child_pre_delivery(
+                    task_id, rec.run_token, rec.agent_id, rec.fencing_token, rec.idempotency_key,
+                    "child start interrupted before agent invocation", cleanup_complete=False,
+                    pane_creation_attempted=True):
+                raise HerdrRuntimeError("child_pre_delivery_audit_denied", task_id)
+        self.cleanup_bound_pre_delivery(task_id)
+        if not self.scheduler.mark_pre_delivery_cleanup_complete(task_id):
+            raise HerdrRuntimeError("child_cleanup_unproven", task_id)
+
     def cleanup_bound_pre_delivery(self, task_id: str) -> None:
         rec = self.scheduler._tasks[task_id]
         if not rec.pre_delivery_failure or not rec.execution_pane or not all((
@@ -966,6 +1022,8 @@ class HerdrChildRuntime:
         policy_env = {
             "HERDR_DURABLE_TASK_ID": lease.task_id,
             "HERDR_DURABLE_RUN_TOKEN": run_token,
+            "HERDR_DURABLE_FENCING_TOKEN": str(lease.fencing_token),
+            "HERDR_DURABLE_IDEMPOTENCY_KEY": idempotency_key,
             "HERDR_DURABLE_MARKER": marker,
             "HERDR_REAL_BINARY": real,
             "PATH": f"{policy_bin}:{self.env.get('PATH', os.environ.get('PATH', ''))}",
@@ -985,6 +1043,9 @@ class HerdrChildRuntime:
             self.prepare()
             self._admit_child(lease)
             self._preflight_child_provider()
+            if not self.scheduler.record_child_pane_intent(
+                    lease.task_id, run_token, lease.agent_id, lease.fencing_token, idempotency_key, marker):
+                raise HerdrRuntimeError("child_pane_intent_denied", lease.task_id)
             pane_creation_attempted = True
             pane_id = self._create_pane(0, marker, policy_env)
             self._reservation_panes[lease.agent_id] = pane_id

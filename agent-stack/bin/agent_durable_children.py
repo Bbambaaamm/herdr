@@ -6,11 +6,12 @@ import json
 import os
 import stat
 import sys
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from herdr.scheduler import AuditLog, DynamicChildScheduler
+from herdr.scheduler import AuditLog, DynamicChildScheduler, SchedulerError
 from herdr.taskgraph import LifecycleState
 from herdr.runtime import AdmissionRegistry, HerdrChildRuntime, SubprocessHerdrRunner
 
@@ -64,6 +65,128 @@ def mark_ledger_required(directory: Path) -> None:
     finally:
         os.close(fd)
     _fsync_directory(directory)
+
+
+
+INITIALIZATION = "scheduler.initialization.json"
+MAX_INITIALIZATION_BYTES = 1024 * 1024
+
+
+def _atomic_control_file(path: Path, payload: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
+    staged = Path(temporary)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(staged, path)
+        _fsync_directory(path.parent)
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+def _read_control_file(path: Path) -> bytes:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_INITIALIZATION_BYTES:
+            raise SchedulerError("invalid scheduler initialization file")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            raw = handle.read(MAX_INITIALIZATION_BYTES + 1)
+        if len(raw) > MAX_INITIALIZATION_BYTES:
+            raise SchedulerError("oversized scheduler initialization file")
+        return raw
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _initialization(directory: Path, parent_task_id: str, run_token: str):
+    try:
+        document = json.loads(_read_control_file(directory / INITIALIZATION))
+    except FileNotFoundError:
+        return None
+    if (not isinstance(document, dict) or document.get("schema") != 1
+            or document.get("parent_task_id") != parent_task_id or document.get("run_token") != run_token
+            or document.get("state") not in {"pending", "committed"}):
+        raise SchedulerError("scheduler initialization identity mismatch")
+    expected = {"schema", "parent_task_id", "run_token", "state", "ledger_sha256"}
+    if document["state"] == "pending":
+        expected.add("ledger")
+    if set(document) != expected or not isinstance(document["ledger_sha256"], str):
+        raise SchedulerError("invalid scheduler initialization envelope")
+    if document["state"] == "pending":
+        if not isinstance(document["ledger"], str):
+            raise SchedulerError("invalid scheduler initialization ledger")
+        raw = document["ledger"].encode("utf-8")
+        if hashlib.sha256(raw).hexdigest() != document["ledger_sha256"]:
+            raise SchedulerError("scheduler initialization digest mismatch")
+        events = [json.loads(line) for line in raw.splitlines()]
+        if (len(events) != 3 or [event.get("event") for event in events] !=
+                ["submit", "claim", "execution_session_bound"]
+                or any(event.get("task_id") != parent_task_id for event in events)
+                or events[1].get("run_token") != run_token or events[2].get("run_token") != run_token
+                or events[1].get("attempt_state") != "accepted"
+                or not events[1].get("idempotency_key")
+                or not all(events[2].get(key) for key in ("agent_name", "pane_id", "marker"))
+                or events[0].get("agent_id") != events[1].get("agent_id")
+                or events[1].get("agent_id") != events[2].get("agent_name")):
+            raise SchedulerError("invalid scheduler parent initialization events")
+    return document
+
+
+def initialization_pending(directory: Path, parent_task_id: str, run_token: str) -> bool:
+    document = _initialization(directory, parent_task_id, run_token)
+    return document is not None and document["state"] == "pending"
+
+
+def repair_initialization(directory: Path, parent_task_id: str, run_token: str) -> None:
+    """Finish only an authenticated initial parent ledger, while bridge.lock is held.
+
+    A committed initialization can never repair missing/corrupt scheduler state.
+    No child may be admitted until the committed marker is durably published.
+    """
+    document = _initialization(directory, parent_task_id, run_token)
+    if document is None or document["state"] == "committed":
+        return
+    ledger = directory / "scheduler.jsonl"
+    raw = document["ledger"].encode("utf-8")
+    if os.path.lexists(ledger):
+        if _read_control_file(ledger) != raw:
+            raise SchedulerError("pending initialization conflicts with scheduler ledger")
+    else:
+        _atomic_control_file(ledger, raw)
+    mark_ledger_required(directory)
+    committed = {key: value for key, value in document.items() if key != "ledger"}
+    committed["state"] = "committed"
+    _atomic_control_file(directory / INITIALIZATION,
+                         json.dumps(committed, sort_keys=True, allow_nan=False).encode("utf-8"))
+
+
+def initialize_parent_scheduler(directory: Path, **binding) -> DynamicChildScheduler:
+    """Stage the whole parent registration before publishing either required artifact."""
+    ledger = directory / "scheduler.jsonl"
+    if os.path.lexists(ledger) or ledger_required(directory) or os.path.lexists(directory / INITIALIZATION):
+        raise SchedulerError("scheduler initialization is not empty")
+    fd, name = tempfile.mkstemp(prefix=".scheduler-stage-", dir=directory)
+    os.close(fd)
+    stage = Path(name)
+    try:
+        scheduler = DynamicChildScheduler(audit_log=AuditLog(stage))
+        scheduler.register_external_parent_attempt(**binding)
+        raw = _read_control_file(stage)
+        document = {"schema": 1, "parent_task_id": binding["task_id"], "run_token": binding["run_token"],
+                    "state": "pending", "ledger_sha256": hashlib.sha256(raw).hexdigest(),
+                    "ledger": raw.decode("utf-8")}
+        _atomic_control_file(directory / INITIALIZATION,
+                             json.dumps(document, sort_keys=True, allow_nan=False).encode("utf-8"))
+        repair_initialization(directory, binding["task_id"], binding["run_token"])
+        scheduler.audit_log = AuditLog(ledger)
+        return scheduler
+    finally:
+        stage.unlink(missing_ok=True)
 
 
 def ledger_required(directory: Path) -> bool:
@@ -148,6 +271,19 @@ def reconcile_child_results(root: Path, parent_task_id: str, run_token: str) -> 
                     event.get("parent_run_token") != run_token for event in spawned)):
             return
         for rec in children:
+            if (rec.state is not LifecycleState.RUNNING or not rec.pre_delivery_pane_creation_attempted
+                    or rec.pre_delivery_agent_start_attempted):
+                continue
+            try:
+                runner = SubprocessHerdrRunner(os.environ.get(
+                    "HERDR_REAL_BINARY", "/home/agentops/.local/bin/herdr"))
+                runtime = HerdrChildRuntime(scheduler, runner, cwd=root,
+                    snapshot_path=directory / "swarm.json", admission_registry=AdmissionRegistry())
+                runtime.recover_interrupted_child_start(rec.id)
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+                # Retain exact intent when ownership is absent, ambiguous or unavailable.
+                continue
+        for rec in children:
             if rec.attempt_state == "terminal" or rec.state is not LifecycleState.RUNNING:
                 continue
             path = directory / "results" / f"{rec.node.id}.result.json"
@@ -168,7 +304,7 @@ def reconcile_child_results(root: Path, parent_task_id: str, run_token: str) -> 
                     admission_registry=AdmissionRegistry())
                 if rec.pre_delivery_failure and not rec.execution_pane:
                     if rec.pre_delivery_pane_creation_attempted:
-                        # Split may have created an unidentified pane.
+                        runtime.recover_interrupted_child_start(rec.id)
                         continue
                     runtime.admission_registry.release(
                         rec.agent_id, now=scheduler.current_time(),
@@ -199,6 +335,7 @@ def parent_attempt_guard(root: Path, parent_task_id: str, run_token: str, *,
         _fsync_directory(directory)
         fcntl.flock(handle, fcntl.LOCK_EX)
         try:
+            repair_initialization(directory, parent_task_id, run_token)
             if reconcile_results:
                 reconcile_child_results(root, parent_task_id, run_token)
             yield all_children_terminal(root, parent_task_id, run_token, lock_held=True)
@@ -215,6 +352,11 @@ def all_children_terminal(root: Path, parent_task_id: str, run_token: str, *,
     ledger = directory / "scheduler.jsonl"
     if not directory.exists():
         return True
+    try:
+        if initialization_pending(directory, parent_task_id, run_token):
+            return False
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+        return False
     if ledger.is_file() and not ledger_required(directory):
         return False
     if not ledger.is_file():

@@ -364,3 +364,86 @@ def test_deleted_managed_ledger_blocks_worker_retry_and_recovery(setup):
     assert held_task["watchdog_blocker"] == "active_durable_children"
     assert held_task["attempt_state"] == "result_ready"
     assert not (recovery.DONE / path.name).exists()
+
+
+def parent_binding():
+    return dict(task_id="parent", run_token="run-1", idempotency_key="key-1",
+        agent_name="agent", pane_id="pane-1", marker="marker", repo="repo",
+        issue="82", role="writer", tools=("read_file",), permissions=(), policy_profile="default")
+
+
+@pytest.mark.parametrize("phase", ["pending", "ledger", "sentinel", "committed"])
+def test_initial_parent_ledger_recovers_each_publication_crash(tmp_path, monkeypatch, phase):
+    directory = ensure_attempt_directory(tmp_path, "parent", "run-1")
+    original_atomic = agent_durable_children._atomic_control_file
+    original_mark = agent_durable_children.mark_ledger_required
+    def atomic(path, raw):
+        original_atomic(path, raw)
+        state = json.loads(raw).get("state") if path.name == agent_durable_children.INITIALIZATION else None
+        if (phase == "pending" and state == "pending" or phase == "ledger" and path.name == "scheduler.jsonl"
+                or phase == "committed" and state == "committed"):
+            raise SystemExit("simulated process death after durable publication")
+    def mark(path):
+        original_mark(path)
+        if phase == "sentinel":
+            raise SystemExit("simulated process death after required sentinel")
+    with monkeypatch.context() as patch:
+        patch.setattr(agent_durable_children, "_atomic_control_file", atomic)
+        patch.setattr(agent_durable_children, "mark_ledger_required", mark)
+        with pytest.raises(SystemExit):
+            with parent_attempt_guard(tmp_path, "parent", "run-1"):
+                agent_durable_children.initialize_parent_scheduler(directory, **parent_binding())
+    if phase != "committed":
+        assert not all_children_terminal(tmp_path, "parent", "run-1")
+    with parent_attempt_guard(tmp_path, "parent", "run-1", reconcile_results=True) as terminal:
+        assert terminal
+    assert ledger_required(directory)
+    document = json.loads((directory / agent_durable_children.INITIALIZATION).read_text())
+    assert document["state"] == "committed" and "ledger" not in document
+    scheduler = DynamicChildScheduler(audit_log=AuditLog(directory / "scheduler.jsonl"))
+    scheduler.replay()
+    parent = scheduler._tasks["parent"]
+    assert (parent.run_token, parent.idempotency_key, parent.execution_pane) == ("run-1", "key-1", "pane-1")
+    assert [e["event"] for e in scheduler.audit_log.replay()] == ["submit", "claim", "execution_session_bound"]
+    assert all_children_terminal(tmp_path, "parent", "run-1")
+
+
+@pytest.mark.parametrize("artifact", ["scheduler.jsonl", "scheduler.required"])
+def test_committed_initialization_never_recreates_lost_scheduler_artifacts(tmp_path, artifact):
+    directory = ensure_attempt_directory(tmp_path, "parent", "run-1")
+    with parent_attempt_guard(tmp_path, "parent", "run-1"):
+        agent_durable_children.initialize_parent_scheduler(directory, **parent_binding())
+    (directory / artifact).unlink()
+    with parent_attempt_guard(tmp_path, "parent", "run-1", reconcile_results=True) as terminal:
+        assert not terminal
+    assert not (directory / artifact).exists()
+
+
+@pytest.mark.parametrize("fault", ["wrong_run", "digest", "changed_ledger"])
+def test_pending_initialization_conflict_remains_fail_closed(tmp_path, monkeypatch, fault):
+    directory = ensure_attempt_directory(tmp_path, "parent", "run-1")
+    original = agent_durable_children._atomic_control_file
+    def atomic(path, raw):
+        original(path, raw)
+        if path.name == "scheduler.jsonl":
+            raise SystemExit("crash before sentinel")
+    with monkeypatch.context() as patch:
+        patch.setattr(agent_durable_children, "_atomic_control_file", atomic)
+        with pytest.raises(SystemExit):
+            with parent_attempt_guard(tmp_path, "parent", "run-1"):
+                agent_durable_children.initialize_parent_scheduler(directory, **parent_binding())
+    metadata = directory / agent_durable_children.INITIALIZATION
+    if fault == "changed_ledger":
+        with (directory / "scheduler.jsonl").open("a") as handle:
+            handle.write('{"event":"spawn_child","child_id":"foreign"}\n')
+    else:
+        value = json.loads(metadata.read_text())
+        value["run_token" if fault == "wrong_run" else "ledger_sha256"] = "different"
+        metadata.write_text(json.dumps(value))
+    before = (directory / "scheduler.jsonl").read_bytes()
+    assert not all_children_terminal(tmp_path, "parent", "run-1")
+    with pytest.raises((ValueError, RuntimeError)):
+        with parent_attempt_guard(tmp_path, "parent", "run-1"):
+            pass
+    assert (directory / "scheduler.jsonl").read_bytes() == before
+    assert not ledger_required(directory)

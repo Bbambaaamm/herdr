@@ -41,3 +41,28 @@ replacement with file and parent-directory fsync. Crash regressions recover the
 canonical record at bridge, sandbox and agent-start boundaries and close only
 the owned pane. Failed child setup removes its frozen policy at every failure
 stage; policy-copy failures also remove the incomplete temporary file.
+
+## Recovering interrupted child startup
+
+The scheduler commits the child task/run/fence/idempotency identity and deterministic
+pane marker before invoking an external split. Recovery scans current panes and
+requires one process matching every recorded identity field before binding an
+unknown pane. It can then terminalize the interrupted pre-agent start as blocked,
+close only that owned pane, and release only the matching admission reservation.
+Missing, duplicate or unavailable ownership remains quarantined. Recovery never
+creates a replacement pane or sends a second economic prompt. Agent-start intent
+is recorded separately; a possibly started agent is not treated as an unsent split.
+
+The first scheduler registration is staged as a complete parent-only ledger. A
+host-protected initialization envelope durably records its exact bytes and digest
+before publishing the ledger and required sentinel. Under the parent attempt lock,
+recovery can finish a pending publication only if the existing ledger matches that
+initial parent record exactly. The initialization becomes committed before any
+child is admitted. A committed initialization never recreates missing scheduler
+state or a deleted sentinel; conflicting or corrupt state remains fail-closed.
+
+Regressions interrupt publication after its pending envelope, ledger, sentinel
+and committed marker, and interrupt pane creation before its returned identity
+or after durable binding. The pane recovery fixture reads actual process identity,
+retains foreign processes/reservations, rejects duplicate/wrong-fence ownership,
+and proves replay preserves one child attempt without another prompt.
