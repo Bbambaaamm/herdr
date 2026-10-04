@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from herdr import a2a as a2a_module
 from herdr.a2a import (A2AError, Admission, BindingStore, Gateway, HEADER, Identity,
                        decode_child_proposal, discover_card, parse_card, registration)
 from herdr.scheduler import AuditLog, DenyReason, DynamicChildScheduler
@@ -77,6 +78,7 @@ def test_send_poll_candidate_no_completion(tmp_path):
     gateway = Gateway(transport, store, card, policy)
     assert gateway.send(identity, "do bounded work") == ()
     assert transport.sends[0]["message"]["messageId"] == identity.message_id
+    assert transport.sends[0]["configuration"] == {"returnImmediately": True}
     assert store.read()["delivery"] == "bound"
     artifact = {"artifactId": "result-1", "parts": [{"text": "done"}]}
     transport.response = task("TASK_STATE_COMPLETED", artifacts=[artifact])
@@ -86,7 +88,7 @@ def test_send_poll_candidate_no_completion(tmp_path):
     assert candidates[0].content == artifact
     assert candidates[0].acceptance == "requires_shared_85_acceptance"
     assert store.read()["last_observation"] == "TASK_STATE_COMPLETED"
-    assert transport.gets == [{"id": "remote-task"}]
+    assert transport.gets == [{"id": "remote-task", "historyLength": 0}]
     assert len(transport.sends) == 1
 
 
@@ -151,8 +153,13 @@ def test_direct_message(tmp_path):
     assert candidates[0].kind == "message"
     assert candidates[0].remote_task_id is None
     assert store.read()["delivery"] == "direct"
-    with pytest.raises(A2AError):
-        Gateway(transport, store, card, policy).poll(identity)
+    # Simulate caller loss/restart after the durable direct state was written.
+    restarted = Gateway(transport, store, card, policy)
+    recovered = restarted.recover(identity)
+    assert len(recovered) == 1 and recovered[0].digest == candidates[0].digest
+    assert restarted.poll(identity)[0].digest == candidates[0].digest
+    assert transport.gets == []
+    assert len(transport.sends) == 1
 
 
 def test_message_response_with_task_id_binds_existing_remote_task(tmp_path):
@@ -175,7 +182,7 @@ def test_message_response_with_task_id_binds_existing_remote_task(tmp_path):
 
     transport.response = task("TASK_STATE_WORKING")
     assert Gateway(transport, store, card, policy).poll(identity) == ()
-    assert transport.gets == [{"id": "remote-task"}]
+    assert transport.gets == [{"id": "remote-task", "historyLength": 0}]
     assert len(transport.sends) == 1
 
 
@@ -240,7 +247,7 @@ def test_tenant_sent_in_service_requests(tmp_path):
     gateway.poll(identity)
     gateway.cancel(identity)
     assert transport.sends[0]["tenant"] == "team-1"
-    assert transport.gets == [{"id": "remote-task", "tenant": "team-1"}]
+    assert transport.gets == [{"id": "remote-task", "historyLength": 0, "tenant": "team-1"}]
     assert transport.cancels == [{"id": "remote-task", "tenant": "team-1"}]
 
 
@@ -388,3 +395,169 @@ def test_concurrent_send_has_single_economic_dispatch(tmp_path):
         "sent",
     ]
     assert len(transport.sends) == 1
+
+
+def test_cancel_task_terminal_artifact_is_durable_candidate(tmp_path):
+    _, card, policy, identity, store = setup(tmp_path)
+    transport = Mock()
+    gateway = Gateway(transport, store, card, policy)
+    gateway.send(identity, "work")
+    artifact = {"artifactId": "cancel-race", "parts": [{"text": "completed while cancelling"}]}
+
+    def completed_cancel(interface, request, headers):
+        transport.cancels.append(request)
+        return task("TASK_STATE_COMPLETED", artifacts=[artifact])
+
+    transport.cancel = completed_cancel
+    candidates = gateway.cancel(identity)
+    assert len(candidates) == 1
+    assert candidates[0].content == artifact
+    restarted = Gateway(transport, store, card, policy)
+    recovered = restarted.recover(identity)
+    assert len(recovered) == 1
+    assert recovered[0].digest == candidates[0].digest
+    assert recovered[0].acceptance == "requires_shared_85_acceptance"
+    assert store.read()["last_observation"] == "TASK_STATE_COMPLETED"
+
+
+def test_part_url_allows_signed_query_but_not_embedded_credentials(tmp_path):
+    _, card, policy, identity, _ = setup(tmp_path)
+    signed = "https://files.example/download/report?token=opaque-signed-reference&expires=123"
+    response = task("TASK_STATE_COMPLETED", artifacts=[
+        {"artifactId": "file", "parts": [{"url": signed, "mediaType": "application/octet-stream"}]}
+    ])
+    candidate, = Gateway(Mock(response), BindingStore(tmp_path / "signed-url.json"), card, policy).send(identity, "work")
+    assert candidate.content["parts"][0]["url"] == signed
+
+    bad = task("TASK_STATE_COMPLETED", artifacts=[
+        {"artifactId": "file", "parts": [{"url": "https://user:pass@files.example/download?x=1"}]}
+    ])
+    with pytest.raises(A2AError, match="part URL"):
+        Gateway(Mock(bad), BindingStore(tmp_path / "bad-url.json"), card, policy).send(identity, "work")
+
+
+def test_remote_task_and_context_ids_are_bounded_opaque_strings(tmp_path):
+    _, card, policy, identity, store = setup(tmp_path)
+    task_id = "opaque==任务/with space"
+    context_id = "ctx=κόσμε"
+    transport = Mock(task(task_id=task_id, context=context_id))
+    Gateway(transport, store, card, policy).send(identity, "work")
+    bound = store.read()
+    assert bound["remote_task_id"] == task_id
+    assert bound["remote_context_id"] == context_id
+    transport.response = task(task_id=task_id, context=context_id)
+    assert Gateway(transport, store, card, policy).poll(identity) == ()
+    assert transport.gets == [{"id": task_id, "historyLength": 0}]
+
+    with pytest.raises(A2AError, match="task id"):
+        Gateway(Mock(task(task_id="bad\nremote", context=context_id)),
+                BindingStore(tmp_path / "control-id.json"), card, policy).send(identity, "work")
+
+
+def test_oauth_card_metadata_is_not_mistaken_for_raw_secret(tmp_path):
+    raw, _, _, _, _ = setup(tmp_path)
+    raw["securitySchemes"] = {
+        "oauth": {
+            "type": "oauth2",
+            "flows": {
+                "authorizationCode": {
+                    "authorizationUrl": "https://auth.example/authorize",
+                    "tokenUrl": "https://auth.example/token",
+                },
+                "clientCredentials": {"tokenUrl": "https://auth.example/token"},
+                "password": {"tokenUrl": "https://auth.example/token"},
+            },
+        }
+    }
+    assert parse_card(raw).name == "remote"
+
+    compromised = {**raw, "description": "api_key=sk-abcdefghijklmnopqrstuvwxyz123456"}
+    with pytest.raises(A2AError, match="secret-like"):
+        parse_card(compromised)
+
+
+def test_unknown_bounded_service_response_fields_are_ignored(tmp_path):
+    _, card, policy, identity, store = setup(tmp_path)
+    response = {
+        "task": {
+            "id": "remote-task",
+            "contextId": "remote-context",
+            "status": {"state": "TASK_STATE_COMPLETED", "futureStatus": {"v": 1}},
+            "artifacts": [{
+                "artifactId": "artifact",
+                "parts": [{"text": "ok", "futurePart": True}],
+                "futureArtifact": "ignored",
+            }],
+            "futureTask": [1, 2, 3],
+        },
+        "futureEnvelope": {"extension": True},
+    }
+    candidate, = Gateway(Mock(response), store, card, policy).send(identity, "work")
+    assert candidate.content["futureArtifact"] == "ignored"
+    assert candidate.content["parts"][0]["futurePart"] is True
+
+
+def test_binding_parent_directories_are_fsynced_before_economic_send(tmp_path, monkeypatch):
+    _, card, policy, identity, _ = setup(tmp_path)
+    store = BindingStore(tmp_path / "new-a" / "new-b" / "binding.json")
+    real_fsync = a2a_module.os.fsync
+    directory_syncs = []
+    dispatched = []
+
+    def traced_fsync(fd):
+        info = a2a_module.os.fstat(fd)
+        if a2a_module.stat.S_ISDIR(info.st_mode):
+            directory_syncs.append((info.st_dev, info.st_ino))
+        return real_fsync(fd)
+
+    monkeypatch.setattr(a2a_module.os, "fsync", traced_fsync)
+
+    class DurableMock(Mock):
+        def send(self, interface, message, headers):
+            # Both newly created directory entries must already have durable
+            # parent-directory fsync evidence before economic transport.
+            assert (tmp_path / "new-a" / "new-b").is_dir()
+            assert len(directory_syncs) >= 4
+            dispatched.append(True)
+            return super().send(interface, message, headers)
+
+    Gateway(DurableMock(), store, card, policy).send(identity, "work")
+    assert dispatched == [True]
+    assert store.read()["delivery"] == "bound"
+
+
+@pytest.mark.parametrize("child_task", [None, {}, [], "", "   "])
+def test_child_proposal_rejects_malformed_objective(tmp_path, child_task):
+    _, card, policy, identity, store = setup(tmp_path)
+    artifact = {"artifactId": "proposal", "parts": [{"text": json.dumps({
+        "child_role": "reader",
+        "child_tools": ["read_file"],
+        "child_permissions": ["read"],
+        "child_task": child_task,
+    })}]}
+    candidate = Gateway(
+        Mock(task("TASK_STATE_COMPLETED", artifacts=[artifact])),
+        store, card, policy,
+    ).send(identity, "work")[0]
+    with pytest.raises(A2AError, match="child task"):
+        decode_child_proposal(
+            candidate,
+            parent_role="reader",
+            parent_tools=("read_file",),
+            parent_permissions=("read",),
+        )
+
+
+def test_direct_candidate_is_atomic_with_direct_delivery_state(tmp_path):
+    _, card, policy, identity, store = setup(tmp_path)
+    response = {"message": {
+        "messageId": "direct-reply",
+        "contextId": "opaque-context",
+        "role": "ROLE_AGENT",
+        "parts": [{"text": "answer"}],
+    }}
+    Gateway(Mock(response), store, card, policy).send(identity, "question")
+    raw = store.read()
+    assert raw["delivery"] == "direct"
+    assert len(raw["candidates"]) == 1
+    assert Gateway(Mock(), store, card, policy).recover(identity)[0].content["messageId"] == "direct-reply"

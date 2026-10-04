@@ -24,8 +24,13 @@ HEADER = {"A2A-Version": VERSION}
 MAX_CARD = 32_768
 MAX_RESPONSE = 131_072
 MAX_PARTS = 16
+MAX_BINDING = 196_608
+MAX_REMOTE_ID_BYTES = 4096
 _ID = re.compile(r"^[A-Za-z0-9._:@/+-]{1,256}$")
 _SECRET = re.compile(r"(?i)(secret|password|credential|private.?key|api.?key|access.?token|authorization|cookie|bearer\s|ghp_[a-z0-9]{20,}|sk-[a-z0-9]{20,}|xox[baprs]-)")
+_CARD_SECRET_VALUE = re.compile(
+    r"(?i)(bearer\s+\S{12,}|ghp_[a-z0-9]{20,}|sk-[a-z0-9]{20,}|xox[baprs]-[a-z0-9-]{12,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|(?:password|api.?key|access.?token|authorization)\s*[:=]\s*\S{4,})"
+)
 _STATES = frozenset("TASK_STATE_UNSPECIFIED TASK_STATE_SUBMITTED TASK_STATE_WORKING TASK_STATE_COMPLETED TASK_STATE_FAILED TASK_STATE_CANCELED TASK_STATE_REJECTED TASK_STATE_INPUT_REQUIRED TASK_STATE_AUTH_REQUIRED".split())
 _TERMINAL = frozenset("TASK_STATE_COMPLETED TASK_STATE_FAILED TASK_STATE_CANCELED TASK_STATE_REJECTED".split())
 _BINDINGS = frozenset({"JSONRPC", "GRPC", "HTTP+JSON"})
@@ -47,14 +52,44 @@ def _label(value: Any, label: str) -> str:
     return value
 
 
-def _bounded(value: Any, limit: int) -> bytes:
+def _bounded(value: Any, limit: int, *, secret_scan: bool = True) -> bytes:
     try:
         data = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
     except (TypeError, ValueError, OverflowError) as exc:
         raise A2AError("invalid JSON") from exc
-    if len(data) > limit or _SECRET.search(data.decode()):
+    if len(data) > limit or (secret_scan and _SECRET.search(data.decode())):
         raise A2AError("oversized or secret-like metadata")
     return data
+
+
+def _reject_secret_values(value: Any) -> None:
+    if isinstance(value, str):
+        if _CARD_SECRET_VALUE.search(value):
+            raise A2AError("raw secret-like value")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if (
+                isinstance(key, str)
+                and re.fullmatch(r"(?i)(password|api.?key|access.?token|authorization|credential)", key)
+                and isinstance(item, str)
+                and item
+            ):
+                raise A2AError("raw secret-like value")
+            _reject_secret_values(item)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _reject_secret_values(item)
+
+
+def _remote_id(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise A2AError(f"invalid {label}")
+    raw = value.encode("utf-8")
+    if len(raw) > MAX_REMOTE_ID_BYTES or any(ord(c) < 32 or ord(c) == 127 for c in value):
+        raise A2AError(f"invalid {label}")
+    return value
 
 
 def _object(value: Any, keys: set[str], required: set[str]) -> Mapping[str, Any]:
@@ -69,6 +104,15 @@ def _url(value: Any) -> str:
     parsed = urlsplit(value)
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.fragment or parsed.query:
         raise A2AError("interface requires a plain HTTPS URL")
+    return value
+
+
+def _part_url(value: Any) -> str:
+    if not isinstance(value, str) or len(value) > 4096:
+        raise A2AError("invalid part URL")
+    parsed = urlsplit(value)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise A2AError("part URL requires HTTPS without embedded credentials")
     return value
 
 
@@ -107,7 +151,8 @@ class AgentCard:
 
 
 def parse_card(raw: Any) -> AgentCard:
-    _bounded(raw, MAX_CARD)
+    _bounded(raw, MAX_CARD, secret_scan=False)
+    _reject_secret_values(raw)
     card = _object(raw, {"name", "description", "version", "supportedInterfaces", "capabilities", "skills", "defaultInputModes", "defaultOutputModes", "provider", "documentationUrl", "iconUrl", "securitySchemes", "securityRequirements", "signatures"}, {"name", "description", "version", "supportedInterfaces", "capabilities", "skills", "defaultInputModes", "defaultOutputModes"})
     name = _label(card["name"], "card name")
     _label(card["description"], "description")
@@ -137,7 +182,7 @@ def parse_card(raw: Any) -> AgentCard:
         if not isinstance(binding, str) or binding not in _BINDINGS or entry["protocolVersion"] != VERSION:
             raise A2AError("unsupported binding/version")
         interfaces.append(Interface(_interface_address(entry["url"], binding), binding, _id(entry["tenant"], "tenant") if "tenant" in entry else None, VERSION))
-    return AgentCard(name, tuple(interfaces), hashlib.sha256(_bounded(raw, MAX_CARD)).hexdigest())
+    return AgentCard(name, tuple(interfaces), hashlib.sha256(_bounded(raw, MAX_CARD, secret_scan=False)).hexdigest())
 
 
 @dataclass(frozen=True)
@@ -214,6 +259,54 @@ class Candidate:
         return json.loads(self.content_json)
 
 
+def _candidate_record(candidate: Candidate) -> dict[str, Any]:
+    return {
+        "remote_task_id": candidate.remote_task_id,
+        "remote_context_id": candidate.remote_context_id,
+        "kind": candidate.kind,
+        "digest": candidate.digest,
+        "content": candidate.content,
+    }
+
+
+def _candidate_from_record(identity: Identity, raw: Any) -> Candidate:
+    item = _object(
+        raw,
+        {"remote_task_id", "remote_context_id", "kind", "digest", "content"},
+        {"remote_task_id", "remote_context_id", "kind", "digest", "content"},
+    )
+    task = _remote_id(item["remote_task_id"], "remote task id") if item["remote_task_id"] is not None else None
+    context = _remote_id(item["remote_context_id"], "remote context id") if item["remote_context_id"] is not None else None
+    if item["kind"] not in {"message", "artifact"}:
+        raise A2AError("invalid candidate kind")
+    content_json = _bounded(item["content"], MAX_RESPONSE, secret_scan=False)
+    _reject_secret_values(item["content"])
+    digest = hashlib.sha256(content_json).hexdigest()
+    if not isinstance(item["digest"], str) or item["digest"] != digest:
+        raise A2AError("candidate digest mismatch")
+    return Candidate(identity, task, context, item["kind"], digest, content_json)
+
+
+def _merge_candidate_records(existing: Any, candidates: tuple[Candidate, ...]) -> list[dict[str, Any]]:
+    if not isinstance(existing, list):
+        raise A2AError("invalid recovery candidates")
+    records = list(existing)
+    seen = {
+        (item.get("kind"), item.get("digest"), item.get("remote_task_id"), item.get("remote_context_id"))
+        for item in records if isinstance(item, dict)
+    }
+    for candidate in candidates:
+        record = _candidate_record(candidate)
+        key = (record["kind"], record["digest"], record["remote_task_id"], record["remote_context_id"])
+        if key not in seen:
+            records.append(record)
+            seen.add(key)
+    if len(records) > 32:
+        raise A2AError("candidate recovery count exceeds bound")
+    _bounded(records, MAX_BINDING)
+    return records
+
+
 class Transport(Protocol):
     def discover(self, url: str, headers: Mapping[str, str]) -> Any: ...
     def send(self, interface: Interface, message: Mapping[str, Any], headers: Mapping[str, str]) -> Any: ...
@@ -230,6 +323,53 @@ def discover_card(transport: Transport, origin: str) -> AgentCard:
     return parse_card(transport.discover(url.rstrip("/") + "/.well-known/agent-card.json", HEADER))
 
 
+def _ensure_durable_directory(path: Path) -> None:
+    path = Path(path)
+    missing: list[Path] = []
+    current = path
+    while True:
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            missing.append(current)
+            if current.parent == current:
+                raise A2AError("binding directory has no durable ancestor")
+            current = current.parent
+            continue
+        if not stat.S_ISDIR(info.st_mode) or current.is_symlink():
+            raise A2AError("invalid binding directory")
+        break
+    for directory in reversed(missing):
+        try:
+            os.mkdir(directory, 0o700)
+        except FileExistsError:
+            info = directory.lstat()
+            if not stat.S_ISDIR(info.st_mode) or directory.is_symlink():
+                raise A2AError("invalid binding directory")
+        parent_fd = os.open(directory.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    # Even when the directory pre-existed, sync its parent entry before the
+    # first economic dispatch; this closes the recently-created-parent crash gap.
+    parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+    directory_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 class BindingStore:
     """Single dispatch binding with durable, serialized state transitions."""
     def __init__(self, path: Path):
@@ -237,7 +377,7 @@ class BindingStore:
 
     @contextlib.contextmanager
     def locked(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_durable_directory(self.path.parent)
         directory = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         lock_name = self.path.name + ".lock"
         try:
@@ -264,15 +404,15 @@ class BindingStore:
             raise A2AError("invalid binding path") from exc
         try:
             info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
+            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_BINDING:
                 raise A2AError("invalid or oversized binding")
-            raw = os.read(fd, 4097)
-            if len(raw) > 4096:
+            raw = os.read(fd, MAX_BINDING + 1)
+            if len(raw) > MAX_BINDING:
                 raise A2AError("oversized binding")
             data = json.loads(raw)
         finally:
             os.close(fd)
-        _object(data, {"identity", "message_id", "card_fingerprint", "interface_fingerprint", "delivery", "remote_task_id", "remote_context_id", "cancel_intent", "last_observation"}, {"identity", "message_id", "card_fingerprint", "interface_fingerprint", "delivery", "remote_task_id", "remote_context_id", "cancel_intent", "last_observation"})
+        _object(data, {"identity", "message_id", "card_fingerprint", "interface_fingerprint", "delivery", "remote_task_id", "remote_context_id", "cancel_intent", "last_observation", "candidates"}, {"identity", "message_id", "card_fingerprint", "interface_fingerprint", "delivery", "remote_task_id", "remote_context_id", "cancel_intent", "last_observation", "candidates"})
         identity = Identity(**data["identity"])
         if identity.message_id != data["message_id"] or data["delivery"] not in {"send_started", "bound", "direct"}:
             raise A2AError("invalid binding")
@@ -282,7 +422,11 @@ class BindingStore:
             raise A2AError("invalid cancel intent")
         for key in ("remote_task_id", "remote_context_id"):
             if data[key] is not None:
-                _id(data[key], key)
+                _remote_id(data[key], key)
+        if not isinstance(data["candidates"], list) or len(data["candidates"]) > 32:
+            raise A2AError("invalid recovery candidates")
+        for item in data["candidates"]:
+            _candidate_from_record(identity, item)
         if data["delivery"] == "bound" and not data["remote_task_id"]:
             raise A2AError("invalid remote binding")
         if data["delivery"] != "bound" and data["remote_task_id"] is not None:
@@ -296,7 +440,7 @@ class BindingStore:
             return self._read(directory)
 
     def _write(self, directory: int, data: dict[str, Any], *, create: bool = False) -> None:
-        raw = _bounded(data, 4096)
+        raw = _bounded(data, MAX_BINDING, secret_scan=False)
         tmp = ".a2a-" + uuid.uuid4().hex
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
         try:
@@ -331,11 +475,12 @@ def _parts(raw: Any) -> Any:
     if not isinstance(raw, list) or not 1 <= len(raw) <= MAX_PARTS:
         raise A2AError("invalid parts")
     for part in raw:
-        _object(part, {"text", "raw", "url", "data", "mediaType", "filename", "metadata"}, set())
+        if not isinstance(part, dict):
+            raise A2AError("invalid part")
         if sum(k in part for k in ("text", "raw", "url", "data")) != 1:
             raise A2AError("invalid part content")
         if "url" in part:
-            _url(part["url"])
+            _part_url(part["url"])
         if "text" in part and not isinstance(part["text"], str):
             raise A2AError("invalid text")
         if "raw" in part:
@@ -346,7 +491,8 @@ def _parts(raw: Any) -> Any:
             except (ValueError, binascii.Error) as exc:
                 raise A2AError("invalid base64 raw part") from exc
         if "data" in part:
-            _bounded(part["data"], MAX_RESPONSE)
+            _bounded(part["data"], MAX_RESPONSE, secret_scan=False)
+            _reject_secret_values(part["data"])
         for field in ("mediaType", "filename"):
             if field in part and (not isinstance(part[field], str) or len(part[field]) > 256):
                 raise A2AError("invalid part metadata")
@@ -356,37 +502,48 @@ def _parts(raw: Any) -> Any:
 
 
 def _candidate(identity: Identity, task: str | None, context: str | None, kind: str, content: Any) -> Candidate:
-    raw = _bounded(content, MAX_RESPONSE)
+    raw = _bounded(content, MAX_RESPONSE, secret_scan=False)
+    _reject_secret_values(content)
     return Candidate(identity, task, context, kind, hashlib.sha256(raw).hexdigest(), raw)
 
 
+def _response_object(value: Any, required: set[str]) -> Mapping[str, Any]:
+    if not isinstance(value, dict) or not required <= value.keys():
+        raise A2AError("invalid response object")
+    return value
+
+
 def _parse_response(raw: Any, identity: Identity, binding: dict[str, Any] | None = None) -> tuple[str, str | None, str | None, tuple[Candidate, ...]]:
-    _bounded(raw, MAX_RESPONSE)
-    envelope = _object(raw, {"task", "message"}, set())
-    if len(envelope) != 1:
+    _bounded(raw, MAX_RESPONSE, secret_scan=False)
+    _reject_secret_values(raw)
+    if not isinstance(raw, dict):
         raise A2AError("expected task or message")
+    known = [key for key in ("task", "message") if key in raw]
+    if len(known) != 1:
+        raise A2AError("expected task or message")
+    envelope = raw
     if "message" in envelope:
         if binding and binding["remote_task_id"]:
             raise A2AError("bound task cannot become direct message")
-        msg = _object(envelope["message"], {"messageId", "contextId", "taskId", "role", "parts", "metadata", "extensions", "referenceTaskIds"}, {"messageId", "role", "parts"})
-        _id(msg["messageId"], "messageId")
+        msg = _response_object(envelope["message"], {"messageId", "role", "parts"})
+        _remote_id(msg["messageId"], "messageId")
         if msg["role"] != "ROLE_AGENT":
             raise A2AError("expected agent message")
         _parts(msg["parts"])
         if "contextId" not in msg:
             raise A2AError("agent message requires contextId")
-        context = _id(msg["contextId"], "contextId")
-        task_id = _id(msg["taskId"], "taskId") if "taskId" in msg else None
+        context = _remote_id(msg["contextId"], "contextId")
+        task_id = _remote_id(msg["taskId"], "taskId") if "taskId" in msg else None
         observation = "message" if task_id is not None else "direct"
         return observation, task_id, context, (
             _candidate(identity, task_id, context, "message", msg),
         )
-    task = _object(envelope["task"], {"id", "contextId", "status", "artifacts", "history", "metadata"}, {"id", "status"})
-    task_id = _id(task["id"], "task id")
-    context = _id(task["contextId"], "context id") if "contextId" in task else None
+    task = _response_object(envelope["task"], {"id", "status"})
+    task_id = _remote_id(task["id"], "task id")
+    context = _remote_id(task["contextId"], "context id") if "contextId" in task else None
     if binding and (binding["remote_task_id"] != task_id or binding["remote_context_id"] != context):
         raise A2AError("remote binding mismatch")
-    status = _object(task["status"], {"state", "message", "timestamp"}, {"state"})
+    status = _response_object(task["status"], {"state"})
     state = status["state"]
     if not isinstance(state, str) or state not in _STATES:
         raise A2AError("invalid task state")
@@ -395,8 +552,8 @@ def _parse_response(raw: Any, identity: Identity, binding: dict[str, Any] | None
         raise A2AError("invalid artifacts")
     candidates = []
     for artifact in artifacts:
-        item = _object(artifact, {"artifactId", "name", "description", "parts", "metadata", "extensions"}, {"artifactId", "parts"})
-        _id(item["artifactId"], "artifactId")
+        item = _response_object(artifact, {"artifactId", "parts"})
+        _remote_id(item["artifactId"], "artifactId")
         _parts(item["parts"])
         candidates.append(_candidate(identity, task_id, context, "artifact", item))
     return state, task_id, context, tuple(candidates)
@@ -419,41 +576,55 @@ class Gateway:
         with self.store.locked() as directory:
             if self.store._read(directory) is not None:
                 raise A2AError("delivery already started; reconcile ambiguous send")
-            data = {"identity": asdict(identity), "message_id": identity.message_id, "card_fingerprint": self.card.fingerprint, "interface_fingerprint": self.interface.fingerprint, "delivery": "send_started", "remote_task_id": None, "remote_context_id": None, "cancel_intent": False, "last_observation": None}
+            data = {"identity": asdict(identity), "message_id": identity.message_id, "card_fingerprint": self.card.fingerprint, "interface_fingerprint": self.interface.fingerprint, "delivery": "send_started", "remote_task_id": None, "remote_context_id": None, "cancel_intent": False, "last_observation": None, "candidates": []}
             self.store._write(directory, data, create=True)
-            request = {"message": {"messageId": identity.message_id, "role": "ROLE_USER", "parts": [{"text": text}]}}
+            request = {
+                "message": {"messageId": identity.message_id, "role": "ROLE_USER", "parts": [{"text": text}]},
+                "configuration": {"returnImmediately": True},
+            }
             if self.interface.tenant is not None:
                 request["tenant"] = self.interface.tenant
             response = self.transport.send(self.interface, request, HEADER)
             state, task, context, candidates = _parse_response(response, identity)
             data.update(delivery="bound" if task else "direct", remote_task_id=task, remote_context_id=context, last_observation=state)
+            if candidates:
+                data["candidates"] = _merge_candidate_records(data["candidates"], candidates)
             self.store._write(directory, data)
             return candidates
 
     def poll(self, identity: Identity) -> tuple[Candidate, ...]:
         with self.store.locked() as directory:
             data = self._bound(identity, directory)
+            if data["delivery"] == "direct":
+                return tuple(_candidate_from_record(identity, item) for item in data["candidates"])
             if data["delivery"] != "bound":
                 raise A2AError("no bound remote task; reconciliation required")
-            request = {"id": data["remote_task_id"]}
+            request = {"id": data["remote_task_id"], "historyLength": 0}
             if self.interface.tenant is not None:
                 request["tenant"] = self.interface.tenant
             response = self.transport.get(self.interface, request, HEADER)
             state, _, _, candidates = _parse_response(response, identity, data)
             data["last_observation"] = state
+            if candidates:
+                data["candidates"] = _merge_candidate_records(data["candidates"], candidates)
             self.store._write(directory, data)
             return candidates
 
-    def cancel(self, identity: Identity) -> None:
+    def recover(self, identity: Identity) -> tuple[Candidate, ...]:
+        with self.store.locked() as directory:
+            data = self._bound(identity, directory)
+            return tuple(_candidate_from_record(identity, item) for item in data["candidates"])
+
+    def cancel(self, identity: Identity) -> tuple[Candidate, ...]:
         with self.store.locked() as directory:
             data = self._bound(identity, directory)
             if data["delivery"] != "bound":
                 raise A2AError("no bound remote task")
             data["cancel_intent"] = True
             self.store._write(directory, data)
-        self.retry_cancel(identity)
+        return self.retry_cancel(identity)
 
-    def retry_cancel(self, identity: Identity) -> None:
+    def retry_cancel(self, identity: Identity) -> tuple[Candidate, ...]:
         with self.store.locked() as directory:
             data = self._bound(identity, directory)
             if not data["cancel_intent"] or data["delivery"] != "bound":
@@ -462,9 +633,12 @@ class Gateway:
             if self.interface.tenant is not None:
                 request["tenant"] = self.interface.tenant
             response = self.transport.cancel(self.interface, request, HEADER)
-            state, _, _, _ = _parse_response(response, identity, data)
+            state, _, _, candidates = _parse_response(response, identity, data)
             data["last_observation"] = state
+            if candidates:
+                data["candidates"] = _merge_candidate_records(data["candidates"], candidates)
             self.store._write(directory, data)
+            return candidates
 
 
 def decode_child_proposal(candidate: Candidate, *, parent_role: str, parent_tools: tuple[str, ...], parent_permissions: tuple[str, ...]) -> ChildProposal:
@@ -482,4 +656,7 @@ def decode_child_proposal(candidate: Candidate, *, parent_role: str, parent_tool
             raise A2AError("invalid proposal list")
         for item in proposal[key]:
             _id(item, key)
-    return ChildProposal(parent_role, parent_tools, _id(proposal["child_role"], "child role"), tuple(proposal["child_tools"]), child_task=proposal["child_task"], parent_permissions=parent_permissions, child_permissions=tuple(proposal["child_permissions"]))
+    child_task = proposal["child_task"]
+    if not isinstance(child_task, str) or not child_task.strip() or len(child_task.encode("utf-8")) > 8192:
+        raise A2AError("invalid child task")
+    return ChildProposal(parent_role, parent_tools, _id(proposal["child_role"], "child role"), tuple(proposal["child_tools"]), child_task=child_task, parent_permissions=parent_permissions, child_permissions=tuple(proposal["child_permissions"]))
