@@ -21,7 +21,25 @@ def _isolated_economic_claim_root(monkeypatch, tmp_path):
     )
 
 def setup(tmp_path):
-    raw = {"name": "remote", "description": "bounded executor", "version": "1.0.1", "capabilities": {}, "defaultInputModes": ["text/plain"], "defaultOutputModes": ["text/plain"], "skills": [], "supportedInterfaces": [{"url": "https://remote.example/a2a", "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0"}]}
+    raw = {
+        "name": "remote",
+        "description": "bounded executor",
+        "version": "1.0.1",
+        "capabilities": {},
+        "defaultInputModes": ["text/plain"],
+        "defaultOutputModes": ["text/plain"],
+        "skills": [{
+            "id": "bounded-work",
+            "name": "Bounded work",
+            "description": "Perform bounded delegated work.",
+            "tags": ["bounded"],
+        }],
+        "supportedInterfaces": [{
+            "url": "https://remote.example/a2a",
+            "protocolBinding": "HTTP+JSON",
+            "protocolVersion": "1.0",
+        }],
+    }
     card = parse_card(raw)
     policy = Admission(
         card.fingerprint, card.interfaces[0].fingerprint, "remote-exec",
@@ -243,19 +261,41 @@ def test_normative_card_fields_and_grpc(tmp_path):
     for field in ("name", "description", "version", "supportedInterfaces", "capabilities", "defaultInputModes", "defaultOutputModes", "skills"):
         with pytest.raises(A2AError):
             parse_card({key: value for key, value in raw.items() if key != field})
-    for change in ({"capabilities": []}, {"skills": ["invalid"]}, {"defaultInputModes": []}, {"description": 7}):
+    for change in (
+        {"capabilities": []},
+        {"skills": []},
+        {"skills": ["invalid"]},
+        {"defaultInputModes": []},
+        {"description": 7},
+    ):
         with pytest.raises(A2AError):
             parse_card({**raw, **change})
-    grpc = {**raw, "supportedInterfaces": [{"url": "remote.example:443", "protocolBinding": "GRPC", "protocolVersion": "1.0", "tenant": "team-1"}]}
-    assert parse_card(grpc).interfaces[0].url == "remote.example:443"
-    for address in ("http://remote.example", "remote.example:0", "remote.example:99999", "../socket"):
+    grpc = {
+        **raw,
+        "supportedInterfaces": [{
+            "url": "https://grpc.remote.example/a2a",
+            "protocolBinding": "GRPC",
+            "protocolVersion": "1.0",
+            "tenant": "team-1",
+        }],
+    }
+    assert parse_card(grpc).interfaces[0].url == "https://grpc.remote.example/a2a"
+    for address in (
+        "http://remote.example",
+        "remote.example:443",
+        "remote.example:0",
+        "../socket",
+    ):
         with pytest.raises(A2AError):
-            parse_card({**grpc, "supportedInterfaces": [{**grpc["supportedInterfaces"][0], "url": address}]})
+            parse_card({
+                **grpc,
+                "supportedInterfaces": [{**grpc["supportedInterfaces"][0], "url": address}],
+            })
 
 
 def test_tenant_sent_in_service_requests(tmp_path):
     raw, _, _, identity, store = setup(tmp_path)
-    raw["supportedInterfaces"][0]["tenant"] = "team-1"
+    raw["supportedInterfaces"][0]["tenant"] = "org=東京 west"
     card = parse_card(raw)
     policy = Admission(
         card.fingerprint, card.interfaces[0].fingerprint, "remote-exec",
@@ -266,14 +306,26 @@ def test_tenant_sent_in_service_requests(tmp_path):
     gateway.send(identity, "work")
     gateway.poll(identity)
     gateway.cancel(identity)
-    assert transport.sends[0]["tenant"] == "team-1"
-    assert transport.gets == [{"id": "remote-task", "historyLength": 0, "tenant": "team-1"}]
-    assert transport.cancels == [{"id": "remote-task", "tenant": "team-1"}]
+    assert transport.sends[0]["tenant"] == "org=東京 west"
+    assert transport.gets == [{
+        "id": "remote-task", "historyLength": 0, "tenant": "org=東京 west"
+    }]
+    assert transport.cancels == [{"id": "remote-task", "tenant": "org=東京 west"}]
 
 
 def test_parts_and_agent_context(tmp_path):
     _, card, policy, identity, _ = setup(tmp_path)
-    valid_parts = ({"data": {"answer": 1}}, {"data": [1, "x"]}, {"data": "scalar"}, {"data": 7}, {"data": True}, {"data": None}, {"raw": "YQ==", "mediaType": "application/octet-stream"})
+    valid_parts = (
+        {"data": {"answer": 1}},
+        {"data": [1, "x"]},
+        {"data": "scalar"},
+        {"data": 7},
+        {"data": True},
+        {"data": None},
+        {"raw": "YQ==", "mediaType": "application/octet-stream"},
+        {"raw": "YQ", "mediaType": "application/octet-stream"},
+        {"raw": "-_8", "mediaType": "application/octet-stream"},
+    )
     for index, part in enumerate(valid_parts):
         attempt = replace(identity, idempotency_key=f"valid-part-{index}")
         Gateway(
@@ -281,7 +333,7 @@ def test_parts_and_agent_context(tmp_path):
             BindingStore(tmp_path / f"valid-{index}.json"), card, policy,
         ).send(attempt, "work")
     for index, part in enumerate((
-        {"raw": "!!!"}, {"raw": "YQ="}, {"raw": "YQ==", "data": {}}, {"data": object()},
+        {"raw": "!!!"}, {"raw": "A"}, {"raw": "YQ==", "data": {}}, {"data": object()},
     )):
         attempt = replace(identity, idempotency_key=f"invalid-part-{index}")
         with pytest.raises(A2AError):
@@ -753,7 +805,7 @@ def test_benign_security_words_remain_durable_candidates(tmp_path):
         "messageId": "direct-benign-security",
         "contextId": "context",
         "role": "ROLE_AGENT",
-        "parts": [{"text": "Password reset instructions are available in the runbook."}],
+        "parts": [{"text": "Use the Authorization header described in the runbook."}],
     }
     direct_gateway = Gateway(
         Mock({"message": direct_message}), direct_store, card, policy
@@ -780,3 +832,81 @@ def test_benign_security_words_remain_durable_candidates(tmp_path):
     recovered = late_gateway.recover(late_identity)
     assert recovered[-1].digest == late_candidate.digest
     assert recovered[-1].content == late_artifact
+
+def test_required_extensions_are_rejected_before_admission(tmp_path):
+    raw, _, _, _, _ = setup(tmp_path)
+    optional = {
+        **raw,
+        "capabilities": {
+            "extensions": [{
+                "uri": "https://extensions.example/optional",
+                "required": False,
+            }],
+        },
+    }
+    assert parse_card(optional).name == "remote"
+    required = {
+        **raw,
+        "capabilities": {
+            "extensions": [{
+                "uri": "https://extensions.example/required",
+                "required": True,
+            }],
+        },
+    }
+    with pytest.raises(A2AError, match="unsupported required extension"):
+        parse_card(required)
+
+
+def test_get_and_cancel_accept_bare_task_responses(tmp_path):
+    _, card, policy, identity, store = setup(tmp_path)
+    transport = Mock()
+    gateway = Gateway(transport, store, card, policy)
+    gateway.send(identity, "work")
+
+    transport.response = task("TASK_STATE_WORKING")["task"]
+    assert gateway.poll(identity) == ()
+
+    late = {"artifactId": "bare-cancel", "parts": [{"text": "late result"}]}
+    def bare_cancel(interface, request, headers):
+        transport.cancels.append(request)
+        return task("TASK_STATE_COMPLETED", artifacts=[late])["task"]
+    transport.cancel = bare_cancel
+
+    candidate, = gateway.cancel(identity)
+    assert candidate.content == late
+    assert gateway.recover(identity)[-1].digest == candidate.digest
+
+
+def test_existing_binding_ancestor_chain_is_fsynced_before_send(tmp_path, monkeypatch):
+    _, card, policy, identity, _ = setup(tmp_path)
+    root = tmp_path / "preexisting" / "a" / "b"
+    root.mkdir(parents=True)
+    store = BindingStore(root / "binding.json", authority_root=tmp_path)
+
+    expected = {
+        (path.stat().st_dev, path.stat().st_ino)
+        for path in (
+            tmp_path,
+            tmp_path / "preexisting",
+            tmp_path / "preexisting" / "a",
+            root,
+        )
+    }
+    seen = set()
+    real_fsync = a2a_module.os.fsync
+
+    def traced(fd):
+        info = a2a_module.os.fstat(fd)
+        if a2a_module.stat.S_ISDIR(info.st_mode):
+            seen.add((info.st_dev, info.st_ino))
+        return real_fsync(fd)
+
+    monkeypatch.setattr(a2a_module.os, "fsync", traced)
+
+    class CheckBeforeSend(Mock):
+        def send(self, interface, message, headers):
+            assert expected <= seen
+            return super().send(interface, message, headers)
+
+    Gateway(CheckBeforeSend(), store, card, policy).send(identity, "work")

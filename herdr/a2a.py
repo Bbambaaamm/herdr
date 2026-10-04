@@ -127,17 +127,24 @@ def _part_url(value: Any) -> str:
 
 
 def _interface_address(value: Any, binding: str) -> str:
-    if binding != "GRPC":
-        return _url(value)
-    if not isinstance(value, str) or len(value) > 2048 or _SECRET.search(value):
-        raise A2AError("invalid GRPC address")
-    if value.startswith("https://"):
-        return _url(value)
-    if not re.fullmatch(r"[A-Za-z0-9.-]+:[0-9]{1,5}", value):
-        raise A2AError("invalid GRPC address")
-    host, port = value.rsplit(":", 1)
-    if host.startswith("-") or ".." in host or not 1 <= int(port) <= 65535:
-        raise A2AError("invalid GRPC address")
+    # A2A v1.0.1 requires AgentInterface.url to be an absolute HTTPS URL for
+    # every core binding, including GRPC. The binding changes transport
+    # semantics, not the production URL/TLS contract.
+    if binding not in _BINDINGS:
+        raise A2AError("unsupported binding")
+    return _url(value)
+
+
+def _tenant(value: Any) -> str:
+    """Bound the opaque AgentInterface tenant without imposing local ID syntax."""
+    if not isinstance(value, str):
+        raise A2AError("invalid tenant")
+    try:
+        raw = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise A2AError("invalid tenant") from exc
+    if len(raw) > MAX_REMOTE_ID_BYTES:
+        raise A2AError("invalid tenant")
     return value
 
 
@@ -150,7 +157,7 @@ class Interface:
 
     @property
     def fingerprint(self) -> str:
-        return hashlib.sha256(_bounded(asdict(self), MAX_CARD)).hexdigest()
+        return hashlib.sha256(_bounded(asdict(self), MAX_CARD, secret_scan=False)).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -167,9 +174,23 @@ def parse_card(raw: Any) -> AgentCard:
     name = _label(card["name"], "card name")
     _label(card["description"], "description")
     _label(card["version"], "version")
-    if not isinstance(card["capabilities"], dict):
+    capabilities = card["capabilities"]
+    if not isinstance(capabilities, dict):
         raise A2AError("invalid capabilities")
-    if not isinstance(card["skills"], list) or len(card["skills"]) > 32:
+    extensions = capabilities.get("extensions", [])
+    if not isinstance(extensions, list) or len(extensions) > 32:
+        raise A2AError("invalid capability extensions")
+    for extension in extensions:
+        if not isinstance(extension, dict):
+            raise A2AError("invalid capability extension")
+        required = extension.get("required", False)
+        if type(required) is not bool:
+            raise A2AError("invalid capability extension")
+        if required:
+            # #71 intentionally implements no A2A extensions. Fail before
+            # admission/economic dispatch instead of relying on a remote error.
+            raise A2AError("unsupported required extension")
+    if not isinstance(card["skills"], list) or not 1 <= len(card["skills"]) <= 32:
         raise A2AError("invalid skills")
     for skill in card["skills"]:
         item = _object(skill, {"id", "name", "description", "tags", "examples", "inputModes", "outputModes", "securityRequirements"}, {"id", "name", "description", "tags"})
@@ -191,7 +212,12 @@ def parse_card(raw: Any) -> AgentCard:
         binding = entry["protocolBinding"]
         if not isinstance(binding, str) or binding not in _BINDINGS or entry["protocolVersion"] != VERSION:
             raise A2AError("unsupported binding/version")
-        interfaces.append(Interface(_interface_address(entry["url"], binding), binding, _id(entry["tenant"], "tenant") if "tenant" in entry else None, VERSION))
+        interfaces.append(Interface(
+            _interface_address(entry["url"], binding),
+            binding,
+            _tenant(entry["tenant"]) if "tenant" in entry else None,
+            VERSION,
+        ))
     return AgentCard(name, tuple(interfaces), hashlib.sha256(_bounded(raw, MAX_CARD, secret_scan=False)).hexdigest())
 
 
@@ -387,6 +413,10 @@ def _open_durable_directory(path: Path) -> int:
             if not stat.S_ISDIR(info.st_mode):
                 os.close(next_fd)
                 raise A2AError("invalid binding directory")
+            # Fsync every ancestor directory, not only directories created by
+            # this call. A caller may have created an existing multi-level
+            # binding path immediately before constructing the store.
+            os.fsync(current)
             if created:
                 os.fsync(next_fd)
             os.close(current)
@@ -646,8 +676,14 @@ def _parts(raw: Any) -> Any:
             if not isinstance(part["raw"], str):
                 raise A2AError("invalid raw part")
             try:
-                base64.b64decode(part["raw"], validate=True)
-            except (ValueError, binascii.Error) as exc:
+                encoded = part["raw"].encode("ascii")
+                # ProtoJSON parsers must accept standard and URL-safe base64,
+                # with or without padding. Normalize to strict standard base64
+                # and then validate the normalized representation.
+                normalized = encoded.replace(b"-", b"+").replace(b"_", b"/")
+                normalized += b"=" * ((-len(normalized)) % 4)
+                base64.b64decode(normalized, validate=True)
+            except (UnicodeEncodeError, ValueError, binascii.Error) as exc:
                 raise A2AError("invalid base64 raw part") from exc
         if "data" in part:
             _bounded(part["data"], MAX_RESPONSE, secret_scan=False)
@@ -672,15 +708,26 @@ def _response_object(value: Any, required: set[str]) -> Mapping[str, Any]:
     return value
 
 
-def _parse_response(raw: Any, identity: Identity, binding: dict[str, Any] | None = None) -> tuple[str, str | None, str | None, tuple[Candidate, ...]]:
+def _parse_response(
+    raw: Any,
+    identity: Identity,
+    binding: dict[str, Any] | None = None,
+    *,
+    allow_bare_task: bool = False,
+) -> tuple[str, str | None, str | None, tuple[Candidate, ...]]:
     _bounded(raw, MAX_RESPONSE, secret_scan=False)
     _reject_secret_values(raw)
     if not isinstance(raw, dict):
         raise A2AError("expected task or message")
-    known = [key for key in ("task", "message") if key in raw]
-    if len(known) != 1:
-        raise A2AError("expected task or message")
-    envelope = raw
+    if allow_bare_task and "task" not in raw and "message" not in raw:
+        if not {"id", "status"} <= raw.keys():
+            raise A2AError("expected task")
+        envelope: Mapping[str, Any] = {"task": raw}
+    else:
+        known = [key for key in ("task", "message") if key in raw]
+        if len(known) != 1:
+            raise A2AError("expected task or message")
+        envelope = raw
     if "message" in envelope:
         if binding and binding["remote_task_id"]:
             raise A2AError("bound task cannot become direct message")
@@ -792,7 +839,9 @@ class Gateway:
             if self.interface.tenant is not None:
                 request["tenant"] = self.interface.tenant
             response = self.transport.get(self.interface, request, HEADER)
-            state, _, _, candidates = _parse_response(response, identity, data)
+            state, _, _, candidates = _parse_response(
+                response, identity, data, allow_bare_task=True
+            )
             data["last_observation"] = state
             if candidates:
                 data["candidates"] = _merge_candidate_records(data["candidates"], candidates)
@@ -823,7 +872,9 @@ class Gateway:
             if self.interface.tenant is not None:
                 request["tenant"] = self.interface.tenant
             response = self.transport.cancel(self.interface, request, HEADER)
-            state, _, _, candidates = _parse_response(response, identity, data)
+            state, _, _, candidates = _parse_response(
+                response, identity, data, allow_bare_task=True
+            )
             data["last_observation"] = state
             if candidates:
                 data["candidates"] = _merge_candidate_records(data["candidates"], candidates)
