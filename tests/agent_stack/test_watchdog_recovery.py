@@ -1013,3 +1013,24 @@ def test_invalid_watchdog_evidence_requests_replan_and_is_not_polled_again(tmp_p
     recovery.reconcile_watchdog_blocked_tasks()
     assert len(calls) == 1
     assert saved["run_token"] == "token-1"
+
+
+def test_worker_cleanup_marker_recovers_same_exact_completed_result(tmp_path, monkeypatch):
+    configure_paths(tmp_path)
+    now = datetime.now(timezone.utc)
+    payload = task(now)
+    payload.update(attempt_state="blocked", verification_status="accepted",
+                   watchdog_blocker="task_session_cleanup_failed")
+    path = recovery.BLOCKED / "task-1.json"
+    write_task(path, payload)
+    result = {"task_id": payload["id"], "run_token": payload["run_token"],
+              "status": "completed", "summary": "control done", "next_action": "continue", "blocker": None}
+    (recovery.RESULTS / "task-1.json").write_text(json.dumps(result))
+    monkeypatch.setattr(recovery, "active_worker_tasks", lambda: set())
+    monkeypatch.setattr(recovery, "cleanup_task_owned_pane", lambda *a: True)
+    recovery.reconcile_verification_pending()
+    saved = json.loads((recovery.DONE / path.name).read_text())
+    assert saved["attempt_state"] == "done"
+    assert saved["run_token"] == payload["run_token"]
+    assert "watchdog_blocker" not in saved
+    assert json.loads((recovery.RESULTS / "task-1.json").read_text()) == result

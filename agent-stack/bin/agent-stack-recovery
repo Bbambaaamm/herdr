@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from agent_completion_evidence import EvidenceError, record_verification_failure, verify_completion
+from agent_completion_evidence import EvidenceError, record_verification_failure, verification_applies, verify_completion
 
 HOME = Path("/home/agentops")
 HERDR = HOME / ".local/bin/herdr"
@@ -402,7 +402,8 @@ def terminalize_from_result(
 
     if status == "completed" and (not blocker or blocker.lower() in {"none", "null"}):
         try:
-            accepted = verify_completion(ROOT, task, result)
+            accepted = (verify_completion(ROOT, task, result) if verification_applies(task)
+                        else {"level": "legacy_unverified_result"})
         except EvidenceError as exc:
             waiting = record_verification_failure(task, exc)
             if waiting:
@@ -411,7 +412,8 @@ def terminalize_from_result(
             return
         task["completion_level"] = accepted["level"]
         task["completion_bundle_hash"] = accepted.get("bundle_hash", accepted.get("result_digest"))
-        task["verification_status"] = "accepted"
+        task["verification_status"] = ("accepted" if verification_applies(task)
+                                       else "legacy_unverified")
 
     if not cleanup_task_owned_pane(task):
         task["watchdog_cleanup_blocker"] = (
@@ -567,7 +569,8 @@ def reconcile_verification_pending() -> None:
             task = json.loads(path.read_text(encoding="utf-8"))
             due = task.get("not_before")
             waiting = (task.get("attempt_state") == "verification_pending"
-                       or task.get("watchdog_cleanup_blocker") == "task_session_cleanup_failed")
+                       or task.get("watchdog_cleanup_blocker") == "task_session_cleanup_failed"
+                       or task.get("watchdog_blocker") == "task_session_cleanup_failed")
             if (not waiting or task.get("verification_resolution") == "needs_replan"
                     or path.resolve() in active
                     or (due and datetime.fromisoformat(due.replace("Z", "+00:00")) > utcnow())):

@@ -73,3 +73,12 @@ evidence can wait. Metadata and changed blobs have an explicit 2 MB bound;
 exceeding it requires replanning rather than automatic verification polling.
 Reviews and unresolved threads are refreshed after resolving clean-comment
 commit candidates, before the final PR identity check.
+
+### Mutable final gates and recovery
+Required check runs and their workflow origin are recollected after resolving review candidates, alongside effective reviews and unresolved threads. A newly pending or failing rerun cannot reuse an older green snapshot. The Git verifier additionally uses a host-generated libseccomp filter to deny socket/network I/O and io_uring, including pathname-based AF_UNIX connections that a read-only mount alone would permit. A verifier timeout is temporary evidence unavailability; bounded output overflow remains a permanent rejection.
+
+Unique-address reads also compare every matching legacy record, even if the new address already exists. This prevents an intermediate upgrade from hiding contradictory historical outcomes. Original records remain retained.
+
+The worker retains an exact completed publication when pane cleanup fails after acceptance or verification waiting. Recovery recognizes both worker and watchdog cleanup markers and retries cleanup/verification on the same identity. Permanent rejection is exported as its actionable verification reason.
+
+Temporary predispatch plan failures reschedule the same unexecuted attempt with its identity intact. They do not consume another model delivery. Invalid policy/specification failures remain blocked. The currently configured coding/report policy applies to Herdr; other enabled consumers retain explicitly labelled legacy_unverified_result completion until their own trusted policies are configured. Their prior behavior is not silently relabelled as verified.

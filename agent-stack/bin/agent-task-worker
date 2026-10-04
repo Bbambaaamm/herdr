@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from agent_model_policy import decide as decide_model_route, record as record_model_route
-from agent_completion_evidence import EvidenceError, record_verification_failure, freeze_plan, verify_completion, completion_instructions
+from agent_completion_evidence import EvidenceError, record_verification_failure, verification_applies, freeze_plan, verify_completion, completion_instructions
 
 HOME = Path("/home/agentops")
 HERDR = HOME / ".local/bin/herdr"
@@ -62,7 +62,8 @@ def archive_previous_result(task_id: str, attempt: int) -> None:
 
 def prepare_attempt(task: dict) -> None:
     """Allocate one semantic execution attempt; reconciliation reuses it."""
-    if task.get("attempt_state") == "delivery_uncertain" and task.get("run_token"):
+    if (task.get("attempt_state") == "delivery_uncertain"
+            or task.get("completion_plan_pending")) and task.get("run_token"):
         return
     session = task.get("execution_session")
     if (
@@ -368,9 +369,11 @@ def cleanup_task_session_if_safe(task: dict) -> bool:
         path = current_task_path(task)
         if path is not None:
             task["watchdog_blocker"] = "task_session_cleanup_failed"
-            archive_previous_result(
-                str(task["id"]), int(task.get("attempts") or 0)
-            )
+            # Retain the exact completed publication for host reconciliation.
+            # A cleanup failure cannot replace accepted/pending evidence.
+            if task.get("verification_status") not in {
+                    "accepted", "evidence_missing", "evidence_unavailable", "evidence_invalid"}:
+                archive_previous_result(str(task["id"]), int(task.get("attempts") or 0))
             block_task(
                 path,
                 task,
@@ -682,7 +685,8 @@ def finish(task_path: Path, task: dict, output: str) -> None:
     blocker = str(result.get("blocker") or "").strip()
     if str(result.get("status") or "") == "completed" and (not blocker or blocker.lower() in {"none", "null"}):
         try:
-            accepted = verify_completion(ROOT, task, result)
+            accepted = (verify_completion(ROOT, task, result) if verification_applies(task)
+                        else {"level": "legacy_unverified_result"})
         except EvidenceError as exc:
             waiting = record_verification_failure(task, exc)
             if waiting:
@@ -693,7 +697,8 @@ def finish(task_path: Path, task: dict, output: str) -> None:
             return
         task["completion_level"] = accepted["level"]
         task["completion_bundle_hash"] = accepted.get("bundle_hash", accepted.get("result_digest"))
-        task["verification_status"] = "accepted"
+        task["verification_status"] = ("accepted" if verification_applies(task)
+                                       else "legacy_unverified")
 
     status = str(result.get("status") or "")
     blocker = str(result.get("blocker") or "").strip()
@@ -766,9 +771,19 @@ def main(task_path: Path) -> int:
         prepare_attempt(task)
         try:
             freeze_plan(ROOT, task)
+            task.pop("completion_plan_pending", None)
         except EvidenceError as exc:
+            from herdr.evidence import EvidenceUnavailable
             task["last_error"] = str(exc)
-            block_task(task_path, task, exc.code, "Trusted completion plan is unavailable before dispatch.")
+            if isinstance(exc, EvidenceUnavailable):
+                task["completion_plan_pending"] = True
+                task["attempt_state"] = "retry_scheduled"
+                task["not_before"] = (utcnow() + timedelta(seconds=60)).isoformat()
+                write_json(task_path, task)
+                move(task_path, PENDING)
+            else:
+                task["verification_resolution"] = "needs_replan"
+                block_task(task_path, task, exc.code, "Trusted completion plan is invalid before dispatch.")
             return 0
         attempt = int(task.get("attempts") or 0)
         decision = decide_model_route(task)

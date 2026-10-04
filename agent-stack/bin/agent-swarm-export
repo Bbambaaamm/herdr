@@ -362,6 +362,9 @@ def bounded_history(records):
 def sanitized_blocker(raw, result, state):
     if state == "done":
         return None
+    if raw.get("verification_resolution") == "needs_replan":
+        status = raw.get("verification_status")
+        return status if status in {"evidence_invalid", "evidence_missing", "evidence_unavailable"} else "evidence_invalid"
     if raw.get("attempt_state") == "verification_pending":
         status = raw.get("verification_status")
         return status if status in {"evidence_missing", "evidence_unavailable", "evidence_invalid"} else "verification_pending"

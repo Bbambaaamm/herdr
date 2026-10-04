@@ -258,6 +258,16 @@ class SwarmExportTests(unittest.TestCase):
             sources.SWARM_PATH = previous
         self.assertEqual(normalized[0]["tasks"][0]["attempt_state"], "verification_pending")
 
+    def test_permanent_verification_replan_exports_reason(self):
+        self.write_task("blocked", self.herdr_task(
+            attempt_state="blocked", verification_status="evidence_invalid",
+            verification_resolution="needs_replan", attempts=1, run_token="same-run"))
+        payload = self.exporter.materialize(self.exporter.load_records(), observed_at=100)
+        row = payload["tasks"][0]
+        self.assertEqual(row["state"], "blocked")
+        self.assertEqual(row["blocker"], "evidence_invalid")
+        self.assertEqual(row["attempts"], 1)
+
     def test_closed_issue_is_explicit_and_cannot_mask_open_work(self):
         self.exporter.INTAKE.write_text(
             json.dumps({

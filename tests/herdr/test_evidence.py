@@ -503,3 +503,61 @@ def test_bounded_git_output_failure_is_permanent_rejection(tmp_path, monkeypatch
     with pytest.raises(EvidenceError, match="bounded") as error:
         read_only_git(tmp_path)(["ls-tree", "-r", "HEAD"])
     assert not isinstance(error.value, (EvidenceMissing, EvidenceUnavailable))
+
+
+def test_unique_record_does_not_mask_a_contradictory_legacy_outcome(tmp_path):
+    task, result, plan, store, path, proof = fixture(tmp_path)
+    proof["review"]["pull_request"] = 4
+    first = accept_artifact(task, result, plan, store, path, lambda *a: proof)
+    legacy = {k: v for k, v in first.items() if k not in {"bundle_hash", "publication_hash"}}
+    old_key = digest({"identity": binding(task), "plan_hash": plan["plan_hash"], "artifact": legacy["artifact"]})
+    store.publish("accepted", old_key, legacy)
+    assert accept_artifact(task, result, plan, store, path, lambda *a: proof) == first
+    contradictory = json.loads(json.dumps(legacy))
+    contradictory["artifact"]["commit_sha"] = "e" * 40
+    other_key = digest({"identity": binding(task), "plan_hash": plan["plan_hash"], "artifact": contradictory["artifact"]})
+    store.publish("accepted", other_key, contradictory)
+    with pytest.raises(EvidenceError, match="conflicting legacy and unique"):
+        accept_artifact(task, result, plan, store, path, lambda *a: proof)
+    assert len(list(store.root.glob("accepted-*"))) == 3
+
+
+def test_actual_git_timeout_is_transient(tmp_path, monkeypatch):
+    from herdr.evidence import read_only_git
+    monkeypatch.setattr("herdr.evidence.artifact_command",
+                        lambda *a, **k: (_ for _ in ()).throw(ValueError("source_timeout")))
+    with pytest.raises(EvidenceUnavailable, match="timed out"):
+        read_only_git(tmp_path)(["rev-parse", "HEAD"])
+
+
+def test_actual_git_filter_cannot_reach_host_unix_control_socket(tmp_path):
+    from herdr.evidence import read_only_git
+    import socket
+    import tempfile
+    base = Path(os.environ.get("HERDR_BOUNDARY_TEST_ROOT", "/home/agentops/tmp"))
+    if not shutil.which("bwrap") or not base.is_dir() or not os.access(base, os.W_OK):
+        pytest.skip("physical artifact verifier fixture root is unavailable")
+    with tempfile.TemporaryDirectory(prefix="git-unix-boundary-", dir=base) as directory:
+        task, result, plan, store, workspace, proof = fixture(Path(directory))
+        control = Path(directory) / "control.sock"
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind(str(control))
+            listener.listen(1)
+            listener.settimeout(0.15)
+            malicious = Path(directory) / "clean-filter.py"
+            malicious.write_text("""import socket,sys
+try:
+    client=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+    client.connect(sys.argv[1]); client.sendall(b'host-control')
+except OSError:
+    pass
+else:
+    raise SystemExit('control socket accessible')
+sys.stdout.buffer.write(sys.stdin.buffer.read()+b'filter-ran')
+""")
+            (workspace / ".gitattributes").write_text("result.txt filter=attack\n")
+            run_git(workspace, "config", "filter.attack.clean", f"/usr/bin/python3 {malicious} {control}")
+            filtered = read_only_git(workspace)(["hash-object", "--path=result.txt", str(workspace / "result.txt")])
+            assert filtered.strip() != run_git(workspace, "hash-object", "--no-filters", str(workspace / "result.txt"))
+            with pytest.raises(socket.timeout):
+                listener.accept()

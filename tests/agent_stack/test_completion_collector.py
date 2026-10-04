@@ -288,3 +288,42 @@ def test_missing_immutable_coding_publication_fields_require_replan(tmp_path, mo
     with pytest.raises(EvidenceError) as error:
         collector.verify_completion(store.root.parent, task, result)
     assert not isinstance(error.value, (EvidenceMissing, EvidenceUnavailable))
+
+
+@pytest.mark.parametrize("fault", ["rerun_pending", "rerun_wrong_workflow"])
+def test_required_checks_and_workflow_are_refreshed_at_final_gate(monkeypatch, fault):
+    from copy import deepcopy
+    artifact, plan, pr, checks, comment = proof_fixture()
+    install_transport(monkeypatch, artifact, plan, pr, checks, comment)
+    old = collector.github
+    counts = {"checks": 0, "workflow": 0}
+    def api(path):
+        data = deepcopy(old(path))
+        if "check-runs" in path:
+            counts["checks"] += 1
+            if counts["checks"] == 2 and fault == "rerun_pending":
+                row = deepcopy(data["check_runs"][0])
+                row.update(id=20, status="in_progress", conclusion=None)
+                data["check_runs"].append(row)
+        if "/actions/runs/" in path:
+            counts["workflow"] += 1
+            if counts["workflow"] == 2 and fault == "rerun_wrong_workflow":
+                data["workflow_id"] = 1
+        return data
+    monkeypatch.setattr(collector, "github", api)
+    with pytest.raises(EvidenceError):
+        collector.collect_github(plan, artifact, 4)
+    assert counts["checks"] == 2
+
+
+def test_herdr_policy_does_not_freeze_other_consumer_tasks(tmp_path):
+    task = {"id": "quantlab-1", "repo": "Bbambaaamm/Autonomous-Quant-Lab",
+            "kind": "github_issue_slice", "run_token": "run", "idempotency_key": "key"}
+    assert not collector.verification_applies(task)
+    collector.freeze_plan(tmp_path, task)
+    assert not (tmp_path / "verification").exists()
+    assert "legacy unverified" in collector.completion_instructions(task)
+    task["completion_plan"] = {"plan_hash": "a" * 64}
+    assert collector.verification_applies(task)
+    with pytest.raises(EvidenceError, match="consumer verification policy"):
+        collector.freeze_plan(tmp_path, task)

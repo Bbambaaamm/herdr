@@ -145,9 +145,9 @@ class EvidenceStore:
         """
         key = digest({"identity": identity, "plan_hash": plan_hash})
         try:
-            return self.read("accepted", key), False
+            unique = self.read("accepted", key)
         except EvidenceMissing:
-            pass
+            unique = None
         matches = []
         for index, path in enumerate(sorted(self.root.glob("accepted-*.json"))):
             if index >= 10_000:
@@ -155,6 +155,8 @@ class EvidenceStore:
             address = path.name.removeprefix("accepted-").removesuffix(".json")
             if not _SHA.fullmatch(address):
                 raise EvidenceError("invalid legacy evidence address")
+            if address == key:
+                continue
             record = self.read("accepted", address)
             if record.get("identity") != identity or record.get("plan_hash") != plan_hash:
                 continue
@@ -172,6 +174,12 @@ class EvidenceStore:
             if address != legacy_key:
                 raise EvidenceError("legacy completion address does not bind its payload")
             matches.append(record)
+        if unique is not None:
+            comparable = {k: v for k, v in unique.items() if k != "publication_hash"}
+            if any({k: v for k, v in item.items() if k != "publication_hash"} != comparable
+                   for item in matches):
+                raise EvidenceError("conflicting legacy and unique attempt records require trusted replan")
+            return unique, False
         if not matches:
             return None, False
         if any(item != matches[0] for item in matches[1:]):
@@ -214,6 +222,58 @@ class EvidenceStore:
         return content_hash
 
 
+def network_denial_filter():
+    """Return a host-generated BPF FD; fail closed without libseccomp."""
+    import ctypes
+    import errno
+    lib = None
+    ctx = None
+    fd = None
+    try:
+        lib = ctypes.CDLL("libseccomp.so.2")
+        lib.seccomp_init.argtypes = [ctypes.c_uint32]
+        lib.seccomp_init.restype = ctypes.c_void_p
+        lib.seccomp_release.argtypes = [ctypes.c_void_p]
+        lib.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
+        lib.seccomp_syscall_resolve_name.restype = ctypes.c_int
+        lib.seccomp_rule_add.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                        ctypes.c_int, ctypes.c_uint]
+        lib.seccomp_rule_add.restype = ctypes.c_int
+        lib.seccomp_export_bpf.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.seccomp_export_bpf.restype = ctypes.c_int
+        ctx = lib.seccomp_init(0x7fff0000)  # SCMP_ACT_ALLOW; other ABIs fail closed.
+        if not ctx:
+            raise EvidenceUnavailable("artifact syscall filter cannot initialize")
+        for name in ("socket", "socketpair", "connect", "accept", "accept4", "bind",
+                     "listen", "sendto", "sendmsg", "sendmmsg", "recvfrom", "recvmsg",
+                     "recvmmsg", "shutdown", "getsockname", "getpeername",
+                     "setsockopt", "getsockopt", "io_uring_setup", "io_uring_enter",
+                     "io_uring_register"):
+            number = lib.seccomp_syscall_resolve_name(name.encode("ascii"))
+            if number == -1:
+                if name in {"socket", "connect"}:
+                    raise EvidenceUnavailable("mandatory artifact syscall cannot resolve")
+                continue
+            if lib.seccomp_rule_add(ctx, 0x00050000 | errno.EPERM, number, 0) != 0:
+                raise EvidenceUnavailable("artifact syscall filter rule failed")
+        fd = os.memfd_create("herdr-artifact-network-denial", os.MFD_CLOEXEC)
+        if lib.seccomp_export_bpf(ctx, fd) != 0:
+            raise EvidenceUnavailable("artifact syscall filter cannot export")
+        os.lseek(fd, 0, os.SEEK_SET)
+        return fd
+    except (OSError, AttributeError) as exc:
+        if fd is not None:
+            os.close(fd)
+        raise EvidenceUnavailable("artifact syscall isolation is unavailable") from exc
+    except EvidenceError:
+        if fd is not None:
+            os.close(fd)
+        raise
+    finally:
+        if lib is not None and ctx:
+            lib.seccomp_release(ctx)
+
+
 def read_only_git(root: Path):
     """Untrusted worktree Git configuration never runs in the host namespace.
 
@@ -225,20 +285,27 @@ def read_only_git(root: Path):
     if not bwrap.is_file() or not git.is_file():
         raise EvidenceUnavailable("read-only artifact verifier is unavailable")
     def raw(args):
+        seccomp_fd = network_denial_filter()
         command = [
             str(bwrap), "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
-            "--unshare-pid", "--unshare-net", "--tmpfs", "/tmp", "--clearenv",
+            "--unshare-pid", "--unshare-net", "--seccomp", str(seccomp_fd),
+            "--tmpfs", "/tmp", "--clearenv",
             "--setenv", "PATH", "/usr/bin:/bin", "--setenv", "HOME", "/tmp",
             "--", str(git), "--no-optional-locks", "--no-replace-objects",
             "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
             "-c", "diff.external=", "-C", str(root), *args,
         ]
         try:
-            return artifact_command(command, limit=2_000_000, timeout=30)
+            return artifact_command(command, limit=2_000_000, timeout=30,
+                                    pass_fds=(seccomp_fd,))
         except ValueError as exc:
+            if str(exc) == "source_timeout":
+                raise EvidenceUnavailable("artifact verifier temporarily timed out") from exc
             raise EvidenceError("bounded artifact metadata or blob output exceeded") from exc
         except (OSError, subprocess.SubprocessError) as exc:
             raise EvidenceUnavailable("artifact verifier execution unavailable") from exc
+        finally:
+            os.close(seccomp_fd)
     def run(args):
         try:
             return raw(args).decode("utf-8")

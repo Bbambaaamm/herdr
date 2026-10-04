@@ -205,6 +205,10 @@ def _collect_github(plan: dict, artifact, number):
            and r.get("state") in {"COMMENTED", "CHANGES_REQUESTED"}
            for r in latest_reviews):
         raise EvidenceMissing("newer exact-commit review must be reconciled")
+    # A rerun can supersede a previously green check during review collection.
+    checks = collect_checks(repo, artifact.commit_sha, plan["required_checks"],
+                            require_success=True)
+    verify_workflow(plan, artifact, checks)
     latest = github(f"repos/{repo}/pulls/{number}")
     if _pr_binding(latest) != initial_binding:
         raise EvidenceError("pull request changed during evidence collection; replan is required")
@@ -268,7 +272,15 @@ def advertise_plan(task: dict, plan: dict) -> None:
             task["completion_plan"][key] = plan[key]
 
 
+def verification_applies(task: dict) -> bool:
+    # A persisted plan remains binding even if a trusted task edit changes repo.
+    return (task.get("repo") == POLICY["repo"] or completion_kind(task) == "control"
+            or bool(task.get("completion_plan")))
+
+
 def completion_instructions(task: dict) -> str:
+    if not verification_applies(task):
+        return "\nHost policy: this consumer currently retains legacy unverified completion; do not claim verified worker result, integration or deployment.\n"
     kind = completion_kind(task)
     plan = task.get("completion_plan") or {}
     common = ("\nHOST COMPLETION VERIFICATION:\n"
@@ -292,11 +304,13 @@ def completion_instructions(task: dict) -> str:
 
 
 def freeze_plan(root: Path, task: dict) -> None:
+    if not verification_applies(task):
+        return
     kind = completion_kind(task)
     if kind not in {"coding", "control", "research", "review"}:
         raise EvidenceError(f"typed {kind} immutable completion contract is not configured")
     if kind != "control" and task.get("repo") != POLICY["repo"]:
-        raise EvidenceMissing("consumer verification policy is not configured")
+        raise EvidenceError("consumer verification policy is not configured")
     criteria = task.get("completion_contract")
     if kind in {"research", "review"}:
         validate_criteria(kind, criteria)

@@ -965,3 +965,56 @@ def test_incomplete_control_publication_is_replan_not_missing_late_evidence(tmp_
         assert saved["verification_resolution"] == "needs_replan"
         assert saved["attempts"] == 0
         (worker.BLOCKED / path.name).unlink()
+
+
+def test_predispatch_outage_retries_same_unexecuted_attempt(tmp_path, monkeypatch):
+    from herdr.evidence import EvidenceUnavailable
+    configure_paths(tmp_path)
+    monkeypatch.setattr(worker, "LOCK", tmp_path / "worker.lock")
+    task = base_task()
+    path = worker.RUNNING / "task-1.json"
+    worker.write_json(path, task)
+    calls = []
+    def unavailable(root, task):
+        calls.append((task["run_token"], task["idempotency_key"], task["attempt_id"]))
+        raise EvidenceUnavailable("baseline service offline")
+    monkeypatch.setattr(worker, "freeze_plan", unavailable)
+    monkeypatch.setattr(worker, "create_task_session",
+                        lambda *a: (_ for _ in ()).throw(AssertionError("economic dispatch")))
+    assert worker.main(path) == 0
+    pending = worker.PENDING / path.name
+    first = json.loads(pending.read_text())
+    assert first["completion_plan_pending"] and first["attempts"] == 0
+    assert first["attempt_state"] == "retry_scheduled"
+    assert not worker.result_path("task-1").exists()
+    assert worker.main(pending) == 0
+    second = json.loads(pending.read_text())
+    assert first["run_token"] == second["run_token"]
+    assert calls[0] == calls[1]
+    assert not list(worker.BLOCKED.iterdir())
+
+
+def test_worker_cleanup_failure_retains_completed_publication_for_recovery(tmp_path, monkeypatch):
+    task, path, result = verification_task(tmp_path)
+    task["execution_session"] = {"owned_pane": True, "pane_id": "pane"}
+    monkeypatch.setattr(worker, "verify_completion", lambda *a:
+                        {"level": "verified_worker_result", "bundle_hash": "a" * 64})
+    monkeypatch.setattr(worker, "cleanup_task_session", lambda *a: False)
+    worker.finish(path, task, "")
+    assert worker.cleanup_task_session_if_safe(task) is False
+    blocked = worker.BLOCKED / path.name
+    saved = json.loads(blocked.read_text())
+    assert saved["watchdog_blocker"] == "task_session_cleanup_failed"
+    assert saved["verification_status"] == "accepted"
+    assert json.loads(worker.result_path(task["id"]).read_text()) == result
+    assert not list(worker.RESULTS.glob("*.previous-*.json"))
+
+
+def test_other_consumer_completion_remains_explicitly_unverified(tmp_path):
+    task, path, result = verification_task(tmp_path)
+    task["repo"] = "Bbambaaamm/Autonomous-Quant-Lab"
+    worker.finish(path, task, "")
+    saved = json.loads((worker.DONE / path.name).read_text())
+    assert saved["completion_level"] == "legacy_unverified_result"
+    assert saved["completion_bundle_hash"] is None
+    assert saved["verification_status"] == "legacy_unverified"
