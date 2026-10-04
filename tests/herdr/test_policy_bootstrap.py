@@ -395,6 +395,8 @@ def test_stage2_direct_execution_without_stage1_proof_is_rejected(monkeypatch):
 
 def test_stage1_execs_verified_stage2_source_fd(monkeypatch):
     module = _stage1()
+    from herdr.launch_environment import sanitize_environment
+    monkeypatch.setattr(module.os,"environ",sanitize_environment(module.os.environ))
     monkeypatch.setattr(module, "_require_independent_stage0", lambda: None)
     monkeypatch.setattr(module, "_mount_rows", lambda: {})
     monkeypatch.setattr(module, "_require_exact_ro_tree", lambda *args: None)
