@@ -42,6 +42,7 @@ def test_fixed_production_entry_preserves_argv_without_policy_override(monkeypat
     monkeypatch.setenv(module._INTERPRETER_FD_ENV, 'test-stage-two')
     monkeypatch.setenv(module.STAGE1_PROOF_ENV, 'a' * 64)
     monkeypatch.setenv(module.STAGE2_FD_ENV, '9')
+    monkeypatch.setenv(module.BOOTSTRAP_AUTH_FD_ENV, '10')
     monkeypatch.setattr(sys, 'argv', [str(LAUNCHER), '--grant', '/model/choice', '--key-fd', '3'])
     assert module.main() == 0
     assert seen == [['--grant', '/model/choice', '--key-fd', '3']]
@@ -62,7 +63,7 @@ def test_policy_bin_hermes_invokes_guarded_launcher():
     )
     module = _launcher()
     with pytest.raises(
-        SystemExit, match="security path is not on a dedicated read-only trust mount"
+        SystemExit, match="security path (?:must have exactly one mountpoint|is not on a dedicated read-only trust mount)"
     ):
         module._require_production_mount(module.BUNDLE_PATH, exact=True)
 
@@ -248,6 +249,7 @@ def test_production_trust_mount_requires_dedicated_readonly_exact_root(monkeypat
 
     monkeypatch.setattr(module, "_covering_mount", lambda path: (trusted, {"ro", "nosuid"}))
     monkeypatch.setattr(module, "_mount_rows", lambda: {str(trusted): {"ro", "nosuid"}})
+    monkeypatch.setattr(module, "_mountpoint_count", lambda path: 1)
     module._require_production_mount(trusted, exact=True)
 
     for nested_mode in ("rw", "ro"):
@@ -284,11 +286,14 @@ def test_production_bootstrap_checks_all_lifetime_trust_roots_before_hashing(mon
         if path == module.PYTHON_ROOT:
             raise RuntimeError("stop-after-trust-roots")
 
+    monkeypatch.setattr(module, "_require_host_bootstrap_authority",
+                        lambda: calls.append(("hostauth", True)))
     monkeypatch.setattr(module, "_require_stage1_continuity", lambda: calls.append(("stage1", True)))
     monkeypatch.setattr(module, "_require_production_mount", require)
     with pytest.raises(RuntimeError, match="stop-after-trust-roots"):
         module.bootstrap([])
     assert calls == [
+        ("hostauth", True),
         ("stage1", True),
         (module.BUNDLE_PATH, True),
         (module.POLICY_CODE_ROOT, True),
@@ -366,6 +371,7 @@ def test_stage2_direct_execution_without_stage1_proof_is_rejected(monkeypatch):
     monkeypatch.delenv(module._INTERPRETER_FD_ENV, raising=False)
     monkeypatch.delenv(module.STAGE1_PROOF_ENV, raising=False)
     monkeypatch.delenv(module.STAGE2_FD_ENV, raising=False)
+    monkeypatch.delenv(module.BOOTSTRAP_AUTH_FD_ENV, raising=False)
     with pytest.raises(SystemExit, match="verified immutable stage-one bootstrap required"):
         module.main()
 
@@ -379,6 +385,8 @@ def test_stage1_execs_verified_stage2_source_fd(monkeypatch):
     monkeypatch.setattr(module, "_verify_trees", lambda *args: None)
     monkeypatch.setattr(module, "_open_verified_stage2", lambda: 41)
     monkeypatch.setattr(module, "_open_verified_python", lambda: 42)
+    monkeypatch.setattr(module, "_connect_host_authority", lambda *args: 43)
+    monkeypatch.setattr(module, "_fresh_pycache_prefix", lambda: "/tmp/herdr-policy-pycache-test")
     monkeypatch.setattr(module.os, "set_inheritable", lambda *args: None)
     seen = {}
 
@@ -391,11 +399,13 @@ def test_stage1_execs_verified_stage2_source_fd(monkeypatch):
         module.main(["chat", "--profile", "test"])
     assert seen["executable"] == "/proc/self/fd/42"
     assert seen["argv"] == [
-        "/proc/self/fd/42", "-I", "-S", "/proc/self/fd/41",
+        "/proc/self/fd/42", "-I", "-S", "-X",
+        "pycache_prefix=/tmp/herdr-policy-pycache-test", "/proc/self/fd/41",
         "chat", "--profile", "test",
     ]
     assert seen["env"][module.INTERPRETER_FD_ENV] == "42"
     assert seen["env"][module.STAGE2_FD_ENV] == "41"
+    assert seen["env"][module.AUTHORITY_FD_ENV] == "43"
     assert seen["env"][module.PROOF_ENV] == hashlib.sha256(b"proof").hexdigest()
 
 
@@ -410,3 +420,33 @@ def test_stage2_continuity_binds_loaded_source_to_held_fd(monkeypatch):
             module._require_held_stage2_source(str(other))
     finally:
         os.close(fd)
+
+
+def test_bundle_trust_path_rejects_stacked_mountpoints(monkeypatch, tmp_path):
+    module = _launcher()
+    trusted = tmp_path / "bundle.json"
+    monkeypatch.setattr(module, "_mountpoint_count", lambda path: 2)
+    monkeypatch.setattr(module, "_covering_mount", lambda path: (trusted, {"ro"}))
+    monkeypatch.setattr(module, "_mount_rows", lambda: {str(trusted): {"ro"}})
+    with pytest.raises(SystemExit, match="exactly one mountpoint"):
+        module._require_production_mount(trusted, exact=True)
+
+    monkeypatch.setattr(module, "_mountpoint_count", lambda path: 1)
+    module._require_production_mount(trusted, exact=True)
+
+
+def test_runtime_requires_startup_pycache_prefix(monkeypatch):
+    module = _launcher()
+    monkeypatch.setattr(module.sys, "pycache_prefix", None)
+    with pytest.raises(SystemExit, match="pycache prefix"):
+        module._require_startup_pycache_prefix()
+
+
+def test_stage1_rejects_stacked_exact_trust_root(tmp_path):
+    module = _stage1()
+    root = tmp_path / "bootstrap"
+    root.mkdir()
+    info = root.stat()
+    rows = {str(root): {"ro", "__stacked__"}}
+    with pytest.raises(SystemExit, match="one exact read-only trust mount"):
+        module._require_exact_ro_tree(root, rows)

@@ -1014,6 +1014,22 @@ class ProviderCircuitBreaker:
             raise PolicyDenied("provider_isolated", reason)
 
 
+def _recv_bounded_line(stream: socket.socket, *, limit: int = 256) -> bytes:
+    """Read exactly one bounded newline-terminated authority response."""
+    data = bytearray()
+    while len(data) < limit:
+        chunk = stream.recv(min(64, limit - len(data)))
+        if not chunk:
+            break
+        data.extend(chunk)
+        if b"\n" in data:
+            line, tail = bytes(data).split(b"\n", 1)
+            if tail:
+                raise OSError("approval authority sent trailing data")
+            return line + b"\n"
+    raise OSError("approval authority response incomplete or oversized")
+
+
 @dataclass
 class InvocationGuard:
     grant: SecurityGrant
@@ -1149,7 +1165,7 @@ class InvocationGuard:
                     client.settimeout(2)
                     client.connect(str(self.approval_socket))
                     client.sendall(request)
-                    answer = client.recv(256)
+                    answer = _recv_bounded_line(client, limit=256)
             except (OSError, TimeoutError) as exc:
                 raise PolicyDenied("approval_authority_unavailable") from exc
             if answer == b"consumed\n":

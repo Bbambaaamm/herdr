@@ -840,3 +840,28 @@ def test_signed_envelope_round_trip_is_deterministic(tmp_path):
     decoded = SignedGrantEnvelope.from_dict(json.loads(encoded))
     assert decoded.to_json() == envelope.to_json()
     assert decoded.grant.hash == item.hash
+
+
+def test_approval_response_fragmentation_is_read_through_newline(monkeypatch, tmp_path):
+    args = {"path": str((tmp_path / "out.txt").resolve()), "content": "ok"}
+    digest = canonical_digest({"tool": "write_file", "args": args})
+    item = grant(
+        tmp_path, tools=("write_file",),
+        approvals=(ApprovalEvidence("fragmented", identity(), "write_file", digest),),
+        approval_required_for=(RiskClass.WORKSPACE_WRITE,),
+    )
+
+    class FakeSocket:
+        def __init__(self, *unused):
+            self.parts = [b"con", b"sum", b"ed", b"\n"]
+        def __enter__(self): return self
+        def __exit__(self, *unused): return False
+        def settimeout(self, value): pass
+        def connect(self, path): pass
+        def sendall(self, data): assert data.endswith(b"\n")
+        def recv(self, size): return self.parts.pop(0) if self.parts else b""
+
+    monkeypatch.setattr(security.socket, "socket", FakeSocket)
+    assert InvocationGuard(item, assurance(), approval_socket=tmp_path / "authority.sock").authorize_tool(
+        "write_file", args
+    ) == "write_file"

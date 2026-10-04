@@ -275,6 +275,40 @@ def main() -> int:
         assert lifecycle._try_refresh_anthropic_client_credentials() is False
 
         installation.uninstall()
+
+        # A granted local write goes through the pinned RootFDWorkspace facade,
+        # not a re-opened model pathname. This proves the installed Hermes
+        # registry/file_tools seam actually uses the #76 nofollow adapter.
+        write_scope = replace(
+            scope,
+            tools=("write_file",),
+            permissions=("workspace-write",),
+        )
+        write_grant = replace(
+            grant,
+            grant_id="hermes-v0215-write-probe",
+            scope=write_scope,
+            tool_rules=(
+                ToolRule(
+                    tool="write_file",
+                    risk=RiskClass.WORKSPACE_WRITE,
+                    allowed_arg_keys=("path", "content"),
+                    path_fields=("path",),
+                    allowed_roots=(str(workspace),),
+                ),
+            ),
+        )
+        installation = install_hermes_guard(InvocationGuard(write_grant))
+        allowed_write = workspace / "rootfd-write.txt"
+        write_result = model_tools.handle_function_call(
+            "write_file",
+            {"path": str(allowed_write), "content": "ROOTFD_OK\n"},
+            **common,
+        )
+        assert "HERDR_SECURITY_DENIED" not in str(write_result), write_result
+        assert allowed_write.read_text(encoding="utf-8") == "ROOTFD_OK\n"
+        installation.uninstall()
+
         patch_scope = replace(
             scope,
             tools=("patch",),
@@ -318,6 +352,7 @@ def main() -> int:
             "status": "PASS",
             "hermes_file_toolset": sorted(file_toolset),
             "read_file_allowed": True,
+            "rootfd_write_allowed": True,
             "write_file_skip_flags_denied": True,
             "direct_registry_write_denied": True,
             "legacy_alias_denied": True,

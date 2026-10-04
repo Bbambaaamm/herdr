@@ -12,11 +12,14 @@ import hashlib
 import json
 import os
 import re
+import socket
 import stat
 from pathlib import Path
 
 BOOTSTRAP_ROOT = Path("/run/herdr-bootstrap")
 PROOF_PATH = BOOTSTRAP_ROOT / "immutable-trees.json"
+STAGE1_PATH = BOOTSTRAP_ROOT / "agent-hermes-policy-stage1"
+BUNDLE_PATH = Path("/run/herdr-policy/grant.bundle.json")
 POLICY_CODE_ROOT = Path("/run/herdr/policy-code")
 HERMES_ROOT = Path("/home/agentops/.hermes/hermes-agent")
 PYTHON_ROOT = Path("/home/agentops/.local/share/uv/python/cpython-3.11.16-linux-x86_64-gnu")
@@ -29,6 +32,11 @@ PROOF_AUTHORITY = "herdr-host-frozen-tree"
 PROOF_ENV = "HERDR_POLICY_STAGE1_PROOF_SHA256"
 INTERPRETER_FD_ENV = "HERDR_VERIFIED_PYTHON_FD"
 STAGE2_FD_ENV = "HERDR_VERIFIED_STAGE2_FD"
+AUTHORITY_SOCKET = Path("/run/herdr-policy/bootstrap-authority.sock")
+AUTHORITY_FD_ENV = "HERDR_BOOTSTRAP_AUTH_FD"
+MAX_AUTH_RESPONSE = 128
+MAX_BUNDLE = 2 * 1024 * 1024
+MAX_STAGE1 = 4 * 1024 * 1024
 MAX_PROOF = 65536
 MAX_MOUNTINFO = 1048576
 MAX_POLICY_FILES = 65536
@@ -92,15 +100,21 @@ def _mount_rows(path: Path = Path("/proc/self/mountinfo")) -> dict[str, set[str]
         fields = line.split(" - ", 1)[0].split()
         if len(fields) < 6:
             _fail("bootstrap mount evidence malformed")
-        rows[_unescape(fields[4])] = set(fields[5].split(","))
+        mountpoint = _unescape(fields[4])
+        modes = set(fields[5].split(","))
+        if mountpoint in rows:
+            rows[mountpoint].add("__stacked__")
+            rows[mountpoint].update(modes)
+        else:
+            rows[mountpoint] = modes
     return rows
 
 
 def _require_exact_ro_tree(path: Path, rows: dict[str, set[str]]) -> os.stat_result:
     target = str(path)
     modes = rows.get(target)
-    if modes is None or "ro" not in modes or path == Path("/"):
-        _fail(f"security path is not an exact read-only trust mount: {path}")
+    if modes is None or "ro" not in modes or path == Path("/") or "__stacked__" in modes:
+        _fail(f"security path is not one exact read-only trust mount: {path}")
     for name in rows:
         if name == target:
             continue
@@ -255,6 +269,73 @@ def _verify_trees(proof: dict, rows: dict[str, set[str]]) -> None:
         _fail("policy snapshot digest mismatch")
 
 
+def _sha256_fd(fd: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(fd, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    os.lseek(fd, 0, os.SEEK_SET)
+    return digest.hexdigest()
+
+
+def _recv_status(connection: socket.socket, expected: bytes) -> None:
+    data = bytearray()
+    while len(data) < MAX_AUTH_RESPONSE:
+        chunk = connection.recv(min(64, MAX_AUTH_RESPONSE - len(data)))
+        if not chunk:
+            break
+        data.extend(chunk)
+        if b"\n" in data:
+            line, tail = bytes(data).split(b"\n", 1)
+            if tail or line + b"\n" != expected:
+                _fail("bootstrap authority denied stage one")
+            return
+    _fail("bootstrap authority response incomplete")
+
+
+def _connect_host_authority(proof_raw: bytes, stage2_fd: int, python_fd: int) -> int:
+    request = {
+        "op": "stage1",
+        "identity": _identity_from_env(),
+        "proof_sha256": hashlib.sha256(proof_raw).hexdigest(),
+        "stage1_sha256": hashlib.sha256(_read_regular(STAGE1_PATH, MAX_STAGE1)).hexdigest(),
+        "stage2_sha256": _sha256_fd(stage2_fd),
+        "python_sha256": _sha256_fd(python_fd),
+        "bundle_sha256": hashlib.sha256(_read_regular(BUNDLE_PATH, MAX_BUNDLE)).hexdigest(),
+    }
+    payload = _canonical(request) + b"\n"
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        connection.settimeout(5)
+        connection.connect(str(AUTHORITY_SOCKET))
+        connection.sendall(payload)
+        _recv_status(connection, b"stage1-ok\n")
+        fd = connection.detach()
+    except BaseException:
+        connection.close()
+        raise
+    os.set_inheritable(fd, True)
+    return fd
+
+
+def _fresh_pycache_prefix() -> str:
+    for _ in range(8):
+        token = hashlib.sha256(os.urandom(32)).hexdigest()[:24]
+        path = Path("/tmp") / f"herdr-policy-pycache-{os.getpid()}-{token}"
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            continue
+        info = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or (info.st_mode & 0o077):
+            _fail("fresh pycache prefix is not private")
+        return str(path)
+    _fail("cannot create fresh pycache prefix")
+
+
 def _open_verified_stage2() -> int:
     """Hold the already-verified stage-two source inode across execve."""
     try:
@@ -307,15 +388,22 @@ def main(argv: list[str] | None = None) -> int:
     # mutable pathname after stage one.
     stage2_fd = _open_verified_stage2()
     python_fd = _open_verified_python()
+    authority_fd = _connect_host_authority(raw, stage2_fd, python_fd)
     os.set_inheritable(stage2_fd, True)
     os.set_inheritable(python_fd, True)
+    pycache_prefix = _fresh_pycache_prefix()
     env = dict(os.environ)
     env[PROOF_ENV] = hashlib.sha256(raw).hexdigest()
     env[INTERPRETER_FD_ENV] = str(python_fd)
     env[STAGE2_FD_ENV] = str(stage2_fd)
+    env[AUTHORITY_FD_ENV] = str(authority_fd)
     executable = f"/proc/self/fd/{python_fd}"
     stage2_source = f"/proc/self/fd/{stage2_fd}"
-    os.execve(executable, [executable, "-I", "-S", stage2_source, *args], env)
+    os.execve(
+        executable,
+        [executable, "-I", "-S", "-X", f"pycache_prefix={pycache_prefix}", stage2_source, *args],
+        env,
+    )
     return 127
 
 

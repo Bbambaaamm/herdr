@@ -7,11 +7,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from herdr.capability import CapabilityScope, RegistrySnapshot
+from herdr.capability import CapabilityScope, Egress, RegistrySnapshot, Retention, Training
 from herdr.security import (
     ApprovalEvidence, InvocationIdentity, ProcessPolicy, ProviderRoute,
     RiskClass, RuntimeAssurance, SecurityError, SecurityGrant, ToolRule,
 )
+
+
+_EGRESS_ORDER = {Egress.NONE: 0, Egress.REGION_BOUND: 1, Egress.GLOBAL: 2}
+_RETENTION_ORDER = {Retention.ZERO: 0, Retention.LIMITED: 1, Retention.INDEFINITE: 2}
+_TRAINING_ORDER = {Training.EXCLUDED: 0, Training.ALLOWED: 1}
+
+
+def _most_restrictive(values, order, label):
+    try:
+        return min(values, key=order.__getitem__)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SecurityError(f"unknown {label} policy") from exc
 
 
 @dataclass(frozen=True)
@@ -93,26 +105,34 @@ def build_host_grant(
         for capability in selected_caps:
             regions &= set(capability.data_policy.regions)
             classes &= set(capability.data_policy.data_classes)
-            if (list(type(scope.max_egress)).index(capability.data_policy.egress) >
-                    list(type(scope.max_egress)).index(scope.max_egress)
-                    or list(type(scope.max_retention)).index(capability.data_policy.retention) >
-                    list(type(scope.max_retention)).index(scope.max_retention)
-                    or capability.data_policy.training != scope.training):
-                raise SecurityError("registry capability data policy exceeds admitted scope")
         if len(regions) != 1 or len(classes) != 1:
             raise SecurityError("provider region or data class is ambiguous")
-        if (list(type(scope.max_egress)).index(provider.data_policy.egress) >
-                list(type(scope.max_egress)).index(scope.max_egress)
-                or list(type(scope.max_retention)).index(provider.data_policy.retention) >
-                list(type(scope.max_retention)).index(scope.max_retention)
-                or provider.data_policy.training != scope.training):
-            raise SecurityError("registry provider data policy exceeds admitted scope")
+        # Provider/capability metadata can be broader than the admitted task
+        # scope. The route is the INTERSECTION/most-restrictive policy across
+        # all three authorities, never just the provider default.
+        for data_policy in (provider.data_policy,*(cap.data_policy for cap in selected_caps)):
+            if (_EGRESS_ORDER[data_policy.egress]>_EGRESS_ORDER[scope.max_egress]
+                or _RETENTION_ORDER[data_policy.retention]>_RETENTION_ORDER[scope.max_retention]
+                or _TRAINING_ORDER[data_policy.training]>_TRAINING_ORDER[scope.training]):
+                raise SecurityError("registry data policy exceeds admitted scope")
+        policy_rows = [scope, provider.data_policy, *(cap.data_policy for cap in selected_caps)]
+        route_egress = _most_restrictive(
+            [row.max_egress if row is scope else row.egress for row in policy_rows],
+            _EGRESS_ORDER, "egress",
+        )
+        route_retention = _most_restrictive(
+            [row.max_retention if row is scope else row.retention for row in policy_rows],
+            _RETENTION_ORDER, "retention",
+        )
+        route_training = _most_restrictive(
+            [row.training for row in policy_rows], _TRAINING_ORDER, "training"
+        )
         route = ProviderRoute(
             provider=provider_id, base_url=broker.base_url, api_mode=broker.api_mode,
             regions=tuple(regions), data_classes=tuple(classes),
-            max_egress=provider.data_policy.egress,
-            max_retention=provider.data_policy.retention,
-            training=provider.data_policy.training,
+            max_egress=route_egress,
+            max_retention=route_retention,
+            training=route_training,
             credential_refs=broker.credential_refs,
         )
         routes.append(route)

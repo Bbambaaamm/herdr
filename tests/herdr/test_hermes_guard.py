@@ -232,12 +232,26 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
     tools_pkg.terminal_tool = terminal_tool
     tools_pkg.terminal_tool_backends = terminal_backends
     tools_pkg.code_execution_tool = code_execution
+    file_tools = types.ModuleType("tools.file_tools")
+    file_tools._get_file_ops = lambda task_id="default": types.SimpleNamespace(
+        env=types.SimpleNamespace(env_type="local")
+    )
+    file_tools._file_metadata = lambda path: None
+    file_tools._file_version = lambda path: None
+    file_tools._special_file_kind = lambda path: None
+    file_tracking = types.ModuleType("tools.file_tools_read_tracking")
+    file_tracking._file_metadata = lambda path: None
+    file_tracking._file_version = lambda path: None
+    tools_pkg.file_tools = file_tools
+    tools_pkg.file_tools_read_tracking = file_tracking
     monkeypatch.setitem(sys.modules, "tools", tools_pkg)
     monkeypatch.setitem(sys.modules, "tools.registry", registry_module)
     monkeypatch.setitem(sys.modules, "tools.connectors", connector_module)
     monkeypatch.setitem(sys.modules, "tools.terminal_tool", terminal_tool)
     monkeypatch.setitem(sys.modules, "tools.terminal_tool_backends", terminal_backends)
     monkeypatch.setitem(sys.modules, "tools.code_execution_tool", code_execution)
+    monkeypatch.setitem(sys.modules, "tools.file_tools", file_tools)
+    monkeypatch.setitem(sys.modules, "tools.file_tools_read_tracking", file_tracking)
     monkeypatch.setitem(sys.modules, "tools.connectors.dispatch", connector_dispatch)
     monkeypatch.setitem(sys.modules, "tools.tool_search", tool_search)
     read_extract = types.ModuleType("tools.read_extract")
@@ -482,3 +496,72 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
         assert called == ["read_file", "read_file", "read_file"]
     finally:
         installation.uninstall()
+
+
+def test_policy_file_ops_binary_read_uses_pinned_root_fd(tmp_path):
+    import base64
+    from herdr.file_authority import RootFDWorkspace
+
+    root = tmp_path / "workspace"
+    pinned = tmp_path / "workspace-pinned"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    (root / "document.bin").write_bytes(b"trusted-bytes")
+    (outside / "document.bin").write_bytes(b"outside-bytes")
+
+    class ReadResult:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+            self.error = kwargs.get("error")
+
+    common = types.SimpleNamespace(ReadResult=ReadResult)
+    delegate = types.SimpleNamespace()
+    authority = RootFDWorkspace((str(root),))
+    try:
+        ops = hermes_guard._PolicyFileOps(authority, delegate, common, types.SimpleNamespace())
+        root.rename(pinned)
+        root.symlink_to(outside, target_is_directory=True)
+        result = ops.read_file_bytes(str(root / "document.bin"), max_bytes=1024)
+        assert result.error is None
+        assert base64.b64decode(result.base64_content) == b"trusted-bytes"
+        assert result.is_binary is True
+    finally:
+        authority.close()
+
+
+def test_policy_search_cannot_delegate_shell_or_follow_a_raced_file(tmp_path,monkeypatch):
+    from herdr.file_authority import RootFDWorkspace
+    from dataclasses import dataclass,field
+    @dataclass
+    class Result:
+        matches:list=field(default_factory=list)
+        files:list=field(default_factory=list)
+        counts:dict=field(default_factory=dict)
+        total_count:int=0
+        truncated:bool=False
+        limit_reason:str|None=None
+        error:str|None=None
+    root=tmp_path/"work";outside=tmp_path/"outside";root.mkdir();outside.mkdir()
+    target=root/"safe.txt";target.write_text("needle in owned file")
+    secret=outside/"secret.txt";secret.write_text("needle outside secret")
+    authority=RootFDWorkspace((str(root),))
+    delegate=types.SimpleNamespace(search=lambda *a,**kw:pytest.fail("raw backend search forbidden"))
+    common=types.SimpleNamespace(SearchResult=Result,SearchMatch=lambda path,line_number,content:
+        types.SimpleNamespace(path=path,line_number=line_number,content=content))
+    ops=hermes_guard._PolicyFileOps(authority,delegate,common,types.SimpleNamespace())
+    try:
+        result=ops.search("needle",str(root))
+        assert result.total_count==1 and result.matches[0].content=="needle in owned file"
+        assert ops.search("*.txt",str(root),target="files").files==[str(target)]
+        assert ops.search("(needle)+",str(root)).error
+        original=authority.read_bytes
+        def race(path,**kw):
+            target.unlink();target.symlink_to(secret)
+            return original(path,**kw)
+        monkeypatch.setattr(authority,"read_bytes",race)
+        assert ops.search("needle",str(root)).error
+        assert secret.read_text()=="needle outside secret"
+        with pytest.raises(PolicyDenied,match="file_operation_unattested"):
+            ops._execute
+    finally: authority.close()

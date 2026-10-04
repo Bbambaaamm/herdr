@@ -73,3 +73,43 @@ def test_host_factory_rejects_unregistered_or_unbrokered_authority(tmp_path):
         build_host_grant(**{**kwargs, "broker_inventory": (
             replace(kwargs["broker_inventory"][0],
                     credential_refs=("sk-abcdefghijklmnopqrstuvwxyz123456",)),)})
+
+
+def test_host_factory_preserves_narrowest_capability_privacy_ceiling(tmp_path):
+    kwargs = inputs(tmp_path)
+    registry = kwargs["registry"]
+    capability = replace(
+        registry.capabilities[0],
+        data_policy=DataPolicy(
+            ("eu-central",), (DataClass.INTERNAL,), Egress.REGION_BOUND,
+            Retention.ZERO, Training.EXCLUDED,
+        ),
+    )
+    provider = replace(
+        registry.providers[0],
+        data_policy=DataPolicy(
+            ("eu-central",), (DataClass.INTERNAL,), Egress.GLOBAL,
+            Retention.INDEFINITE, Training.ALLOWED,
+        ),
+    )
+    broader_scope = replace(
+        kwargs["scope"], max_egress=Egress.GLOBAL,
+        max_retention=Retention.INDEFINITE, training=Training.ALLOWED,
+    )
+    grant = build_host_grant(**{
+        **kwargs,
+        "scope": broader_scope,
+        "registry": RegistrySnapshot((capability,), (provider,), registry.executors),
+    })
+    route = grant.provider_routes[0]
+    assert route.max_egress is Egress.REGION_BOUND
+    assert route.max_retention is Retention.ZERO
+    assert route.training is Training.EXCLUDED
+
+
+def test_narrow_scope_does_not_relabel_a_broader_provider_guarantee(tmp_path):
+    kwargs=inputs(tmp_path);registry=kwargs["registry"]
+    policy=replace(registry.providers[0].data_policy,egress=Egress.GLOBAL)
+    broader=replace(registry.providers[0],data_policy=policy)
+    with pytest.raises(SecurityError,match="exceeds admitted scope"):
+        build_host_grant(**{**kwargs,"registry":RegistrySnapshot(registry.capabilities,(broader,),registry.executors)})

@@ -16,14 +16,212 @@ authority.
 """
 from __future__ import annotations
 
+import base64
+import difflib
 import functools
+import fnmatch
+import time
 import inspect
 import json
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from herdr.file_authority import FileAuthorityError, RootFDWorkspace
 from herdr.security import InvocationGuard, PolicyDenied, SecurityError, ProviderRequest, canonical_digest
+
+
+class _PolicyFileOps:
+    """Hermes FileOperations facade backed by pinned nofollow root FDs."""
+
+    def __init__(self, workspace: RootFDWorkspace, delegate: Any, common: Any, patch_parser: Any) -> None:
+        self._workspace = workspace
+        self._delegate = delegate
+        self._common = common
+        self._patch_parser = patch_parser
+
+    def __getattr__(self, name: str) -> Any:
+        if name not in {"env","_add_line_numbers"}:
+            raise PolicyDenied("file_operation_unattested",name[:64])
+        return getattr(self._delegate, name)
+
+    def read_file_raw(self, path: str) -> Any:
+        try:
+            content = self._workspace.read_text(path)
+        except (OSError, FileAuthorityError) as exc:
+            return self._common.ReadResult(error=str(exc))
+        return self._common.ReadResult(
+            content=content, total_lines=len(content.splitlines()),
+            file_size=len(content.encode("utf-8")),
+        )
+
+    def read_file_bytes(self, path: str, max_bytes: int | None = None) -> Any:
+        limit = self._workspace_max_file_bytes() if max_bytes is None else max_bytes
+        if type(limit) is not int or limit < 0:
+            return self._common.ReadResult(error="invalid binary read limit")
+        limit=min(limit,self._workspace_max_file_bytes())
+        try:
+            raw = self._workspace.read_bytes(path, limit=limit)
+        except (OSError, FileAuthorityError) as exc:
+            return self._common.ReadResult(error=str(exc))
+        return self._common.ReadResult(
+            base64_content=base64.b64encode(raw).decode("ascii"),
+            file_size=len(raw),
+            is_binary=True,
+        )
+
+    @staticmethod
+    def _workspace_max_file_bytes() -> int:
+        from herdr.file_authority import MAX_FILE_BYTES
+        return MAX_FILE_BYTES
+
+    def read_file(self, path: str, offset: int = 1, limit: int = 2000) -> Any:
+        result = self.read_file_raw(path)
+        if result.error:
+            return result
+        if type(offset) is not int or type(limit) is not int or offset < 1 or limit < 1:
+            return self._common.ReadResult(error="invalid read pagination")
+        lines = result.content.splitlines(keepends=True)
+        page = "".join(lines[offset - 1:offset - 1 + limit])
+        numbered = self._delegate._add_line_numbers(page, offset)
+        return self._common.ReadResult(
+            content=numbered, total_lines=len(lines), file_size=result.file_size,
+            truncated=(offset - 1 + limit) < len(lines),
+        )
+
+    def search(self,pattern,path=".",target="content",file_glob=None,limit=50,offset=0,
+               output_mode="content",context=0,order="discovery"):
+        """No shell/backend delegation. This attested profile supports literals
+        and file globs; regex/context profiles require separate host admission.
+        """
+        common=self._common
+        if (not isinstance(pattern,str) or not 0<len(pattern)<=1024 or
+            type(limit) is not int or not 1<=limit<=200 or type(offset) is not int or not 0<=offset<=1000
+            or target not in {"content","files"} or output_mode not in {"content","files_only","count"}
+            or type(context) is not int or context!=0 or order!="discovery" or file_glob is not None and (not isinstance(file_glob,str) or len(file_glob)>256)):
+            return common.SearchResult(error="unsupported bounded policy-mode search profile")
+        if target=="content" and any(x in pattern for x in "[]()*+?{}|^$\\"):
+            return common.SearchResult(error="policy-mode search supports literal content; regex needs an admitted search profile")
+        # A regex dot is also unsupported rather than silently changed to literal.
+        if target=="content" and "." in pattern:
+            return common.SearchResult(error="policy-mode search supports literal content; regex dot is unsupported")
+        result=common.SearchResult();total_bytes=0;deadline=time.monotonic()+2
+        try:
+            paths=self._workspace.list_regular_files(path)
+            matches=[];files=[];counts={}
+            for name in paths:
+                if time.monotonic()>deadline: raise FileAuthorityError("search elapsed bound exceeded")
+                if file_glob and not fnmatch.fnmatchcase(name,file_glob) and not fnmatch.fnmatchcase(Path(name).name,file_glob): continue
+                if target=="files":
+                    if fnmatch.fnmatchcase(name,pattern) or fnmatch.fnmatchcase(Path(name).name,pattern): files.append(name)
+                    continue
+                raw=self._workspace.read_bytes(name,limit=524288)
+                total_bytes+=len(raw)
+                if total_bytes>8388608: raise FileAuthorityError("search bytes exceed bound")
+                try: text=raw.decode("utf-8")
+                except UnicodeDecodeError: continue
+                hit=0
+                for number,line in enumerate(text.splitlines(),1):
+                    if pattern in line:
+                        hit+=1
+                        if output_mode=="content":
+                            if len(line.encode())>4096: raise FileAuthorityError("search line exceeds bound")
+                            matches.append(common.SearchMatch(name,number,line))
+                if hit: counts[name]=hit;files.append(name)
+                if sum(len(x.content.encode()) for x in matches)>262144:
+                    raise FileAuthorityError("search output exceeds bound")
+            result.total_count=len(files) if target=="files" or output_mode=="files_only" else sum(counts.values())
+            if target=="files" or output_mode=="files_only": result.files=files[offset:offset+limit]
+            elif output_mode=="count": result.counts=dict(list(counts.items())[offset:offset+limit])
+            else: result.matches=matches[offset:offset+limit]
+            result.truncated=result.total_count>offset+limit
+            if result.truncated: result.limit_reason="pagination"
+            return result
+        except (OSError,FileAuthorityError) as exc:
+            return common.SearchResult(error=str(exc))
+
+    def write_file(self, path: str, content: str, pre_content: str | None = None) -> Any:
+        try:
+            count, digest = self._workspace.write_text(path, content)
+        except (OSError, FileAuthorityError) as exc:
+            return self._common.WriteResult(error=str(exc))
+        return self._common.WriteResult(
+            bytes_written=count, dirs_created=bool(Path(path).parent), verified=True,
+            _content_sha256=digest,
+        )
+
+    def patch_replace(self, path: str, old_string: str, new_string: str, replace_all: bool = False) -> Any:
+        read = self.read_file_raw(path)
+        if read.error:
+            return self._common.PatchResult(error=read.error)
+        from tools.fuzzy_match import fuzzy_find_and_replace, is_already_applied
+        updated, count, _strategy, error = fuzzy_find_and_replace(
+            read.content, old_string, new_string, replace_all
+        )
+        if error or count == 0:
+            if is_already_applied(read.content, old_string, new_string):
+                return self._common.PatchResult(
+                    success=True, no_change=True, note="edit already applied"
+                )
+            return self._common.PatchResult(error=error or "old_string not found")
+        write = self.write_file(path, updated, pre_content=read.content)
+        if write.error:
+            return self._common.PatchResult(error=write.error)
+        diff = "".join(difflib.unified_diff(
+            read.content.splitlines(keepends=True), updated.splitlines(keepends=True),
+            fromfile=f"a/{path}", tofile=f"b/{path}",
+        ))
+        return self._common.PatchResult(success=True, diff=diff, files_modified=[path])
+
+    def patch_v4a(self, patch_content: str) -> Any:
+        operations, error = self._patch_parser.parse_v4a_patch(patch_content)
+        if error:
+            return self._common.PatchResult(error=error)
+
+        # V4A Add is create-only. The parser's generic apply path calls
+        # write_file for both Add and Update, so interpose only the first write
+        # for each Add target with an atomic no-clobber create.
+        add_targets = {
+            op.file_path
+            for op in operations
+            if getattr(getattr(op, "operation", None), "value", None) == "add"
+        }
+        parent = self
+
+        class _V4AApplyOps:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(parent, name)
+
+            def write_file(
+                self, path: str, content: str, pre_content: str | None = None
+            ) -> Any:
+                if path in add_targets:
+                    add_targets.remove(path)
+                    try:
+                        count, digest = parent._workspace.create_text(path, content)
+                    except (OSError, FileAuthorityError) as exc:
+                        return parent._common.WriteResult(error=str(exc))
+                    return parent._common.WriteResult(
+                        bytes_written=count, verified=True, _content_sha256=digest
+                    )
+                return parent.write_file(path, content, pre_content=pre_content)
+
+        return self._patch_parser.apply_v4a_operations(operations, _V4AApplyOps())
+
+    def delete_file(self, path: str) -> Any:
+        try:
+            self._workspace.delete_file(path)
+            return self._common.WriteResult(verified=True)
+        except (OSError, FileAuthorityError) as exc:
+            return self._common.WriteResult(error=str(exc))
+
+    def move_file(self, source: str, destination: str) -> Any:
+        try:
+            self._workspace.move_file(source, destination)
+            return self._common.WriteResult(verified=True)
+        except (OSError, FileAuthorityError) as exc:
+            return self._common.WriteResult(error=str(exc))
 
 
 class HermesCompatibilityError(RuntimeError):
@@ -211,7 +409,7 @@ def inspect_hermes_security_surface() -> dict[str, Any]:
         from hermes_cli import env_loader, middleware, plugins
         from agent import auxiliary_client, turn_api_call, conversation_loop, tool_executor
         from agent.client_lifecycle import ClientLifecycleMixin
-        from tools import code_execution_tool, connectors, read_extract, terminal_tool, terminal_tool_backends
+        from tools import code_execution_tool, connectors, file_tools, file_tools_read_tracking, read_extract, terminal_tool, terminal_tool_backends
         from tools.file_tools_paths import _resolve_path_for_task
         from tools.registry import registry
         from toolsets import resolve_toolset
@@ -288,6 +486,11 @@ def inspect_hermes_security_surface() -> dict[str, Any]:
         raise HermesCompatibilityError("execute_code backend seam unavailable")
     if not callable(getattr(terminal_tool_backends, "_create_environment", None)):
         raise HermesCompatibilityError("terminal environment creation seam unavailable")
+    if not callable(getattr(file_tools, "_get_file_ops", None)):
+        raise HermesCompatibilityError("file operations seam unavailable")
+    if not all(callable(getattr(file_tools_read_tracking, name, None))
+               for name in ("_file_metadata", "_file_version")):
+        raise HermesCompatibilityError("file read-tracking seam unavailable")
     if not callable(_resolve_path_for_task):
         raise HermesCompatibilityError("Hermes task path resolver unavailable")
     if not callable(getattr(read_extract, "_hosted_ocr_config", None)):
@@ -335,6 +538,7 @@ class GuardInstallation:
     guard: InvocationGuard
     originals: list[tuple[Any, str, Any]] = field(default_factory=list)
     surface: dict[str, Any] = field(default_factory=dict)
+    finalizers: list[Callable[[], Any]] = field(default_factory=list)
     installed: bool = True
 
     def _remember(self, owner: Any, name: str, replacement: Any) -> None:
@@ -347,6 +551,11 @@ class GuardInstallation:
             return
         for owner, name, original in reversed(self.originals):
             setattr(owner, name, original)
+        for finalizer in reversed(self.finalizers):
+            try:
+                finalizer()
+            except Exception:
+                pass
         self.installed = False
 
 
@@ -363,7 +572,7 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
     from agent import auxiliary_client, conversation_loop, turn_api_call, tool_executor
     from agent.client_lifecycle import ClientLifecycleMixin
     from hermes_cli import env_loader, middleware, plugins
-    from tools import code_execution_tool, connectors, read_extract, terminal_tool, terminal_tool_backends
+    from tools import code_execution_tool, connectors, file_tools, file_tools_read_tracking, read_extract, terminal_tool, terminal_tool_backends
     from tools.connectors import dispatch as connector_dispatch_module
     from tools.file_tools_paths import _resolve_path_for_task
     from tools.registry import ToolRegistry, registry
@@ -374,6 +583,71 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
         value, task_id
     )
     installation = GuardInstallation(guard=guard, surface=surface)
+
+    # Pin local file authority to the granted directory inodes. Hermes may keep
+    # its higher-level formatting/search helpers, but physical read/write/patch
+    # goes through RootFDWorkspace so a path/symlink swap after authorization
+    # cannot redirect an open or rename outside the signed roots.
+    file_rules = {rule.tool: rule for rule in getattr(guard.grant, "tool_rules", ())}
+    file_roots = {
+        root
+        for tool in ("read_file", "write_file", "patch", "search_files")
+        for root in getattr(file_rules.get(tool), "allowed_roots", ())
+    }
+    file_workspace = RootFDWorkspace(file_roots) if file_roots else None
+    if file_workspace is not None:
+        from tools import file_operations_common, patch_parser
+        original_get_file_ops = file_tools._get_file_ops
+        proxies: dict[int, _PolicyFileOps] = {}
+
+        @functools.wraps(original_get_file_ops)
+        def guarded_get_file_ops(task_id: str = "default") -> Any:
+            # Check the configured backend BEFORE original_get_file_ops can
+            # provision/connect a Docker/SSH/Modal/plugin environment.
+            config = terminal_tool._get_env_config()
+            _require_local_backend(config.get("env_type"))
+            delegate = original_get_file_ops(task_id)
+            env = getattr(delegate, "env", None)
+            _require_local_backend(getattr(env, "env_type", "local"), env)
+            key = id(delegate)
+            proxy = proxies.get(key)
+            if proxy is None:
+                proxy = proxies[key] = _PolicyFileOps(
+                    file_workspace, delegate, file_operations_common, patch_parser
+                )
+            return proxy
+
+        installation._remember(file_tools, "_get_file_ops", guarded_get_file_ops)
+
+        def guarded_file_metadata(path: str) -> tuple | None:
+            try:
+                return file_workspace.file_metadata(path)
+            except (OSError, FileAuthorityError):
+                return None
+
+        def guarded_file_version(path: str) -> tuple | None:
+            try:
+                return file_workspace.file_version(path)
+            except (OSError, FileAuthorityError):
+                return None
+
+        # Hermes imports these functions into file_tools at module import time,
+        # while the tracking module also calls its own globals. Patch both
+        # references so dedup/staleness hashing cannot reopen a raced symlink.
+        installation._remember(file_tools, "_file_metadata", guarded_file_metadata)
+        installation._remember(file_tools, "_file_version", guarded_file_version)
+        installation._remember(
+            file_tools_read_tracking, "_file_metadata", guarded_file_metadata
+        )
+        installation._remember(
+            file_tools_read_tracking, "_file_version", guarded_file_version
+        )
+        # The original special-file precheck follows pathname symlinks with
+        # os.stat. RootFDWorkspace uses O_NONBLOCK+O_NOFOLLOW and rejects
+        # non-regular targets at the actual open seam, so avoid that unsafe
+        # preliminary dereference in policy mode.
+        installation._remember(file_tools, "_special_file_kind", lambda path: None)
+        installation.finalizers.append(file_workspace.close)
 
     # Policy suppression is authority, not user config. Hermes reloads profile
     # dotenv files with override=True after profile selection, so reassert the

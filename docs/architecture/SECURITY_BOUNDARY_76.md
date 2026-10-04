@@ -368,3 +368,20 @@ descendant's identity and digest.
    the grant is scoped to one exact process/run/fence.
 
 No #82 runtime or deployment change is made by #76.
+
+## Round-5 bootstrap and filesystem authority clarification
+
+This section supersedes any earlier wording that could be read as treating public environment variables or readable file descriptors as bootstrap provenance.
+
+BootstrapAuthority is a host-only one-use authority. #82 must create the listener and register BootstrapExpectation only after the real sandbox/mount proof and same-inode grant seal exist. Registration binds the exact InvocationIdentity, frozen proof digest, exact stage-one inode and SHA256, exact held stage-two SHA256, exact pinned Python inode and SHA256, and sealed bundle SHA256. The authority also requires a host-supplied peer_authorizer callback. That callback must bind the SO_PEERCRED peer PID/start ticks and process ancestry to #82's independently retained physical launch intent/proof; being a child of the pane shell, presenting the expected argv, or reproducing readable digests is not sufficient. If this host broker is absent or the expectation is not registered, policy-mode Hermes startup intentionally fails closed. #76 provides this authority contract; #82 owns its physical launch wiring.
+
+The same authenticated Unix connection is retained across stage-one exec into stage two. Stage two must complete the one-use handshake on that connected socket and prove the same sealed bundle digest before any policy/Hermes import authority is accepted. Verified stage one starts pinned Python with -I -S and a fresh private -X pycache_prefix before stage-two stdlib imports.
+
+Policy-mode local file operations use RootFDWorkspace pinned directory descriptors. read_file, document/binary read_file_bytes, read-tracking metadata/version hashing, write_file and V4A patch physical opens are relative to held root/parent FDs with O_NOFOLLOW. V4A Add uses atomic no-clobber creation, and Move uses renameat2 RENAME_NOREPLACE (or fails closed when unavailable), so a raced-in destination cannot be overwritten. File backend selection is forced local before Hermes can provision a Docker/SSH/Modal/plugin backend.
+
+Provider routes retain the most restrictive ceilings across the admitted scope, provider policy and every selected capability: region/data-class intersections plus egress, retention and training ceilings. Approval responses are read as bounded Unix-stream lines through the terminating newline. Exact security mountpoints reject duplicate/stacked entries rather than trusting an arbitrary equal-depth mount record.
+
+
+Recovery hardening retains full immutable seven-field bootstrap identities, bounded process observation and explicit boolean host peer authorization. Host routes preserve all admitted-scope hard filters and the narrowest selected-capability/provider privacy ceilings. File facade methods cannot fall through to unverified backend I/O. Policy-mode search walks pinned directory descriptors without following links or spawning a shell; this bounded profile supports literal content and file globs with explicit limits (256 files, 4096 entries, depth 16, 512 KiB per searched file, 8 MiB total, 2 seconds). Regex, context and modified-order search require a separately admitted profile and fail explicitly. Large binary read requests are clamped to the 32 MiB physical file bound.
+
+The host broker retains an immutable BootstrapContinuation only after authenticating both stages in the same peer PID/start ticks. The bounded host-only wait/lookup supplies #82 with full admitted identity, actual agent process identity, bundle/proof/stage-one/stage-two/Python hashes and interpreter inode. Public environment markers and a registered but unfinished launch cannot produce this receipt; it is observation of bootstrap continuity, with later live readiness and completion checks still required.
