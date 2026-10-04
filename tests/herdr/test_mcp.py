@@ -2383,3 +2383,84 @@ def test_connect_recomputes_remaining_timeout_before_tls(monkeypatch, elapsed):
         assert module.connect_resolved(addresses, 11.0) is sock
         assert sock.timeouts == pytest.approx([1.0, 0.2])
         assert not sock.closed
+
+
+@pytest.mark.parametrize("task", [False,True])
+@pytest.mark.parametrize("message", [[],42,None,{},"x"*8193])
+def test_remote_task_status_message_is_bounded_string(tmp_path,task,message):
+    gateway,context,transport,clock,*_=fixture(tmp_path,tasks=True)
+    transport.task=True
+    if task:
+        gateway.call(context,"local","read",{"path":"source.py"},"op")
+        clock.value+=2
+    transport.response={"resultType":"complete" if task else "task","taskId":"remote-task-1",
+        "status":"working","statusMessage":message,"createdAt":"2026-10-03T20:00:00Z",
+        "lastUpdatedAt":"2026-10-03T20:00:01Z","ttlMs":60000}
+    action=lambda:gateway.poll(context,"op") if task else gateway.call(context,"local","read",{"path":"source.py"},"op")
+    with pytest.raises(GatewayError,match="status message"):action()
+    assert gateway.ledger.get(operation_key(context))["state"]!="observed_complete"
+
+@pytest.mark.parametrize("task",[False,True])
+def test_input_required_task_cannot_supply_only_request_state(tmp_path,task):
+    gateway,context,transport,clock,*_=fixture(tmp_path,tasks=True)
+    transport.task=True
+    if task:
+        gateway.call(context,"local","read",{"path":"source.py"},"op")
+        clock.value+=2
+    transport.response={"resultType":"complete" if task else "task","taskId":"remote-task-1",
+        "status":"input_required","requestState":{"opaque":"state"},
+        "createdAt":"2026-10-03T20:00:00Z","lastUpdatedAt":"2026-10-03T20:00:01Z","ttlMs":60000}
+    action=lambda:gateway.poll(context,"op") if task else gateway.call(context,"local","read",{"path":"source.py"},"op")
+    with pytest.raises(GatewayError,match="requests are missing"):action()
+
+def test_resource_interim_response_is_bounded_rejection(tmp_path):
+    gateway,context,transport,*_=fixture(tmp_path,tools=("docs_read",))
+    transport.response={"resultType":"input_required","inputRequests":{"ask":{
+        "method":"elicitation/create","params":{"message":"Choose","requestedSchema":{"type":"object","properties":{}}}}}}
+    with pytest.raises(GatewayError,match="resource interim"):
+        gateway.read_resource(context,"local","herdr://docs/one","op")
+    assert gateway.ledger.get(operation_key(context))["state"]=="response_rejected"
+
+@pytest.mark.parametrize("structured",[None,{},[1],"text"])
+def test_nested_tool_result_structured_content_requires_text_modality(structured):
+    from herdr.mcp import require_input_modalities
+    result={"inputRequests":{"sample":{"method":"sampling/createMessage","params":{
+        "messages":[{"role":"user","content":{"type":"tool_result","toolUseId":"use",
+            "content":[],"structuredContent":structured}}],"maxTokens":1}}}}
+    with pytest.raises(PolicyDenied,match="modality"):
+        require_input_modalities(result,(Modality.IMAGE,),(Modality.IMAGE,))
+
+@pytest.mark.parametrize("uri",["not a uri","https://","relative","\ud800","http://host:%wrong","herdr://bad%q"])
+def test_resource_binding_requires_protocol_uri(tmp_path,uri):
+    _,_,_,_,client,_=fixture(tmp_path)
+    with pytest.raises(GatewayError,match="URI"):
+        replace(client.server,resources=((uri,"docs_read"),))
+
+def test_lone_surrogate_in_routing_value_is_bounded_jsonrpc_error(tmp_path):
+    gateway,context,transport,*_=fixture(tmp_path)
+    message=request_message(context,"tools/call",{"name":"local.\ud800","arguments":{"path":"source.py"}},"wire")
+    message["params"]["_meta"]["org.herdr/operation"]="op"
+    status,body=ServerAdapter(gateway,lambda _:context,origins=()).handle(
+        json.dumps(message,ensure_ascii=True).encode("ascii"),authorization="host",
+        headers={"MCP-Protocol-Version":PROTOCOL,"Mcp-Method":"tools/call","Mcp-Name":"local.invalid"})
+    assert status==400 and "error" in decode(body)
+    assert not semantic_calls(transport)
+
+@pytest.mark.parametrize("count",[64,257])
+def test_resource_contents_are_bounded_and_validated_as_one_collection(tmp_path,monkeypatch,count):
+    import herdr.mcp as module
+    gateway,context,transport,*_=fixture(tmp_path,tools=("docs_read",))
+    transport.response={"resultType":"complete","ttlMs":0,"cacheScope":"private",
+        "contents":[{"uri":"herdr://docs/one","text":"data"} for _ in range(count)]}
+    original=module.validate_tool_content
+    validations=[]
+    def validate(result):
+        validations.append(len(result["content"]))
+        return original(result)
+    monkeypatch.setattr(module,"validate_tool_content",validate)
+    if count>256:
+        with pytest.raises(GatewayError):gateway.read_resource(context,"local","herdr://docs/one","op")
+        assert validations==[]
+    else:
+        assert gateway.read_resource(context,"local","herdr://docs/one","op").state=="observed_complete"
+        assert validations==[count]

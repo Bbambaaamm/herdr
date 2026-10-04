@@ -137,7 +137,10 @@ def header_value(value) -> str:
         raise GatewayError("routing header exceeds bounded length")
     if (value != value.strip() or any(ord(c) < 32 or ord(c) > 126 for c in value)
             or (value.startswith("=?base64?") and value.endswith("?="))):
-        value = "=?base64?" + base64.b64encode(value.encode()).decode() + "?="
+        try:
+            value = "=?base64?" + base64.b64encode(value.encode("utf-8")).decode() + "?="
+        except UnicodeError as exc:
+            raise GatewayError("routing header text is not valid UTF-8") from exc
     if len(value) > 8192:
         raise GatewayError("encoded routing header exceeds bounded length")
     return value
@@ -377,6 +380,8 @@ def require_input_modalities(result, binding_modalities, scope_modalities):
                 content(block, depth+1)
         elif isinstance(value, dict):
             if value.get("type") == "tool_result":
+                if "structuredContent" in value:
+                    blocks.append({"type":"text","text":""})
                 content(value.get("content", ()), depth+1)
             elif value.get("type") == "tool_use":
                 blocks.append({"type":"text","text":""})
@@ -474,6 +479,18 @@ class ServerBinding:
             raise GatewayError("duplicate resource binding")
         for uri, logical in self.resources:
             identifier(uri, maximum=1024)
+            if (any(ord(x) <= 32 or ord(x) > 126 or x in '<>"{}|\\\\^' + chr(96) for x in uri)
+                    or re.search(r"%(?![0-9A-Fa-f]{2})",uri)):
+                raise GatewayError("resource binding URI invalid")
+            try:
+                parsed = urlsplit(uri)
+                if (not re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*",parsed.scheme)
+                        or parsed.scheme in {"http","https"} and not parsed.hostname):
+                    raise ValueError("URI scheme/hostname missing")
+                if parsed.netloc:
+                    parsed.port
+            except ValueError as exc:
+                raise GatewayError("resource binding URI invalid") from exc
             if not _NAME.fullmatch(logical):
                 raise GatewayError("invalid resource capability")
 
@@ -1471,6 +1488,8 @@ class McpGateway:
                         extra_headers=extra_headers, prepared=prepared)
                     for _notification in notifications:
                         self.ledger.audit(key, "untrusted_notification", self.clock())
+                    if method == "resources/read" and result["resultType"] in {"task","input_required"}:
+                        raise GatewayError("resource interim responses are unsupported")
                     if result["resultType"] == "task":
                         state, due = self._task_state(result, definition, binding.output_modalities, context.toolset.scope.output_modalities)
                         remote = result["taskId"]
@@ -1485,13 +1504,12 @@ class McpGateway:
                         if method == "resources/read":
                             validate_cacheable(result)
                             contents = result.get("contents")
-                            if not isinstance(contents, list) or not contents or any(
+                            if not isinstance(contents, list) or not 1 <= len(contents) <= 256 or any(
                                     not isinstance(x, dict) or x.get("uri") != params["uri"] for x in contents):
                                 raise PolicyDenied("remote resource contents escaped allowlist")
-                            for resource in contents:
-                                content = {"content": [{"type": "resource", "resource": resource}]}
-                                validate_tool_content(content)
-                                require_output_modalities(content, (Modality.TEXT,), context.toolset.scope.output_modalities)
+                            content = {"content":[{"type":"resource","resource":resource} for resource in contents]}
+                            validate_tool_content(content)
+                            require_output_modalities(content,(Modality.TEXT,),context.toolset.scope.output_modalities)
                         else:
                             validate_tool_content(result)
                             require_output_modalities(result, binding.output_modalities, context.toolset.scope.output_modalities)
@@ -1529,6 +1547,9 @@ class McpGateway:
         if (not isinstance(result.get("status"), str)
                 or result["status"] not in {"working", "input_required", "completed", "failed", "cancelled"}):
             raise GatewayError("invalid remote task state")
+        if "statusMessage" in result and (not isinstance(result["statusMessage"],str)
+                or len(result["statusMessage"]) > 8192):
+            raise GatewayError("invalid bounded task status message")
         for name in ("createdAt", "lastUpdatedAt"):
             value = result.get(name)
             try:
@@ -1562,6 +1583,8 @@ class McpGateway:
             if completed.get("isError"):
                 status = "failed"
         elif status == "input_required":
+            if "inputRequests" not in result:
+                raise GatewayError("input-required task requests are missing")
             validate_input_required(result)
             require_input_modalities(result, binding_modalities, scope_modalities)
         elif status == "failed":
