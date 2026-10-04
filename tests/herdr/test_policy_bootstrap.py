@@ -484,7 +484,8 @@ def test_stage1_cache_requires_physical_readonly_bootstrap(tmp_path,monkeypatch)
 
 def test_actual_user_namespace_keeps_stage0_verification_before_host_handshake():
     import shutil
-    if not shutil.which("bwrap"): pytest.skip("bwrap prerequisite unavailable")
+    if not shutil.which("bwrap") or not _stage1().PYTHON_PATH.is_file():
+        pytest.skip("bwrap/pinned runtime prerequisite unavailable")
     script=("import importlib.machinery,importlib.util;"
         f"loader=importlib.machinery.SourceFileLoader('stage1_probe',{str(STAGE1)!r});"
         "spec=importlib.util.spec_from_loader(loader.name,loader);"
