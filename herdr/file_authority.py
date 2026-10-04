@@ -6,6 +6,7 @@ import errno
 import hashlib
 import os
 import stat
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -126,8 +127,11 @@ class RootFDWorkspace:
             raise FileAuthorityError("file exceeds policy-mode bound")
         return bytes(data)
 
-    def list_regular_files(self,path: str,*,maximum: int=256) -> list[str]:
+    def list_regular_files(self,path: str,*,maximum: int=256,deadline: float|None=None) -> list[str]:
         """Bounded nofollow directory walk; names never become external authority."""
+        if type(maximum) is not int or not 1 <= maximum <= 256:
+            raise FileAuthorityError("bounded search file count required")
+        if deadline is None: deadline=time.monotonic()+2
         candidate=Path(path)
         if not candidate.is_absolute() or ".." in candidate.parts:
             raise FileAuthorityError("exact search path required")
@@ -143,9 +147,17 @@ class RootFDWorkspace:
         def visit(directory,logical,depth):
             nonlocal entries
             if depth>16: raise FileAuthorityError("search depth exceeds bound")
-            for name in sorted(os.listdir(directory)):
-                entries+=1
-                if entries>4096: raise FileAuthorityError("search entry count exceeds bound")
+            names=[]
+            with os.scandir(directory) as stream:
+                for entry in stream:
+                    if time.monotonic()>deadline:
+                        raise FileAuthorityError("search elapsed bound exceeded")
+                    entries+=1
+                    if entries>4096: raise FileAuthorityError("search entry count exceeds bound")
+                    names.append(entry.name)
+            for name in sorted(names):
+                if time.monotonic()>deadline:
+                    raise FileAuthorityError("search elapsed bound exceeded")
                 if name==".git": continue
                 info=os.stat(name,dir_fd=directory,follow_symlinks=False)
                 if stat.S_ISREG(info.st_mode):

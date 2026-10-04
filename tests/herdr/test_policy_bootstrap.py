@@ -386,7 +386,7 @@ def test_stage1_execs_verified_stage2_source_fd(monkeypatch):
     monkeypatch.setattr(module, "_open_verified_stage2", lambda: 41)
     monkeypatch.setattr(module, "_open_verified_python", lambda: 42)
     monkeypatch.setattr(module, "_connect_host_authority", lambda *args: 43)
-    monkeypatch.setattr(module, "_fresh_pycache_prefix", lambda: "/tmp/herdr-policy-pycache-test")
+    monkeypatch.setattr(module, "_fresh_pycache_prefix", lambda: "/run/herdr-bootstrap/no-bytecode-cache")
     monkeypatch.setattr(module.os, "set_inheritable", lambda *args: None)
     seen = {}
 
@@ -400,7 +400,7 @@ def test_stage1_execs_verified_stage2_source_fd(monkeypatch):
     assert seen["executable"] == "/proc/self/fd/42"
     assert seen["argv"] == [
         "/proc/self/fd/42", "-I", "-S", "-X",
-        "pycache_prefix=/tmp/herdr-policy-pycache-test", "/proc/self/fd/41",
+        "pycache_prefix=/run/herdr-bootstrap/no-bytecode-cache", "/proc/self/fd/41",
         "chat", "--profile", "test",
     ]
     assert seen["env"][module.INTERPRETER_FD_ENV] == "42"
@@ -450,3 +450,33 @@ def test_stage1_rejects_stacked_exact_trust_root(tmp_path):
     rows = {str(root): {"ro", "__stacked__"}}
     with pytest.raises(SystemExit, match="one exact read-only trust mount"):
         module._require_exact_ro_tree(root, rows)
+
+def test_startup_cache_is_absent_under_frozen_root_not_same_uid_tmp(tmp_path,monkeypatch):
+    stage1, stage2 = _stage1(), _launcher()
+    root = tmp_path / "bootstrap"
+    root.mkdir()
+    monkeypatch.setattr(stage1,"BOOTSTRAP_ROOT",root)
+    monkeypatch.setattr(stage2,"BOOTSTRAP_ROOT",root)
+    monkeypatch.setattr(stage1,"_mount_rows",lambda:{str(root):{"ro"}})
+    prefix = str(root / "no-bytecode-cache")
+    assert stage1._fresh_pycache_prefix() == prefix
+    monkeypatch.setattr(stage2.sys,"pycache_prefix",prefix)
+    stage2._require_startup_pycache_prefix()
+    # A peer-populated cache is rejected rather than trusted because of 0700.
+    (root / "no-bytecode-cache").mkdir(mode=0o700)
+    with pytest.raises(SystemExit,match="remain absent"):
+        stage1._fresh_pycache_prefix()
+    with pytest.raises(SystemExit,match="remain absent"):
+        stage2._require_startup_pycache_prefix()
+    monkeypatch.setattr(stage2.sys,"pycache_prefix","/tmp/herdr-policy-pycache-attacker")
+    with pytest.raises(SystemExit,match="immutable startup"):
+        stage2._require_startup_pycache_prefix()
+
+def test_stage1_cache_requires_physical_readonly_bootstrap(tmp_path,monkeypatch):
+    module = _stage1()
+    root = tmp_path / "bootstrap"
+    root.mkdir()
+    monkeypatch.setattr(module,"BOOTSTRAP_ROOT",root)
+    monkeypatch.setattr(module,"_mount_rows",lambda:{str(root):{"rw"}})
+    with pytest.raises(SystemExit,match="read-only"):
+        module._fresh_pycache_prefix()
