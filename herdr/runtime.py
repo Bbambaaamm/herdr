@@ -51,7 +51,7 @@ DEFAULT_ADMISSION_AUDIT = Path("/var/lib/agent-platform-herdr/admission.jsonl")
 DEFAULT_ADMISSION_REGISTRY = Path("/var/lib/agent-platform-herdr/admission-registry.json")
 DEFAULT_PROFILE = "quantlab"
 _CHILD_FILE_TOOLS = frozenset({
-    "read_file", "search_files", "read", "write_file", "write", "patch", "review",
+    "read_file", "search_files", "write_file", "patch",
 })
 _CHILD_RUNTIME_PERMISSIONS = frozenset({"workspace-write"})
 
@@ -1037,7 +1037,8 @@ class HerdrChildRuntime:
 
     def recover_interrupted_child_start(self, task_id: str) -> None:
         rec = self.scheduler._tasks[task_id]
-        if (not rec.pre_delivery_pane_creation_attempted or rec.pre_delivery_agent_start_attempted
+        if (not rec.pre_delivery_pane_creation_attempted
+                or rec.pre_delivery_agent_start_attempted and rec.economic_delivery_attempted is not False
                 or rec.execution_agent != rec.agent_id or rec.execution_marker != f"child-{rec.run_token}"
                 or (rec.state is not LifecycleState.RUNNING and not rec.pre_delivery_failure)):
             raise HerdrRuntimeError("child_cleanup_unproven", task_id)
@@ -1174,6 +1175,9 @@ class HerdrChildRuntime:
             if not prompt or len(prompt) > MAX_PROMPT_CHARS:
                 raise HerdrRuntimeError("invalid_child_prompt", lease.task_id)
             timeout = int(min(3600.0, max(1.0, self.scheduler.budget.claim_ttl_seconds - 30.0)))
+            if not self.scheduler.mark_child_delivery_started(
+                    lease.task_id,run_token,lease.agent_id,lease.fencing_token,idempotency_key):
+                raise HerdrRuntimeError("child_delivery_already_started",lease.task_id)
             delivery_started = True
             result = self.runner.run(["agent", "prompt", lease.agent_id, prompt,
                                       "--wait", "--timeout", str(timeout * 1000)],

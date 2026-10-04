@@ -998,3 +998,16 @@ def explicit_host_policy_for_lifecycle_tests(monkeypatch):
     from tests.policy_launch_fakes import install_runtime_policy_fixture
     from herdr.runtime import HerdrChildRuntime
     install_runtime_policy_fixture(monkeypatch, HerdrChildRuntime)
+
+
+def test_standalone_bridge_supplies_deferred_verified_parent_factory(monkeypatch,tmp_path):
+    from herdr import host_configuration
+    captured={}
+    factory_provider=lambda task_file,identity:object()
+    monkeypatch.setattr(host_configuration,"child_factory_for_root",factory_provider)
+    monkeypatch.setattr(server,"serve",lambda *args,**kwargs:captured.update(args=args,kwargs=kwargs))
+    argv=["agent-durable-bridge","--task-file",str(tmp_path/"parent.json"),"--task-id","parent",
+        "--run-token","run","--agent","agent","--pane","pane","--marker","marker","--real-binary","/bin/true"]
+    monkeypatch.setattr(sys,"argv",argv);server.main()
+    assert captured["kwargs"]["policy_launch_factory_provider"] is factory_provider
+    assert captured["args"][1]["task_id"]=="parent"

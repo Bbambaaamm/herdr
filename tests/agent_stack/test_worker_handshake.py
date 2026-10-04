@@ -1230,8 +1230,39 @@ def explicit_host_policy_for_worker_lifecycle_tests(monkeypatch):
     from tests.policy_launch_fakes import FakeHostPolicyLaunchFactory
     monkeypatch.setattr(worker, "HOST_POLICY_LAUNCH_FACTORY", FakeHostPolicyLaunchFactory())
     monkeypatch.setattr(worker, "HOST_POLICY_LAUNCHES", {})
+    monkeypatch.setattr(worker, "_preflight_root_provider", lambda profile: None)
     original = worker.create_task_session
     def create(task, **kwargs):
         task.setdefault("fencing_token", 1)
         return original(task, **kwargs)
     monkeypatch.setattr(worker, "create_task_session", create)
+
+
+def test_standalone_root_worker_loads_fixed_host_configuration_each_attempt(monkeypatch):
+    from herdr import host_configuration
+    from tests.policy_launch_fakes import FakeHostPolicyLaunchFactory
+    factories=[]
+    def build():
+        item=FakeHostPolicyLaunchFactory();factories.append(item);return item
+    monkeypatch.setattr(worker,"HOST_POLICY_LAUNCH_FACTORY",None)
+    monkeypatch.setattr(host_configuration,"build_host_policy_factory",build)
+    assert worker._root_policy_factory() is not worker._root_policy_factory()
+    assert len(factories)==2
+
+def test_root_host_provider_preflight_precedes_pane_creation_and_failure_cleans_launch(tmp_path,monkeypatch):
+    configure_paths(tmp_path);task=base_task();worker.prepare_attempt(task)
+    task["workspace"]=str(tmp_path)
+    events=[]
+    def control(args,**kwargs):
+        events.append(tuple(args))
+        assert args[:2]==["agent","get"]
+        return {"result":{"agent":{"agent":"hermes","pane_id":"coordinator-pane","workspace_id":"workspace"}}}
+    def preflight(profile):
+        raise RuntimeError("host preflight denied")
+    monkeypatch.setattr(worker,"_herdr_json",control)
+    monkeypatch.setattr(worker,"_preflight_root_provider",preflight)
+    with pytest.raises(RuntimeError,match="host preflight denied"):worker.create_task_session(task)
+    launch=worker.HOST_POLICY_LAUNCH_FACTORY.created[0]
+    assert launch.events==[("closed",)]
+    assert worker.HOST_POLICY_LAUNCHES=={}
+    assert len(events)==1

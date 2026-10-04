@@ -416,6 +416,31 @@ def _cleanup_setup_pane(pane_id: str, coordinator_pane: str, marker: str,
 HOST_POLICY_LAUNCH_FACTORY = None
 HOST_POLICY_LAUNCHES = {}
 
+def _root_policy_factory():
+    global HOST_POLICY_LAUNCH_FACTORY
+    from herdr.policy_launch import HostPolicyLaunchFactory
+    if HOST_POLICY_LAUNCH_FACTORY is None:
+        from herdr.host_configuration import build_host_policy_factory
+        return build_host_policy_factory()
+    if not isinstance(HOST_POLICY_LAUNCH_FACTORY,HostPolicyLaunchFactory):
+        raise RuntimeError("task_invocation_policy_missing")
+    return HOST_POLICY_LAUNCH_FACTORY
+
+
+def _preflight_root_provider(profile):
+    from herdr.runtime import _trusted_hermes_profile_preflight
+    _trusted_hermes_profile_preflight(profile,
+        executable=ENV.get("HERDR_HERMES_BINARY","/home/agentops/.local/bin/hermes"),env=ENV)
+
+
+def _cleanup_prepared_root_launch(task):
+    key=(task.get("id"),task.get("run_token"))
+    launch=HOST_POLICY_LAUNCHES.get(key)
+    if launch is not None:
+        launch.cleanup_after_pane_closed()
+        del HOST_POLICY_LAUNCHES[key]
+
+
 def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
     """Create one fresh Hermes pane/session for exactly one durable attempt."""
     routing = task.get("routing") if isinstance(task.get("routing"), dict) else {}
@@ -455,7 +480,7 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from herdr.policy_launch import HostPolicyLaunchFactory, PreparedPolicyLaunch
     from herdr.security import InvocationIdentity
-    factory = policy_launch_factory if policy_launch_factory is not None else HOST_POLICY_LAUNCH_FACTORY
+    factory = policy_launch_factory if policy_launch_factory is not None else _root_policy_factory()
     if not isinstance(factory, HostPolicyLaunchFactory):
         raise RuntimeError("task_invocation_policy_missing")
     identity = InvocationIdentity(consumer="github:" + str(task["repo"]), agent_id=agent_name,
@@ -467,12 +492,16 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
                              permissions=tuple(task.get("parent_permissions") or ()))
     if not isinstance(launch, PreparedPolicyLaunch) or launch.identity != identity:
         raise RuntimeError("task_invocation_policy_identity_mismatch")
-    task_env.update(launch.environment())
-    profile = _task_hermes_profile(task)
     pane_id = ""
     agent_start_attempted = False
-    preexisting_panes = _setup_pane_ids()
+    split_attempted = False
+    preexisting_panes = set()
+    HOST_POLICY_LAUNCHES[(task["id"],task["run_token"])]=launch
     try:
+        task_env.update(launch.environment())
+        profile = _task_hermes_profile(task)
+        _preflight_root_provider(profile)
+        preexisting_panes = _setup_pane_ids()
         def inspect_startup_source():
             source = _herdr_json(["pane","process-info","--pane",coordinator_pane],
                                  timeout_seconds=10.0)
@@ -481,6 +510,7 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
                 raise RuntimeError("task_startup_source_missing")
             return source_process.get("shell_pid")
         launch.verify_spawn_source(inspect_startup_source)
+        split_attempted = True
         split = _herdr_json(
             [
                 "pane", "split", "--pane", coordinator_pane,
@@ -581,6 +611,9 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         persist_execution_session(task)
         return session
     except Exception as exc:
+        if not split_attempted:
+            _cleanup_prepared_root_launch(task)
+            raise
         if pane_id and pane_id != coordinator_pane:
             candidates = (pane_id,)
         elif pane_id == coordinator_pane:
@@ -618,6 +651,7 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
                 session["cleanup_status"] = "closed"
         if cleanup_failed:
             raise RuntimeError("task_session_cleanup_failed") from exc
+        _cleanup_prepared_root_launch(task)
         if isinstance(task.get("execution_session"), dict):
             if task["execution_session"].get("closed_at"):
                 stop_bridge(task["execution_session"])
@@ -632,6 +666,11 @@ def cleanup_task_session(task: dict) -> bool:
     if not isinstance(session, dict) or not session.get("owned_pane"):
         return True
     if session.get("closed_at"):
+        try:
+            _cleanup_prepared_root_launch(task)
+        except Exception:
+            session["cleanup_status"]="launch_cleanup_failed"
+            return False
         return True
     pane_id = str(session.get("pane_id") or "")
     if not pane_id:
@@ -675,11 +714,7 @@ def cleanup_task_session(task: dict) -> bool:
     if not present or _close_owned_pane(pane_id):
         session["closed_at"] = utcnow().isoformat()
         session["cleanup_status"] = "closed"
-        launch_key = (task.get("id"), task.get("run_token"))
-        launch = HOST_POLICY_LAUNCHES.get(launch_key)
-        if launch is not None:
-            launch.cleanup_after_pane_closed()
-            del HOST_POLICY_LAUNCHES[launch_key]
+        _cleanup_prepared_root_launch(task)
         stop_bridge(session)
         if session.get("policy_file"):
             Path(session["policy_file"]).unlink(missing_ok=True)

@@ -272,7 +272,7 @@ def reconcile_child_results(root: Path, parent_task_id: str, run_token: str) -> 
             return
         for rec in children:
             if (rec.state is not LifecycleState.RUNNING or not rec.pre_delivery_pane_creation_attempted
-                    or rec.pre_delivery_agent_start_attempted):
+                    or rec.pre_delivery_agent_start_attempted and rec.economic_delivery_attempted is not False):
                 continue
             try:
                 runner = SubprocessHerdrRunner(os.environ.get(

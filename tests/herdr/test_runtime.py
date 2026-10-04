@@ -446,11 +446,11 @@ def test_child_workspace_write_requires_role_tool_and_permission(
 
 @pytest.mark.parametrize("tools,expected", [
     (("read_file", "search_files"), "file"),
-    (("read_file", "patch", "review"), "file"),
+    (("read_file", "write_file", "patch"), "file"),
 ])
 def test_managed_agent_start_uses_explicit_admitted_toolset(tmp_path, tools, expected):
     scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
-    role = "reviewer" if "review" in tools else "reader"
+    role = "writer" if set(tools) & {"patch","write_file"} else "reader"
     parent_role = "reviewer" if role == "reviewer" else "writer"
     scheduler.register_external_parent_attempt(
         task_id="parent", run_token="parent-run", idempotency_key="parent-key",
@@ -686,10 +686,12 @@ def test_prompt_invocation_error_preserves_accepted_child(tmp_path: Path, monkey
                                   idempotency_key=rec.idempotency_key)
     assert rec.state.value == "running" and rec.lease is lease
     assert rec.pre_delivery_failure is None and rec.execution_pane == "child-pane"
+    assert rec.economic_delivery_attempted is True
     replay = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
     replay.replay()
     assert replay._tasks[child.id].state.value == "running"
     assert replay._tasks[child.id].pre_delivery_failure is None
+    assert replay._tasks[child.id].economic_delivery_attempted is True
 
 
 def _healthy_usage(*_args) -> ResourceUsage:
@@ -1341,3 +1343,80 @@ def explicit_host_policy_for_lifecycle_tests(monkeypatch):
     from tests.policy_launch_fakes import install_runtime_policy_fixture
     from herdr.runtime import HerdrChildRuntime
     install_runtime_policy_fixture(monkeypatch, HerdrChildRuntime)
+
+
+@pytest.mark.parametrize("alias",["read","write","review"])
+def test_unsupported_file_alias_is_rejected_before_agent_start(alias):
+    with pytest.raises(HerdrRuntimeError,match="child_toolset_unmapped"):
+        runtime_mod._child_toolsets((alias,))
+
+def _interrupted_start_record(tmp_path):
+    scheduler=DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path/"events.jsonl"))
+    scheduler.register_external_parent_attempt(task_id="parent",run_token="parent-run",
+        idempotency_key="parent-key",agent_name="parent-agent",pane_id="parent-pane",
+        marker="parent-marker",repo="repo",issue="82",role="writer",
+        tools=("read_file",),permissions=(),policy_profile="default")
+    child=scheduler.delegate_child("parent","parent-run","startup",
+        ChildProposal("writer",("read_file",),"reader",("read_file",),child_task="inspect"))
+    lease=scheduler.dispatch(task_ids={child.id})[0];rec=scheduler._tasks[child.id]
+    scheduler.bind_child_prompt(child.id,"inspect")
+    assert scheduler.record_child_pane_intent(child.id,rec.run_token,rec.agent_id,
+        rec.fencing_token,rec.idempotency_key,f"child-{rec.run_token}")
+    assert scheduler.bind_pre_delivery_pane(child.id,rec.run_token,lease.agent_id,"owned-pane",f"child-{rec.run_token}")
+    scheduler.mark_pre_delivery_agent_start(child.id)
+    return scheduler,child,rec
+
+@pytest.mark.parametrize("legacy",[False,True])
+def test_crash_after_agent_start_recovers_only_proven_absent_prompt(tmp_path,monkeypatch,legacy):
+    scheduler,child,rec=_interrupted_start_record(tmp_path)
+    if legacy:
+        events=scheduler.audit_log.replay()
+        for event in events:
+            if event["event"]=="child_agent_start_attempted":event.pop("delivery_protocol_version")
+        scheduler.audit_log._path.write_text("".join(json.dumps(e)+"\n" for e in events))
+    replay=DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path/"events.jsonl"));replay.replay()
+    recovered=replay._tasks[child.id];closed=[]
+    runtime=HerdrChildRuntime(replay,FakeHerdrRunner(),cwd=tmp_path)
+    monkeypatch.setattr(runtime,"cleanup_bound_pre_delivery",lambda task_id:closed.append(task_id))
+    if legacy:
+        assert recovered.economic_delivery_attempted is None
+        with pytest.raises(HerdrRuntimeError,match="cleanup_unproven"):runtime.recover_interrupted_child_start(child.id)
+        assert not closed and recovered.state.value=="running"
+    else:
+        assert recovered.economic_delivery_attempted is False
+        runtime.recover_interrupted_child_start(child.id)
+        assert closed==[child.id] and recovered.cleanup_complete
+        assert recovered.state.value=="blocked" and recovered.run_token==rec.run_token
+        replay2=DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path/"events.jsonl"));replay2.replay()
+        assert replay2._tasks[child.id].cleanup_complete
+
+def test_duplicate_agent_start_event_cannot_clear_possible_prompt_effect(tmp_path):
+    from herdr.scheduler import SchedulerError
+    scheduler,child,rec=_interrupted_start_record(tmp_path)
+    original=next(e for e in scheduler.audit_log.replay() if e["event"]=="child_agent_start_attempted")
+    scheduler.audit_log.append(original);scheduler.audit_log.flush()
+    replay=DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path/"events.jsonl"))
+    with pytest.raises(SchedulerError,match="repeated child agent start"):replay.replay()
+
+
+@pytest.mark.parametrize("field,value",[("agent_id","foreign"),("fencing_token",999),("idempotency_key","foreign"),("delivery_protocol_version",1.0)])
+def test_new_start_protocol_replay_requires_full_attempt_identity_and_integer_version(tmp_path,field,value):
+    from herdr.scheduler import SchedulerError
+    scheduler,child,rec=_interrupted_start_record(tmp_path)
+    events=scheduler.audit_log.replay()
+    for event in events:
+        if event["event"]=="child_agent_start_attempted":event[field]=value
+    scheduler.audit_log._path.write_text("".join(json.dumps(e)+"\n" for e in events))
+    replay=DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path/"events.jsonl"))
+    with pytest.raises(SchedulerError):replay.replay()
+
+def test_prompt_intent_is_durable_one_use_and_prevents_pre_delivery_cleanup(tmp_path,monkeypatch):
+    scheduler,child,rec=_interrupted_start_record(tmp_path)
+    monkeypatch.setattr(scheduler,"authorize_child_delivery",lambda *args:True)
+    args=(child.id,rec.run_token,rec.agent_id,rec.fencing_token,rec.idempotency_key)
+    assert scheduler.mark_child_delivery_started(*args) is True
+    assert scheduler.mark_child_delivery_started(*args) is False
+    assert scheduler.fail_child_pre_delivery(*args,"cannot assume delivery absent",cleanup_complete=False) is False
+    replay=DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path/"events.jsonl"));replay.replay()
+    assert replay._tasks[child.id].economic_delivery_attempted is True
+    assert len([e for e in replay.audit_log.replay() if e["event"]=="child_prompt_delivery_attempted"])==1

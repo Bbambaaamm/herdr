@@ -325,6 +325,7 @@ class TaskRecord:
     cleanup_complete: bool = False
     pre_delivery_failure: str | None = None
     pre_delivery_agent_start_attempted: bool = False
+    economic_delivery_attempted: bool | None = None
     pre_delivery_pane_creation_attempted: bool = False
     delivery_prompt_sha256: str | None = None
     result_status: str | None = None
@@ -1439,9 +1440,25 @@ class DynamicChildScheduler:
             raise SchedulerError("child pane unavailable")
         if not rec.pre_delivery_agent_start_attempted:
             self.audit_log.append({"event": "child_agent_start_attempted", "task_id": task_id,
-                                   "run_token": rec.run_token})
+                                   "run_token": rec.run_token,"delivery_protocol_version":1,
+                                   "agent_id":rec.agent_id,"fencing_token":rec.fencing_token,
+                                   "idempotency_key":rec.idempotency_key})
             self.audit_log.flush()
             rec.pre_delivery_agent_start_attempted = True
+            rec.economic_delivery_attempted = False
+
+    def mark_child_delivery_started(self,task_id,run_token,agent_id,fencing_token,idempotency_key):
+        rec=self._tasks.get(task_id)
+        if (rec is None or rec.economic_delivery_attempted is not False
+                or not rec.pre_delivery_agent_start_attempted
+                or not self.authorize_child_delivery(task_id,run_token,agent_id,fencing_token,idempotency_key)):
+            return False
+        self.audit_log.append({"event":"child_prompt_delivery_attempted","task_id":task_id,
+            "run_token":run_token,"agent_id":agent_id,"fencing_token":fencing_token,
+            "idempotency_key":idempotency_key,"prompt_sha256":rec.delivery_prompt_sha256})
+        self.audit_log.flush()
+        rec.economic_delivery_attempted=True
+        return True
 
     def fail_child_pre_delivery(self, task_id: str, run_token: str, agent_id: str,
                                 fencing_token: int, idempotency_key: str,
@@ -1454,6 +1471,7 @@ class DynamicChildScheduler:
                 or (rec.run_token, rec.agent_id, rec.fencing_token, rec.idempotency_key) !=
                    (run_token, agent_id, fencing_token, idempotency_key)
                 or cleanup_complete
+                or rec.pre_delivery_agent_start_attempted and rec.economic_delivery_attempted is not False
                 ):
             return False
         pane_creation_attempted = pane_creation_attempted or rec.pre_delivery_pane_creation_attempted
@@ -1631,6 +1649,7 @@ class DynamicChildScheduler:
                     "cleanup_complete": rec.cleanup_complete,
                     "pre_delivery_failure": rec.pre_delivery_failure,
                     "pre_delivery_agent_start_attempted": rec.pre_delivery_agent_start_attempted,
+                    "economic_delivery_attempted": rec.economic_delivery_attempted,
                     "pre_delivery_pane_creation_attempted": rec.pre_delivery_pane_creation_attempted,
                     "run_token": rec.run_token,
                     "delegation_key": rec.delegation_key,
@@ -2051,9 +2070,25 @@ class DynamicChildScheduler:
                 rec.execution_pane = pane
             elif event_type == "child_agent_start_attempted":
                 rec = self._tasks.get(str(e.get("task_id", "")))
-                if rec is None or rec.run_token != e.get("run_token") or not rec.execution_pane:
-                    raise SchedulerError("invalid child agent start evidence")
+                if (rec is None or rec.run_token != e.get("run_token") or not rec.execution_pane
+                        or rec.state is not LifecycleState.RUNNING or rec.pre_delivery_agent_start_attempted):
+                    raise SchedulerError("invalid or repeated child agent start evidence")
+                version=e.get("delivery_protocol_version")
+                if version is not None and (type(version) is not int or version!=1):
+                    raise SchedulerError("invalid child delivery protocol")
+                if version==1 and (e.get("agent_id"),e.get("fencing_token"),e.get("idempotency_key"))!=(
+                        rec.agent_id,rec.fencing_token,rec.idempotency_key):
+                    raise SchedulerError("child agent start invocation identity changed")
                 rec.pre_delivery_agent_start_attempted = True
+                rec.economic_delivery_attempted=False if version==1 else None
+            elif event_type == "child_prompt_delivery_attempted":
+                rec=self._tasks.get(str(e.get("task_id","")))
+                if (rec is None or rec.state is not LifecycleState.RUNNING
+                    or rec.economic_delivery_attempted is not False or not rec.pre_delivery_agent_start_attempted
+                    or (rec.run_token,rec.agent_id,rec.fencing_token,rec.idempotency_key,rec.delivery_prompt_sha256)!=
+                        (e.get("run_token"),e.get("agent_id"),e.get("fencing_token"),e.get("idempotency_key"),e.get("prompt_sha256"))):
+                    raise SchedulerError("invalid or repeated child prompt delivery")
+                rec.economic_delivery_attempted=True
             elif event_type == "child_pre_delivery_failed":
                 rec = self._tasks.get(str(e.get("task_id", "")))
                 lease = rec.lease if rec else None
@@ -2065,6 +2100,7 @@ class DynamicChildScheduler:
                             e.get("idempotency_key"))
                         or not isinstance(e.get("cleanup_complete"), bool)
                         or e["cleanup_complete"]
+                        or rec.pre_delivery_agent_start_attempted and rec.economic_delivery_attempted is not False
                         ):
                     raise SchedulerError("invalid child pre-delivery failure")
                 rec.state = LifecycleState.BLOCKED

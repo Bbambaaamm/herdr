@@ -20,7 +20,6 @@ FILES = (
     Path("docs/CONSUMERS.md"),
     Path("docs/architecture/AGENT_SKILLS.md"),
     Path("docs/architecture/CONTEXT_MEMORY.md"),
-    Path("docs/architecture/INVOCATION_POLICY_LAUNCH.md"),
     Path("package.json"),
     Path("package-lock.json"),
     Path("requirements-mcp.txt"),

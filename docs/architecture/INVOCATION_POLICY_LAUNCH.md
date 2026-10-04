@@ -47,3 +47,53 @@ Before delivery and during managed-child reconciliation, the runtime reopens the
 Unsealed child proposals undergo the logical parent comparison before copying; signing always repeats the complete comparison against physically observed RuntimeAssurance. Network, writable roots, credential isolation and sandbox verification cannot widen. No provisional observation is treated as a sealed grant.
 
 The explicit scripts/probe-herdr-physical-bootstrap.py operator probe freezes the actual installed runtime, binds the real broker socket and verifies/fsyncs the receipt while stage two is blocked on ACK, then invokes only Hermes --version. It uses an isolated home and invokes no provider, deployment or live service mutation. Unit host doubles are not physical acceptance evidence.
+
+
+## Standalone host composition
+
+Both executable entrypoints now compose their real HostPolicyLaunchFactory.
+The worker reads the fixed /etc/herdr/host-policy.json for each new root attempt;
+a task, environment variable or CLI request cannot select a policy file. The
+bridge supplies a deferred parent factory and resolves the current canonical task
+file after authenticated stage-three publication and parent peer checks. It
+cannot resolve the parent eagerly because the bridge starts before that receipt
+exists.
+
+The closed schema contains schema_version=1, host_uid, code and exactly two
+runtime ApprovedTree inventories (source, target, files, executable_files,
+max_bytes, max_file_bytes), storage, task_store_root, templates keyed by consumer
+and grant_ttl_seconds (1..3600). Templates are serialized SecurityGrant ceilings.
+The configuration and all ancestors must be owned by root with no group/other
+write permission; the bounded reader rejects symlinks, special files and changes
+during reading. Private launch storage belongs to the executing host UID and is
+0700. Approved hashes come from host release approval, never from a worker
+request. Templates contain opaque credential references, not raw credentials.
+
+Root grants narrow consumer templates to the exact invocation identity,
+workspace, tools and permissions. Child grants additionally reopen and
+authenticate the exact retained parent policy and compare all logical ceilings
+against the current consumer template, including provider routes, credentials
+and tool arguments. A missing configuration denies before pane creation or
+provider preflight. Installation and live policy approval remain an explicit
+deployment gate; no production configuration is installed by the unit tests.
+
+Provider authentication preflight runs in the trusted host before root pane
+creation, using the sanitized environment. A setup failure before any split
+cleans its prepared snapshots and bootstrap socket. After a split, cleanup
+requires proof of closure of every exactly owned pane; ambiguous ownership keeps
+the prepared launch for reconciliation. A successful cleanup also removes the
+retained host map entry. File-tool aliases read/write/review are rejected before
+agent start; grants and actual Hermes tools use read_file/search_files/write_file/patch.
+
+## Prompt-effect boundary during crash recovery
+
+New start-intent records carry delivery_protocol_version=1 and the exact agent,
+run, fence and idempotency key. They prove only that agent startup was attempted.
+A separately fsynced, one-use child_prompt_delivery_attempted record binds the
+same invocation and prompt hash immediately before the economic prompt call.
+Recovery can close the exact owned pane after interrupted agent startup only
+when this new protocol proves no prompt intent exists. Once the prompt intent
+exists, delivery remains uncertain until same-attempt reconciliation; recovery
+does not resend, reset the attempt or discard its resources. Historical start
+records without this protocol retain unknown delivery status and remain
+quarantined. Replayed duplicate starts cannot erase a possible prompt effect.

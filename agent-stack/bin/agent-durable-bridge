@@ -127,7 +127,7 @@ def _peer_in_pane(connection: socket.socket, process_info: dict, marker: str) ->
     return False
 
 
-def serve(task_file: Path, identity: dict, real_binary: Path, *, policy_launch_factory=None) -> None:
+def serve(task_file: Path, identity: dict, real_binary: Path, *, policy_launch_factory=None, policy_launch_factory_provider=None) -> None:
     if not real_binary.is_absolute() or not real_binary.is_file():
         raise ValueError("real Herdr binary unavailable")
     startup_path = task_file.resolve(strict=True)
@@ -197,7 +197,12 @@ def serve(task_file: Path, identity: dict, real_binary: Path, *, policy_launch_f
                     ):
                         raise ValueError("request outside parent sandbox")
 
-                    result = child.delegate(args, runner=runner, policy_launch_factory=policy_launch_factory)
+                    factory=policy_launch_factory
+                    if factory is None:
+                        if not callable(policy_launch_factory_provider):
+                            raise ValueError("child host policy composition unavailable")
+                        factory=policy_launch_factory_provider(current_path,identity)
+                    result = child.delegate(args, runner=runner, policy_launch_factory=factory)
                     response = {"ok": True, "result": result, "error": None}
                 except Exception as exc:
                     response = {"ok": False, "result": None, "error": str(exc)[:1000]}
@@ -223,7 +228,9 @@ def main() -> None:
         "pane": args.pane,
         "marker": args.marker,
     }
-    serve(Path(args.task_file), identity, Path(args.real_binary))
+    from herdr.host_configuration import child_factory_for_root
+    serve(Path(args.task_file), identity, Path(args.real_binary),
+          policy_launch_factory_provider=child_factory_for_root)
 
 
 if __name__ == "__main__":
