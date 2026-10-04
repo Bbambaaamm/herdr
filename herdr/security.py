@@ -16,6 +16,7 @@ import json
 import os
 import re
 import stat
+import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -34,6 +35,15 @@ _MAX_ARG_ITEMS = 4096
 _MAX_ARG_STRING = 256 * 1024
 _TOKEN = re.compile(r"^[A-Za-z0-9._:/@+-]{1,256}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_V4A_SINGLE_HEADER = re.compile(
+    r"^\*\*\*\s*(Update|Add|Delete)\s+File:\s*(.+?)\s*$"
+)
+_V4A_MOVE_HEADER = re.compile(
+    r"^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+?)\s*$"
+)
+_V4A_ANY_FILE_HEADER = re.compile(
+    r"^\*\*\*\s*(?:Update|Add|Delete|Move)\s+File:"
+)
 _SECRET_KEY = re.compile(
     r"(?:^|_)(?:password|passwd|secret|api_key|apikey|access_key|access_token|"
     r"refresh_token|private_key|client_secret|authorization|credential)(?:$|_)",
@@ -549,8 +559,11 @@ class SecurityGrant:
                 raise SecurityError("child tool rule missing from parent")
             if not set(child_rule.allowed_arg_keys) <= set(parent_rule.allowed_arg_keys):
                 raise SecurityError("child tool argument ceiling escalates above parent")
-            if not set(child_rule.path_fields) <= set(parent_rule.path_fields):
-                raise SecurityError("child path-field ceiling escalates above parent")
+            required_path_fields = (
+                set(parent_rule.path_fields) & set(child_rule.allowed_arg_keys)
+            )
+            if not required_path_fields <= set(child_rule.path_fields):
+                raise SecurityError("child weakens parent path constraint")
             if not _roots_subset(child_rule.allowed_roots, parent_rule.allowed_roots):
                 raise SecurityError("child filesystem ceiling escalates above parent")
             if not set(child_rule.credential_ref_fields) <= set(parent_rule.credential_ref_fields):
@@ -989,6 +1002,9 @@ class InvocationGuard:
     aliases: Mapping[str, str] = field(default_factory=dict)
     breaker: ProviderCircuitBreaker = field(default_factory=ProviderCircuitBreaker)
     _consumed_approvals: set[str] = field(default_factory=set, init=False, repr=False)
+    _approval_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.grant, SecurityGrant):
@@ -1071,9 +1087,10 @@ class InvocationGuard:
         if evidence is None:
             raise PolicyDenied("approval_required", tool)
         if consume:
-            if evidence.approval_id in self._consumed_approvals:
-                raise PolicyDenied("approval_replayed", evidence.approval_id)
-            self._consumed_approvals.add(evidence.approval_id)
+            with self._approval_lock:
+                if evidence.approval_id in self._consumed_approvals:
+                    raise PolicyDenied("approval_replayed", evidence.approval_id)
+                self._consumed_approvals.add(evidence.approval_id)
 
     def authorize_provider(
         self,
@@ -1132,7 +1149,39 @@ def _validate_args(
         if not any(_path_within(resolved, Path(root)) for root in rule.allowed_roots):
             raise PolicyDenied("path_outside_grant", field)
         checked[field] = str(resolved)
+
+    if rule.tool == "patch" and checked.get("mode") == "patch":
+        patch = checked.get("patch")
+        if not isinstance(patch, str):
+            raise PolicyDenied("patch_content_required")
+        targets = _v4a_patch_targets(patch)
+        if not targets:
+            raise PolicyDenied("patch_target_required")
+        if not rule.allowed_roots:
+            raise PolicyDenied("path_root_required", "patch")
+        for target in targets:
+            resolved = Path(target).expanduser().resolve(strict=False)
+            if not any(_path_within(resolved, Path(root)) for root in rule.allowed_roots):
+                raise PolicyDenied("path_outside_grant", target[:256])
     return checked
+
+
+def _v4a_patch_targets(patch: str) -> tuple[str, ...]:
+    """Extract every source/destination path from Hermes V4A patch headers."""
+    targets: list[str] = []
+    for raw_line in patch.splitlines():
+        line = raw_line
+        move = _V4A_MOVE_HEADER.match(line)
+        if move:
+            targets.extend((move.group(1).strip(), move.group(2).strip()))
+            continue
+        single = _V4A_SINGLE_HEADER.match(line)
+        if single:
+            targets.append(single.group(2).strip())
+            continue
+        if _V4A_ANY_FILE_HEADER.match(line):
+            raise PolicyDenied("patch_header_invalid")
+    return tuple(target for target in targets if target)
 
 
 def _validate_value(

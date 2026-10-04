@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 
 
@@ -207,6 +208,45 @@ def main() -> int:
         assert "HERDR76_OUTSIDE_SECRET" not in str(poisoned)
 
         installation.uninstall()
+        patch_scope = replace(
+            scope,
+            tools=("patch",),
+            permissions=("workspace-write",),
+        )
+        patch_grant = replace(
+            grant,
+            grant_id="hermes-v0215-patch-probe",
+            scope=patch_scope,
+            tool_rules=(
+                ToolRule(
+                    tool="patch",
+                    risk=RiskClass.WORKSPACE_WRITE,
+                    allowed_arg_keys=("path", "mode", "patch"),
+                    path_fields=("path",),
+                    allowed_roots=(str(workspace),),
+                ),
+            ),
+        )
+        installation = install_hermes_guard(InvocationGuard(patch_grant))
+        outside_move = outside / "moved.txt"
+        v4a_denied = model_tools.handle_function_call(
+            "patch",
+            {
+                "path": str(allowed_file),
+                "mode": "patch",
+                "patch": (
+                    "*** Begin Patch\n"
+                    f"*** Move File: {allowed_file} -> {outside_move}\n"
+                    "*** End Patch"
+                ),
+            },
+            **common,
+        )
+        assert "HERDR_SECURITY_DENIED[path_outside_grant]" in str(v4a_denied), v4a_denied
+        assert allowed_file.exists()
+        assert not outside_move.exists()
+
+        installation.uninstall()
         result = {
             "status": "PASS",
             "hermes_file_toolset": sorted(file_toolset),
@@ -217,6 +257,7 @@ def main() -> int:
             "malformed_tool_denied_fail_closed": True,
             "bridge_connector_denied_before_dispatch": True,
             "post_middleware_path_poisoning_denied": True,
+            "v4a_embedded_target_denied": True,
             "live_config_changed": False,
         }
         print(json.dumps(result, sort_keys=True))

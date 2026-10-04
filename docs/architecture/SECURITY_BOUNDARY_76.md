@@ -181,8 +181,9 @@ Hermes version banner never appeared, and the probe pane was closed. This proves
 the supported path is `herdr server → pane shell → policy-bin/hermes → guarded
 Hermes`; it does not claim #82 has integrated the bundle yet.
 
-`agent-stack/policy-bin/hermes` resolves to `agent-hermes-policy-run`. The
-launcher reads only the fixed bundle path and exact host-controlled pane env:
+`agent-stack/policy-bin/hermes` is a regular executable, byte-identical copy of
+`agent-hermes-policy-run` (not a symlink, because release payload extraction is
+fail-closed on links). The launcher reads only the fixed bundle path and exact host-controlled pane env:
 `HERDR_POLICY_CONSUMER`, `HERDR_POLICY_AGENT_ID`,
 `HERDR_POLICY_PARENT_AGENT_ID`, `HERDR_POLICY_PARENT_TASK_ID`,
 `HERDR_POLICY_TASK_ID`, `HERDR_POLICY_RUN_TOKEN`, and

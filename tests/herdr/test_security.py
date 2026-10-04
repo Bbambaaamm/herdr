@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization
 from dataclasses import replace
@@ -433,6 +435,79 @@ def test_exact_approval_is_bound_to_identity_tool_args_and_single_use(tmp_path):
         )
 
 
+def test_v4a_patch_authorizes_every_embedded_target(tmp_path):
+    outside = tmp_path.parent / "outside.py"
+    rule = ToolRule(
+        "patch",
+        RiskClass.WORKSPACE_WRITE,
+        ("path", "mode", "patch"),
+        ("path",),
+        (str(tmp_path),),
+    )
+    item = grant(tmp_path, tools=("patch",), rules=(rule,))
+    guard = InvocationGuard(item, assurance())
+    dummy = str((tmp_path / "anchor.py").resolve())
+    inside = str((tmp_path / "inside.py").resolve())
+
+    allowed = {
+        "path": dummy,
+        "mode": "patch",
+        "patch": (
+            "*** Begin Patch\n"
+            f"*** Add File: {inside}\n"
+            "+ok\n"
+            "*** End Patch"
+        ),
+    }
+    assert guard.authorize_tool("patch", allowed) == "patch"
+
+    escaped = {
+        **allowed,
+        "patch": (
+            "*** Begin Patch\n"
+            f"*** Update File: {inside}\n"
+            "@@ x @@\n-old\n+new\n"
+            f"*** Move File: {inside} -> {outside}\n"
+            "*** End Patch"
+        ),
+    }
+    with pytest.raises(PolicyDenied, match="path_outside_grant"):
+        guard.authorize_tool("patch", escaped)
+
+
+def test_one_use_approval_is_atomic_under_concurrent_dispatch(tmp_path):
+    args = {"target": "external-system"}
+    digest = canonical_digest({"tool": "deploy_prod", "args": args})
+    approval = ApprovalEvidence("approval-race", identity(), "deploy_prod", digest)
+    rule = ToolRule("deploy_prod", RiskClass.EXTERNAL_SIDE_EFFECT, ("target",))
+    item = grant(
+        tmp_path,
+        tools=("deploy_prod",),
+        rules=(rule,),
+        approvals=(approval,),
+        approval_required_for=(RiskClass.EXTERNAL_SIDE_EFFECT,),
+    )
+    guard = InvocationGuard(item, assurance())
+
+    class SlowContainsSet(set):
+        def __contains__(self, value):
+            present = super().__contains__(value)
+            time.sleep(0.03)
+            return present
+
+    guard._consumed_approvals = SlowContainsSet()
+
+    def invoke():
+        try:
+            return guard.authorize_tool("deploy_prod", args)
+        except PolicyDenied as exc:
+            return exc.reason
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: invoke(), range(2)))
+    assert sorted(results) == ["approval_replayed", "deploy_prod"]
+
+
 def test_known_side_effect_cannot_lose_risk_or_approval_gate(tmp_path):
     item = grant(tmp_path, tools=("write_file",))
     # Routine workspace edits remain possible inside the signed physical
@@ -508,6 +583,42 @@ def test_child_scope_must_be_mathematical_subset_including_runtime_edges(tmp_pat
     with pytest.raises(SecurityError, match="risk cannot be reclassified"):
         replace(parent, identity=child.identity, parent_grant_hash=parent.hash,
                 tool_rules=(parent.tool_rules[0], weakened_rule))
+
+
+def test_child_cannot_drop_retained_parent_path_constraint(tmp_path):
+    parent_rule = ToolRule(
+        "custom_file",
+        RiskClass.READ,
+        ("path", "format"),
+        ("path",),
+        (str(tmp_path),),
+    )
+    parent = grant(tmp_path, tools=("custom_file",), rules=(parent_rule,))
+    child_identity = identity(
+        agent_id="grandchild-agent",
+        parent_agent_id=parent.identity.agent_id,
+        parent_task_id=parent.identity.task_id,
+        task_id="grandchild",
+    )
+    child = replace(
+        grant(
+            tmp_path,
+            tools=("custom_file",),
+            rules=(
+                ToolRule("custom_file", RiskClass.READ, ("path", "format"), (), ()),
+            ),
+        ),
+        identity=child_identity,
+        parent_grant_hash=parent.hash,
+    )
+    with pytest.raises(SecurityError, match="weakens parent path constraint"):
+        child.require_subset_of(parent)
+
+    narrowed = replace(
+        child,
+        tool_rules=(ToolRule("custom_file", RiskClass.READ, ("format",), (), ()),),
+    )
+    narrowed.require_subset_of(parent)
 
 
 def test_untrusted_content_can_only_restrict_not_grant(tmp_path):

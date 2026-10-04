@@ -33,8 +33,10 @@ def test_fixed_production_entry_preserves_argv_without_policy_override(monkeypat
 
 
 def test_policy_bin_hermes_invokes_guarded_launcher():
-    assert POLICY_BIN.is_symlink()
-    assert POLICY_BIN.resolve() == LAUNCHER
+    assert POLICY_BIN.is_file()
+    assert not POLICY_BIN.is_symlink()
+    assert POLICY_BIN.read_bytes() == LAUNCHER.read_bytes()
+    assert POLICY_BIN.stat().st_mode & 0o111
     # Production intentionally uses the pinned staging-host Hermes interpreter.
     # Generic CI does not have that absolute interpreter, so executing the symlink
     # would fail in the kernel before any policy code runs. Verify the launcher
