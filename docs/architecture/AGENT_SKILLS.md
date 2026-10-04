@@ -123,3 +123,10 @@ an over-budget resource from its declared size before reading or base64 expansio
 and checks text escaping before loading the next resource. Mandatory content
 cannot bypass the same budget. Selected telemetry includes resource paths,
 digests, sizes, media types and data classes; resource bytes remain excluded.
+
+Skill payload and trace bindings include the selected executor ID; its frozen
+registry identifies the provider and capability that passed compatibility.
+A provider switch re-resolves and binds the same portable content to the new
+executor. Requested image resources require image input in both the grant and
+selected capability before any body or resource is opened. Unrequested images
+remain lazy and do not impose image input on a text-only use.

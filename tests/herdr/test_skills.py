@@ -124,7 +124,11 @@ def test_rendering_identical_for_two_compatible_providers(tmp_path, registry_fac
     registry = registry_factory(item)
     bundles = [registry.resolve((SkillRequest("sample", "research"),), context(), policy(item[1]),
                                 LAYERS, executor_id=x + "-runtime") for x in ("a", "b")]
-    assert bundles[0].payload == bundles[1].payload and bundles[0].hash == bundles[1].hash
+    assert bundles[0].render()["skills"] == bundles[1].render()["skills"]
+    assert bundles[0].hash != bundles[1].hash
+    assert bundles[0].render()["binding"]["executor_id"] == "a-runtime"
+    assert bundles[1].render()["binding"]["executor_id"] == "b-runtime"
+    assert bundles[0].telemetry()["binding"]["executor_id"] == "a-runtime"
     trace = bundles[0].telemetry()["selected"][0]
     assert trace["version"] == "1.0.0" and trace["package_hash"] == item[2].hash
     assert trace["approved_revision"] == BASE and trace["reason"] == "research"
@@ -538,3 +542,42 @@ def test_source_manifest_rejects_nonregular_skill_tree_entries(tmp_path, kind):
     result = subprocess.run([sys.executable, str(script)], cwd=workspace,
                             capture_output=True, text=True, timeout=3)
     assert result.returncode != 0 and ("Nonregular skill" in result.stderr or "Non-directory skill" in result.stderr)
+
+@pytest.mark.parametrize("media_type", ["image/png", "image/jpeg"])
+@pytest.mark.parametrize("scope_vision,executor_vision", [(False, False), (True, False), (False, True), (True, True)])
+def test_requested_images_require_granted_and_selected_executor_image_input(
+        tmp_path, registry_factory, media_type, scope_vision, executor_vision):
+    item = package(tmp_path, resources={"assets/image": b"bounded image bytes"})
+    manifest = replace(item[2], files=tuple(replace(x, media_type=media_type)
+        if x.path == "assets/image" else x for x in item[2].files))
+    (item[0] / "manifest.json").write_bytes(canonical(manifest.to_json()))
+    item = (item[0], replace(item[1], package_hash=manifest.hash), manifest)
+    registry = registry_factory(item)
+    ctx = context()
+    if scope_vision:
+        scope = replace(ctx.scope, input_modalities=("text", "image"))
+        ctx = replace(ctx, scope=scope, parent_scope=scope, consumer_scope=scope)
+    if executor_vision:
+        caps = tuple(replace(x, input_modalities=("text", "image")) for x in ctx.registry.capabilities)
+        ctx = replace(ctx, registry=RegistrySnapshot(caps, ctx.registry.providers, ctx.registry.executors))
+    original = registry.packages[0].load
+    loaded = []
+    def load(path):
+        loaded.append(path)
+        return original(path)
+    registry.packages[0].load = load
+    request = SkillRequest("sample", "image evidence", ("assets/image",))
+    bundle = registry.resolve((request,), ctx, policy(item[1]), LAYERS, executor_id="a-runtime")
+    if scope_vision and executor_vision:
+        assert bundle.render()["skills"][0]["resources"][0]["encoding"] == "base64"
+    else:
+        assert bundle.telemetry()["rejected"] == [{"name": "sample", "code": "resource_modality_incompatible"}]
+        assert not loaded
+        with pytest.raises(SkillError, match="mandatory_skill_unavailable"):
+            registry.resolve((request,), ctx, policy(item[1], mandatory=(item[1],)),
+                             LAYERS, executor_id="a-runtime")
+    # Unselected image assets never require image input and remain unopened.
+    loaded.clear()
+    bundle = registry.resolve((SkillRequest("sample", "text only"),), context(), policy(item[1]),
+                              LAYERS, executor_id="a-runtime")
+    assert bundle.render()["skills"] and loaded == ["SKILL.md"]

@@ -586,7 +586,8 @@ class SkillRegistry:
                 requested[package.manifest.name] = SkillRequest(package.manifest.name, "mandatory_project_security")
         by_name = {x.manifest.name: x for x in self.packages}
         selected, rejected, content = [], [], []
-        envelope = {"schema_version": VERSION, "binding": context.binding(),
+        binding = {**context.binding(), "executor_id": executor_id}
+        envelope = {"schema_version": VERSION, "binding": binding,
                     "consumer_skill_policy_hash": policy.hash,
                     "policy_layers": layers.to_json(), "skills": content}
         used_bytes = len(canonical(envelope))
@@ -603,6 +604,13 @@ class SkillRegistry:
                 declared = {x.path for x in package.manifest.files}
                 if not set(request.resources) <= declared:
                     reason = "undeclared_resource"
+                else:
+                    executor = next(x for x in context.registry.executors if x.id == executor_id)
+                    capability = next(x for x in context.registry.capabilities if x.id == executor.capability_id)
+                    requested_entries = [x for x in package.manifest.files if x.path in request.resources]
+                    if (any(x.media_type in {"image/png", "image/jpeg"} for x in requested_entries)
+                            and Modality.IMAGE not in set(context.scope.input_modalities) & set(capability.input_modalities)):
+                        reason = "resource_modality_incompatible"
             if reason is not None:
                 need(skill_name not in mandatory, "mandatory_skill_unavailable")
                 rejected.append({"name": skill_name, "code": reason})
@@ -643,7 +651,7 @@ class SkillRegistry:
                              "resources": resource_trace})
         payload = canonical(envelope)
         need(len(payload) == used_bytes and len(payload) <= max_bytes, "context_budget_exceeded")
-        trace = canonical({"schema_version": VERSION, "binding": context.binding(),
+        trace = canonical({"schema_version": VERSION, "binding": binding,
                            "consumer_skill_policy_hash": policy.hash,
                            "selected": selected, "rejected": rejected})
         return SkillBundle(payload, trace)
