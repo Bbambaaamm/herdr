@@ -536,6 +536,9 @@ class _OwnedChild:
     prompt: str
 
 
+from herdr.policy_launch import HostPolicyLaunchFactory, PreparedPolicyLaunch
+from herdr.security import InvocationIdentity
+
 class HerdrChildRuntime:
     def __init__(
         self,
@@ -544,6 +547,7 @@ class HerdrChildRuntime:
         *,
         cwd: Path,
         pinned_worktree: object | None = None,
+        policy_launch_factory: HostPolicyLaunchFactory | None = None,
         snapshot_path: Path = DEFAULT_SNAPSHOT,
         env: Mapping[str, str] | None = None,
         host_guard: Callable[[], bool] = host_resources_allow_spawn,
@@ -558,6 +562,9 @@ class HerdrChildRuntime:
         self.runner = runner
         self.cwd = Path(cwd).absolute() if pinned_worktree is not None else cwd.resolve()
         self.pinned_worktree = pinned_worktree
+        self.policy_launch_factory = policy_launch_factory
+        self._policy_launches: dict[str, PreparedPolicyLaunch] = {}
+        self._policy_panes: dict[str, PreparedPolicyLaunch] = {}
         self.snapshot_path = snapshot_path
         self.env = dict(env if env is not None else os.environ)
         self.host_guard = host_guard
@@ -817,6 +824,10 @@ class HerdrChildRuntime:
         spec = importlib.util.spec_from_loader(loader.name, loader)
         sandbox = importlib.util.module_from_spec(spec)
         loader.exec_module(sandbox)
+        launch = self._policy_launches.get(task_id)
+        if not isinstance(launch, PreparedPolicyLaunch):
+            raise HerdrRuntimeError("child_invocation_policy_missing", task_id)
+        self._policy_panes[pane_id] = launch
         policy = sandbox.frozen_policy()
         try:
             writable = self._child_result_writable(task_id)
@@ -827,6 +838,7 @@ class HerdrChildRuntime:
                 policy=policy,
                 child_workspace_writable=self._child_workspace_writable(task_id),
                 pinned_worktree=self.pinned_worktree,
+                policy_mount=launch.mount,
             )
             _json_result(self.runner.run(["pane", "run", pane_id,
                                           sandbox.shell_command(sandbox_args)]), "child sandbox start")
@@ -839,9 +851,20 @@ class HerdrChildRuntime:
             if not sandbox_pid or not sandbox.verify(
                     sandbox_pid, Path(real), marker, policy=policy,
                     pinned_worktree=self.pinned_worktree,
-                    child_workspace_writable=self._child_workspace_writable(task_id)):
+                    child_workspace_writable=self._child_workspace_writable(task_id),
+                    policy_mount=launch.mount):
                 raise HerdrRuntimeError("child_sandbox_unverified", pane_id)
+            record = self.scheduler._tasks[task_id]
+            node = self.scheduler.task_node(task_id)
+            attestation = {"authority": "herdr-runtime", "task_id": task_id,
+                           "run_token": record.run_token, "sandbox_pid": sandbox_pid,
+                           "fencing_token": record.fencing_token, "agent_name": record.agent_id,
+                           "pane_id": pane_id, "marker": marker,
+                           "worktree_identity": record.worktree_identity}
+            policy_evidence = launch.seal(sandbox_pid, attestation, tools=node.tools,
+                                          permissions=node.permissions)
             self._sandbox_proofs[pane_id] = {
+                "invocation_policy": policy_evidence,
                 "sandbox_pid": sandbox_pid,
                 "policy_sha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
             }
@@ -894,6 +917,9 @@ class HerdrChildRuntime:
                     raise HerdrRuntimeError("child_cleanup_unproven", pane_id)
                 if any(isinstance(row, Mapping) and row.get("pane_id") == pane_id for row in panes):
                     raise HerdrRuntimeError("child_cleanup_failed", pane_id)
+        if pane_id in self._policy_panes:
+            self._policy_panes[pane_id].cleanup_after_pane_closed()
+            del self._policy_panes[pane_id]
         if rec.agent_id:
             self.admission_registry.release(
                 rec.agent_id, now=self.scheduler.current_time(),
@@ -937,6 +963,9 @@ class HerdrChildRuntime:
                         isinstance(row, Mapping) and row.get("pane_id") == pane_id
                         for row in remaining)):
                     raise HerdrRuntimeError("child_cleanup_failed", pane_id)
+        if pane_id in self._policy_panes:
+            self._policy_panes[pane_id].cleanup_after_pane_closed()
+            del self._policy_panes[pane_id]
         self._owned_panes.discard(pane_id)
         self.admission_registry.release(
             lease.agent_id, now=self.scheduler.current_time(),
@@ -1042,6 +1071,23 @@ class HerdrChildRuntime:
                 raise HerdrRuntimeError("real_herdr_required", "managed child needs real binary")
             self.prepare()
             self._admit_child(lease)
+            if not isinstance(self.policy_launch_factory, HostPolicyLaunchFactory):
+                raise HerdrRuntimeError("child_invocation_policy_missing", lease.task_id)
+            record = self.scheduler._tasks[lease.task_id]
+            node = self.scheduler.task_node(lease.task_id)
+            context = self.scheduler.task_context(lease.task_id)
+            identity = InvocationIdentity(consumer="github:" + context["repo"],
+                                          agent_id=lease.agent_id,
+                                          parent_agent_id=str(record.parent_agent_id or ""),
+                                          parent_task_id=str(record.parent_task_id or ""),
+                                          task_id=lease.task_id, run_token=run_token,
+                                          fencing_token=lease.fencing_token)
+            launch = self.policy_launch_factory.prepare_child(identity=identity, workspace=self.cwd,
+                                                         tools=node.tools, permissions=node.permissions)
+            if not isinstance(launch, PreparedPolicyLaunch) or launch.identity != identity:
+                raise HerdrRuntimeError("child_invocation_policy_identity_mismatch", lease.task_id)
+            self._policy_launches[lease.task_id] = launch
+            policy_env.update(launch.environment())
             self._preflight_child_provider()
             if not self.scheduler.record_child_pane_intent(
                     lease.task_id, run_token, lease.agent_id, lease.fencing_token, idempotency_key, marker):

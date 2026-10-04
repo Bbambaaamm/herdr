@@ -122,6 +122,10 @@ def prepare_attempt(task: dict) -> None:
     attempt = int(task.get("attempts") or 0)
     archive_previous_result(str(task["id"]), attempt)
     task.pop("execution_session", None)
+    previous_fence = task.get("fencing_token", 0)
+    if type(previous_fence) is not int or not 0 <= previous_fence < (1 << 63) - 1:
+        raise RuntimeError("task_fencing_token_invalid")
+    task["fencing_token"] = previous_fence + 1
     task["run_token"] = uuid.uuid4().hex
     task["attempt_id"] = attempt
     seed = ":".join(
@@ -406,7 +410,11 @@ def _cleanup_setup_pane(pane_id: str, coordinator_pane: str, marker: str,
         return False
 
 
-def create_task_session(task: dict) -> dict:
+# Host embedding supplies the accepted factory; queue/model fields never select it.
+HOST_POLICY_LAUNCH_FACTORY = None
+HOST_POLICY_LAUNCHES = {}
+
+def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
     """Create one fresh Hermes pane/session for exactly one durable attempt."""
     routing = task.get("routing") if isinstance(task.get("routing"), dict) else {}
     coordinator = str(
@@ -442,6 +450,22 @@ def create_task_session(task: dict) -> dict:
         "HERDR_DURABLE_BRIDGE_SOCKET": bridge_socket_name(task),
         "PATH": f"{POLICY_BIN}:{ENV['PATH']}",
     }
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from herdr.policy_launch import HostPolicyLaunchFactory, PreparedPolicyLaunch
+    from herdr.security import InvocationIdentity
+    factory = policy_launch_factory if policy_launch_factory is not None else HOST_POLICY_LAUNCH_FACTORY
+    if not isinstance(factory, HostPolicyLaunchFactory):
+        raise RuntimeError("task_invocation_policy_missing")
+    identity = InvocationIdentity(consumer="github:" + str(task["repo"]), agent_id=agent_name,
+                                  parent_agent_id=coordinator, parent_task_id="coordinator:" + coordinator,
+                                  task_id=str(task["id"]), run_token=str(task["run_token"]),
+                                  fencing_token=task["fencing_token"])
+    launch = factory.prepare(identity=identity, workspace=Path(workspace),
+                             tools=tuple(task.get("parent_tools") or ()),
+                             permissions=tuple(task.get("parent_permissions") or ()))
+    if not isinstance(launch, PreparedPolicyLaunch) or launch.identity != identity:
+        raise RuntimeError("task_invocation_policy_identity_mismatch")
+    task_env.update(launch.environment())
     profile = _task_hermes_profile(task)
     pane_id = ""
     agent_start_attempted = False
@@ -476,6 +500,7 @@ def create_task_session(task: dict) -> dict:
             "created_at": utcnow().isoformat(),
         }
         task["execution_session"] = session
+        HOST_POLICY_LAUNCHES[(task["id"], task["run_token"])] = launch
         persist_execution_session(task)
         start_bridge(task, session)
         policy = frozen_policy()
@@ -486,13 +511,13 @@ def create_task_session(task: dict) -> dict:
         if not task_result.exists():
             task_result.touch(mode=0o600)
         command = sandbox_command(
-            Path(workspace), HERDR, writable=(task_result,), policy=policy
+            Path(workspace), HERDR, writable=(task_result,), policy=policy, policy_mount=launch.mount
         )
         _herdr_json(["pane", "run", pane_id, shell_command(command)], timeout_seconds=15.0)
         info = _herdr_json(["pane", "process-info", "--pane", pane_id], timeout_seconds=10.0)
         process_info = (info.get("result") or {}).get("process_info")
         sandbox_pid = inner_pid(process_info if isinstance(process_info, dict) else {}, pane_marker)
-        if not sandbox_pid or not verify_sandbox(sandbox_pid, HERDR, pane_marker, policy=policy):
+        if not sandbox_pid or not verify_sandbox(sandbox_pid, HERDR, pane_marker, policy=policy, policy_mount=launch.mount):
             raise RuntimeError("durable_sandbox_unverified")
         session["sandbox_pid"] = sandbox_pid
         session["sandbox_attestation"] = {
@@ -507,6 +532,10 @@ def create_task_session(task: dict) -> dict:
             "policy_sha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
             "verified_at": utcnow().isoformat(),
         }
+        session["sandbox_attestation"]["fencing_token"] = task["fencing_token"]
+        session["invocation_policy"] = launch.seal(
+            sandbox_pid, session["sandbox_attestation"], tools=tuple(task.get("parent_tools") or ()),
+            permissions=tuple(task.get("parent_permissions") or ()))
         session["sandbox_verified"] = True
         persist_execution_session(task)
         agent_start_attempted = True
@@ -629,6 +658,11 @@ def cleanup_task_session(task: dict) -> bool:
     if not present or _close_owned_pane(pane_id):
         session["closed_at"] = utcnow().isoformat()
         session["cleanup_status"] = "closed"
+        launch_key = (task.get("id"), task.get("run_token"))
+        launch = HOST_POLICY_LAUNCHES.get(launch_key)
+        if launch is not None:
+            launch.cleanup_after_pane_closed()
+            del HOST_POLICY_LAUNCHES[launch_key]
         stop_bridge(session)
         if session.get("policy_file"):
             Path(session["policy_file"]).unlink(missing_ok=True)
@@ -1253,6 +1287,10 @@ def main(task_path: Path) -> int:
                         "task_session_isolation_uncertain",
                         f"Task pane ownership/cleanup could not be proven safe: {detail}",
                     )
+                    return 1
+                if detail.startswith(("task_invocation_policy_", "host grant")):
+                    block_task(task_path, task, "task_invocation_policy_unavailable",
+                               "Host invocation policy must be supplied before execution.")
                     return 1
                 retry(task_path, task, f"task_session_isolation_unavailable: {detail}")
                 return 1

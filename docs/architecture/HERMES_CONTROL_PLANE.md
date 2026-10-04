@@ -170,3 +170,8 @@ Machine City and audit export must show:
 - restart reconstructs the same authoritative graph and attempts;
 - Machine City reflects durable state, not terminal heuristics;
 - consumer CI/review/merge authority remains unchanged.
+
+
+## Physical invocation boundary
+
+Root and managed-child launches require the host-only policy factory and same-inode sealing described in [Host invocation policy launch](INVOCATION_POLICY_LAUNCH.md). Physical evidence is verified before Hermes starts. Missing host authorization is a policy blocker; a model-visible schema, pane status or task field cannot supply it.

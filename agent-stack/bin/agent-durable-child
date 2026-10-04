@@ -218,7 +218,7 @@ def _parent_context(runner):
     return task, pane, agent, marker
 
 
-def delegate(args, *, runner=None):
+def delegate(args, *, runner=None, policy_launch_factory=None):
     real = _required_env("HERDR_REAL_BINARY")
     if not Path(real).is_absolute() or not Path(real).is_file():
         raise ValueError("real Herdr binary unavailable")
@@ -228,10 +228,10 @@ def delegate(args, *, runner=None):
         runner.env = {**os.environ, "HERDR_ENV": "1", "HERDR_PANE_ID": pane}
     parent_id, token = task["id"], task["run_token"]
     with closing(_pin_child_cwd(task, args)) as pinned:
-        return _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned)
+        return _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, policy_launch_factory)
 
 
-def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned):
+def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, policy_launch_factory=None):
     child_cwd = pinned.logical
     parent_id, token = task["id"], task["run_token"]
     if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", args.key):
@@ -340,6 +340,7 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned):
         if newly_claimed:
             runtime = HerdrChildRuntime(
                 scheduler, runner, cwd=child_cwd, pinned_worktree=pinned,
+                policy_launch_factory=policy_launch_factory,
                 snapshot_path=directory / "swarm.json",
                 env={**os.environ, "HERDR_ENV": "1", "HERDR_PANE_ID": pane,
                      "HERDR_PROFILE": task["safety_profile"],

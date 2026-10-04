@@ -1202,6 +1202,9 @@ def test_child_sandbox_failure_removes_frozen_policy(tmp_path, monkeypatch, phas
                 raise RuntimeError("transport failed")
             return CommandResult(0, json.dumps({"result": {"process_info": {}}}), "")
     runtime = HerdrChildRuntime(scheduler, Runner(), cwd=tmp_path, snapshot_path=tmp_path / "scheduler.json")
+    from tests.policy_launch_fakes import FakePreparedPolicyLaunch
+    from tests.herdr.test_security import identity
+    runtime._policy_launches["task"] = FakePreparedPolicyLaunch(identity(task_id="task"))
     def result(*a):
         if phase == "result":
             raise RuntimeError("result failed")
@@ -1326,3 +1329,9 @@ def test_split_crash_recovers_durable_intent_with_actual_process_identity(tmp_pa
             if process.poll() is None:
                 process.terminate()
             process.wait(timeout=5)
+
+@pytest.fixture(autouse=True)
+def explicit_host_policy_for_lifecycle_tests(monkeypatch):
+    from tests.policy_launch_fakes import install_runtime_policy_fixture
+    from herdr.runtime import HerdrChildRuntime
+    install_runtime_policy_fixture(monkeypatch, HerdrChildRuntime)

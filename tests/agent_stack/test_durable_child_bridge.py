@@ -990,3 +990,9 @@ def test_bridge_resumes_first_ledger_initialization_without_duplicate_delivery(t
     assert calls == [first["task_id"]]
     assert ledger_required(directory)
     assert json.loads((directory / agent_durable_children.INITIALIZATION).read_text())["state"] == "committed"
+
+@pytest.fixture(autouse=True)
+def explicit_host_policy_for_lifecycle_tests(monkeypatch):
+    from tests.policy_launch_fakes import install_runtime_policy_fixture
+    from herdr.runtime import HerdrChildRuntime
+    install_runtime_policy_fixture(monkeypatch, HerdrChildRuntime)

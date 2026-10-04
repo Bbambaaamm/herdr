@@ -1223,3 +1223,14 @@ def test_worker_session_writes_fsync_file_then_directory(tmp_path, monkeypatch):
     assert len(observed) == 2 and stat.S_ISREG(observed[0]) and stat.S_ISDIR(observed[1])
     assert (tmp_path / "record.json").stat().st_mode & 0o777 == 0o600
     assert not list(tmp_path.glob("*.tmp"))
+
+@pytest.fixture(autouse=True)
+def explicit_host_policy_for_worker_lifecycle_tests(monkeypatch):
+    from tests.policy_launch_fakes import FakeHostPolicyLaunchFactory
+    monkeypatch.setattr(worker, "HOST_POLICY_LAUNCH_FACTORY", FakeHostPolicyLaunchFactory())
+    monkeypatch.setattr(worker, "HOST_POLICY_LAUNCHES", {})
+    original = worker.create_task_session
+    def create(task, **kwargs):
+        task.setdefault("fencing_token", 1)
+        return original(task, **kwargs)
+    monkeypatch.setattr(worker, "create_task_session", create)
