@@ -248,10 +248,15 @@ class BootstrapAuthority:
         stage1_inspector: Callable[[int, str], tuple[int, int, str]] = inspect_stage1,
         peer_authorizer: Callable[[PeerProcess, BootstrapExpectation], bool] | None = None,
         clock: Callable[[], float] = time.time,
+        require_root_owned_stage0: bool = True,
     ) -> None:
         info = os.stat(stage0_path)
         if not stat.S_ISREG(info.st_mode):
             raise BootstrapAuthorityError("stage-zero interpreter must be regular")
+        if type(require_root_owned_stage0) is not bool:
+            raise BootstrapAuthorityError("explicit host stage-zero ownership requirement")
+        if require_root_owned_stage0 and (info.st_uid != 0 or info.st_mode & 0o022):
+            raise BootstrapAuthorityError("host stage-zero interpreter must be root-owned and immutable")
         if not callable(peer_authorizer):
             raise BootstrapAuthorityError("host peer authorizer required")
         self._stage0 = (info.st_dev, info.st_ino)

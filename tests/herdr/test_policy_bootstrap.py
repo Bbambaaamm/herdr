@@ -480,3 +480,20 @@ def test_stage1_cache_requires_physical_readonly_bootstrap(tmp_path,monkeypatch)
     monkeypatch.setattr(module,"_mount_rows",lambda:{str(root):{"rw"}})
     with pytest.raises(SystemExit,match="read-only"):
         module._fresh_pycache_prefix()
+
+
+def test_actual_user_namespace_keeps_stage0_verification_before_host_handshake():
+    import shutil
+    if not shutil.which("bwrap"): pytest.skip("bwrap prerequisite unavailable")
+    script=("import importlib.machinery,importlib.util;"
+        f"loader=importlib.machinery.SourceFileLoader('stage1_probe',{str(STAGE1)!r});"
+        "spec=importlib.util.spec_from_loader(loader.name,loader);"
+        "m=importlib.util.module_from_spec(spec);loader.exec_module(m);"
+        "m._require_independent_stage0();print('independent-stage0-ready-for-host-auth')")
+    result=subprocess.run(["/usr/bin/bwrap","--ro-bind","/","/","--unshare-pid","--proc","/proc",
+                           "--","/usr/bin/python3","-I","-S","-c",script],
+                          capture_output=True,text=True,timeout=5)
+    if result.returncode and "Operation not permitted" in result.stderr:
+        pytest.skip("kernel user-namespace prerequisite unavailable")
+    assert result.returncode==0,result.stderr
+    assert "ready-for-host-auth" in result.stdout

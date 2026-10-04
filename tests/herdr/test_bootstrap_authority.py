@@ -69,7 +69,7 @@ def test_host_authenticated_stage1_session_survives_exec_identity(tmp_path):
         python_inode=pinned_info.st_ino,
     )
     authority = BootstrapAuthority(
-        stage0_path=stage0,
+        stage0_path=stage0, require_root_owned_stage0=False,
         peer_inspector=inspect,
         stage1_inspector=lambda pid, path: (11, 12, "d" * 64),
         peer_authorizer=lambda peer, expected: True,
@@ -140,7 +140,7 @@ def test_bootstrap_authority_rejects_forged_sibling_process(tmp_path):
     identity = {"consumer":"github:owner/repo","agent_id":"agent","parent_agent_id":"parent",
         "parent_task_id":"parent-task","task_id":"task","run_token":"run","fencing_token":1}
     authority = BootstrapAuthority(
-        stage0_path=stage0, peer_inspector=inspect,
+        stage0_path=stage0, require_root_owned_stage0=False, peer_inspector=inspect,
         stage1_inspector=lambda pid, path: (21, 22, "d" * 64),
         peer_authorizer=lambda peer, expected: True,
     )
@@ -180,7 +180,7 @@ def test_bootstrap_authority_requires_host_peer_authorizer(tmp_path):
     stage0 = tmp_path / "stage0"
     stage0.write_bytes(b"x")
     with pytest.raises(BootstrapAuthorityError, match="host peer authorizer required"):
-        BootstrapAuthority(stage0_path=stage0)
+        BootstrapAuthority(stage0_path=stage0, require_root_owned_stage0=False)
 
 
 def test_bootstrap_authority_rejects_exact_argv_peer_not_confirmed_by_host(tmp_path):
@@ -204,7 +204,7 @@ def test_bootstrap_authority_rejects_exact_argv_peer_not_confirmed_by_host(tmp_p
         )
 
     authority = BootstrapAuthority(
-        stage0_path=stage0,
+        stage0_path=stage0, require_root_owned_stage0=False,
         peer_inspector=inspect,
         stage1_inspector=lambda pid, path: (31, 32, "d" * 64),
         peer_authorizer=lambda peer, expected: False,
@@ -249,7 +249,7 @@ def test_bootstrap_authority_requires_exact_stage1_argv_position(tmp_path):
         )
 
     authority = BootstrapAuthority(
-        stage0_path=stage0, peer_inspector=inspect,
+        stage0_path=stage0, require_root_owned_stage0=False, peer_inspector=inspect,
         stage1_inspector=lambda pid, path: (41, 42, "d" * 64),
         peer_authorizer=lambda peer, expected: True,
     )
@@ -288,7 +288,7 @@ def test_continuation_cannot_be_claimed_from_public_identity_without_exec(tmp_pa
     from herdr.security import InvocationIdentity
     stage0 = tmp_path / "stage0"
     stage0.write_bytes(b"x")
-    authority = BootstrapAuthority(stage0_path=stage0, peer_authorizer=lambda *args: True)
+    authority = BootstrapAuthority(stage0_path=stage0, require_root_owned_stage0=False, peer_authorizer=lambda *args: True)
     identity = InvocationIdentity("github:owner/repo","a","p","parent","task","run",1)
     assert authority.continuation(identity) is None
     with pytest.raises(BootstrapAuthorityError, match="unavailable"):
@@ -307,7 +307,7 @@ def test_expired_consumed_launches_reclaim_capacity_without_replay(tmp_path):
         if value==parent: return PeerProcess(parent,1,7,1,1,("shell",))
         return PeerProcess(pid,parent,8,info.st_dev,info.st_ino,
             (str(stage0),"-I","-S","/run/herdr-bootstrap/agent-hermes-policy-stage1"))
-    authority=BootstrapAuthority(stage0_path=stage0,peer_inspector=inspect,
+    authority=BootstrapAuthority(stage0_path=stage0, require_root_owned_stage0=False,peer_inspector=inspect,
         stage1_inspector=lambda *args:(3,4,"b"*64),peer_authorizer=lambda *args:True,
         clock=lambda:now[0])
     identity={"consumer":"github:owner/repo","agent_id":"agent","parent_agent_id":"parent",
@@ -335,7 +335,7 @@ def test_expired_consumed_launches_reclaim_capacity_without_replay(tmp_path):
 def test_unregistered_stalled_socket_peer_is_rejected_before_read(tmp_path):
     stage0=tmp_path/"stage0";stage0.write_bytes(b"trusted")
     info=stage0.stat()
-    authority=BootstrapAuthority(stage0_path=stage0,peer_authorizer=lambda *args:True,
+    authority=BootstrapAuthority(stage0_path=stage0, require_root_owned_stage0=False,peer_authorizer=lambda *args:True,
         peer_inspector=lambda pid:PeerProcess(pid,1,1,info.st_dev,info.st_ino,
                            (str(stage0),"-I","-S","/run/herdr-bootstrap/agent-hermes-policy-stage1")))
     server,client=socket.socketpair()
@@ -359,7 +359,7 @@ def test_stalled_authenticated_peer_cannot_block_another_launch(tmp_path):
         info=pin if counts[pid]>=3 else s0
         return PeerProcess(pid,parent,8,info.st_dev,info.st_ino,
                  (str(stage0),"-I","-S","/run/herdr-bootstrap/agent-hermes-policy-stage1"))
-    authority=BootstrapAuthority(stage0_path=stage0,peer_inspector=inspect,
+    authority=BootstrapAuthority(stage0_path=stage0, require_root_owned_stage0=False,peer_inspector=inspect,
         stage1_inspector=lambda *args:(3,4,"b"*64),
         peer_authorizer=lambda peer,expected:allowed.get(peer.pid)==dict(expected.identity))
     identities=[]
@@ -420,7 +420,7 @@ def test_unauthorized_bootstrap_peers_cannot_reserve_connection_capacity(tmp_pat
         info=pin if phase["stage2"] else s0
         return PeerProcess(pid,parent,8,info.st_dev,info.st_ino,
                  (str(stage0),"-I","-S","/run/herdr-bootstrap/agent-hermes-policy-stage1"))
-    authority=BootstrapAuthority(stage0_path=stage0,peer_inspector=inspect,
+    authority=BootstrapAuthority(stage0_path=stage0, require_root_owned_stage0=False,peer_inspector=inspect,
         stage1_inspector=lambda *args:(3,4,"b"*64),
         peer_authorizer=lambda *args:phase["allowed"])
     identity={"consumer":"github:owner/repo","agent_id":"a","parent_agent_id":"p",
@@ -444,3 +444,12 @@ def test_unauthorized_bootstrap_peers_cannot_reserve_connection_capacity(tmp_pat
         assert client.recv(64)==b"stage2-ok"+bytes([10])
     finally:
         client.close();authority.close(timeout_seconds=2);server.close()
+
+
+def test_production_authority_requires_actual_host_root_ownership(tmp_path):
+    stage0=tmp_path/"user-python";stage0.write_bytes(b"not a trusted system executable")
+    with pytest.raises(BootstrapAuthorityError,match="root-owned"):
+        BootstrapAuthority(stage0_path=stage0,peer_authorizer=lambda *args:True)
+    # The real host interpreter meets this condition outside the remapped pane.
+    authority=BootstrapAuthority(peer_authorizer=lambda *args:False)
+    authority.close(timeout_seconds=0)
