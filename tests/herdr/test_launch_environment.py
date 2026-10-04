@@ -27,10 +27,20 @@ def test_empty_loader_control_is_still_denied():
         require_clean_environment({"LD_TRACE_LOADED_OBJECTS":""})
     assert sanitize_environment({"LD_TRACE_LOADED_OBJECTS":"","TASK":"safe"})=={"TASK":"safe"}
 
-def test_live_spawn_source_has_no_loader_controls():
-    import os
-    from herdr.launch_environment import require_clean_spawn_source
-    require_clean_spawn_source(os.getpid())
+def test_owned_process_environment_preserves_empty_loader_controls():
+    import os,subprocess,sys,pytest
+    from herdr.launch_environment import process_environment
+    env=sanitize_environment(os.environ)
+    env["LD_FUTURE_CONTROL"]=""
+    process=subprocess.Popen([sys.executable,"-I","-S","-c","import time;time.sleep(30)"],
+                             env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    try:
+        actual=process_environment(process.pid)
+        assert "LD_FUTURE_CONTROL" in actual and actual["LD_FUTURE_CONTROL"]==""
+        with pytest.raises(ValueError,match="unsafe"):
+            require_clean_environment(actual)
+    finally:
+        process.terminate();process.wait(timeout=5)
 
 
 def test_unreadable_spawn_source_denies_before_creation():
