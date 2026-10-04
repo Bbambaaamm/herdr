@@ -1,0 +1,675 @@
+from __future__ import annotations
+
+import json
+import hashlib
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives import serialization
+from dataclasses import replace
+from datetime import UTC, datetime
+
+import pytest
+
+from herdr.capability import CapabilityScope, DataClass, Egress, Retention, Training
+from herdr import security
+from herdr.security import (
+    ApprovalEvidence,
+    ContentProvenance,
+    InvocationGuard,
+    InvocationIdentity,
+    NetworkAccess,
+    PolicyDenied,
+    ProcessPolicy,
+    ProviderRequest,
+    ProviderRoute,
+    RiskClass,
+    RuntimeAssurance,
+    SecurityError,
+    SecurityGrant,
+    SignedGrantEnvelope,
+    TaintRestrictions,
+    ToolRule,
+    canonical_digest,
+    canonical_json_bytes,
+    sign_grant,
+    stage_policy_bundle,
+    load_policy_bundle,
+    verify_signed_grant,
+)
+
+
+def identity(**changes):
+    base = dict(
+        consumer="github:Bbambaaamm/herdr",
+        agent_id="child-agent",
+        parent_agent_id="parent-agent",
+        parent_task_id="parent-task",
+        task_id="child-task",
+        run_token="run-1",
+        fencing_token=7,
+    )
+    base.update(changes)
+    return InvocationIdentity(**base)
+
+
+def scope(*, tools=("read_file",), providers=("provider-a",), permissions=("repo:read",)):
+    return CapabilityScope(
+        providers=providers,
+        capabilities=("reasoning",),
+        executors=("hermes-runtime",),
+        tools=tools,
+        permissions=permissions,
+        regions=("eu-central",),
+        data_classes=(DataClass.INTERNAL,),
+        input_modalities=("text",),
+        output_modalities=("text",),
+        max_cost_microusd=1000,
+        max_context_tokens=8192,
+        max_egress=Egress.REGION_BOUND,
+        max_retention=Retention.LIMITED,
+        training=Training.EXCLUDED,
+    )
+
+
+def route(provider="provider-a"):
+    return ProviderRoute(
+        provider=provider,
+        base_url=f"https://{provider}.example.invalid/v1",
+        api_mode="openai",
+        regions=("eu-central",),
+        data_classes=(DataClass.INTERNAL,),
+        max_egress=Egress.REGION_BOUND,
+        max_retention=Retention.LIMITED,
+        training=Training.EXCLUDED,
+    )
+
+
+def grant(
+    tmp_path,
+    *,
+    tools=("read_file",),
+    risks=None,
+    providers=("provider-a",),
+    process=None,
+    runtime=None,
+    approvals=(),
+    approval_required_for=(),
+    rules=None,
+):
+    risks = risks or {}
+    risks = {**{"write_file": RiskClass.WORKSPACE_WRITE, "patch": RiskClass.WORKSPACE_WRITE,
+                "terminal": RiskClass.PROCESS, "execute_code": RiskClass.PROCESS}, **risks}
+    if rules is None:
+        rules = tuple(
+            ToolRule(
+                tool=tool,
+                risk=risks.get(tool, RiskClass.READ),
+                allowed_arg_keys=(
+                    ("path", "offset", "limit")
+                    if tool == "read_file"
+                    else ("path", "content")
+                ),
+                path_fields=("path",),
+                allowed_roots=(str(tmp_path),),
+                requires_process=tool in {"terminal", "execute_code"},
+                requires_sandbox=tool in {"terminal", "execute_code"},
+            )
+            for tool in tools
+        )
+    process = process or ProcessPolicy(False, (), NetworkAccess.NONE)
+    runtime = runtime or assurance()
+    return SecurityGrant(
+        workspace_root=str(tmp_path),
+        grant_id="grant-1",
+        identity=identity(),
+        scope=scope(tools=tools, providers=providers),
+        tool_rules=rules,
+        process=process,
+        runtime_assurance=runtime,
+        provider_routes=tuple(route(item) for item in providers),
+        credential_refs=(),
+        approvals=tuple(approvals),
+        approval_required_for=tuple(approval_required_for),
+        issued_at="2026-01-01T00:00:00+00:00",
+        expires_at="2030-01-01T00:00:00+00:00",
+    )
+
+
+def assurance(**changes):
+    raw = dict(
+        sandbox_verified=True,
+        sandbox_attestation_sha256="a" * 64,
+        network_access=NetworkAccess.NONE,
+        writable_roots=(),
+        credentials_isolated=True,
+    )
+    raw.update(changes)
+    return RuntimeAssurance(**raw)
+
+
+def test_signed_grant_is_canonical_bound_to_identity_and_tamper_evident(tmp_path):
+    item = grant(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    envelope = sign_grant(item, key, key_id="ephemeral-1")
+    assert verify_signed_grant(
+        envelope,
+        public,
+        expected_identity=item.identity,
+        now=datetime(2026, 10, 4, tzinfo=UTC),
+    ).hash == item.hash
+
+    with pytest.raises(SecurityError, match="identity/fence"):
+        verify_signed_grant(
+            envelope,
+            public,
+            expected_identity=replace(item.identity, fencing_token=8),
+            now=datetime(2026, 10, 4, tzinfo=UTC),
+        )
+
+    wrong = Ed25519PrivateKey.generate().public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    with pytest.raises(SecurityError, match="authentication"):
+        verify_signed_grant(envelope, wrong, expected_identity=item.identity)
+    with pytest.raises(SecurityError, match="not active"):
+        verify_signed_grant(envelope, public, expected_identity=item.identity,
+                            now=datetime(2031, 1, 1, tzinfo=UTC))
+    malformed = envelope.to_json()
+    malformed["signature"] = "!" * 88
+    with pytest.raises(SecurityError, match="encoding"):
+        SignedGrantEnvelope.from_dict(malformed)
+
+    bad_algorithm = envelope.to_json()
+    bad_algorithm["algorithm"] = "hmac-sha256"
+    with pytest.raises(SecurityError, match="unsupported"):
+        SignedGrantEnvelope.from_dict(bad_algorithm)
+    wrong_key_id = envelope.to_json()
+    wrong_key_id["key_id"] = "other-host-key"
+    with pytest.raises(SecurityError, match="authentication"):
+        verify_signed_grant(SignedGrantEnvelope.from_dict(wrong_key_id), public,
+                            expected_identity=item.identity)
+
+    raw = envelope.to_json()
+    raw["grant"]["tool_rules"][0]["allowed_arg_keys"].append("mode")
+    tampered = SignedGrantEnvelope.from_dict(raw)
+    with pytest.raises(SecurityError, match="authentication"):
+        verify_signed_grant(
+            tampered,
+            public,
+            expected_identity=item.identity,
+            now=datetime(2026, 10, 4, tzinfo=UTC),
+        )
+
+
+def test_bundle_has_only_public_material_and_checks_attestation(tmp_path):
+    item = grant(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    root = tmp_path / "grant.bundle.json"
+    with stage_policy_bundle(root) as stage:
+        assert root.read_bytes() == b""
+        with pytest.raises(SecurityError, match="empty"):
+            load_policy_bundle(root, item.identity)
+        before = (stage.device, stage.inode)
+        sealed = stage.seal(item, key, key_id="host-1", expected_identity=item.identity,
+                            expected_attestation_sha256="a" * 64)
+        assert (sealed.device, sealed.inode) == before
+        assert (root.stat().st_dev, root.stat().st_ino) == before
+        assert sealed.sha256 == hashlib.sha256(root.read_bytes()).hexdigest()
+        with pytest.raises(SecurityError, match="one-shot"):
+            stage.seal(item, key, key_id="host-1", expected_identity=item.identity,
+                       expected_attestation_sha256="a" * 64)
+    private_bytes = key.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+                                      serialization.NoEncryption())
+    assert private_bytes not in root.read_bytes()
+    assert load_policy_bundle(root, item.identity, expected_attestation_sha256="a" * 64).hash == item.hash
+    with pytest.raises(SecurityError, match="attestation"):
+        load_policy_bundle(root, item.identity, expected_attestation_sha256="b" * 64)
+    with pytest.raises(SecurityError, match="identity/fence"):
+        load_policy_bundle(root, replace(item.identity, fencing_token=9), expected_attestation_sha256="a" * 64)
+    with pytest.raises(SecurityError, match="identity/fence"):
+        load_policy_bundle(root, replace(item.identity, agent_id="other"))
+    raw = root.read_bytes()
+    root.write_bytes(raw[:len(raw) // 2])
+    with pytest.raises(SecurityError):
+        load_policy_bundle(root, item.identity)
+    root.write_bytes(raw + b"\n")
+    with pytest.raises(SecurityError, match="canonical"):
+        load_policy_bundle(root, item.identity)
+    parsed = json.loads(raw)
+    parsed["envelope"]["grant"]["grant_id"] = "tampered"
+    root.write_bytes(canonical_json_bytes(parsed))
+    with pytest.raises(SecurityError, match="authentication"):
+        load_policy_bundle(root, item.identity)
+
+
+def test_bundle_rejects_symlink_and_fifo(tmp_path):
+    item = grant(tmp_path)
+    target = tmp_path / "target"
+    target.write_bytes(b"x")
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    with pytest.raises(SecurityError, match="unavailable"):
+        load_policy_bundle(link, item.identity)
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    with pytest.raises(SecurityError, match="regular file"):
+        load_policy_bundle(fifo, item.identity)
+
+
+def test_bundle_reads_opened_inode_after_path_replacement(tmp_path, monkeypatch):
+    item = grant(tmp_path)
+    key = Ed25519PrivateKey.generate()
+    path = tmp_path / "bundle"
+    with stage_policy_bundle(path) as stage:
+        stage.seal(item, key, key_id="host", expected_identity=item.identity,
+                   expected_attestation_sha256="a" * 64)
+    original_read = security.os.read
+    replaced = False
+
+    def replace_path_after_open(fd, count):
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            path.rename(tmp_path / "original")
+            path.write_bytes(b"untrusted replacement")
+        return original_read(fd, count)
+
+    monkeypatch.setattr(security.os, "read", replace_path_after_open)
+    assert load_policy_bundle(path, item.identity).hash == item.hash
+    assert replaced
+
+
+def test_bundle_seal_requires_exact_attestation_and_identity(tmp_path):
+    item = grant(tmp_path)
+    with stage_policy_bundle(tmp_path / "bundle") as stage:
+        with pytest.raises(SecurityError, match="identity/attestation"):
+            stage.seal(item, Ed25519PrivateKey.generate(), key_id="host",
+                       expected_identity=item.identity,
+                       expected_attestation_sha256="b" * 64)
+        with pytest.raises(SecurityError, match="one-shot"):
+            stage.seal(item, Ed25519PrivateKey.generate(), key_id="host",
+                       expected_identity=item.identity,
+                       expected_attestation_sha256="a" * 64)
+
+
+def test_file_rule_cannot_escape_signed_workspace(tmp_path):
+    item = grant(tmp_path)
+    with pytest.raises(SecurityError, match="workspace-scoped"):
+        replace(item, tool_rules=(replace(item.tool_rules[0],
+                                         allowed_roots=(str(tmp_path.parent),)),))
+
+
+def test_read_only_grant_enforces_tool_and_path_arguments(tmp_path):
+    item = grant(tmp_path)
+    guard = InvocationGuard(item, assurance())
+    inside = tmp_path / "inside.txt"
+    outside = tmp_path.parent / "outside.txt"
+
+    assert guard.authorize_tool("read_file", {"path": str(inside), "offset": 0}) == "read_file"
+    with pytest.raises(PolicyDenied, match="tool_not_granted"):
+        guard.authorize_tool("write_file", {"path": str(inside), "content": "x"})
+    with pytest.raises(PolicyDenied, match="path_outside_grant"):
+        guard.authorize_tool("read_file", {"path": str(outside)})
+    with pytest.raises(PolicyDenied, match="tool_arg_not_granted"):
+        guard.authorize_tool("read_file", {"path": str(inside), "mode": "write"})
+
+
+def test_alias_and_task_identity_cannot_expand_grant(tmp_path):
+    item = grant(tmp_path)
+    guard = InvocationGuard(item, assurance(), aliases={"legacy_write": "write_file"})
+    with pytest.raises(PolicyDenied, match="tool_not_granted"):
+        guard.authorize_tool("legacy_write", {"path": str(tmp_path / "x"), "content": "x"})
+    with pytest.raises(PolicyDenied, match="task_identity_mismatch"):
+        guard.authorize_tool("read_file", {"path": str(tmp_path / "x")}, caller_task_id="other-task")
+
+
+def test_raw_credentials_fail_closed_but_explicit_reference_can_be_granted(tmp_path):
+    item = grant(tmp_path)
+    guard = InvocationGuard(item, assurance())
+    with pytest.raises(PolicyDenied, match="raw_credential_material_denied"):
+        guard.authorize_tool("read_file", {"path": "ghp_" + "A" * 24})
+    with pytest.raises(PolicyDenied, match="raw_credential_material_denied"):
+        guard.authorize_tool("read_file", {"path": str(tmp_path / "x"), "api_key": "secret"})
+
+
+def test_process_risk_cannot_omit_physical_requirements(tmp_path):
+    item = grant(tmp_path)
+    with pytest.raises(SecurityError, match="process tool requires"):
+        replace(item, scope=scope(tools=("terminal",)),
+                tool_rules=(ToolRule("terminal", RiskClass.PROCESS, ("command",)),))
+
+
+def test_process_grant_cannot_disable_credential_isolation():
+    with pytest.raises(SecurityError, match="credential isolation"):
+        ProcessPolicy(
+            True,
+            ("terminal",),
+            NetworkAccess.NONE,
+            (),
+            False,
+        )
+
+
+def test_process_grant_requires_real_sandbox_network_and_credential_boundary(tmp_path):
+    rules = (
+        ToolRule(
+            "terminal",
+            RiskClass.PROCESS,
+            ("command",),
+            requires_process=True,
+            requires_sandbox=True,
+        ),
+    )
+    item = grant(
+        tmp_path,
+        tools=("terminal",),
+        providers=("provider-a",),
+        rules=rules,
+        process=ProcessPolicy(True, ("terminal",), NetworkAccess.NONE, (), True),
+        approvals=(ApprovalEvidence("terminal-approval", identity(), "terminal",
+                                    canonical_digest({"tool": "terminal", "args": {"command": "printf ok"}})),),
+    )
+    good = InvocationGuard(item, assurance(network_access=NetworkAccess.NONE))
+    assert good.authorize_tool("terminal", {"command": "printf ok"}) == "terminal"
+
+    with pytest.raises(PolicyDenied, match="network_ceiling_exceeded"):
+        InvocationGuard(
+            replace(
+                item,
+                runtime_assurance=assurance(
+                    network_access=NetworkAccess.GLOBAL,
+                ),
+            )
+        ).authorize_tool("terminal", {"command": "printf ok"})
+    with pytest.raises(PolicyDenied, match="credential_boundary_unverified"):
+        InvocationGuard(
+            replace(
+                item,
+                runtime_assurance=assurance(
+                    credentials_isolated=False,
+                ),
+            )
+        ).authorize_tool("terminal", {"command": "printf ok"})
+    with pytest.raises(PolicyDenied, match="filesystem_write_ceiling_exceeded"):
+        InvocationGuard(
+            replace(
+                item,
+                runtime_assurance=assurance(
+                    writable_roots=(str(tmp_path),),
+                ),
+            )
+        ).authorize_tool("terminal", {"command": "printf ok"})
+    with pytest.raises(PolicyDenied, match="sandbox"):
+        InvocationGuard(
+            replace(
+                item,
+                runtime_assurance=RuntimeAssurance(
+                    False, None, NetworkAccess.NONE, (), True
+                ),
+            )
+        ).authorize_tool("terminal", {"command": "printf ok"})
+
+
+def test_exact_approval_is_bound_to_identity_tool_args_and_single_use(tmp_path):
+    args = {"path": str((tmp_path / "out.txt").resolve()), "content": "ok"}
+    digest = canonical_digest({"tool": "write_file", "args": args})
+    approval = ApprovalEvidence("approval-1", identity(), "write_file", digest)
+    item = grant(
+        tmp_path,
+        tools=("write_file",),
+        risks={"write_file": RiskClass.WORKSPACE_WRITE},
+        approvals=(approval,),
+        approval_required_for=(RiskClass.WORKSPACE_WRITE,),
+    )
+    guard = InvocationGuard(item, assurance())
+    assert guard.authorize_tool("write_file", args) == "write_file"
+    with pytest.raises(PolicyDenied, match="approval_replayed"):
+        guard.authorize_tool("write_file", args)
+
+    fresh = InvocationGuard(item, assurance())
+    with pytest.raises(PolicyDenied, match="approval_required"):
+        fresh.authorize_tool(
+            "write_file",
+            {"path": str((tmp_path / "other.txt").resolve()), "content": "ok"},
+        )
+
+
+def test_v4a_patch_authorizes_every_embedded_target(tmp_path):
+    outside = tmp_path.parent / "outside.py"
+    rule = ToolRule(
+        "patch",
+        RiskClass.WORKSPACE_WRITE,
+        ("path", "mode", "patch"),
+        ("path",),
+        (str(tmp_path),),
+    )
+    item = grant(tmp_path, tools=("patch",), rules=(rule,))
+    guard = InvocationGuard(item, assurance())
+    dummy = str((tmp_path / "anchor.py").resolve())
+    inside = str((tmp_path / "inside.py").resolve())
+
+    allowed = {
+        "path": dummy,
+        "mode": "patch",
+        "patch": (
+            "*** Begin Patch\n"
+            f"*** Add File: {inside}\n"
+            "+ok\n"
+            "*** End Patch"
+        ),
+    }
+    assert guard.authorize_tool("patch", allowed) == "patch"
+
+    escaped = {
+        **allowed,
+        "patch": (
+            "*** Begin Patch\n"
+            f"*** Update File: {inside}\n"
+            "@@ x @@\n-old\n+new\n"
+            f"*** Move File: {inside} -> {outside}\n"
+            "*** End Patch"
+        ),
+    }
+    with pytest.raises(PolicyDenied, match="path_outside_grant"):
+        guard.authorize_tool("patch", escaped)
+
+
+def test_one_use_approval_is_atomic_under_concurrent_dispatch(tmp_path):
+    args = {"target": "external-system"}
+    digest = canonical_digest({"tool": "deploy_prod", "args": args})
+    approval = ApprovalEvidence("approval-race", identity(), "deploy_prod", digest)
+    rule = ToolRule("deploy_prod", RiskClass.EXTERNAL_SIDE_EFFECT, ("target",))
+    item = grant(
+        tmp_path,
+        tools=("deploy_prod",),
+        rules=(rule,),
+        approvals=(approval,),
+        approval_required_for=(RiskClass.EXTERNAL_SIDE_EFFECT,),
+    )
+    guard = InvocationGuard(item, assurance())
+
+    class SlowContainsSet(set):
+        def __contains__(self, value):
+            present = super().__contains__(value)
+            time.sleep(0.03)
+            return present
+
+    guard._consumed_approvals = SlowContainsSet()
+
+    def invoke():
+        try:
+            return guard.authorize_tool("deploy_prod", args)
+        except PolicyDenied as exc:
+            return exc.reason
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: invoke(), range(2)))
+    assert sorted(results) == ["approval_replayed", "deploy_prod"]
+
+
+def test_known_side_effect_cannot_lose_risk_or_approval_gate(tmp_path):
+    item = grant(tmp_path, tools=("write_file",))
+    # Routine workspace edits remain possible inside the signed physical
+    # sandbox; consumer policy may still request per-call approval.
+    assert item.approval_required_for == ()
+    with pytest.raises(SecurityError, match="risk cannot be reclassified"):
+        replace(item, tool_rules=(replace(item.tool_rules[0], risk=RiskClass.READ),))
+
+    external = ToolRule(
+        "deploy_prod",
+        RiskClass.EXTERNAL_SIDE_EFFECT,
+        ("target",),
+    )
+    with pytest.raises(SecurityError, match="high-risk side-effect approval gate missing"):
+        grant(
+            tmp_path,
+            tools=("deploy_prod",),
+            rules=(external,),
+            approval_required_for=(),
+        )
+
+
+def test_child_scope_must_be_mathematical_subset_including_runtime_edges(tmp_path):
+    parent = grant(
+        tmp_path,
+        tools=("read_file", "write_file"),
+        risks={"write_file": RiskClass.WORKSPACE_WRITE},
+    )
+    child = replace(
+        grant(tmp_path, tools=("read_file",)),
+        identity=identity(
+            agent_id="grandchild-agent",
+            parent_agent_id=parent.identity.agent_id,
+            parent_task_id=parent.identity.task_id,
+            task_id="grandchild",
+        ),
+        parent_grant_hash=parent.hash,
+    )
+    child.require_subset_of(parent)
+    with pytest.raises(SecurityError, match="parent grant hash"):
+        replace(child, parent_grant_hash="0" * 64).require_subset_of(parent)
+    with pytest.raises(SecurityError, match="parent identity"):
+        replace(
+            child,
+            identity=identity(
+                agent_id="grandchild-agent",
+                parent_agent_id=parent.identity.agent_id,
+                parent_task_id="forged",
+                task_id="grandchild",
+            ),
+        ).require_subset_of(parent)
+
+    widened_scope = replace(child.scope, tools=("read_file", "patch"))
+    widened = replace(
+        child,
+        scope=widened_scope,
+        approval_required_for=(RiskClass.WORKSPACE_WRITE,),
+        tool_rules=(
+            child.tool_rules[0],
+            ToolRule(
+                "patch",
+                RiskClass.WORKSPACE_WRITE,
+                ("path",),
+                ("path",),
+                (str(tmp_path),),
+            ),
+        ),
+    )
+    with pytest.raises(Exception, match="escalates|missing"):
+        widened.require_subset_of(parent)
+
+    weakened_rule = replace(parent.tool_rules[1], risk=RiskClass.READ)
+    with pytest.raises(SecurityError, match="risk cannot be reclassified"):
+        replace(parent, identity=child.identity, parent_grant_hash=parent.hash,
+                tool_rules=(parent.tool_rules[0], weakened_rule))
+
+
+def test_child_cannot_drop_retained_parent_path_constraint(tmp_path):
+    parent_rule = ToolRule(
+        "custom_file",
+        RiskClass.READ,
+        ("path", "format"),
+        ("path",),
+        (str(tmp_path),),
+    )
+    parent = grant(tmp_path, tools=("custom_file",), rules=(parent_rule,))
+    child_identity = identity(
+        agent_id="grandchild-agent",
+        parent_agent_id=parent.identity.agent_id,
+        parent_task_id=parent.identity.task_id,
+        task_id="grandchild",
+    )
+    child = replace(
+        grant(
+            tmp_path,
+            tools=("custom_file",),
+            rules=(
+                ToolRule("custom_file", RiskClass.READ, ("path", "format"), (), ()),
+            ),
+        ),
+        identity=child_identity,
+        parent_grant_hash=parent.hash,
+    )
+    with pytest.raises(SecurityError, match="weakens parent path constraint"):
+        child.require_subset_of(parent)
+
+    narrowed = replace(
+        child,
+        tool_rules=(ToolRule("custom_file", RiskClass.READ, ("format",), (), ()),),
+    )
+    narrowed.require_subset_of(parent)
+
+
+def test_untrusted_content_can_only_restrict_not_grant(tmp_path):
+    provenance = (ContentProvenance("web", "document-1", True),)
+    taint = TaintRestrictions.from_untrusted_directives(
+        provenance,
+        {"deny_tools": ["read_file"], "deny_providers": []},
+    )
+    guard = InvocationGuard(grant(tmp_path), assurance())
+    with pytest.raises(PolicyDenied, match="tainted_tool_denied"):
+        guard.authorize_tool("read_file", {"path": str(tmp_path / "x")}, taint=taint)
+
+    with pytest.raises(SecurityError, match="fields differ"):
+        TaintRestrictions.from_untrusted_directives(
+            provenance,
+            {
+                "deny_tools": [],
+                "deny_providers": [],
+                "allow_tools": ["write_file"],
+            },
+        )
+
+
+def test_provider_data_route_and_breaker_isolate_only_target_provider(tmp_path):
+    item = grant(tmp_path, providers=("provider-a", "provider-b"))
+    guard = InvocationGuard(item, assurance())
+    request_a = ProviderRequest(
+        "provider-a",
+        "eu-central",
+        DataClass.INTERNAL,
+        Egress.REGION_BOUND,
+        Retention.LIMITED,
+        Training.EXCLUDED,
+    )
+    request_b = replace(request_a, provider="provider-b")
+    guard.authorize_provider(request_a)
+    guard.authorize_provider(request_b)
+
+    guard.breaker.open("provider-a", "compromised")
+    with pytest.raises(PolicyDenied, match="provider_isolated"):
+        guard.authorize_provider(request_a)
+    guard.authorize_provider(request_b)
+
+    with pytest.raises(PolicyDenied, match="provider_region_denied"):
+        guard.authorize_provider(replace(request_b, region="us-east"))
+
+
+def test_signed_envelope_round_trip_is_deterministic(tmp_path):
+    item = grant(tmp_path)
+    envelope = sign_grant(item, Ed25519PrivateKey.generate(), key_id="k1")
+    encoded = json.dumps(envelope.to_json(), sort_keys=True, separators=(",", ":"))
+    decoded = SignedGrantEnvelope.from_dict(json.loads(encoded))
+    assert decoded.to_json() == envelope.to_json()
+    assert decoded.grant.hash == item.hash
