@@ -315,7 +315,7 @@ Operating model:
 - select the nearest dependency-ready AUTO slice, not simply the lowest or newest issue number;
 - delegate bounded research/code/test/review work to available Herdr child agents (including herdr-codex) when useful;
 - independent dependency-safe branches may run concurrently only inside admission/resource/fanout limits;
-- use isolated clean worktrees under /home/agentops/worktrees/herdr/ for code changes;
+- use isolated clean worktrees under {str(consumer.get('worktree_root') or Path(consumer['workspace']) / 'worktrees').rstrip('/')}/ for code changes;
 - never write directly to main, bypass CI/review/rulesets, widen child permissions, create unbounded retries/fallbacks/fanout, or fabricate acceptance evidence;
 - merge only after required tests, exact-head green CI and independent exact-head review with no unresolved applicable finding;
 - after every merge re-read live main/issues/PRs and replan immediately;

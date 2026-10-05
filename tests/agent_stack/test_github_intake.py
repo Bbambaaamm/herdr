@@ -237,8 +237,8 @@ class GitHubIntakeTests(unittest.TestCase):
         self.assertIn("autonomous backlog-drain", task["prompt"])
         self.assertIn("ACCEPTANCE_GATE", task["prompt"])
         self.assertIn("Do not flatten", task["prompt"])
-        self.assertIn("/home/agentops/worktrees/herdr/", task["prompt"])
-        self.assertNotIn("/home/agentops/workspaces/herdr/worktrees/", task["prompt"])
+        self.assertNotIn("/home/agentops/worktrees/herdr/", task["prompt"])
+        self.assertIn("/home/agentops/workspaces/herdr/worktrees/", task["prompt"])
 
     def test_queue_majak_root_carries_explicit_consumer_identity(self):
         issue = {
