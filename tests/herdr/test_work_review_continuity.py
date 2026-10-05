@@ -149,3 +149,63 @@ def test_cold_watchdog_uses_original_work_receipt_without_live_sdk(boundary_work
     assert len(calls)==1 and calls[0]==task["execution_session"]["invocation_policy"]
     assert recovered.phase is WorkPhase.FINISHED and task["work_contract"]["phase"]=="finished"
     assert (recovery.DONE/path.name).exists()
+
+def test_actual_wire_response_uses_the_same_unicode_bytes_as_preflight(boundary_workspace,monkeypatch):
+    import socket
+    from tests.herdr.test_work_authority import owner_for
+    from herdr.work_authority import dispatch_work_connection
+    port,cycle,guard,result,task,plan,observed,log=ready(boundary_workspace,monkeypatch)
+    owner,_=owner_for(SimpleNamespace(authorize_invocation=lambda *a,**kw:True),guard.grant)
+    outcome={"status":"pass","submission":{"narrative":"ž"*1200,"artifact_fixture":"a"*1500}}
+    assert len(json.dumps(outcome).encode())>8192 and len(canonical(outcome))<8192
+    callbacks=[]
+    owner.work_verify=lambda *a,**kw:callbacks.append(kw) or outcome
+    left,right=socket.socketpair()
+    request={"op":"work-verify","identity":guard.grant.identity.to_json(),"grant_sha256":guard.grant.hash,
+             "request_id":"unicode","handoff":{"pr_number":None,"scope_claim":{"narrative":"ž"*1200}}}
+    encoded=json.dumps(request).encode()+b"\n";assert len(encoded)<8192
+    right.sendall(encoded)
+    assert dispatch_work_connection(owner,left)
+    response=right.recv(8193);right.close()
+    assert response==canonical(outcome)+b"\n" and len(callbacks)==1
+
+def test_short_grant_blocks_factory_before_baseline_effect(tmp_path,monkeypatch):
+    from datetime import UTC,datetime,timedelta
+    from tests.herdr.test_work_contract_host import factory_fixture
+    factory,root,plan,grant,log=factory_fixture(tmp_path)
+    grant=replace(grant,expires_at=(datetime.now(UTC)+timedelta(seconds=30)).isoformat())
+    factory.approve=lambda **kw:replace(plan,grant_sha256=grant.hash)
+    monkeypatch.setattr("herdr.check_runner.HostCheckRunner.__call__",
+                        lambda *a:pytest.fail("insufficient grant cannot run baseline"))
+    with pytest.raises(WorkContractError,match="lifetime"):
+        factory.prepare(identity=grant.identity,workspace=root,grant=grant,spec_sha256=plan.spec_sha256)
+    assert log.replay()==[]
+
+def test_short_grant_blocks_socket_before_verification_callback(boundary_workspace,monkeypatch):
+    from datetime import UTC,datetime,timedelta
+    import socket
+    from tests.herdr.test_work_authority import owner_for
+    from herdr.work_authority import dispatch_work_connection
+    port,cycle,guard,result,task,plan,observed,log=ready(boundary_workspace,monkeypatch)
+    grant=replace(guard.grant,expires_at=(datetime.now(UTC)+timedelta(seconds=30)).isoformat())
+    owner,_=owner_for(SimpleNamespace(authorize_invocation=lambda *a,**kw:True),grant)
+    owner.work_verify=lambda *a,**kw:pytest.fail("insufficient grant cannot commit")
+    left,right=socket.socketpair()
+    right.sendall(canonical({"op":"work-verify","identity":grant.identity.to_json(),"grant_sha256":grant.hash,
+                            "request_id":"short"})+b"\n")
+    assert dispatch_work_connection(owner,left)
+    assert right.recv(8193)==b"denied\n";right.close()
+
+def test_modifying_hook_allows_new_immutable_reverification_intent(boundary_workspace,monkeypatch):
+    from herdr.check_runner import HostCheckRunner
+    port,cycle,guard,result,task,plan,observed,log=ready(boundary_workspace,monkeypatch,
+        hook="printf '\\n# formatter changed tested content\\n' >> result.py")
+    oracle=HostCheckRunner(port.committer.policy.environment,boundary_workspace/"host"/"checks",git=cycle.git)
+    port.prepare_request(cycle,"before-hook",{"pr_number":None})
+    outcome=cycle.request_verification("before-hook",oracle)
+    with pytest.raises(ValueError,match="invalidated"):port.complete(cycle,"before-hook",outcome)
+    assert cycle.phase is WorkPhase.VERIFY and cycle.verification_open and not cycle.verified_checks
+    port.prepare_request(cycle,"after-hook",{"pr_number":None})
+    repeated=cycle.request_verification("after-hook",oracle)
+    assert repeated["status"]=="pass" and cycle.phase is WorkPhase.HYGIENE
+    assert result.read_bytes()==b"" and git(cycle.root,"rev-parse","HEAD")==cycle.plan.base_sha

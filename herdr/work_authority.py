@@ -7,6 +7,7 @@ import struct
 from .bootstrap_authority import SOCKET_PATH, _recv_line, inspect_peer
 from .security import InvocationIdentity, PolicyDenied
 from .work_cycle import require
+from .evidence import canonical
 
 
 class WorkAuthorityClient:
@@ -108,13 +109,21 @@ def dispatch_work_connection(owner, connection):
                     "verification tool is not granted")
             callback = getattr(owner, "work_verify", None)
             require(callable(callback), "host verification authority unavailable")
+            from .work_lifetime import check_wall_seconds, require_grant_lifetime
+            target=getattr(callback,"__self__",None)
+            if target is not None and callable(getattr(target,"cycle",None)):
+                current=target.cycle(owner.launch.identity)
+                seconds=check_wall_seconds(current.plan,getattr(target,"local_commit_policy",None))
+            else:
+                seconds=900  # Closed host transport fixture without an exact plan.
+            require_grant_lifetime(owner.launch.grant,seconds)
             outcome = (callback(owner.launch.identity, owner.launch.grant.hash, request["request_id"], handoff=request["handoff"])
                        if "handoff" in request else callback(owner.launch.identity, owner.launch.grant.hash, request["request_id"]))
             after = inspect_peer(pid)
             require(after == peer and owner.launch.grant.is_active(),
                     "work authority peer or grant changed during verification")
             owner.launch.mount.verify_mounted(pid, owner.launch.sealed)
-            encoded = json.dumps(outcome, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+            encoded = canonical(outcome) + b"\n"
             require(len(encoded) <= 8192, "verification outcome exceeds bound")
             connection.sendall(encoded)
         else:

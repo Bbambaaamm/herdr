@@ -275,7 +275,8 @@ def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG
     factory.host_admission = admitted
     factory.local_commit_policy = hygiene
     checks=tuple(ValidationCheck(**item) for item in definition["checks"])
-    factory.request_wall_seconds=sum(check.timeout_seconds+13 for check in checks)
+    factory.baseline_wall_seconds=sum(check.timeout_seconds+13 for check in checks)
+    factory.request_wall_seconds=factory.baseline_wall_seconds
     if hygiene is not None:factory.request_wall_seconds+=hygiene.timeout_seconds+13
     require(factory.request_wall_seconds<=900,"full host verification request exceeds bound")
     factory.task_store_root = root
@@ -367,6 +368,9 @@ def preflight_handoff(factory, launch, completion_plan, *, require_slot=True):
     require(completion_plan.get("kind") == "coding"
             and isinstance(getattr(factory, "local_commit_policy", None), LocalCommitPolicy),
             "modern coding needs an approved local commit profile")
+    from .work_lifetime import require_grant_lifetime
+    require_grant_lifetime(launch.grant, getattr(factory,"baseline_wall_seconds",0)
+        + getattr(factory,"request_wall_seconds",factory.local_commit_policy.timeout_seconds+13))
     rules = {rule.tool:rule for rule in launch.grant.tool_rules}
     require("herdr_verify_work" in launch.grant.scope.tools
             and "herdr_submit_result" in launch.grant.scope.tools

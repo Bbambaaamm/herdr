@@ -15,7 +15,7 @@ from herdr.work_cycle import WorkCycle, WorkPhase
 from tests.herdr.test_evidence import launch_fixture
 from tests.herdr.test_work_hygiene import boundary_workspace, fixture
 
-def ready(root, monkeypatch):
+def ready(root, monkeypatch, *, hook="true"):
     result = root/"host-result.json"; result.touch(mode=0o600)
     grants = []
     def bind(grant):
@@ -27,7 +27,7 @@ def ready(root, monkeypatch):
                         tool_rules=(*grant.tool_rules, rule, verify))
         grants.append(grant)
         return grant
-    committer, cycle, work, log = fixture(root, grant_transform=bind, defer_verify=True)
+    committer, cycle, work, log = fixture(root, hook, grant_transform=bind, defer_verify=True)
     (root/"host").chmod(0o700); log._path.chmod(0o600)
     identity = cycle.plan.identity; grant = grants[0]
     task = {"id":identity.task_id, "run_token":identity.run_token, "fencing_token":identity.fencing_token,

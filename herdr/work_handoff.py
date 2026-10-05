@@ -59,7 +59,8 @@ class HostWorkHandoff:
             verify_scope_self_check(self.plan, draft, {**scope, "spec_sha256":self.plan["spec_hash"],
                                                      "artifact_sha256":draft.result_sha})
         from .work_cycle import WorkPhase
-        require(cycle.phase is WorkPhase.WORK and not cycle.verified_checks,
+        require(cycle.phase in {WorkPhase.WORK,WorkPhase.VERIFY} and cycle.verification_open
+                and not cycle.verified_checks,
                 "new handoff intent must precede host verification")
         launch_policy = verify_invocation_session(self.task)
         require(launch_policy["grant_sha256"] == cycle.plan.grant_sha256, "work request grant changed")

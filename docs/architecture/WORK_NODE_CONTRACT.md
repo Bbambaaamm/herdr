@@ -181,3 +181,16 @@ check proofs remain in the protected verification receipt. The exact candidate
 shape is bounded before oracle/commit effects. The registry consumes required
 one-shot tool approval once; its internal verification rechecks without consuming
 the same approval again.
+
+Work IPC uses the same compact UTF-8 canonical encoding as candidate preflight,
+including non-ASCII scope narratives. Grant admission reserves the existing
+signed lifetime for the complete bounded baseline and verification/hygiene
+request; the socket checks the full remaining request interval before effects.
+No lease or grant extension is inferred. Cold receipt recovery stays available
+through the protected host path after SDK authority expires.
+
+Known hook content invalidation can open a new immutable verification intent in
+VERIFY when proofs are cleared and verification is explicitly reopened. It
+cannot reuse the original PASS as a new check or silently submit modified bytes.
+Unknown original hook/commit delivery still requires original evidence and does
+not authorize repeating hooks.

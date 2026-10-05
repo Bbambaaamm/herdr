@@ -51,6 +51,9 @@ class HostWorkContractFactory:
                     "approved work contract binding mismatch")
             if plan.planning is not None:
                 plan.planning.require_binding(plan, grant)
+            from .work_lifetime import check_wall_seconds, require_grant_lifetime
+            request=check_wall_seconds(plan,getattr(self,"local_commit_policy",None))
+            require_grant_lifetime(grant,check_wall_seconds(plan)+request)
             runner=HostCheckRunner(self.environment,self.storage,git=self.git)
             cycle=WorkCycle(plan,root,self.audit_log,git=self.git)
             cycle.start(runner)
