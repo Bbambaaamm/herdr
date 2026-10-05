@@ -119,6 +119,11 @@ class HostWorkHandoff:
                 "local hygiene budget binding changed")
         semantic=digest({"purpose":"local-hygiene","identity":self.identity.to_json(),
                          "plan":cycle.plan.hash,"tree":cycle.verified_tree,"policy":self.committer.policy.hash})
+        from .work_cycle import WorkPhase
+        if cycle.phase in {WorkPhase.HANDOFF,WorkPhase.FINISHED}:
+            with authority._serialized():
+                require(digest({"allocation_id":allocation.allocation_id,"semantic_key":semantic})
+                        in authority._state()["operations"],"original hygiene reservation unavailable")
         operation=authority.reserve(allocation_id=allocation.allocation_id,semantic_key=semantic,
             identity=self.identity,plan_sha256=cycle.plan.hash,provider="offline-hygiene",
             demand=Demand((self.committer.policy.timeout_seconds+13)*1000,0,0,0),

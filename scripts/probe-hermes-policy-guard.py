@@ -16,6 +16,97 @@ from dataclasses import replace
 from pathlib import Path
 
 
+
+def _probe_installed_work_budget(grant, workspace, outside, middleware):
+    """Real installed SDK middleware; host admission/transport is an explicit fixture."""
+    import threading
+    import time
+    from dataclasses import asdict
+    from types import SimpleNamespace
+    from herdr.capability import DataClass, Egress, Retention, Training
+    from herdr.security import ProviderRoute, PolicyDenied
+    from herdr.evidence import digest
+    from herdr.work_budget import BudgetAllocation, BudgetLimits
+    from herdr.work_budget_configuration import bind_budget, model_effect
+    from herdr.work_contract_host import WorkInvocationGuard
+    from herdr.work_cycle import WorkPhase, WorkContractError
+    from herdr.hermes_guard import install_hermes_guard, _ACTIVE_AGENT
+    from agent import turn_api_call
+    provider="budget-fixture"
+    route=ProviderRoute(provider,"https://budget-fixture.invalid/v1","chat_completions",
+        ("eu-central",),(DataClass.INTERNAL,),Egress.NONE,Retention.ZERO,Training.EXCLUDED)
+    grant=replace(grant,scope=replace(grant.scope,providers=(provider,)),provider_routes=(route,))
+    allocation=BudgetAllocation(digest("sdk-budget-allocation"),grant.identity.consumer,
+        digest("sdk-stable-work"),digest("sdk-lineage"),digest("sdk-host-approval"),
+        BudgetLimits(100000,100000,3,20000,0,1,0,1,1))
+    quote={"provider":provider,"model":"text-fixture","api_mode":route.api_mode,"base_url":route.base_url,
+           "max_request_bytes":4096,"max_output_tokens":100,"max_tokens":5000,
+           "max_cost_microusd":0,"max_work_ms":30}
+    cycle=SimpleNamespace(plan=SimpleNamespace(hash=digest("fixture-plan"),grant_sha256=grant.hash),
+                          phase=WorkPhase.WORK)
+    # Only protected admission/phase is supplied by this fixture. Quote parser,
+    # cumulative ledger, reservation/settlement and SDK guard are production code.
+    factory=SimpleNamespace(_lock=threading.RLock(),_refresh=lambda identity:(cycle,None),
+                            allocations={digest(grant.identity.to_json()):allocation})
+    storage=outside/"sdk-budget";storage.mkdir(mode=0o700)
+    bind_budget(factory,{"version":1,"allocation":asdict(allocation),"ancestors":[],
+                        "model_quotes":[quote]},storage=storage,writable_roots=(workspace,))
+    class HostBudgetTransportFixture:
+        deny_status=False
+        def __call__(self,identity,grant_hash,**kwargs):
+            assert identity==grant.identity and grant_hash==grant.hash
+            return True
+        def effect(self,identity,grant_hash,action,payload):
+            assert identity==grant.identity and grant_hash==grant.hash
+            if action=="status":
+                if self.deny_status:raise PolicyDenied("fixture_status_unavailable")
+                return {"required":True}
+            return model_effect(factory,identity,grant_hash,action,payload)
+    transport=HostBudgetTransportFixture()
+    guard=WorkInvocationGuard(grant,work_authority=transport)
+    installation=install_hermes_guard(guard)
+    agent=SimpleNamespace(provider=provider,model=quote["model"],api_mode=route.api_mode,
+        base_url=route.base_url,api_key=None,client=SimpleNamespace(max_retries=0),_disable_streaming=False)
+    request={"model":agent.model,"messages":[{"role":"user","content":"bounded fixture text"}],"max_tokens":50}
+    calls=[]
+    def returned(payload):
+        state=factory.budget_authority.snapshot(allocation.allocation_id)
+        assert state["inflight"]==1 and state["charged_upper_bounds"]["model_calls"]==1
+        calls.append("returned")
+        return {"fixture":"response"}
+    token=_ACTIVE_AGENT.set(agent)
+    try:
+        middleware.run_llm_execution_middleware(request,returned,api_request_id="sdk:original:1")
+        state=factory.budget_authority.snapshot(allocation.allocation_id)
+        assert state["inflight"]==0 and state["charged_upper_bounds"]["tokens"]==5000
+        def slow(payload):
+            state=factory.budget_authority.snapshot(allocation.allocation_id)
+            assert state["inflight"]==1 and state["charged_upper_bounds"]["model_calls"]==2
+            calls.append("timeout");time.sleep(1)
+        try:middleware.run_llm_execution_middleware(request,slow,api_request_id="sdk:original:2")
+        except PolicyDenied as exc:assert "reconcile_original" in exc.reason
+        else:raise AssertionError("SDK callback deadline must stop")
+        try:middleware.run_llm_execution_middleware(request,returned,api_request_id="renamed:session:1")
+        except WorkContractError as exc:assert "uncertain" in str(exc)
+        else:raise AssertionError("renamed session cannot refill unknown reservation")
+        assert calls==["returned","timeout"]
+        assert factory.budget_authority.snapshot(allocation.allocation_id)["inflight"]==1
+        try:guard.deny_unbudgeted_auxiliary()
+        except PolicyDenied as exc:assert exc.reason=="auxiliary_budget_profile_unsupported"
+        else:raise AssertionError("unsupported auxiliary must stop before callback")
+        agent.client.max_retries=2
+        try:turn_api_call.perform_api_call(agent)
+        except PolicyDenied as exc:assert exc.reason=="budgeted_client_retry_profile_unsupported"
+        else:raise AssertionError("internal SDK retries must be disabled")
+        assert _ACTIVE_AGENT.get() is agent and not agent._disable_streaming
+        transport.deny_status=True
+        try:turn_api_call.perform_api_call(agent)
+        except PolicyDenied as exc:assert exc.reason=="fixture_status_unavailable"
+        else:raise AssertionError("missing budget authority must stop")
+        assert _ACTIVE_AGENT.get() is agent
+    finally:
+        _ACTIVE_AGENT.reset(token);installation.uninstall()
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--hermes-root", required=True)
@@ -373,6 +464,7 @@ def main() -> int:
                 if value is None:os.environ.pop(key,None)
                 else:os.environ[key]=value
         assert registry.get_entry("herdr_verify_work") is None
+        _probe_installed_work_budget(grant, workspace, outside, middleware)
 
         # A granted local write goes through the pinned RootFDWorkspace facade,
         # not a re-opened model pathname. This proves the installed Hermes
@@ -509,6 +601,10 @@ def main() -> int:
             "result_submission_sdk_dispatch": True,
             "work_verification_sdk_dispatch": True,
             "work_phase_after_pass_sdk_denied": True,
+            "model_budget_installed_sdk_pre_effect": True,
+            "model_budget_sdk_timeout_unknown_held": True,
+            "model_budget_host_admission_transport_fixture": True,
+            "model_budget_sdk_retry_profile_denied": True,
             "work_tool_host_transport_fixture": True,
             "result_submission_one_inode_no_process": True,
             "granted_delegation_sdk_dispatch": True,

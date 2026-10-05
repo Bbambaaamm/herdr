@@ -61,6 +61,11 @@ class HostWorkContractFactory:
             allocation=None
             if self.budget_authority is not None:
                 from .work_budget import BudgetAllocation,BudgetedCheckRunner
+                for quote in getattr(self,"budget_quotes",{}).values():
+                    require(quote["provider"] in grant.scope.providers
+                            and quote["max_tokens"]<=grant.scope.max_context_tokens
+                            and quote["max_cost_microusd"]<=grant.scope.max_cost_microusd,
+                            "model quote exceeds the consumer grant")
                 require(callable(self.budget_binding), 'host budget binding required')
                 approved=self.budget_binding(identity=identity,workspace=root,grant=grant,spec_sha256=spec_sha256)
                 require(isinstance(approved,BudgetAllocation) and approved.consumer==identity.consumer, 'exact approved budget required')

@@ -705,6 +705,11 @@ class WorkBudgetAuthority:
             require(op is not None and op["allocation_id"]==allocation_id
                     and op["usage"] is not None and event.get("pre_delivery_proven") is True,
                     "uncertain provider operation must reconcile without fallback")
+        if kind is FailureKind.TOOL:
+            for ancestor in self._ancestors(state,allocation_id):
+                require(self._counter_used(state,ancestor,"tool_fallbacks") <
+                        state["allocations"][ancestor]["allocation"].limits.max_tool_fallbacks,
+                        "cumulative tool_fallbacks exhausted")
         if kind is FailureKind.DEPENDENCY:
             require(event.get("workspace_local") is True,"dependency change must remain workspace local")
         if kind is FailureKind.FLAKY:
@@ -754,6 +759,15 @@ class WorkBudgetAuthority:
             if unstable: self._stop_for_allocation(state,alternative["allocation_id"],"flaky_instability")
             return unstable
 
+    def _counter_used(self,state,allocation_id,kind):
+        values=[row["quantity"] for row in state["counters"].values() if row["counter"]==kind
+                and allocation_id in self._ancestors(state,row["allocation_id"])]
+        used=max(values,default=0) if kind=="candidate_depth" else sum(values)
+        if kind=="tool_fallbacks":
+            used+=sum(len(rows) for (child,k),rows in state["alternatives"].items()
+                      if k==FailureKind.TOOL.value and allocation_id in self._ancestors(state,child))
+        return used
+
     def _validate_counter(self,state,event):
         allocation_id=event["allocation_id"]
         require(allocation_id in state["allocations"],"counter allocation missing")
@@ -765,9 +779,7 @@ class WorkBudgetAuthority:
                 "counter identity changed")
         require(event["counter_id"] not in state["counters"],"counter repeated")
         for ancestor in self._ancestors(state,allocation_id):
-            prior=[row["quantity"] for row in state["counters"].values() if row["counter"]==kind
-                   and ancestor in self._ancestors(state,row["allocation_id"])]
-            used=max(prior,default=0) if kind=="candidate_depth" else sum(prior)
+            used=self._counter_used(state,ancestor,kind)
             proposed=max(used,quantity) if kind=="candidate_depth" else used+quantity
             require(proposed<=getattr(state["allocations"][ancestor]["allocation"].limits,"max_"+kind),
                     "cumulative "+kind+" exhausted")
@@ -786,7 +798,11 @@ class WorkBudgetAuthority:
                 return old["event_sha256"]
             self._available(state,allocation_id,self._now(state))
             event["approval_sha256"]=sha(host_approval(dict(event)))
-            self._validate_counter(state,event)
+            try:
+                self._validate_counter(state,event)
+            except BudgetBlocked as exc:
+                if "exhausted" in str(exc):self._stop_for_allocation(state,allocation_id,exc.reason_code)
+                raise
             return self._append("counter",**event)
 
     def _require_resources(self,state,allocation_id,demand):
@@ -944,10 +960,7 @@ class WorkBudgetAuthority:
                 "instabilities":[x for x in state["instabilities"].values()
                     if any(a["event_sha256"]==x["alternative_sha256"] for a in
                            state["alternatives"].get((allocation_id,FailureKind.FLAKY.value),[]))],
-                "counters":{kind:(max((row["quantity"] for row in state["counters"].values()
-                    if row["counter"]==kind and allocation_id in self._ancestors(state,row["allocation_id"])),default=0)
-                    if kind=="candidate_depth" else sum(row["quantity"] for row in state["counters"].values()
-                    if row["counter"]==kind and allocation_id in self._ancestors(state,row["allocation_id"]))) for kind in _COUNTERS},
+                "counters":{kind:self._counter_used(state,allocation_id,kind) for kind in _COUNTERS},
                 "implementation_retries":sum(max(0,len(rows)-1) for child,rows in state["attempts"].items()
                     if allocation_id in self._ancestors(state,child)),
                 "active_stops":[x for x in state["stops"].values() if x["active"]]}

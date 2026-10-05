@@ -652,7 +652,8 @@ def test_child_candidate_slots_and_depth_respect_parent_ceiling(tmp_path):
         outcomes=list(pool.map(take,(child1,child2)))
     assert sum(value is not None for value in outcomes)==1
     assert auth.snapshot(parent.allocation_id)["counters"]["candidate_executions"]==1
-    with pytest.raises(BudgetBlocked,match="candidate_depth exhausted"):
+    assert auth.snapshot(parent.allocation_id)["active_stops"]
+    with pytest.raises(BudgetBlocked,match="scoped policy"):
         auth.charge_counter(allocation_id=child1.allocation_id,counter="candidate_depth",quantity=3,
                             semantic_key=h("deeper"),host_approval=lambda event:h("approval"))
 
@@ -686,3 +687,36 @@ def test_live_projection_does_not_rescan_history_and_external_change_is_verified
     with pytest.raises(BudgetBlocked,match="integrity"):
         auth.snapshot(alloc.allocation_id)
     assert len(calls)==1
+
+def test_tool_alternative_projects_counter_and_respects_parent_ceiling(tmp_path):
+    parent=allocation("tool-parent",max_tool_fallbacks=1,consumer_policy_version="work-budget-2")
+    first=allocation("tool-child-one",parent.allocation_id,consumer_policy_version="work-budget-2")
+    second=allocation("tool-child-two",parent.allocation_id,consumer_policy_version="work-budget-2")
+    rows={row.work_key:row for row in (parent,first,second)}
+    auth=WorkBudgetAuthority(audit_log=AuditLog(tmp_path/"tools.jsonl"),
+        authorize=lambda **kw:rows[kw["work_key"]],clock_ms=lambda:1000)
+    for row in (parent,first,second):
+        auth.open(consumer=row.consumer,work_key=row.work_key,lineage_key=row.lineage_key,
+                  authorization_reference=row.authorization_reference)
+    alternative(auth,first)
+    assert auth.snapshot(parent.allocation_id)["counters"]["tool_fallbacks"]==1
+    with pytest.raises(BudgetBlocked,match="cumulative tool_fallbacks"):alternative(auth,second)
+    assert auth.snapshot(parent.allocation_id)["counters"]["tool_fallbacks"]==1
+    with pytest.raises(BudgetBlocked,match="tool_fallbacks"):
+        auth.charge_counter(allocation_id=parent.allocation_id,counter="tool_fallbacks",
+                            semantic_key=h("another-tool-dispatch"),host_approval=lambda event:h(event))
+    assert auth.snapshot(parent.allocation_id)["active_stops"]
+
+def test_zero_tool_fallback_policy_blocks_before_alternative(tmp_path):
+    auth,alloc,log=authority(tmp_path,allocation(max_tool_fallbacks=0,consumer_policy_version="work-budget-2"))
+    with pytest.raises(BudgetBlocked,match="tool_fallbacks"):alternative(auth,alloc)
+    assert auth.snapshot(alloc.allocation_id)["counters"]["tool_fallbacks"]==0
+
+def test_candidate_depth_exhaustion_has_its_own_audited_stop(tmp_path):
+    auth,alloc,log=authority(tmp_path,allocation(consumer_policy_version="work-budget-2",max_candidate_depth=2))
+    with pytest.raises(BudgetBlocked,match="candidate_depth exhausted"):
+        auth.charge_counter(allocation_id=alloc.allocation_id,counter="candidate_depth",
+                            semantic_key=h("depth-three"),quantity=3,host_approval=lambda event:h(event))
+    state=auth.snapshot(alloc.allocation_id)
+    assert state["counters"]["candidate_depth"]==0
+    assert state["active_stops"][0]["reason_code"]=="cumulative_candidate_depth_exhausted"

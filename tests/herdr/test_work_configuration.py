@@ -16,7 +16,7 @@ from tests.herdr.test_work_contract_host import factory_fixture
 from tests.herdr.test_work_planning import artifact
 from tests.herdr.test_work_cycle import seal
 
-def configured(tmp_path, monkeypatch):
+def configured(tmp_path, monkeypatch, *, budget=None):
     raw, unused, unused_grant = approved_config(tmp_path, monkeypatch)
     factory, root, old_plan, grant, old_log = factory_fixture(tmp_path/"actual")
     task = {"id": grant.identity.task_id, "run_token": grant.identity.run_token,
@@ -24,7 +24,11 @@ def configured(tmp_path, monkeypatch):
             "attempt_id": 1, "repo": "Bbambaaamm/herdr", "kind": "coding",
             "prompt": "Repair the approved function only", "workspace": str(root),
             "work_contract_version": 1, "completion_plan": {"base_sha": old_plan.base_sha}}
+    if budget is not None:task["work_budget_version"]=1
     plan = replace(old_plan, spec_sha256=spec_digest(task))
+    if budget is not None:
+        from herdr.work_budget_configuration import parse_allocation
+        plan=replace(plan,budget_reference=parse_allocation(budget["allocation"]).hash)
     planning = artifact(plan, root)
     planning["tools"] = ["read_file"]; planning["permissions"] = ["repo:read"]
     planning["team"]["nodes"][0].update(tools=["read_file"], permissions=["repo:read"])
@@ -32,6 +36,7 @@ def configured(tmp_path, monkeypatch):
     definition = json.loads(json.dumps(plan.to_json()))
     for key in ("version", "identity", "spec_sha256", "grant_sha256", "environment_sha256"): definition.pop(key)
     definition.update(discovery_files=["result.py"], planning=planning)
+    if budget is not None:definition["budget"]=deepcopy(budget)
     raw["templates"] = {grant.identity.consumer: grant.to_json()}
     raw["work_contracts"] = {"version": 1, "environment": asdict(factory.environment),
                             "plans": {spec_digest(task): definition}, "review_records": {}}

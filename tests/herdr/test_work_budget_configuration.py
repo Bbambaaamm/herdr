@@ -1,6 +1,7 @@
 """Actual host admission/effect ports and finite SDK deadline, without provider calls."""
 from dataclasses import asdict,replace
 from types import SimpleNamespace
+from pathlib import Path
 import signal
 import time
 import pytest
@@ -22,7 +23,7 @@ def approved_factory(tmp_path,*,repair=False):
            "max_tokens":5000,"max_cost_microusd":1000,"max_work_ms":1000}
     raw={"version":1,"allocation":asdict(allocation),"ancestors":[],"model_quotes":[quote]}
     if repair:raw["repair"]={"version":1,"reason_code":"approved_behavior_repair",
-                            "paths":["result.py"],"max_changed_lines":20}
+                            "paths":["result.py"],"max_changed_lines":20,"failure_outputs":[original.checks[0].expected_baseline_output_sha256]}
     plan=replace(original,budget_reference=allocation.hash)
     factory.approve=lambda **kwargs:plan
     (tmp_path/"private").mkdir(mode=0o700)
@@ -83,3 +84,31 @@ def test_text_quote_rejects_multimodal_multiple_outputs_and_route_poisoning():
                     {**request,"messages":[{"role":"user","content":[{"type":"image_url","image_url":"private"}]}]},
                     {**request,"max_completion_tokens":50}):
         with pytest.raises(WorkContractError):validate_text_request(invalid,agent)
+
+def test_protected_host_catalogue_binds_budget_before_baseline_and_cold_recovery(tmp_path,monkeypatch):
+    from tests.herdr.test_work_configuration import configured
+    from herdr import work_configuration as config
+    from agent_completion_evidence import spec_digest
+    allocation=BudgetAllocation(digest("catalogue-allocation"),"github:org/repo",digest("catalogue-work"),
+        digest("catalogue-lineage"),digest("catalogue-approval"),
+        BudgetLimits(1000000,1000000,5,100000,0,2,0,1,1,consumer_policy_version="work-budget-2"))
+    budget={"version":1,"allocation":asdict(allocation),"ancestors":[],"model_quotes":[]}
+    raw,task,factory,cycle,grant,root=configured(tmp_path,monkeypatch,budget=budget)
+    assert task["work_budget_version"]==1 and cycle.plan.budget_reference==allocation.hash
+    before=factory.budget_authority.snapshot(allocation.allocation_id)
+    assert before["implementation_attempts"]==1 and before["charged_upper_bounds"]["work_ms"]>0
+    original=factory.budget_authority.audit_log._path.read_bytes()
+    recovered=config.build_root_work_factory(Path(raw["task_store_root"]),task,recovery=True,git=factory.git)
+    recovered.recover(identity=grant.identity,workspace=root,spec_sha256=spec_digest(task),
+        grant_sha256=grant.hash,plan_sha256=cycle.plan.hash)
+    assert recovered.budget_authority.snapshot(allocation.allocation_id)==before
+    assert recovered.budget_authority.audit_log._path.read_bytes()==original
+
+@pytest.mark.parametrize("version",[True,0,2,"1"])
+def test_unknown_budget_marker_cannot_use_historical_admission(tmp_path,monkeypatch,version):
+    from tests.herdr.test_work_configuration import configured
+    from herdr import work_configuration as config
+    raw,task,factory,cycle,grant,root=configured(tmp_path,monkeypatch)
+    task["work_budget_version"]=version
+    with pytest.raises(WorkContractError,match="version unsupported"):
+        config.build_root_work_factory(Path(raw["task_store_root"]),task)

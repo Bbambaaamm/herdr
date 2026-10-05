@@ -9,7 +9,7 @@ def bind_repair(factory,raw):
     if raw is None:
         factory.repair_policy=None
         return
-    closed(raw,("version","reason_code","paths","max_changed_lines"),"bounded host repair policy")
+    closed(raw,("version","reason_code","paths","max_changed_lines","failure_outputs"),"bounded host repair policy")
     require(type(raw["version"]) is int and raw["version"]==1
             and isinstance(raw["reason_code"],str) and 1<=len(raw["reason_code"])<=64
             and isinstance(raw["paths"],list) and 1<=len(raw["paths"])<=8
@@ -17,6 +17,9 @@ def bind_repair(factory,raw):
             and all(isinstance(path,str) and 1<=len(path)<=1024 for path in raw["paths"])
             and type(raw["max_changed_lines"]) is int and 1<=raw["max_changed_lines"]<=200,
             "finite repair profile required")
+    require(isinstance(raw["failure_outputs"],list) and 1<=len(raw["failure_outputs"])<=32
+            and all(isinstance(value,str) and len(value)==64 and set(value)<=set("0123456789abcdef")
+                    for value in raw["failure_outputs"]),"approved failure classifier required")
     factory.repair_policy=dict(raw)
 
 def after_verification(factory,cycle,outcome,*,new_request):
@@ -34,6 +37,9 @@ def after_verification(factory,cycle,outcome,*,new_request):
     if len(failed)!=1 or failed[0].truncated or failed[0].exit_code!=1:
         return {**outcome,"next_action":"host_typed_failure_disposition_required"}
     check=failed[0]
+    policy=getattr(factory,"repair_policy",None)
+    if policy is None or check.output_sha256 not in policy["failure_outputs"]:
+        return {**outcome,"next_action":"host_typed_failure_disposition_required"}
     failure=Failure(FailureKind.IMPLEMENTATION,"approved_check_failed",
                     check.hash,check.tree_sha256,check.output_sha256)
     factory.budget_authority.record_failure(allocation.allocation_id,failure)

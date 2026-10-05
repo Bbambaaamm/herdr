@@ -887,9 +887,17 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
     def guarded_perform(agent: Any, *args: Any, **kwargs: Any) -> Any:
         authorize_agent_provider(agent)
         token = _ACTIVE_AGENT.set(agent)
+        budgeted=False
+        old_streaming=getattr(agent,"_disable_streaming",False)
         try:
+            budgeted=callable(getattr(guard,"budget_required",None)) and guard.budget_required()
+            if budgeted:
+                if getattr(getattr(agent,"client",None),"max_retries",None)!=0:
+                    raise PolicyDenied("budgeted_client_retry_profile_unsupported")
+                agent._disable_streaming=True
             return original_perform(agent, *args, **kwargs)
         finally:
+            if budgeted:agent._disable_streaming=old_streaming
             _ACTIVE_AGENT.reset(token)
 
     installation._remember(turn_api_call, "perform_api_call", guarded_perform)

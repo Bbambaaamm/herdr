@@ -174,6 +174,9 @@ def inspect_discovery(workspace, paths, snapshot):
 def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG, git=None, recovery=False, spec_sha256=None):
     """Only standalone host code selects the protected configuration path."""
     from agent_completion_evidence import spec_digest
+    if "work_budget_version" in task:
+        require(type(task["work_budget_version"]) is int and task["work_budget_version"]==1,
+                "work budget version unsupported")
     raw = _read_configuration(configuration_path)
     policy_factory = build_host_policy_factory(configuration_path=configuration_path)
     require(raw == _read_configuration(configuration_path), "host configuration changed during work admission")
