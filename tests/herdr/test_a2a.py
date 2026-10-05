@@ -1397,3 +1397,42 @@ def test_surrogate_task_text_denies_before_dispatch(tmp_path):
     with pytest.raises(A2AError,match="message text"):
         Gateway(transport,store,card,policy).send(identity,chr(0xd800))
     assert transport.sends==[] and store.read() is None
+
+@pytest.mark.parametrize("address",["https://@remote.example","https://:@remote.example",
+    "https://user@remote.example","https://:value@remote.example"])
+@pytest.mark.parametrize("surface",["discovery","interface","part"])
+def test_https_userinfo_is_denied_even_when_empty(address,surface):
+    with pytest.raises(A2AError):
+        if surface=="discovery":
+            class Never:
+                def discover(self,*args):pytest.fail("userinfo origin contacted transport")
+            discover_card(Never(),address)
+        elif surface=="interface":a2a_module._interface_address(address,"JSONRPC")
+        else:a2a_module._part_url(address)
+
+@pytest.mark.parametrize("refs",["scalar",{},["bad"+chr(10)+"id"],[""],[3],
+    [chr(0xd800)],["x"*4097],["id"]*17])
+@pytest.mark.parametrize("field",["referenceTaskIds","reference_task_ids"])
+@pytest.mark.parametrize("surface",["direct","status"])
+def test_message_reference_ids_are_bounded_and_typed_before_candidate(tmp_path,refs,field,surface):
+    _,card,policy,identity,store=setup(tmp_path)
+    msg={"messageId":"reply","contextId":"remote-context","role":"ROLE_AGENT",
+         "parts":[{"text":"answer"}],field:refs}
+    payload={"message":msg} if surface=="direct" else task()
+    if surface=="status":payload["task"]["status"]["message"]=msg
+    transport=Mock(payload)
+    with pytest.raises(A2AError):
+        Gateway(transport,store,card,policy).send(identity,"work")
+    assert len(transport.sends)==1 and store.read()["candidates"]==[]
+
+@pytest.mark.parametrize("refs",[None,[],["remote/one","remote/two"]])
+@pytest.mark.parametrize("surface",["direct","status"])
+def test_optional_reference_ids_normalize_and_preserve_valid_opaque_ids(tmp_path,refs,surface):
+    _,card,policy,identity,store=setup(tmp_path)
+    msg={"messageId":"reply","contextId":"remote-context","role":"ROLE_AGENT",
+         "parts":[{"text":"answer"}],"reference_task_ids":refs}
+    payload={"message":msg} if surface=="direct" else task()
+    if surface=="status":payload["task"]["status"]["message"]=msg
+    candidate,=Gateway(Mock(payload),store,card,policy).send(identity,"work")
+    if refs is None:assert "referenceTaskIds" not in candidate.content
+    else:assert candidate.content["referenceTaskIds"]==refs

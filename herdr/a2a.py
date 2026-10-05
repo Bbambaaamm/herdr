@@ -163,7 +163,7 @@ def _https_url(value: Any,limit: int):
             ascii_host = idna.encode(host, strict=True, uts46=False).decode("ascii").rstrip(".")
             if not ascii_host or len(ascii_host) > 253:
                 raise ValueError("invalid hostname")
-        if parsed.scheme!="https" or parsed.username or parsed.password or port is not None and not 1<=port<=65535:
+        if parsed.scheme!="https" or parsed.username is not None or parsed.password is not None or port is not None and not 1<=port<=65535:
             raise ValueError("invalid HTTPS URL authority or embedded credentials")
     except (ValueError,UnicodeError) as exc:
         raise A2AError("invalid HTTPS URL authority or embedded credentials") from exc
@@ -171,7 +171,7 @@ def _https_url(value: Any,limit: int):
 
 def _url(value: Any) -> str:
     parsed=_https_url(value,2048)
-    if parsed.fragment or parsed.query:
+    if "?" in value or "#" in value:
         raise A2AError("interface requires a plain HTTPS URL")
     return value
 
@@ -794,6 +794,15 @@ def _response_object(value: Any, required: set[str]) -> Mapping[str, Any]:
     value = _proto_keys(value, {"messageId", "contextId", "taskId", "artifactId", "referenceTaskIds"})
     if not required <= value.keys():
         raise A2AError("invalid response object")
+    if "referenceTaskIds" in value:
+        refs=value["referenceTaskIds"]
+        # ProtoJSON null denotes an unset optional repeated field.
+        if refs is None:
+            value.pop("referenceTaskIds")
+        else:
+            if not isinstance(refs,list) or len(refs)>MAX_PARTS:
+                raise A2AError("invalid referenceTaskIds")
+            for ref in refs:_remote_id(ref,"referenceTaskIds")
     for key in ("taskId", "contextId"):
         if key not in required and value.get(key) in (None, ""):
             value.pop(key, None)
