@@ -106,7 +106,8 @@ def _reject_secret_values(value: Any) -> None:
             if _CARD_SECRET_VALUE.search(normalized):raise A2AError("raw secret-like value")
         elif isinstance(current,dict):
             for key,item in current.items():
-                if isinstance(key,str) and protected.fullmatch(key) and isinstance(item,str) and item:
+                empty = item is None or isinstance(item,str) and item=="" or isinstance(item,(list,dict)) and not item
+                if isinstance(key,str) and protected.fullmatch(key) and not empty:
                     raise A2AError("raw secret-like value")
             stack.append((iter(current.values()),depth+1))
         elif isinstance(current,list):
@@ -227,9 +228,45 @@ class AgentCard:
                    {"text","text/plain","text/*","*/*"} for mode in self.input_modes)
 
 
+def _card_secret_scan(raw):
+    # "password" is also the name of a public OAuth flow declaration. Only
+    # that exact typed declaration is exempt from credential-key assignment;
+    # its URL/scopes and descendants still receive the normal secret scan.
+    if not isinstance(raw,dict):return _reject_secret_values(raw)
+    scan=dict(raw)
+    schemes=raw.get("securitySchemes",raw.get("security_schemes"))
+    if isinstance(schemes,dict):
+        scanned={}
+        for key,scheme in schemes.items():
+            if not isinstance(scheme,dict):
+                scanned[key]=scheme;continue
+            scheme_scan=dict(scheme)
+            oauth=scheme.get("oauth2SecurityScheme",scheme.get("oauth2_security_scheme"))
+            container=oauth if isinstance(oauth,dict) else scheme if scheme.get("type")=="oauth2" else None
+            if container is not None and isinstance(container.get("flows"),dict):
+                flows=dict(container["flows"])
+                password=flows.get("password")
+                if isinstance(password,dict) and set(password)<={"tokenUrl","refreshUrl","scopes"} and isinstance(password.get("tokenUrl"),str):
+                    _https_url(password["tokenUrl"],2048)
+                    if "refreshUrl" in password:_https_url(password["refreshUrl"],2048)
+                    scopes=password.get("scopes",{})
+                    if not isinstance(scopes,dict) or any(not isinstance(a,str) or not isinstance(b,str) for a,b in scopes.items()):
+                        raise A2AError("invalid OAuth password flow scopes")
+                    flows.pop("password");flows["passwordFlowDeclaration"]=password
+                    changed={**container,"flows":flows}
+                    if container is scheme:scheme_scan=changed
+                    else:
+                        field="oauth2SecurityScheme" if "oauth2SecurityScheme" in scheme else "oauth2_security_scheme"
+                        scheme_scan[field]=changed
+            scanned[key]=scheme_scan
+        field="securitySchemes" if "securitySchemes" in raw else "security_schemes"
+        scan[field]=scanned
+    _reject_secret_values(scan)
+
+
 def parse_card(raw: Any) -> AgentCard:
     _bounded(raw, MAX_CARD, secret_scan=False)
-    _reject_secret_values(raw)
+    _card_secret_scan(raw)
     card = _object(raw, {"name", "description", "version", "supportedInterfaces", "capabilities", "skills", "defaultInputModes", "defaultOutputModes", "provider", "documentationUrl", "iconUrl", "securitySchemes", "securityRequirements", "signatures"}, {"name", "description", "version", "supportedInterfaces", "capabilities", "skills", "defaultInputModes", "defaultOutputModes"})
     name = _label(card["name"], "card name")
     _label(card["description"], "description")
@@ -791,9 +828,48 @@ def _candidate(identity: Identity, task: str | None, context: str | None, kind: 
 def _response_object(value: Any, required: set[str]) -> Mapping[str, Any]:
     if not isinstance(value, dict):
         raise A2AError("invalid response object")
-    value = _proto_keys(value, {"messageId", "contextId", "taskId", "artifactId", "referenceTaskIds"})
-    if not required <= value.keys():
-        raise A2AError("invalid response object")
+    # Released v1.0.1 Message/Artifact/Task/TaskStatus declarations. Extension
+    # data belongs in metadata; it does not add fields to protocol objects.
+    fields = ({"artifactId","parts","name","description","metadata","extensions"} if "artifactId" in required else
+              {"messageId","contextId","taskId","role","parts","metadata","extensions","referenceTaskIds"} if "messageId" in required else
+              {"id","contextId","status","artifacts","history","metadata"} if "id" in required else
+              {"state","message","timestamp"} if "state" in required else None)
+    if fields is None:raise A2AError("unknown protocol object")
+    value=_proto_keys(value,fields)
+    # Preserve bounded future fields as untrusted candidate data. Only declared
+    # fields receive protocol semantics; unknown fields confer no authority.
+    unknown = {key:item for key,item in value.items() if key not in fields}
+    known = dict(_object({key:item for key,item in value.items() if key in fields},fields,required))
+    value = {**unknown,**known}
+    if "metadata" in value and not isinstance(value["metadata"],dict):
+        raise A2AError("invalid protocol metadata")
+    for key,limit in (("name",256),("description",8192)):
+        if key not in fields or key not in value:continue
+        if not isinstance(value[key],str):raise A2AError("invalid protocol "+key)
+        try:encoded=value[key].encode("utf-8")
+        except UnicodeError:raise A2AError("invalid protocol "+key) from None
+        if len(encoded)>limit:raise A2AError("oversized protocol "+key)
+    if "extensions" in value:
+        extensions=value["extensions"]
+        if not isinstance(extensions,list) or len(extensions)>MAX_PARTS:
+            raise A2AError("invalid protocol extensions")
+        for extension in extensions:
+            _remote_id(extension,"extension URI")
+            try:scheme=urlsplit(extension).scheme
+            except ValueError:raise A2AError("invalid extension URI") from None
+            if any(char.isspace() for char in extension) or not re.fullmatch(
+                    r"[A-Za-z][A-Za-z0-9+.-]*",scheme):
+                raise A2AError("invalid extension URI")
+    if "history" in value and not isinstance(value["history"],list):
+        raise A2AError("invalid task history")
+    if "timestamp" in value:
+        stamp=value["timestamp"]
+        if not isinstance(stamp,str) or not re.fullmatch(
+                r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}(?:[.][0-9]{1,9})?(?:[Zz]|[+-][0-9]{2}:[0-9]{2})",stamp):
+            raise A2AError("invalid status timestamp")
+        from datetime import datetime
+        try:datetime.fromisoformat(stamp.replace("t","T").replace("z","+00:00").replace("Z","+00:00"))
+        except ValueError:raise A2AError("invalid status timestamp") from None
     if "referenceTaskIds" in value:
         refs=value["referenceTaskIds"]
         # ProtoJSON null denotes an unset optional repeated field.

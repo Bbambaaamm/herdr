@@ -1436,3 +1436,59 @@ def test_optional_reference_ids_normalize_and_preserve_valid_opaque_ids(tmp_path
     candidate,=Gateway(Mock(payload),store,card,policy).send(identity,"work")
     if refs is None:assert "referenceTaskIds" not in candidate.content
     else:assert candidate.content["referenceTaskIds"]==refs
+
+
+@pytest.mark.parametrize("key",["password","access_token","credentials","private_key","client_secret"])
+@pytest.mark.parametrize("secret",[0,False,123456,{"value":"do-not-export"},["do-not-export"]])
+@pytest.mark.parametrize("surface",["data","metadata"])
+def test_protected_fields_reject_nonstring_concrete_values_before_candidate(tmp_path,key,secret,surface):
+    _,card,policy,identity,store=setup(tmp_path)
+    part={"data":{key:secret}} if surface=="data" else {"text":"answer","metadata":{key:secret}}
+    response=task("TASK_STATE_COMPLETED",artifacts=[{"artifactId":"result","parts":[part]}])
+    transport=Mock(response)
+    with pytest.raises(A2AError,match="secret"):
+        Gateway(transport,store,card,policy).send(identity,"work")
+    assert store.read()["candidates"]==[] and len(transport.sends)==1
+
+@pytest.mark.parametrize("surface,field,value",
+    [("artifact","name",123),("artifact","description",{}),("status","timestamp","bad-time")]
+    +[(surface,field,value) for surface in ("artifact","direct","status") for field,value in
+      [("metadata",[]),("extensions","scalar"),("extensions",[1]),
+       ("extensions",["not a URI"]),("extensions",["urn:extension"+chr(10)]),
+       ("extensions",["https://[broken"])]])
+def test_optional_protocol_fields_are_validated_before_candidate(tmp_path,field,value,surface):
+    if field=="timestamp":
+        response=task();response["task"]["status"][field]=value
+    elif surface=="artifact":
+        response=task(artifacts=[{"artifactId":"result","parts":[{"text":"answer"}],field:value}])
+    else:
+        msg={"messageId":"reply","contextId":"remote-context","role":"ROLE_AGENT","parts":[{"text":"answer"}],field:value}
+        response={"message":msg} if surface=="direct" else task()
+        if surface=="status":response["task"]["status"]["message"]=msg
+    _,card,policy,identity,store=setup(tmp_path);transport=Mock(response)
+    with pytest.raises(A2AError):Gateway(transport,store,card,policy).send(identity,"work")
+    assert store.read()["candidates"]==[]
+
+@pytest.mark.parametrize("nulls",[False,True])
+def test_valid_optional_artifact_fields_preserve_metadata_and_normalize_nulls(tmp_path,nulls):
+    _,card,policy,identity,store=setup(tmp_path)
+    item={"artifact_id":"result","name":None if nulls else "Report",
+        "description":None if nulls else "A multiline"+chr(10)+"description",
+        "metadata":None if nulls else {"checked":True},"extensions":None if nulls else ["urn:herdr:evidence:v1"],
+        "parts":[{"text":"answer"}]}
+    candidate,=Gateway(Mock(task(artifacts=[item])),store,card,policy).send(identity,"work")
+    assert candidate.content["artifactId"]=="result"
+    if nulls:assert not set(candidate.content)&{"name","description","metadata","extensions"}
+    else:assert candidate.content["metadata"]=={"checked":True}
+
+@pytest.mark.parametrize("password",[{"value":"do-not-export"},123456,{"tokenUrl":"https://safe.example/token","access_token":123456}])
+def test_card_oauth_declaration_exception_never_allows_credential_payload(password,tmp_path):
+    raw,*_=setup(tmp_path)
+    raw["securitySchemes"]={"oauth":{"type":"oauth2","flows":{"password":password}}}
+    with pytest.raises(A2AError):parse_card(raw)
+
+def test_oauth_shaped_password_in_part_data_is_still_a_concrete_value(tmp_path):
+    _,card,policy,identity,store=setup(tmp_path)
+    payload=task(artifacts=[{"artifactId":"result","parts":[{"data":
+        {"password":{"tokenUrl":"https://safe.example/token"}}}]}])
+    with pytest.raises(A2AError):Gateway(Mock(payload),store,card,policy).send(identity,"work")
