@@ -160,3 +160,24 @@ def test_live_original_host_cannot_be_cold_reaped(tmp_path,monkeypatch):
         assert launch._ownership is None
     finally:
         if launch._ownership is not None: launch.cleanup_after_pane_closed()
+
+def test_enabled_consumer_worktree_ceiling_is_inside_its_parent_workspace():
+    consumers=json.loads((Path(__file__).resolve().parents[2]/
+        "agent-stack/config/github-intake-consumers.json").read_text())["consumers"]
+    for item in consumers:
+        if not item.get("enabled") or not item.get("worktree_root"):continue
+        assert Path(item["workspace"]) in Path(item["worktree_root"]).parents,item["repository"]
+
+def test_canonical_nested_child_worktree_passes_actual_factory_parent_ceiling(tmp_path,monkeypatch):
+    from herdr.security import InvocationIdentity
+    raw,workspace,parent=approved_config(tmp_path,monkeypatch)
+    child_workspace=workspace/"worktrees"/"child";child_workspace.mkdir(parents=True)
+    factory=config.build_host_policy_factory(parent_grant=parent)
+    child=InvocationIdentity(parent.identity.consumer,"child-agent",parent.identity.agent_id,
+        parent.identity.task_id,"child-task","child-run",parent.identity.fencing_token+1)
+    launch=factory.prepare_child(identity=child,workspace=child_workspace,
+        tools=parent.scope.tools,permissions=parent.scope.permissions)
+    try:
+        launch.grant.require_logical_subset_of(parent)
+        assert launch.grant.workspace_root==str(child_workspace)
+    finally:launch.cleanup_after_pane_closed()

@@ -52,7 +52,7 @@ def test_existing_herdr_task_gets_explicit_consumer_scope():
     task["safety_profile"] = "herdr-core"
     worker.ensure_parent_scope(task)
     assert task["parent_role"] == "writer"
-    assert task["worktree_root"] == "/home/agentops/worktrees/herdr"
+    assert task["worktree_root"] == "/home/agentops/workspaces/herdr/worktrees"
     assert set(task["parent_tools"]) == {"read_file", "search_files", "patch", "write_file", "herdr_delegate_child", "herdr_submit_result"}
     assert task["parent_permissions"] == ["workspace-write"]
 

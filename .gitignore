@@ -9,3 +9,6 @@ dist/
 build/
 node_modules/
 .DS_Store
+
+# Isolated task worktrees remain beneath the parent workspace grant.
+worktrees/

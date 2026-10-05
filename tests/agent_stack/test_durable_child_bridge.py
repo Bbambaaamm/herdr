@@ -82,7 +82,7 @@ def _task(tmp_path):
     task = {"id": "parent", "run_token": "run-1", "idempotency_key": "attempt-1",
             "attempt_state": "accepted", "task_file": str(path), "repo": "Bbambaaamm/herdr",
             "issue": 82, "workspace": str(tmp_path), "safety_profile": "herdr-core",
-            "worktree_root": "/home/agentops/worktrees/herdr",
+            "worktree_root": "/home/agentops/workspaces/herdr/worktrees",
             "parent_role": "writer", "parent_tools": ["read_file", "search_files"],
             "parent_permissions": [], "execution_session": {
                 "agent_name": "parent-agent", "pane_id": "parent-pane",
