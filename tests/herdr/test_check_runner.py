@@ -12,6 +12,8 @@ from herdr.workspace import _real_git
 from test_work_cycle import setup, runner
 
 def environment():
+    if not Path("/usr/bin/bwrap").is_file():
+        pytest.skip("physical namespace runtime unavailable in this test environment")
     python=str(Path("/usr/bin/python3").resolve(strict=True))
     bwrap=str(Path("/usr/bin/bwrap").resolve(strict=True))
     from tests.runtime_closure import approved_runtime
