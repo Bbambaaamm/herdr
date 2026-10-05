@@ -476,8 +476,9 @@ class ContextCompiler:
                     "provider_data_policy")
         return executor, cap, provider
 
-    def compile(self, plan: ContextPlan, *, executor_id, counter: TokenCounter, loader: Callable,
-                renderer="messages"):
+    def preflight(self, plan: ContextPlan, *, executor_id, counter: TokenCounter,
+                  renderer="messages",allowed_data_classes=None):
+        """Validate source-independent host metadata before any source loader."""
         require(isinstance(plan, ContextPlan) and plan.redaction_hash == self.redactor.policy_hash,
                 "plan_redaction_policy")
         require(isinstance(counter, TokenCounter) and callable(counter.count), "host_tokenizer_required")
@@ -490,18 +491,51 @@ class ContextCompiler:
         budget = min(limits)
         require(renderer in {"messages", "parts"}, "renderer")
         raw = json.loads(plan.payload)
+        require(plan.project==raw["stable_prefix"]["project_map"]["project"],"context_project_binding")
+        provider_classes=set(cap.data_policy.data_classes)&set(provider.data_policy.data_classes)
+        if allowed_data_classes is not None:
+            require(isinstance(allowed_data_classes,tuple) and all(isinstance(x,DataClass) for x in allowed_data_classes)
+                    and len(set(allowed_data_classes))==len(allowed_data_classes),"host_provider_data_classes")
+            provider_classes &= set(allowed_data_classes)
         controls_class = DataClass(raw["controls"]["data_class"])
-        require(controls_class in set(cap.data_policy.data_classes) & set(provider.data_policy.data_classes),
+        require(controls_class in provider_classes,
                 "required_provider_data_class")
         for source_raw in raw["controls"]["evidence"]:
             source = SourceRef(**source_raw)
+            require(self.redactor.tree(asdict(source)) == asdict(source), "secret_source_reference")
             require(_source_policy(source, plan.project, plan.context, series=plan.experiment_series,
                                    role=plan.role) is None and source.data_class in
-                    set(cap.data_policy.data_classes) & set(provider.data_policy.data_classes),
-                    "required_provider_evidence_scope")
+                    provider_classes,"required_provider_evidence_scope")
+        for item in plan.items:
+            if item.mandatory:
+                require(self.redactor.redact(item.id) == item.id, "secret_context_identity")
+                if item.memory_class == MemoryClass.PROVIDER_CACHE:
+                    raise ContextBlocked("required_source_provider_cache_not_authority")
+                for source in item.sources:
+                    require(self.redactor.tree(asdict(source)) == asdict(source), "secret_source_reference")
+                    reason = _source_policy(source, plan.project, plan.context,
+                                            series=plan.experiment_series, role=plan.role)
+                    if reason:
+                        raise ContextBlocked("required_source_" + reason)
+                    if source.data_class not in provider_classes:
+                        raise ContextBlocked("required_provider_source_data_class")
         # The skill resolver checked this executor; a switch re-resolves skills first.
         require(raw["skill_trace"].get("binding") == {**plan.context.binding(), "executor_id": executor_id},
                 "skill_executor_binding")
+        return executor, cap, provider, raw, budget
+
+    def compile(self, plan: ContextPlan, *, executor_id, counter: TokenCounter, loader: Callable,
+                renderer="messages", envelope=None, input_token_limit=None,allowed_data_classes=None):
+        executor, cap, provider, raw, budget = self.preflight(
+            plan, executor_id=executor_id, counter=counter, renderer=renderer,
+            allowed_data_classes=allowed_data_classes)
+        provider_classes=set(cap.data_policy.data_classes)&set(provider.data_policy.data_classes)
+        if allowed_data_classes is not None:provider_classes &= set(allowed_data_classes)
+        require(envelope is None or callable(envelope), "host_context_envelope")
+        if input_token_limit is not None:
+            require(type(input_token_limit) is int and 0 < input_token_limit <= 2**31,
+                    "host_context_input_limit")
+            budget = min(budget, input_token_limit)
         content, selected, rejected = [], [], []
         def render():
             # Both adapters preserve the same host-control / untrusted-data envelope.
@@ -514,8 +548,15 @@ class ContextCompiler:
                 value = {"system": canonical(raw["stable_prefix"]).decode(),
                          "contents": [{"role": "user", "parts": [{"text": canonical(data).decode()}]}]}
             return canonical(value)
+        def measured(wire):
+            transport = envelope(wire) if envelope is not None else wire
+            require(isinstance(transport,bytes),"host_context_envelope_bytes")
+            return transport
+        def fits(wire):
+            transport = measured(wire)
+            return len(transport) <= plan.byte_budget and counter.measure(transport) <= budget
         wire = render()
-        if len(wire) > plan.byte_budget or counter.measure(wire) > budget:
+        if not fits(wire):
             raise ContextBlocked("mandatory_context_exceeds_budget")
         for item in plan.items:
             reason = "provider_cache_not_authority" if item.memory_class == MemoryClass.PROVIDER_CACHE else None
@@ -528,54 +569,52 @@ class ContextCompiler:
                         and source_reason == SourceState.UNVERIFIED.value):
                     source_reason = None
                 reason = reason or source_reason
-                if source.data_class not in set(cap.data_policy.data_classes) & set(provider.data_policy.data_classes):
+                if source.data_class not in provider_classes:
                     reason = reason or "provider_data_class"
             if reason:
                 if item.mandatory:
                     raise ContextBlocked("required_source_" + reason)
-                rejected.append({"id": item.id, "code": reason})
+                rejected.append({"id": self.redactor.redact(item.id), "code": reason})
                 continue
-            if item.size > plan.byte_budget - len(wire):
-                if item.mandatory:
-                    raise ContextBlocked("mandatory_context_exceeds_budget")
-                rejected.append({"id": item.id, "code": "byte_budget"})
-                continue
+            # Source size is integrity metadata. The bounded source may shrink
+            # under redaction; only the rendered candidate determines fit.
             try:
                 source_bytes = loader(item)
             except Exception as exc:
                 if item.mandatory:
                     raise ContextBlocked("required_source_unavailable") from exc
-                rejected.append({"id": item.id, "code": "source_unavailable"})
+                rejected.append({"id": self.redactor.redact(item.id), "code": "source_unavailable"})
                 continue
             if (not isinstance(source_bytes, bytes) or len(source_bytes) != item.size
                     or hashlib.sha256(source_bytes).hexdigest() != item.sources[0].sha256):
                 if item.mandatory:
                     raise ContextBlocked("required_source_digest_mismatch")
-                rejected.append({"id": item.id, "code": "source_digest_mismatch"})
+                rejected.append({"id": self.redactor.redact(item.id), "code": "source_digest_mismatch"})
                 continue
             try:
                 text = self.redactor.redact(source_bytes.decode("utf-8"))
             except (UnicodeError, ContextError) as exc:
                 if item.mandatory:
                     raise ContextBlocked("required_source_encoding") from exc
-                rejected.append({"id": item.id, "code": "source_encoding"})
+                rejected.append({"id": self.redactor.redact(item.id), "code": "source_encoding"})
                 continue
-            content.append({"id": item.id, "authority": "context_data", "text": text,
+            content.append({"id": self.redactor.redact(item.id), "authority": "context_data", "text": text,
                             "memory_class": item.memory_class, "derived_summary": item.derived_summary, "sources": [asdict(x) for x in item.sources]})
             candidate = render()
-            if len(candidate) > plan.byte_budget or counter.measure(candidate) > budget:
+            if not fits(candidate):
                 content.pop()
                 if item.mandatory:
                     raise ContextBlocked("mandatory_context_exceeds_budget")
-                rejected.append({"id": item.id, "code": "context_budget"})
+                rejected.append({"id": self.redactor.redact(item.id), "code": "context_budget"})
                 continue
             wire = candidate
-            selected.append({"id": item.id, "reason": self.redactor.redact(item.reason), "sources": [asdict(x) for x in item.sources],
+            selected.append({"id": self.redactor.redact(item.id), "reason": self.redactor.redact(item.reason), "sources": [asdict(x) for x in item.sources],
                               "redacted": text.encode() != source_bytes, "derived_summary": item.derived_summary,
                              "authority": "context_data"})
         trace = canonical({"plan_hash": plan.hash, "binding": raw["binding"], "executor_id": executor.id,
                            "provider_id": provider.id, "tokenizer_version": counter.tokenizer_version,
-                           "tokenizer_input_tokens": counter.measure(wire), "provider_usage": "unmeasured", "input_bytes": len(wire),
+                           "tokenizer_input_tokens": counter.measure(measured(wire)),
+                            **({"measurement":"host_envelope","measurement_bytes":len(measured(wire))} if envelope is not None else {}), "provider_usage": "unmeasured", "input_bytes": len(wire),
                            "stable_prefix_hash": digest(raw["stable_prefix"]),
                            "cache_evidence": "unmeasured", "selection_hash": raw["selection_hash"],
                            "selection_reason": raw["selection_reason"], "previous_selection_hash": raw["previous_selection_hash"],
