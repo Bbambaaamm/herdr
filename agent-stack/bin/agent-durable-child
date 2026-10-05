@@ -217,7 +217,7 @@ def _parent_context(runner):
     return task, pane, agent, marker
 
 
-def delegate(args, *, runner=None, policy_launch_factory=None):
+def delegate(args, *, runner=None, policy_launch_factory=None, completion_authority=None):
     real = _required_env("HERDR_REAL_BINARY")
     if not Path(real).is_absolute() or not Path(real).is_file():
         raise ValueError("real Herdr binary unavailable")
@@ -232,10 +232,10 @@ def delegate(args, *, runner=None, policy_launch_factory=None):
     # reconciliation when the coordinator worker has already died.
     with legacy_admission_guard(state_root):
         with closing(_pin_child_cwd(task, args)) as pinned:
-            return _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, policy_launch_factory)
+            return _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, policy_launch_factory, completion_authority)
 
 
-def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, policy_launch_factory=None):
+def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, policy_launch_factory=None, completion_authority=None):
     child_cwd = pinned.logical
     parent_id, token = task["id"], task["run_token"]
     if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", args.key):
@@ -280,7 +280,7 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
             raise SchedulerError("durable child scheduler sentinel missing")
         if ledger_required(directory) and not ledger_preexisting:
             raise SchedulerError("durable child scheduler ledger missing")
-        scheduler = DynamicChildScheduler(audit_log=AuditLog(ledger),
+        scheduler = DynamicChildScheduler(audit_log=AuditLog(ledger),completion_authority=completion_authority,
             ownership_registry=ownership_registry, ownership_parent=ownership_parent)
         scheduler.replay()
         # The outer preflight is conservative for concurrent claims. Recheck
@@ -329,8 +329,8 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
         if ledger_preexisting:
             scheduler.register_external_parent_attempt(**parent_binding)
         else:
-            scheduler = initialize_parent_scheduler(directory, ownership_registry=ownership_registry,
-                ownership_parent=ownership_parent, **parent_binding)
+            scheduler = initialize_parent_scheduler(directory, completion_authority=completion_authority,
+                ownership_registry=ownership_registry, ownership_parent=ownership_parent, **parent_binding)
         if not ledger.is_file() or not ledger_required(directory):
             raise SchedulerError("durable child scheduler initialization missing")
         proposal = ChildProposal(parent_role=task["parent_role"],
@@ -358,6 +358,13 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
         delivery_prompt = _delivery_prompt(args.prompt, result_path, child.id,
                                            rec.run_token, rec.fencing_token,
                                            rec.idempotency_key)
+        from herdr.child_evidence import ChildCompletionAuthority
+        authority=scheduler.completion_authority
+        if authority is not None:
+            if not isinstance(authority,ChildCompletionAuthority):
+                raise SchedulerError("host child completion authority invalid")
+            authority.prepare(rec)
+            delivery_prompt+=authority.instructions(rec)
         if len(delivery_prompt) > MAX_PROMPT_CHARS:
             raise ValueError("managed child prompt exceeds maximum length")
         scheduler.bind_child_prompt(child.id, delivery_prompt)
@@ -417,7 +424,10 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
     retained = rec.result_evidence_canonical
     if retained is not None and hashlib.sha256(retained).hexdigest() != rec.result_artifact_sha256:
         raise SchedulerError("retained child result digest mismatch")
+    accepted_handoff=(authority.accepted_handoff(rec,registry=scheduler.ownership_registry)
+                      if authority is not None else None)
     return {"handoff": rec.result_handoff,
+                "accepted_handoff": accepted_handoff,
                 "evidence": json.loads(retained) if retained is not None else None,
                 "evidence_sha256": rec.result_artifact_sha256,
                 "task_id": child.id, "parent_task_id": parent_id,

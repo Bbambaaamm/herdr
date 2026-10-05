@@ -438,5 +438,22 @@ class GitHubIntakeTests(unittest.TestCase):
         )
 
 
+    def test_main_never_replans_pending_verification_as_another_work_episode(self):
+        path = self.intake.ROOT / "blocked" / "verification-pending.json"
+        path.write_text(json.dumps({
+            "id": "verification-pending", "issue": 662, "repo": "Bbambaaamm/dotacni-majak",
+            "attempt_state": "verification_pending", "verification_status": "evidence_unavailable",
+            "run_token": "stable-run", "attempts": 1,
+        }))
+        self.assertEqual(self._run_main_with_majak(), 0)
+        self.assertEqual(list(self.intake.PENDING.glob("*.json")), [])
+        state = json.loads(self.intake.STATE.read_text())
+        self.assertEqual(state["Bbambaaamm/dotacni-majak#662"]["scheduler_state"], "active")
+        records = self.intake.task_index()["Bbambaaamm/dotacni-majak#662"]
+        self.assertEqual(self.intake.intervention_blocker(records, allow_failed_replan=True),
+                         ("verification-pending", "evidence_unavailable"))
+
+
+
 if __name__ == "__main__":
     unittest.main()

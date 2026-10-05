@@ -1353,6 +1353,11 @@ def explicit_host_policy_for_lifecycle_tests(monkeypatch):
     from herdr.runtime import HerdrChildRuntime
     install_runtime_policy_fixture(monkeypatch, HerdrChildRuntime)
 
+@pytest.fixture(autouse=True)
+def explicit_host_completion_port_for_lifecycle_only(monkeypatch):
+    from tests.policy_launch_fakes import install_child_completion_fixture
+    install_child_completion_fixture(monkeypatch)
+
 
 @pytest.mark.parametrize("alias",["read","write","review"])
 def test_unsupported_file_alias_is_rejected_before_agent_start(alias):

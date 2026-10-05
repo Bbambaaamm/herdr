@@ -1250,6 +1250,11 @@ class HerdrChildRuntime:
                 )
             ):
                 raise HerdrRuntimeError("child_sandbox_attestation_denied", lease.task_id)
+            from .child_evidence import ChildCompletionAuthority
+            authority=self.scheduler.completion_authority
+            if not isinstance(authority,ChildCompletionAuthority):
+                raise HerdrRuntimeError("child_completion_authority_missing",lease.task_id)
+            authority.prepare(record)
             def publish_continuation(evidence):
                 return self.scheduler.attest_execution_sandbox(
                     lease.task_id,run_token,lease.agent_id,pane_id,marker,

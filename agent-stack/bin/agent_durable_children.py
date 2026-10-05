@@ -165,7 +165,7 @@ def repair_initialization(directory: Path, parent_task_id: str, run_token: str) 
                          json.dumps(committed, sort_keys=True, allow_nan=False).encode("utf-8"))
 
 
-def initialize_parent_scheduler(directory: Path, *, ownership_registry=None, ownership_parent=None, **binding) -> DynamicChildScheduler:
+def initialize_parent_scheduler(directory: Path, *, completion_authority=None, ownership_registry=None, ownership_parent=None, **binding) -> DynamicChildScheduler:
     """Stage the whole parent registration before publishing either required artifact."""
     ledger = directory / "scheduler.jsonl"
     if os.path.lexists(ledger) or ledger_required(directory) or os.path.lexists(directory / INITIALIZATION):
@@ -174,7 +174,7 @@ def initialize_parent_scheduler(directory: Path, *, ownership_registry=None, own
     os.close(fd)
     stage = Path(name)
     try:
-        scheduler = DynamicChildScheduler(audit_log=AuditLog(stage),
+        scheduler = DynamicChildScheduler(audit_log=AuditLog(stage),completion_authority=completion_authority,
             ownership_registry=ownership_registry, ownership_parent=ownership_parent)
         scheduler.register_external_parent_attempt(**binding)
         raw = _read_control_file(stage)
@@ -239,11 +239,23 @@ def publish_exact_child_result(scheduler: DynamicChildScheduler, rec, result_pat
         if not scheduler.publish_child_result(rec.node.id, rec.run_token, rec.agent_id,
                                               rec.fencing_token, rec.idempotency_key,
                                               evidence_sha, evidence,
-                                              status=result["status"]):
+                                              status=result["status"],result_payload=result):
             raise ValueError("child result publication denied")
-    if (rec.attempt_state != "terminal" or rec.result_status != result["status"]
+    rejection=getattr(rec,"completion_failure",None)
+    if rejection is not None:
+        from herdr.child_evidence import validate_child_rejection
+        from herdr.evidence import digest
+        validate_child_rejection(rec,rejection)
+        if rejection["result_payload_sha256"] != digest(result) or rec.result_status!="blocked":
+            raise ValueError("child candidate differs from permanent host rejection")
+    if (rec.attempt_state != "terminal" or (rec.result_status != result["status"] and rejection is None)
             or rec.result_artifact_sha256 != evidence_sha):
         raise ValueError("child result not durably terminal")
+    if result["status"]=="completed" and rejection is None:
+        from herdr.evidence import digest
+        receipt=getattr(rec,"completion_receipt",None)
+        if not isinstance(receipt,dict) or receipt.get("result_payload_sha256")!=digest(result):
+            raise ValueError("child result differs from accepted semantic receipt")
     return rec.result_status
 
 
@@ -270,6 +282,10 @@ def replay_host_scheduler(root: Path, ledger: Path) -> DynamicChildScheduler:
         verify_legacy=LegacyOwnershipInventory(root),verify_release=HostOwnershipRelease(root))
     scheduler = DynamicChildScheduler(audit_log=audit,ownership_registry=registry,ownership_parent=owner)
     scheduler.replay()
+    from agent_completion_evidence import child_completion_for_replay
+    authority=child_completion_for_replay(root,scheduler)
+    if authority is not None:
+        scheduler.completion_authority=authority
     if any(rec.ownership is not None and rec.ownership_reservation is None
            for rec in scheduler._tasks.values()):
         raise SchedulerError("declared ownership lacks protected reservation")
@@ -454,6 +470,8 @@ def all_children_terminal(root: Path, parent_task_id: str, run_token: str, *,
             e.get("parent_run_token") != run_token for e in spawned
         ):
             return False
+        # Old accepted results remain historical when a shared contract changes;
+        # a stale dependent may not open the parent's completion barrier.
         for rec in children:
             if rec.namespace_lifetime is not None and rec.attempt_state == "terminal" and rec.cleanup_complete:
                 from herdr.ownership_release import namespace_exited
@@ -465,6 +483,7 @@ def all_children_terminal(root: Path, parent_task_id: str, run_token: str, *,
         return all(rec.attempt_state == "terminal" and
                    (bool(rec.pre_delivery_failure) and rec.cleanup_complete or
                     rec.result_status in {"completed", "blocked", "failed"} and
+                    (rec.result_status!="completed" or rec.completion_receipt is not None) and
                     (not rec.execution_pane or rec.cleanup_complete)) and rec.lease is None and
                    rec.state in {LifecycleState.DONE, LifecycleState.FAILED,
                                  LifecycleState.BLOCKED} for rec in children)

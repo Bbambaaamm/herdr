@@ -342,6 +342,9 @@ class TaskRecord:
     delivery_prompt_sha256: str | None = None
     result_status: str | None = None
     result_artifact_sha256: str | None = None
+    completion_contract_version: int = 2
+    completion_receipt: dict[str,object] | None = None
+    completion_failure: dict[str,object] | None = None
     result_evidence_canonical: bytes | None = None
     result_handoff: dict[str, object] | None = None
 
@@ -370,6 +373,7 @@ class DynamicChildScheduler:
         consumer_policy: ConsumerPolicy | None = None,
         telemetry_store: TelemetryStore | None = None,
         execution_verifier: Callable[[str, str, str], str] | None = None,
+        completion_authority=None,
         ownership_registry: OwnershipRegistry | None = None,
         ownership_parent=None,
     ) -> None:
@@ -387,6 +391,10 @@ class DynamicChildScheduler:
         self.consumer_policy = consumer_policy or _DefaultConsumerPolicy()
         self.telemetry_store = telemetry_store
         self.execution_verifier = execution_verifier
+        if completion_authority is None:
+            from .child_evidence import HOST_CHILD_COMPLETION_AUTHORITY
+            completion_authority=HOST_CHILD_COMPLETION_AUTHORITY
+        self.completion_authority = completion_authority
         from .security import InvocationIdentity
         if (ownership_registry is None) != (ownership_parent is None):
             raise SchedulerError("ownership registry and verified parent required together")
@@ -729,6 +737,8 @@ class DynamicChildScheduler:
                     LifecycleState.FAILED,
                     LifecycleState.CANCELLED,
                 )
+                and (self._tasks[d].state is not LifecycleState.DONE
+                     or self._tasks[d].delegation_key is None or self._tasks[d].completion_receipt is not None)
                 for d in deps
             )
             if deps_met:
@@ -1024,6 +1034,7 @@ class DynamicChildScheduler:
                 continue
             deps_met = all(
                 d in self._tasks and self._tasks[d].state in (LifecycleState.DONE,)
+                and (self._tasks[d].delegation_key is None or self._tasks[d].completion_receipt is not None)
                 for d in rec.node.dependencies
             )
             if deps_met:
@@ -1363,6 +1374,7 @@ class DynamicChildScheduler:
                 "delegation_key": delegation_key,
                 "parent_run_token": parent_run_token,
                 "worktree_identity": proposal.worktree_identity,
+                "completion_contract_version":rec.completion_contract_version,
                 "ownership":proposal.ownership.to_json() if proposal.ownership else None,
                 "dependencies":list(child_node.dependencies),
                 "inputs":child_node.to_json()["inputs"],"expected_outputs":child_node.to_json()["expected_outputs"],
@@ -1743,7 +1755,7 @@ class DynamicChildScheduler:
     def publish_child_result(self, task_id: str, run_token: str, agent_id: str,
                              fencing_token: int, idempotency_key: str,
                              artifact_sha256: str, evidence: list[object],
-                             status: str = "completed") -> bool:
+                             status: str = "completed", *, result_payload=None) -> bool:
         rec = self._tasks.get(task_id)
         states = {"completed": LifecycleState.DONE,
                   "blocked": LifecycleState.BLOCKED,
@@ -1778,6 +1790,39 @@ class DynamicChildScheduler:
                 return False
         except (OwnershipError,SchedulerError,TypeError,ValueError):
             return False
+        receipt=None
+        rejection=None
+        if status=="completed":
+            from .child_evidence import ChildCompletionAuthority,AcceptedChildReceipt
+            from .evidence import EvidenceError,EvidenceMissing,EvidenceUnavailable
+            try:
+                if not isinstance(self.completion_authority,ChildCompletionAuthority):
+                    raise EvidenceError("host child completion authority is not configured; trusted replan required")
+                receipt=self.completion_authority.verify(rec,result_payload)
+                if not isinstance(receipt,AcceptedChildReceipt):
+                    return False
+                from .evidence import digest
+                receipt.validate(rec,digest(result_payload))
+            except (EvidenceMissing,EvidenceUnavailable):
+                return False
+            except EvidenceError as exc:
+                from .child_evidence import rejected_child_candidate
+                try:
+                    rejection=rejected_child_candidate(rec,result_payload,exc)
+                    if rejection["artifact_sha256"] != artifact_sha256:
+                        return False
+                except EvidenceError:
+                    return False
+                status="blocked"
+                receipt=None
+                candidate=replace(rec,result_status=status,result_artifact_sha256=artifact_sha256)
+                handoff=HandoffEnvelope.submitted_child(candidate,evidence=json.loads(canonical))
+                handoff.require_binding(candidate)
+        try:self._require_current_ownership(rec)
+        except (OwnershipError,SchedulerError):return False
+        if receipt is not None:
+            rec.completion_receipt=receipt.to_json()
+        rec.completion_failure=rejection
         rec.state = states[status]
         rec.attempt_state = "terminal"
         rec.result_status = status
@@ -1793,6 +1838,10 @@ class DynamicChildScheduler:
                                "artifact_sha256": artifact_sha256, "evidence": json.loads(canonical),
                                "handoff": rec.result_handoff,
                                "status": status, "state": rec.state.value,
+                               "completion_contract_version":rec.completion_contract_version,
+                               "completion_receipt":rec.completion_receipt,
+                               "completion_failure":rec.completion_failure,
+                               "completion_failure":rec.completion_failure,
                                "ownership_sha256":rec.ownership.hash if rec.ownership else None,
                                "handoff_ref":rec.ownership.handoff_ref if rec.ownership else None,
                                "ts": datetime.now(UTC).isoformat()})
@@ -1860,6 +1909,11 @@ class DynamicChildScheduler:
                     "attempt_state": rec.attempt_state,
                     "result_status": rec.result_status,
                     "result_artifact_sha256": rec.result_artifact_sha256,
+                    "completion_contract_version":rec.completion_contract_version,
+                    "completion_receipt":rec.completion_receipt,
+                    "completion_failure":rec.completion_failure,
+                    "completion_level":(rec.completion_receipt or {}).get("level",
+                        "legacy_unverified_result" if rec.result_status=="completed" else None),
                     "observed_execution": rec.observed_execution,
                     "observation_source": rec.observation_source,
                     "observed_at": rec.observed_at,
@@ -2130,6 +2184,31 @@ class DynamicChildScheduler:
                             valid = False
                         if not valid:
                             raise SchedulerError("invalid durable child result evidence")
+                        if e.get("completion_contract_version",1)!=rec.completion_contract_version:
+                            raise SchedulerError("child result contract version mismatch")
+                        receipt=e.get("completion_receipt")
+                        if status=="completed" and (rec.completion_contract_version==2 or receipt is not None):
+                            from .child_evidence import AcceptedChildReceipt
+                            from .evidence import EvidenceError
+                            try:
+                                if not isinstance(receipt,dict):
+                                    raise EvidenceError("accepted child receipt missing")
+                                AcceptedChildReceipt(**receipt).validate(rec)
+                            except (EvidenceError,TypeError,ValueError) as exc:
+                                raise SchedulerError("invalid verified child result receipt") from exc
+                        failure=e.get("completion_failure")
+                        if failure is not None:
+                            from .child_evidence import validate_child_rejection
+                            from .evidence import EvidenceError
+                            try:
+                                validate_child_rejection(rec,failure)
+                                if (status!="blocked" or receipt is not None
+                                        or failure["artifact_sha256"]!=e["artifact_sha256"]):
+                                    raise EvidenceError("permanent rejection settlement differs")
+                            except (EvidenceError,TypeError,ValueError) as exc:
+                                raise SchedulerError("invalid child permanent rejection") from exc
+                        rec.completion_failure=failure
+                        rec.completion_receipt=receipt
                     rec.state = states[status]
                     rec.attempt_state = "terminal"
                     rec.result_status = status if event_type == "child_result" else None
@@ -2259,6 +2338,10 @@ class DynamicChildScheduler:
                 if not isinstance(identity, str):
                     raise SchedulerError("invalid durable child worktree identity")
                 rec.worktree_identity = identity
+                version=e.get("completion_contract_version",1)
+                if type(version) is not int or version not in {1,2}:
+                    raise SchedulerError("unsupported child completion contract")
+                rec.completion_contract_version=version
                 raw_ownership=e.get("ownership")
                 ownership=ChildOwnership.from_json(raw_ownership) if raw_ownership is not None else None
                 if rec.ownership is not None and rec.ownership!=ownership:

@@ -43,6 +43,7 @@ PAYLOAD_PATHS = (
     "docs/architecture/AGENT_SKILLS.md",
     "docs/architecture/CONTEXT_MEMORY.md",
     "docs/architecture/INVOCATION_POLICY_LAUNCH.md",
+    "docs/architecture/COMPLETION_EVIDENCE.md",
     "integrations/search-router",
     "provenance/external-runtime-dependency.txt",
 )

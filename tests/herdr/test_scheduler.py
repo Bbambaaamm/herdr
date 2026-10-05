@@ -1015,3 +1015,8 @@ def test_pre_delivery_pending_lease_can_still_be_reclaimed(tmp_path: Path) -> No
     assert reclaimed == ["root"]
     assert sched._tasks["root"].state == LifecycleState.PENDING
     assert sched._tasks["root"].lease.fencing_token > original.fencing_token
+
+@pytest.fixture(autouse=True)
+def explicit_host_completion_port_for_lifecycle_only(monkeypatch):
+    from tests.policy_launch_fakes import install_child_completion_fixture
+    install_child_completion_fixture(monkeypatch)

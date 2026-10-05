@@ -76,3 +76,21 @@ def install_runtime_policy_fixture(monkeypatch, runtime_class):
                                         run_token=record.run_token,fencing_token=record.fencing_token)
             self._policy_launches[record.id]=FakePreparedPolicyLaunch(identity)
     monkeypatch.setattr(runtime_class,"__init__",init)
+
+def install_child_completion_fixture(monkeypatch):
+    from herdr.scheduler import DynamicChildScheduler
+    from herdr.child_evidence import ChildCompletionAuthority,AcceptedChildReceipt,child_identity,child_spec
+    from herdr.evidence import digest
+    class Authority(ChildCompletionAuthority):
+        def __init__(self): pass
+        def prepare(self,rec): pass
+        def instructions(self,rec): return ""
+        def accepted_handoff(self,rec,**kwargs): return None
+        def verify(self,rec,payload):
+            return AcceptedChildReceipt(2,child_identity(rec).to_json(),digest(payload),"a"*64,
+                "b"*64,child_spec(rec),"c"*64,"verified_worker_result")
+    original=DynamicChildScheduler.__init__
+    def init(self,*args,**kwargs):
+        if kwargs.get("completion_authority") is None: kwargs["completion_authority"]=Authority()
+        original(self,*args,**kwargs)
+    monkeypatch.setattr(DynamicChildScheduler,"__init__",init)

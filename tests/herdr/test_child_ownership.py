@@ -648,7 +648,7 @@ def test_production_release_reads_exact_protected_terminal_and_cleanup_truth(tmp
     evidence = [{"answer": "submitted"}]
     digest = hashlib.sha256(json.dumps(evidence, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     assert item.publish_child_result(rec.id, rec.run_token, rec.agent_id, rec.fencing_token,
-                                    rec.idempotency_key, digest, evidence)
+                                    rec.idempotency_key, digest, evidence, status="blocked")
     assert not item.release_child_ownership(rec.id)
     assert item.mark_child_cleanup_complete(rec.id)
     assert item.release_child_ownership(rec.id)

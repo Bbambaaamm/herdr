@@ -9,6 +9,12 @@ from herdr.scheduler import AuditLog, DynamicChildScheduler
 from tests.herdr.test_child_ownership import parent, registry, scheduler, ownership, proposal
 
 
+@pytest.fixture(autouse=True)
+def explicit_completion_port_for_handoff_lifecycle_only(monkeypatch):
+    from tests.policy_launch_fakes import install_child_completion_fixture
+    install_child_completion_fixture(monkeypatch)
+
+
 def claimed(tmp_path):
     owner = parent()
     store = registry(tmp_path)
