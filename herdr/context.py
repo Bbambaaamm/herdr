@@ -506,10 +506,14 @@ class ContextCompiler:
         return executor, cap, provider, raw, budget
 
     def compile(self, plan: ContextPlan, *, executor_id, counter: TokenCounter, loader: Callable,
-                renderer="messages", envelope=None):
+                renderer="messages", envelope=None, input_token_limit=None):
         executor, cap, provider, raw, budget = self.preflight(
             plan, executor_id=executor_id, counter=counter, renderer=renderer)
         require(envelope is None or callable(envelope), "host_context_envelope")
+        if input_token_limit is not None:
+            require(type(input_token_limit) is int and 0 < input_token_limit <= 2**31,
+                    "host_context_input_limit")
+            budget = min(budget, input_token_limit)
         content, selected, rejected = [], [], []
         def render():
             # Both adapters preserve the same host-control / untrusted-data envelope.

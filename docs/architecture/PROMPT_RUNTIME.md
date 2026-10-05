@@ -90,3 +90,7 @@ reference; #86 freezes prompt and evidence requirements with the work contract.
 #95 reconstructs execution from those references. Integration and live acceptance
 remain subject to #78 and the core chain; this contract does not automatically
 activate a runtime, provider, paid service or production configuration.
+
+Prompt plans require the active host SecretRedactor before construction and persistence. Opaque known secrets in objective/instruction/reminder/schema/reference metadata deny freezing; serialized plans retain only the redaction-policy hash. Reconstruction requires a matching host redactor. The output contract pins a positive output-token allowance, checked against the capability and reserved from the shared input-plus-output context window. Closed object schemas cannot require undeclared properties. Both native and validated JSON fallback require granted text output.
+
+The returned bundle retains the exact compiled context payload and context trace, and pins the trace digest in its prompt audit. Already-redacted context is used directly, preserving exact provenance even when a known secret overlaps the redaction marker. Context selection/rejection reasons and source digests are available separately from instruction and demonstration audits.

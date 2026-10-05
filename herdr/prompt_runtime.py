@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 
 from jsonschema import Draft202012Validator
@@ -94,6 +94,11 @@ def bounded_schema(schema):
             props = node.get("properties", {})
             require(node.get("additionalProperties") is False and isinstance(props, dict)
                     and len(props) <= 32, "output_schema_closed_object_required")
+            required = node.get("required", [])
+            require(isinstance(required, list) and len(required) <= 32
+                    and all(isinstance(key, str) for key in required)
+                    and len(set(required)) == len(required) and set(required) <= set(props),
+                    "output_schema_required_property")
             for key, value in props.items():
                 safe_text(key, 128); walk(value, depth+1)
         if "items" in node:
@@ -127,10 +132,12 @@ class OutputContract:
     result_schema: bytes
     minimum_evidence_refs: int = 1
     schema_version: str = VERSION
+    output_token_allowance: int = 1024
 
     def __post_init__(self):
         require(self.schema_version == VERSION, "output_contract_version")
         integer(self.minimum_evidence_refs, 1, 64, "evidence_requirement_bound")
+        integer(self.output_token_allowance, 1, 16384, "output_token_allowance")
         parsed = parse_json(self.result_schema, 32768)
         require(canonical(parsed) == self.result_schema, "canonical_output_schema_required")
         require(SecretRedactor().tree(parsed) == parsed, "output_schema_secret")
@@ -139,7 +146,8 @@ class OutputContract:
     @property
     def hash(self):
         return digest({"version": self.schema_version, "result_schema": json.loads(self.result_schema),
-                       "minimum_evidence_refs": self.minimum_evidence_refs})
+                       "minimum_evidence_refs": self.minimum_evidence_refs,
+                       "output_token_allowance": self.output_token_allowance})
 
     def schema(self):
         identity = InvocationIdentity.__dataclass_fields__
@@ -273,8 +281,10 @@ class PromptPlan:
     evidence_requirement_sha256: str
     renderer_version: str = VERSION
     context_alternatives: tuple[str, ...] = ()
+    _redactor: SecretRedactor = field(default=None, repr=False, compare=False)
 
     def __post_init__(self):
+        require(isinstance(self._redactor, SecretRedactor), "host_prompt_redaction_required")
         require(isinstance(self.identity, InvocationIdentity) and isinstance(self.output_contract, OutputContract),
                 "typed_prompt_contract_required")
         for name in ("spec_sha256", "policy_sha256", "grant_sha256", "context_plan_sha256",
@@ -304,22 +314,36 @@ class PromptPlan:
         require(self.renderer_version == VERSION, "prompt_renderer_version")
         require(len(canonical(self.to_json())) <= MAX_PROMPT, "prompt_plan_bytes")
 
+        require(canonical(self._redactor.tree(self.to_json())) == canonical(self.to_json()),
+                "prompt_plan_host_secret")
+
     def to_json(self):
-        raw = asdict(self)
+        raw = {name: getattr(self,name) for name in self.__dataclass_fields__ if name != "_redactor"}
+        raw["identity"] = self.identity.to_json()
+        raw["instruction_refs"] = [asdict(ref) for ref in self.instruction_refs]
+        raw["demonstrations"] = [asdict(ref) for ref in self.demonstrations]
+        raw["redaction_policy_sha256"] = self._redactor.policy_hash
         raw["output_contract"] = {"result_schema": json.loads(self.output_contract.result_schema),
             "minimum_evidence_refs": self.output_contract.minimum_evidence_refs,
-            "schema_version": self.output_contract.schema_version, "hash": self.output_contract.hash}
+            "schema_version": self.output_contract.schema_version, "hash": self.output_contract.hash,
+            "output_token_allowance": self.output_contract.output_token_allowance}
         return raw
 
     @classmethod
-    def from_json(cls, raw):
-        require(isinstance(raw, dict) and set(raw) == set(cls.__dataclass_fields__)
+    def from_json(cls, raw, *, redactor):
+        expected = (set(cls.__dataclass_fields__) - {"_redactor"}) | {"redaction_policy_sha256"}
+        require(isinstance(raw, dict) and set(raw) == expected
                 and len(canonical(raw)) <= MAX_PROMPT, "prompt_plan_schema")
+        require(isinstance(redactor, SecretRedactor)
+                and raw["redaction_policy_sha256"] == redactor.policy_hash, "prompt_redaction_policy")
         values = dict(raw)
+        del values["redaction_policy_sha256"]
+        values["_redactor"] = redactor
         values["identity"] = InvocationIdentity.from_dict(values["identity"])
         contract = values["output_contract"]
         require(isinstance(contract, dict) and set(contract) == {
-            "result_schema", "minimum_evidence_refs", "schema_version", "hash"}, "output_contract_schema")
+            "result_schema", "minimum_evidence_refs", "schema_version", "hash",
+            "output_token_allowance"}, "output_contract_schema")
         output = OutputContract(canonical(contract["result_schema"]), contract["minimum_evidence_refs"],
                                 contract["schema_version"])
         require(output.hash == contract["hash"], "output_contract_digest")
@@ -367,6 +391,8 @@ class PromptBundle:
     dynamic_payload: bytes
     wire: bytes
     trace: bytes
+    context_payload: bytes
+    context_trace: bytes
 
     @property
     def hash(self): return hashlib.sha256(self.wire).hexdigest()
@@ -401,6 +427,8 @@ class PromptRuntime:
                 and isinstance(grant, SecurityGrant), "host_prompt_binding_required")
         require(grant.identity == plan.identity and grant.hash == plan.grant_sha256
                 and grant.is_active(), "prompt_grant_binding")
+        require(plan._redactor.policy_hash == self.redactor.policy_hash,
+                "prompt_redaction_policy")
         identity = plan.identity
         require(context.hash in (plan.context_plan_sha256, *plan.context_alternatives)
                 and context_authority_hash(context) == plan.context_authority_sha256
@@ -427,6 +455,8 @@ class PromptRuntime:
             context, executor_id=binding.executor_id, counter=counter, renderer="messages")
         require(executor.version == binding.executor_version and executor.provider_id == binding.provider_id,
                 "prompt_executor_version")
+        require("text" in cap.output_modalities and "text" in grant.scope.output_modalities,
+                "prompt_text_output_required")
         native = binding.native_structured_output and Feature.STRUCTURED_OUTPUT in cap.features
         require(native or binding.allow_validated_fallback, "structured_output_unsupported")
         provider_classes = set(cap.data_policy.data_classes) & set(provider.data_policy.data_classes)
@@ -452,8 +482,13 @@ class PromptRuntime:
                    "project_instructions": [], "demonstrations": []}
         stable = self.redactor.tree(stable); dynamic = self.redactor.tree(dynamic)
         rejected, selected = [], []
+        allowance = plan.output_contract.output_token_allowance
+        require(cap.max_output_tokens is None or allowance <= cap.max_output_tokens,
+                "prompt_output_capability_limit")
+        shared_input = None if cap.context_tokens is None else cap.context_tokens - allowance
+        require(shared_input is None or shared_input > 0, "prompt_output_exceeds_context")
         token_limit = min(x for x in (context.token_budget, grant.scope.max_context_tokens,
-            cap.context_tokens, cap.max_input_tokens) if x is not None)
+            shared_input, cap.max_input_tokens) if x is not None)
         byte_limit = min(MAX_PROMPT, context.byte_budget)
         def render():
             prefix = canonical(stable).decode()
@@ -462,7 +497,8 @@ class PromptRuntime:
                     if binding.renderer == "messages" else
                     {"system": prefix, "contents": [{"role": "user", "parts": [{"text": task}]}]})
             body["structured_output"] = {"mode": "native" if native else "validated_fallback",
-                "schema": plan.output_contract.schema(), "schema_sha256": plan.output_contract.hash}
+                "schema": plan.output_contract.schema(), "schema_sha256": plan.output_contract.hash,
+                "max_output_tokens": plan.output_contract.output_token_allowance}
             return canonical(body)
         def fits(wire): return len(wire) <= byte_limit and counter.measure(wire) <= token_limit
         def load_reference(kind, ref):
@@ -500,10 +536,11 @@ class PromptRuntime:
                              "reason_code":"verified_relevant_scoped_source"})
 
         def envelope(context_wire):
-            dynamic["context"] = self.redactor.tree(json.loads(json.loads(context_wire)["messages"][1]["content"]))
+            dynamic["context"] = json.loads(json.loads(context_wire)["messages"][1]["content"])
             return render()
         compiled = self.context_compiler.compile(context, executor_id=binding.executor_id,
-            counter=counter, loader=loader, renderer="messages", envelope=envelope)
+            counter=counter, loader=loader, renderer="messages", envelope=envelope,
+            input_token_limit=token_limit)
         require(isinstance(compiled, ContextBundle), "compiled_context_required")
         wire = envelope(compiled.payload)
         require(fits(wire), "mandatory_prompt_exceeds_budget")
@@ -525,11 +562,14 @@ class PromptRuntime:
                                      "reason_code":"verified_relevant_scoped_source"})
         trace = canonical({"version": VERSION, "plan_sha256": plan.hash, "binding_sha256": binding.hash,
                            "context_plan_sha256": context.hash, "context_bundle_sha256": compiled.hash,
+                           "context_trace_sha256": hashlib.sha256(compiled.trace).hexdigest(),
+                           "context_audit": json.loads(compiled.trace),
                            "input_bytes": len(wire), "tokenizer_input_tokens": counter.measure(wire),
                            "stable_prefix_sha256": digest(stable), "demonstrations_used": len(dynamic["demonstrations"]),
                            "selected": selected, "rejected": rejected, "cache_usage": "UNKNOWN",
                            "provider_usage": "UNKNOWN", "schema_mode": "native" if native else "validated_fallback"})
-        return PromptBundle(plan.hash, binding.hash, compiled.hash, canonical(stable), canonical(dynamic), wire, trace)
+        return PromptBundle(plan.hash, binding.hash, compiled.hash, canonical(stable), canonical(dynamic),
+                            wire, trace, compiled.payload, compiled.trace)
 
     def validate_output(self, plan, raw):
         require(isinstance(plan, PromptPlan), "output_plan_required")

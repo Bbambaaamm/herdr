@@ -51,7 +51,7 @@ def setup(tmp_path, *, executor="a-runtime", instructions=(), demonstrations=(),
         task_class="coding", conditions_sha256=CONDITIONS, immediate_instruction="Use the approved checks.",
         reminders=(), compute_policy_sha256=digest("DIRECT-policy"),
         output_contract=OutputContract(canonical({"type": ["string", "null"], "maxLength": 1024})),
-        evidence_requirement_sha256=digest("tests-and-review"))
+        evidence_requirement_sha256=digest("tests-and-review"), _redactor=compiler.redactor)
     runtime = PromptRuntime(compiler, verify_demo_evidence=lambda _: True,
                             verify_output_evidence=lambda ref, plan: ref == digest("trusted-proof"))
     binding = RendererBinding(executor, "1", executor[0], "messages", True, True)
@@ -80,12 +80,12 @@ def output(plan, status=Sufficiency.UNKNOWN, refs=(), **changes):
 def test_immutable_plan_round_trip_and_reconstruction_do_not_need_session_cache(tmp_path):
     data = setup(tmp_path)
     plan = data[1]; saved = json.loads(canonical(plan.to_json()))
-    restored = PromptPlan.from_json(saved)
+    restored = PromptPlan.from_json(saved,redactor=data[0].redactor)
     assert restored == plan and restored.hash == plan.hash
     saved["output_contract"]["result_schema"]["maxLength"] = 1
     assert restored.hash == plan.hash
     with pytest.raises(PromptBlocked, match="digest"):
-        PromptPlan.from_json(saved)
+        PromptPlan.from_json(saved,redactor=data[0].redactor)
     assert compile(data).wire == compile((data[0], restored, *data[2:])).wire
     assert "hidden_chain_of_thought" not in json.dumps(plan.to_json())
 
@@ -286,15 +286,14 @@ def test_renderer_switch_and_immediate_task_do_not_change_static_prefix(tmp_path
     assert first.telemetry()["provider_usage"] == second.telemetry()["provider_usage"] == "UNKNOWN"
 
 
-def test_rejected_secret_reference_id_is_hashed_in_trace_without_loading(tmp_path):
+def test_secret_reference_id_cannot_enter_persisted_prompt_plan(tmp_path):
     from herdr.context import SecretRedactor
     secret="private-token-reference"
-    raw=b"optional instructions"
+    raw=b"ordinary instructions"
     ref=InstructionRef(secret,"repo_instructions",source(raw),len(raw),mandatory=False)
-    data=setup(tmp_path,instructions=(ref,),redactor=SecretRedactor((secret,)))
-    bundle=compile(data,lambda ref:pytest.fail("rejected secret reference loaded"))
-    assert secret.encode() not in bundle.trace
-    assert bundle.telemetry()["rejected"][0]["reference_sha256"]==hashlib.sha256(secret.encode()).hexdigest()
+    with pytest.raises(PromptBlocked,match="prompt_plan_host_secret"):
+        setup(tmp_path,instructions=(ref,),redactor=SecretRedactor((secret,)))
+
 
 def test_optional_context_accounts_for_complete_prompt_envelope(tmp_path):
     from tests.herdr.test_context import item
@@ -398,3 +397,101 @@ def test_redacted_context_fits_complete_envelope_despite_original_source_size(tm
     entries=json.loads(bundle.dynamic_payload)["context"]["context_data"]
     assert [entry["id"] for entry in entries]==["redacted-context"]
     assert "useful evidence" in entries[0]["text"] and secret.encode() not in bundle.wire
+
+@pytest.mark.parametrize("schema",[
+    {"type":"object","properties":{},"required":["undeclared"],"additionalProperties":False},
+    {"type":"object","properties":{"present":{"type":"string","maxLength":10}},
+     "required":["present","undeclared"],"additionalProperties":False},
+    {"oneOf":[{"type":"object","properties":{},"required":["undeclared"],"additionalProperties":False}]}])
+def test_impossible_closed_output_schema_denies_before_plan_or_provider(schema):
+    with pytest.raises(PromptBlocked,match="required_property"):
+        OutputContract(canonical(schema))
+
+@pytest.mark.parametrize("field",["objective","immediate_instruction","reminders","schema"])
+def test_host_known_opaque_secret_denies_before_plan_serialization(tmp_path,field):
+    from herdr.context import SecretRedactor
+    secret="opaque-host-private-value"
+    data=setup(tmp_path,redactor=SecretRedactor((secret,)))
+    kwargs={field:secret}
+    if field=="reminders":kwargs={"reminders":(secret,)}
+    if field=="schema":
+        kwargs={"output_contract":OutputContract(canonical({"type":"string","maxLength":128,"description":secret}))}
+    with pytest.raises(PromptBlocked,match="prompt_plan_host_secret"):
+        replace(data[1],**kwargs)
+    frozen=canonical(data[1].to_json())
+    assert secret.encode() not in frozen and "_redactor" not in data[1].to_json()
+    restored=PromptPlan.from_json(data[1].to_json(),redactor=data[0].redactor)
+    assert restored.hash==data[1].hash
+    with pytest.raises(PromptBlocked,match="redaction_policy"):
+        PromptPlan.from_json(data[1].to_json(),redactor=SecretRedactor())
+
+def test_output_token_reservation_is_pinned_and_shared_window_is_admitted(tmp_path):
+    from tests.herdr.test_context import item
+    data=setup(tmp_path,token_budget=8192,items=(item(b"x"*24000,id="optional-large"),))
+    runtime,plan,context,grant,binding=data
+    node=replace(context.context,registry=replace(context.context.registry,
+        capabilities=tuple(replace(c,context_tokens=8192,max_input_tokens=8192,max_output_tokens=1024)
+                           for c in context.context.registry.capabilities)))
+    raw=json.loads(context.payload);raw["binding"]=node.binding()
+    raw["skill_trace"]["binding"]={**node.binding(),"executor_id":binding.executor_id}
+    context=replace(context,context=node,payload=canonical(raw))
+    plan=replace(plan,context_plan_sha256=context.hash,
+                 context_authority_sha256=context_authority_hash(context))
+    bundle=compile((runtime,plan,context,grant,binding),lambda _:b"x"*24000)
+    allowance=plan.output_contract.output_token_allowance
+    assert counter().measure(bundle.wire)+allowance<=8192
+    assert bundle.render()["structured_output"]["max_output_tokens"]==allowance
+    assert OutputContract(plan.output_contract.result_schema,output_token_allowance=512).hash!=plan.output_contract.hash
+    bad=replace(plan,output_contract=replace(plan.output_contract,output_token_allowance=2048))
+    with pytest.raises(PromptBlocked,match="output_capability_limit"):
+        compile((runtime,bad,context,grant,binding),lambda _:pytest.fail("excess output allowance loaded a source"))
+
+
+def test_compiled_context_marker_is_preserved_exactly_and_audit_is_retained(tmp_path):
+    from herdr.context import SecretRedactor
+    from tests.herdr.test_context import item
+    raw=b"REDA is a protected value."
+    data=setup(tmp_path,redactor=SecretRedactor(("REDA",)),items=(item(raw,id="source"),))
+    bundle=compile(data,lambda _:raw)
+    actual=json.loads(json.loads(bundle.context_payload)["messages"][1]["content"])
+    assert json.loads(bundle.dynamic_payload)["context"]==actual
+    assert actual["context_data"][0]["text"]=="[REDACTED] is a protected value."
+    assert bundle.context_bundle_sha256==hashlib.sha256(bundle.context_payload).hexdigest()
+    audit=json.loads(bundle.context_trace)
+    assert bundle.telemetry()["context_audit"]==audit
+    assert [entry["id"] for entry in audit["selected"]]==["source"]
+    assert audit["selected"][0]["sources"][0]["sha256"]==hashlib.sha256(raw).hexdigest()
+
+def test_optional_context_rejection_keeps_reason_and_source_audit_in_returned_bundle(tmp_path):
+    from tests.herdr.test_context import item
+    raw=b"evidence"
+    denied=item(raw,id="stale",state=SourceState.STALE)
+    data=setup(tmp_path,items=(denied,))
+    bundle=compile(data,lambda _:pytest.fail("stale source loaded"))
+    audit=json.loads(bundle.context_trace)
+    assert audit["rejected"]==[{"id":"stale","code":SourceState.STALE.value}]
+    assert bundle.telemetry()["context_audit"]==audit
+    assert bundle.telemetry()["context_trace_sha256"]==hashlib.sha256(bundle.context_trace).hexdigest()
+
+@pytest.mark.parametrize("fault",["capability","grant"])
+def test_non_text_output_denies_structured_native_and_fallback_before_sources(tmp_path,fault):
+    from dataclasses import fields
+    from herdr.capability import CapabilityScope
+    runtime,plan,context,grant,binding=setup(tmp_path)
+    node=context.context
+    if fault=="capability":
+        node=replace(node,registry=replace(node.registry,
+            capabilities=tuple(replace(c,output_modalities=("image",)) for c in node.registry.capabilities)))
+    else:
+        node=replace(node,**{f.name:replace(getattr(node,f.name),output_modalities=("image",))
+            for f in fields(node) if isinstance(getattr(node,f.name),CapabilityScope)})
+        grant=replace(grant,scope=node.scope)
+    payload=json.loads(context.payload);payload["binding"]=node.binding()
+    payload["skill_trace"]["binding"]={**node.binding(),"executor_id":binding.executor_id}
+    context=replace(context,context=node,payload=canonical(payload))
+    plan=replace(plan,grant_sha256=grant.hash,context_plan_sha256=context.hash,
+                 context_authority_sha256=context_authority_hash(context))
+    for native in (False,True):
+        with pytest.raises(PromptBlocked,match="text_output_required"):
+            compile((runtime,plan,context,grant,replace(binding,native_structured_output=native)),
+                    lambda _:pytest.fail("unsupported output read context"))
