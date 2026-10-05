@@ -1060,6 +1060,8 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
         register_delegation_tool(installation, registry, _AUTHORIZED_CALL, _call_digest)
         from herdr.result_submission import register_result_tool
         register_result_tool(installation, registry, _AUTHORIZED_CALL, _call_digest)
+        from herdr.work_tool import register_work_tool
+        register_work_tool(installation, registry, _AUTHORIZED_CALL, _call_digest)
     except BaseException:
         installation.uninstall()
         raise

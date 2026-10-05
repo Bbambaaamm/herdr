@@ -24,7 +24,7 @@ def require(ok, reason):
 
 def validate_contracts(value):
     require(isinstance(value, dict) and set(value) == {"version", "base_sha", "children"}
-        and type(value["version"]) is int and value["version"] == 1
+        and type(value["version"]) is int and value["version"] in {1, 2}
         and isinstance(value["base_sha"], str) and GIT_SHA.fullmatch(value["base_sha"]),
         "closed preapproved child contracts required")
     children = value["children"]
@@ -36,7 +36,10 @@ def validate_contracts(value):
             and entry["kind"] in {"coding", "research", "review"},
             "child contract specification or kind invalid")
         kind = entry["kind"]
-        require(set(entry) == {"kind", "criteria"},
+        fields = {"kind", "criteria"} | ({"work_contract_version"} if value["version"] == 2 and kind == "coding" else set())
+        require(set(entry) == fields
+            and ("work_contract_version" not in fields or type(entry["work_contract_version"]) is int
+                 and entry["work_contract_version"] == 1),
             "child contract has unknown fields")
         if kind != "coding":
             validate_criteria(kind, entry["criteria"])
@@ -124,7 +127,9 @@ def build_authority(store, policy, *, collector):
                             if row.get("name") in plan["required_checks"]]
         validate_plan(plan)
         return plan
-    return ChildCompletionAuthority(store=store, approve=approve, collector=collector)
+    authority = ChildCompletionAuthority(store=store, approve=approve, collector=collector)
+    authority.work_contracts = copy.deepcopy(policy["contracts"])
+    return authority
 
 def authority_for_parent(store, task, *, parent_spec_hash, collector, parent_identity=None):
     policy = store.read("plan", policy_key(task["repo"], task["id"], task["run_token"]))

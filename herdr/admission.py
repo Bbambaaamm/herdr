@@ -51,6 +51,7 @@ def _writer_tools() -> frozenset[str]:
             "delete_file",
             "git_add",
             "git_commit",
+            "herdr_verify_work",
         }
     )
 

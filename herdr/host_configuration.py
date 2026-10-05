@@ -56,8 +56,9 @@ def _tree(raw):
 def build_host_policy_factory(*,parent_grant=None,configuration_path=HOST_POLICY_CONFIG):
     """Only executable host entrypoints select this configuration path."""
     raw=_read_configuration(configuration_path)
-    require(set(raw)=={"schema_version","host_uid","code","runtime","storage","templates",
-                      "grant_ttl_seconds","task_store_root"} and type(raw["schema_version"]) is int and raw["schema_version"]==1,
+    required={"schema_version","host_uid","code","runtime","storage","templates",
+              "grant_ttl_seconds","task_store_root"}
+    require(set(raw) in (required,required|{"work_contracts"}) and type(raw["schema_version"]) is int and raw["schema_version"]==1,
             "closed host composition schema required")
     require(type(raw["host_uid"]) is int and raw["host_uid"]==os.geteuid(),"host configuration UID mismatch")
     require(type(raw["grant_ttl_seconds"]) is int and 1<=raw["grant_ttl_seconds"]<=3600,

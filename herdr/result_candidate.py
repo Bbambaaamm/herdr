@@ -46,13 +46,16 @@ def completion_candidate(payload, *, workspace=None):
         raise EvidenceError("ambiguous completion candidate")
     key, data = tagged[0]
     row = next(row for row in evidence if isinstance(row, dict) and key in row)
-    if set(row) != {key} or not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] != 1:
+    if set(row) != {key} or not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] not in ({1, 2} if key == "herdr_completion" else {1}):
         raise EvidenceError("invalid tagged completion candidate")
     allowed = ({"version", "artifact", "pr_number", "artifact_workspace", "scope_self_check"}
                if key == "herdr_completion" else {"version", "next_action"})
     required = {"version", "artifact", "pr_number"} if key == "herdr_completion" else allowed
     if not required <= set(data) <= allowed:
         raise EvidenceError("unsupported completion candidate fields")
+    if key == "herdr_completion" and data["version"] == 2:
+        if data["pr_number"] is not None and (type(data["pr_number"]) is not int or data["pr_number"] <= 0):
+            raise EvidenceError("invalid local handoff PR reference")
     result = {**payload, **{k: v for k, v in data.items() if k != "version"}}
     if workspace is not None and key == "herdr_completion":
         if "artifact_workspace" in data and data["artifact_workspace"] != str(workspace):

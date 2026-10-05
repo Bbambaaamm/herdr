@@ -107,6 +107,8 @@ class HostBootstrap:
         self._shell_pid = self._shell_ticks = None
         self._attestation = None
         self._guard = threading.Lock()
+        self.work_authority = None
+        self.work_verify = None
 
     @classmethod
     def create(cls, launch, *, storage, writable_roots):
@@ -262,7 +264,9 @@ class HostBootstrap:
                 continue
             except OSError:
                 break
-            self.authority.dispatch_connection(connection)
+            from .work_authority import dispatch_work_connection
+            if not dispatch_work_connection(self, connection):
+                self.authority.dispatch_connection(connection)
 
     def confirm(self, *, timeout_seconds=10):
         receipt = self.launch._published_bootstrap_receipt or self.authority.wait_for_continuation(

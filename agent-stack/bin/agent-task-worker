@@ -76,6 +76,8 @@ def persist_execution_session(task: dict, *, startup=True) -> None:
         if startup and canonical.parent in (DONE, BLOCKED, FAILED):
             raise RuntimeError("task_session_canonical_already_terminal")
     current["execution_session"] = dict(task["execution_session"])
+    if task.get("work_contract") is not None:
+        current["work_contract"] = dict(task["work_contract"])
     current["task_file"] = str(sidecar)
     write_json(canonical, current)
     if sidecar != canonical:
@@ -426,6 +428,73 @@ def _cleanup_setup_pane(pane_id: str, coordinator_pane: str, marker: str,
 # Host embedding supplies the accepted factory; queue/model fields never select it.
 HOST_POLICY_LAUNCH_FACTORY = None
 HOST_POLICY_LAUNCHES = {}
+HOST_WORK_CONTRACT_FACTORY = None
+HOST_WORK_CYCLES = {}
+HOST_WORK_FACTORIES = {}
+
+def modern_work_contract(task):
+    value=task.get("work_contract_version")
+    if value is None:
+        return False
+    if type(value) is not int or value!=1:
+        raise EvidenceError("task_work_contract_version_unsupported")
+    return True
+
+def _root_work_factory(task, *, recovery=False):
+    from herdr.work_contract_host import HostWorkContractFactory
+    from herdr.evidence import binding, digest
+    cache_key = digest(binding(task))
+    factory = HOST_WORK_CONTRACT_FACTORY or HOST_WORK_FACTORIES.get(cache_key)
+    if factory is None:
+        from herdr.work_configuration import build_root_work_factory
+        try:
+            factory = build_root_work_factory(ROOT, task, recovery=recovery)
+        except (OSError, ValueError, KeyError, TypeError, EvidenceError) as exc:
+            raise EvidenceError("task_work_contract_authority_missing") from exc
+    if not isinstance(factory, HostWorkContractFactory):
+        raise EvidenceError("task_work_contract_authority_missing")
+    HOST_WORK_FACTORIES[cache_key] = factory
+    return factory
+
+
+
+def _recover_root_work_cycle(task):
+    from herdr.security import InvocationIdentity
+    from herdr.evidence import digest
+    from agent_completion_evidence import spec_digest
+    factory = _root_work_factory(task, recovery=True)
+    reference = task.get("work_contract") or {}
+    identity = InvocationIdentity.from_dict(reference.get("identity"))
+    cycle = HOST_WORK_CYCLES.get((task["id"],task["run_token"]))
+    if cycle is None or digest(identity.to_json()) not in factory.cycles:
+        cycle = factory.recover(identity=identity,workspace=Path(task["workspace"]),
+            spec_sha256=spec_digest(task),
+            grant_sha256=(task["execution_session"].get("invocation_policy") or {}).get("grant_sha256"),
+            plan_sha256=reference.get("plan_sha256"))
+        HOST_WORK_CYCLES[(task["id"],task["run_token"])] = cycle
+    return factory, cycle
+
+
+
+def _recover_root_local_result(task):
+    from herdr.work_cycle import WorkPhase
+    from herdr.work_configuration import recover_host_handoff
+    from agent_completion_evidence import store_for
+    from herdr.evidence import binding, digest
+    factory, cycle = _recover_root_work_cycle(task)
+    if cycle.phase not in {WorkPhase.HYGIENE, WorkPhase.HANDOFF}:
+        return False
+    plan = store_for(ROOT, task).read("plan", digest(binding(task)))
+    port = recover_host_handoff(factory, task, cycle, plan)
+    if Path(port.slot.path) != result_path(str(task["id"])):
+        raise EvidenceError("original root result slot path changed")
+    requests = [key for key,value in cycle.verification_requests.items() if value is not None
+                and value["status"] == "pass" and value.get("tree_sha256") == cycle.verified_tree]
+    if not requests:
+        raise EvidenceError("original passed handoff request is missing")
+    port.deliver(cycle, requests[-1])
+    return True
+
 
 def _root_policy_factory():
     global HOST_POLICY_LAUNCH_FACTORY
@@ -524,6 +593,8 @@ def _cleanup_prepared_root_launch(task):
 
 def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
     """Create one fresh Hermes pane/session for exactly one durable attempt."""
+    if modern_work_contract(task):
+        work_factory = _root_work_factory(task)
     routing = task.get("routing") if isinstance(task.get("routing"), dict) else {}
     coordinator = str(
         routing.get("selected_agent") or task.get("agent") or "quantlab-hermes"
@@ -666,6 +737,27 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
             permissions=tuple(task.get("parent_permissions") or ()))
         session["sandbox_verified"] = True
         persist_execution_session(task)
+        if modern_work_contract(task):
+            from herdr.work_contract_host import HostWorkContractFactory
+            from agent_completion_evidence import spec_digest
+            require_factory = work_factory
+            if not isinstance(require_factory, HostWorkContractFactory):
+                raise EvidenceError("task_work_contract_authority_missing")
+            from herdr.work_configuration import preflight_handoff
+            from agent_completion_evidence import store_for
+            from herdr.evidence import binding, digest
+            preflight_handoff(work_factory, launch, store_for(ROOT,task).read("plan",digest(binding(task))))
+            cycle = work_factory.prepare(identity=identity, workspace=Path(workspace),
+                                         grant=launch.grant, spec_sha256=spec_digest(task))
+            task["work_contract"] = {"version":1,"plan_sha256":cycle.plan.hash,
+                                     "identity":identity.to_json(),"phase":cycle.phase.value,
+                                     "environment_sha256":cycle.plan.environment_sha256}
+            HOST_WORK_CYCLES[(task["id"],task["run_token"])] = cycle
+            from herdr.work_configuration import bind_root_handoff
+            bind_root_handoff(work_factory, task, launch, cycle)
+            launch.mount.bootstrap.work_authority = work_factory.authorize_invocation
+            launch.mount.bootstrap.work_verify = work_factory.verify_request
+            persist_execution_session(task)
         def publish_continuation(evidence):
             session["invocation_policy"]=evidence
             persist_execution_session(task)
@@ -964,6 +1056,12 @@ TASK COMPLETION CONTRACT:
                  "key, role, objective, prompt, tool and permission arguments. Reuse the same key "
                  "for reconciliation. For write-capable children set cwd to the exact existing issue Git "
                  "worktree. Returned evidence still requires shared acceptance.\n")
+    if modern_work_contract(task):
+        from herdr.work_configuration import prompt_contract
+        cycle = HOST_WORK_CYCLES.get((task["id"],task["run_token"]))
+        if cycle is None:
+            raise RuntimeError("task_work_contract_unavailable")
+        contract += prompt_contract(cycle.plan)
     return base + contract + completion_instructions(task)
 
 
@@ -976,6 +1074,13 @@ def run_prompt(task: dict) -> tuple[int, str]:
     session = task.get("execution_session")
     if not isinstance(session, dict) or not session.get("agent_name"):
         raise RuntimeError("task_session_isolation_missing")
+    if modern_work_contract(task):
+        from herdr.work_cycle import WorkCycle
+        cycle = HOST_WORK_CYCLES.get((task["id"],task["run_token"]))
+        if not isinstance(cycle,WorkCycle) or not cycle.implementation_allowed():
+            raise RuntimeError("task_work_contract_forbids_implementation")
+        if cycle.plan.hash != (task.get("work_contract") or {}).get("plan_sha256"):
+            raise RuntimeError("task_work_contract_changed")
     agent = str(session["agent_name"])
     timeout_seconds = int(task.get("timeout_seconds") or 1800)
     prompt = prompt_text(task)
@@ -1281,6 +1386,13 @@ def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool)
             )
             return
         result_payload_present = info.st_size > 0
+    if not result_payload_present and modern_work_contract(task) and task.get("work_contract"):
+        try:
+            result_payload_present = _recover_root_local_result(task)
+        except EvidenceError as exc:
+            _defer_delivery_reconciliation_locked(
+                task_path, task, f"original local handoff requires reconciliation: {exc.code}", all_terminal)
+            return
     if not result_payload_present:
         if reconcile_completion_evidence(task):
             rp = result_path(task_id)
@@ -1292,8 +1404,18 @@ def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool)
     try:
         result = json.loads(rp.read_text(encoding="utf-8"))
     except Exception as exc:
-        _defer_delivery_reconciliation_locked(task_path, task, f"invalid result JSON: {exc}", all_terminal)
-        return
+        if modern_work_contract(task) and task.get("work_contract"):
+            try:
+                if not _recover_root_local_result(task):
+                    raise EvidenceError("no proven committed local handoff")
+                result = json.loads(rp.read_text(encoding="utf-8"))
+            except (EvidenceError, OSError, ValueError) as recovery_error:
+                _defer_delivery_reconciliation_locked(task_path, task,
+                    f"original partial handoff requires reconciliation: {recovery_error}", all_terminal)
+                return
+        else:
+            _defer_delivery_reconciliation_locked(task_path, task, f"invalid result JSON: {exc}", all_terminal)
+            return
 
     if str(result.get("task_id") or "") != task_id:
         _defer_delivery_reconciliation_locked(
@@ -1324,8 +1446,26 @@ def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool)
     blocker = str(result.get("blocker") or "").strip()
     if str(result.get("status") or "") == "completed" and (not blocker or blocker.lower() in {"none", "null"}):
         try:
-            accepted = (verify_completion(ROOT, task, result) if verification_applies(task)
+            cycle=None
+            if modern_work_contract(task):
+                factory, cycle = _recover_root_work_cycle(task)
+                identity = cycle.plan.identity
+                cycle=factory.before_completion(identity,result)
+            invocation_verifier = None
+            if cycle is not None:
+                from agent_completion_evidence import store_for
+                from herdr.evidence import binding, digest
+                plan = store_for(ROOT, task).read("plan", digest(binding(task)))
+                invocation_verifier = factory.result_authority.verifier(
+                    task, result, plan, work_plan_sha256=cycle.plan.hash)
+            accepted = ((verify_completion(ROOT, task, result, invocation_verifier=invocation_verifier)
+                         if invocation_verifier is not None else verify_completion(ROOT, task, result)) if verification_applies(task)
                         else {"level": "legacy_unverified_result"})
+            if cycle is not None:
+                if accepted["level"]!="verified_worker_result":
+                    raise EvidenceError("modern coding contract needs verified worker artifact")
+                cycle.handed_off(accepted["bundle_hash"])
+                task["work_contract"]["phase"]=cycle.phase.value
         except EvidenceError as exc:
             waiting = record_verification_failure(task, exc)
             if waiting:
@@ -1525,7 +1665,13 @@ def _main_with_epoch(task_path: Path) -> int:
                         f"Task pane ownership/cleanup could not be proven safe: {detail}",
                     )
                     return 1
-                if detail.startswith(("task_invocation_policy_", "host grant")):
+                from herdr.work_cycle import WorkContractError
+                if isinstance(exc, WorkContractError):
+                    task["verification_status"] = exc.code
+                    task["verification_next_action"] = ("resolve_material_intent" if exc.code == "info_required" else "host_work_replan_required")
+                    block_task(task_path, task, exc.code, detail[:1024])
+                    return 1
+                if detail.startswith(("task_invocation_policy_", "task_work_contract_", "host grant")):
                     block_task(task_path, task, "task_invocation_policy_unavailable",
                                "Host invocation policy must be supplied before execution.")
                     return 1

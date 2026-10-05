@@ -74,6 +74,22 @@ def arguments(raw):
         raise ValueError("result exceeds bound")
     return value
 
+def payload_for_slot(identity, slot, raw):
+    from .security import InvocationIdentity, PolicyDenied
+    value = arguments(raw)
+    if (not isinstance(identity, InvocationIdentity) or not isinstance(slot, ResultSlot)
+            or slot.identity_sha256 != hashlib.sha256(_canonical(identity.to_json())).hexdigest()):
+        raise PolicyDenied("result_slot_unbound")
+    evidence = value["evidence"]
+    evidence_sha = hashlib.sha256(json.dumps(evidence, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+    payload = dict(task_id=identity.task_id, run_token=identity.run_token,
+        fencing_token=identity.fencing_token, idempotency_key=slot.idempotency_key,
+        status=value["status"], evidence=evidence, artifact_sha256=evidence_sha,
+        summary=value.get("summary", ""))
+    if len(_canonical(payload)) > slot.max_bytes:
+        raise PolicyDenied("result_exceeds_slot")
+    return payload
+
 def submit(guard, raw, *, consume_approval=True):
     from .security import PolicyDenied
     value = arguments(raw)
@@ -83,15 +99,24 @@ def submit(guard, raw, *, consume_approval=True):
     identity = guard.grant.identity
     if slot is None or slot.identity_sha256 != hashlib.sha256(_canonical(identity.to_json())).hexdigest():
         raise PolicyDenied("result_slot_unbound")
-    evidence = checked["evidence"]
-    evidence_sha = hashlib.sha256(json.dumps(evidence, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()).hexdigest()
-    payload = dict(task_id=identity.task_id, run_token=identity.run_token,
-        fencing_token=identity.fencing_token, idempotency_key=slot.idempotency_key,
-        status=checked["status"], evidence=evidence, artifact_sha256=evidence_sha,
-        summary=checked.get("summary",""))
+    payload = payload_for_slot(identity, slot, value)
+    evidence_sha = payload["artifact_sha256"]
     encoded = _canonical(payload)
     if len(encoded) > slot.max_bytes:
         raise PolicyDenied("result_exceeds_slot")
+    return publish_slot_payload(identity, slot, payload)
+
+def publish_slot_payload(identity, slot, payload):
+    """Host reconciliation may publish only the same original pinned candidate."""
+    from .security import PolicyDenied
+    if not isinstance(payload, dict):
+        raise PolicyDenied("result_payload_invalid")
+    raw = {name:payload.get(name) for name in ("status", "evidence", "summary")}
+    expected = payload_for_slot(identity, slot, raw)
+    if _canonical(payload) != _canonical(expected):
+        raise PolicyDenied("result_payload_binding_changed")
+    encoded = _canonical(payload)
+    evidence_sha = payload["artifact_sha256"]
     fd = os.open(slot.path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)

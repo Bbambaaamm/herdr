@@ -194,7 +194,7 @@ def ledger_required(directory: Path) -> bool:
     return os.path.lexists(directory / LEDGER_REQUIRED)
 
 
-def publish_exact_child_result(scheduler: DynamicChildScheduler, rec, result_path: Path) -> str | None:
+def publish_exact_child_result(scheduler: DynamicChildScheduler, rec, result_path: Path, *, _recovered=False) -> str | None:
     """Publish only a result bound to this delegated child's current attempt."""
     try:
         _require_real_directory(result_path.parent)
@@ -216,7 +216,16 @@ def publish_exact_child_result(scheduler: DynamicChildScheduler, rec, result_pat
     finally:
         if fd >= 0:
             os.close(fd)
-    result = json.loads(raw.decode("utf-8", errors="strict"))
+    try:
+        result = json.loads(raw.decode("utf-8", errors="strict"))
+    except (ValueError, UnicodeError):
+        authority = scheduler.completion_authority
+        from herdr.child_evidence import ChildCompletionAuthority
+        if (not _recovered and rec.state is LifecycleState.RUNNING
+                and isinstance(authority, ChildCompletionAuthority)
+                and authority.recover_local_result(rec, result_path)):
+            return publish_exact_child_result(scheduler, rec, result_path, _recovered=True)
+        raise
     if not isinstance(result, dict):
         raise ValueError("child result invalid")
     evidence = result.get("evidence")

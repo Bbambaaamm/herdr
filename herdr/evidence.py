@@ -107,7 +107,7 @@ class EvidenceStore:
                 raise EvidenceError("evidence store overlaps a worker-writable root")
 
     def _path(self, kind: str, key: str) -> Path:
-        if kind not in {"plan", "accepted"} or not _SHA.fullmatch(key):
+        if kind not in {"plan", "accepted", "work-result", "work-handoff-intent"} or not _SHA.fullmatch(key):
             raise EvidenceError("invalid evidence address")
         return self.root / f"{kind}-{key}.json"
 
@@ -212,7 +212,7 @@ class EvidenceStore:
             try:
                 self._exclusive_publish(tmp, path)
             except FileExistsError:
-                if self.read(kind, key) != payload:
+                if canonical(self.read(kind, key)) != canonical(payload):
                     raise EvidenceError("immutable evidence publication conflict")
             self._sync_directory()
         finally:
@@ -223,7 +223,7 @@ class EvidenceStore:
         return content_hash
 
 
-def network_denial_filter():
+def network_denial_filter(*, deny_process_creation=False):
     """Return a host-generated BPF FD; fail closed without libseccomp."""
     import ctypes
     import errno
@@ -245,14 +245,19 @@ def network_denial_filter():
         ctx = lib.seccomp_init(0x7fff0000)  # SCMP_ACT_ALLOW; other ABIs fail closed.
         if not ctx:
             raise EvidenceUnavailable("artifact syscall filter cannot initialize")
-        for name in ("socket", "socketpair", "connect", "accept", "accept4", "bind",
+        names = ("socket", "socketpair", "connect", "accept", "accept4", "bind",
                      "listen", "sendto", "sendmsg", "sendmmsg", "recvfrom", "recvmsg",
                      "recvmmsg", "shutdown", "getsockname", "getpeername",
                      "setsockopt", "getsockopt", "io_uring_setup", "io_uring_enter",
-                     "io_uring_register"):
+                     "io_uring_register")
+        if deny_process_creation:
+            names += ("fork", "vfork", "clone", "clone3", "unshare", "setns", "mount", "umount2",
+                      "move_mount", "open_tree", "mount_setattr", "fsopen", "fsconfig",
+                      "fsmount", "fspick", "pivot_root", "chroot")
+        for name in names:
             number = lib.seccomp_syscall_resolve_name(name.encode("ascii"))
             if number == -1:
-                if name in {"socket", "connect"}:
+                if name in {"socket", "connect", "clone"}:
                     raise EvidenceUnavailable("mandatory artifact syscall cannot resolve")
                 continue
             if lib.seccomp_rule_add(ctx, 0x00050000 | errno.EPERM, number, 0) != 0:
@@ -392,10 +397,13 @@ def validate_criteria(kind: str, criteria: Any) -> None:
     if not isinstance(criteria, dict):
         raise EvidenceError(f"typed {kind} immutable artifact criteria are missing")
     common = {"schema", "report_path"}
-    extra = {"sections"} if kind == "research" else {"target_commit"}
+    contract_review = kind == "review" and criteria.get("schema") == "review-contract-report-v1"
+    extra = ({"sections"} if kind == "research" else
+             {"target_commit", "target_contract", "target_contract_sha256"} if contract_review else {"target_commit"})
+    schema = "review-contract-report-v1" if contract_review else f"{kind}-report-v1"
     path = criteria.get("report_path")
     if (set(criteria) != common | extra
-            or criteria.get("schema") != f"{kind}-report-v1"
+            or criteria.get("schema") != schema
             or not isinstance(path, str) or len(path) > 256
             or not path.startswith(f"reports/{kind}/") or not path.endswith(".json")
             or Path(path).is_absolute() or ":" in path or "\\" in path
@@ -409,6 +417,17 @@ def validate_criteria(kind: str, criteria: Any) -> None:
             raise EvidenceError("research sections are invalid")
     elif not isinstance(criteria["target_commit"], str) or not _GIT_SHA.fullmatch(criteria["target_commit"]):
         raise EvidenceError("review target must be a full commit SHA")
+
+    if contract_review:
+        from .work_planning import bounded
+        target = criteria["target_contract"]
+        bounded(target)
+        if (not isinstance(target, dict) or set(target) != {"spec_sha256", "definition"}
+                or not isinstance(target["spec_sha256"], str) or not _SHA.fullmatch(target["spec_sha256"])
+                or not isinstance(target["definition"], dict)
+                or target["definition"].get("base_sha") != criteria["target_commit"]
+                or digest(target) != criteria["target_contract_sha256"]):
+            raise EvidenceError("prebuild review target contract binding invalid")
 
 
 def validate_plan(plan: dict) -> None:
@@ -484,7 +503,9 @@ def inspect_typed_artifact(plan: dict, artifact: ArtifactRef, workspace: Path) -
         coverage = {"sections": criteria["sections"], "source_reference_count": sum(len(row["sources"]) for row in sections),
                     "limits": "structure and independent artifact review; source truth is not asserted by schema validation"}
     else:
-        if (set(report) != {"version", "kind", "target_commit", "summary", "verdict", "findings"}
+        contract_keys = {"target_contract_sha256"} if criteria["schema"] == "review-contract-report-v1" else set()
+        if (set(report) != {"version", "kind", "target_commit", "summary", "verdict", "findings"} | contract_keys
+                or contract_keys and report.get("target_contract_sha256") != criteria["target_contract_sha256"]
                 or report["target_commit"] != criteria["target_commit"]
                 or report["verdict"] not in {"pass", "block", "needs_replan"}
                 or not isinstance(report["summary"], str) or not report["summary"].strip()
@@ -499,6 +520,8 @@ def inspect_typed_artifact(plan: dict, artifact: ArtifactRef, workspace: Path) -
             raise EvidenceError("review pass contradicts blocking findings")
         coverage = {"target_commit": report["target_commit"], "verdict": report["verdict"],
                     "limits": "review artifact completion does not approve or merge the reviewed implementation"}
+        if contract_keys:
+            coverage["target_contract_sha256"] = criteria["target_contract_sha256"]
     return {"schema": criteria["schema"], "report_path": path, "report_hash": digest(report), "coverage": coverage}
 
 
@@ -570,11 +593,14 @@ def verify_invocation_session(task):
 
 
 def accept_artifact(task: dict, result: dict, plan: dict, store: EvidenceStore,
-                  workspace: Path, collector, *, result_payload_sha256: str | None = None) -> dict:
+                  workspace: Path, collector, *, result_payload_sha256: str | None = None, invocation_verifier=None) -> dict:
     """Reuse WorkspaceManager and ReviewerGate; never consume result.evidence."""
     validate_plan(plan)
     if result_payload_sha256 is not None and (not isinstance(result_payload_sha256,str) or not _SHA.fullmatch(result_payload_sha256)):
         raise EvidenceError("result payload digest invalid")
+    if invocation_verifier is not None and not callable(invocation_verifier):
+        raise EvidenceError("host invocation verifier required")
+    verify_invocation = invocation_verifier or verify_invocation_session
     identity = binding(task)
     if plan["identity"] != identity or plan["repo"] != task.get("repo"):
         raise EvidenceError("plan belongs to another task or attempt")
@@ -623,7 +649,7 @@ def accept_artifact(task: dict, result: dict, plan: dict, store: EvidenceStore,
             store.publish("accepted", key, accepted)
         return {**accepted, "bundle_hash": digest(accepted)}
 
-    launch_policy = verify_invocation_session(task)
+    launch_policy = verify_invocation(task)
     try:
         manager = WorkspaceManager(workspace, git=read_only_git(workspace), worktrees_dir=root)
     except (OSError, WorkspaceError) as exc:
@@ -679,7 +705,7 @@ def accept_artifact(task: dict, result: dict, plan: dict, store: EvidenceStore,
         verify_committed_bytes(artifact, workspace, manager.git)
     except WorkspaceError as exc:
         raise EvidenceError("artifact changed during collection") from exc
-    if verify_invocation_session(task) != launch_policy:
+    if verify_invocation(task) != launch_policy:
         raise EvidenceError("invocation policy changed during collection")
     if scope_proof is not None:
         validate_plan(plan)
