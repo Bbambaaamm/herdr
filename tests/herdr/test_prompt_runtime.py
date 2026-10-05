@@ -284,3 +284,51 @@ def test_renderer_switch_and_immediate_task_do_not_change_static_prefix(tmp_path
     assert first.stable_prefix == second.stable_prefix
     assert first.plan_sha256 != second.plan_sha256
     assert first.telemetry()["provider_usage"] == second.telemetry()["provider_usage"] == "UNKNOWN"
+
+
+def test_rejected_secret_reference_id_is_hashed_in_trace_without_loading(tmp_path):
+    from herdr.context import SecretRedactor
+    secret="private-token-reference"
+    raw=b"optional instructions"
+    ref=InstructionRef(secret,"repo_instructions",source(raw),len(raw),mandatory=False)
+    data=setup(tmp_path,instructions=(ref,),redactor=SecretRedactor((secret,)))
+    bundle=compile(data,lambda ref:pytest.fail("rejected secret reference loaded"))
+    assert secret.encode() not in bundle.trace
+    assert bundle.telemetry()["rejected"][0]["reference_sha256"]==hashlib.sha256(secret.encode()).hexdigest()
+
+def test_optional_context_accounts_for_complete_prompt_envelope(tmp_path):
+    from tests.herdr.test_context import item
+    raw=b"x"*10000
+    initial=setup(tmp_path,items=(item(raw,id="optional-large"),),token_budget=4096)
+    standalone=initial[0].context_compiler.compile(initial[2],executor_id="a-runtime",
+        counter=counter(),loader=lambda _:raw)
+    budget=len(standalone.payload)+100
+    data=setup(tmp_path,items=(item(raw,id="optional-large"),),token_budget=4096,byte_budget=budget)
+    loaded=[]
+    bundle=compile(data,lambda ref:loaded.append(ref.id) or raw)
+    assert len(loaded)<=1
+    assert json.loads(bundle.dynamic_payload)["context"]["context_data"]==[]
+    assert bundle.telemetry()["tokenizer_input_tokens"]<=4096
+
+@pytest.mark.parametrize("optional_first",[True,False])
+def test_mandatory_project_instruction_precedes_optional_selection(tmp_path,optional_first):
+    mandatory=b"Required review check."
+    optional=b"x"*10000
+    required=InstructionRef("required","repo_instructions",source(mandatory),len(mandatory),mandatory=True)
+    extra=InstructionRef("optional","repo_instructions",source(optional),len(optional),mandatory=False)
+    refs=(extra,required) if optional_first else (required,extra)
+    data=setup(tmp_path,instructions=refs,token_budget=4096)
+    bundle=compile(data,lambda ref:mandatory if ref.id=="required" else optional)
+    entries=json.loads(bundle.dynamic_payload)["project_instructions"]
+    assert [entry["id"] for entry in entries]==["required"]
+    assert bundle.telemetry()["rejected"][0]["reason_code"]=="prompt_budget"
+
+def test_mandatory_instruction_reserves_space_before_optional_context(tmp_path):
+    from tests.herdr.test_context import item
+    mandatory=b"Required check."*70
+    raw=b"x"*8500
+    ref=InstructionRef("required","repo_instructions",source(mandatory),len(mandatory),mandatory=True)
+    data=setup(tmp_path,instructions=(ref,),items=(item(raw,id="optional-context"),),token_budget=4096)
+    bundle=compile(data,lambda ref:mandatory if ref.id=="required" else raw)
+    assert [entry["id"] for entry in json.loads(bundle.dynamic_payload)["project_instructions"]]==["required"]
+    assert bundle.telemetry()["tokenizer_input_tokens"]<=4096

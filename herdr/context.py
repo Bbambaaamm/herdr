@@ -477,13 +477,14 @@ class ContextCompiler:
         return executor, cap, provider
 
     def compile(self, plan: ContextPlan, *, executor_id, counter: TokenCounter, loader: Callable,
-                renderer="messages"):
+                renderer="messages", envelope=None):
         require(isinstance(plan, ContextPlan) and plan.redaction_hash == self.redactor.policy_hash,
                 "plan_redaction_policy")
         require(isinstance(counter, TokenCounter) and callable(counter.count), "host_tokenizer_required")
         executor, cap, provider = self._executor(plan, executor_id)
         require(counter.provider_id == executor.provider_id and counter.executor_version == executor.version,
                 "tokenizer_executor_binding")
+        require(envelope is None or callable(envelope), "host_context_envelope")
         token(counter.tokenizer_version)
         limits = [x for x in (plan.token_budget, plan.context.scope.max_context_tokens,
                                cap.context_tokens, cap.max_input_tokens) if x is not None]
@@ -514,8 +515,15 @@ class ContextCompiler:
                 value = {"system": canonical(raw["stable_prefix"]).decode(),
                          "contents": [{"role": "user", "parts": [{"text": canonical(data).decode()}]}]}
             return canonical(value)
+        def measured(wire):
+            transport = envelope(wire) if envelope is not None else wire
+            require(isinstance(transport,bytes),"host_context_envelope_bytes")
+            return transport
+        def fits(wire):
+            transport = measured(wire)
+            return len(transport) <= plan.byte_budget and counter.measure(transport) <= budget
         wire = render()
-        if len(wire) > plan.byte_budget or counter.measure(wire) > budget:
+        if not fits(wire):
             raise ContextBlocked("mandatory_context_exceeds_budget")
         for item in plan.items:
             reason = "provider_cache_not_authority" if item.memory_class == MemoryClass.PROVIDER_CACHE else None
@@ -535,7 +543,7 @@ class ContextCompiler:
                     raise ContextBlocked("required_source_" + reason)
                 rejected.append({"id": item.id, "code": reason})
                 continue
-            if item.size > plan.byte_budget - len(wire):
+            if item.size > plan.byte_budget - len(measured(wire)):
                 if item.mandatory:
                     raise ContextBlocked("mandatory_context_exceeds_budget")
                 rejected.append({"id": item.id, "code": "byte_budget"})
@@ -563,7 +571,7 @@ class ContextCompiler:
             content.append({"id": item.id, "authority": "context_data", "text": text,
                             "memory_class": item.memory_class, "derived_summary": item.derived_summary, "sources": [asdict(x) for x in item.sources]})
             candidate = render()
-            if len(candidate) > plan.byte_budget or counter.measure(candidate) > budget:
+            if not fits(candidate):
                 content.pop()
                 if item.mandatory:
                     raise ContextBlocked("mandatory_context_exceeds_budget")
@@ -575,7 +583,8 @@ class ContextCompiler:
                              "authority": "context_data"})
         trace = canonical({"plan_hash": plan.hash, "binding": raw["binding"], "executor_id": executor.id,
                            "provider_id": provider.id, "tokenizer_version": counter.tokenizer_version,
-                           "tokenizer_input_tokens": counter.measure(wire), "provider_usage": "unmeasured", "input_bytes": len(wire),
+                           "tokenizer_input_tokens": counter.measure(measured(wire)),
+                            **({"measurement":"host_envelope","measurement_bytes":len(measured(wire))} if envelope is not None else {}), "provider_usage": "unmeasured", "input_bytes": len(wire),
                            "stable_prefix_hash": digest(raw["stable_prefix"]),
                            "cache_evidence": "unmeasured", "selection_hash": raw["selection_hash"],
                            "selection_reason": raw["selection_reason"], "previous_selection_hash": raw["previous_selection_hash"],

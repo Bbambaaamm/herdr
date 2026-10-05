@@ -423,16 +423,12 @@ class PromptRuntime:
                 and binding.executor_version == counter.executor_version, "prompt_executor_binding")
         require(self.redactor.tree(plan.output_contract.schema()) == plan.output_contract.schema(),
                 "output_schema_secret")
-        compiled = self.context_compiler.compile(context, executor_id=binding.executor_id,
-            counter=counter, loader=loader, renderer="messages")
-        require(isinstance(compiled, ContextBundle), "compiled_context_required")
         executor, cap, provider = self.context_compiler._executor(context, binding.executor_id)
         require(executor.version == binding.executor_version and executor.provider_id == binding.provider_id,
                 "prompt_executor_version")
         native = binding.native_structured_output and Feature.STRUCTURED_OUTPUT in cap.features
         require(native or binding.allow_validated_fallback, "structured_output_unsupported")
         provider_classes = set(cap.data_policy.data_classes) & set(provider.data_policy.data_classes)
-        raw_context = compiled.render()
         selected_resources = {resource["sha256"] for item in context.stable_prefix["selection"]["skills"]
                               for resource in item.get("resources", [])}
         stable = {"version": VERSION, "precedence": ["host", "consumer", "task", "context"],
@@ -451,7 +447,7 @@ class PromptRuntime:
                    "instructions": plan.immediate_instruction, "reminders": list(plan.reminders),
                    "compute_policy_sha256": plan.compute_policy_sha256,
                    "evidence_requirement_sha256": plan.evidence_requirement_sha256,
-                   "context": json.loads(raw_context["messages"][1]["content"]),
+                   "context": None,
                    "project_instructions": [], "demonstrations": []}
         stable = self.redactor.tree(stable); dynamic = self.redactor.tree(dynamic)
         rejected, selected = [], []
@@ -468,44 +464,64 @@ class PromptRuntime:
                 "schema": plan.output_contract.schema(), "schema_sha256": plan.output_contract.hash}
             return canonical(body)
         def fits(wire): return len(wire) <= byte_limit and counter.measure(wire) <= token_limit
-        wire = render()
+        def load_reference(kind, ref):
+            reason = source_reason(ref.source, context)
+            if ref.source.data_class not in provider_classes: reason = reason or "provider_data_class"
+            if kind == "instruction" and ref.kind == "skill_resource" and ref.source.sha256 not in selected_resources:
+                reason = reason or "skill_resource_not_selected"
+            if kind == "demonstration":
+                if ref.task_class != plan.task_class: reason = reason or "task_class"
+                if ref.conditions_sha256 != plan.conditions_sha256: reason = reason or "conditions_changed"
+                if reason is None:
+                    try: verified = self.demonstration_selector.verify(ref)
+                    except Exception: verified = None
+                    if verified is not True: reason = "evidence_unverified"
+            if self.redactor.tree(asdict(ref)) != asdict(ref): reason = reason or "secret_source_reference"
+            if reason is not None: return None, reason
+            try:
+                data = loader(ref)
+                require(isinstance(data, bytes) and len(data) == ref.size
+                        and hashlib.sha256(data).hexdigest() == ref.source.sha256, "source_digest_mismatch")
+                text = self.redactor.redact(data.decode())
+            except Exception:
+                return None, "source_unavailable_or_changed"
+            return {"id": ref.id, "authority": "context_data", "text": text,
+                    "source": asdict(ref.source), "source_sha256": ref.source.sha256}, None
+
+        # Required project instructions reserve their space before any optional
+        # context. Selection order in the persisted plan cannot deprive them.
+        for ref in plan.instruction_refs:
+            if not ref.mandatory: continue
+            entry, reason = load_reference("instruction", ref)
+            require(reason is None, "required_instruction_" + str(reason))
+            dynamic["project_instructions"].append(entry)
+            selected.append({"id":ref.id,"kind":"instruction","source_sha256":ref.source.sha256,
+                             "reason_code":"verified_relevant_scoped_source"})
+
+        def envelope(context_wire):
+            dynamic["context"] = json.loads(json.loads(context_wire)["messages"][1]["content"])
+            return render()
+        compiled = self.context_compiler.compile(context, executor_id=binding.executor_id,
+            counter=counter, loader=loader, renderer="messages", envelope=envelope)
+        require(isinstance(compiled, ContextBundle), "compiled_context_required")
+        wire = envelope(compiled.payload)
         require(fits(wire), "mandatory_prompt_exceeds_budget")
-        for kind, refs, target in (("instruction", plan.instruction_refs, dynamic["project_instructions"]),
+        optional_instructions = tuple(ref for ref in plan.instruction_refs if not ref.mandatory)
+        for kind, refs, target in (("instruction", optional_instructions, dynamic["project_instructions"]),
                                    ("demonstration", plan.demonstrations, dynamic["demonstrations"])):
             for ref in refs:
-                reason = source_reason(ref.source, context)
-                if ref.source.data_class not in provider_classes: reason = reason or "provider_data_class"
-                if kind == "instruction" and ref.kind == "skill_resource" and ref.source.sha256 not in selected_resources:
-                    reason = reason or "skill_resource_not_selected"
-                if kind == "demonstration":
-                    if ref.task_class != plan.task_class: reason = reason or "task_class"
-                    if ref.conditions_sha256 != plan.conditions_sha256: reason = reason or "conditions_changed"
-                    if reason is None:
-                        try: verified = self.demonstration_selector.verify(ref)
-                        except Exception: verified = None
-                        if verified is not True: reason = "evidence_unverified"
-                if self.redactor.tree(asdict(ref)) != asdict(ref): reason = reason or "secret_source_reference"
-                mandatory = kind == "instruction" and ref.mandatory
+                entry, reason = load_reference(kind, ref)
                 if reason is None:
-                    try:
-                        data = loader(ref)
-                        require(isinstance(data, bytes) and len(data) == ref.size
-                                and hashlib.sha256(data).hexdigest() == ref.source.sha256, "source_digest_mismatch")
-                        text = self.redactor.redact(data.decode())
-                    except Exception:
-                        reason = "source_unavailable_or_changed"
-                if reason is None:
-                    entry = {"id": ref.id, "authority": "context_data", "text": text,
-                             "source": asdict(ref.source), "source_sha256": ref.source.sha256}
                     target.append(entry); candidate = render()
                     if not fits(candidate): target.pop(); reason = "prompt_budget"
                     else: wire = candidate
                 if reason:
-                    require(not mandatory, "required_instruction_" + reason)
-                    rejected.append({"id": ref.id, "kind": kind, "reason_code": reason})
+                    # Rejection must never echo a secret-bearing reference ID.
+                    rejected.append({"reference_sha256":hashlib.sha256(ref.id.encode()).hexdigest(),
+                                     "kind":kind,"reason_code":reason})
                 else:
-                    selected.append({"id": ref.id, "kind": kind, "source_sha256": ref.source.sha256,
-                                     "reason_code": "verified_relevant_scoped_source"})
+                    selected.append({"id":ref.id,"kind":kind,"source_sha256":ref.source.sha256,
+                                     "reason_code":"verified_relevant_scoped_source"})
         trace = canonical({"version": VERSION, "plan_sha256": plan.hash, "binding_sha256": binding.hash,
                            "context_plan_sha256": context.hash, "context_bundle_sha256": compiled.hash,
                            "input_bytes": len(wire), "tokenizer_input_tokens": counter.measure(wire),
