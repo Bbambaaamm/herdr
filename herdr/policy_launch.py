@@ -626,18 +626,36 @@ class HostPolicyLaunchFactory:
         self.code, self.runtime, self.storage = code, tuple(runtime), Path(storage)
         self.authorize, self.writable_roots, self.parent_grant = authorize, tuple(writable_roots), parent_grant
 
-    def prepare_child(self, *, identity: InvocationIdentity, workspace: Path, tools, permissions):
+    def prepare_child(self, *, identity: InvocationIdentity, workspace: Path, tools, permissions,
+                      owned_write_roots=None):
         tools = tuple(tools)
         _require("herdr_delegate_child" not in tools, "child-bound delegation transport unavailable")
         _require(isinstance(self.parent_grant, SecurityGrant), "accepted host parent grant required")
-        return self.prepare(identity=identity, workspace=workspace, tools=tools, permissions=permissions)
+        return self.prepare(identity=identity,workspace=workspace,tools=tools,permissions=permissions,
+                            owned_write_roots=owned_write_roots)
 
-    def prepare(self, *, identity: InvocationIdentity, workspace: Path, tools, permissions):
+    def prepare(self, *, identity: InvocationIdentity, workspace: Path, tools, permissions,
+                owned_write_roots=None):
         _require(isinstance(identity, InvocationIdentity), "typed invocation identity required")
         tools, permissions = tuple(tools), tuple(permissions)
         grant = self.authorize(identity=identity, workspace=Path(workspace), tools=tools, permissions=permissions)
         _require(isinstance(grant, SecurityGrant) and grant.identity == identity,
                  "host grant unavailable or mismatched")
+        if owned_write_roots is not None:
+            from dataclasses import replace
+            _require(isinstance(owned_write_roots,tuple) and len(owned_write_roots)<=64
+                     and len(set(owned_write_roots))==len(owned_write_roots),"finite owned write roots required")
+            roots=tuple(Path(item).absolute() for item in owned_write_roots)
+            workspace_root=Path(grant.workspace_root).absolute()
+            _require(all(root!=workspace_root and workspace_root in root.parents
+                         and root.resolve(strict=True)==root for root in roots),"owned write root outside workspace")
+            write_rules=tuple(rule for rule in grant.tool_rules if rule.tool in {"write_file","patch"})
+            _require(not write_rules or bool(roots),"file writer has no owned write mount")
+            _require(all(any(root==Path(limit) or Path(limit) in root.parents for limit in rule.allowed_roots)
+                         for rule in write_rules for root in roots),"owned write root exceeds host rule")
+            grant=replace(grant,tool_rules=tuple(
+                replace(rule,allowed_roots=tuple(str(root) for root in roots))
+                if rule.tool in {"write_file","patch"} else rule for rule in grant.tool_rules))
         _require(set(grant.scope.tools) == set(tools) and set(grant.scope.permissions) <= set(permissions),
                  "host grant exceeds admitted scope")
         path = Path(workspace).absolute()

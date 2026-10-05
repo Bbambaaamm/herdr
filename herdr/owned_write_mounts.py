@@ -110,8 +110,14 @@ class OwnedWritePins:
                  "device":item.device,"inode":item.inode,"kind":item.kind,"target":item.target}
                 for item in self.mounts]
 
+    def evidence(self):
+        self.verify()
+        return [{"key":item.key,"kind":item.kind,"device":item.device,"inode":item.inode}
+                for item in self.mounts]
+
     def verify_mounted(self,pid,modes):
         self.verify()
+        verify_owned_mount_evidence(self.worktree.logical,self.evidence(),pid,modes)
         root=Path(f"/proc/{pid}/root")
         for item in self.mounts:
             mounted=(root/item.target.lstrip("/")).stat()
@@ -126,3 +132,46 @@ class OwnedWritePins:
 
     def __enter__(self):return self
     def __exit__(self,*_):self.close()
+
+
+def validate_owned_mount_evidence(ownership, rows):
+    require(isinstance(ownership,ChildOwnership) and isinstance(rows,list) and len(rows)<=64,
+            "owned_mount_evidence_bound")
+    expected={}
+    for scope in ownership.write_scope:
+        if scope.kind=="resource":
+            continue
+        if any(kind=="directory" and (scope.key==key or scope.key.startswith(key+"/"))
+               for key,kind in expected.items()):
+            continue
+        if scope.kind=="directory":
+            expected={key:kind for key,kind in expected.items() if not key.startswith(scope.key+"/")}
+        expected[scope.key]=scope.kind
+    found={}
+    for row in rows:
+        require(isinstance(row,dict) and set(row)=={"key","kind","device","inode"}
+                and isinstance(row["key"],str) and row["key"] not in found
+                and expected.get(row["key"])==row["kind"]
+                and all(type(row[name]) is int and 0<=row[name]<2**64 for name in ("device","inode"))
+                and row["inode"]>0,"owned_mount_evidence_schema")
+        found[row["key"]]=dict(row)
+    require(set(found)==set(expected),"owned_mount_evidence_scope")
+    return tuple(found.values())
+
+
+def verify_owned_mount_evidence(workspace, rows, pid, modes):
+    workspace=Path(workspace)
+    require(workspace.is_absolute() and type(pid) is int and pid>0,"owned_mount_process")
+    targets={str(workspace/row["key"]) for row in rows}
+    for name,flags in modes.items():
+        path=Path(name)
+        if workspace in path.parents:
+            require(name in targets and "__stacked__" not in flags,"owned_unexpected_mount")
+    root=Path(f"/proc/{pid}/root")
+    for row in rows:
+        target=workspace/row["key"]
+        info=(root/str(target).lstrip("/")).stat()
+        require((info.st_dev,info.st_ino)==(row["device"],row["inode"])
+                and ((row["kind"]=="file" and stat.S_ISREG(info.st_mode)) or
+                     (row["kind"]=="directory" and stat.S_ISDIR(info.st_mode)))
+                and "rw" in modes.get(str(target),set()),"owned_write_mount_mismatch")

@@ -205,3 +205,123 @@ def test_failed_registry_write_leaves_no_private_temporary_or_false_claim(tmp_pa
     assert list(store.directory.glob(".registry-*"))==[]
     assert store.snapshot()["reservations"]=={}
     assert store.reserve(owner,"child",ownership(owner))
+
+
+def inventory_ledger(tmp_path, scope, *, writing=True, claimed=True):
+    directory=tmp_path/"durable-children"/("0"*64)
+    directory.mkdir(mode=0o700,parents=True)
+    directory.parent.chmod(0o700)
+    owner=parent()
+    store=registry(tmp_path)
+    item=scheduler(directory,owner,store)
+    node=item.delegate_child(owner.task_id,owner.run_token,"inventory-child",
+                             proposal(owner,scope,writing=writing))
+    if claimed:
+        assert len(item.dispatch(task_ids={node.id},managed_start=True))==1
+    item.audit_log.flush()
+    (directory/"graph.jsonl").rename(directory/"scheduler.jsonl")
+    return directory,store,item,node
+
+
+@pytest.mark.parametrize("claimed",[False,True])
+def test_host_inventory_quarantines_unknown_legacy_writers_even_before_claim(tmp_path,claimed):
+    from herdr.ownership_inventory import LegacyOwnershipInventory
+    _,store,item,node=inventory_ledger(tmp_path,None,claimed=claimed)
+    inventory=LegacyOwnershipInventory(tmp_path)
+    assert inventory(store.snapshot()) is False
+    other=parent(task="another-parent")
+    guarded=OwnershipRegistry(tmp_path,verify_legacy=inventory)
+    with pytest.raises(OwnershipError,match="legacy_writer_quarantined"):
+        guarded.reserve(other,"new-child",ownership(other,files=("different.py",)))
+    assert item._tasks[node.id].run_token is not None if claimed else item._tasks[node.id].run_token is None
+
+
+def test_inventory_matches_actual_full_claim_and_rejects_forged_registry_identity(tmp_path):
+    from herdr.ownership_inventory import LegacyOwnershipInventory
+    directory,store,item,node=inventory_ledger(tmp_path,ownership(parent(),files=("owned.py",)))
+    inventory=LegacyOwnershipInventory(tmp_path)
+    data=store.snapshot()
+    assert inventory(data) is True
+    row=next(iter(data["reservations"].values()))
+    row["identity"]["run_token"]="foreign-run"
+    assert inventory(data) is False
+    # A model result and cleanup observation cannot substitute for the claim.
+    row["state"]="released"
+    assert inventory(data) is False
+
+
+def test_inventory_allows_only_explicit_read_tools_without_registry_metadata(tmp_path):
+    from herdr.ownership_inventory import LegacyOwnershipInventory
+    _,store,_,_=inventory_ledger(tmp_path,None,writing=False)
+    assert LegacyOwnershipInventory(tmp_path)(store.snapshot()) is True
+
+
+@pytest.mark.parametrize("fault",["symlink","hardlink","writable","missing_required","duplicate_key","corrupt"])
+def test_host_inventory_rejects_unsafe_or_corrupt_canonical_ledgers(tmp_path,fault):
+    from herdr.ownership_inventory import LegacyOwnershipInventory
+    directory,store,_,_=inventory_ledger(tmp_path,ownership(parent(),files=("owned.py",)))
+    path=directory/"scheduler.jsonl"
+    if fault=="symlink":
+        path.rename(directory/"saved-ledger");path.symlink_to(directory/"saved-ledger")
+    elif fault=="hardlink":
+        os.link(path,directory/"extra-link")
+    elif fault=="writable":
+        path.chmod(0o666)
+    elif fault=="missing_required":
+        path.unlink();(directory/"scheduler.required").write_text("")
+    elif fault=="duplicate_key":
+        path.write_text('{"event":"submit","event":"claim"}\n')
+    else:
+        path.write_text("{partial")
+    with pytest.raises(OwnershipError):
+        LegacyOwnershipInventory(tmp_path)(store.snapshot())
+
+
+def test_actual_owned_inode_observation_replays_and_cannot_rebind(tmp_path):
+    from contextlib import closing
+    from herdr.owned_write_mounts import OwnedWritePins
+    from tests.herdr.test_host_policy_launch import sandbox_module
+    sandbox=sandbox_module()
+    workspace=tmp_path/"worktree";workspace.mkdir()
+    (workspace/"owned.py").write_text("original")
+    fd=os.open(workspace,os.O_PATH|os.O_DIRECTORY|os.O_NOFOLLOW)
+    info=os.fstat(fd)
+    pin=sandbox.PinnedWorktree(workspace,fd,info.st_dev,info.st_ino,tmp_path)
+    owner=parent();store=registry(tmp_path);item=scheduler(tmp_path,owner,store)
+    scope=ownership(owner,files=("owned.py",))
+    candidate=replace(proposal(owner,scope),worktree_identity=pin.identity)
+    node=item.delegate_child(owner.task_id,owner.run_token,"pins",candidate)
+    item.dispatch(task_ids={node.id},managed_start=True)
+    try:
+        with OwnedWritePins(scope,pin) as pins:
+            item.bind_owned_write_mounts(node.id,pins)
+            expected=pins.evidence()
+            item.bind_owned_write_mounts(node.id,pins)
+        rec=item._tasks[node.id]
+        assert rec.owned_write_mounts==tuple(expected)
+        snapshot=next(x for x in item.snapshot()["tasks"] if x["task_id"]==node.id)
+        assert snapshot["owned_write_mounts"]==expected and snapshot["ownership_sha256"]==scope.hash
+        restored=DynamicChildScheduler(audit_log=AuditLog(tmp_path/"graph.jsonl"),
+            ownership_registry=store,ownership_parent=owner)
+        restored.replay()
+        assert restored._tasks[node.id].owned_write_mounts==tuple(expected)
+        events=item.audit_log.replay()
+        bad=dict(events[-1]);bad["mounts"]=[{**expected[0],"inode":expected[0]["inode"]+1}]
+        item.audit_log.append(bad);item.audit_log.flush()
+        fresh=DynamicChildScheduler(audit_log=AuditLog(tmp_path/"graph.jsonl"),
+            ownership_registry=store,ownership_parent=owner)
+        with pytest.raises(SchedulerError,match="owned mount replay changed"):
+            fresh.replay()
+    finally:
+        pin.close()
+
+
+def test_owned_mount_evidence_cannot_omit_add_or_mistype_declared_inode():
+    from herdr.owned_write_mounts import validate_owned_mount_evidence
+    scope=ownership(parent(),files=("src/owned.py",))
+    good=[{"key":"src/owned.py","kind":"file","device":1,"inode":2}]
+    assert validate_owned_mount_evidence(scope,good)==tuple(good)
+    for bad in [[],[{**good[0],"key":"src/foreign.py"}],
+                [{**good[0],"inode":True}],[good[0],good[0]],[{**good[0],"fd":3}]]:
+        with pytest.raises(OwnershipError):
+            validate_owned_mount_evidence(scope,bad)

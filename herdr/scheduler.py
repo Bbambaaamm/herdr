@@ -22,7 +22,7 @@ import subprocess
 import threading
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -331,6 +331,7 @@ class TaskRecord:
     worktree_identity: str = ""
     ownership: ChildOwnership | None = None
     ownership_reservation: str | None = None
+    owned_write_mounts: tuple[dict, ...] | None = None
     cleanup_complete: bool = False
     pre_delivery_failure: str | None = None
     pre_delivery_agent_start_attempted: bool = False
@@ -1356,6 +1357,28 @@ class DynamicChildScheduler:
                                    "sha256": digest})
             self.audit_log.flush()
 
+    def bind_owned_write_mounts(self,task_id,pins):
+        from .owned_write_mounts import OwnedWritePins,validate_owned_mount_evidence
+        from .security import InvocationIdentity
+        rec=self._tasks.get(task_id)
+        if (rec is None or rec.ownership is None or not isinstance(pins,OwnedWritePins)
+                or pins.ownership_sha256!=rec.ownership.hash
+                or pins.worktree.identity!=rec.worktree_identity):
+            raise SchedulerError("owned mount observation differs from claimed child")
+        self._require_current_ownership(rec)
+        identity=InvocationIdentity("github:"+rec.repo,rec.agent_id,rec.parent_agent_id,
+            rec.parent_task_id,rec.id,rec.run_token,rec.fencing_token)
+        rows=validate_owned_mount_evidence(rec.ownership,pins.evidence())
+        if rec.owned_write_mounts is not None:
+            if rec.owned_write_mounts!=rows:
+                raise SchedulerError("owned mount observation changed")
+            return
+        self.audit_log.append({"event":"child_owned_mounts_observed","identity":identity.to_json(),
+            "ownership_sha256":rec.ownership.hash,"worktree_identity":rec.worktree_identity,
+            "mounts":[dict(x) for x in rows]})
+        self.audit_log.flush()
+        rec.owned_write_mounts=rows
+
     def authorize_child_delivery(self, task_id: str, run_token: str,
                                  agent_id: str, fencing_token: int,
                                  idempotency_key: str) -> bool:
@@ -1465,6 +1488,11 @@ class DynamicChildScheduler:
             "policy_sha256": policy_sha256,
             "verified_at": datetime.now(UTC).isoformat(),
         }
+        if rec.ownership is not None:
+            if rec.owned_write_mounts is None:
+                return False
+            attestation.update(ownership_sha256=rec.ownership.hash,
+                owned_write_mounts=[dict(x) for x in rec.owned_write_mounts])
         if invocation_policy is not None:
             from herdr.policy_launch import validate_policy_evidence
             from herdr.security import InvocationIdentity, SecurityError
@@ -1794,6 +1822,14 @@ class DynamicChildScheduler:
                     "execution_sandbox_verified": rec.execution_sandbox_verified,
                     "execution_sandbox_attestation": rec.execution_sandbox_attestation,
                     "worktree_identity": rec.worktree_identity,
+                    "ownership_sha256": rec.ownership.hash if rec.ownership else None,
+                    "ownership_reservation": rec.ownership_reservation,
+                    "owned_write_mounts": [dict(x) for x in rec.owned_write_mounts] if rec.owned_write_mounts is not None else None,
+                    "write_scope": [asdict(x) for x in rec.ownership.write_scope] if rec.ownership else None,
+                    "decision_scope": [asdict(x) for x in rec.ownership.decision_scope] if rec.ownership else None,
+                    "integration_owner": rec.ownership.integration_owner if rec.ownership else None,
+                    "handoff_ref": rec.ownership.handoff_ref if rec.ownership else None,
+                    "shared_dependencies": [asdict(x) for x in rec.ownership.shared_dependencies] if rec.ownership else None,
                     "cleanup_complete": rec.cleanup_complete,
                     "pre_delivery_failure": rec.pre_delivery_failure,
                     "pre_delivery_agent_start_attempted": rec.pre_delivery_agent_start_attempted,
@@ -2063,6 +2099,22 @@ class DynamicChildScheduler:
                         rec.fencing_token = int(e["fencing_token"])
                     if e.get("agent_id"):
                         rec.agent_id = str(e["agent_id"])
+            elif event_type == "child_owned_mounts_observed":
+                from .security import InvocationIdentity
+                from .owned_write_mounts import validate_owned_mount_evidence
+                identity=InvocationIdentity.from_dict(e.get("identity"))
+                rec=self._tasks.get(identity.task_id)
+                if (set(e)!={"event","identity","ownership_sha256","worktree_identity","mounts"}
+                        or rec is None or rec.ownership is None or rec.ownership_reservation is None
+                        or e["ownership_sha256"]!=rec.ownership.hash
+                        or e["worktree_identity"]!=rec.worktree_identity
+                        or identity.to_json()!=InvocationIdentity("github:"+rec.repo,rec.agent_id,
+                            rec.parent_agent_id,rec.parent_task_id,rec.id,rec.run_token,rec.fencing_token).to_json()):
+                    raise SchedulerError("owned mount replay binding mismatch")
+                rows=validate_owned_mount_evidence(rec.ownership,e["mounts"])
+                if rec.owned_write_mounts not in (None,rows):
+                    raise SchedulerError("owned mount replay changed")
+                rec.owned_write_mounts=rows
             elif event_type == "child_ownership_reserved":
                 rec=self._tasks.get(e.get("task_id"))
                 if rec is None or rec.parent_task_id is None:raise SchedulerError("ownership without child")
@@ -2219,6 +2271,13 @@ class DynamicChildScheduler:
                     or not isinstance(attestation.get("verified_at"), str)
                 ):
                     raise SchedulerError("invalid child sandbox attestation")
+                if rec.ownership is not None:
+                    from .owned_write_mounts import validate_owned_mount_evidence
+                    if (rec.owned_write_mounts is None
+                            or attestation.get("ownership_sha256")!=rec.ownership.hash
+                            or validate_owned_mount_evidence(rec.ownership,attestation.get("owned_write_mounts"))
+                               !=rec.owned_write_mounts):
+                        raise SchedulerError("owned mount attestation replay mismatch")
                 if "invocation_policy" in attestation:
                     from herdr.policy_launch import validate_policy_evidence
                     from herdr.security import InvocationIdentity, SecurityError

@@ -150,11 +150,13 @@ class OwnershipRegistry:
     MAX_BYTES=4*1024*1024
     MAX_RECORDS=1024
 
-    def __init__(self,root,*,verify_contract=None,verify_release=None):
+    def __init__(self,root,*,verify_contract=None,verify_release=None,verify_legacy=None):
         import os,stat
         from pathlib import Path
         self.root=Path(root).absolute()
         self.verify_contract,self.verify_release=verify_contract,verify_release
+        require(verify_legacy is None or callable(verify_legacy),"ownership_host_inventory")
+        self.verify_legacy=verify_legacy
         require(self.root.resolve(strict=True)==self.root,"ownership_symlink_root")
         info=self.root.lstat()
         require(stat.S_ISDIR(info.st_mode) and info.st_uid==os.getuid()
@@ -303,6 +305,8 @@ class OwnershipRegistry:
              "ownership":None if ownership is None else ownership.to_json(),
              "read_only":read_only,"identity":None,"state":"reserved"}
         with self._transaction() as data:
+            if not read_only and self.verify_legacy is not None:
+                require(self.verify_legacy(data) is True,"ownership_legacy_writer_quarantined")
             previous=data["reservations"].get(key)
             if previous is not None:
                 require(all(previous[k]==row[k] for k in ("parent","task_id","ownership","read_only")),
@@ -343,6 +347,8 @@ class OwnershipRegistry:
             row=data["reservations"].get(key)
             require(row is not None and row["state"]=="claimed"
                     and row["identity"]==identity.to_json(),"ownership_claim_unavailable")
+            if not row["read_only"] and self.verify_legacy is not None:
+                require(self.verify_legacy(data) is True,"ownership_legacy_writer_quarantined")
             owner=ChildOwnership.from_json(row["ownership"]) if row["ownership"] is not None else None
             require(self._contract_current(data,owner,row["parent"]["consumer"]),"ownership_shared_contract_stale")
         return True

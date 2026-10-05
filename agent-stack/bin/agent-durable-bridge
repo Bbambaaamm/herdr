@@ -19,7 +19,7 @@ loader.exec_module(child)
 
 FIELDS = {
     "operation", "task_id", "run_token", "agent", "pane", "marker",
-    "key", "role", "objective", "prompt", "tool", "permission", "cwd",
+    "key", "role", "objective", "prompt", "tool", "permission", "cwd", "ownership",
 }
 ACTIVE_STATES = {"running", "blocked"}
 TERMINAL_STATES = {"done", "failed"}
@@ -36,7 +36,7 @@ def socket_name(task_id: str, run_token: str) -> str:
 def validate_request(request: object, identity: dict) -> argparse.Namespace:
     if (
         not isinstance(request, dict)
-        or set(request) != FIELDS
+        or set(request) not in (FIELDS, FIELDS-{"ownership"})
         or request.get("operation") != "delegate"
     ):
         raise ValueError("invalid delegation request schema")
@@ -61,8 +61,13 @@ def validate_request(request: object, identity: dict) -> argparse.Namespace:
             or any(not isinstance(item, str) or not item or len(item) > 128 for item in value)
         ):
             raise ValueError("invalid delegation scope")
+    ownership = request.get("ownership")
+    if ownership is not None:
+        from herdr.child_ownership import ChildOwnership
+        ownership = ChildOwnership.from_json(ownership).to_json()
     return argparse.Namespace(
-        **{key: request[key] for key in ("key", "role", "objective", "prompt", "tool", "permission", "cwd")}
+        **{key: request[key] for key in ("key", "role", "objective", "prompt", "tool", "permission", "cwd")},
+        ownership=ownership,
     )
 
 

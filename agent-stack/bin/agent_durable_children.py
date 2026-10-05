@@ -165,7 +165,7 @@ def repair_initialization(directory: Path, parent_task_id: str, run_token: str) 
                          json.dumps(committed, sort_keys=True, allow_nan=False).encode("utf-8"))
 
 
-def initialize_parent_scheduler(directory: Path, **binding) -> DynamicChildScheduler:
+def initialize_parent_scheduler(directory: Path, *, ownership_registry=None, ownership_parent=None, **binding) -> DynamicChildScheduler:
     """Stage the whole parent registration before publishing either required artifact."""
     ledger = directory / "scheduler.jsonl"
     if os.path.lexists(ledger) or ledger_required(directory) or os.path.lexists(directory / INITIALIZATION):
@@ -174,7 +174,8 @@ def initialize_parent_scheduler(directory: Path, **binding) -> DynamicChildSched
     os.close(fd)
     stage = Path(name)
     try:
-        scheduler = DynamicChildScheduler(audit_log=AuditLog(stage))
+        scheduler = DynamicChildScheduler(audit_log=AuditLog(stage),
+            ownership_registry=ownership_registry, ownership_parent=ownership_parent)
         scheduler.register_external_parent_attempt(**binding)
         raw = _read_control_file(stage)
         document = {"schema": 1, "parent_task_id": binding["task_id"], "run_token": binding["run_token"],
