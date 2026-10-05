@@ -101,7 +101,10 @@ def command(
     pinned_worktree: PinnedWorktree | None = None,
     policy_mount=None,
     owned_write_pins=None,
+    admission_root: Path | None = None,
 ) -> list[str]:
+    if admission_root is not None and policy_mount is None:
+        raise RuntimeError("ownership_epoch_authenticated_launch_required")
     workspace = Path(workspace).absolute() if pinned_worktree else workspace.resolve(strict=True)
     if child_workspace_writable is not None:
         if (pinned_worktree is None or pinned_worktree.logical != workspace):
@@ -144,6 +147,7 @@ def command(
         "--ro-bind", "/", "/",
         "--dev", "/dev",
         "--unshare-pid",
+        *(["--die-with-parent"] if admission_root is not None else []),
         "--tmpfs", "/tmp",
         *([] if pinned_worktree is None else
           ["--tmpfs", str(workspace.parent), "--dir", str(workspace)]),
@@ -215,8 +219,13 @@ def command(
             descriptors.insert(0, {"source": pinned_worktree.source, "fd": pinned_worktree.fd,
                                   "device": pinned_worktree.device, "inode": pinned_worktree.inode,
                                   "kind": "directory", "target": str(pinned_worktree.logical)})
-        return ["/usr/bin/python3", "-I", "-S", "-c", _POLICY_FD_LAUNCHER,
-                json.dumps(descriptors, separators=(",", ":")), *args]
+        result_command = ["/usr/bin/python3", "-I", "-S", "-c", _POLICY_FD_LAUNCHER,
+                          json.dumps(descriptors, separators=(",", ":")), *args]
+        if admission_root is not None:
+            from herdr.ownership_epoch import custodial_command, legacy_admission_guard
+            with legacy_admission_guard(admission_root) as epoch:
+                return custodial_command(result_command, epoch)
+        return result_command
     if pinned_worktree is not None:
         return [sys.executable, "-I", "-c", _PINNED_LAUNCHER,
                 pinned_worktree.source, str(pinned_worktree.fd),

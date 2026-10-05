@@ -81,6 +81,8 @@ def _task(tmp_path):
     path = running / "parent.json"
     task = {"id": "parent", "run_token": "run-1", "idempotency_key": "attempt-1",
             "attempt_state": "accepted", "task_file": str(path), "repo": "Bbambaaamm/herdr",
+            "fencing_token": 9,
+            "ownership_epoch": {"version": 1, "run_token": "run-1", "fencing_token": 9},
             "issue": 82, "workspace": str(tmp_path), "safety_profile": "herdr-core",
             "worktree_root": "/home/agentops/workspaces/herdr/worktrees",
             "parent_role": "writer", "parent_tools": ["read_file", "search_files"],

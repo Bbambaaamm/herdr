@@ -328,6 +328,7 @@ class TaskRecord:
     execution_marker: str | None = None
     execution_sandbox_verified: bool = False
     execution_sandbox_attestation: dict[str, object] | None = None
+    namespace_lifetime: dict[str, object] | None = None
     worktree_identity: str = ""
     ownership: ChildOwnership | None = None
     ownership_reservation: str | None = None
@@ -342,6 +343,7 @@ class TaskRecord:
     result_status: str | None = None
     result_artifact_sha256: str | None = None
     result_evidence_canonical: bytes | None = None
+    result_handoff: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "id", self.node.id)
@@ -892,7 +894,7 @@ class DynamicChildScheduler:
                 if conflict:return conflict
         return None
 
-    def _require_current_ownership(self,rec):
+    def _require_current_ownership(self,rec,*,result=False):
         if self.ownership_registry is None:
             if rec.ownership is not None:
                 raise SchedulerError("owned child requires authenticated registry")
@@ -900,9 +902,41 @@ class DynamicChildScheduler:
         from .security import InvocationIdentity
         if rec.ownership_reservation is None:
             raise SchedulerError("child ownership reservation missing")
-        self.ownership_registry.require_current(rec.ownership_reservation,
+        verifier=(self.ownership_registry.require_result_current if result
+                  else self.ownership_registry.require_current)
+        verifier(rec.ownership_reservation,
             InvocationIdentity("github:"+rec.repo,rec.agent_id,rec.parent_agent_id,
                 rec.parent_task_id,rec.id,rec.run_token,rec.fencing_token))
+
+    def record_namespace_lifetime(self,task_id,proof):
+        from .ownership_release import validate_namespace_lifetime
+        rec=self._tasks[task_id]
+        proof=validate_namespace_lifetime(proof)
+        if rec.state is not LifecycleState.RUNNING or not rec.execution_pane:
+            raise SchedulerError("namespace lifetime requires bound running child")
+        if rec.namespace_lifetime is not None:
+            if rec.namespace_lifetime!=proof:raise SchedulerError("namespace lifetime changed")
+            return
+        self.audit_log.append({"event":"child_namespace_lifetime","task_id":rec.id,
+            "run_token":rec.run_token,"fencing_token":rec.fencing_token,
+            "idempotency_key":rec.idempotency_key,"proof":proof})
+        self.audit_log.flush()
+        rec.namespace_lifetime=proof
+
+    def release_child_ownership(self,task_id):
+        from .security import InvocationIdentity
+        rec=self._tasks[task_id]
+        if not (self.ownership_registry and self.ownership_parent and rec.ownership_reservation
+                and rec.attempt_state=="terminal" and rec.cleanup_complete):
+            return False
+        try:
+            self.ownership_registry.release(rec.ownership_reservation,
+                InvocationIdentity("github:"+rec.repo,rec.agent_id,rec.parent_agent_id,
+                    rec.parent_task_id,rec.id,rec.run_token,rec.fencing_token),
+                {"parent":self.ownership_parent.to_json()})
+        except OwnershipError:
+            return False
+        return True
 
     # -- completion ----------------------------------------------------------
 
@@ -1734,13 +1768,22 @@ class DynamicChildScheduler:
         # run/fence/key still identifies a late result for this same attempt.
         if rec.state is not LifecycleState.RUNNING:
             return False
-        try:self._require_current_ownership(rec)
-        except (OwnershipError,SchedulerError):return False
+        try:
+            self._require_current_ownership(rec)
+            from .handoff import HandoffEnvelope
+            candidate=replace(rec,result_status=status,result_artifact_sha256=artifact_sha256)
+            handoff=HandoffEnvelope.submitted_child(candidate,evidence=json.loads(canonical))
+            handoff.require_binding(candidate)
+            if status=="completed" and handoff.current_state in {"PARTIAL","CONFLICT"}:
+                return False
+        except (OwnershipError,SchedulerError,TypeError,ValueError):
+            return False
         rec.state = states[status]
         rec.attempt_state = "terminal"
         rec.result_status = status
         rec.result_artifact_sha256 = artifact_sha256
         rec.result_evidence_canonical = canonical
+        rec.result_handoff = handoff.to_json()
         rec.fencing_token = fencing_token
         rec.lease = None
         self._claims.pop(task_id, None)
@@ -1748,6 +1791,7 @@ class DynamicChildScheduler:
                                "agent_id": agent_id, "fencing_token": fencing_token,
                                "run_token": run_token, "idempotency_key": idempotency_key,
                                "artifact_sha256": artifact_sha256, "evidence": json.loads(canonical),
+                               "handoff": rec.result_handoff,
                                "status": status, "state": rec.state.value,
                                "ownership_sha256":rec.ownership.hash if rec.ownership else None,
                                "handoff_ref":rec.ownership.handoff_ref if rec.ownership else None,
@@ -2094,6 +2138,13 @@ class DynamicChildScheduler:
                     rec.result_evidence_canonical = (json.dumps(e["evidence"], sort_keys=True,
                         ensure_ascii=False, allow_nan=False).encode("utf-8")
                         if event_type == "child_result" else None)
+                    if event_type=="child_result" and e.get("handoff") is not None:
+                        from .handoff import HandoffEnvelope
+                        envelope=HandoffEnvelope.from_json(e["handoff"])
+                        envelope.require_binding(rec)
+                        if status=="completed" and envelope.current_state in {"PARTIAL","CONFLICT"}:
+                            raise SchedulerError("incomplete child handoff cannot complete")
+                        rec.result_handoff=envelope.to_json()
                     if rec.result_evidence_canonical is not None and len(rec.result_evidence_canonical) > 262144:
                         raise SchedulerError("durable child evidence exceeds limit")
                     rec.lease = None
@@ -2299,6 +2350,17 @@ class DynamicChildScheduler:
                     raise SchedulerError("invalid authenticated bootstrap upgrade")
                 rec.execution_sandbox_verified = True
                 rec.execution_sandbox_attestation = json.loads(json.dumps(attestation))
+            elif event_type == "child_namespace_lifetime":
+                from .ownership_release import validate_namespace_lifetime
+                rec=self._tasks.get(e.get("task_id"))
+                if (rec is None or rec.state is not LifecycleState.RUNNING
+                        or (rec.run_token,rec.fencing_token,rec.idempotency_key)!=
+                           (e.get("run_token"),e.get("fencing_token"),e.get("idempotency_key"))):
+                    raise SchedulerError("namespace lifetime replay binding")
+                proof=validate_namespace_lifetime(e.get("proof"))
+                if rec.namespace_lifetime is not None and rec.namespace_lifetime!=proof:
+                    raise SchedulerError("namespace lifetime replay changed")
+                rec.namespace_lifetime=proof
             elif event_type == "child_pane_creation_attempted":
                 rec = self._tasks.get(str(e.get("task_id", "")))
                 if (rec is None or rec.delegation_key is None or rec.state is not LifecycleState.RUNNING

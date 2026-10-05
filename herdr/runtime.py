@@ -906,6 +906,8 @@ class HerdrChildRuntime:
                 pinned_worktree=self.pinned_worktree,
                 policy_mount=launch.mount,
                 owned_write_pins=self._owned_write_pins.get(task_id),
+                admission_root=(self.scheduler.ownership_registry.root
+                                if getattr(self.scheduler, "ownership_registry", None) is not None else None),
             )
             _json_result(self.runner.run(["pane", "run", pane_id,
                                           sandbox.shell_command(sandbox_args)]), "child sandbox start")
@@ -933,6 +935,9 @@ class HerdrChildRuntime:
                     raise HerdrRuntimeError("child_owned_mount_proof_missing",task_id)
                 attestation.update(ownership_sha256=record.ownership.hash,
                     owned_write_mounts=[dict(x) for x in record.owned_write_mounts])
+            if getattr(self.scheduler,"ownership_registry",None) is not None:
+                from .ownership_release import capture_namespace_lifetime
+                self.scheduler.record_namespace_lifetime(task_id,capture_namespace_lifetime(sandbox_pid))
             policy_evidence = launch.seal(sandbox_pid, attestation, tools=node.tools,
                                           permissions=node.permissions)
             pins=self._owned_write_pins.pop(task_id,None)

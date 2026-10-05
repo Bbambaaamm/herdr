@@ -307,6 +307,7 @@ class OwnershipRegistry:
         with self._transaction() as data:
             if not read_only and self.verify_legacy is not None:
                 require(self.verify_legacy(data) is True,"ownership_legacy_writer_quarantined")
+            require(self.retired_reservation(key) is None,"ownership_stale_or_released")
             previous=data["reservations"].get(key)
             if previous is not None:
                 require(all(previous[k]==row[k] for k in ("parent","task_id","ownership","read_only")),
@@ -314,6 +315,8 @@ class OwnershipRegistry:
                 require(previous["state"] in {"reserved","claimed"} and self._contract_current(data,ownership,parent.consumer),
                         "ownership_stale_or_released")
                 return key
+            if len(data["reservations"])>=self.MAX_RECORDS:
+                self._compact_released(data)
             require(len(data["reservations"])<self.MAX_RECORDS,"ownership_capacity")
             require(self._contract_current(data,ownership,parent.consumer),"ownership_shared_contract_stale")
             for other in data["reservations"].values():
@@ -326,6 +329,88 @@ class OwnershipRegistry:
                     require(conflict is None,conflict or "ownership_conflict")
             data["reservations"][key]=row
         return key
+
+    def retired_reservation(self,key):
+        import os
+        sha(key)
+        directory=os.open(self.directory,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+        try:
+            info=os.fstat(directory)
+            require((info.st_dev,info.st_ino)==self._directory_identity,"ownership_private_directory")
+            try:fd=os.open("released-"+key+".json",os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC,dir_fd=directory)
+            except FileNotFoundError:return None
+            try:
+                require(self._private_file(fd).st_size<=65536,"ownership_retired_bound")
+                raw=os.read(fd,65537);require(len(raw)<=65536,"ownership_retired_bound")
+            finally:os.close(fd)
+            def unique(pairs):
+                value={}
+                for k,v in pairs:
+                    require(k not in value,"ownership_duplicate_store_key");value[k]=v
+                return value
+            row=json.loads(raw,object_pairs_hook=unique)
+            from .security import InvocationIdentity
+            require(isinstance(row,dict) and set(row)=={"parent","task_id","ownership","read_only","identity","state"}
+                    and row["state"]=="released" and type(row["read_only"]) is bool,
+                    "ownership_retired_schema")
+            parent=InvocationIdentity.from_dict(row["parent"])
+            actual=InvocationIdentity.from_dict(row["identity"])
+            require(self.key(parent,row["task_id"])==key and
+                    (actual.consumer,actual.parent_agent_id,actual.parent_task_id,actual.task_id)==
+                    (parent.consumer,parent.agent_id,parent.task_id,row["task_id"]),
+                    "ownership_retired_identity")
+            if row["ownership"] is not None:
+                owner=ChildOwnership.from_json(row["ownership"])
+                require(owner.read_only==row["read_only"] and owner.integration_owner==parent.task_id,
+                        "ownership_retired_scope")
+            return row
+        finally:os.close(directory)
+
+    def _compact_released(self,data):
+        import os
+        directory=os.open(self.directory,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+        try:
+            for key,row in list(data["reservations"].items()):
+                if row["state"]!="released":continue
+                existing=self.retired_reservation(key)
+                if existing is not None:
+                    require(existing==row,"ownership_retired_conflict")
+                else:
+                    raw=json.dumps(row,sort_keys=True,separators=(",",":"),allow_nan=False).encode()
+                    require(len(raw)<=65536,"ownership_retired_bound")
+                    # Publish/fsync the immutable tombstone BEFORE removing the
+                    # bounded active row. A crash cannot resurrect this key.
+                    import uuid
+                    temporary=".released-"+uuid.uuid4().hex
+                    fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,
+                               0o600,dir_fd=directory)
+                    try:
+                        try:
+                            view=memoryview(raw)
+                            while view:
+                                size=os.write(fd,view);require(size>0,"ownership_short_write");view=view[size:]
+                            os.fsync(fd)
+                        finally:os.close(fd)
+                        os.replace(temporary,"released-"+key+".json",src_dir_fd=directory,dst_dir_fd=directory)
+                        os.fsync(directory)
+                    finally:
+                        try:os.unlink(temporary,dir_fd=directory)
+                        except FileNotFoundError:pass
+                del data["reservations"][key]
+        finally:os.close(directory)
+
+    def require_result_current(self,key,identity):
+        sha(key)
+        with self._transaction() as data:
+            row=data["reservations"].get(key) or self.retired_reservation(key)
+            require(row is not None and row["state"] in {"claimed","released"}
+                    and row["identity"]==identity.to_json(),"ownership_result_unavailable")
+            if row["state"]=="claimed" and callable(self.verify_release):
+                require(self.verify_release(identity,{"parent":row["parent"]}) is True,
+                        "ownership_result_not_quiescent")
+            owner=ChildOwnership.from_json(row["ownership"]) if row["ownership"] is not None else None
+            require(self._contract_current(data,owner,row["parent"]["consumer"]),"ownership_shared_contract_stale")
+        return True
 
     def bind_claim(self,key,identity):
         from .security import InvocationIdentity
@@ -358,7 +443,7 @@ class OwnershipRegistry:
         require((identity.consumer,identity.parent_agent_id,identity.parent_task_id,identity.task_id)==
                 (parent.consumer,parent.agent_id,parent.task_id,task_id),"ownership_replay_identity")
         with self._transaction() as data:
-            row=data["reservations"].get(key)
+            row=data["reservations"].get(key) or self.retired_reservation(key)
             require(row is not None and all(row[k]==v for k,v in expected.items()),
                     "ownership_replay_reservation")
             require(row["identity"] in (None,identity.to_json()),"ownership_claim_rebind")
@@ -403,9 +488,11 @@ class OwnershipRegistry:
         require(callable(self.verify_release) and self.verify_release(identity,evidence) is True,
                 "ownership_host_release_evidence")
         with self._transaction() as data:
-            row=data["reservations"].get(key)
+            row=data["reservations"].get(key) or self.retired_reservation(key)
             require(row is not None and row["identity"]==identity.to_json(),"ownership_release_identity")
             row["state"]="released"
+            if sum(item["state"]=="released" for item in data["reservations"].values())>=128:
+                self._compact_released(data)
 
     def snapshot(self):
         with self._transaction() as data:

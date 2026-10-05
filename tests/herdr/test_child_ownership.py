@@ -425,3 +425,237 @@ def test_protected_recovery_restores_full_registry_parent_binding(tmp_path):
         rec.id,rec.run_token,rec.fencing_token)
     assert restored.ownership_registry.require_current(rec.ownership_reservation,identity)
     assert restored.dispatch(task_ids={node.id},managed_start=True)==[]
+
+
+@pytest.mark.parametrize("replacement", ["none", "inode", "symlink", "ancestor_symlink"])
+def test_owned_pre_delivery_recovery_reopens_exact_durable_worktree(tmp_path, monkeypatch, replacement):
+    import sys
+    from importlib.machinery import SourceFileLoader
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "agent-stack/bin"))
+    import agent_durable_children as recovery
+    from herdr.runtime import AdmissionRegistry, CommandResult, HerdrChildRuntime
+    from herdr import policy_launch, owned_write_mounts
+
+    owner = parent()
+    store = registry(tmp_path)
+    directory = recovery.ensure_attempt_directory(tmp_path, owner.task_id, owner.run_token)
+    item = scheduler(directory, owner, store)
+    work_parent = tmp_path / "worktrees"
+    workspace = work_parent / "child"
+    workspace.mkdir(parents=True)
+    target = workspace / "owned.py"
+    target.write_text("original")
+    info = workspace.stat()
+    identity = f"{workspace}|{info.st_dev}:{info.st_ino}"
+    scope = ownership(owner, files=("owned.py",))
+    node = item.delegate_child(owner.task_id, owner.run_token, "interrupted-owned",
+        replace(proposal(owner, scope), worktree_identity=identity))
+    item.dispatch(task_ids={node.id}, managed_start=True)
+    rec = item._tasks[node.id]
+    item.bind_child_prompt(node.id, "bounded work")
+    marker = f"child-{rec.run_token}"
+    assert item.record_child_pane_intent(rec.id, rec.run_token, rec.agent_id,
+        rec.fencing_token, rec.idempotency_key, marker)
+    assert item.bind_pre_delivery_pane(rec.id, rec.run_token, rec.agent_id, "owned-pane", marker)
+    fd = os.open(workspace, os.O_PATH | os.O_DIRECTORY)
+    from agent_durable_sandbox import PinnedWorktree
+    pin = PinnedWorktree(workspace, fd, info.st_dev, info.st_ino)
+    try:
+        with owned_write_mounts.OwnedWritePins(scope, pin) as pins:
+            item.bind_owned_write_mounts(rec.id, pins)
+    finally:
+        pin.close()
+    assert item.attest_execution_sandbox(rec.id, rec.run_token, rec.agent_id, "owned-pane", marker,
+        sandbox_pid=321, policy_sha256="a"*64)
+    item.mark_pre_delivery_agent_start(rec.id)
+    (directory / "graph.jsonl").rename(directory / "scheduler.jsonl")
+    recovery.mark_ledger_required(directory)
+
+    if replacement in {"inode", "symlink"}:
+        workspace.rename(work_parent / "retained")
+        if replacement == "inode":
+            workspace.mkdir()
+        else:
+            workspace.symlink_to(work_parent / "retained", target_is_directory=True)
+    elif replacement == "ancestor_symlink":
+        work_parent.rename(tmp_path / "retained-parent")
+        work_parent.symlink_to(tmp_path / "retained-parent", target_is_directory=True)
+    closed, verified, pins_seen = [], [], []
+    class Runner:
+        def run(self, args, timeout_seconds=30):
+            if args[:2] == ["pane", "list"]:
+                return CommandResult(0, '{"result":{"panes":[{"pane_id":"owned-pane"}]}}', "")
+            if args[:2] == ["agent", "get"]:
+                return CommandResult(1, '{"error":{"code":"agent_not_found"}}', "")
+            if args[:2] == ["pane", "process-info"]:
+                return CommandResult(0, '{"result":{"process_info":{"shell_pid":123}}}', "")
+            if args[:2] == ["pane", "close"]:
+                closed.append(args[2])
+                return CommandResult(0, "{}", "")
+            raise AssertionError(args)
+    runner = Runner()
+    monkeypatch.setattr(recovery, "SubprocessHerdrRunner", lambda *a: runner)
+    monkeypatch.setattr(recovery, "AdmissionRegistry",
+                        lambda: AdmissionRegistry(tmp_path / "admission.json"))
+    original_runtime = recovery.HerdrChildRuntime
+    def runtime(*args, **kwargs):
+        retained = kwargs["pinned_worktree"]
+        retained.verify()
+        pins_seen.append(retained.fd)
+        assert retained.identity == identity
+        from tests.policy_launch_fakes import FakeHostPolicyLaunchFactory
+        kwargs["policy_launch_factory"] = FakeHostPolicyLaunchFactory()
+        return original_runtime(*args, **kwargs)
+    monkeypatch.setattr(recovery, "HerdrChildRuntime", runtime)
+    monkeypatch.setattr(HerdrChildRuntime, "_verify_created_pane_marker", lambda *a: None)
+    original_load = SourceFileLoader.exec_module
+    def load(loader, module):
+        if loader.name == "agent_durable_sandbox_verify":
+            module.inner_pid = lambda process, supplied: 321
+        else:
+            original_load(loader, module)
+    monkeypatch.setattr(SourceFileLoader, "exec_module", load)
+    def retained_policy(proof, *, identity: object, pid, attestation, require_bootstrap, **kw):
+        assert identity.task_id == rec.id and pid == 321 and not require_bootstrap
+    monkeypatch.setattr(policy_launch, "verify_retained_policy_evidence", retained_policy)
+    monkeypatch.setattr(policy_launch, "mount_rows", lambda pid: [])
+    def verify_mounts(logical, rows, pid, mounts):
+        assert logical == workspace and pid == 321
+        actual = target.stat()
+        assert rows[0]["device"] == actual.st_dev and rows[0]["inode"] == actual.st_ino
+        verified.append(logical)
+    monkeypatch.setattr(owned_write_mounts, "verify_owned_mount_evidence", verify_mounts)
+
+    recovery.reconcile_child_results(tmp_path, owner.task_id, owner.run_token)
+    restored = recovery.replay_host_scheduler(tmp_path, directory / "scheduler.jsonl")
+    recovered = restored._tasks[rec.id]
+    if replacement == "none":
+        assert closed == ["owned-pane"] and verified == [workspace]
+        assert recovered.cleanup_complete and recovered.pre_delivery_failure
+        # This retained-pin transport test deliberately stubs physical proofs.
+        # It must not open acceptance without a real namespace lifetime.
+        assert not recovery.all_children_terminal(tmp_path, owner.task_id, owner.run_token)
+        for descriptor in pins_seen:
+            with pytest.raises(OSError):
+                os.fstat(descriptor)
+    else:
+        assert not closed and not verified and not pins_seen
+        assert not recovered.cleanup_complete
+        assert not recovery.all_children_terminal(tmp_path, owner.task_id, owner.run_token)
+    events = restored.audit_log.replay()
+    assert sum(e.get("event") == "claim" and e.get("task_id") == rec.id for e in events) == 1
+    assert not any(e.get("event") == "child_prompt_delivery_attempted" for e in events)
+    assert (recovered.run_token, recovered.fencing_token, recovered.idempotency_key) == (
+        rec.run_token, rec.fencing_token, rec.idempotency_key)
+
+
+def test_registry_reclaims_more_than_1024_terminal_claims_without_resurrection(tmp_path):
+    owner = parent()
+    store = registry(tmp_path, verify_release=lambda identity, evidence: evidence == {"host": "verified"})
+    first = None
+    for number in range(1030):
+        task = f"finished-{number}"
+        scope = ownership(owner, files=(task + ".py",))
+        key = store.reserve(owner, task, scope)
+        identity = child(owner, task)
+        store.bind_claim(key, identity)
+        store.release(key, identity, {"host": "verified"})
+        if number == 0:
+            first = (key, identity, scope)
+    assert len(store.snapshot()["reservations"]) < 1024
+    key, identity, scope = first
+    assert store.retired_reservation(key)["identity"] == identity.to_json()
+    with pytest.raises(OwnershipError, match="stale_or_released"):
+        store.reserve(owner, identity.task_id, scope)
+    with pytest.raises(OwnershipError):
+        store.bind_claim(key, identity)
+    # Cold ledger binding can recover history, never turn it into a new grant.
+    store.reconcile_claim(key, owner, identity.task_id, scope, identity)
+    assert store.require_result_current(key, identity)
+    with pytest.raises(OwnershipError):
+        store.require_current(key, identity)
+
+
+def test_release_archive_survives_crash_before_active_index_commit(tmp_path, monkeypatch):
+    owner = parent()
+    store = registry(tmp_path, verify_release=lambda *_: True)
+    monkeypatch.setattr(store, "MAX_RECORDS", 2)
+    for task in ("old-one", "old-two"):
+        key = store.reserve(owner, task, ownership(owner))
+        identity = child(owner, task)
+        store.bind_claim(key, identity)
+        store.release(key, identity, {})
+    original = store._write
+    monkeypatch.setattr(store, "_write", lambda *a: (_ for _ in ()).throw(SystemExit("after archive fsync")))
+    with pytest.raises(SystemExit):
+        store.reserve(owner, "next", ownership(owner))
+    monkeypatch.setattr(store, "_write", original)
+    with pytest.raises(OwnershipError, match="stale_or_released"):
+        store.reserve(owner, "old-one", ownership(owner))
+    store.reserve(owner, "next", ownership(owner))
+    assert list(store.snapshot()["reservations"].values())[0]["task_id"] == "next"
+
+
+@pytest.mark.parametrize("fault", ["symlink", "hardlink", "public", "corrupt", "identity"])
+def test_retired_history_tamper_denies_replay_and_new_admission(tmp_path, monkeypatch, fault):
+    owner = parent()
+    store = registry(tmp_path, verify_release=lambda *_: True)
+    monkeypatch.setattr(store, "MAX_RECORDS", 1)
+    key = store.reserve(owner, "old", ownership(owner))
+    identity = child(owner, "old")
+    store.bind_claim(key, identity)
+    store.release(key, identity, {})
+    store.reserve(owner, "next", ownership(owner))
+    path = store.directory / ("released-" + key + ".json")
+    if fault == "symlink":
+        path.rename(store.directory / "real-history")
+        path.symlink_to(store.directory / "real-history")
+    elif fault == "hardlink":
+        os.link(path, store.directory / "alias")
+    elif fault == "public":
+        path.chmod(0o644)
+    elif fault == "corrupt":
+        path.write_text("{partial")
+    else:
+        value = json.loads(path.read_text())
+        value["identity"]["parent_task_id"] = "foreign"
+        path.write_text(json.dumps(value))
+    with pytest.raises((OwnershipError, OSError, ValueError)):
+        store.reconcile_claim(key, owner, "old", ownership(owner), identity)
+    with pytest.raises((OwnershipError, OSError, ValueError)):
+        store.reserve(owner, "old", ownership(owner))
+
+
+def test_production_release_reads_exact_protected_terminal_and_cleanup_truth(tmp_path):
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "agent-stack/bin"))
+    from agent_durable_children import ensure_attempt_directory
+    from herdr.ownership_release import HostOwnershipRelease
+    owner = parent()
+    store = registry(tmp_path, verify_release=HostOwnershipRelease(tmp_path))
+    directory = ensure_attempt_directory(tmp_path, owner.task_id, owner.run_token)
+    item = scheduler(directory, owner, store)
+    node = item.delegate_child(owner.task_id, owner.run_token, "read-only-terminal",
+        proposal(owner, ownership(owner), writing=False))
+    item.dispatch(task_ids={node.id}, managed_start=True)
+    rec = item._tasks[node.id]
+    marker = f"child-{rec.run_token}"
+    assert item.record_child_pane_intent(rec.id, rec.run_token, rec.agent_id,
+        rec.fencing_token, rec.idempotency_key, marker)
+    assert item.bind_pre_delivery_pane(rec.id, rec.run_token, rec.agent_id, "child-pane", marker)
+    (directory / "graph.jsonl").rename(directory / "scheduler.jsonl")
+    item.audit_log._path = directory / "scheduler.jsonl"
+    evidence = [{"answer": "submitted"}]
+    digest = hashlib.sha256(json.dumps(evidence, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    assert item.publish_child_result(rec.id, rec.run_token, rec.agent_id, rec.fencing_token,
+                                    rec.idempotency_key, digest, evidence)
+    assert not item.release_child_ownership(rec.id)
+    assert item.mark_child_cleanup_complete(rec.id)
+    assert item.release_child_ownership(rec.id)
+    item._require_current_ownership(rec, result=True)
+    with pytest.raises(OwnershipError):
+        item._require_current_ownership(rec)
+    row = store.snapshot()["reservations"][rec.ownership_reservation]
+    assert row["state"] == "released"
+    assert not HostOwnershipRelease(tmp_path)(
+        child(owner, rec.id, run="foreign"), {"parent": owner.to_json()})

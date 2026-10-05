@@ -226,8 +226,13 @@ def delegate(args, *, runner=None, policy_launch_factory=None):
     if isinstance(runner, SubprocessHerdrRunner):
         runner.env = {**os.environ, "HERDR_ENV": "1", "HERDR_PANE_ID": pane}
     parent_id, token = task["id"], task["run_token"]
-    with closing(_pin_child_cwd(task, args)) as pinned:
-        return _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, policy_launch_factory)
+    from herdr.ownership_epoch import legacy_admission_guard
+    state_root = Path(_required_env("HERDR_DURABLE_TASK_FILE")).resolve(strict=True).parent.parent
+    # Retain the fence from reservation to verified namespace custody, including
+    # reconciliation when the coordinator worker has already died.
+    with legacy_admission_guard(state_root):
+        with closing(_pin_child_cwd(task, args)) as pinned:
+            return _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, policy_launch_factory)
 
 
 def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, policy_launch_factory=None):
@@ -256,7 +261,9 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
             raise ValueError("ownership parent differs from authenticated attempt")
         if ownership is not None and ownership.integration_owner != parent_id:
             raise ValueError("ownership integration owner differs from parent")
-        ownership_registry = OwnershipRegistry(state_root, verify_legacy=LegacyOwnershipInventory(state_root))
+        from herdr.ownership_release import HostOwnershipRelease
+        ownership_registry = OwnershipRegistry(state_root, verify_legacy=LegacyOwnershipInventory(state_root),
+                                                verify_release=HostOwnershipRelease(state_root))
     _validate_delivery_prompt(args.prompt, directory, predicted_id, parent_task_id=parent_id, run_token=token)
     with parent_attempt_guard(state_root, parent_id, token):
         # Recheck while holding the same lock as parent terminalization.
@@ -404,12 +411,14 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
                     # Retain verified evidence while resources and the parent gate
                     # remain quarantined. Cleanup is never semantic acceptance.
                     pass
+        scheduler.release_child_ownership(rec.id)
     # Use the fsync-protected scheduler record, never a changed worker result file.
     # These are submitted artifacts; only the shared completion gate accepts them.
     retained = rec.result_evidence_canonical
     if retained is not None and hashlib.sha256(retained).hexdigest() != rec.result_artifact_sha256:
         raise SchedulerError("retained child result digest mismatch")
-    return {"evidence": json.loads(retained) if retained is not None else None,
+    return {"handoff": rec.result_handoff,
+                "evidence": json.loads(retained) if retained is not None else None,
                 "evidence_sha256": rec.result_artifact_sha256,
                 "task_id": child.id, "parent_task_id": parent_id,
                 "run_token": rec.run_token, "agent_id": rec.agent_id,

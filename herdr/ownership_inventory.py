@@ -92,9 +92,11 @@ class LegacyOwnershipInventory:
         finally:
             os.close(fd)
 
-    @staticmethod
-    def _known_claim(rec, data):
+    def _known_claim(self, rec, data):
         row = data["reservations"].get(rec.ownership_reservation)
+        if row is None and rec.ownership_reservation:
+            from .child_ownership import OwnershipRegistry
+            row = OwnershipRegistry(self.root).retired_reservation(rec.ownership_reservation)
         if row is None or rec.ownership is None or row["ownership"] is None or ChildOwnership.from_json(row["ownership"]) != rec.ownership:
             return False
         actual = InvocationIdentity("github:"+rec.repo, rec.agent_id,
@@ -102,6 +104,70 @@ class LegacyOwnershipInventory:
         return row["identity"] == actual.to_json() and row["task_id"] == rec.id
 
     def __call__(self, data):
+        from .ownership_epoch import legacy_admission_guard
+        with legacy_admission_guard(self.root):
+            self._require_current_parents()
+            return self._scan(data)
+
+    def _require_current_parents(self):
+        """An old bridge can have no children yet; inspect its canonical parent."""
+        total = 0
+        for state in ("running", "blocked", "pending"):
+            directory = self.root / state
+            try:
+                fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            except FileNotFoundError:
+                continue
+            try:
+                self._directory(fd, private=False)
+                names = os.listdir(fd)
+                require(len(names) <= self.MAX_DIRECTORIES, "ownership_parent_inventory_bound")
+                for name in names:
+                    require(name.endswith(".json") and "/" not in name,
+                            "ownership_parent_inventory_name")
+                    task_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK |
+                                      os.O_CLOEXEC, dir_fd=fd)
+                    try:
+                        before = os.fstat(task_fd)
+                        require(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid()
+                                and not before.st_mode & 0o022 and before.st_nlink == 1
+                                and before.st_size <= 131072, "ownership_parent_inventory_file")
+                        raw = os.read(task_fd, 131073)
+                        require(len(raw) <= 131072, "ownership_parent_inventory_bound")
+                        total += len(raw)
+                        require(total <= self.MAX_TOTAL, "ownership_parent_inventory_bound")
+                        def unique(pairs):
+                            value = {}
+                            for key, item in pairs:
+                                require(key not in value, "ownership_parent_inventory_duplicate")
+                                value[key] = item
+                            return value
+                        task = json.loads(raw, object_pairs_hook=unique)
+                        after = os.fstat(task_fd)
+                        named = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                        fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+                        require(tuple(getattr(before, k) for k in fields) ==
+                                tuple(getattr(after, k) for k in fields) ==
+                                tuple(getattr(named, k) for k in fields),
+                                "ownership_parent_inventory_changed")
+                        require(isinstance(task, dict), "ownership_parent_inventory_schema")
+                        if task.get("run_token") and task.get("attempt_state") in {
+                            "dispatching", "accepted", "delivery_uncertain", "result_ready", "verifying"
+                        }:
+                            epoch = task.get("ownership_epoch")
+                            require(isinstance(epoch, dict) and
+                                    set(epoch) == {"version", "run_token", "fencing_token"} and
+                                    type(epoch["version"]) is int and epoch["version"] == 1 and
+                                    epoch["run_token"] == task["run_token"] and
+                                    type(epoch["fencing_token"]) is int and
+                                    epoch["fencing_token"] == task.get("fencing_token"),
+                                    "ownership_legacy_parent_active")
+                    finally:
+                        os.close(task_fd)
+            finally:
+                os.close(fd)
+
+    def _scan(self, data):
         root_fd = container = None
         total = 0
         try:

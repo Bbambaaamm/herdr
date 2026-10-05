@@ -153,8 +153,13 @@ class RootFDWorkspace:
             return fd, parts
         raise FileAuthorityError("file path outside pinned roots")
 
-    def _parent(self, path: str, *, create: bool = False) -> tuple[int, str]:
+    def _parent(self, path: str, *, create: bool = False, mutating: bool = False) -> tuple[int, str]:
         root_fd, parts = self._select(path)
+        if mutating and any(part in {".git", ".herdr"} or part.startswith(".herdr-")
+                            for part in parts):
+            # Validate the whole relative path before mkdir or any file effect.
+            # Absolute ancestors can legitimately name a host-created worktree.
+            raise FileAuthorityError("workspace control path is not writable")
         current = os.dup(root_fd)
         try:
             for part in parts[:-1]:
@@ -330,7 +335,7 @@ class RootFDWorkspace:
         """Atomically create one regular file without overwriting a raced-in target."""
         if len(content) > MAX_FILE_BYTES:
             raise FileAuthorityError("write exceeds policy-mode bound")
-        parent, name = self._parent(path, create=True)
+        parent, name = self._parent(path, create=True, mutating=True)
         temp = f".herdr-policy-{os.getpid()}-{os.urandom(12).hex()}"
         temp_fd = -1
         writer=_writer_locks(parent)
@@ -383,7 +388,7 @@ class RootFDWorkspace:
         if entry is None:
             raise FileAuthorityError("exact file root required")
         _root,_parent,_target,device,inode=entry
-        parent,name=self._parent(path)
+        parent,name=self._parent(path, mutating=True)
         try:
             with _writer_locks(parent):
                 fd=os.open(name,os.O_WRONLY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=parent)
@@ -416,7 +421,7 @@ class RootFDWorkspace:
             raise FileAuthorityError("conditional replacement unavailable on shared workspace")
         if any(Path(path)==root for root,*_ in self._files):
             return self._write_exact_file(path,content)
-        parent, name = self._parent(path, create=True)
+        parent, name = self._parent(path, create=True, mutating=True)
         temp = f".herdr-policy-{os.getpid()}-{os.urandom(12).hex()}"
         temp_fd = -1
         writer=_writer_locks(parent)
@@ -474,7 +479,7 @@ class RootFDWorkspace:
         return self.write_bytes(path, raw, expected_content=expected)
 
     def delete_file(self, path: str) -> None:
-        parent, name = self._parent(path)
+        parent, name = self._parent(path, mutating=True)
         writer=_writer_locks(parent)
         try:
             writer.__enter__()
@@ -488,8 +493,17 @@ class RootFDWorkspace:
             os.close(parent)
 
     def move_file(self, source: str, destination: str) -> None:
-        src_parent, src_name = self._parent(source)
-        dst_parent, dst_name = self._parent(destination, create=True)
+        # Validate both complete relative paths before creating destination parents.
+        for candidate in (source, destination):
+            _root, parts = self._select(candidate)
+            if any(part in {".git", ".herdr"} or part.startswith(".herdr-") for part in parts):
+                raise FileAuthorityError("workspace control path is not writable")
+        src_parent, src_name = self._parent(source, mutating=True)
+        try:
+            dst_parent, dst_name = self._parent(destination, create=True, mutating=True)
+        except BaseException:
+            os.close(src_parent)
+            raise
         writer=_writer_locks(src_parent,dst_parent)
         try:
             writer.__enter__()
