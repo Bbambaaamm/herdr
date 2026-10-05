@@ -586,8 +586,19 @@ class SecurityGrant:
         self.require_logical_subset_of(parent)
         observed,ceiling=self.runtime_assurance,parent.runtime_assurance
         network_order={NetworkAccess.NONE:0,NetworkAccess.PROVIDER_ONLY:1,NetworkAccess.GLOBAL:2}
+        parent_result = next((rule for rule in parent.tool_rules
+            if rule.risk == RiskClass.RESULT_SUBMISSION and rule.result_slot is not None), None)
+        delegated_slots = ()
+        if parent_result is not None:
+            delegated_slots = tuple(rule.result_slot.path for rule in self.tool_rules
+                if rule.risk == RiskClass.RESULT_SUBMISSION and rule.result_slot is not None
+                and rule.tool == parent_result.tool
+                and _roots_subset((rule.result_slot.path,), parent_result.allowed_roots))
+        # This exception names only a host-bound result inode, never its directory.
+        # Normal path/process writes still obey the parent's physical ceiling.
+        allowed_writes = (*ceiling.writable_roots, *delegated_slots)
         if (network_order[observed.network_access]>network_order[ceiling.network_access]
-                or not _roots_subset(observed.writable_roots,ceiling.writable_roots)
+                or not _roots_subset(observed.writable_roots,allowed_writes)
                 or ceiling.credentials_isolated and not observed.credentials_isolated
                 or ceiling.sandbox_verified and not observed.sandbox_verified):
             raise SecurityError("child runtime assurance escalates above parent")

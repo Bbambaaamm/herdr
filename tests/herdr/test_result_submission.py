@@ -122,3 +122,55 @@ print("BOUND_RESULT_PASS")
     assert "BOUND_RESULT_PASS" in completed.stdout
     assert json.loads(result.read_text())["idempotency_key"]=="result-key"
     assert sibling.read_text()=="preserve" and not (workspace/"escape").exists()
+
+
+@pytest.mark.parametrize("failure",["write","fsync"])
+def test_partial_submission_replays_same_candidate_on_exact_inode(tmp_path,monkeypatch,failure):
+    import herdr.result_submission as module
+    guard,result=setup(tmp_path);before=result.stat()
+    real_write,real_fsync=os.write,os.fsync
+    calls=0
+    def write(fd,payload):
+        nonlocal calls
+        if os.fstat(fd).st_ino != before.st_ino:return real_write(fd,payload)
+        calls+=1
+        if calls==1:return real_write(fd,payload[:19])
+        if failure=="write":raise OSError("simulated full filesystem")
+        return real_write(fd,payload)
+    def fsync(fd):
+        if failure=="fsync" and os.fstat(fd).st_ino==before.st_ino:
+            raise OSError("simulated interrupted commit")
+        return real_fsync(fd)
+    monkeypatch.setattr(module.os,"write",write)
+    monkeypatch.setattr(module.os,"fsync",fsync)
+    with pytest.raises(OSError):submit(guard,value())
+    partial=result.read_bytes()
+    assert partial
+    monkeypatch.setattr(module.os,"write",real_write)
+    monkeypatch.setattr(module.os,"fsync",real_fsync)
+    assert submit(guard,value())["submitted"]
+    assert result.stat().st_ino==before.st_ino
+    assert json.loads(result.read_bytes())["status"]=="completed"
+    with pytest.raises(PolicyDenied,match="already_submitted"):
+        submit(guard,{**value(),"summary":"different"})
+
+def test_delegated_result_inode_fits_parent_without_other_sibling_mounts(tmp_path):
+    from herdr.security import InvocationIdentity, RuntimeAssurance
+    from herdr.context import digest
+    parent,result=setup(tmp_path)
+    g=parent.grant
+    child_id=InvocationIdentity(g.identity.consumer,"child-agent",g.identity.agent_id,
+        g.identity.task_id,"child-task","child-run",g.identity.fencing_token+1)
+    child_result=tmp_path/"child-result.json";child_result.touch(mode=0o600)
+    child_slot=ResultSlot.bind(child_result,child_id,"child-key")
+    child=replace(g,identity=child_id,parent_grant_hash=g.hash,
+        tool_rules=(replace(g.tool_rules[0],result_slot=child_slot),),
+        runtime_assurance=replace(g.runtime_assurance,writable_roots=(str(child_result),)))
+    child.require_subset_of(g)
+    forbidden=tmp_path/"other-result.json";forbidden.touch()
+    with pytest.raises(SecurityError,match="runtime assurance"):
+        replace(child,runtime_assurance=replace(child.runtime_assurance,
+            writable_roots=(str(child_result),str(forbidden)))).require_subset_of(g)
+    with pytest.raises(SecurityError,match="runtime assurance"):
+        replace(child,runtime_assurance=replace(child.runtime_assurance,
+            writable_roots=(str(tmp_path),))).require_subset_of(g)

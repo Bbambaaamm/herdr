@@ -562,6 +562,16 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
                                   parent_agent_id=coordinator, parent_task_id="coordinator:" + coordinator,
                                   task_id=str(task["id"]), run_token=str(task["run_token"]),
                                   fencing_token=task["fencing_token"])
+    session = {
+        "agent_name": agent_name, "session_name": session_name, "pane_id": "",
+        "pane_marker": pane_marker, "coordinator_agent": coordinator,
+        "coordinator_pane_id": coordinator_pane, "owned_pane": True,
+        "launch_identity": identity.to_json(), "economic_delivery_attempted": False,
+        "agent_start_attempted": False, "pane_split_started": False,
+        "launch_intent_version": 1, "created_at": utcnow().isoformat(),
+    }
+    task["execution_session"] = session
+    persist_execution_session(task)
     try:
         launch = factory.prepare(identity=identity, workspace=Path(workspace),
                                  tools=tuple(task.get("parent_tools") or ()),
@@ -588,6 +598,8 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
                 raise RuntimeError("task_startup_source_missing")
             return source_process.get("shell_pid")
         launch.verify_spawn_source(inspect_startup_source)
+        session["pane_split_started"] = True
+        persist_execution_session(task)
         split_attempted = True
         split = _herdr_json(
             [
@@ -606,19 +618,7 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
             raise RuntimeError("task_session_pane_not_isolated")
         if pane_id in preexisting_panes:
             raise RuntimeError("task_session_pane_reused")
-        session = {
-            "agent_name": agent_name,
-            "session_name": session_name,
-            "pane_id": pane_id,
-            "pane_marker": pane_marker,
-            "coordinator_agent": coordinator,
-            "coordinator_pane_id": coordinator_pane,
-            "profile": profile,
-            "owned_pane": True,
-            "launch_identity": identity.to_json(),
-            "economic_delivery_attempted": False,
-            "created_at": utcnow().isoformat(),
-        }
+        session.update(pane_id=pane_id, profile=profile)
         task["execution_session"] = session
         HOST_POLICY_LAUNCHES[(task["id"], task["run_token"])] = launch
         persist_execution_session(task)
@@ -722,7 +722,7 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         for candidate in candidates:
             if not _cleanup_setup_pane(candidate, coordinator_pane, pane_marker,
                                        agent_name, agent_start_attempted,
-                                       preexisting_panes):
+                                       preexisting_panes, task=task):
                 cleanup_failed = True
         if isinstance(task.get("execution_session"), dict):
             session = task["execution_session"]
@@ -757,6 +757,22 @@ def cleanup_task_session(task: dict) -> bool:
         return True
     pane_id = str(session.get("pane_id") or "")
     if not pane_id:
+        never_split = (type(session.get("launch_intent_version")) is int
+            and session["launch_intent_version"] == 1
+            and session.get("pane_split_started") is False
+            and session.get("agent_start_attempted") is False
+            and session.get("economic_delivery_attempted") is False
+            and session.get("launch_identity") is not None)
+        if never_split:
+            try:
+                _cleanup_prepared_root_launch(task)
+            except Exception:
+                session["cleanup_status"] = "launch_cleanup_failed"
+                return False
+            session["closed_at"] = utcnow().isoformat()
+            session["cleanup_status"] = "closed_before_split"
+            persist_execution_session(task, startup=False)
+            return True
         session["cleanup_status"] = "close_unproven"
         return False
     coordinator_pane = str(session.get("coordinator_pane_id") or "")
@@ -923,7 +939,7 @@ TASK COMPLETION CONTRACT:
 - Any economic child coding, research, testing, or review requires an admitted durable Herdr TaskGraph child before prompt delivery. Direct unmanaged persistent-child prompts are denied; read-only inspection may remain local.
 - Before finishing, use herdr_submit_result with status, a nonempty evidence list and summary. The host publishes to the exact attempt-owned result inode.
 - The host binds task_id="{task_id}", run_token="{run_token}", the fence and idempotency key; do not supply a path or identity arguments.
-- Include keys: task_id, run_token, status, summary, issue, evidence, blocker, next_action, completed_at.
+- Supply only status, evidence and summary to the tool. Put blocker details and suggested next actions in summary; the host adds exact task/run/fence/idempotency metadata.
 - status must be one of completed, blocked, failed.
 - If GitHub write authorization is required to complete the slice, set status=blocked and blocker=github_write_auth_required. Preserve exact local branch/patch/evidence and do not redo implementation.
 - If an interactive approval/question is required, do not guess or approve it yourself; leave it blocked with evidence.

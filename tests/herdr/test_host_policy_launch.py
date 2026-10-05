@@ -374,3 +374,96 @@ def test_host_environment_rejects_presence_based_loader_controls(monkeypatch):
     monkeypatch.setenv("LD_TRACE_LOADED_OBJECTS","")
     with pytest.raises(ValueError,match="unsafe"):
         launch.environment()
+
+
+@pytest.mark.parametrize("foreign_mount",[False,True])
+def test_actual_parent_child_seal_accepts_only_bound_delegated_result_inode(tmp_path,monkeypatch,foreign_mount,private_result_kernel_root):
+    tmp_path=private_result_kernel_root
+    from herdr.result_submission import ResultSlot,TOOL,ARGUMENTS
+    from herdr.security import InvocationIdentity,ToolRule,RiskClass
+    sandbox=sandbox_module()
+    if not sandbox.BWRAP.is_file():pytest.skip("bwrap prerequisite unavailable")
+    workspace=tmp_path/"worktrees"/"workspace";workspace.mkdir(parents=True)
+    config=tmp_path/"config";config.mkdir();releases=tmp_path/"releases";releases.mkdir()
+    monkeypatch.setattr(sandbox,"HERDR_CONFIG",config)
+    monkeypatch.setattr(sandbox,"HERDR_RELEASES",releases)
+    monkeypatch.setattr(sandbox,"DEFAULT_WRITABLE",())
+    cli=tmp_path/"herdr";cli.write_text("#!/bin/sh\nexit 0\n");cli.chmod(0o755)
+    policy=tmp_path/"policy";policy.write_text("#!/bin/sh\nexit 2\n");policy.chmod(0o555)
+    results=tmp_path/"results";results.mkdir(mode=0o700)
+    parent_file=results/"parent.result.json";parent_file.touch(mode=0o600)
+    child_file=results/"child.result.json";child_file.touch(mode=0o600)
+    other=results/"other.json";other.touch(mode=0o600)
+    parent=grant(workspace)
+    parent=replace(parent,scope=replace(parent.scope,tools=(*parent.scope.tools,TOOL)),
+        tool_rules=(*parent.tool_rules,ToolRule(TOOL,RiskClass.RESULT_SUBMISSION,ARGUMENTS,
+            allowed_roots=(str(results),),requires_sandbox=True,
+            result_slot=ResultSlot.bind(parent_file,parent.identity,"parent-key"))))
+    resources=[]
+    def physical_seal(planned,destination,extra=()):
+        item=mount(tmp_path);marker="delegated-result-"+uuid.uuid4().hex
+        fd=os.open(workspace,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);info=os.fstat(fd)
+        pin=sandbox.PinnedWorktree(workspace,fd,info.st_dev,info.st_ino,workspace.parent)
+        env={**os.environ,"HERDR_DURABLE_TASK_PANE":marker,
+             **{key:str(getattr(planned.identity,field)) for field,key in IDENTITY_ENV.items()}}
+        args=sandbox.command(workspace,cli,writable=(destination,),policy=policy,
+            child_workspace_writable=False,pinned_worktree=pin,policy_mount=item)
+        for forbidden in extra:
+            # Deliberately create an unexpected physical mount for rejection.
+            index=args.index("--")
+            args[index:index]=["--bind",str(forbidden),str(forbidden)]
+        proc=subprocess.Popen(args,stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,env=env)
+        resources.append((proc,pin,item))
+        pid=None
+        for _ in range(100):
+            if proc.poll() is not None:pytest.fail(proc.stderr.read(8192).decode())
+            rows=[]
+            for entry in Path("/proc").iterdir():
+                if not entry.name.isdigit():continue
+                try:
+                    with (entry/"environ").open("rb") as stream:raw=stream.read(262145)
+                    if ("HERDR_DURABLE_TASK_PANE="+marker).encode() in raw.split(bytes([0])):
+                        rows.append({"pid":int(entry.name)})
+                except OSError:pass
+            pid=sandbox.inner_pid({"foreground_processes":rows},marker)
+            if pid:break
+            time.sleep(.02)
+        assert pid
+        bound,_=item.seal(pid,planned,identity=planned.identity,
+            attestation={"task_id":planned.identity.task_id,"run_token":planned.identity.run_token,"sandbox_pid":pid},
+            tools=planned.scope.tools,permissions=planned.scope.permissions,
+            private_key=Ed25519PrivateKey.generate(),key_id="isolated-result-test")
+        return bound
+    try:
+        parent=physical_seal(parent,parent_file)
+        assert str(child_file) not in parent.runtime_assurance.writable_roots
+        child_identity=InvocationIdentity(parent.identity.consumer,"child-agent",parent.identity.agent_id,
+            parent.identity.task_id,"child-task","child-run",parent.identity.fencing_token+1)
+        child=replace(parent,identity=child_identity,parent_grant_hash=parent.hash,
+            tool_rules=tuple(replace(rule,result_slot=ResultSlot.bind(child_file,child_identity,"child-key"))
+                if rule.tool==TOOL else rule for rule in parent.tool_rules))
+        child=physical_seal(child,child_file,(other,) if foreign_mount else ())
+        if foreign_mount:
+            with pytest.raises(SecurityError,match="runtime assurance"):child.require_subset_of(parent)
+        else:
+            child.require_subset_of(parent)
+            assert str(child_file) in child.runtime_assurance.writable_roots
+            assert parent_file.stat().st_ino!=child_file.stat().st_ino
+    finally:
+        for proc,pin,item in reversed(resources):
+            proc.stdin.close()
+            try:proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:proc.kill();proc.wait(timeout=3)
+            pin.close();cleanup(item)
+
+
+@pytest.fixture
+def private_result_kernel_root():
+    import tempfile
+    repo=Path(__file__).resolve().parents[2]
+    # Host task-store paths live outside sandbox tmpfs. Keep this test's bind
+    # targets outside /tmp so the parent's generic tmpfs cannot mask the case.
+    with tempfile.TemporaryDirectory(prefix=".herdr-result-kernel-",dir=repo) as name:
+        root=Path(name).resolve()
+        assert root.parent==repo.resolve()
+        yield root

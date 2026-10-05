@@ -1360,3 +1360,92 @@ def test_modern_root_prompt_intent_is_persisted_before_effect_and_never_repeats(
     assert events==[("intent",True),("native",)]
     with pytest.raises(RuntimeError,match="already_started"):worker.run_prompt(task)
     assert len(events)==2
+
+
+def test_root_preparation_crash_retains_full_identity_before_any_resource(tmp_path,monkeypatch):
+    from tests.policy_launch_fakes import FakeHostPolicyLaunchFactory
+    configure_paths(tmp_path);task=base_task();worker.prepare_attempt(task)
+    task["workspace"]=str(tmp_path);task["fencing_token"]=17
+    calls=[]
+    def native(args,**kw):
+        calls.append(args);assert args[:2]==["agent","get"]
+        return {"result":{"agent":{"kind":"hermes","pane_id":"coordinator","workspace_id":"workspace"}}}
+    monkeypatch.setattr(worker,"_herdr_json",native)
+    resources=tmp_path/"simulated-frozen-launch";factory=FakeHostPolicyLaunchFactory()
+    def prepare(**kwargs):
+        retained=json.loads((worker.RUNNING/(task["id"]+".json")).read_text())
+        session=retained["execution_session"]
+        assert session["launch_identity"]==kwargs["identity"].to_json()
+        assert session["launch_intent_version"]==1
+        assert session["pane_split_started"] is False and session["agent_start_attempted"] is False
+        resources.write_text("prepared")
+        raise SystemExit("simulated worker death after resource preparation")
+    monkeypatch.setattr(factory,"prepare",prepare)
+    with pytest.raises(SystemExit):worker.create_task_session(task,policy_launch_factory=factory)
+    restored=json.loads((worker.RUNNING/(task["id"]+".json")).read_text())
+    assert restored["run_token"]==task["run_token"] and restored["fencing_token"]==17
+    assert resources.exists() and len(calls)==1
+    cleaned=[]
+    factory.cleanup_orphan=lambda identity:cleaned.append(identity.to_json()) or resources.unlink() or True
+    monkeypatch.setattr(worker,"_root_policy_factory",lambda:factory)
+    monkeypatch.setattr(worker,"HOST_POLICY_LAUNCHES",{})
+    assert worker.cleanup_task_session(restored)
+    assert not resources.exists() and cleaned==[restored["execution_session"]["launch_identity"]]
+    assert restored["execution_session"]["cleanup_status"]=="closed_before_split"
+    assert restored["run_token"]==task["run_token"] and restored["fencing_token"]==17
+
+@pytest.mark.parametrize("fault",["split","unknown-split","start","prompt","legacy"])
+def test_sessionless_root_cleanup_never_guesses_after_native_intent(tmp_path,monkeypatch,fault):
+    configure_paths(tmp_path);task=base_task();session=_modern_root_session(task)
+    task["task_file"]=str(worker.RUNNING/"task-1.json")
+    session.update(pane_id="",launch_intent_version=1,pane_split_started=False,agent_start_attempted=False)
+    if fault=="split":session["pane_split_started"]=True
+    if fault=="unknown-split":session["pane_split_started"]=None
+    if fault=="start":session["agent_start_attempted"]=True
+    if fault=="prompt":session["economic_delivery_attempted"]=True
+    if fault=="legacy":session.pop("launch_intent_version")
+    monkeypatch.setattr(worker,"_cleanup_prepared_root_launch",lambda _:pytest.fail("ambiguous root resources released"))
+    monkeypatch.setattr(worker,"_herdr_json",lambda *args,**kw:pytest.fail("empty pane guessed as native quiescence"))
+    assert worker.cleanup_task_session(task) is False
+    assert session["cleanup_status"]=="close_unproven" and "closed_at" not in session
+
+
+def test_actual_root_setup_failure_passes_task_to_absent_agent_cleanup(tmp_path,monkeypatch):
+    configure_paths(tmp_path);task=base_task();worker.prepare_attempt(task)
+    task.update(workspace=str(tmp_path),parent_tools=["read_file","herdr_submit_result"],
+                parent_permissions=["repo:read"],fencing_token=3)
+    def native(args,**kw):
+        if args[:2]==["agent","get"]:
+            return {"result":{"agent":{"kind":"hermes","pane_id":"coordinator","workspace_id":"workspace"}}}
+        if args[:2]==["pane","list"]:return {"result":{"panes":[{"pane_id":"coordinator"}]}}
+        if args[:2]==["pane","split"]:return {"result":{"pane":{"pane_id":"owned"}}}
+        if args[:2]==["pane","process-info"]:return {"result":{"process_info":{"shell_pid":123}}}
+        if args[:2]==["pane","run"]:return {"result":{}}
+        if args[:2]==["agent","start"]:raise RuntimeError("native start absent")
+        raise AssertionError(args)
+    monkeypatch.setattr(worker,"_herdr_json",native)
+    monkeypatch.setattr(worker,"start_bridge",lambda *args:None)
+    monkeypatch.setattr(worker,"stop_bridge",lambda *args:None)
+    monkeypatch.setattr(worker,"frozen_policy",lambda:_policy_file(tmp_path))
+    monkeypatch.setattr(worker,"sandbox_command",lambda *args,**kw:["/bin/true"])
+    monkeypatch.setattr(worker,"inner_pid",lambda *args:123)
+    monkeypatch.setattr(worker,"verify_sandbox",lambda *args,**kw:True)
+    cleaned=[]
+    def clean(*args,**kw):
+        assert kw["task"] is task
+        assert kw["task"]["execution_session"]["agent_start_attempted"] is True
+        cleaned.append(args[0]);return True
+    monkeypatch.setattr(worker,"_cleanup_setup_pane",clean)
+    with pytest.raises(RuntimeError,match="native start absent"):
+        worker.create_task_session(task)
+    assert cleaned==["owned"] and task["execution_session"]["cleanup_status"]=="closed"
+
+def test_quantlab_completion_prompt_matches_closed_result_tool(tmp_path):
+    configure_paths(tmp_path);task=base_task()
+    task["repo"]="Bbambaaamm/Autonomous-Quant-Lab"
+    task["safety_profile"]="quantlab-paper"
+    worker.prepare_attempt(task)
+    rendered=worker.prompt_text(task)
+    assert "Supply only status, evidence and summary" in rendered
+    assert "Include keys:" not in rendered
+    assert "herdr_submit_result" in rendered

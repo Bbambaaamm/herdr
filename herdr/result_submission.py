@@ -104,16 +104,25 @@ def submit(guard, raw, *, consume_approval=True):
                 or info.st_size > slot.max_bytes):
             raise PolicyDenied("result_slot_replaced")
         existing = os.read(fd, slot.max_bytes + 1)
-        if existing:
-            if existing != encoded:
+        if existing and existing != encoded:
+            # A prefix is an interrupted uncommitted candidate, not acceptance.
+            # Repair only an exact prefix of this same identity-bound submission.
+            if len(existing) >= len(encoded) or not encoded.startswith(existing):
                 raise PolicyDenied("result_already_submitted")
-        else:
+            try:
+                json.loads(existing)
+            except (ValueError, UnicodeError):
+                pass
+            else:
+                raise PolicyDenied("result_already_submitted")
+        if existing != encoded:
             os.lseek(fd,0,os.SEEK_SET)
             pending=memoryview(encoded)
             while pending:
                 written=os.write(fd,pending)
                 if written<=0: raise OSError("result write made no progress")
                 pending=pending[written:]
+            os.ftruncate(fd,len(encoded))
         os.fsync(fd)
     finally:
         os.close(fd)
