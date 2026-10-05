@@ -138,7 +138,7 @@ def test_partial_submission_replays_same_candidate_on_exact_inode(tmp_path,monke
         if failure=="write":raise OSError("simulated full filesystem")
         return real_write(fd,payload)
     def fsync(fd):
-        if failure=="fsync" and os.fstat(fd).st_ino==before.st_ino:
+        if failure=="fsync" and os.fstat(fd).st_ino==before.st_ino and os.fstat(fd).st_size:
             raise OSError("simulated interrupted commit")
         return real_fsync(fd)
     monkeypatch.setattr(module.os,"write",write)
@@ -174,3 +174,36 @@ def test_delegated_result_inode_fits_parent_without_other_sibling_mounts(tmp_pat
     with pytest.raises(SecurityError,match="runtime assurance"):
         replace(child,runtime_assurance=replace(child.runtime_assurance,
             writable_roots=(str(tmp_path),))).require_subset_of(g)
+
+
+@pytest.mark.parametrize("prefix",[1,5,19])
+def test_partial_result_intent_denies_different_candidate_with_same_prefix(tmp_path,monkeypatch,prefix):
+    import herdr.result_submission as module
+    guard,result=setup(tmp_path);inode=result.stat().st_ino
+    actual=os.write;calls=0
+    def interrupted(fd,data):
+        nonlocal calls
+        calls+=1
+        if calls==1:return actual(fd,data[:prefix])
+        raise OSError("interrupt original candidate")
+    monkeypatch.setattr(module.os,"write",interrupted)
+    with pytest.raises(OSError):submit(guard,value())
+    retained=result.read_bytes()
+    assert len(retained)==prefix
+    monkeypatch.setattr(module.os,"write",actual)
+    with pytest.raises(PolicyDenied,match="already_submitted"):
+        submit(guard,{**value(),"summary":"different candidate"})
+    assert result.read_bytes()==retained and result.stat().st_ino==inode
+    assert submit(guard,value())["submitted"]
+
+def test_result_intent_survives_failure_before_first_payload_byte(tmp_path,monkeypatch):
+    import herdr.result_submission as module
+    guard,result=setup(tmp_path);actual=os.fsync
+    def interrupted(fd):raise OSError("intent fsync uncertain")
+    monkeypatch.setattr(module.os,"fsync",interrupted)
+    with pytest.raises(OSError):submit(guard,value())
+    assert result.read_bytes()==b""
+    monkeypatch.setattr(module.os,"fsync",actual)
+    with pytest.raises(PolicyDenied,match="already_submitted"):
+        submit(guard,{**value(),"summary":"different candidate"})
+    assert submit(guard,value())["submitted"]

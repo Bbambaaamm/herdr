@@ -104,6 +104,27 @@ def submit(guard, raw, *, consume_approval=True):
                 or info.st_size > slot.max_bytes):
             raise PolicyDenied("result_slot_replaced")
         existing = os.read(fd, slot.max_bytes + 1)
+        # Durable intent metadata belongs to this same private inode. It pins
+        # the entire first candidate before any result bytes are written.
+        import errno
+        intent = _canonical({"identity_sha256":slot.identity_sha256,
+            "idempotency_key":slot.idempotency_key,
+            "payload_sha256":hashlib.sha256(encoded).hexdigest()})
+        attribute = "user.herdr.result_submission"
+        try:
+            committed_intent = os.getxattr(fd, attribute)
+        except OSError as exc:
+            if exc.errno != errno.ENODATA: raise
+            committed_intent = None
+        if committed_intent is None:
+            # A complete legacy result authenticates itself against exact bytes;
+            # an unauthenticated partial legacy result stays quarantined.
+            if existing and existing != encoded:
+                raise PolicyDenied("result_already_submitted")
+            os.setxattr(fd, attribute, intent, flags=os.XATTR_CREATE)
+            os.fsync(fd)
+        elif committed_intent != intent:
+            raise PolicyDenied("result_already_submitted")
         if existing and existing != encoded:
             # A prefix is an interrupted uncommitted candidate, not acceptance.
             # Repair only an exact prefix of this same identity-bound submission.

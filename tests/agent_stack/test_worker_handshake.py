@@ -52,7 +52,7 @@ def test_existing_herdr_task_gets_explicit_consumer_scope():
     task["safety_profile"] = "herdr-core"
     worker.ensure_parent_scope(task)
     assert task["parent_role"] == "writer"
-    assert task["worktree_root"] == "/home/agentops/worktrees/herdr"
+    assert task["worktree_root"] == "/home/agentops/workspaces/herdr/worktrees"
     assert set(task["parent_tools"]) == {"read_file", "search_files", "patch", "write_file", "herdr_delegate_child", "herdr_submit_result"}
     assert task["parent_permissions"] == ["workspace-write"]
 
@@ -540,8 +540,8 @@ def test_herdr_core_prompt_has_generic_backlog_contract(tmp_path):
     assert "Root issue #53 is orchestration authority" in prompt
     assert "PAPER-only, PIT/causality" not in prompt
     assert "status=blocked only when the whole safe backlog cannot progress" in prompt
-    assert "/home/agentops/worktrees/herdr/" in prompt
-    assert "/home/agentops/workspaces/herdr/worktrees/" not in prompt
+    assert "/home/agentops/worktrees/herdr/" not in prompt
+    assert "/home/agentops/workspaces/herdr/worktrees/" in prompt
 
 
 def test_run_prompt_fails_closed_without_isolated_session(tmp_path):

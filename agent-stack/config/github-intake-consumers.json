@@ -76,7 +76,7 @@
       "hermes_profile": "quantlab",
       "priority_default": 60,
       "priority_architecture": 60,
-      "worktree_root": "/home/agentops/worktrees/herdr"
+      "worktree_root": "/home/agentops/workspaces/herdr/worktrees"
     },
     {
       "consumer": "heating",
