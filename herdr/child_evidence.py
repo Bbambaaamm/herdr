@@ -125,7 +125,8 @@ class ChildCompletionAuthority:
             "changed_files":["<exact changed files>"],"branch":"<isolated task branch>"}
         return ("\nHOST CHILD COMPLETION CONTRACT:\n"
             "- Lifecycle settlement is not verified completion. Preserve this attempt while CI/review is pending.\n"
-            "- Use WorkspaceManager.seal and supply artifact, artifact_workspace and numeric pr_number.\n"
+            "- Submit through herdr_submit_result with exactly one evidence item {herdr_completion:{version:1,artifact:<ArtifactRef>,pr_number:<integer>,scope_self_check:<only when required>}}; the host derives the admitted workspace.\n"
+            "- The reviewed commit must include this exact immutable footer: "+__import__("herdr.verification_binding",fromlist=["commit_footer"]).commit_footer(plan)+"\n"
             "- Worker evidence/producer labels cannot waive host validation.\n"
             "- A frozen scope_policy requires exact scope_self_check; unrelated or shared-contract changes require a revised host plan, never implicit scope expansion.\n"
             "- Artifact contract: "+canonical(artifact).decode()+"\n"
@@ -146,7 +147,9 @@ class ChildCompletionAuthority:
         validate_plan(plan)
         if plan["spec_hash"]!=child_spec(rec):
             raise EvidenceError("child specification changed")
-        workspace=payload.get("artifact_workspace")
+        from .result_candidate import completion_candidate
+        candidate=completion_candidate(payload,workspace=child_workspace(rec)[0])
+        workspace=candidate.get("artifact_workspace")
         if (not isinstance(workspace,str) or not Path(workspace).is_absolute()
                 or Path(workspace)!=child_workspace(rec)[0]):
             raise EvidenceError("child artifact workspace differs from admitted worktree")
@@ -158,7 +161,7 @@ class ChildCompletionAuthority:
             result=self.collector(*args)
             require_child_workspace(rec)
             return result
-        bundle=accept_artifact(task,payload,plan,self.store,Path(workspace),collect,result_payload_sha256=payload_hash)
+        bundle=accept_artifact(task,candidate,plan,self.store,Path(workspace),collect,result_payload_sha256=payload_hash)
         receipt=AcceptedChildReceipt(2,child_identity(rec).to_json(),payload_hash,bundle["bundle_hash"],
             plan["plan_hash"],plan["spec_hash"],plan["policy_hash"],bundle["level"])
         receipt.validate(rec,payload_hash)
@@ -207,3 +210,33 @@ class ChildCompletionAuthority:
         except OwnershipError:
             return None
         return accepted.to_json()
+
+
+def rejected_child_candidate(rec, payload, error):
+    from .result_candidate import bounded_result
+    bounded_result(payload)
+    if (not isinstance(payload, dict) or payload.get("status") != "completed"
+            or payload.get("task_id") != rec.node.id or payload.get("run_token") != rec.run_token
+            or payload.get("fencing_token") != rec.fencing_token
+            or payload.get("idempotency_key") != rec.idempotency_key):
+        raise EvidenceError("rejected child candidate lacks exact attempt binding")
+    document = {"version": 1, "identity": child_identity(rec).to_json(),
+        "candidate_status": "completed", "level": "needs_replan",
+        "result_payload_sha256": digest(payload), "artifact_sha256": payload.get("artifact_sha256"),
+        "code": error.code, "reason": str(error)[:1024] or error.code}
+    validate_child_rejection(rec, document)
+    return document
+
+def validate_child_rejection(rec, document):
+    import re
+    if (not isinstance(document, dict) or set(document) != {"version", "identity",
+            "candidate_status", "level", "result_payload_sha256", "artifact_sha256", "code", "reason"}
+            or type(document["version"]) is not int or document["version"] != 1
+            or document["identity"] != child_identity(rec).to_json()
+            or document["candidate_status"] != "completed" or document["level"] != "needs_replan"
+            or any(not isinstance(document[k], str) or not re.fullmatch("[0-9a-f]{64}", document[k])
+                   for k in ("result_payload_sha256", "artifact_sha256"))
+            or not isinstance(document["code"], str) or not re.fullmatch("[a-z_]{1,128}", document["code"])
+            or document["code"] in {"evidence_missing", "evidence_unavailable"}
+            or not isinstance(document["reason"], str) or not 1 <= len(document["reason"]) <= 1024):
+        raise EvidenceError("invalid permanent child rejection receipt")

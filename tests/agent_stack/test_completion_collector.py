@@ -28,6 +28,9 @@ def proof_fixture():
     comment = {"id": 8, "user": {"login": collector.BOT, "type": "Bot"},
                "body": f"Codex Review: Didn't find any major issues. Bravo.\n**Reviewed commit:** \x60{head[:10]}\x60",
                "created_at": "2026-10-03T20:00:00Z"}
+    plan.update(identity={"id":"task","run_token":"run","attempt":1,
+                "idempotency_key":"key","fencing_token":2},
+                spec_hash="d"*64,policy_hash="e"*64,base_sha=base)
     return artifact, plan, pr, checks, comment
 
 
@@ -50,7 +53,9 @@ def install_transport(monkeypatch, artifact, plan, pr, checks, comment, *, resol
         if "/issues/" in path:
             return [comment]
         if "/commits/" in path:
-            return {"sha": resolved or artifact.commit_sha}
+            from herdr.verification_binding import commit_footer
+            return {"sha": resolved or artifact.commit_sha,
+                    "commit":{"message":"Candidate\n\n"+commit_footer(plan)}}
         raise AssertionError(path)
     monkeypatch.setattr(collector, "github", api)
     monkeypatch.setattr(collector, "_unresolved_threads", lambda *a: False)
@@ -149,6 +154,9 @@ def test_actual_worker_replays_host_bundle_after_crash_without_recollection(tmp_
     plan["spec_hash"] = collector.spec_digest(task)
     plan["policy_hash"] = digest(collector.typed_policy("coding"))
     plan["plan_hash"] = digest({k: v for k, v in plan.items() if k not in {"plan_hash", "baseline"}})
+    from herdr.verification_binding import commit_binding
+    bound_spec=commit_binding(plan)
+    proof["review"]["specification_binding"]={**bound_spec,"binding_sha256":digest(bound_spec)}
     store.publish("plan", digest(binding(task)), plan)
     calls = []
     monkeypatch.setattr(collector, "collect_github", lambda *a: calls.append(a) or proof)
@@ -350,6 +358,9 @@ def test_actual_worker_scope_acceptance_or_typed_permanent_refusal(tmp_path,monk
     result["scope_self_check"]["verdict"]=refusal
     result.update(task_id=task["id"],run_token=task["run_token"],status="completed",
         summary="Committed bounded result",blocker=None,artifact_workspace=str(workspace))
+    from herdr.verification_binding import commit_binding
+    bound_spec=commit_binding(plan)
+    proof["review"]["specification_binding"]={**bound_spec,"binding_sha256":digest(bound_spec)}
     store.publish("plan",digest(binding(task)),plan)
     handshake.configure_paths(store.root.parent)
     worker=handshake.worker

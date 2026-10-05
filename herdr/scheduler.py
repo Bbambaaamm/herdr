@@ -344,6 +344,7 @@ class TaskRecord:
     result_artifact_sha256: str | None = None
     completion_contract_version: int = 2
     completion_receipt: dict[str,object] | None = None
+    completion_failure: dict[str,object] | None = None
     result_evidence_canonical: bytes | None = None
     result_handoff: dict[str, object] | None = None
 
@@ -1790,23 +1791,38 @@ class DynamicChildScheduler:
         except (OwnershipError,SchedulerError,TypeError,ValueError):
             return False
         receipt=None
+        rejection=None
         if status=="completed":
             from .child_evidence import ChildCompletionAuthority,AcceptedChildReceipt
-            from .evidence import EvidenceError
-            if not isinstance(self.completion_authority,ChildCompletionAuthority):
-                return False
+            from .evidence import EvidenceError,EvidenceMissing,EvidenceUnavailable
             try:
+                if not isinstance(self.completion_authority,ChildCompletionAuthority):
+                    raise EvidenceError("host child completion authority is not configured; trusted replan required")
                 receipt=self.completion_authority.verify(rec,result_payload)
                 if not isinstance(receipt,AcceptedChildReceipt):
                     return False
                 from .evidence import digest
                 receipt.validate(rec,digest(result_payload))
-            except EvidenceError:
+            except (EvidenceMissing,EvidenceUnavailable):
                 return False
+            except EvidenceError as exc:
+                from .child_evidence import rejected_child_candidate
+                try:
+                    rejection=rejected_child_candidate(rec,result_payload,exc)
+                    if rejection["artifact_sha256"] != artifact_sha256:
+                        return False
+                except EvidenceError:
+                    return False
+                status="blocked"
+                receipt=None
+                candidate=replace(rec,result_status=status,result_artifact_sha256=artifact_sha256)
+                handoff=HandoffEnvelope.submitted_child(candidate,evidence=json.loads(canonical))
+                handoff.require_binding(candidate)
         try:self._require_current_ownership(rec)
         except (OwnershipError,SchedulerError):return False
         if receipt is not None:
             rec.completion_receipt=receipt.to_json()
+        rec.completion_failure=rejection
         rec.state = states[status]
         rec.attempt_state = "terminal"
         rec.result_status = status
@@ -1824,6 +1840,8 @@ class DynamicChildScheduler:
                                "status": status, "state": rec.state.value,
                                "completion_contract_version":rec.completion_contract_version,
                                "completion_receipt":rec.completion_receipt,
+                               "completion_failure":rec.completion_failure,
+                               "completion_failure":rec.completion_failure,
                                "ownership_sha256":rec.ownership.hash if rec.ownership else None,
                                "handoff_ref":rec.ownership.handoff_ref if rec.ownership else None,
                                "ts": datetime.now(UTC).isoformat()})
@@ -1893,6 +1911,7 @@ class DynamicChildScheduler:
                     "result_artifact_sha256": rec.result_artifact_sha256,
                     "completion_contract_version":rec.completion_contract_version,
                     "completion_receipt":rec.completion_receipt,
+                    "completion_failure":rec.completion_failure,
                     "completion_level":(rec.completion_receipt or {}).get("level",
                         "legacy_unverified_result" if rec.result_status=="completed" else None),
                     "observed_execution": rec.observed_execution,
@@ -2177,6 +2196,18 @@ class DynamicChildScheduler:
                                 AcceptedChildReceipt(**receipt).validate(rec)
                             except (EvidenceError,TypeError,ValueError) as exc:
                                 raise SchedulerError("invalid verified child result receipt") from exc
+                        failure=e.get("completion_failure")
+                        if failure is not None:
+                            from .child_evidence import validate_child_rejection
+                            from .evidence import EvidenceError
+                            try:
+                                validate_child_rejection(rec,failure)
+                                if (status!="blocked" or receipt is not None
+                                        or failure["artifact_sha256"]!=e["artifact_sha256"]):
+                                    raise EvidenceError("permanent rejection settlement differs")
+                            except (EvidenceError,TypeError,ValueError) as exc:
+                                raise SchedulerError("invalid child permanent rejection") from exc
+                        rec.completion_failure=failure
                         rec.completion_receipt=receipt
                     rec.state = states[status]
                     rec.attempt_state = "terminal"

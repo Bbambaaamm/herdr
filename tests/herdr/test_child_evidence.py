@@ -31,6 +31,9 @@ def artifact_fixture(tmp_path,monkeypatch):
     result.update(artifact_workspace=str(path))
     monkeypatch.setattr("herdr.evidence.read_only_git",_real_git)
     monkeypatch.setattr("herdr.evidence.verify_invocation_session",launch_fixture)
+    from herdr.verification_binding import commit_binding
+    spec_binding=commit_binding(plan)
+    proof["review"]["specification_binding"]={**spec_binding,"binding_sha256":digest(spec_binding)}
     return rec,result,plan,store,path,proof
 
 def test_child_semantic_gate_uses_exact_real_artifact_and_replays_after_cleanup(tmp_path,monkeypatch):
@@ -201,6 +204,9 @@ def test_owned_child_specification_invalidates_old_semantic_plan(tmp_path,monkey
         (FrozenContract("api",1,"d"*64,rec.parent_task_id),),rec.parent_task_id,"artifact://handoff/task")
     original_spec=child_spec(rec)
     plan["spec_hash"]=original_spec
+    from herdr.verification_binding import commit_binding
+    updated=commit_binding(plan)
+    proof["review"]["specification_binding"]={**updated,"binding_sha256":digest(updated)}
     plan["plan_hash"]=digest({k:v for k,v in plan.items() if k not in {"plan_hash","baseline"}})
     authority=ChildCompletionAuthority(store=store,approve=lambda **kwargs:plan,collector=lambda *a:proof)
     authority.prepare(rec)

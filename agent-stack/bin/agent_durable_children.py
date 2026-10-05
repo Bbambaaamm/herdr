@@ -241,10 +241,17 @@ def publish_exact_child_result(scheduler: DynamicChildScheduler, rec, result_pat
                                               evidence_sha, evidence,
                                               status=result["status"],result_payload=result):
             raise ValueError("child result publication denied")
-    if (rec.attempt_state != "terminal" or rec.result_status != result["status"]
+    rejection=getattr(rec,"completion_failure",None)
+    if rejection is not None:
+        from herdr.child_evidence import validate_child_rejection
+        from herdr.evidence import digest
+        validate_child_rejection(rec,rejection)
+        if rejection["result_payload_sha256"] != digest(result) or rec.result_status!="blocked":
+            raise ValueError("child candidate differs from permanent host rejection")
+    if (rec.attempt_state != "terminal" or (rec.result_status != result["status"] and rejection is None)
             or rec.result_artifact_sha256 != evidence_sha):
         raise ValueError("child result not durably terminal")
-    if result["status"]=="completed":
+    if result["status"]=="completed" and rejection is None:
         from herdr.evidence import digest
         receipt=getattr(rec,"completion_receipt",None)
         if not isinstance(receipt,dict) or receipt.get("result_payload_sha256")!=digest(result):

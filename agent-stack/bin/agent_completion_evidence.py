@@ -169,6 +169,9 @@ def _collect_github(plan: dict, artifact, number):
             or pr.get("base", {}).get("ref") != "main"):
         raise EvidenceError("pull request repository, commit or baseline mismatch")
     initial_binding = _pr_binding(pr)
+    from herdr.verification_binding import verify_commit_binding
+    specification_binding = verify_commit_binding(plan, artifact,
+        github(f"repos/{repo}/commits/{artifact.commit_sha}"))
     checks = collect_checks(repo, artifact.commit_sha, plan["required_checks"],
                             require_success=True)
     verify_workflow(plan, artifact, checks)
@@ -209,6 +212,17 @@ def _collect_github(plan: dict, artifact, number):
     checks = collect_checks(repo, artifact.commit_sha, plan["required_checks"],
                             require_success=True)
     verify_workflow(plan, artifact, checks)
+    latest_comments = github(f"repos/{repo}/issues/{number}/comments?per_page=100")
+    retained = [row for row in latest_comments if row.get("id") == clean["id"]]
+    if len(retained) != 1 or retained[0] != clean:
+        raise EvidenceMissing("selected independent review changed or disappeared")
+    for row in latest_comments:
+        if row.get("id", 0) <= clean["id"] or row.get("user", {}).get("login") != BOT:
+            continue
+        body = row.get("body", "")
+        match = re.search(r"\*\*Reviewed commit:\*\*\s*\x60([0-9a-f]{10,40})\x60", body)
+        if match and artifact.commit_sha.startswith(match.group(1)):
+            raise EvidenceMissing("newer conversation review must be reconciled")
     latest = github(f"repos/{repo}/pulls/{number}")
     if _pr_binding(latest) != initial_binding:
         raise EvidenceError("pull request changed during evidence collection; replan is required")
@@ -216,6 +230,7 @@ def _collect_github(plan: dict, artifact, number):
             "review": {"actor": BOT, "commit_sha": artifact.commit_sha,
                        "comment_id": clean["id"], "created_at": clean["created_at"],
                        "body_digest": digest(clean["body"]),
+                       "specification_binding": specification_binding,
                        "repository": repo, "pull_request": number}}
 
 
@@ -287,7 +302,10 @@ def completion_instructions(task: dict) -> str:
               "- The host accepts results against a plan frozen before dispatch. Model prose and producer labels cannot waive it.\n"
               "- Completed worker result, integration, deployment, and control cycle are distinct levels.\n")
     if kind == "control":
-        return common + ("- This is a control cycle. Supply nonempty summary and next_action; its completion does not satisfy an implementation or its dependencies.\n")
+        return common + ("- This is a control cycle. Submit nonempty summary and evidence=[{herdr_control:{version:1,next_action:<nonempty text>}}] through herdr_submit_result. Its completion does not satisfy an implementation or its dependencies.\n")
+    from herdr.verification_binding import commit_footer
+    footer = (commit_footer(plan) if {"identity","spec_hash","policy_hash","base_sha"} <= set(plan)
+              else "<host must freeze and advertise this exact attempt before dispatch>")
     artifact = {
         "task_id": task.get("id"), "attempt": plan.get("identity", {}).get("attempt"),
         "base_sha": plan.get("base_sha"), "commit_sha": "<full exact commit>",
@@ -297,9 +315,10 @@ def completion_instructions(task: dict) -> str:
     return common + (
         "- Use the existing herdr.workspace.WorkspaceManager.seal and ArtifactRef for the committed clean worktree.\n"
         "- If the frozen plan declares scope_policy, also supply scope_self_check bound to spec_hash and exact result_sha; account for every changed file and acceptance criterion. BLOCK/REPLAN cannot claim completed.\n"
-        "- Add artifact, absolute artifact_workspace, and numeric pr_number to the result JSON. Artifact fields: "
+        "- Use herdr_submit_result(status, evidence, summary). Put exactly one structured evidence item {herdr_completion:{version:1,artifact:<ArtifactRef>,artifact_workspace:<absolute verified issue worktree>,pr_number:<integer>,scope_self_check:<only if required>}}. Artifact fields: "
         + json.dumps(artifact, sort_keys=True) + "\n"
         "- Keep the published artifact/workspace until host acceptance. Missing or unavailable CI/review means verification_pending on this same attempt, not another implementation.\n"
+        "- The reviewed commit must contain this exact immutable footer: " + footer + "\n"
         "- Frozen validation plan: " + json.dumps(plan, sort_keys=True) + "\n"
         "- Research/review use their declared report schema and exact independent artifact review; do not invent compilation, factual certainty, integration, or deployment evidence.\n")
 
@@ -372,6 +391,10 @@ def freeze_plan(root: Path, task: dict) -> None:
 
 
 def verify_completion(root: Path, task: dict, result: dict) -> dict:
+    from herdr.result_candidate import completion_candidate
+    from herdr.evidence import canonical
+    original_result = result
+    result = completion_candidate(result)
     kind = completion_kind(task)
     if kind not in {"coding", "control", "research", "review"}:
         raise EvidenceError(f"typed {kind} immutable completion contract is not configured")
@@ -399,7 +422,7 @@ def verify_completion(root: Path, task: dict, result: dict) -> dict:
                     or previous.get("kind") != "control" or previous.get("level") != "control_cycle"
                     or previous.get("spec_hash") != plan["spec_hash"]
                     or previous.get("policy_hash") != plan["policy_hash"]
-                    or previous.get("proof", {}).get("result_digest") != digest(result)):
+                    or previous.get("proof", {}).get("result_digest") != digest(original_result)):
                 raise EvidenceError("immutable control outcome publication conflict")
             if legacy:
                 store.publish("accepted", key, previous)
@@ -408,7 +431,7 @@ def verify_completion(root: Path, task: dict, result: dict) -> dict:
                   "level": "control_cycle", "kind": "control", "spec_hash": plan["spec_hash"],
                   "policy_hash": plan["policy_hash"], "plan_hash": plan["plan_hash"],
                   "baseline": plan["baseline"], "environment": plan["environment"],
-                  "proof": {"source": "host-schema-v1", "result_digest": digest(result)},
+                  "proof": {"source": "host-schema-v1", "result_digest": digest(original_result)},
                   "integration": None, "deployment": None}
         return {**bundle, "bundle_hash": store.publish("accepted", key, bundle)}
     workspace = result.get("artifact_workspace")
@@ -475,6 +498,10 @@ def child_completion_for_root(task_file, identity, *, factory):
             or path.parent.parent!=factory.task_store_root or task.get("id")!=identity["task_id"]
             or task.get("run_token")!=identity["run_token"]):
         raise EvidenceError("canonical authenticated parent completion binding required")
+    if task.get("child_completion_contracts") is None:
+        # Keep authenticated delegation available; absence of an acceptance
+        # policy never authorizes an unverified completed implementation.
+        return None
     return authority_for_parent(store_for(factory.task_store_root,task),task,
         parent_spec_hash=spec_digest(task),collector=collect_github,
         parent_identity=factory.parent_grant.identity)

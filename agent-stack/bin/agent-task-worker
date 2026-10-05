@@ -1331,6 +1331,16 @@ def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool)
             if waiting:
                 task["verification_reconcile_count"] = int(task.get("verification_reconcile_count", 0)) + 1
                 task["not_before"] = (utcnow() + timedelta(seconds=60)).isoformat()
+            if not waiting:
+                if defer_for_active_children(task_path, task, all_terminal=all_terminal):
+                    task["verification_resolution"] = "needs_replan_cleanup_pending"
+                    write_json(task_path, task)
+                    return
+                if not cleanup_task_session(task):
+                    task["watchdog_cleanup_blocker"] = "task_session_cleanup_failed"
+                    task["verification_resolution"] = "needs_replan_cleanup_pending"
+                    task["attempt_state"] = "delivery_uncertain"
+                    task.pop("result_status", None)
             write_json(task_path, task)
             move(task_path, BLOCKED)
             return

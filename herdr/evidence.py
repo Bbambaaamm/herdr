@@ -135,58 +135,15 @@ class EvidenceStore:
             raise
         except OSError as exc:
             raise EvidenceUnavailable("evidence cannot be read") from exc
-        except (TypeError, ValueError, KeyError) as exc:
+        except (TypeError, ValueError, KeyError, UnicodeError, RecursionError) as exc:
             raise EvidenceError("invalid evidence encoding") from exc
 
     def lookup_acceptance(self, identity: dict, plan_hash: str) -> tuple[dict | None, bool]:
-        """Read the unique address, or fail-closed reconcile legacy addresses.
-
-        Scan all old records for this attempt, not just the caller's current
-        artifact-derived key. Original records are retained and never rewritten.
-        Upgrade requires old writers to be quiesced by the release envelope.
-        """
-        key = digest({"identity": identity, "plan_hash": plan_hash})
+        from .accepted_index import AcceptedIndex
         try:
-            unique = self.read("accepted", key)
-        except EvidenceMissing:
-            unique = None
-        matches = []
-        for index, path in enumerate(sorted(self.root.glob("accepted-*.json"))):
-            if index >= 10_000:
-                raise EvidenceError("legacy evidence index exceeds migration bound")
-            address = path.name.removeprefix("accepted-").removesuffix(".json")
-            if not _SHA.fullmatch(address):
-                raise EvidenceError("invalid legacy evidence address")
-            if address == key:
-                continue
-            record = self.read("accepted", address)
-            if record.get("identity") != identity or record.get("plan_hash") != plan_hash:
-                continue
-            if record.get("level") == "verified_worker_result":
-                legacy_key = digest({"identity": identity, "plan_hash": plan_hash,
-                                     "artifact": record.get("artifact")})
-            elif record.get("level") == "control_cycle":
-                result_hash = record.get("proof", {}).get("result_digest")
-                if not isinstance(result_hash, str) or not _SHA.fullmatch(result_hash):
-                    raise EvidenceError("invalid legacy result digest")
-                legacy_key = digest({"identity": identity, "plan_hash": plan_hash,
-                                     "result_hash": result_hash})
-            else:
-                raise EvidenceError("unsupported legacy completion record")
-            if address != legacy_key:
-                raise EvidenceError("legacy completion address does not bind its payload")
-            matches.append(record)
-        if unique is not None:
-            comparable = {k: v for k, v in unique.items() if k != "publication_hash"}
-            if any({k: v for k, v in item.items() if k != "publication_hash"} != comparable
-                   for item in matches):
-                raise EvidenceError("conflicting legacy and unique attempt records require trusted replan")
-            return unique, False
-        if not matches:
-            return None, False
-        if any(item != matches[0] for item in matches[1:]):
-            raise EvidenceError("conflicting legacy attempt records require trusted replan")
-        return matches[0], True
+            return AcceptedIndex(self).lookup(identity, plan_hash)
+        except OSError as exc:
+            raise EvidenceUnavailable("host acceptance index is unavailable") from exc
 
     def _sync_directory(self) -> None:
         fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
@@ -201,12 +158,15 @@ class EvidenceStore:
         except OSError as exc:
             raise EvidenceUnavailable("host evidence publication is unavailable") from exc
 
-    def _publish(self, kind: str, key: str, payload: dict) -> str:
+    def _publish(self, kind: str, key: str, payload: dict, *, register_index=True) -> str:
         path = self._path(kind, key)
         content_hash = digest(payload)
         data = canonical({"payload": payload, "sha256": content_hash})
         if len(data) > 2_000_000:
             raise EvidenceError("evidence exceeds bounded record size")
+        if register_index:
+            from .accepted_index import AcceptedIndex
+            AcceptedIndex(self).prepare_publication(kind, key, payload)
         fd, tmp = tempfile.mkstemp(prefix=".publication-", dir=self.root)
         try:
             with os.fdopen(fd, "wb") as handle:
@@ -324,6 +284,9 @@ def verify_committed_bytes(artifact: ArtifactRef, workspace: Path, git) -> None:
     files. Compare every tracked file to the exact committed tree, and derive
     changed-file SHA-256 records from those committed blobs.
     """
+    import time
+    deadline = time.monotonic() + 60
+    total_bytes = 0
     entries = {}
     for item in git(["ls-tree", "-r", "-z", "--full-tree", artifact.commit_sha]).split("\0"):
         if not item:
@@ -334,6 +297,8 @@ def verify_committed_bytes(artifact: ArtifactRef, workspace: Path, git) -> None:
                 or not _GIT_SHA.fullmatch(blob)
                 or Path(relative).is_absolute() or ".." in Path(relative).parts):
             raise EvidenceError("unsupported committed output type or path")
+        if len(entries) >= 4096 or time.monotonic() > deadline:
+            raise EvidenceError("artifact tree exceeds cumulative verification bound")
         entries[relative] = blob
         path = workspace / relative
         if any(parent.is_symlink() for parent in path.parents if parent != workspace and parent.is_relative_to(workspace)):
@@ -347,6 +312,9 @@ def verify_committed_bytes(artifact: ArtifactRef, workspace: Path, git) -> None:
                     raise EvidenceError("unsupported or oversized tracked file")
                 if bool(info.st_mode & stat.S_IXUSR) != (mode == "100755"):
                     raise EvidenceError("physical executable mode differs from committed tree")
+                total_bytes += size
+                if total_bytes > 67_108_864 or time.monotonic() > deadline:
+                    raise EvidenceError("artifact tree exceeds cumulative verification bound")
                 sha = hashlib.sha1(f"blob {size}\0".encode())
                 remaining = size
                 while remaining:
@@ -361,6 +329,8 @@ def verify_committed_bytes(artifact: ArtifactRef, workspace: Path, git) -> None:
             raise EvidenceError("committed file is missing or unsafe") from exc
     records = []
     for relative in artifact.changed_files:
+        if time.monotonic() > deadline:
+            raise EvidenceError("artifact tree exceeds cumulative verification deadline")
         blob = entries.get(relative)
         if blob is None:
             if (workspace / relative).exists() or (workspace / relative).is_symlink():
@@ -370,6 +340,8 @@ def verify_committed_bytes(artifact: ArtifactRef, workspace: Path, git) -> None:
             data = git.raw(["cat-file", "blob", blob])
             records.append({"path": relative, "kind": "file", "size": len(data),
                             "sha256": hashlib.sha256(data).hexdigest()})
+    if time.monotonic() > deadline:
+        raise EvidenceError("artifact tree exceeds cumulative verification deadline")
     payload = {"task_id": artifact.task_id, "attempt": artifact.attempt,
                "base_sha": artifact.base_sha, "commit_sha": artifact.commit_sha,
                "branch": artifact.branch, "files": records}
@@ -550,6 +522,9 @@ def verify_invocation_session(task):
         verify_retained_policy_evidence(proof,identity=identity,pid=pid,attestation=original,now=verified_at)
         return proof
     except OSError as exc:
+        import errno
+        if exc.errno in {errno.ENOENT, errno.ESRCH}:
+            raise EvidenceError("retained physical invocation is irrecoverably lost; trusted replan required") from exc
         raise EvidenceUnavailable("retained physical invocation is unavailable") from exc
     except (SecurityError, KeyError, TypeError, ValueError) as exc:
         raise EvidenceError("retained physical invocation proof is invalid") from exc
@@ -619,6 +594,9 @@ def accept_artifact(task: dict, result: dict, plan: dict, store: EvidenceStore,
         verify_committed_bytes(artifact, workspace, manager.git)
     except WorkspaceError as exc:
         raise EvidenceError("artifact workspace verification failed") from exc
+    if scope_proof is not None:
+        from .scope_evidence import verify_shared_contracts
+        verify_shared_contracts(plan, artifact, manager.git)
     proof = collector(plan, artifact, result.get("pr_number"))
     required = list(plan["required_checks"])
     if (not isinstance(proof, dict) or set(proof) != {"checks", "review", "source"}
@@ -636,15 +614,18 @@ def accept_artifact(task: dict, result: dict, plan: dict, store: EvidenceStore,
             name="artifact-criteria", passed=True, artifact_result_sha=artifact.result_sha,
             producer="trusted-validator", evidence_sha256=digest(typed_proof)),)
     review = proof["review"]
-    if review.get("actor") != plan["reviewer"] or review.get("commit_sha") != artifact.commit_sha:
+    from .verification_binding import commit_binding
+    expected_binding = commit_binding(plan)
+    if (review.get("specification_binding") != {**expected_binding, "binding_sha256": digest(expected_binding)}
+            or review.get("actor") != plan["reviewer"] or review.get("commit_sha") != artifact.commit_sha):
         raise EvidenceError("review origin or commit mismatch")
     model_review = ModelReview(
         artifact_result_sha=artifact.result_sha,
         evidence_digest=ReviewerGate.evidence_digest(records),
         actor_id=review["actor"], provider="github", model="codex-review",
-        verdict=ReviewVerdict.PASS, review_sha256=digest(review),
+        verdict=ReviewVerdict.PASS, review_sha256=digest(review), spec_hash=plan["spec_hash"],
     )
-    gate = ReviewerGate(required_evidence=tuple(required))
+    gate = ReviewerGate(required_evidence=tuple(required), require_spec_binding=True)
     decision = gate.review(ReviewInput(
         spec_hash=plan["spec_hash"], artifact=artifact,
         worker_actor=(task.get("execution_session") or {}).get("agent_name", "durable-worker"),
@@ -663,6 +644,7 @@ def accept_artifact(task: dict, result: dict, plan: dict, store: EvidenceStore,
         raise EvidenceError("invocation policy changed during collection")
     if scope_proof is not None:
         validate_plan(plan)
+        verify_shared_contracts(plan, artifact, manager.git)
         if verify_scope_self_check(plan, artifact, result.get("scope_self_check")) != scope_proof:
             raise EvidenceError("scope report changed during collection")
     bundle = {

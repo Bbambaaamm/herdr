@@ -19,7 +19,7 @@ def host_fixture(monkeypatch):
 def scoped(tmp_path):
     task, result, plan, store, workspace, proof = fixture(tmp_path)
     policy = {"version": 1, "files": [{"path": "result.txt", "subtree": False}],
-              "acceptance_ids": ["functional"], "shared_contract_keys": ["api:v1"]}
+              "acceptance_ids": ["functional"], "shared_contract_keys": []}
     plan["scope_policy"] = policy
     plan["plan_hash"] = digest({k: v for k, v in plan.items() if k not in {"plan_hash", "baseline"}})
     report = {"version": 1, "spec_sha256": plan["spec_hash"],
@@ -75,7 +75,10 @@ def test_scope_replan_block_are_distinct_from_functional_failure(tmp_path, chang
     elif change == "replan": report["verdict"] = "REPLAN_REQUIRED"
     elif change == "block": report["verdict"] = "BLOCK"
     elif change == "side_effect": report["unexpected_side_effects"] = ["Unplanned external write."]
-    else: report["shared_contract_changes"] = [{"key": "api:v1", "previous_sha256": "a"*64, "next_sha256": "b"*64}]
+    else:
+        plan["scope_policy"]["shared_contract_keys"]=["api:v1"]
+        plan["plan_hash"]=digest({k:v for k,v in plan.items() if k not in {"plan_hash","baseline"}})
+        report["shared_contract_changes"] = [{"key": "api:v1", "previous_sha256": "a"*64, "next_sha256": "b"*64}]
     with pytest.raises(exception):
         accept_artifact(task, result, plan, store, workspace, lambda *a: pytest.fail("scope refused before CI"))
     assert not list(store.root.glob("accepted-*"))

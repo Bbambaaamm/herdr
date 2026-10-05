@@ -546,6 +546,13 @@ def _terminalize_from_result_locked(
             waiting = record_verification_failure(task, exc)
             if waiting:
                 task["not_before"] = (utcnow() + timedelta(seconds=60)).isoformat()
+            elif not cleanup_task_owned_pane(task):
+                task["watchdog_cleanup_blocker"] = "task_session_cleanup_failed"
+                task["verification_resolution"] = "needs_replan_cleanup_pending"
+                task["attempt_state"] = "delivery_uncertain"
+                task.pop("result_status", None)
+            else:
+                task.pop("watchdog_cleanup_blocker", None)
             move_task(path, BLOCKED, task)
             return
         task["completion_level"] = accepted["level"]

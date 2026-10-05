@@ -79,8 +79,9 @@ def strings(value, maximum, *, identifiers=False, nonempty=False):
 
 def validate_scope_policy(policy):
     require(isinstance(policy, dict)
-            and set(policy) == {"version", "files", "acceptance_ids", "shared_contract_keys"}
-            and type(policy["version"]) is int and policy["version"] == 1,
+            and type(policy.get("version")) is int and policy["version"] in {1, 2}
+            and set(policy) == ({"version", "files", "acceptance_ids", "shared_contract_keys"}
+                 | ({"shared_contracts"} if policy["version"] == 2 else set())),
             "unsupported scope policy")
     files = policy["files"]
     require(isinstance(files, list) and 1 <= len(files) <= 4096, "frozen file scope required")
@@ -91,6 +92,19 @@ def validate_scope_policy(policy):
     require(len({x["path"] for x in files}) == len(files), "duplicate frozen path")
     strings(policy["acceptance_ids"], 128, identifiers=True, nonempty=True)
     strings(policy["shared_contract_keys"], 128, identifiers=True)
+    if policy["version"] == 2:
+        rows = policy["shared_contracts"]
+        require(isinstance(rows, list) and len(rows) <= 128, "shared contract mapping exceeds bound")
+        for row in rows:
+            require(isinstance(row, dict) and set(row) == {"key", "path", "base_sha256"}
+                    and isinstance(row["key"], str) and _ID.fullmatch(row["key"])
+                    and isinstance(row["base_sha256"], str) and _SHA.fullmatch(row["base_sha256"]),
+                    "invalid frozen shared contract mapping")
+            path(row["path"])
+        require(len({row["key"] for row in rows}) == len(rows)
+                and len({row["path"] for row in rows}) == len(rows)
+                and {row["key"] for row in rows} == set(policy["shared_contract_keys"]),
+                "shared contract mapping must cover each frozen key exactly once")
     bounded_json(policy)
 
 
@@ -121,6 +135,7 @@ def verify_scope_self_check(plan, artifact, report):
     groups = report["changed_groups"]
     require(isinstance(groups, list) and 1 <= len(groups) <= 4096, "scope groups required")
     seen = set()
+    linked_criteria = set()
     for group in groups:
         require(isinstance(group, dict) and set(group) ==
                 {"files", "symbols", "resources", "acceptance_ids", "justification"},
@@ -132,12 +147,14 @@ def verify_scope_self_check(plan, artifact, report):
             seen.add(name)
         criteria = strings(group["acceptance_ids"], 128, identifiers=True, nonempty=True)
         require(set(criteria) <= set(policy["acceptance_ids"]), "unknown acceptance linkage")
+        linked_criteria.update(criteria)
         strings(group["symbols"], 256)
         strings(group["resources"], 256)
         require(isinstance(group["justification"], str)
                 and 1 <= len(group["justification"].strip()) <= 4096
                 and "\0" not in group["justification"], "change justification required")
     require(seen == set(artifact.changed_files), "scope report differs from exact artifact")
+    require(linked_criteria == set(policy["acceptance_ids"]), "scope report omits frozen acceptance linkage")
     for field in ("unrelated_changes", "unexpected_side_effects", "followups_not_implemented"):
         strings(report[field], 256)
     changes = report["shared_contract_changes"]
@@ -164,3 +181,34 @@ def verify_scope_self_check(plan, artifact, report):
             "report_sha256": digest(report), "policy_sha256": digest(policy),
             "coverage": "exact changed-file set and frozen acceptance linkage",
             "limitations": "worker explanations are advisory; independent review remains required"}
+
+
+def verify_shared_contracts(plan, artifact, git):
+    """Derive contract mutations from exact Git bytes, regardless of confession."""
+    import hashlib
+    import time
+    from .workspace import WorkspaceError
+    policy = plan["scope_policy"]
+    validate_scope_policy(policy)
+    if policy["version"] == 1:
+        if policy["shared_contract_keys"]:
+            raise ScopeReplan("frozen shared contract keys require a trusted path and base digest mapping")
+        return
+    deadline = time.monotonic() + 60
+    total = 0
+    for row in policy["shared_contracts"]:
+        if time.monotonic() > deadline:
+            raise ScopeReplan("shared contract verification exceeds cumulative bound")
+        try:
+            baseline = git.raw(["cat-file", "blob", artifact.base_sha + ":" + row["path"]])
+        except WorkspaceError as exc:
+            raise ScopeReplan("frozen shared contract baseline cannot be verified") from exc
+        total += len(baseline)
+        if total > 67108864 or time.monotonic() > deadline:
+            raise ScopeReplan("shared contract verification exceeds cumulative bound")
+        if hashlib.sha256(baseline).hexdigest() != row["base_sha256"]:
+            raise ScopeReplan("frozen shared contract baseline digest differs")
+        if row["path"] in artifact.changed_files:
+            # The verified ArtifactRef is the exact base-to-commit diff, including
+            # deletion and mode changes. A worker cannot omit this host observation.
+            raise ScopeReplan("exact artifact changes a frozen shared contract; invalidate dependents and replan")

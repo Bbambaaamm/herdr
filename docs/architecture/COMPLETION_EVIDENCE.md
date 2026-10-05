@@ -176,3 +176,69 @@ reference binds the full commit; base_sha256 is SHA256 of the canonical
 changes deny the projection. Verified worker completion still has a distinct
 parent_synthesis_and_integration next action and does not assert integration,
 deployment or factual certainty outside the frozen artifact criteria.
+
+
+## Reviewed specification, closed result submission and rejected attempts
+
+A fresh independent review must target a commit containing exactly one canonical
+Herdr-Verification-Binding footer. Its closed version-1 object carries the frozen
+five-field attempt identity, spec_hash, policy_hash and base_sha. The host reads
+the immutable commit metadata through GitHub and compares the whole canonical
+object with the frozen plan. A green old PR at the same base cannot be rebound
+to another task, run, fence, objective or policy by changing an ArtifactRef label.
+The collector also rereads the selected bot comment before acceptance; deletion,
+editing or a newer decision keeps the same attempt pending. Review is an
+independent artifact gate, not a guarantee of truth beyond the frozen criteria.
+
+The existing herdr_submit_result interface remains status/evidence/summary.
+Coding/research/review candidates use exactly one evidence object
+{"herdr_completion":{"version":1,"artifact":<ArtifactRef>,"pr_number":<number>}}.
+A required scope_self_check belongs inside that object. Root callers also
+declare the exact isolated artifact_workspace; an admitted child never chooses
+its workspace, which the host derives from the pinned worktree. Control cycles
+use {"herdr_control":{"version":1,"next_action":<text>}} and a nonempty summary.
+These objects are claims. They do not assert CI, review, scope, acceptance or
+integration authority. Child receipts bind the original complete SDK payload,
+not the host's decoded copy. Historical flat host transport remains readable.
+
+Scope policy version 2 maps every shared_contract_key to an exact path and
+base_sha256. The host checks the committed baseline and the actual ArtifactRef
+diff. An omitted shared-contract confession cannot conceal a change. Any such
+change invalidates the existing plan and dependent evidence; version-1 nonempty
+shared keys without a trusted mapping also require replan. Every frozen
+acceptance ID must appear in the aggregate change-group linkage.
+
+Missing/unavailable evidence remains pending on the same attempt. Permanent
+child rejection instead persists a full-identity needs_replan receipt, blocks
+the child and clears its claim/lease. The original candidate remains immutable;
+no accepted semantic receipt or completed dependency is manufactured. Physical
+namespace exit and exact cleanup still gate parent terminalization. Root worker
+and cold watchdog recovery close the exact owned session after a permanent
+rejection; failed cleanup remains quarantined and retries cleanup without an
+implementation redispatch. A lost retained physical invocation is permanent,
+whereas a temporary observation/transport failure can remain pending.
+
+## Acceptance history without a lifetime limit
+
+The host-private .acceptance-index holds bounded per-attempt immutable intents.
+An accepted bundle's exact proof is fsynced there before its original flat alias
+is published. A crash between those steps recovers that same proof and alias
+without repeating validators or accepting a different candidate. Flat bundles
+and legacy aliases remain intact; conflicting outcomes fail closed.
+
+Migration from the older flat layout uses durable Linux directory cookies
+bound to the source directory identity and metadata. Each pass processes at most
+512 entries, 8 MiB plus one bounded record, and one second between record
+operations. Incomplete migration raises EvidenceUnavailable for the same attempt.
+Participating publishers finish migration before changing the source directory.
+Restart resumes the checkpoint; a changed source restarts the scan conservatively.
+Old writers must first be quiesced by the existing ownership/epoch upgrade
+barrier. This index is host evidence storage, not another task queue.
+
+Completed migration makes lookup depend only on this attempt's intent and flat
+proof. New publication and replay therefore have no global 10,000-result cutoff.
+Index directories, locks, checkpoints and intents reject unsafe permissions,
+foreign ownership, symlinks, extra hardlinks and invalid bindings. The existing
+worker write-boundary protection covers the index with the rest of the store.
+Artifact verification separately limits tracked file count, aggregate bytes
+and elapsed checks; a per-file size limit alone is insufficient.

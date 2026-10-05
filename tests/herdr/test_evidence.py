@@ -71,10 +71,17 @@ def fixture(tmp_path):
             "reviewer": "chatgpt-codex-connector[bot]", "environment": {"collector": "test"}}
     plan["plan_hash"] = digest(plan)
     plan["baseline"] = [{"head_sha": base, "status": "completed"}]
+    from herdr.verification_binding import commit_footer
+    run_git(path, "commit", "--amend", "-qm", "result\n\n" + commit_footer(plan))
+    commit = run_git(path, "rev-parse", "HEAD")
+    artifact = manager.seal(ArtifactRef("task", 1, base, commit, "", (), "task"), path)
     result = {"artifact": artifact.to_json(), "pr_number": 4}
     store = EvidenceStore(tmp_path / "host" / "verification")
     proof = {"source": "github-api", "checks": {"tests": {"head_sha": commit, "id": 7}},
              "review": {"actor": plan["reviewer"], "commit_sha": commit, "comment_id": 8}}
+    from herdr.verification_binding import commit_binding
+    spec_binding = commit_binding(plan)
+    proof["review"]["specification_binding"] = {**spec_binding, "binding_sha256": digest(spec_binding)}
     return task, result, plan, store, path, proof
 
 
@@ -282,6 +289,9 @@ def typed_fixture(tmp_path, kind, fault=None):
     plan["plan_hash"] = digest({k: v for k, v in plan.items() if k not in {"plan_hash", "baseline"}})
     proof["checks"] = {"GitGuardian Security Checks": {"head_sha": commit, "app_id": 46505, "status": "completed", "conclusion": "success"}}
     proof["review"]["commit_sha"] = commit
+    from herdr.verification_binding import commit_binding
+    spec_binding = commit_binding(plan)
+    proof["review"]["specification_binding"] = {**spec_binding, "binding_sha256": digest(spec_binding)}
     return task, result, plan, store, path, proof
 
 
@@ -400,7 +410,8 @@ def test_failed_publication_is_typed_transient_and_leaves_no_accepted_record(tmp
     monkeypatch.setattr(os, "link", lambda *a, **k: (_ for _ in ()).throw(OSError("temporary disk failure")))
     with pytest.raises(EvidenceUnavailable, match="publication"):
         store.publish("accepted", "a" * 64, {"accepted": True})
-    assert not list(store.root.iterdir())
+    assert not list(store.root.glob("accepted-*"))
+    assert not list(store.root.glob(".publication-*"))
 
 
 def test_restart_finishes_interrupted_directory_fsync_before_accepting_record(tmp_path, monkeypatch):
@@ -448,7 +459,9 @@ def legacy_artifact_record(store, task, result, plan, first):
     legacy = {k: v for k, v in first.items() if k not in {"bundle_hash", "publication_hash"}}
     old_key = digest({"identity": binding(task), "plan_hash": plan["plan_hash"], "artifact": legacy["artifact"]})
     new_key = digest({"identity": binding(task), "plan_hash": plan["plan_hash"]})
-    store.publish("accepted", old_key, legacy)
+    # Simulate an actual pre-index host store after old writers are quiescent.
+    shutil.rmtree(store.root/".acceptance-index")
+    store._publish("accepted", old_key, legacy, register_index=False)
     store._path("accepted", new_key).unlink()
     return old_key, legacy
 
@@ -493,7 +506,7 @@ def test_conflicting_legacy_outcomes_require_replan_before_new_index(tmp_path):
     different = json.loads(json.dumps(legacy))
     different["artifact"]["commit_sha"] = "e" * 40
     key = digest({"identity": binding(task), "plan_hash": plan["plan_hash"], "artifact": different["artifact"]})
-    store.publish("accepted", key, different)
+    store._publish("accepted", key, different, register_index=False)
     with pytest.raises(EvidenceError, match="conflicting legacy"):
         accept_artifact(task, result, plan, store, path, lambda *a: proof)
     assert len(list(store.root.glob("accepted-*"))) == 2
@@ -544,7 +557,8 @@ def test_unique_record_does_not_mask_a_contradictory_legacy_outcome(tmp_path):
     contradictory = json.loads(json.dumps(legacy))
     contradictory["artifact"]["commit_sha"] = "e" * 40
     other_key = digest({"identity": binding(task), "plan_hash": plan["plan_hash"], "artifact": contradictory["artifact"]})
-    store.publish("accepted", other_key, contradictory)
+    store._publish("accepted", other_key, contradictory, register_index=False)
+    shutil.rmtree(store.root/".acceptance-index")
     with pytest.raises(EvidenceError, match="conflicting legacy and unique"):
         accept_artifact(task, result, plan, store, path, lambda *a: proof)
     assert len(list(store.root.glob("accepted-*"))) == 3

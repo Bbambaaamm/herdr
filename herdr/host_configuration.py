@@ -187,10 +187,10 @@ def read_canonical_parent(root, task_id, run_token):
                     before=os.fstat(fd)
                     require(stat.S_ISREG(before.st_mode) and before.st_uid==os.geteuid()
                             and not before.st_mode&0o077 and before.st_nlink==1
-                            and 0<before.st_size<=131072,"canonical parent task untrusted")
+                            and 0<before.st_size<=1048576,"canonical parent task untrusted")
                     raw=b""
-                    while len(raw)<=131072:
-                        chunk=os.read(fd,min(65536,131073-len(raw)))
+                    while len(raw)<=1048576:
+                        chunk=os.read(fd,min(65536,1048577-len(raw)))
                         if not chunk:break
                         raw+=chunk
                     after=os.fstat(fd)
