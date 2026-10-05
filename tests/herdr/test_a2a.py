@@ -1365,3 +1365,35 @@ def test_send_explicitly_requests_no_task_history(tmp_path):
     transport=HistoryServer()
     Gateway(transport,store,card,policy).send(identity,"work")
     assert store.read()["delivery"]=="bound" and len(transport.sends)==1
+
+
+@pytest.mark.parametrize("name",["password","credential","private_key","api_key","client_secret",
+    "refresh_token","access_token","authorization","cookie","set-cookie"])
+@pytest.mark.parametrize("position",[0,3])
+def test_json_unicode_escaped_protected_key_denies_before_economic_dispatch(tmp_path,name,position):
+    _,card,policy,identity,store=setup(tmp_path)
+    transport=Mock()
+    key=name[:position]+chr(92)+"u"+format(ord(name[position]),"04x")+name[position+1:]
+    text='{"'+key+'":"do-not-export"}'
+    with pytest.raises(A2AError,match="secret"):
+        Gateway(transport,store,card,policy).send(identity,text)
+    assert transport.sends==[] and store.read() is None
+
+@pytest.mark.parametrize("suffix",["?","#","/?","/#","?query","#fragment"])
+def test_discovery_query_or_fragment_delimiter_denies_before_transport(tmp_path,suffix):
+    class DeniedTransport:
+        def discover(self,*args):pytest.fail("invalid origin contacted a remote endpoint")
+    with pytest.raises(A2AError,match="origin"):
+        discover_card(DeniedTransport(),"https://remote.example"+suffix)
+
+@pytest.mark.parametrize("value",[chr(0xd800), "before"+chr(0xdfff)+"after"])
+def test_remote_identifiers_reject_surrogates_through_typed_error(value):
+    with pytest.raises(A2AError,match="invalid remote id"):
+        a2a_module._remote_id(value,"remote id")
+
+def test_surrogate_task_text_denies_before_dispatch(tmp_path):
+    _,card,policy,identity,store=setup(tmp_path)
+    transport=Mock()
+    with pytest.raises(A2AError,match="message text"):
+        Gateway(transport,store,card,policy).send(identity,chr(0xd800))
+    assert transport.sends==[] and store.read() is None

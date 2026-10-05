@@ -95,7 +95,15 @@ def _reject_secret_values(value: Any) -> None:
         nodes+=1
         if nodes>65536 or depth>32:raise A2AError("JSON structure exceeds bound")
         if isinstance(current,str):
-            if _CARD_SECRET_VALUE.search(current):raise A2AError("raw secret-like value")
+            # Decode JSON Unicode escapes for scanning without parsing an
+            # untrusted program/tree or changing the transmitted source.
+            if len(current) > MAX_RESPONSE:
+                raise A2AError("secret scan text exceeds bound")
+            escaped = re.compile(re.escape(chr(92)) + r"u([0-9a-fA-F]{4})")
+            normalized = escaped.sub(lambda match: chr(int(match.group(1),16)), current)
+            normalized = normalized.replace(chr(92)+chr(34),chr(34))
+            normalized = normalized.replace(chr(92)+chr(39),chr(39))
+            if _CARD_SECRET_VALUE.search(normalized):raise A2AError("raw secret-like value")
         elif isinstance(current,dict):
             for key,item in current.items():
                 if isinstance(key,str) and protected.fullmatch(key) and isinstance(item,str) and item:
@@ -108,11 +116,10 @@ def _reject_secret_values(value: Any) -> None:
 def _remote_id(value: Any, label: str) -> str:
     if not isinstance(value, str) or not value:
         raise A2AError(f"invalid {label}")
+    if any(unicodedata.category(c) in {"Cc", "Cf", "Cs"} for c in value):
+        raise A2AError(f"invalid {label}")
     raw = value.encode("utf-8")
-    if (
-        len(raw) > MAX_REMOTE_ID_BYTES
-        or any(unicodedata.category(c) in {"Cc", "Cf", "Cs"} for c in value)
-    ):
+    if len(raw) > MAX_REMOTE_ID_BYTES:
         raise A2AError(f"invalid {label}")
     return value
 
@@ -437,6 +444,8 @@ class Transport(Protocol):
 
 def discover_card(transport: Transport, origin: str) -> AgentCard:
     """Read discovery metadata; this does not produce an admitted executor."""
+    if not isinstance(origin,str) or "?" in origin or "#" in origin:
+        raise A2AError("discovery requires an origin without query or fragment")
     url = _url(origin)
     parsed = urlsplit(url)
     if parsed.path not in ("", "/"):
@@ -911,7 +920,9 @@ class Gateway:
     def send(self, identity: Identity, text: str) -> tuple[Candidate, ...]:
         if not self.card.supports_text_input:
             raise A2AError("remote card does not support text input")
-        if not isinstance(text, str) or not text or len(text.encode()) > 8192:
+        if (not isinstance(text, str) or not text
+                or any(unicodedata.category(char) == "Cs" for char in text)
+                or len(text.encode()) > 8192):
             raise A2AError("invalid message text")
         _reject_secret_values(text)
         with self.store.locked() as directory:
