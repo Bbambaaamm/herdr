@@ -6,6 +6,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from .child_ownership import ChildOwnership, OwnershipError, require
 
+def _mount_id(fd):
+    """Read the held FD's kernel mount identity, including same-device binds."""
+    descriptor=os.open(f"/proc/self/fdinfo/{fd}",os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC)
+    try:
+        raw=os.read(descriptor,4097)
+    finally:os.close(descriptor)
+    require(len(raw)<=4096,"owned_mount_info_bound")
+    values=[line.partition(b":")[2].strip() for line in raw.splitlines()
+            if line.startswith(b"mnt_id:")]
+    require(len(values)==1 and 1<=len(values[0])<=20 and values[0].isdigit(),
+            "owned_mount_identity_unavailable")
+    result=int(values[0])
+    require(0<result<2**64,"owned_mount_identity_unavailable")
+    return result
+
+def _require_owned_name(name):
+    require(name not in {".git",".herdr"} and not name.startswith(".herdr-"),
+            "owned_control_path_denied")
+
 @dataclass(frozen=True)
 class WriteMount:
     key: str
@@ -26,6 +45,7 @@ class OwnedWritePins:
         require(stat.S_ISDIR(root.st_mode) and (root.st_dev,root.st_ino)==
                 (worktree.device,worktree.inode),"owned_worktree_binding")
         self.worktree=worktree
+        self._root_mount_id=_mount_id(worktree.fd)
         self.ownership_sha256=ownership.hash
         self._opened={}
         self._chains={}
@@ -63,6 +83,7 @@ class OwnedWritePins:
                             created=True
                         self._opened[key]=fd
                     info=os.fstat(fd)
+                    self._require_same_mount(fd,info)
                     require(info.st_uid==os.geteuid() and not info.st_mode&0o022,
                             "owned_target_untrusted")
                     require((kind=="directory" and stat.S_ISDIR(info.st_mode)) or
@@ -89,14 +110,25 @@ class OwnedWritePins:
     def roots(self):
         return tuple(item.target for item in self.mounts)
 
+    def _require_same_mount(self,fd,info):
+        require(info.st_dev==self.worktree.device and _mount_id(fd)==self._root_mount_id,
+                "owned_mount_crossing_denied")
+
     def verify(self):
         require(not self._closed,"owned_write_pins_closed")
         self.worktree.verify()
         for chain in self._chains.values():
             parent=self.worktree.fd
             for key,fd,device,inode,kind in chain:
-                named=os.stat(key.rsplit("/",1)[-1],dir_fd=parent,follow_symlinks=False)
+                flags=os.O_PATH|os.O_NOFOLLOW|os.O_CLOEXEC
+                if kind=="directory":flags|=os.O_DIRECTORY
+                fresh=os.open(key.rsplit("/",1)[-1],flags,dir_fd=parent)
+                try:
+                    named=os.fstat(fresh)
+                    self._require_same_mount(fresh,named)
+                finally:os.close(fresh)
                 held=os.fstat(fd)
+                self._require_same_mount(fd,held)
                 require((named.st_dev,named.st_ino)==(held.st_dev,held.st_ino)==(device,inode)
                         and held.st_uid==os.geteuid() and not held.st_mode&0o022
                         and ((kind=="directory" and stat.S_ISDIR(held.st_mode)) or
@@ -109,7 +141,7 @@ class OwnedWritePins:
 
     def _verify_directory_tree(self,fd):
         remaining=4096
-        device=os.fstat(fd).st_dev
+        device=self.worktree.device
         def visit(directory,depth):
             nonlocal remaining
             require(depth<=16,"owned_directory_depth_bound")
@@ -117,6 +149,7 @@ class OwnedWritePins:
                 for entry in entries:
                     remaining-=1
                     require(remaining>=0,"owned_directory_entry_bound")
+                    _require_owned_name(entry.name)
                     info=os.stat(entry.name,dir_fd=directory,follow_symlinks=False)
                     require(info.st_dev==device and info.st_uid==os.geteuid()
                             and not info.st_mode&0o022,"owned_directory_entry_untrusted")
@@ -125,6 +158,7 @@ class OwnedWritePins:
                                       dir_fd=directory)
                         try:
                             held=os.fstat(child)
+                            self._require_same_mount(child,held)
                             require((held.st_dev,held.st_ino)==(info.st_dev,info.st_ino),
                                     "owned_directory_entry_changed")
                             visit(child,depth+1)
@@ -132,6 +166,14 @@ class OwnedWritePins:
                     else:
                         require(stat.S_ISREG(info.st_mode) and info.st_nlink==1,
                                 "owned_directory_hardlink_or_special")
+                        target=os.open(entry.name,os.O_PATH|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=directory)
+                        try:
+                            held=os.fstat(target)
+                            self._require_same_mount(target,held)
+                            require((held.st_dev,held.st_ino)==(info.st_dev,info.st_ino)
+                                    and stat.S_ISREG(held.st_mode) and held.st_nlink==1,
+                                    "owned_directory_entry_changed")
+                        finally:os.close(target)
         opened=os.open(".",os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC,dir_fd=fd)
         try:visit(opened,0)
         finally:os.close(opened)

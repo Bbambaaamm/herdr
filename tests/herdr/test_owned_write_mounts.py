@@ -126,3 +126,71 @@ def test_directory_descendant_link_introduced_after_pinning_is_rejected(tmp_path
     with pin(tmp_path) as root,OwnedWritePins(contract(("directory","own")),root) as owned:
         os.link(tmp_path/"foreign",tmp_path/"own/alias")
         with pytest.raises(OwnershipError,match="hardlink"):owned.descriptors()
+
+
+@pytest.mark.parametrize("name",[".git",".herdr",".herdr-state"])
+@pytest.mark.parametrize("kind",["file","directory"])
+@pytest.mark.parametrize("after_pin",[False,True])
+def test_nested_control_entries_never_receive_a_writable_descriptor(tmp_path,name,kind,after_pin):
+    nested=tmp_path/"vendor/subrepo";nested.mkdir(parents=True)
+    target=nested/name
+    def create_control():
+        if kind=="directory":
+            target.mkdir();(target/"config").write_text("host-control")
+        else:target.write_text("host-control")
+    with pin(tmp_path) as root:
+        if not after_pin:
+            create_control()
+            with pytest.raises(OwnershipError,match="control_path"):
+                OwnedWritePins(contract(("directory","vendor")),root)
+        else:
+            with OwnedWritePins(contract(("directory","vendor")),root) as owned:
+                create_control()
+                with pytest.raises(OwnershipError,match="control_path"):owned.descriptors()
+    assert (target/"config" if kind=="directory" else target).read_text()=="host-control"
+
+
+@pytest.mark.parametrize("scope",["mounted-directory","mounted-file","mounted-ancestor","mounted-descendant"])
+def test_actual_namespace_rejects_same_device_mount_crossings(tmp_path,scope):
+    if not sandbox.BWRAP.is_file():
+        pytest.skip("mount crossing test requires installed bubblewrap; host still denies without it")
+    workspace=tmp_path/"worktree";workspace.mkdir()
+    (workspace/"owned").mkdir();(workspace/"owned/file.py").write_text("owned")
+    foreign=tmp_path/"foreign";foreign.mkdir();(foreign/"file.py").write_text("foreign")
+    assert foreign.stat().st_dev==workspace.stat().st_dev
+    if scope=="mounted-file":
+        source=foreign/"file.py";target=workspace/"owned/file.py";kind="file";key="owned/file.py"
+    else:
+        source=foreign;target=workspace/"owned";kind="directory";key="owned"
+        if scope=="mounted-ancestor":kind="file";key="owned/file.py"
+        elif scope=="mounted-descendant":key="."
+    # A bind of an external path deliberately keeps st_dev unchanged. Mount ID
+    # verification must still reject it, both in the declared path and below it.
+    if key==".":
+        (workspace/"container").mkdir();target=workspace/"container/nested";target.mkdir();key="container"
+    code="\n".join([
+        "import os,sys",
+        "from pathlib import Path",
+        "sys.path.insert(0,"+repr(str(ROOT))+")",
+        "from herdr.child_ownership import ChildOwnership,WriteScope,OwnershipError",
+        "from herdr.owned_write_mounts import OwnedWritePins",
+        "from types import SimpleNamespace",
+        "root=Path("+repr(str(workspace))+")",
+        "fd=os.open(root,os.O_PATH|os.O_DIRECTORY|os.O_CLOEXEC)",
+        "info=os.fstat(fd)",
+        "held=SimpleNamespace(fd=fd,device=info.st_dev,inode=info.st_ino,logical=root,verify=lambda:None)",
+        "contract=ChildOwnership((WriteScope("+repr(kind)+","+repr(key)+"),),(),(),(),'parent','handoff/artifact')",
+        "try:",
+        "    OwnedWritePins(contract,held)",
+        "except OwnershipError as exc:",
+        "    assert 'mount_crossing' in str(exc),str(exc)",
+        "else:",
+        "    raise AssertionError('foreign mounted inode granted writable authority')",
+        "finally:",
+        "    os.close(fd)",
+    ])
+    done=subprocess.run([str(sandbox.BWRAP),"--unshare-user","--ro-bind","/","/",
+        "--bind",str(source),str(target),"--proc","/proc","--",sys.executable,"-I","-c",code],
+        capture_output=True,text=True,timeout=20)
+    assert done.returncode==0,done.stderr
+    assert (foreign/"file.py").read_text()=="foreign"
