@@ -495,3 +495,12 @@ def test_non_text_output_denies_structured_native_and_fallback_before_sources(tm
         with pytest.raises(PromptBlocked,match="text_output_required"):
             compile((runtime,plan,context,grant,replace(binding,native_structured_output=native)),
                     lambda _:pytest.fail("unsupported output read context"))
+
+@pytest.mark.parametrize("allowance",[1,256,2048,16384])
+def test_nondefault_output_allowance_survives_host_plan_reconstruction(tmp_path,allowance):
+    data=setup(tmp_path)
+    plan=replace(data[1],output_contract=replace(data[1].output_contract,output_token_allowance=allowance))
+    restored=PromptPlan.from_json(json.loads(canonical(plan.to_json())),redactor=data[0].redactor)
+    assert restored.output_contract.output_token_allowance==allowance
+    assert restored.output_contract.hash==plan.output_contract.hash
+    assert restored.hash==plan.hash

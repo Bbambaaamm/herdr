@@ -345,7 +345,7 @@ class PromptPlan:
             "result_schema", "minimum_evidence_refs", "schema_version", "hash",
             "output_token_allowance"}, "output_contract_schema")
         output = OutputContract(canonical(contract["result_schema"]), contract["minimum_evidence_refs"],
-                                contract["schema_version"])
+                                contract["schema_version"], contract["output_token_allowance"])
         require(output.hash == contract["hash"], "output_contract_digest")
         values["output_contract"] = output
         for name, typ in (("instruction_refs", InstructionRef), ("demonstrations", DemonstrationRef)):
