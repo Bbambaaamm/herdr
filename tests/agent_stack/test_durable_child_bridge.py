@@ -1020,3 +1020,42 @@ def test_standalone_bridge_supplies_deferred_verified_parent_factory(monkeypatch
     monkeypatch.setattr(sys,"argv",argv);server.main()
     assert captured["kwargs"]["policy_launch_factory_provider"] is factory_provider
     assert captured["args"][1]["task_id"]=="parent"
+
+
+def test_authenticated_bridge_carries_ownership_into_actual_claim_and_runtime(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from herdr.child_ownership import ChildOwnership,WriteScope,OwnershipRegistry
+    from herdr.security import InvocationIdentity
+    from herdr.policy_launch import HostPolicyLaunchFactory
+    task,path=_task(tmp_path)
+    task["parent_tools"]=["read_file","write_file"]
+    task["parent_permissions"]=["workspace-write"]
+    path.write_text(json.dumps(task))
+    _env(monkeypatch,path)
+    owner=InvocationIdentity("github:"+task["repo"],"parent-agent","coordinator","coordinator-task",
+        task["id"],task["run_token"],9)
+    # Typed host-factory transport fixture; physical signed-grant/mount behavior
+    # is proved by the installed SDK/bootstrap and Linux kernel tests separately.
+    factory=HostPolicyLaunchFactory.__new__(HostPolicyLaunchFactory)
+    factory.parent_grant=SimpleNamespace(identity=owner)
+    scope=ChildOwnership((WriteScope("file","own.py"),),(),(),(),"parent","artifact://handoff/owned")
+    captured={}
+    class Runtime:
+        def __init__(self,scheduler,runner,**kwargs):self.scheduler=scheduler
+        def run_managed_child(self,lease,prompt,**kwargs):
+            rec=self.scheduler._tasks[lease.task_id]
+            captured.update(ownership=rec.ownership,reservation=rec.ownership_reservation,
+                identity=InvocationIdentity(owner.consumer,rec.agent_id,owner.agent_id,owner.task_id,
+                    rec.id,rec.run_token,rec.fencing_token))
+    monkeypatch.setattr(bridge,"HerdrChildRuntime",Runtime)
+    args=argparse.Namespace(key="owned",role="writer",objective="Scoped change",prompt="Write owned file",
+        tool=["write_file"],permission=["workspace-write"],ownership=scope.to_json())
+    with _test_pin(tmp_path,tmp_path.parent) as held:
+        first=bridge._delegate_pinned(args,None,Path("/bin/true"),task,"parent-pane",
+            "parent-agent","marker",held,policy_launch_factory=factory)
+    assert captured["ownership"]==scope
+    store=OwnershipRegistry(path.parent.parent)
+    row=store.snapshot()["reservations"][captured["reservation"]]
+    assert row["ownership"]==scope.to_json()
+    assert store.require_current(captured["reservation"],captured["identity"])
+    assert first["task_id"]==captured["identity"].task_id

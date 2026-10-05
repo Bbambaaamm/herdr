@@ -325,3 +325,71 @@ def test_owned_mount_evidence_cannot_omit_add_or_mistype_declared_inode():
                 [{**good[0],"inode":True}],[good[0],good[0]],[{**good[0],"fd":3}]]:
         with pytest.raises(OwnershipError):
             validate_owned_mount_evidence(scope,bad)
+
+
+@pytest.mark.parametrize("already_bound",[False,True])
+def test_cold_replay_recovers_crash_after_claim_flush_without_redelivery(tmp_path,monkeypatch,already_bound):
+    owner=parent();store=registry(tmp_path);item=scheduler(tmp_path,owner,store)
+    scope=ownership(owner,files=("src/one.py",))
+    node=item.delegate_child(owner.task_id,owner.run_token,"recover-bind",proposal(owner,scope))
+    original=store.bind_claim
+    def interrupted(key,identity):
+        if already_bound:original(key,identity)
+        raise OSError("crash after durable claim flush")
+    with monkeypatch.context() as fault:
+        fault.setattr(store,"bind_claim",interrupted)
+        with pytest.raises(OSError,match="durable claim"):
+            item.dispatch(task_ids={node.id},managed_start=True)
+    rec=item._tasks[node.id]
+    raw=(tmp_path/"graph.jsonl").read_bytes()
+    restored=DynamicChildScheduler(audit_log=AuditLog(tmp_path/"graph.jsonl"),
+        ownership_registry=store,ownership_parent=owner)
+    restored.replay()
+    identity=InvocationIdentity(owner.consumer,rec.agent_id,owner.agent_id,owner.task_id,
+        rec.id,rec.run_token,rec.fencing_token)
+    assert store.require_current(rec.ownership_reservation,identity)
+    assert restored._tasks[node.id].run_token==rec.run_token
+    assert restored.dispatch(task_ids={node.id},managed_start=True)==[]
+    assert (tmp_path/"graph.jsonl").read_bytes()==raw
+    # Repeating cold replay on a fresh process retains the same single claim.
+    second=DynamicChildScheduler(audit_log=AuditLog(tmp_path/"graph.jsonl"),
+        ownership_registry=store,ownership_parent=owner)
+    second.replay()
+    assert second._tasks[node.id].run_token==rec.run_token
+    assert store.snapshot()["reservations"][rec.ownership_reservation]["identity"]==identity.to_json()
+
+
+def test_recovered_claim_stays_quarantined_when_frozen_contract_changed(tmp_path,monkeypatch):
+    owner=parent();store=registry(tmp_path,verify_contract=lambda *args:True)
+    old=FrozenContract("api/schema",1,"a"*64,owner.task_id)
+    store.publish_contract(owner,old,"host")
+    item=scheduler(tmp_path,owner,store)
+    scope=ownership(owner,shared=(old,),files=("one.py",))
+    node=item.delegate_child(owner.task_id,owner.run_token,"stale-bind",proposal(owner,scope))
+    with monkeypatch.context() as fault:
+        fault.setattr(store,"bind_claim",lambda *args:(_ for _ in ()).throw(OSError("crash")))
+        with pytest.raises(OSError):item.dispatch(task_ids={node.id},managed_start=True)
+    store.publish_contract(owner,replace(old,version=2,contract_sha256="b"*64),"host")
+    restored=DynamicChildScheduler(audit_log=AuditLog(tmp_path/"graph.jsonl"),
+        ownership_registry=store,ownership_parent=owner)
+    restored.replay()
+    rec=restored._tasks[node.id]
+    row=store.snapshot()["reservations"][rec.ownership_reservation]
+    assert row["state"]=="quarantined" and row["identity"]["run_token"]==rec.run_token
+    with pytest.raises(OwnershipError):restored._require_current_ownership(rec)
+    assert restored.dispatch(task_ids={node.id},managed_start=True)==[]
+
+
+def test_claim_replay_never_adopts_modified_global_reservation(tmp_path,monkeypatch):
+    owner=parent();store=registry(tmp_path);item=scheduler(tmp_path,owner,store)
+    node=item.delegate_child(owner.task_id,owner.run_token,"bad-bind",
+        proposal(owner,ownership(owner,files=("one.py",))))
+    with monkeypatch.context() as fault:
+        fault.setattr(store,"bind_claim",lambda *args:(_ for _ in ()).throw(OSError("crash")))
+        with pytest.raises(OSError):item.dispatch(task_ids={node.id},managed_start=True)
+    rec=item._tasks[node.id]
+    with store._transaction() as data:
+        data["reservations"][rec.ownership_reservation]["ownership"]["handoff_ref"]="different"
+    restored=DynamicChildScheduler(audit_log=AuditLog(tmp_path/"graph.jsonl"),
+        ownership_registry=store,ownership_parent=owner)
+    with pytest.raises(OwnershipError,match="replay_reservation"):restored.replay()

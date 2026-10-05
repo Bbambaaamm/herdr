@@ -341,6 +341,33 @@ class OwnershipRegistry:
             require(self._contract_current(data,owner,parent.consumer),"ownership_shared_contract_stale")
             row["identity"]=identity.to_json();row["state"]="claimed"
 
+    def reconcile_claim(self,key,parent,task_id,ownership,identity,*,read_only=False):
+        """Bind an already durable canonical claim without dispatch or new work.
+
+        The caller supplies a protected ledger claim, never a worker receipt.
+        Exact reservation data and parent lineage must match. Stale claims stay
+        quarantined while retaining the identity needed for safe reconciliation.
+        """
+        sha(key)
+        require(ownership is None or isinstance(ownership,ChildOwnership),"typed_ownership")
+        require(type(read_only) is bool,"ownership_read_only")
+        if ownership is not None:read_only=ownership.read_only
+        expected={"parent":parent.to_json(),"task_id":task_id,
+                  "ownership":None if ownership is None else ownership.to_json(),"read_only":read_only}
+        require(key==self.key(parent,task_id),"ownership_replay_reservation")
+        require((identity.consumer,identity.parent_agent_id,identity.parent_task_id,identity.task_id)==
+                (parent.consumer,parent.agent_id,parent.task_id,task_id),"ownership_replay_identity")
+        with self._transaction() as data:
+            row=data["reservations"].get(key)
+            require(row is not None and all(row[k]==v for k,v in expected.items()),
+                    "ownership_replay_reservation")
+            require(row["identity"] in (None,identity.to_json()),"ownership_claim_rebind")
+            require(row["identity"] is not None or row["state"] in {"reserved","quarantined"},
+                    "ownership_replay_missing_identity")
+            row["identity"]=identity.to_json()
+            if row["state"]=="reserved":
+                row["state"]="claimed" if self._contract_current(data,ownership,parent.consumer) else "quarantined"
+
     def require_current(self,key,identity):
         sha(key)
         with self._transaction() as data:

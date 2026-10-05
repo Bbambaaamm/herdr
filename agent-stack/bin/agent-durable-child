@@ -333,7 +333,7 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
                                       ({"herdr_submit_result"} if "herdr_submit_result" in task["parent_tools"] else set()))),
                                  child_permissions=tuple(args.permission),
                                  child_task=args.objective,
-                                 worktree_identity=pinned.identity)
+                                 worktree_identity=pinned.identity, ownership=ownership)
         child = scheduler.delegate_child(parent_id, token, args.key, proposal)
         if isinstance(child, DenyDecision):
             raise ValueError(f"child denied: {child.reason.value}")

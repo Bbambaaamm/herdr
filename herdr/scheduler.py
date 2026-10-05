@@ -2417,6 +2417,19 @@ class DynamicChildScheduler:
                          if match]
         self._next_agent_id_value = max(self._next_agent_id_value,
                                         max(agent_numbers, default=0) + 1)
+        if self.ownership_registry is not None:
+            from .security import InvocationIdentity
+            for rec in self._tasks.values():
+                if rec.ownership_reservation is None or rec.run_token is None:
+                    continue
+                owner=self.ownership_parent
+                if (rec.parent_task_id,rec.parent_agent_id,rec.parent_run_token,"github:"+rec.repo)!=(
+                        owner.task_id,owner.agent_id,owner.run_token,owner.consumer):
+                    raise SchedulerError("ownership replay parent differs from canonical claim")
+                self.ownership_registry.reconcile_claim(rec.ownership_reservation,owner,rec.id,
+                    rec.ownership,InvocationIdentity(owner.consumer,rec.agent_id,owner.agent_id,
+                        owner.task_id,rec.id,rec.run_token,rec.fencing_token),
+                    read_only=self._ownership_read_only(rec))
         return applied
 
     # -- internal helpers ----------------------------------------------------
