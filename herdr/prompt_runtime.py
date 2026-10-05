@@ -423,7 +423,8 @@ class PromptRuntime:
                 and binding.executor_version == counter.executor_version, "prompt_executor_binding")
         require(self.redactor.tree(plan.output_contract.schema()) == plan.output_contract.schema(),
                 "output_schema_secret")
-        executor, cap, provider = self.context_compiler._executor(context, binding.executor_id)
+        executor, cap, provider, _, _ = self.context_compiler.preflight(
+            context, executor_id=binding.executor_id, counter=counter, renderer="messages")
         require(executor.version == binding.executor_version and executor.provider_id == binding.provider_id,
                 "prompt_executor_version")
         native = binding.native_structured_output and Feature.STRUCTURED_OUTPUT in cap.features
@@ -499,7 +500,7 @@ class PromptRuntime:
                              "reason_code":"verified_relevant_scoped_source"})
 
         def envelope(context_wire):
-            dynamic["context"] = json.loads(json.loads(context_wire)["messages"][1]["content"])
+            dynamic["context"] = self.redactor.tree(json.loads(json.loads(context_wire)["messages"][1]["content"]))
             return render()
         compiled = self.context_compiler.compile(context, executor_id=binding.executor_id,
             counter=counter, loader=loader, renderer="messages", envelope=envelope)

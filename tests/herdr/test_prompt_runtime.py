@@ -332,3 +332,69 @@ def test_mandatory_instruction_reserves_space_before_optional_context(tmp_path):
     bundle=compile(data,lambda ref:mandatory if ref.id=="required" else raw)
     assert [entry["id"] for entry in json.loads(bundle.dynamic_payload)["project_instructions"]]==["required"]
     assert bundle.telemetry()["tokenizer_input_tokens"]<=4096
+
+def test_context_reference_id_remains_redacted_in_complete_envelope_and_context_trace(tmp_path):
+    from herdr.context import SecretRedactor
+    from tests.herdr.test_context import item
+    secret="private-context-reference"
+    raw=b"ordinary context evidence"
+    initial=setup(tmp_path,redactor=SecretRedactor((secret,)))
+    context=replace(initial[2],items=(item(raw,id=secret),))
+    plan=replace(initial[1],context_plan_sha256=context.hash,
+                 context_authority_sha256=context_authority_hash(context))
+    data=(initial[0],plan,context,initial[3],initial[4])
+    bundle=compile(data,lambda _:raw)
+    assert secret.encode() not in bundle.wire and secret.encode() not in bundle.dynamic_payload
+    standalone=data[0].context_compiler.compile(data[2],executor_id="a-runtime",
+        counter=counter(),loader=lambda _:raw)
+    assert secret.encode() not in standalone.payload and secret.encode() not in standalone.trace
+
+
+@pytest.mark.parametrize("fault,reason", [
+    ("redaction", "plan_redaction_policy"),
+    ("required-evidence", "required_provider_evidence_scope"),
+    ("skill-executor", "skill_executor_binding")])
+def test_context_preflight_denies_before_required_instruction_loader(tmp_path, fault, reason):
+    from herdr.context import ContextError
+    raw=b"Required instructions."
+    ref=InstructionRef("required","repo_instructions",source(raw),len(raw))
+    runtime,plan,context,grant,binding=setup(tmp_path,instructions=(ref,))
+    if fault=="redaction":
+        context=replace(context,redaction_hash=digest("stale-redaction"))
+    else:
+        payload=json.loads(context.payload)
+        if fault=="required-evidence":
+            from dataclasses import asdict
+            payload["controls"]["evidence"]=[asdict(source(state=SourceState.UNVERIFIED))]
+        else:
+            payload["skill_trace"]["binding"]["executor_id"]="b-runtime"
+        context=replace(context,payload=canonical(payload))
+    plan=replace(plan,context_plan_sha256=context.hash,
+                 context_authority_sha256=context_authority_hash(context))
+    with pytest.raises(ContextError,match=reason):
+        compile((runtime,plan,context,grant,binding),
+                lambda _:pytest.fail("source loaded before context metadata admission"))
+
+
+@pytest.mark.parametrize("mandatory",[False,True])
+def test_redacted_context_fits_complete_envelope_despite_original_source_size(tmp_path, mandatory):
+    from herdr.context import SecretRedactor
+    from tests.herdr.test_context import item
+    secret="known-secret-"+("Q"*4000)
+    raw=(secret*6+" useful evidence").encode()
+    data=setup(tmp_path,redactor=SecretRedactor((secret,)))
+    baseline=compile(data)
+    context=replace(data[2],byte_budget=len(baseline.wire)+1500,
+                    items=(item(raw,id="redacted-context",mandatory=mandatory),))
+    plan=replace(data[1],context_plan_sha256=context.hash,
+                 context_authority_sha256=context_authority_hash(context))
+    loaded=[]
+    def loader(ref):
+        loaded.append(ref.id)
+        return raw
+    bundle=compile((data[0],plan,context,data[3],data[4]),loader)
+    assert len(raw)>context.byte_budget and len(bundle.wire)<=context.byte_budget
+    assert loaded==["redacted-context"]
+    entries=json.loads(bundle.dynamic_payload)["context"]["context_data"]
+    assert [entry["id"] for entry in entries]==["redacted-context"]
+    assert "useful evidence" in entries[0]["text"] and secret.encode() not in bundle.wire

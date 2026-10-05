@@ -476,15 +476,15 @@ class ContextCompiler:
                     "provider_data_policy")
         return executor, cap, provider
 
-    def compile(self, plan: ContextPlan, *, executor_id, counter: TokenCounter, loader: Callable,
-                renderer="messages", envelope=None):
+    def preflight(self, plan: ContextPlan, *, executor_id, counter: TokenCounter,
+                  renderer="messages"):
+        """Validate source-independent host metadata before any source loader."""
         require(isinstance(plan, ContextPlan) and plan.redaction_hash == self.redactor.policy_hash,
                 "plan_redaction_policy")
         require(isinstance(counter, TokenCounter) and callable(counter.count), "host_tokenizer_required")
         executor, cap, provider = self._executor(plan, executor_id)
         require(counter.provider_id == executor.provider_id and counter.executor_version == executor.version,
                 "tokenizer_executor_binding")
-        require(envelope is None or callable(envelope), "host_context_envelope")
         token(counter.tokenizer_version)
         limits = [x for x in (plan.token_budget, plan.context.scope.max_context_tokens,
                                cap.context_tokens, cap.max_input_tokens) if x is not None]
@@ -503,6 +503,13 @@ class ContextCompiler:
         # The skill resolver checked this executor; a switch re-resolves skills first.
         require(raw["skill_trace"].get("binding") == {**plan.context.binding(), "executor_id": executor_id},
                 "skill_executor_binding")
+        return executor, cap, provider, raw, budget
+
+    def compile(self, plan: ContextPlan, *, executor_id, counter: TokenCounter, loader: Callable,
+                renderer="messages", envelope=None):
+        executor, cap, provider, raw, budget = self.preflight(
+            plan, executor_id=executor_id, counter=counter, renderer=renderer)
+        require(envelope is None or callable(envelope), "host_context_envelope")
         content, selected, rejected = [], [], []
         def render():
             # Both adapters preserve the same host-control / untrusted-data envelope.
@@ -541,44 +548,41 @@ class ContextCompiler:
             if reason:
                 if item.mandatory:
                     raise ContextBlocked("required_source_" + reason)
-                rejected.append({"id": item.id, "code": reason})
+                rejected.append({"id": self.redactor.redact(item.id), "code": reason})
                 continue
-            if item.size > plan.byte_budget - len(measured(wire)):
-                if item.mandatory:
-                    raise ContextBlocked("mandatory_context_exceeds_budget")
-                rejected.append({"id": item.id, "code": "byte_budget"})
-                continue
+            # Source size is integrity metadata. The bounded source may shrink
+            # under redaction; only the rendered candidate determines fit.
             try:
                 source_bytes = loader(item)
             except Exception as exc:
                 if item.mandatory:
                     raise ContextBlocked("required_source_unavailable") from exc
-                rejected.append({"id": item.id, "code": "source_unavailable"})
+                rejected.append({"id": self.redactor.redact(item.id), "code": "source_unavailable"})
                 continue
             if (not isinstance(source_bytes, bytes) or len(source_bytes) != item.size
                     or hashlib.sha256(source_bytes).hexdigest() != item.sources[0].sha256):
                 if item.mandatory:
                     raise ContextBlocked("required_source_digest_mismatch")
-                rejected.append({"id": item.id, "code": "source_digest_mismatch"})
+                rejected.append({"id": self.redactor.redact(item.id), "code": "source_digest_mismatch"})
                 continue
             try:
                 text = self.redactor.redact(source_bytes.decode("utf-8"))
             except (UnicodeError, ContextError) as exc:
                 if item.mandatory:
                     raise ContextBlocked("required_source_encoding") from exc
-                rejected.append({"id": item.id, "code": "source_encoding"})
+                rejected.append({"id": self.redactor.redact(item.id), "code": "source_encoding"})
                 continue
-            content.append({"id": item.id, "authority": "context_data", "text": text,
+            content.append({"id": self.redactor.redact(item.id), "authority": "context_data", "text": text,
                             "memory_class": item.memory_class, "derived_summary": item.derived_summary, "sources": [asdict(x) for x in item.sources]})
             candidate = render()
             if not fits(candidate):
                 content.pop()
                 if item.mandatory:
                     raise ContextBlocked("mandatory_context_exceeds_budget")
-                rejected.append({"id": item.id, "code": "context_budget"})
+                rejected.append({"id": self.redactor.redact(item.id), "code": "context_budget"})
                 continue
             wire = candidate
-            selected.append({"id": item.id, "reason": self.redactor.redact(item.reason), "sources": [asdict(x) for x in item.sources],
+            selected.append({"id": self.redactor.redact(item.id), "reason": self.redactor.redact(item.reason), "sources": [asdict(x) for x in item.sources],
                               "redacted": text.encode() != source_bytes, "derived_summary": item.derived_summary,
                              "authority": "context_data"})
         trace = canonical({"plan_hash": plan.hash, "binding": raw["binding"], "executor_id": executor.id,

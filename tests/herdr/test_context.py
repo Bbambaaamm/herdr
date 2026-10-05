@@ -123,19 +123,18 @@ def test_required_context_over_budget_blocks_instead_of_truncating():
         compile(compiler, plan)
 
 
-def test_optional_sources_prioritized_audited_and_large_unneeded_bytes_never_loaded():
+def test_optional_sources_prioritized_and_actual_rendered_size_is_audited():
     small = item(id="small")
     oversized = item(b"x"*262144, id="large", priority=0)
     compiler, plan, *_ = fixture(items=(oversized, small))
     loaded = []
     def loader(value):
         loaded.append(value.id)
-        assert value.id != "large"
-        return b"source evidence"
+        return b"x"*262144 if value.id == "large" else b"source evidence"
     bundle = compile(compiler, plan, loader)
-    assert loaded == ["small"]
+    assert loaded == ["small", "large"]
     assert bundle.telemetry()["selected"][0]["reason"] == "directly referenced source"
-    assert bundle.telemetry()["rejected"] == [{"id": "large", "code": "byte_budget"}]
+    assert bundle.telemetry()["rejected"] == [{"id": "large", "code": "context_budget"}]
     assert "source evidence" not in json.dumps(bundle.telemetry())
 
 
