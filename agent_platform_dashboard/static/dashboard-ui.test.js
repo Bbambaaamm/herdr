@@ -1589,3 +1589,14 @@ for (const fault of ['wrong_agent', 'terminal', 'ambiguous']) {
     assert.doesNotMatch(h.get('#face-task').textContent, /live práce probíhá/);
   });
 }
+
+test('verification pending preserves a valid blocked task and does not imply new runtime work', async t => {
+  const h = await harness(t);
+  const task = { ...reviewPending(), state: 'blocked', attempt_state: 'verification_pending',
+    blocker: 'evidence_unavailable', attempt: 1 };
+  reviewSwarm(h, [], [task]);
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().freshSnapshot, true);
+  assert.doesNotMatch(h.get('#face-task').textContent, /live práce probíhá/);
+  assert.equal(h.calls.activity.at(-1).workingAgents, 0);
+});

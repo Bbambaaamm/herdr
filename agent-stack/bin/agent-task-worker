@@ -15,6 +15,7 @@ from pathlib import Path
 from contextlib import contextmanager
 
 from agent_model_policy import decide as decide_model_route, record as record_model_route
+from agent_completion_evidence import EvidenceError, record_verification_failure, verification_applies, freeze_plan, verify_completion, completion_instructions
 from agent_durable_sandbox import (command as sandbox_command, frozen_policy, inner_pid,
                                    shell_command, verify as verify_sandbox)
 from agent_durable_children import parent_attempt_guard
@@ -105,7 +106,8 @@ def archive_previous_result(task_id: str, attempt: int) -> None:
 
 def prepare_attempt(task: dict) -> None:
     """Allocate one semantic execution attempt; reconciliation reuses it."""
-    if task.get("attempt_state") == "delivery_uncertain" and task.get("run_token"):
+    if (task.get("attempt_state") == "delivery_uncertain"
+            or task.get("completion_plan_pending")) and task.get("run_token"):
         return
     if task.get("parent_task_id"):
         if not all(task.get(field) for field in ("run_token", "idempotency_key",
@@ -850,16 +852,20 @@ def persist_current_task(task: dict) -> None:
 
 def cleanup_task_session_if_safe(task: dict) -> bool:
     """Keep a task-owned pane alive while prompt delivery is still ambiguous."""
-    if task.get("attempt_state") == "delivery_uncertain" or task.get("watchdog_blocker") == "active_durable_children":
+    if (task.get("watchdog_blocker") == "active_durable_children"
+            or task.get("attempt_state") == "delivery_uncertain"
+            and task.get("verification_status") != "accepted"):
         return True
     cleaned = cleanup_task_session(task)
     if not cleaned:
         path = current_task_path(task)
         if path is not None:
             task["watchdog_blocker"] = "task_session_cleanup_failed"
-            archive_previous_result(
-                str(task["id"]), int(task.get("attempts") or 0)
-            )
+            # Retain the exact completed publication for host reconciliation.
+            # A cleanup failure cannot replace accepted/pending evidence.
+            if task.get("verification_status") not in {
+                    "accepted", "evidence_missing", "evidence_unavailable", "evidence_invalid"}:
+                archive_previous_result(str(task["id"]), int(task.get("attempts") or 0))
             block_task(
                 path,
                 task,
@@ -958,7 +964,8 @@ TASK COMPLETION CONTRACT:
                  "key, role, objective, prompt, tool and permission arguments. Reuse the same key "
                  "for reconciliation. For write-capable children set cwd to the exact existing issue Git "
                  "worktree. Returned evidence still requires shared acceptance.\n")
-    return base + contract
+    return base + contract + completion_instructions(task)
+
 
 def run_prompt(task: dict) -> tuple[int, str]:
     if task.get("parent_task_id") and (
@@ -1314,6 +1321,24 @@ def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool)
         _defer_delivery_reconciliation_locked(task_path, task, "child result missing exact fence/idempotency/artifact evidence", all_terminal)
         return
 
+    blocker = str(result.get("blocker") or "").strip()
+    if str(result.get("status") or "") == "completed" and (not blocker or blocker.lower() in {"none", "null"}):
+        try:
+            accepted = (verify_completion(ROOT, task, result) if verification_applies(task)
+                        else {"level": "legacy_unverified_result"})
+        except EvidenceError as exc:
+            waiting = record_verification_failure(task, exc)
+            if waiting:
+                task["verification_reconcile_count"] = int(task.get("verification_reconcile_count", 0)) + 1
+                task["not_before"] = (utcnow() + timedelta(seconds=60)).isoformat()
+            write_json(task_path, task)
+            move(task_path, BLOCKED)
+            return
+        task["completion_level"] = accepted["level"]
+        task["completion_bundle_hash"] = accepted.get("bundle_hash", accepted.get("result_digest"))
+        task["verification_status"] = ("accepted" if verification_applies(task)
+                                       else "legacy_unverified")
+
     status = str(result.get("status") or "")
     blocker = str(result.get("blocker") or "").strip()
     if defer_for_active_children(task_path, task, all_terminal=all_terminal):
@@ -1377,6 +1402,13 @@ def _main_with_epoch(task_path: Path) -> int:
         task = json.loads(task_path.read_text(encoding="utf-8"))
         task_id = str(task["id"])
 
+        if task.get("verification_resolution") == "needs_replan":
+            return 0
+
+        if task.get("attempt_state") == "verification_pending" and task.get("run_token"):
+            finish(task_path, task, "reconcile completion evidence without redispatch")
+            return 0
+
         if task.get("attempt_state") == "delivery_uncertain" and task.get("run_token"):
             log(
                 task_id,
@@ -1412,6 +1444,22 @@ def _main_with_epoch(task_path: Path) -> int:
         attempt_dir = ROOT / "attempts"
         attempt_dir.mkdir(parents=True, exist_ok=True)
         task["task_file"] = str((attempt_dir / f"{task['id']}-{task['run_token']}.json").resolve())
+        try:
+            freeze_plan(ROOT, task)
+            task.pop("completion_plan_pending", None)
+        except EvidenceError as exc:
+            from herdr.evidence import EvidenceUnavailable
+            task["last_error"] = str(exc)
+            if isinstance(exc, EvidenceUnavailable):
+                task["completion_plan_pending"] = True
+                task["attempt_state"] = "retry_scheduled"
+                task["not_before"] = (utcnow() + timedelta(seconds=60)).isoformat()
+                write_json(task_path, task)
+                move(task_path, PENDING)
+            else:
+                task["verification_resolution"] = "needs_replan"
+                block_task(task_path, task, exc.code, "Trusted completion plan is invalid before dispatch.")
+            return 0
         attempt = int(task.get("attempts") or 0)
         decision = decide_model_route(task)
         task["routing"] = decision

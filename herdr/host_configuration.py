@@ -131,7 +131,8 @@ def child_factory_for_root(task_file,identity):
     try:
         info=os.fstat(fd)
         require(stat.S_ISREG(info.st_mode) and info.st_uid==os.geteuid()
-                and not info.st_mode&0o077 and 0<info.st_size<=1048576,"canonical task file untrusted")
+                and not info.st_mode&0o077 and info.st_nlink==1
+                and 0<info.st_size<=1048576,"canonical task file untrusted")
         with os.fdopen(os.dup(fd),"rb") as stream:task=json.loads(stream.read(1048577))
         after=os.fstat(fd);named=task_file.lstat()
         stamp=lambda x:(x.st_dev,x.st_ino,x.st_size,x.st_mtime_ns,x.st_ctime_ns,x.st_mode,x.st_uid)
@@ -151,4 +152,67 @@ def child_factory_for_root(task_file,identity):
             and parent_identity.fencing_token==task["fencing_token"],"parent grant identity changed")
     parent=verify_retained_policy_evidence(proof,identity=parent_identity,pid=int(session["sandbox_pid"]),
         attestation=attestation,require_bootstrap=True)
-    return build_host_policy_factory(parent_grant=parent)
+    factory=build_host_policy_factory(parent_grant=parent)
+    factory.verified_parent_task=task
+    return factory
+
+def read_canonical_parent(root, task_id, run_token):
+    """Read a protected current/terminal root task without editing its state."""
+    import re
+    require(isinstance(task_id,str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}",task_id)
+            and isinstance(run_token,str) and 0<len(run_token)<=128,
+            "canonical parent identity invalid")
+    root=Path(root)
+    require(root.is_absolute() and root.resolve(strict=True)==root,"canonical task root invalid")
+    info=root.lstat()
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid==os.geteuid() and not info.st_mode&0o022,
+            "canonical task root untrusted")
+    found=[]
+    root_fd=os.open(root,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+    try:
+        for state in ("running","blocked","pending","done","failed"):
+            try:
+                directory=os.open(state,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=root_fd)
+            except FileNotFoundError:
+                continue
+            try:
+                state_info=os.fstat(directory)
+                require(state_info.st_uid==os.geteuid() and not state_info.st_mode&0o022,
+                        "canonical task state untrusted")
+                try:
+                    fd=os.open(task_id+".json",os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC|os.O_NONBLOCK,dir_fd=directory)
+                except FileNotFoundError:
+                    continue
+                try:
+                    before=os.fstat(fd)
+                    require(stat.S_ISREG(before.st_mode) and before.st_uid==os.geteuid()
+                            and not before.st_mode&0o077 and before.st_nlink==1
+                            and 0<before.st_size<=131072,"canonical parent task untrusted")
+                    raw=b""
+                    while len(raw)<=131072:
+                        chunk=os.read(fd,min(65536,131073-len(raw)))
+                        if not chunk:break
+                        raw+=chunk
+                    after=os.fstat(fd)
+                    named=os.stat(task_id+".json",dir_fd=directory,follow_symlinks=False)
+                    stamp=lambda x:(x.st_dev,x.st_ino,x.st_size,x.st_mtime_ns,x.st_ctime_ns,x.st_mode,x.st_uid,x.st_nlink)
+                    require(stamp(before)==stamp(after)==stamp(named) and len(raw)==before.st_size,
+                            "canonical parent changed during read")
+                    def unique(pairs):
+                        result={}
+                        for key,value in pairs:
+                            require(key not in result,"canonical parent duplicate field")
+                            result[key]=value
+                        return result
+                    task=json.loads(raw,object_pairs_hook=unique)
+                    require(isinstance(task,dict) and task.get("id")==task_id,"canonical parent identity invalid")
+                    if task.get("run_token")==run_token:
+                        found.append(task)
+                finally:
+                    os.close(fd)
+            finally:
+                os.close(directory)
+        require(len(found)<=1,"canonical parent attempt ambiguous")
+        return found[0] if found else None
+    finally:
+        os.close(root_fd)

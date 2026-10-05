@@ -158,6 +158,7 @@ def evidence_task(snapshot_path):
         "parent_task_id": "runtime-canary-parent",
         "min_children": 2,
     }
+    worker.freeze_plan(worker.ROOT, task)
     return task
 
 
@@ -257,6 +258,9 @@ def test_block_task_preserves_nonregular_result_path(tmp_path):
 
 
 def test_finish_defers_terminal_move_until_task_pane_cleanup(tmp_path, monkeypatch):
+    # This suite isolates lifecycle cleanup; completion acceptance is tested separately.
+    monkeypatch.setattr(worker, "verify_completion", lambda *args:
+                        {"level":"verified_worker_result", "bundle_hash":"a"*64})
     configure_paths(tmp_path)
     task = base_task()
     worker.prepare_attempt(task)
@@ -284,6 +288,9 @@ def test_finish_defers_terminal_move_until_task_pane_cleanup(tmp_path, monkeypat
 
 
 def test_finish_cleans_task_pane_before_terminal_move(tmp_path, monkeypatch):
+    # This suite isolates lifecycle cleanup; completion acceptance is tested separately.
+    monkeypatch.setattr(worker, "verify_completion", lambda *args:
+                        {"level":"verified_worker_result", "bundle_hash":"a"*64})
     configure_paths(tmp_path)
     task = base_task()
     worker.prepare_attempt(task)
@@ -364,6 +371,9 @@ def test_exact_owned_session_observation_does_not_complete_attempt(tmp_path, mon
 
 
 def test_finish_reconciles_snapshot_over_zero_byte_result_placeholder(tmp_path, monkeypatch):
+    # This suite isolates lifecycle cleanup; completion acceptance is tested separately.
+    monkeypatch.setattr(worker, "verify_completion", lambda *args:
+                        {"level":"verified_worker_result", "bundle_hash":"a"*64})
     configure_paths(tmp_path)
     task = base_task()
     task["run_token"] = "snapshot-run"
@@ -1115,6 +1125,271 @@ def test_task_session_agent_name_respects_herdr_limit_for_all_coordinators(tmp_p
         names.append(agent_name)
 
     assert names[0] != names[1]
+
+def verification_task(tmp_path, kind="coding"):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["completion_kind"] = kind
+    worker.prepare_attempt(task)
+    path = worker.RUNNING / f"{task['id']}.json"
+    path.write_text(json.dumps(task))
+    result = {"task_id": task["id"], "run_token": task["run_token"],
+              "status": "completed", "summary": "worker claim only",
+              "next_action": "continue", "repo": task["repo"], "blocker": None,
+              "evidence": [{"producer": "trusted-ci", "passed": True}]}
+    worker.write_json(worker.result_path(task["id"]), result)
+    return task, path, result
+
+
+def test_completed_coding_without_host_proof_is_not_done_or_retried(tmp_path):
+    task, path, result = verification_task(tmp_path)
+    identity = (task["run_token"], task["idempotency_key"], task["attempts"])
+    worker.finish(path, task, "claims completed")
+    saved = json.loads((worker.BLOCKED / path.name).read_text())
+    assert saved["attempt_state"] == "blocked"
+    assert saved["verification_resolution"] == "needs_replan"
+    assert saved["verification_status"] == "evidence_invalid"
+    assert (saved["run_token"], saved["idempotency_key"], saved["attempts"]) == identity
+    assert not list(worker.DONE.iterdir())
+    assert json.loads(worker.result_path(task["id"]).read_text()) == result
+
+
+def test_missing_and_unavailable_evidence_keep_one_attempt(tmp_path, monkeypatch):
+    from herdr.evidence import EvidenceMissing, EvidenceUnavailable
+    for failure in (EvidenceMissing("review pending"), EvidenceUnavailable("CI unavailable")):
+        task, path, result = verification_task(tmp_path)
+        monkeypatch.setattr(worker, "verify_completion",
+                            lambda *a: (_ for _ in ()).throw(failure))
+        worker.finish(path, task, "")
+        saved = json.loads((worker.BLOCKED / path.name).read_text())
+        assert saved["verification_status"] == failure.code
+        assert saved["attempts"] == 0
+        assert saved["run_token"] == task["run_token"]
+        (worker.BLOCKED / path.name).unlink()
+
+
+def test_verified_worker_result_does_not_claim_integration_or_deployment(tmp_path, monkeypatch):
+    task, path, result = verification_task(tmp_path)
+    monkeypatch.setattr(worker, "verify_completion", lambda *a:
+                        {"level": "verified_worker_result", "bundle_hash": "a" * 64,
+                         "integration": None, "deployment": None})
+    worker.finish(path, task, "")
+    saved = json.loads((worker.DONE / path.name).read_text())
+    assert saved["completion_level"] == "verified_worker_result"
+    assert saved["completion_bundle_hash"] == "a" * 64
+    assert "deployed" not in saved and "merged" not in saved
+    assert saved["attempts"] == 0
+
+
+def test_control_cycle_is_labelled_and_never_promoted_to_verified_implementation(tmp_path):
+    task, path, result = verification_task(tmp_path)
+    task["kind"] = "github_root_orchestration"
+    worker.freeze_plan(worker.ROOT, task)
+    worker.finish(path, task, "")
+    saved = json.loads((worker.DONE / path.name).read_text())
+    assert saved["completion_level"] == "control_cycle"
+    assert saved["verification_status"] == "accepted"
+    assert "artifact" not in saved
+    assert saved["attempts"] == 0
+
+
+def test_unconfigured_research_criteria_fail_closed_without_fictitious_build(tmp_path):
+    task, path, result = verification_task(tmp_path, "research")
+    worker.finish(path, task, "")
+    saved = json.loads((worker.BLOCKED / path.name).read_text())
+    assert saved["verification_status"] == "evidence_invalid"
+    assert "research" in saved["last_error"]
+    assert saved["attempts"] == 0
+
+
+def test_pending_verification_main_reuses_publication_without_dispatch(tmp_path, monkeypatch):
+    task, path, result = verification_task(tmp_path)
+    task["attempt_state"] = "verification_pending"
+    path.write_text(json.dumps(task))
+    monkeypatch.setattr(worker, "LOCK", tmp_path / "worker.lock")
+    calls = []
+    monkeypatch.setattr(worker, "finish", lambda *args: calls.append(args))
+    monkeypatch.setattr(worker, "prepare_attempt",
+                        lambda *a: (_ for _ in ()).throw(AssertionError("duplicate attempt")))
+    assert worker.main(path) == 0
+    assert len(calls) == 1
+    assert calls[0][1]["run_token"] == task["run_token"]
+    assert json.loads(worker.result_path(task["id"]).read_text()) == result
+
+
+def test_absent_blocker_spellings_cannot_bypass_completion_evidence(tmp_path):
+    for blocker in (None, "", "none", " null ", "NONE"):
+        task, path, result = verification_task(tmp_path)
+        result["blocker"] = blocker
+        worker.write_json(worker.result_path(task["id"]), result)
+        worker.finish(path, task, "")
+        saved = json.loads((worker.BLOCKED / path.name).read_text())
+        assert saved["attempt_state"] == "blocked"
+        assert saved["verification_resolution"] == "needs_replan"
+        assert saved["verification_status"] == "evidence_invalid"
+        assert not list(worker.DONE.iterdir())
+        assert json.loads(worker.result_path(task["id"]).read_text()) == result
+        (worker.BLOCKED / path.name).unlink()
+
+def test_control_cycle_without_predispatch_plan_stays_unverified(tmp_path):
+    task, path, result = verification_task(tmp_path)
+    task["kind"] = "github_root_orchestration"
+    worker.finish(path, task, "")
+    saved = json.loads((worker.BLOCKED / path.name).read_text())
+    assert saved["verification_status"] == "evidence_invalid"
+    assert not list(worker.DONE.iterdir())
+
+
+def test_control_evidence_is_retained_and_restart_reuses_immutable_bundle(tmp_path):
+    task, path, result = verification_task(tmp_path)
+    task["kind"] = "github_root_orchestration"
+    worker.freeze_plan(worker.ROOT, task)
+    from agent_completion_evidence import verify_completion
+    first = verify_completion(worker.ROOT, task, result)
+    second = verify_completion(worker.ROOT, task, result)
+    assert first == second and first["level"] == "control_cycle"
+    assert len(list((worker.ROOT / "verification").glob("accepted-*"))) == 1
+    assert first["integration"] is None and first["deployment"] is None
+    task["prompt"] = "changed specification"
+    from herdr.evidence import EvidenceError
+    import pytest
+    with pytest.raises(EvidenceError, match="specification"):
+        verify_completion(worker.ROOT, task, result)
+
+def test_worker_prompt_exposes_frozen_criteria_and_limited_completion_level(tmp_path):
+    task, path, result = verification_task(tmp_path)
+    task["kind"] = "github_root_orchestration"
+    worker.freeze_plan(worker.ROOT, task)
+    prompt = worker.prompt_text(task)
+    assert "HOST COMPLETION VERIFICATION" in prompt
+    assert "does not satisfy an implementation" in prompt
+    assert task["completion_plan"]["kind"] == "control"
+    assert len(task["completion_plan"]["plan_hash"]) == 64
+
+
+def test_permanently_invalid_evidence_requires_replan_without_endless_reconciliation(tmp_path, monkeypatch):
+    from herdr.evidence import EvidenceError
+    task, path, result = verification_task(tmp_path)
+    monkeypatch.setattr(worker, "verify_completion",
+                        lambda *a: (_ for _ in ()).throw(EvidenceError("pinned workflow changed")))
+    worker.finish(path, task, "")
+    blocked = worker.BLOCKED / path.name
+    saved = json.loads(blocked.read_text())
+    assert saved["attempt_state"] == "blocked"
+    assert saved["verification_resolution"] == "needs_replan"
+    assert "Replan" in saved["verification_next_action"]
+    assert "not_before" not in saved
+    assert saved["run_token"] == task["run_token"]
+    monkeypatch.setattr(worker, "LOCK", tmp_path / "worker.lock")
+    monkeypatch.setattr(worker, "prepare_attempt",
+                        lambda *a: (_ for _ in ()).throw(AssertionError("economic redispatch")))
+    assert worker.main(blocked) == 0
+    assert json.loads(worker.result_path(task["id"]).read_text()) == result
+
+
+def test_control_cycle_cannot_publish_conflicting_outcomes_for_one_attempt(tmp_path):
+    from agent_completion_evidence import verify_completion
+    from herdr.evidence import EvidenceError
+    import pytest
+    task, path, result = verification_task(tmp_path)
+    task["kind"] = "github_root_orchestration"
+    worker.freeze_plan(worker.ROOT, task)
+    first = verify_completion(worker.ROOT, task, result)
+    result["summary"] = "contradictory second result"
+    with pytest.raises(EvidenceError, match="immutable"):
+        verify_completion(worker.ROOT, task, result)
+    assert len(list((worker.ROOT / "verification").glob("accepted-*"))) == 1
+
+
+def test_control_upgrade_preserves_legacy_outcome_and_rejects_rewrite(tmp_path):
+    from agent_completion_evidence import verify_completion
+    from herdr.evidence import EvidenceStore, binding, digest, EvidenceError
+    import pytest
+    task, path, result = verification_task(tmp_path)
+    task["kind"] = "github_root_orchestration"
+    worker.freeze_plan(worker.ROOT, task)
+    first = verify_completion(worker.ROOT, task, result)
+    store = EvidenceStore(worker.ROOT / "verification")
+    plan_hash = first["plan_hash"]
+    payload = {k: v for k, v in first.items() if k != "bundle_hash"}
+    old_key = digest({"identity": binding(task), "plan_hash": plan_hash, "result_hash": digest(result)})
+    new_key = digest({"identity": binding(task), "plan_hash": plan_hash})
+    store.publish("accepted", old_key, payload)
+    store._path("accepted", new_key).unlink()
+    assert verify_completion(worker.ROOT, task, result) == first
+    result["summary"] = "rewritten after upgrade"
+    with pytest.raises(EvidenceError, match="conflict"):
+        verify_completion(worker.ROOT, task, result)
+    assert store.read("accepted", old_key) == payload
+
+
+def test_incomplete_control_publication_is_replan_not_missing_late_evidence(tmp_path):
+    for field in ("summary", "next_action"):
+        task, path, result = verification_task(tmp_path)
+        task["kind"] = "github_root_orchestration"
+        worker.freeze_plan(worker.ROOT, task)
+        result.pop(field)
+        worker.write_json(worker.result_path(task["id"]), result)
+        worker.finish(path, task, "")
+        saved = json.loads((worker.BLOCKED / path.name).read_text())
+        assert saved["verification_status"] == "evidence_invalid"
+        assert saved["verification_resolution"] == "needs_replan"
+        assert saved["attempts"] == 0
+        (worker.BLOCKED / path.name).unlink()
+
+
+def test_predispatch_outage_retries_same_unexecuted_attempt(tmp_path, monkeypatch):
+    from herdr.evidence import EvidenceUnavailable
+    configure_paths(tmp_path)
+    monkeypatch.setattr(worker, "LOCK", tmp_path / "worker.lock")
+    task = base_task()
+    path = worker.RUNNING / "task-1.json"
+    worker.write_json(path, task)
+    calls = []
+    def unavailable(root, task):
+        calls.append((task["run_token"], task["idempotency_key"], task["attempt_id"]))
+        raise EvidenceUnavailable("baseline service offline")
+    monkeypatch.setattr(worker, "freeze_plan", unavailable)
+    monkeypatch.setattr(worker, "create_task_session",
+                        lambda *a: (_ for _ in ()).throw(AssertionError("economic dispatch")))
+    assert worker.main(path) == 0
+    pending = worker.PENDING / path.name
+    first = json.loads(pending.read_text())
+    assert first["completion_plan_pending"] and first["attempts"] == 0
+    assert first["attempt_state"] == "retry_scheduled"
+    assert not worker.result_path("task-1").exists()
+    assert worker.main(pending) == 0
+    second = json.loads(pending.read_text())
+    assert first["run_token"] == second["run_token"]
+    assert calls[0] == calls[1]
+    assert not list(worker.BLOCKED.iterdir())
+
+
+def test_worker_cleanup_failure_retains_completed_publication_for_recovery(tmp_path, monkeypatch):
+    task, path, result = verification_task(tmp_path)
+    task["execution_session"] = {"owned_pane": True, "pane_id": "pane"}
+    monkeypatch.setattr(worker, "verify_completion", lambda *a:
+                        {"level": "verified_worker_result", "bundle_hash": "a" * 64})
+    monkeypatch.setattr(worker, "cleanup_task_session", lambda *a: False)
+    worker.finish(path, task, "")
+    assert worker.cleanup_task_session_if_safe(task) is False
+    blocked = worker.BLOCKED / path.name
+    saved = json.loads(blocked.read_text())
+    assert saved["watchdog_blocker"] == "task_session_cleanup_failed"
+    assert saved["verification_status"] == "accepted"
+    assert json.loads(worker.result_path(task["id"]).read_text()) == result
+    assert not list(worker.RESULTS.glob("*.previous-*.json"))
+
+
+def test_other_consumer_completion_remains_explicitly_unverified(tmp_path):
+    task, path, result = verification_task(tmp_path)
+    task["repo"] = "Bbambaaamm/Autonomous-Quant-Lab"
+    worker.finish(path, task, "")
+    saved = json.loads((worker.DONE / path.name).read_text())
+    assert saved["completion_level"] == "legacy_unverified_result"
+    assert saved["completion_bundle_hash"] is None
+    assert saved["verification_status"] == "legacy_unverified"
+
 
 
 @pytest.mark.parametrize("phase", ["bridge", "sandbox", "agent"])

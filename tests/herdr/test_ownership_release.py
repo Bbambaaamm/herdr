@@ -4,6 +4,7 @@ import os
 import select
 import subprocess
 import sys
+import time
 from pathlib import Path
 import pytest
 from herdr.child_ownership import OwnershipError
@@ -37,6 +38,13 @@ def start_namespace():
     return process, init
 
 
+def await_namespace_exit(proof):
+    deadline=time.monotonic()+5
+    while not namespace_exited(proof) and time.monotonic()<deadline:
+        time.sleep(0.01)
+    assert namespace_exited(proof)
+
+
 def test_actual_namespace_lifetime_is_not_released_while_init_is_alive():
     process, init = start_namespace()
     try:
@@ -44,7 +52,7 @@ def test_actual_namespace_lifetime_is_not_released_while_init_is_alive():
         assert not namespace_exited(proof)
         process.terminate()
         process.wait(timeout=5)
-        assert namespace_exited(proof)
+        await_namespace_exit(proof)
     finally:
         if process.poll() is None:
             process.kill()
@@ -95,7 +103,7 @@ def test_actual_writer_release_waits_for_kernel_namespace_exit(tmp_path):
         evidence = [{"result": "candidate"}]
         hashed = hashlib.sha256(json.dumps(evidence, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         assert item.publish_child_result(rec.id, rec.run_token, rec.agent_id, rec.fencing_token,
-            rec.idempotency_key, hashed, evidence)
+            rec.idempotency_key, hashed, evidence, status="blocked")
         assert item.mark_child_cleanup_complete(rec.id)
         assert not item.release_child_ownership(rec.id)
         assert not all_children_terminal(tmp_path,owner.task_id,owner.run_token)
@@ -103,6 +111,7 @@ def test_actual_writer_release_waits_for_kernel_namespace_exit(tmp_path):
             item._require_current_ownership(rec, result=True)
         process.terminate()
         process.wait(timeout=5)
+        await_namespace_exit(rec.namespace_lifetime)
         assert item.release_child_ownership(rec.id)
         assert all_children_terminal(tmp_path,owner.task_id,owner.run_token)
         item._require_current_ownership(rec, result=True)

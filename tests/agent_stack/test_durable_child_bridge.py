@@ -80,16 +80,21 @@ def _task(tmp_path):
     running.mkdir(parents=True)
     path = running / "parent.json"
     task = {"id": "parent", "run_token": "run-1", "idempotency_key": "attempt-1",
-            "attempt_state": "accepted", "task_file": str(path), "repo": "Bbambaaamm/herdr",
+            "attempt_state": "accepted", "kind":"github_root_orchestration",
+            "task_file": str(path), "repo": "Bbambaaamm/herdr",
             "fencing_token": 9,
             "ownership_epoch": {"version": 1, "run_token": "run-1", "fencing_token": 9},
-            "issue": 82, "workspace": str(tmp_path), "safety_profile": "herdr-core",
+            "issue": 82, "workspace": str(tmp_path/"workspace"), "safety_profile": "herdr-core",
             "worktree_root": "/home/agentops/workspaces/herdr/worktrees",
             "parent_role": "writer", "parent_tools": ["read_file", "search_files"],
             "parent_permissions": [], "execution_session": {
                 "agent_name": "parent-agent", "pane_id": "parent-pane",
                 "pane_marker": "marker", "session_name": "marker", "owned_pane": True}}
+    Path(task["workspace"]).mkdir()
+    from agent_completion_evidence import freeze_plan
+    freeze_plan(state, task)
     path.write_text(json.dumps(task), encoding="utf-8")
+    path.chmod(0o600)
     return task, path
 
 
@@ -281,7 +286,8 @@ def test_capacity_denial_releases_parent_gate_without_reprompt(tmp_path, monkeyp
     monkeypatch.setattr(recovery, "cleanup_task_owned_pane", lambda parent: True)
     recovery.terminalize_from_result(
         path, task, {"task_id": "parent", "run_token": "run-1",
-                     "status": "completed", "evidence": ["done"]}, 0)
+                     "status": "completed", "evidence": ["done"],
+                     "summary":"Control cycle completed", "next_action":"Await authorized work"}, 0)
     assert (recovery.DONE / path.name).exists()
 
 
@@ -545,7 +551,8 @@ def test_parent_transition_serializes_real_child_claim(tmp_path, monkeypatch, tr
         setattr(module, name, directory)
     if transition != "worker_retry":
         result = {"task_id": "parent", "run_token": "run-1", "status": "completed",
-                  "evidence": ["done"]}
+                  "evidence": ["done"], "summary":"Control cycle completed",
+                  "next_action":"Await authorized work"}
         (module.RESULTS / "parent.json").write_text(json.dumps(result))
     if transition == "recovery_result":
         monkeypatch.setattr(module, "cleanup_task_owned_pane", lambda task: True)
@@ -1010,6 +1017,11 @@ def explicit_host_policy_for_lifecycle_tests(monkeypatch):
     from herdr.runtime import HerdrChildRuntime
     install_runtime_policy_fixture(monkeypatch, HerdrChildRuntime)
 
+@pytest.fixture(autouse=True)
+def explicit_host_completion_port_for_lifecycle_only(monkeypatch):
+    from tests.policy_launch_fakes import install_child_completion_fixture
+    install_child_completion_fixture(monkeypatch)
+
 
 def test_standalone_bridge_supplies_deferred_verified_parent_factory(monkeypatch,tmp_path):
     from herdr import host_configuration
@@ -1021,6 +1033,8 @@ def test_standalone_bridge_supplies_deferred_verified_parent_factory(monkeypatch
         "--run-token","run","--agent","agent","--pane","pane","--marker","marker","--real-binary","/bin/true"]
     monkeypatch.setattr(sys,"argv",argv);server.main()
     assert captured["kwargs"]["policy_launch_factory_provider"] is factory_provider
+    from agent_completion_evidence import child_completion_for_root
+    assert captured["kwargs"]["completion_authority_provider"] is child_completion_for_root
     assert captured["args"][1]["task_id"]=="parent"
 
 

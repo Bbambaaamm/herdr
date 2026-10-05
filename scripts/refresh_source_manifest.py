@@ -21,12 +21,13 @@ FILES = (
     Path("docs/architecture/A2A_GATEWAY_71.md"),
     Path("docs/architecture/AGENT_SKILLS.md"),
     Path("docs/architecture/CONTEXT_MEMORY.md"),
+    Path("docs/architecture/INVOCATION_POLICY_LAUNCH.md"),
+    Path("docs/architecture/COMPLETION_EVIDENCE.md"),
     Path("docs/architecture/PROMPT_RUNTIME.md"),
     Path("package.json"),
     Path("package-lock.json"),
     Path("requirements-mcp.txt"),
     Path("docs/architecture/MCP_GATEWAY.md"),
-    Path("docs/architecture/INVOCATION_POLICY_LAUNCH.md"),
 )
 OUTPUT = Path("provenance/CANONICAL_SOURCE_MANIFEST.sha256")
 TEXT_SUFFIXES = {
