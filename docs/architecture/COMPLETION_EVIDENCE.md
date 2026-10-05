@@ -242,3 +242,11 @@ foreign ownership, symlinks, extra hardlinks and invalid bindings. The existing
 worker write-boundary protection covers the index with the rest of the store.
 Artifact verification separately limits tracked file count, aggregate bytes
 and elapsed checks; a per-file size limit alone is insufficient.
+
+### Corrupt records and irrecoverable child pins
+
+Authenticated parents without a frozen child-completion catalogue still use the existing durable delegation path. Preparation/instructions and accepted-handoff projection are conditional on a host completion authority. A completed candidate without that authority becomes a durable blocked/replan result; it cannot manufacture verified DONE. Reconciliation reuses the original claim and rejection.
+
+A vanished, redirected, replaced or inaccessible admitted child worktree is a permanent evidence failure; transient device/resource I/O remains unavailable. Pin validation traverses each path component through no-follow directory descriptors. Already accepted immutable evidence retains its existing replay after cleanup.
+
+Flat plan/accepted readers open nonblocking, then require a current-host-owned private regular single-link file with bounded size and stable descriptor/named-inode metadata. A FIFO cannot block a legacy-index writer. Exclusive publication uses Linux no-replace atomic rename after temporary-file fsync, avoiding a temporary two-link interval. Unsupported atomic publication fails closed. A directory-fsync interruption can still finish on exact replay without changing the immutable payload.

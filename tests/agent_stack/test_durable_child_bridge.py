@@ -1075,3 +1075,47 @@ def test_authenticated_bridge_carries_ownership_into_actual_claim_and_runtime(tm
     assert row["ownership"]==scope.to_json()
     assert store.require_current(captured["reservation"],captured["identity"])
     assert first["task_id"]==captured["identity"].task_id
+
+
+def test_parent_without_frozen_child_contract_delivers_once_and_never_invents_verified_handoff(tmp_path,monkeypatch):
+    # Remove the lifecycle-only semantic-authority fixture: this exercises the
+    # actual policy-less production path. Process dispatch alone is a fixture.
+    monkeypatch.undo()
+    task,path=_task(tmp_path);_env(monkeypatch,path)
+    assert "child_completion_contracts" not in task
+    monkeypatch.setattr(bridge,"_parent_context",
+                        lambda runner:(task,"parent-pane","parent-agent","marker"))
+    deliveries=[];cleanups=[]
+    class Runtime:
+        def __init__(self,scheduler,runner,**kwargs):
+            self.scheduler=scheduler;self.directory=kwargs["snapshot_path"].parent
+        def run_managed_child(self,lease,prompt,*,run_token,idempotency_key):
+            assert self.scheduler.completion_authority is None
+            assert "HOST CHILD COMPLETION CONTRACT" not in prompt
+            assert self.scheduler.bind_execution_session(lease.task_id,run_token,lease.agent_id,
+                                                         "child-pane","child-"+run_token)
+            deliveries.append(lease.task_id)
+            evidence=[{"observation":"bounded candidate without semantic acceptance"}]
+            checksum=hashlib.sha256(json.dumps(evidence,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+            payload={"task_id":lease.task_id,"run_token":run_token,"fencing_token":lease.fencing_token,
+                     "idempotency_key":idempotency_key,"status":"completed",
+                     "evidence":evidence,"artifact_sha256":checksum}
+            result=self.directory/"results"/(lease.task_id+".result.json")
+            result.write_text(json.dumps(payload));result.chmod(0o600)
+            return "settled"
+        def cleanup_bound_child(self,task_id):cleanups.append(task_id)
+    monkeypatch.setattr(bridge,"HerdrChildRuntime",Runtime)
+    request=argparse.Namespace(key="no-contract",role="reader",objective="inspect",
+                              prompt="read files",tool=["read_file"],permission=[])
+    first=bridge.delegate(request,completion_authority=None)
+    second=bridge.delegate(request,completion_authority=None)
+    assert first["state"]==second["state"]=="blocked"
+    assert first["result_status"]==second["result_status"]=="blocked"
+    assert first["accepted_handoff"] is second["accepted_handoff"] is None
+    assert first["cleanup_complete"] and second["cleanup_complete"]
+    assert deliveries==[first["task_id"]] and cleanups==[first["task_id"]]
+    directory=attempt_directory(path.parent.parent,task["id"],task["run_token"])
+    restored=DynamicChildScheduler(audit_log=AuditLog(directory/"scheduler.jsonl"));restored.replay()
+    rec=restored._tasks[first["task_id"]]
+    assert rec.lease is None and rec.completion_receipt is None
+    assert rec.completion_failure["code"]=="evidence_invalid"

@@ -3,8 +3,9 @@ from dataclasses import asdict,dataclass
 from pathlib import Path
 import os
 import stat
+import errno
 
-from .evidence import (EvidenceError,EvidenceMissing,EvidenceStore,accept_artifact,binding,
+from .evidence import (EvidenceError,EvidenceMissing,EvidenceUnavailable,EvidenceStore,accept_artifact,binding,
                        canonical,digest,validate_plan)
 from .security import InvocationIdentity
 
@@ -23,13 +24,26 @@ def child_workspace(rec):
 
 def require_child_workspace(rec):
     path,device,inode=child_workspace(rec)
-    fd=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    flags=os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC
+    fd=None
     try:
+        if len(path.parts)>128:
+            raise EvidenceError("pinned child worktree path exceeds bound")
+        fd=os.open("/",flags)
+        for part in path.parts[1:]:
+            child=os.open(part,flags,dir_fd=fd)
+            os.close(fd)
+            fd=child
         held=os.fstat(fd)
         if not stat.S_ISDIR(held.st_mode) or (held.st_dev,held.st_ino)!=(device,inode):
             raise EvidenceError("pinned child worktree replaced")
+    except OSError as exc:
+        if exc.errno in {errno.ENOENT,errno.ENOTDIR,errno.ELOOP,errno.ESTALE,errno.EACCES,errno.EPERM}:
+            raise EvidenceError("pinned child worktree missing, replaced or inaccessible; replan required") from exc
+        raise EvidenceUnavailable("pinned child worktree temporarily unavailable") from exc
     finally:
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
 
 def child_task(rec):
     attestation=rec.execution_sandbox_attestation or {}

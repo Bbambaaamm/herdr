@@ -86,7 +86,7 @@ def parse_artifact(raw: Any) -> ArtifactRef:
 class EvidenceStore:
     """Host-owned append-only plans and accepted records, outside writable binds.
 
-    Publication uses fsynced temporary bytes followed by an atomic exclusive link
+    Publication uses fsynced temporary bytes followed by an atomic exclusive rename
     and directory fsync. A restart sees either the complete object or no object.
     It never admits a temporary file or overwrites a prior record.
     """
@@ -114,11 +114,27 @@ class EvidenceStore:
     def read(self, kind: str, key: str) -> dict:
         path = self._path(kind, key)
         try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-            with os.fdopen(fd, "rb") as handle:
-                raw = handle.read(2_000_001)
-            if len(raw) > 2_000_000:
-                raise EvidenceError("evidence exceeds bounded record size")
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+            try:
+                before = os.fstat(fd)
+                if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+                        or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != 0o600
+                        or not 0 < before.st_size <= 2_000_000):
+                    raise EvidenceError("evidence must be a bounded private regular single-link file")
+                chunks, size = [], 0
+                while size <= 2_000_000:
+                    chunk = os.read(fd, min(65536, 2_000_001-size))
+                    if not chunk:
+                        break
+                    chunks.append(chunk); size += len(chunk)
+                raw = b"".join(chunks)
+                after = os.fstat(fd); named = path.lstat()
+                stamp = lambda value: (value.st_dev,value.st_ino,value.st_size,value.st_mtime_ns,
+                                       value.st_ctime_ns,value.st_mode,value.st_uid,value.st_nlink)
+                if len(raw) != before.st_size or stamp(before) != stamp(after) or stamp(after) != stamp(named):
+                    raise EvidenceError("evidence changed during bounded read")
+            finally:
+                os.close(fd)
             envelope = json.loads(raw)
             if (set(envelope) != {"payload", "sha256"}
                     or not isinstance(envelope["payload"], dict)
@@ -134,6 +150,9 @@ class EvidenceStore:
         except EvidenceError:
             raise
         except OSError as exc:
+            import errno
+            if exc.errno in {errno.ELOOP,errno.ENOTDIR,errno.ENXIO}:
+                raise EvidenceError("evidence path is not a private regular record") from exc
             raise EvidenceUnavailable("evidence cannot be read") from exc
         except (TypeError, ValueError, KeyError, UnicodeError, RecursionError) as exc:
             raise EvidenceError("invalid evidence encoding") from exc
@@ -151,6 +170,23 @@ class EvidenceStore:
             os.fsync(fd)
         finally:
             os.close(fd)
+
+    @staticmethod
+    def _exclusive_publish(temporary, destination):
+        # Atomic no-replace rename exposes exactly one link from the outset.
+        # A link/unlink pair has a two-link window that private readers must deny.
+        import ctypes, errno
+        try:
+            operation = ctypes.CDLL(None, use_errno=True).renameat2
+        except (OSError, AttributeError) as exc:
+            raise EvidenceUnavailable("atomic exclusive evidence publication unsupported") from exc
+        operation.argtypes = [ctypes.c_int,ctypes.c_char_p,ctypes.c_int,ctypes.c_char_p,ctypes.c_uint]
+        operation.restype = ctypes.c_int
+        if operation(-100,os.fsencode(temporary),-100,os.fsencode(destination),1) != 0:
+            code=ctypes.get_errno()
+            if code==errno.EEXIST:
+                raise FileExistsError(code,"immutable evidence address exists",str(destination))
+            raise OSError(code,"exclusive evidence publication failed",str(destination))
 
     def publish(self, kind: str, key: str, payload: dict) -> str:
         try:
@@ -174,13 +210,16 @@ class EvidenceStore:
                 handle.flush()
                 os.fsync(handle.fileno())
             try:
-                os.link(tmp, path, follow_symlinks=False)
+                self._exclusive_publish(tmp, path)
             except FileExistsError:
                 if self.read(kind, key) != payload:
                     raise EvidenceError("immutable evidence publication conflict")
             self._sync_directory()
         finally:
-            os.unlink(tmp)
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
         return content_hash
 
 

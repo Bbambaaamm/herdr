@@ -158,14 +158,14 @@ def test_exclusive_atomic_publication_and_invalid_partial_records(tmp_path, monk
     store = EvidenceStore(tmp_path / "host")
     key = "a" * 64
     payload = {"value": 1}
-    real_link = os.link
-    monkeypatch.setattr(os, "link", lambda *a, **k: (_ for _ in ()).throw(OSError("crash before publish")))
+    real_link = EvidenceStore._exclusive_publish
+    monkeypatch.setattr(EvidenceStore, "_exclusive_publish", staticmethod( lambda *a, **k: (_ for _ in ()).throw(OSError("crash before publish"))))
     with pytest.raises(EvidenceUnavailable):
         store.publish("accepted", key, payload)
     with pytest.raises(EvidenceMissing):
         store.read("accepted", key)
     assert not list(store.root.glob(".publication-*"))
-    monkeypatch.setattr(os, "link", real_link)
+    monkeypatch.setattr(EvidenceStore, "_exclusive_publish", staticmethod( real_link))
     store.publish("accepted", key, payload)
     assert store.publish("accepted", key, payload) == digest(payload)
     with pytest.raises(EvidenceError, match="immutable"):
@@ -407,7 +407,7 @@ def test_committed_binary_bytes_and_deletions_are_verified(tmp_path):
 
 def test_failed_publication_is_typed_transient_and_leaves_no_accepted_record(tmp_path, monkeypatch):
     store = EvidenceStore(tmp_path / "store")
-    monkeypatch.setattr(os, "link", lambda *a, **k: (_ for _ in ()).throw(OSError("temporary disk failure")))
+    monkeypatch.setattr(EvidenceStore, "_exclusive_publish", staticmethod( lambda *a, **k: (_ for _ in ()).throw(OSError("temporary disk failure"))))
     with pytest.raises(EvidenceUnavailable, match="publication"):
         store.publish("accepted", "a" * 64, {"accepted": True})
     assert not list(store.root.glob("accepted-*"))

@@ -360,10 +360,11 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
                                            rec.idempotency_key)
         from herdr.child_evidence import ChildCompletionAuthority
         authority=scheduler.completion_authority
-        if not isinstance(authority,ChildCompletionAuthority):
-            raise SchedulerError("host child completion authority missing")
-        authority.prepare(rec)
-        delivery_prompt+=authority.instructions(rec)
+        if authority is not None:
+            if not isinstance(authority,ChildCompletionAuthority):
+                raise SchedulerError("host child completion authority invalid")
+            authority.prepare(rec)
+            delivery_prompt+=authority.instructions(rec)
         if len(delivery_prompt) > MAX_PROMPT_CHARS:
             raise ValueError("managed child prompt exceeds maximum length")
         scheduler.bind_child_prompt(child.id, delivery_prompt)
@@ -423,7 +424,8 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
     retained = rec.result_evidence_canonical
     if retained is not None and hashlib.sha256(retained).hexdigest() != rec.result_artifact_sha256:
         raise SchedulerError("retained child result digest mismatch")
-    accepted_handoff=authority.accepted_handoff(rec,registry=scheduler.ownership_registry)
+    accepted_handoff=(authority.accepted_handoff(rec,registry=scheduler.ownership_registry)
+                      if authority is not None else None)
     return {"handoff": rec.result_handoff,
                 "accepted_handoff": accepted_handoff,
                 "evidence": json.loads(retained) if retained is not None else None,

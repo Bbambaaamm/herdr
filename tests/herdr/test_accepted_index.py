@@ -52,15 +52,15 @@ def test_10001_legacy_documents_migrate_in_bounded_restartable_batches_and_new_a
     assert EvidenceStore(store.root).lookup_acceptance(fresh,new["plan_hash"])==(new,False)
     assert reads<=2 and len(list(store.root.glob("accepted-*")))==10003
 
-def test_exact_fsynced_intent_recovers_after_flat_bundle_link_failure_without_replacing_candidate(tmp_path,monkeypatch):
+def test_exact_fsynced_intent_recovers_after_flat_bundle_publication_failure_without_replacing_candidate(tmp_path,monkeypatch):
     store=EvidenceStore(tmp_path/"store");identity,payload,key,_=record(1)
-    original=os.link
+    original=EvidenceStore._exclusive_publish
     def fail(*args,**kwargs):
-        raise OSError("crash before flat link")
-    monkeypatch.setattr(os,"link",fail)
+        raise OSError("crash before flat publication")
+    monkeypatch.setattr(EvidenceStore,"_exclusive_publish",staticmethod(fail))
     with pytest.raises(EvidenceUnavailable):store.publish("accepted",key,payload)
     assert not list(store.root.glob("accepted-*"))
-    monkeypatch.setattr(os,"link",original)
+    monkeypatch.setattr(EvidenceStore,"_exclusive_publish",staticmethod(original))
     assert EvidenceStore(store.root).lookup_acceptance(identity,payload["plan_hash"])==(payload,False)
     changed=copy.deepcopy(payload);changed["proof"]["result_digest"]="f"*64
     with pytest.raises(EvidenceError,match="conflicting"):

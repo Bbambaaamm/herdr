@@ -87,13 +87,14 @@ def test_changed_child_specification_does_not_reuse_old_plan(tmp_path,monkeypatc
     with pytest.raises(EvidenceError,match="specification"):
         authority.verify(rec,result)
 
-def scheduler_fixture(tmp_path,authority=None):
+def scheduler_fixture(tmp_path,authority=None,*,worktree_identity=""):
     scheduler=DynamicChildScheduler(audit_log=AuditLog(tmp_path/"scheduler.jsonl"),completion_authority=authority)
     scheduler.register_external_parent_attempt(task_id="parent",run_token="parent-run",idempotency_key="parent-key",
         agent_name="parent-agent",pane_id="parent-pane",marker="parent-marker",repo="org/repo",
         issue="85",role="writer",tools=("read_file",),permissions=(),policy_profile="default")
     child=scheduler.delegate_child("parent","parent-run","key",
-        ChildProposal("writer",("read_file",),"reader",("read_file",),child_task="inspect"))
+        ChildProposal("writer",("read_file",),"reader",("read_file",),child_task="inspect",
+                      worktree_identity=worktree_identity))
     lease=scheduler.dispatch(task_ids={child.id})[0]
     rec=scheduler._tasks[child.id]
     evidence=[{"producer":"model","passed":True}]
