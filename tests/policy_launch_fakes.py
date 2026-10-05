@@ -30,6 +30,8 @@ class FakePreparedPolicyLaunch(PreparedPolicyLaunch):
         return {key:str(getattr(self.identity,field)) for field,key in IDENTITY_ENV.items()}
     def verify_spawn_source(self,pid):
         self.events.append(("startup-source",pid))
+    def bind_result_slot(self,path,idempotency_key):
+        self.events.append(("result-slot",str(path),idempotency_key))
     def seal(self,pid,attestation,*,tools,permissions):
         self.events.append(("sealed",pid))
         return policy_fixture(self.identity)

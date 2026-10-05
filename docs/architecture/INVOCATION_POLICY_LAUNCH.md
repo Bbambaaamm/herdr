@@ -158,3 +158,9 @@ owned sandbox. Transport errors, ambiguous output, missing grants and legacy
 unknown prompt state retain the reservation. Permanent root policy/workspace/
 tool denial becomes task_invocation_policy_denied before any pane or provider
 preflight rather than consuming fresh semantic attempts.
+
+Managed root and child results use the granted herdr_submit_result Hermes tool. Its signed rule binds one precreated private regular inode to the complete invocation identity and idempotency key before the policy bundle is sealed. The tool accepts bounded status, evidence and summary, supplies identity and digest itself, checks the same inode under a lock and fsyncs it. General file-tool roots remain the workspace. Identical submission replays are idempotent; a different result cannot overwrite the retained candidate. Submission never grants semantic acceptance or final DONE; shared #85 remains required.
+
+A child's versioned pre-split ownership intent is durable before admission/policy resource preparation. Native split intent precedes the call; an invoked/legacy unknown split remains quarantined. A root session retains its full launch identity before policy proof publication and a one-use prompt intent. Typed native agent absence permits pre-prompt cleanup only with the same marker, current sandbox PID and physically retained grant/attestation. Result replay uses fsynced scheduler evidence even when the mutable source result is corrupted; cleanup failure preserves candidate evidence while withholding the parent gate.
+
+Nested child delegation is rejected before provisioning until a child-bound transport is available through #95. Root delegation retains its authenticated bridge.

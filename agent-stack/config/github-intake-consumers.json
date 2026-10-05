@@ -15,7 +15,8 @@
         "search_files",
         "patch",
         "write_file",
-        "herdr_delegate_child"
+        "herdr_delegate_child",
+        "herdr_submit_result"
       ],
       "parent_permissions": [
         "workspace-write"
@@ -40,7 +41,8 @@
         "search_files",
         "patch",
         "write_file",
-        "herdr_delegate_child"
+        "herdr_delegate_child",
+        "herdr_submit_result"
       ],
       "parent_permissions": [
         "workspace-write"
@@ -65,7 +67,8 @@
         "search_files",
         "patch",
         "write_file",
-        "herdr_delegate_child"
+        "herdr_delegate_child",
+        "herdr_submit_result"
       ],
       "parent_permissions": [
         "workspace-write"

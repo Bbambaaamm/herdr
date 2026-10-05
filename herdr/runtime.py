@@ -56,16 +56,19 @@ _CHILD_FILE_TOOLS = frozenset({
 _CHILD_RUNTIME_PERMISSIONS = frozenset({"workspace-write"})
 
 
-def _child_toolsets(tools: Iterable[str]) -> str:
+def _child_toolsets(tools: Iterable[str], *, allow_delegation: bool = False) -> str:
     """Map admitted capabilities to an explicit Hermes model-tool allowlist."""
     selected = frozenset(tools)
-    if selected - (_CHILD_FILE_TOOLS | {"herdr_delegate_child"}):
+    if "herdr_delegate_child" in selected and not allow_delegation:
+        raise HerdrRuntimeError("child_nested_delegation_unavailable", "child-bound transport required")
+    if selected - (_CHILD_FILE_TOOLS | {"herdr_delegate_child", "herdr_submit_result"}):
         raise HerdrRuntimeError("child_toolset_unmapped", ",".join(sorted(selected)))
     # Hermes has toolset-level (not per-tool) filtering. The file bundle is
     # constrained further by the OS workspace mount below. Empty legacy canary
     # tasks get the zero-tool bot_room bundle.
     groups = (["file"] if selected & _CHILD_FILE_TOOLS else [])
     if "herdr_delegate_child" in selected: groups.append("herdr_delegation")
+    if "herdr_submit_result" in selected: groups.append("herdr_result")
     return ",".join(groups) if groups else "bot_room"
 
 
@@ -618,6 +621,8 @@ class HerdrChildRuntime:
             node = self.scheduler.task_node(lease.task_id)
         except KeyError as exc:
             raise HerdrRuntimeError("unknown_child_task", lease.task_id) from exc
+        _child_toolsets(node.tools)
+        _validate_child_permissions(node.permissions)
         parent_id = node.parent_id
         if not parent_id:
             raise HerdrRuntimeError("child_parent_required", lease.task_id)
@@ -877,6 +882,7 @@ class HerdrChildRuntime:
         policy = sandbox.frozen_policy()
         try:
             writable = self._child_result_writable(task_id)
+            launch.bind_result_slot(writable[0],self.scheduler._tasks[task_id].idempotency_key)
             sandbox_args = sandbox.command(
                 self.cwd,
                 Path(real),
@@ -1146,8 +1152,6 @@ class HerdrChildRuntime:
                 raise HerdrRuntimeError("child_worktree_identity_mismatch", lease.task_id)
             if not real or not Path(real).is_absolute():
                 raise HerdrRuntimeError("real_herdr_required", "managed child needs real binary")
-            self.prepare()
-            self._admit_child(lease)
             if not isinstance(self.policy_launch_factory, HostPolicyLaunchFactory):
                 raise HerdrRuntimeError("child_invocation_policy_missing", lease.task_id)
             record = self.scheduler._tasks[lease.task_id]
@@ -1159,6 +1163,11 @@ class HerdrChildRuntime:
                                           parent_task_id=str(record.parent_task_id or ""),
                                           task_id=lease.task_id, run_token=run_token,
                                           fencing_token=lease.fencing_token)
+            if not self.scheduler.record_child_pane_intent(
+                    lease.task_id, run_token, lease.agent_id, lease.fencing_token, idempotency_key, marker):
+                raise HerdrRuntimeError("child_pane_intent_denied", lease.task_id)
+            self.prepare()
+            self._admit_child(lease)
             launch = self.policy_launch_factory.prepare_child(identity=identity, workspace=self.cwd,
                                                          tools=node.tools, permissions=node.permissions)
             if not isinstance(launch, PreparedPolicyLaunch) or launch.identity != identity:
@@ -1166,9 +1175,6 @@ class HerdrChildRuntime:
             self._policy_launches[lease.task_id] = launch
             policy_env.update(launch.environment())
             self._preflight_child_provider()
-            if not self.scheduler.record_child_pane_intent(
-                    lease.task_id, run_token, lease.agent_id, lease.fencing_token, idempotency_key, marker):
-                raise HerdrRuntimeError("child_pane_intent_denied", lease.task_id)
             def inspect_startup_source():
                 source = _json_result(self.runner.run(["pane","process-info","--current"]),
                                       "pane startup source")

@@ -43,6 +43,7 @@ def base_task():
         "attempts": 0,
         "max_attempts": 4,
         "prompt": "safe test",
+        "idempotency_key": "task-key",
     }
 
 
@@ -52,7 +53,7 @@ def test_existing_herdr_task_gets_explicit_consumer_scope():
     worker.ensure_parent_scope(task)
     assert task["parent_role"] == "writer"
     assert task["worktree_root"] == "/home/agentops/worktrees/herdr"
-    assert set(task["parent_tools"]) == {"read_file", "search_files", "patch", "write_file", "herdr_delegate_child"}
+    assert set(task["parent_tools"]) == {"read_file", "search_files", "patch", "write_file", "herdr_delegate_child", "herdr_submit_result"}
     assert task["parent_permissions"] == ["workspace-write"]
 
 
@@ -1283,3 +1284,79 @@ def test_deterministic_host_prepare_denial_has_permanent_policy_prefix(tmp_path,
     with pytest.raises(RuntimeError,match="task_invocation_policy_denied"):
         worker.create_task_session(task,policy_launch_factory=factory)
     assert len(calls)==1 and not worker.HOST_POLICY_LAUNCHES
+
+
+def _modern_root_session(task):
+    task.update(run_token="root-run", fencing_token=9, routing={"selected_agent":"quantlab-hermes"})
+    agent, marker = worker._task_session_identity(task)
+    session = dict(agent_name=agent, session_name=marker, pane_marker=marker, pane_id="owned-pane",
+        coordinator_agent="quantlab-hermes", coordinator_pane_id="coordinator", owned_pane=True,
+        economic_delivery_attempted=False, sandbox_verified=True, sandbox_pid=123)
+    task["execution_session"] = session
+    session["launch_identity"] = worker._root_launch_identity(task).to_json()
+    return session
+
+@pytest.mark.parametrize("fault", [None, "foreign-agent", "foreign-coordinator", "foreign-fence"])
+def test_cold_root_cleanup_uses_preseal_identity_without_invocation_proof(tmp_path, monkeypatch, fault):
+    task = base_task(); session = _modern_root_session(task)
+    monkeypatch.setattr(worker,"HOST_POLICY_LAUNCHES",{})
+    cleaned = []
+    from tests.policy_launch_fakes import FakeHostPolicyLaunchFactory
+    factory = FakeHostPolicyLaunchFactory()
+    factory.cleanup_orphan = lambda identity: cleaned.append(identity) or True
+    monkeypatch.setattr(worker,"_root_policy_factory",lambda:factory)
+    if fault=="foreign-agent": session["agent_name"]="foreign"
+    if fault=="foreign-coordinator": session["coordinator_agent"]="foreign"
+    if fault=="foreign-fence": session["launch_identity"]["fencing_token"]=10
+    if fault:
+        with pytest.raises((RuntimeError, ValueError)): worker._cleanup_prepared_root_launch(task)
+        assert not cleaned
+    else:
+        worker._cleanup_prepared_root_launch(task)
+        assert len(cleaned)==1 and cleaned[0].to_json()==session["launch_identity"]
+
+@pytest.mark.parametrize("fault", [None, "stderr", "mixed", "transport", "prompt", "legacy", "pid", "proof", "marker", "foreign"])
+def test_root_setup_absent_agent_cleanup_requires_full_pre_prompt_physical_proof(tmp_path, monkeypatch, fault):
+    import subprocess
+    from herdr import policy_launch
+    task = base_task(); session = _modern_root_session(task)
+    session["invocation_policy"] = {"identity":session["launch_identity"]}
+    session["sandbox_attestation"] = {"physical":"fixture"}
+    if fault=="prompt": session["economic_delivery_attempted"]=True
+    if fault=="legacy": session.pop("economic_delivery_attempted")
+    if fault=="foreign": session["launch_identity"]["fencing_token"]=10
+    closed = []; checked = []
+    monkeypatch.setattr(worker,"_pane_has_marker",lambda *args:fault!="marker")
+    monkeypatch.setattr(worker,"_close_owned_pane",lambda pane:closed.append(pane) or True)
+    def native(args,**kwargs):
+        if args[:2]==["pane","list"]: return {"result":{"panes":[{"pane_id":"owned-pane"}]}}
+        if args[:2]==["agent","get"]: raise RuntimeError("native absent")
+        if args[:2]==["pane","process-info"]: return {"result":{"process_info":{"shell_pid":123}}}
+        raise AssertionError(args)
+    monkeypatch.setattr(worker,"_herdr_json",native)
+    raw='{"error":{"code":"agent_not_found"}}'
+    monkeypatch.setattr(worker.subprocess,"run",lambda *args,**kw:subprocess.CompletedProcess(args,
+        2 if fault=="transport" else 1, "" if fault=="stderr" else raw, raw if fault in {"stderr","mixed"} else ""))
+    monkeypatch.setattr(worker,"inner_pid",lambda *args:124 if fault=="pid" else 123)
+    def verify(evidence,**kwargs):
+        if fault=="proof": raise ValueError("changed physical proof")
+        checked.append(kwargs)
+    monkeypatch.setattr(policy_launch,"verify_retained_policy_evidence",verify)
+    answer=worker._cleanup_setup_pane("owned-pane","coordinator",session["pane_marker"],session["agent_name"],True,set(),task=task)
+    assert answer is (fault in {None,"stderr"})
+    assert closed==(["owned-pane"] if answer else [])
+    if answer:
+        assert len(checked)==1 and checked[0]["require_bootstrap"] is False
+        assert checked[0]["identity"].to_json()==session["launch_identity"]
+
+def test_modern_root_prompt_intent_is_persisted_before_effect_and_never_repeats(tmp_path,monkeypatch):
+    import subprocess
+    configure_paths(tmp_path);task=base_task();session=_modern_root_session(task)
+    monkeypatch.setattr(worker,"prompt_text",lambda task:"bounded work")
+    events=[]
+    monkeypatch.setattr(worker,"persist_execution_session",lambda task,**kw:events.append(("intent",task["execution_session"]["economic_delivery_attempted"])))
+    monkeypatch.setattr(worker.subprocess,"run",lambda *args,**kw:events.append(("native",)) or subprocess.CompletedProcess(args,0,"ok",""))
+    assert worker.run_prompt(task)==(0,"ok")
+    assert events==[("intent",True),("native",)]
+    with pytest.raises(RuntimeError,match="already_started"):worker.run_prompt(task)
+    assert len(events)==2

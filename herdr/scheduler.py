@@ -105,13 +105,13 @@ class ConsumerPolicy(Protocol):
 
 class _DefaultConsumerPolicy:
     ROLE_TOOL_ALLOWLIST: ClassVar[dict[str, set[str]]] = {
-        "reader": frozenset({"read_file", "search_files", "read"}),
+        "reader": frozenset({"herdr_submit_result", "read_file", "search_files", "read"}),
         "writer": frozenset(
-            {"read_file", "search_files", "read", "patch", "write_file", "write"}
+            {"herdr_submit_result", "read_file", "search_files", "read", "patch", "write_file", "write"}
         ),
         "reviewer": frozenset(
             {
-                "read_file",
+                "herdr_submit_result", "read_file",
                 "search_files",
                 "read",
                 "patch",
@@ -708,10 +708,14 @@ class DynamicChildScheduler:
                 ready_nodes.append(rec.node)
         return ready_nodes
 
-    def dispatch(self, now: float | None = None, *, task_ids: set[str] | None = None) -> list[Lease]:
+    def dispatch(self, now: float | None = None, *, task_ids: set[str] | None = None,
+                 managed_start: bool = False) -> list[Lease]:
+        if type(managed_start) is not bool: raise SchedulerError("typed managed start flag required")
         now = now or self.clock()
         ready_nodes = sorted((n for n in self.ready() if task_ids is None or n.id in task_ids),
                              key=lambda n: (n.priority, n.id))
+        if managed_start and any(self._tasks[n.id].delegation_key is None for n in ready_nodes):
+            raise SchedulerError("managed start requires a delegated child")
         leases: list[Lease] = []
         used_global = 0
         used_repo: dict[str, int] = defaultdict(int)
@@ -767,6 +771,17 @@ class DynamicChildScheduler:
                     f"{task_id}:{rec.run_token}:economic-attempt".encode()
                 ).hexdigest()
             rec.agent_id = lease.agent_id
+            start = None
+            if managed_start:
+                from .security import InvocationIdentity
+                identity = InvocationIdentity(consumer="github:"+rec.repo,agent_id=rec.agent_id,
+                    parent_agent_id=rec.parent_agent_id,parent_task_id=rec.parent_task_id,
+                    task_id=rec.id,run_token=rec.run_token,fencing_token=lease.fencing_token)
+                start = {"version":1,"identity":identity.to_json(),"idempotency_key":rec.idempotency_key,
+                         "marker":"child-"+rec.run_token}
+                rec.pre_delivery_pane_creation_attempted = True
+                rec.pane_split_started = False
+                rec.execution_agent,rec.execution_marker=rec.agent_id,start["marker"]
             rec.started_at = now
             rec.blocker = None
             used_global += 1
@@ -777,6 +792,7 @@ class DynamicChildScheduler:
             self.audit_log.append(
                 {
                     "event": "claim",
+                    **({"managed_start":start} if start is not None else {}),
                     "task_id": task_id,
                     "agent_id": lease.agent_id,
                     "holder": lease.holder,
@@ -1391,6 +1407,14 @@ class DynamicChildScheduler:
                                   fencing_token: int, idempotency_key: str, marker: str) -> bool:
         """Commit deterministic ownership before an external split can create a pane."""
         rec = self._tasks.get(task_id)
+        if (rec is not None and rec.pre_delivery_pane_creation_attempted
+                and rec.pane_split_started is False and rec.execution_pane is None
+                and not rec.pre_delivery_agent_start_attempted and rec.state is LifecycleState.RUNNING
+                and rec.lease is not None and marker == f"child-{run_token}"
+                and (rec.run_token,rec.agent_id,rec.fencing_token,rec.idempotency_key,
+                     rec.execution_agent,rec.execution_marker) ==
+                    (run_token,agent_id,fencing_token,idempotency_key,agent_id,marker)):
+            return True
         if (rec is None or rec.delegation_key is None or rec.state is not LifecycleState.RUNNING
                 or rec.lease is None or rec.pre_delivery_pane_creation_attempted
                 or any((rec.execution_agent, rec.execution_pane, rec.execution_marker))
@@ -1872,6 +1896,24 @@ class DynamicChildScheduler:
                 rec.agent_id = rec.lease.agent_id
                 rec.fencing_token = rec.lease.fencing_token
                 self._claims[task_id] = rec.lease
+                if "managed_start" in e:
+                    from .security import InvocationIdentity,SecurityError
+                    start=e["managed_start"]
+                    try:
+                        expected=InvocationIdentity(consumer="github:"+rec.repo,agent_id=rec.agent_id,
+                            parent_agent_id=rec.parent_agent_id,parent_task_id=rec.parent_task_id,
+                            task_id=rec.id,run_token=rec.run_token,fencing_token=rec.fencing_token)
+                        valid=(isinstance(start,dict) and set(start)=={"version","identity","idempotency_key","marker"}
+                            and type(start["version"]) is int and start["version"]==1
+                            and InvocationIdentity.from_dict(start["identity"])==expected
+                            and start["idempotency_key"]==rec.idempotency_key
+                            and start["marker"]=="child-"+rec.run_token
+                            and rec.delegation_key is not None and not rec.pre_delivery_pane_creation_attempted)
+                    except (SecurityError,ValueError,TypeError,KeyError):valid=False
+                    if not valid:raise SchedulerError("invalid atomic managed claim intent")
+                    rec.pre_delivery_pane_creation_attempted=True
+                    rec.pane_split_started=False
+                    rec.execution_agent,rec.execution_marker=rec.agent_id,start["marker"]
             elif event_type in {"complete", "child_result"}:
                 task_id = str(e.get("task_id", ""))
                 rec = self._tasks.get(task_id)

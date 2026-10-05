@@ -415,8 +415,10 @@ def test_existing_ledger_without_sentinel_cannot_delegate_or_repair(tmp_path, mo
 def test_delivery_prompt_specifies_exact_evidence_serialization():
     prompt = bridge._delivery_prompt("inspect", Path("/tmp/result.json"), "child",
                                      "run", 7, "key")
-    assert "json.dumps(evidence, sort_keys=True, ensure_ascii=False, allow_nan=False)" in prompt
-    assert "default separators/whitespace" in prompt
+    assert "herdr_submit_result" in prompt
+    assert "host binds task_id=child" in prompt
+    assert "Do not choose a filesystem destination" in prompt
+    assert "exact result inode" in prompt
 
 
 def test_oversized_managed_prompt_rejected_before_child_spawn(tmp_path, monkeypatch):
@@ -590,7 +592,8 @@ def test_parent_transition_serializes_real_child_claim(tmp_path, monkeypatch, tr
 @pytest.mark.parametrize("status,state", [("completed", "done"),
                                           ("blocked", "blocked"),
                                           ("failed", "failed")])
-def test_bridge_publishes_only_canonical_child_evidence(tmp_path, monkeypatch, status, state):
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_bridge_publishes_only_canonical_child_evidence(tmp_path, monkeypatch, status, state, cleanup_failure):
     task, path = _task(tmp_path)
     _env(monkeypatch, path)
     monkeypatch.setattr(bridge, "_parent_context",
@@ -601,7 +604,7 @@ def test_bridge_publishes_only_canonical_child_evidence(tmp_path, monkeypatch, s
             self.directory = kwargs["snapshot_path"].parent
         def run_managed_child(self, lease, prompt, *, run_token, idempotency_key):
             assert self.scheduler.bind_execution_session(
-                lease.task_id, run_token, lease.agent_id, "child-pane", "child-marker")
+                lease.task_id, run_token, lease.agent_id, "child-pane", "child-"+run_token)
             evidence = [{"path": "artifact", "checked": True}]
             digest = hashlib.sha256(json.dumps(evidence, sort_keys=True,
                 ensure_ascii=False).encode()).hexdigest()
@@ -615,7 +618,7 @@ def test_bridge_publishes_only_canonical_child_evidence(tmp_path, monkeypatch, s
         def cleanup(self):
             pass
         def cleanup_bound_child(self, task_id):
-            pass
+            if cleanup_failure: raise RuntimeError("unproven resource")
     monkeypatch.setattr(bridge, "HerdrChildRuntime", Runtime)
     args = argparse.Namespace(key="publication", role="reader", objective="inspect",
                               prompt="read files", tool=["read_file"], permission=[])
@@ -625,8 +628,13 @@ def test_bridge_publishes_only_canonical_child_evidence(tmp_path, monkeypatch, s
     directory = attempt_directory(path.parent.parent, task["id"], task["run_token"])
     replay = DynamicChildScheduler(audit_log=AuditLog(directory / "scheduler.jsonl"))
     replay.replay()
-    assert replay._tasks[result["task_id"]].cleanup_complete
-    assert bridge.delegate(args)["task_id"] == result["task_id"]
+    assert replay._tasks[result["task_id"]].cleanup_complete is (not cleanup_failure)
+    (directory / "results" / f"{result['task_id']}.result.json").write_text("corrupt")
+    repeated = bridge.delegate(args)
+    assert repeated["task_id"] == result["task_id"]
+    assert repeated["evidence"] == result["evidence"]
+    assert repeated["evidence_sha256"] == result["evidence_sha256"]
+    assert repeated["cleanup_complete"] is (not cleanup_failure)
 
 
 def test_sandbox_command_is_narrow_and_overmounts_absolute_herdr(tmp_path, monkeypatch):

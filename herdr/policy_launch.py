@@ -520,6 +520,18 @@ class PreparedPolicyLaunch:
         _require(callable(inspect_source),"host startup source inspector required")
         require_clean_spawn_source(inspect_source())
 
+    def bind_result_slot(self, path, idempotency_key):
+        from dataclasses import replace
+        from .result_submission import ResultSlot, TOOL
+        _require(self._private_key is not None, "result slot must bind before seal")
+        rule = next((rule for rule in self.grant.tool_rules if rule.tool == TOOL), None)
+        _require(rule is not None and rule.result_slot is None, "result submission authority required")
+        slot = ResultSlot.bind(path, self.identity, idempotency_key)
+        self.grant = replace(self.grant, tool_rules=tuple(
+            replace(rule,result_slot=slot) if rule.tool == TOOL else rule for rule in self.grant.tool_rules))
+        if self._parent is not None:
+            self.grant.require_logical_subset_of(self._parent)
+
     def seal(self, pid, attestation, *, tools, permissions):
         bound, sealed = self.mount.seal(pid, self.grant, identity=self.identity, attestation=attestation,
                                        tools=tools, permissions=permissions, private_key=self._private_key,
@@ -615,6 +627,8 @@ class HostPolicyLaunchFactory:
         self.authorize, self.writable_roots, self.parent_grant = authorize, tuple(writable_roots), parent_grant
 
     def prepare_child(self, *, identity: InvocationIdentity, workspace: Path, tools, permissions):
+        tools = tuple(tools)
+        _require("herdr_delegate_child" not in tools, "child-bound delegation transport unavailable")
         _require(isinstance(self.parent_grant, SecurityGrant), "accepted host parent grant required")
         return self.prepare(identity=identity, workspace=workspace, tools=tools, permissions=permissions)
 

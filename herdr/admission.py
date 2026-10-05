@@ -31,6 +31,7 @@ def _reader_tools() -> frozenset[str]:
     return frozenset(
         {
             "read_file",
+            "herdr_submit_result",
             "read",
             "search_files",
             "grep",

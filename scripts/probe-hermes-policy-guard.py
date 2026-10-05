@@ -276,6 +276,42 @@ def main() -> int:
 
         installation.uninstall()
 
+        # Actual offline Hermes model/registry dispatch submits a candidate
+        # without general writes/process tools; physical mounts are tested separately.
+        from herdr.result_submission import ResultSlot, TOOL, ARGUMENTS
+        from herdr.policy_launch import IDENTITY_ENV
+        candidate = outside_file.parent / "attempt-result.json"
+        candidate.touch(mode=0o600)
+        slot = ResultSlot.bind(candidate, identity, "probe-result-key")
+        result_rule = ToolRule(tool=TOOL,risk=RiskClass.RESULT_SUBMISSION,
+            allowed_arg_keys=ARGUMENTS,allowed_roots=(str(outside_file.parent),),requires_sandbox=True,result_slot=slot)
+        result_grant = replace(grant,scope=replace(grant.scope,tools=("read_file",TOOL)),
+            tool_rules=(*grant.tool_rules,result_rule),runtime_assurance=replace(grant.runtime_assurance,
+                sandbox_verified=True,sandbox_attestation_sha256="f"*64))
+        prior_env = {key:os.environ.get(key) for key in (*IDENTITY_ENV.values(),"HERDR_DURABLE_SANDBOX")}
+        for field,key in IDENTITY_ENV.items():os.environ[key]=str(getattr(identity,field))
+        os.environ["HERDR_DURABLE_SANDBOX"]="1"
+        result_installation = install_hermes_guard(InvocationGuard(result_grant))
+        try:
+            submission = {"status":"completed","evidence":[{"artifact":"observed-sdk-dispatch"}],"summary":"candidate"}
+            result_response = model_tools.handle_function_call(TOOL,submission,
+                **{**common,"enabled_toolsets":["file","herdr_result"]})
+            assert json.loads(result_response)["submitted"],result_response
+            retained=json.loads(candidate.read_text())
+            assert retained["task_id"]==identity.task_id and retained["run_token"]==identity.run_token
+            assert retained["fencing_token"]==identity.fencing_token and retained["idempotency_key"]=="probe-result-key"
+            repeated=registry.dispatch(TOOL,submission,task_id=identity.task_id)
+            assert json.loads(repeated)["submitted"],repeated
+            changed=registry.dispatch(TOOL,{**submission,"summary":"other"},task_id=identity.task_id)
+            assert json.loads(changed)["error"]=="result_already_submitted",changed
+            still_denied=registry.dispatch("write_file",{"path":str(outside_file),"content":"no"},task_id=identity.task_id)
+            assert "HERDR_SECURITY_DENIED[tool_not_granted]" in str(still_denied),still_denied
+        finally:
+            result_installation.uninstall()
+            for key,previous in prior_env.items():
+                if previous is None:os.environ.pop(key,None)
+                else:os.environ[key]=previous
+
         # A granted local write goes through the pinned RootFDWorkspace facade,
         # not a re-opened model pathname. This proves the installed Hermes
         # registry/file_tools seam actually uses the #76 nofollow adapter.
@@ -381,6 +417,8 @@ def main() -> int:
             "hermes_file_toolset": sorted(file_toolset),
             "read_file_allowed": True,
             "rootfd_write_allowed": True,
+            "result_submission_sdk_dispatch": True,
+            "result_submission_one_inode_no_process": True,
             "granted_delegation_sdk_dispatch": True,
             "delegation_direct_handler_schema_guarded": True,
             "delegation_generic_process_disabled": True,

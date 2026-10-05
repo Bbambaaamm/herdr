@@ -103,6 +103,8 @@ def build_host_policy_factory(*,parent_grant=None,configuration_path=HOST_POLICY
                 require(any(workspace==Path(root) or Path(root) in workspace.parents for root in rule.allowed_roots),
                         "requested file root exceeds approved rule")
                 rule=replace(rule,allowed_roots=(str(workspace),))
+            if rule.tool == "herdr_submit_result":
+                rule=replace(rule,result_slot=None)
             rules.append(rule)
         now=datetime.now(UTC);expiry=min(now+timedelta(seconds=raw["grant_ttl_seconds"]),
                                         datetime.fromisoformat(source.expires_at))

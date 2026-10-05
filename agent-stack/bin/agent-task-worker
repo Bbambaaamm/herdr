@@ -387,7 +387,7 @@ def _setup_pane_ids() -> set[str]:
 
 def _cleanup_setup_pane(pane_id: str, coordinator_pane: str, marker: str,
                         agent_name: str, agent_start_attempted: bool,
-                        preexisting_panes: set[str]) -> bool:
+                        preexisting_panes: set[str], *, task: dict | None = None) -> bool:
     """Close a setup pane only while its current identity is proven."""
     if not pane_id or pane_id == coordinator_pane or pane_id in preexisting_panes:
         return False
@@ -402,8 +402,13 @@ def _cleanup_setup_pane(pane_id: str, coordinator_pane: str, marker: str,
         if not marker or not _pane_has_marker(pane_id, marker):
             return False
         if agent_start_attempted:
-            live = (_herdr_json(["agent", "get", agent_name], timeout_seconds=10.0)
-                    .get("result") or {}).get("agent")
+            try:
+                live = (_herdr_json(["agent", "get", agent_name], timeout_seconds=10.0)
+                        .get("result") or {}).get("agent")
+            except (OSError, RuntimeError, ValueError):
+                if task is None or not _prove_root_absent_before_prompt(task, pane_id, marker, agent_name):
+                    return False
+                live = {"name": agent_name, "pane_id": pane_id}
             if (not isinstance(live, dict) or live.get("name") != agent_name
                     or str(live.get("pane_id") or "") != pane_id):
                 return False
@@ -437,6 +442,63 @@ def _preflight_root_provider(profile):
         executable=ENV.get("HERDR_HERMES_BINARY","/home/agentops/.local/bin/hermes"),env=ENV)
 
 
+def _root_launch_identity(task):
+    from herdr.security import InvocationIdentity
+    session = task.get("execution_session") or {}
+    routing = task.get("routing") if isinstance(task.get("routing"), dict) else {}
+    coordinator = str(routing.get("selected_agent") or task.get("agent") or "quantlab-hermes")
+    agent, marker = _task_session_identity(task)
+    identity = InvocationIdentity(consumer="github:"+str(task["repo"]), agent_id=agent,
+        parent_agent_id=coordinator, parent_task_id="coordinator:"+coordinator,
+        task_id=str(task["id"]), run_token=str(task["run_token"]), fencing_token=task["fencing_token"])
+    if (session.get("agent_name") != agent or session.get("session_name") != marker
+            or session.get("coordinator_agent") != coordinator or session.get("pane_marker") != marker):
+        raise RuntimeError("task_launch_cleanup_identity_mismatch")
+    proof = session.get("invocation_policy") or {}
+    retained = proof.get("identity") if isinstance(proof, dict) else None
+    for raw in (retained, session.get("launch_identity")):
+        if raw is not None and InvocationIdentity.from_dict(raw) != identity:
+            raise RuntimeError("task_launch_cleanup_identity_mismatch")
+    return identity
+
+
+def _prove_root_absent_before_prompt(task, pane_id, marker, agent_name):
+    """Typed native absence plus the exact physically retained pre-prompt launch."""
+    try:
+        session = task.get("execution_session") or {}
+        if (session.get("economic_delivery_attempted") is not False or
+                session.get("sandbox_verified") is not True or
+                session.get("pane_id") != pane_id or session.get("pane_marker") != marker or
+                session.get("agent_name") != agent_name):
+            return False
+        identity = _root_launch_identity(task)
+        proc = subprocess.run([str(HERDR), "agent", "get", agent_name], text=True,
+                              capture_output=True, timeout=10.0, env=ENV)
+        channel = proc.stdout if not proc.stderr else proc.stderr if not proc.stdout else ""
+        if proc.returncode != 1 or not 0 < len(channel.encode()) <= 131072:
+            return False
+        def pairs(items):
+            value = {}
+            for key, item in items:
+                if key in value: raise ValueError("duplicate native error key")
+                value[key] = item
+            return value
+        payload = json.loads(channel, object_pairs_hook=pairs)
+        if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict) or payload["error"].get("code") != "agent_not_found":
+            return False
+        info = _herdr_json(["pane", "process-info", "--pane", pane_id], timeout_seconds=10.0)
+        process = (info.get("result") or {}).get("process_info")
+        pid = inner_pid(process if isinstance(process, dict) else {}, marker)
+        if type(pid) is not int or pid <= 0 or pid != session.get("sandbox_pid"):
+            return False
+        from herdr.policy_launch import verify_retained_policy_evidence
+        verify_retained_policy_evidence(session.get("invocation_policy"), identity=identity,
+            pid=pid, attestation=session.get("sandbox_attestation"), require_bootstrap=False)
+        return True
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError, AttributeError, TimeoutError, subprocess.TimeoutExpired):
+        return False
+
+
 def _cleanup_prepared_root_launch(task):
     key=(task.get("id"),task.get("run_token"))
     launch=HOST_POLICY_LAUNCHES.get(key)
@@ -446,15 +508,12 @@ def _cleanup_prepared_root_launch(task):
     else:
         session=task.get("execution_session") or {}
         proof=session.get("invocation_policy") or {}
-        if isinstance(proof,dict) and isinstance(proof.get("identity"),dict):
-            from herdr.security import InvocationIdentity
-            identity=InvocationIdentity.from_dict(proof["identity"])
-            if (identity.consumer != "github:"+str(task["repo"])
-                    or identity.task_id != task.get("id") or identity.run_token != task.get("run_token")
-                    or identity.fencing_token != task.get("fencing_token")
-                    or identity.agent_id != session.get("agent_name")):
-                raise RuntimeError("task_launch_cleanup_identity_mismatch")
+        # Legacy observations without a policy launch have no launch resources.
+        # All new sessions carry a pre-seal full identity; never silently skip it.
+        if session.get("launch_identity") is not None or isinstance(proof,dict) and proof.get("identity"):
+            identity = _root_launch_identity(task)
             _root_policy_factory().cleanup_orphan(identity)
+
 
 
 def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
@@ -556,6 +615,8 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
             "coordinator_pane_id": coordinator_pane,
             "profile": profile,
             "owned_pane": True,
+            "launch_identity": identity.to_json(),
+            "economic_delivery_attempted": False,
             "created_at": utcnow().isoformat(),
         }
         task["execution_session"] = session
@@ -569,6 +630,7 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         task_result.parent.mkdir(parents=True, exist_ok=True)
         if not task_result.exists():
             task_result.touch(mode=0o600)
+        launch.bind_result_slot(task_result, str(task["idempotency_key"]))
         command = sandbox_command(
             Path(workspace), HERDR, writable=(task_result,), policy=policy, policy_mount=launch.mount
         )
@@ -614,7 +676,7 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
                 "--continue", session_name, "--create-if-missing",
                 "--in", workspace,
                 "--toolsets", __import__("herdr.runtime", fromlist=["_child_toolsets"])._child_toolsets(
-                    tuple(task.get("parent_tools") or ())),
+                    tuple(task.get("parent_tools") or ()), allow_delegation=True),
             ],
             timeout_seconds=75.0,
         )
@@ -816,9 +878,9 @@ TASK COMPLETION CONTRACT:
 - Continue autonomously through ordinary technical decisions inside the issue scope.
 - Completion flow for mergeable code: builder evidence -> tests -> PR -> CI green -> independent review PASS on the exact PR head SHA -> verify head SHA did not change and no blocking review remains -> merge only if repository protection permits. Any missing/stale gate is FAIL-CLOSED: leave the PR open and report the blocker instead of merging.
 - After a successful merge, verify the issue is actually closed/satisfied. If the issue is broad, complete one bounded high-value slice and leave precise durable next_action so intake can safely schedule the next slice.
-- Before finishing, write UTF-8 JSON to {result}.
-- The JSON MUST contain exactly this task identity: task_id="{task_id}" and run_token="{run_token}".
-- Include keys: task_id, run_token, status, summary, issue, repo, evidence, blocker, next_action, completed_at. repo must be "{repo}".
+- Before finishing, use herdr_submit_result with status, a nonempty evidence list and summary. The host publishes to the exact attempt-owned result inode.
+- The host binds task_id="{task_id}", run_token="{run_token}", the fence and idempotency key; do not supply a path or identity arguments.
+- Include concrete artifacts/checks in evidence. Put any blocker and next action in summary. The host binds repository "{repo}".
 - status must be one of completed, blocked, failed.
 - If GitHub write authorization is required, set status=blocked and blocker=github_write_auth_required. Preserve exact branch/patch/evidence and do not redo implementation.
 - If user-only approval, paid-provider activation, new credential, production deploy, or another interactive authorization is required, do not guess or self-approve; report the specific blocker.
@@ -838,9 +900,9 @@ TASK COMPLETION CONTRACT:
 - Exact-head merge flow is tests -> CI green -> independent review with no unresolved applicable finding -> unchanged head verification -> merge only if repository protection permits.
 - A gated leaf does not block unrelated dependency-ready AUTO work. Do not fabricate elapsed soak evidence; an elapsed-time acceptance wait should end this cycle as completed with a precise next_action for later re-check.
 - Use status=blocked only when the whole safe backlog cannot progress without genuine human/credential/external/privileged action.
-- Before finishing, write UTF-8 JSON to {result}.
-- The JSON MUST contain exactly this task identity: task_id="{task_id}" and run_token="{run_token}".
-- Include keys: task_id, run_token, status, summary, issue, repo, evidence, blocker, next_action, completed_at. repo must be "{repo}".
+- Before finishing, use herdr_submit_result with status, a nonempty evidence list and summary. The host publishes to the exact attempt-owned result inode.
+- The host binds task_id="{task_id}", run_token="{run_token}", the fence and idempotency key; do not supply a path or identity arguments.
+- Include concrete artifacts/checks in evidence. Put any blocker and next action in summary. The host binds repository "{repo}".
 - status must be one of completed, blocked, failed.
 """
     else:
@@ -859,8 +921,8 @@ TASK COMPLETION CONTRACT:
 - Do not bypass protected-branch, CI, deploy-hold, credential, approval, billing, or safety controls.
 - Continue autonomously through ordinary technical decisions within this bounded slice.
 - Any economic child coding, research, testing, or review requires an admitted durable Herdr TaskGraph child before prompt delivery. Direct unmanaged persistent-child prompts are denied; read-only inspection may remain local.
-- Before finishing, write UTF-8 JSON to {result}.
-- The JSON MUST contain exactly this task identity: task_id="{task_id}" and run_token="{run_token}".
+- Before finishing, use herdr_submit_result with status, a nonempty evidence list and summary. The host publishes to the exact attempt-owned result inode.
+- The host binds task_id="{task_id}", run_token="{run_token}", the fence and idempotency key; do not supply a path or identity arguments.
 - Include keys: task_id, run_token, status, summary, issue, evidence, blocker, next_action, completed_at.
 - status must be one of completed, blocked, failed.
 - If GitHub write authorization is required to complete the slice, set status=blocked and blocker=github_write_auth_required. Preserve exact local branch/patch/evidence and do not redo implementation.
@@ -893,6 +955,12 @@ def run_prompt(task: dict) -> tuple[int, str]:
         str(HERDR), "agent", "prompt", agent, prompt,
         "--wait", "--timeout", str(timeout_seconds * 1000),
     ]
+    if session.get("launch_identity") is not None:
+        _root_launch_identity(task)
+        if session.get("economic_delivery_attempted") is not False:
+            raise RuntimeError("task_delivery_already_started")
+        session["economic_delivery_attempted"] = True
+        persist_execution_session(task, startup=False)
     proc = subprocess.run(
         cmd,
         text=True,

@@ -175,3 +175,11 @@ Machine City and audit export must show:
 ## Physical invocation boundary
 
 Root and managed-child launches require the host-only policy factory and same-inode sealing described in [Host invocation policy launch](INVOCATION_POLICY_LAUNCH.md). Physical evidence is verified before Hermes starts. Missing host authorization is a policy blocker; a model-visible schema, pane status or task field cannot supply it.
+
+Managed root and child results use the granted herdr_submit_result Hermes tool. Its signed rule binds one precreated private regular inode to the complete invocation identity and idempotency key before the policy bundle is sealed. The tool accepts bounded status, evidence and summary, supplies identity and digest itself, checks the same inode under a lock and fsyncs it. General file-tool roots remain the workspace. Identical submission replays are idempotent; a different result cannot overwrite the retained candidate. Submission never grants semantic acceptance or final DONE; shared #85 remains required.
+
+A child's versioned pre-split ownership intent is durable before admission/policy resource preparation. Native split intent precedes the call; an invoked/legacy unknown split remains quarantined. A root session retains its full launch identity before policy proof publication and a one-use prompt intent. Typed native agent absence permits pre-prompt cleanup only with the same marker, current sandbox PID and physically retained grant/attestation. Result replay uses fsynced scheduler evidence even when the mutable source result is corrupted; cleanup failure preserves candidate evidence while withholding the parent gate.
+
+Nested child delegation is rejected before provisioning until a child-bound transport is available through #95. Root delegation retains its authenticated bridge.
+
+Managed child claims persist the seven-component launch identity, idempotency key and deterministic pane marker in the same fsynced claim event. Runtime entry confirms that intent before CLI preparation, policy provisioning or pane creation. Replay distinguishes a versioned never-split intent from an ambiguous split/native-start observation; only the former permits absence-based cleanup without inventing native quiescence. Nested child delegation is denied before policy provisioning until a child-bound bridge is available.

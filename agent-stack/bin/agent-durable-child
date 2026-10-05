@@ -27,15 +27,12 @@ from agent_durable_sandbox import PinnedWorktree
 
 def _delivery_prompt(prompt, result_path, child_id, run_token, fencing_token,
                      idempotency_key):
-    return (f"{prompt}\n\nDurable child result: write UTF-8 JSON to {result_path}. "
-            f"Use task_id={child_id}, run_token={run_token}, "
-            f"fencing_token={fencing_token}, idempotency_key={idempotency_key}, "
-            "status=completed|blocked|failed, a nonempty evidence list, "
-            "and exact fencing_token and idempotency_key. "
-            "artifact_sha256 is SHA-256 of the UTF-8 bytes produced exactly by Python "
-            "json.dumps(evidence, sort_keys=True, ensure_ascii=False, allow_nan=False) "
-            "with the default separators/whitespace. "
-            "Evidence binds the result identity; it does not prove tests passed.")
+    return (f"{prompt}\n\nSubmit the durable child result through herdr_submit_result "
+            "with status=completed|blocked|failed, a nonempty evidence list and an optional summary. "
+            f"The host binds task_id={child_id}, run_token={run_token}, "
+            f"fencing_token={fencing_token}, idempotency_key={idempotency_key} "
+            "and the exact result inode. Do not choose a filesystem destination. "
+            "Submission is candidate evidence; the shared host gate decides acceptance.")
 
 
 def _validate_delivery_prompt(prompt, directory, child_id, *, parent_task_id="", run_token=""):
@@ -310,7 +307,8 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
         proposal = ChildProposal(parent_role=task["parent_role"],
                                  parent_tools=tuple(task["parent_tools"]),
                                  parent_permissions=tuple(task["parent_permissions"]),
-                                 child_role=args.role, child_tools=tuple(args.tool),
+                                  child_role=args.role, child_tools=tuple(sorted(set(args.tool) |
+                                      ({"herdr_submit_result"} if "herdr_submit_result" in task["parent_tools"] else set()))),
                                  child_permissions=tuple(args.permission),
                                  child_task=args.objective,
                                  worktree_identity=pinned.identity)
@@ -324,7 +322,7 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
         rec = scheduler._tasks[child.id]
         newly_claimed = rec.state is LifecycleState.PENDING
         if newly_claimed:
-            leases = scheduler.dispatch(task_ids={child.id})
+            leases = scheduler.dispatch(task_ids={child.id},managed_start=True)
             if len(leases) != 1 or leases[0].task_id != child.id:
                 raise SchedulerError("child claim unavailable")
             rec = scheduler._tasks[child.id]
@@ -354,8 +352,14 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
                 if not rec.pre_delivery_failure or rec.pre_delivery_failure != exc.detail:
                     raise SchedulerError("pre-delivery failure audit missing or mismatched") from exc
             # An error after prompt invocation remains the accepted attempt.
-        result_status = (None if rec.pre_delivery_failure else
-                         publish_exact_child_result(scheduler, rec, result_path))
+        if rec.result_evidence_canonical is not None:
+            if (rec.attempt_state != "terminal" or not rec.result_status or
+                    hashlib.sha256(rec.result_evidence_canonical).hexdigest() != rec.result_artifact_sha256):
+                raise SchedulerError("retained child result integrity mismatch")
+            result_status = rec.result_status
+        else:
+            result_status = (None if rec.pre_delivery_failure else
+                             publish_exact_child_result(scheduler, rec, result_path))
         if result_status is not None:
             # Exact terminal result evidence permits deterministic resource
             # cleanup. Without such evidence the execution pane remains owned
@@ -369,9 +373,15 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
                 admission_registry=AdmissionRegistry())
             # Even the immediate result path must re-prove the exact live
             # agent/pane/marker before closing anything.
-            reconciler.cleanup_bound_child(child.id)
-            if rec.execution_pane and not scheduler.mark_child_cleanup_complete(child.id):
-                raise SchedulerError("child cleanup evidence denied")
+            if not rec.cleanup_complete:
+                try:
+                    reconciler.cleanup_bound_child(child.id)
+                    if rec.execution_pane and not scheduler.mark_child_cleanup_complete(child.id):
+                        raise SchedulerError("child cleanup evidence denied")
+                except (OSError, RuntimeError, ValueError, TypeError, KeyError):
+                    # Retain verified evidence while resources and the parent gate
+                    # remain quarantined. Cleanup is never semantic acceptance.
+                    pass
     # Use the fsync-protected scheduler record, never a changed worker result file.
     # These are submitted artifacts; only the shared completion gate accepts them.
     retained = rec.result_evidence_canonical
@@ -385,6 +395,7 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
                 "idempotency_key": rec.idempotency_key,
                 "state": rec.state.value,
                 "result_status": result_status,
+                "cleanup_complete": rec.cleanup_complete,
                 "pre_delivery_failure": rec.pre_delivery_failure,
                 "observed_execution": rec.observed_execution,
                 "evidence_note": "UI settlement is observation, not proof of tests or semantic completion"}

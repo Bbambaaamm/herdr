@@ -94,6 +94,7 @@ class RiskClass(StrEnum):
     READ = "read"
     WORKSPACE_WRITE = "workspace_write"
     DELEGATION = "delegation"
+    RESULT_SUBMISSION = "result_submission"
     PROCESS = "process"
     EXTERNAL_SIDE_EFFECT = "external_side_effect"
     CREDENTIAL_USE = "credential_use"
@@ -272,6 +273,7 @@ class ToolRule:
     credential_ref_fields: tuple[str, ...] = ()
     requires_process: bool = False
     requires_sandbox: bool = False
+    result_slot: Any = None
 
     def __post_init__(self) -> None:
         _token(self.tool, "tool")
@@ -290,11 +292,16 @@ class ToolRule:
         if any(not Path(root).is_absolute() for root in roots):
             raise SecurityError("tool roots must be absolute")
         object.__setattr__(self, "allowed_roots", roots)
+        if self.result_slot is not None:
+            from .result_submission import ResultSlot
+            if not isinstance(self.result_slot, ResultSlot) or self.tool != "herdr_submit_result":
+                raise SecurityError("result slot requires the submission tool")
         if type(self.requires_process) is not bool or type(self.requires_sandbox) is not bool:
             raise SecurityError("tool runtime requirements must be booleans")
 
     def to_json(self) -> dict[str, Any]:
         return {
+            **({"result_slot": self.result_slot.to_json()} if self.result_slot is not None else {}),
             "tool": self.tool,
             "risk": self.risk.value,
             "allowed_arg_keys": list(self.allowed_arg_keys),
@@ -307,6 +314,11 @@ class ToolRule:
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "ToolRule":
+        raw = dict(raw)
+        slot = raw.pop("result_slot", None)
+        if slot is not None:
+            from .result_submission import ResultSlot
+            slot = ResultSlot.from_dict(slot)
         _exact_keys(
             raw,
             {
@@ -314,7 +326,7 @@ class ToolRule:
                 "credential_ref_fields", "requires_process", "requires_sandbox",
             },
         )
-        return cls(**dict(raw))
+        return cls(**raw, result_slot=slot)
 
 
 @dataclass(frozen=True)
@@ -516,7 +528,8 @@ class SecurityGrant:
         built_in_risk = {"read_file": RiskClass.READ, "search_files": RiskClass.READ,
                          "write_file": RiskClass.WORKSPACE_WRITE, "patch": RiskClass.WORKSPACE_WRITE,
                          "terminal": RiskClass.PROCESS, "execute_code": RiskClass.PROCESS,
-                         "herdr_delegate_child": RiskClass.DELEGATION}
+                         "herdr_delegate_child": RiskClass.DELEGATION,
+                         "herdr_submit_result": RiskClass.RESULT_SUBMISSION}
         for rule in self.tool_rules:
             if rule.tool in {"read_file", "search_files", "write_file", "patch"}:
                 required = () if rule.tool == "patch" else ("path",)
@@ -528,6 +541,15 @@ class SecurityGrant:
                     not rule.requires_sandbox or rule.requires_process
                     or set(rule.allowed_arg_keys) - {"key", "role", "objective", "prompt", "tool", "permission", "cwd"}):
                 raise SecurityError("delegation requires narrow sandboxed bridge rule")
+            if rule.tool == "herdr_submit_result":
+                if (not rule.requires_sandbox or rule.requires_process or rule.path_fields
+                        or rule.credential_ref_fields or set(rule.allowed_arg_keys) != {"status","evidence","summary"}
+                        or not rule.allowed_roots):
+                    raise SecurityError("result submission requires a narrow sandboxed rule")
+                if rule.result_slot is not None:
+                    if (not _roots_subset((rule.result_slot.path,),rule.allowed_roots)
+                            or rule.result_slot.identity_sha256 != canonical_digest(self.identity.to_json())):
+                        raise SecurityError("result slot identity/root mismatch")
             if rule.risk == RiskClass.PROCESS and (not rule.requires_process or not rule.requires_sandbox):
                 raise SecurityError("process tool requires process policy and sandbox")
             if rule.tool in built_in_risk and rule.risk != built_in_risk[rule.tool]:
@@ -595,6 +617,9 @@ class SecurityGrant:
             parent_rule = parent_rules.get(child_rule.tool)
             if parent_rule is None:
                 raise SecurityError("child tool rule missing from parent")
+            if (child_rule.result_slot is not None and parent_rule.result_slot is not None
+                    and child_rule.result_slot.max_bytes > parent_rule.result_slot.max_bytes):
+                raise SecurityError("child result bound exceeds parent")
             if not set(child_rule.allowed_arg_keys) <= set(parent_rule.allowed_arg_keys):
                 raise SecurityError("child tool argument ceiling escalates above parent")
             required_path_fields = set(parent_rule.path_fields)

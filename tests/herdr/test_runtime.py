@@ -1186,7 +1186,8 @@ mine.write_text(json.dumps(observed))
 @pytest.mark.parametrize("phase", ["result", "construct", "launch", "inspect", "verify"])
 def test_child_sandbox_failure_removes_frozen_policy(tmp_path, monkeypatch, phase):
     from importlib.machinery import SourceFileLoader
-    scheduler = _canary(tmp_path)
+    import types
+    scheduler = types.SimpleNamespace(_tasks={"task":types.SimpleNamespace(idempotency_key="slot-key",agent_id=None)})
     policy = tmp_path / "frozen-policy"
     policy.write_text("frozen")
     original = SourceFileLoader.exec_module
@@ -1555,3 +1556,67 @@ def test_split_start_is_fsync_durable_one_use_before_native_effect(tmp_path):
     assert not replay.mark_child_split_started(*args)
     third=DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path/"events.jsonl"));third.replay()
     assert third._tasks[child.id].pane_split_started is True
+
+@pytest.mark.parametrize("phase",["admission","policy_prepare"])
+def test_resource_preparation_crash_retains_recoverable_pre_split_intent(tmp_path,monkeypatch,phase):
+    from tests.policy_launch_fakes import FakeHostPolicyLaunchFactory
+    scheduler,child,record=_interrupted_start_record(tmp_path)
+    events=scheduler.audit_log.replay()
+    cutoff=next(i for i,e in enumerate(events) if e["event"]=="child_pane_creation_attempted")
+    scheduler.audit_log._path.write_text("".join(json.dumps(e)+"\n" for e in events[:cutoff]))
+    replay=DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path/"events.jsonl"));replay.replay()
+    current=replay._tasks[child.id]
+    factory=FakeHostPolicyLaunchFactory()
+    runner=FakeHerdrRunner();runner.executable="/bin/true"
+    runtime=HerdrChildRuntime(replay,runner,cwd=tmp_path,policy_launch_factory=factory,admission_registry=_registry(tmp_path))
+    monkeypatch.setattr(runtime,"prepare",lambda:None)
+    def interrupted(*args,**kwargs):
+        durable=DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path/"events.jsonl"));durable.replay()
+        found=durable._tasks[child.id]
+        assert found.pane_split_started is False and found.pre_delivery_pane_creation_attempted
+        assert (found.run_token,found.agent_id,found.fencing_token,found.idempotency_key)==(
+            current.run_token,current.agent_id,current.fencing_token,current.idempotency_key)
+        raise SystemExit("simulated host death")
+    monkeypatch.setattr(runtime,"_admit_child",interrupted if phase=="admission" else lambda lease:None)
+    if phase=="policy_prepare":monkeypatch.setattr(factory,"prepare_child",interrupted)
+    with pytest.raises(SystemExit):runtime.run_managed_child(current.lease,"work",
+        run_token=current.run_token,idempotency_key=current.idempotency_key)
+    recovered=DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path/"events.jsonl"));recovered.replay()
+    class Empty:
+        def run(self,args,**kwargs):
+            assert args==["pane","list"]
+            return CommandResult(0,'{"result":{"panes":[]}}',"")
+    cleanup=HerdrChildRuntime(recovered,Empty(),cwd=tmp_path,policy_launch_factory=factory,admission_registry=_registry(tmp_path))
+    cleanup.recover_interrupted_child_start(child.id)
+    assert recovered._tasks[child.id].cleanup_complete
+    assert recovered._tasks[child.id].run_token==current.run_token
+    assert not any(call[:2] in {("pane","split"),("agent","prompt")} for call in runner.calls)
+
+def test_nested_delegation_is_rejected_before_any_admission_effect(tmp_path):
+    from herdr.runtime import _child_toolsets
+    with pytest.raises(HerdrRuntimeError,match="nested_delegation_unavailable"):
+        _child_toolsets(("herdr_delegate_child",))
+    assert _child_toolsets(("herdr_delegate_child",),allow_delegation=True)=="herdr_delegation"
+
+def test_atomic_managed_claim_survives_crash_before_runtime_entry(tmp_path,monkeypatch):
+    scheduler,child,rec=_interrupted_start_record(tmp_path)
+    events=scheduler.audit_log.replay()
+    cutoff=next(i for i,e in enumerate(events) if e["event"]=="claim" and e["task_id"]==child.id)
+    scheduler.audit_log._path.write_text("".join(json.dumps(e)+"\n" for e in events[:cutoff]))
+    replay=DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path/"events.jsonl"));replay.replay()
+    lease,=replay.dispatch(task_ids={child.id},managed_start=True)
+    durable=DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path/"events.jsonl"));durable.replay()
+    record=durable._tasks[child.id]
+    assert record.pane_split_started is False and record.pre_delivery_pane_creation_attempted
+    assert record.execution_marker=="child-"+record.run_token
+    assert durable.record_child_pane_intent(child.id,record.run_token,record.agent_id,
+        record.fencing_token,record.idempotency_key,record.execution_marker)
+    class Empty:
+        def run(self,args,**kwargs):
+            assert args==["pane","list"]
+            return CommandResult(0,'{"result":{"panes":[]}}',"")
+    runtime=HerdrChildRuntime(durable,Empty(),cwd=tmp_path,admission_registry=_registry(tmp_path))
+    monkeypatch.setattr(runtime,"_cleanup_policy_launch",lambda *args:None)
+    runtime.recover_interrupted_child_start(child.id)
+    assert record.cleanup_complete and record.state.value=="blocked"
+    assert record.fencing_token==lease.fencing_token
