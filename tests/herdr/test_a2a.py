@@ -45,7 +45,7 @@ def setup(tmp_path):
         card.fingerprint, card.interfaces[0].fingerprint, "remote-exec",
         "remote-provider", "remote-cap", "remote-runtime", ("read_file",), str(tmp_path),
     )
-    identity = Identity("parent", "child", "task-1", "run-1", 7, "idem-1")
+    identity = Identity("github:repo", "parent", "child", "task-1", "run-1", 7, "idem-1")
     return raw, card, policy, identity, BindingStore(tmp_path / "binding.json")
 
 
@@ -1103,9 +1103,10 @@ def test_strict_idna2008_invalid_domains_denied(tmp_path, host):
     with pytest.raises(A2AError, match="HTTPS"):
         parse_card(raw)
 
-def test_null_optional_message_task_id_is_direct_and_restart_never_resends(tmp_path):
+@pytest.mark.parametrize("empty", [None, ""])
+def test_null_optional_message_task_id_is_direct_and_restart_never_resends(tmp_path, empty):
     _, card, policy, identity, store = setup(tmp_path)
-    transport = Mock({"message": {"messageId": "reply", "taskId": None,
+    transport = Mock({"message": {"messageId": "reply", "taskId": empty,
         "contextId": "context", "role": "ROLE_AGENT", "parts": [{"text": "answer"}]}})
     first, = Gateway(transport, store, card, policy).send(identity, "work")
     assert first.remote_task_id is None and store.read()["delivery"] == "direct"
@@ -1117,12 +1118,13 @@ def test_null_optional_message_task_id_is_direct_and_restart_never_resends(tmp_p
 
 @pytest.mark.parametrize("operation", ["send", "poll", "cancel"])
 @pytest.mark.parametrize("bare", [False, True])
-def test_null_optional_status_message_task_id_keeps_candidates_and_binding(tmp_path, operation, bare):
+@pytest.mark.parametrize("empty", [None, ""])
+def test_null_optional_status_message_task_id_keeps_candidates_and_binding(tmp_path, operation, bare, empty):
     _, card, policy, identity, store = setup(tmp_path)
     transport = Mock(); gateway = Gateway(transport, store, card, policy)
     response = task("TASK_STATE_WORKING")
     response["task"]["status"]["message"] = {"messageId":"current", "role":"ROLE_AGENT",
-        "contextId":"remote-context", "taskId":None, "parts":[{"text":"findings", "metadata":None}]}
+        "contextId":"remote-context", "taskId":empty, "parts":[{"text":"findings", "metadata":None}]}
     response["task"]["artifacts"] = None
     if operation == "send":
         transport.response = response
@@ -1143,7 +1145,7 @@ def test_null_optional_status_message_task_id_keeps_candidates_and_binding(tmp_p
 @pytest.mark.parametrize("fence", [0, -1, True, 1.0, 2**63])
 def test_invalid_fence_rejected_before_gateway_or_economic_claim(fence):
     with pytest.raises(A2AError, match="fence"):
-        Identity("parent","child","task","run",fence,"key")
+        Identity("github:repo","parent","child","task","run",fence,"key")
 
 
 @pytest.mark.parametrize("operation", ["send","poll","cancel"])
@@ -1236,3 +1238,42 @@ def test_card_required_null_fields_still_deny(tmp_path, field):
     raw[field] = None
     with pytest.raises(A2AError):
         parse_card(raw)
+
+
+@pytest.mark.parametrize("text", ["Implement password reset", "Document credential rotation", "Describe the Authorization header"])
+def test_security_task_terms_without_values_are_delivered(tmp_path, text):
+    _, card, policy, identity, store = setup(tmp_path)
+    transport = Mock()
+    Gateway(transport, store, card, policy).send(identity, text)
+    assert len(transport.sends) == 1
+
+@pytest.mark.parametrize("text", ["password=do-not-export", "api_key: do-not-export", "Authorization: Bearer abcdefghijklmnop", "ghp_" + "a"*30])
+def test_outbound_actual_secret_values_denied_before_claim(tmp_path, text):
+    _, card, policy, identity, store = setup(tmp_path)
+    transport = Mock()
+    with pytest.raises(A2AError, match="secret-like"):
+        Gateway(transport, store, card, policy).send(identity, text)
+    assert transport.sends == [] and not store.path.exists()
+    assert not a2a_module.ECONOMIC_CLAIM_ROOT.exists()
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_binding_file_cannot_equal_authority_root(tmp_path, existing):
+    root = tmp_path / "authority"
+    if existing: root.mkdir()
+    with pytest.raises(A2AError, match="outside authority"):
+        BindingStore(root, authority_root=root)
+    assert not (tmp_path / "authority.lock").exists()
+
+def test_economic_claims_are_scoped_to_consumer_and_restart_stays_one_use(tmp_path):
+    _, card, policy, identity, store = setup(tmp_path)
+    other = replace(identity, consumer="github:other")
+    assert other.message_id != identity.message_id
+    first, second = Mock(), Mock()
+    Gateway(first, store, card, policy).send(identity, "work")
+    other_store = BindingStore(tmp_path / "other.json")
+    Gateway(second, other_store, card, policy).send(other, "work")
+    assert len(first.sends) == len(second.sends) == 1
+    with pytest.raises(A2AError, match="already started"):
+        Gateway(first, BindingStore(tmp_path / "again.json"), card, policy).send(identity, "work")
+    assert len(first.sends) == 1
+    assert Gateway(second, other_store, card, policy).recover(other) == ()

@@ -338,6 +338,7 @@ def registration(card: AgentCard, policy: Admission, *, observed_at: str, ttl_se
 
 @dataclass(frozen=True)
 class Identity:
+    consumer: str
     parent_agent_id: str
     child_agent_id: str
     task_id: str
@@ -346,7 +347,7 @@ class Identity:
     idempotency_key: str
 
     def __post_init__(self) -> None:
-        for name in ("parent_agent_id", "child_agent_id", "task_id", "run_token", "idempotency_key"):
+        for name in ("consumer", "parent_agent_id", "child_agent_id", "task_id", "run_token", "idempotency_key"):
             _id(getattr(self, name), name)
         if type(self.fencing_token) is not int or not 1 <= self.fencing_token < 2**63:
             raise A2AError("invalid fence")
@@ -504,7 +505,7 @@ class BindingStore:
         if not self.authority_root.is_absolute() or ".." in self.authority_root.parts:
             raise A2AError("invalid binding authority root")
         try:
-            self.path.relative_to(self.authority_root)
+            self.path.parent.relative_to(self.authority_root)
         except ValueError as exc:
             raise A2AError("binding path outside authority root") from exc
 
@@ -780,6 +781,9 @@ def _response_object(value: Any, required: set[str]) -> Mapping[str, Any]:
     value = _proto_keys(value, {"messageId", "contextId", "taskId", "artifactId", "referenceTaskIds"})
     if not required <= value.keys():
         raise A2AError("invalid response object")
+    for key in ("taskId", "contextId"):
+        if key not in required and value.get(key) in (None, ""):
+            value.pop(key, None)
     return value
 
 
@@ -901,8 +905,9 @@ class Gateway:
     def send(self, identity: Identity, text: str) -> tuple[Candidate, ...]:
         if not self.card.supports_text_input:
             raise A2AError("remote card does not support text input")
-        if not isinstance(text, str) or not text or len(text.encode()) > 8192 or _SECRET.search(text):
+        if not isinstance(text, str) or not text or len(text.encode()) > 8192:
             raise A2AError("invalid message text")
+        _reject_secret_values(text)
         with self.store.locked() as directory:
             if self.store._read(directory) is not None:
                 raise A2AError("delivery already started; reconcile ambiguous send")
