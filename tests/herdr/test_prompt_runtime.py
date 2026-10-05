@@ -636,3 +636,92 @@ def test_route_filters_context_sources_before_loading(tmp_path,mandatory):
     else:
         bundle=compile(data,lambda _:pytest.fail("sensitive context loaded"))
         assert any(row["code"]=="provider_data_class" for row in bundle.telemetry()["context_audit"]["rejected"])
+
+
+@pytest.mark.parametrize("field", ["id", "task_class", "diversity_key", "source_uri"])
+def test_demo_selection_redacts_all_metadata_before_evidence_lookup(tmp_path, field):
+    from herdr.context import SecretRedactor
+    secret = "opaqueHostCredentialKnownOnlyHere"
+    data = setup(tmp_path, redactor=SecretRedactor((secret,)))
+    candidate, _ = demo()
+    if field == "source_uri":
+        candidate = replace(candidate, source=replace(candidate.source, uri="artifact://herdr/"+secret))
+    else:
+        candidate = replace(candidate, **{field: secret})
+    selector = data[0].demonstration_selector
+    selector.verify = lambda _: pytest.fail("secret-bearing metadata reached evidence lookup")
+    selected, rejected = selector.select((candidate,), context=data[2],
+                                        task_class="coding", conditions_sha256=CONDITIONS)
+    assert selected == ()
+    assert rejected == ({"id_sha256": digest(candidate.id), "reason_code": "secret_source_reference"},)
+    assert secret not in json.dumps(rejected)
+
+
+@pytest.mark.parametrize("fault", ["foreign", "stale", "holdout", "secret_ref", "secret_id"])
+def test_mandatory_context_policy_denies_before_instruction_loader(tmp_path, fault):
+    from herdr.context import ContextError, SecretRedactor
+    from tests.herdr.test_context import item
+    secret = "opaquePrivateReferenceSecret"
+    raw = b"Mandatory instructions must never load for inadmissible context."
+    instruction = InstructionRef("required-instruction", "repo_instructions", source(raw), len(raw))
+    runtime, plan, context, grant, binding = setup(tmp_path, instructions=(instruction,),
+                                                 redactor=SecretRedactor((secret,)))
+    mandatory = item(mandatory=True)
+    if fault == "foreign":
+        mandatory = replace(mandatory, sources=(replace(mandatory.sources[0], project="foreign"),))
+    elif fault == "stale":
+        mandatory = replace(mandatory, sources=(replace(mandatory.sources[0], state=SourceState.STALE),))
+    elif fault == "holdout":
+        mandatory = replace(mandatory, sources=(replace(mandatory.sources[0], holdout_series="private-series"),))
+    elif fault == "secret_ref":
+        mandatory = replace(mandatory, sources=(replace(mandatory.sources[0], uri="artifact://herdr/"+secret),))
+    else:
+        mandatory = replace(mandatory, id=secret)
+    context = replace(context, items=(mandatory,))
+    plan = replace(plan, context_plan_sha256=context.hash)
+    with pytest.raises(ContextError):
+        compile((runtime, plan, context, grant, binding),
+                lambda _: pytest.fail("instruction/context loader called before mandatory preflight"))
+
+
+@pytest.mark.parametrize("keyword", ["anyOf", "oneOf"])
+def test_response_witness_intersects_outer_and_branch_object_requirements(tmp_path, keyword):
+    runtime, plan, context, grant, binding = setup(tmp_path)
+    props = {"a": {"type": "string", "maxLength": 8},
+             "b": {"type": "integer", "minimum": 2}}
+    schema = {"type": "object", "properties": props, "required": ["a"], "additionalProperties": False,
+              keyword: [{"type": "object", "properties": props, "required": ["b"],
+                         "additionalProperties": False}]}
+    plan = replace(plan, output_contract=OutputContract(canonical(schema)))
+    bundle = compile((runtime, plan, context, grant, binding))
+    assert bundle.plan_sha256 == plan.hash
+
+
+@pytest.mark.parametrize("schema", [
+    {"type": "string", "minLength": 5, "maxLength": 8,
+     "anyOf": [{"type": "string", "minLength": 6, "maxLength": 6}]},
+    {"type": "integer", "minimum": 3,
+     "anyOf": [{"type": "number", "maximum": 4}]},
+    {"type": "array", "minItems": 2, "maxItems": 3, "items": {"type": "integer", "minimum": 3},
+     "oneOf": [{"type": "array", "minItems": 1, "maxItems": 2, "items": {"enum": [4]}}]},
+    {"type": "object", "properties": {"a": {"type": "integer", "minimum": 3}},
+     "required": ["a"], "additionalProperties": False,
+     "anyOf": [{"type": "object", "properties": {"a": {"enum": [4, 5]}},
+                "required": ["a"], "additionalProperties": False}]},
+    {"type": "object", "properties": {"a": {"enum": [1]}, "b": {"enum": [2]}},
+     "additionalProperties": False,
+     "oneOf": [{"type": "object", "properties": {"a": {"enum": [1]}}, "additionalProperties": False},
+               {"type": "object", "properties": {"b": {"enum": [2]}}, "additionalProperties": False}]},
+])
+def test_response_witness_intersects_nested_and_scalar_constraints(tmp_path, schema):
+    data = list(setup(tmp_path))
+    data[1] = replace(data[1], output_contract=OutputContract(canonical(schema)))
+    assert compile(data).plan_sha256 == data[1].hash
+
+
+def test_contradictory_branch_intersection_denies_before_any_source_read(tmp_path):
+    data = list(setup(tmp_path))
+    schema = {"type": "integer", "minimum": 3, "anyOf": [{"enum": [1, 2]}]}
+    data[1] = replace(data[1], output_contract=OutputContract(canonical(schema)))
+    with pytest.raises(PromptBlocked, match="witness_unavailable"):
+        compile(data, lambda _: pytest.fail("unsatisfiable response loaded source"))

@@ -502,13 +502,23 @@ class ContextCompiler:
                 "required_provider_data_class")
         for source_raw in raw["controls"]["evidence"]:
             source = SourceRef(**source_raw)
+            require(self.redactor.tree(asdict(source)) == asdict(source), "secret_source_reference")
             require(_source_policy(source, plan.project, plan.context, series=plan.experiment_series,
                                    role=plan.role) is None and source.data_class in
                     provider_classes,"required_provider_evidence_scope")
         for item in plan.items:
             if item.mandatory:
-                if not all(source.data_class in provider_classes for source in item.sources):
-                    raise ContextBlocked("required_provider_source_data_class")
+                require(self.redactor.redact(item.id) == item.id, "secret_context_identity")
+                if item.memory_class == MemoryClass.PROVIDER_CACHE:
+                    raise ContextBlocked("required_source_provider_cache_not_authority")
+                for source in item.sources:
+                    require(self.redactor.tree(asdict(source)) == asdict(source), "secret_source_reference")
+                    reason = _source_policy(source, plan.project, plan.context,
+                                            series=plan.experiment_series, role=plan.role)
+                    if reason:
+                        raise ContextBlocked("required_source_" + reason)
+                    if source.data_class not in provider_classes:
+                        raise ContextBlocked("required_provider_source_data_class")
         # The skill resolver checked this executor; a switch re-resolves skills first.
         require(raw["skill_trace"].get("binding") == {**plan.context.binding(), "executor_id": executor_id},
                 "skill_executor_binding")

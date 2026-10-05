@@ -8,7 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from itertools import islice
+from itertools import islice, product
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 
@@ -146,52 +146,113 @@ def response_witness_tokens(plan, counter):
     """
     work = 0
     allocated = 0
-    def candidates(node, depth=0):
-        nonlocal work, allocated
+
+    def tick(depth):
+        nonlocal work
         work += 1
-        require(work <= 4096 and depth <= 12,"output_response_witness_bound")
-        raw = []
-        if "const" in node:raw.append(node["const"])
-        if "enum" in node:raw.extend(node["enum"])
-        for key in ("anyOf","oneOf"):
-            for child in node.get(key,[]):raw.extend(candidates(child,depth+1))
-        typ=node.get("type",[])
-        for kind in ([typ] if isinstance(typ,str) else typ):
-            if kind=="null":raw.append(None)
-            elif kind=="boolean":raw.extend((False,True))
-            elif kind=="string":
-                size=node.get("minLength",0)
-                raw.extend(("a"*size,"0"*size))
-            elif kind in ("integer","number"):
-                low=node.get("minimum",0);high=node.get("maximum",low)
-                values=(0,1,low,high)
-                if kind=="integer":values=(*values,math.ceil(low),math.floor(high))
-                raw.extend(values)
-            elif kind=="object":
-                objects=[{}]
-                for key in node.get("required",[]):
-                    variants=candidates(node["properties"][key],depth+1)
-                    objects=list(islice(({**item,key:value} for item in objects for value in variants),256))
-                raw.extend(objects)
-            elif kind=="array":
-                size=node.get("minItems",0)
-                if size==0:raw.append([])
+        require(work <= 4096 and depth <= 12, "output_response_witness_bound")
+
+    def branches(nodes, depth):
+        """Distribute alternatives while retaining every sibling constraint."""
+        tick(depth)
+        for index, node in enumerate(nodes):
+            for key in ("anyOf", "oneOf"):
+                if key in node:
+                    sibling = {k: v for k, v in node.items() if k != key}
+                    for child in node[key]:
+                        yield from branches((*nodes[:index], sibling, child, *nodes[index+1:]), depth+1)
+                    return
+        yield nodes
+
+    def samples(nodes, depth):
+        finite = [node for node in nodes if "const" in node or "enum" in node]
+        if finite:
+            # One finite domain is sufficient; all original constraints filter it.
+            node = min(finite, key=lambda x: 1 if "const" in x else len(x["enum"]))
+            yield from ((node["const"],) if "const" in node else node["enum"])
+            return
+        kinds = {"null", "boolean", "string", "integer", "number", "object", "array"}
+        for node in nodes:
+            if "type" in node:
+                declared = node["type"]
+                declared = set([declared] if isinstance(declared, str) else declared)
+                if "number" in declared:
+                    declared.add("integer")
+                kinds &= declared
+        for kind in sorted(kinds):
+            if kind == "null":
+                yield None
+            elif kind == "boolean":
+                yield False
+                yield True
+            elif kind == "string":
+                low = max((x.get("minLength", 0) for x in nodes), default=0)
+                high = min((x.get("maxLength", MAX_OUTPUT) for x in nodes), default=MAX_OUTPUT)
+                if low <= high:
+                    yield "a"*low
+                    yield "0"*low
+            elif kind in ("integer", "number"):
+                lows = [x["minimum"] for x in nodes if "minimum" in x]
+                highs = [x["maximum"] for x in nodes if "maximum" in x]
+                low = max(lows) if lows else (min(highs) if highs else 0)
+                high = min(highs) if highs else low
+                if low <= high:
+                    yield from (0, 1, low, high)
+                    if kind == "integer":
+                        yield math.ceil(low)
+                        yield math.floor(high)
+            elif kind == "object":
+                required = tuple(dict.fromkeys(key for x in nodes for key in x.get("required", ())))
+                properties = set(key for x in nodes for key in x.get("properties", {}))
+                for node in nodes:
+                    if node.get("additionalProperties") is False:
+                        properties &= set(node.get("properties", {}))
+                if not set(required) <= properties:
+                    continue
+                keys = (*required, *sorted(properties-set(required)))
+                missing = object()
+                choices = []
+                for key in keys:
+                    constraints = tuple(x["properties"][key] for x in nodes
+                                        if key in x.get("properties", {}))
+                    values = candidates(constraints, depth+1)
+                    choices.append(values if key in required else (missing, *values))
+                # Product is consumed lazily; even optional-property witnesses
+                # are bounded before allocation.
+                for values in islice(product(*choices), 256):
+                    yield {key: value for key, value in zip(keys, values) if value is not missing}
+            elif kind == "array":
+                low = max((x.get("minItems", 0) for x in nodes), default=0)
+                high = min((x.get("maxItems", 256) for x in nodes), default=256)
+                if low > high:
+                    continue
+                if low == 0:
+                    yield []
                 else:
-                    for value in candidates(node["items"],depth+1):
-                        require(len(canonical(value))*size <= MAX_OUTPUT,"output_response_witness_bound")
-                        raw.append([value]*size)
-        validator=Draft202012Validator(node)
-        found={}
-        for value in raw:
-            work += 1
-            require(work <= 4096,"output_response_witness_bound")
-            wire=canonical(value)
-            allocated += len(wire)
-            require(len(wire)<=MAX_OUTPUT and allocated<=4*MAX_OUTPUT,"output_response_witness_bound")
-            if validator.is_valid(value):found.setdefault(wire,value)
-            if len(found)==256:break
+                    constraints = tuple(x["items"] for x in nodes if "items" in x)
+                    for value in candidates(constraints, depth+1):
+                        require(len(canonical(value))*low <= MAX_OUTPUT, "output_response_witness_bound")
+                        yield [value]*low
+
+    def candidates(nodes, depth=0):
+        nonlocal allocated
+        tick(depth)
+        validators = tuple(Draft202012Validator(node) for node in nodes)
+        found = {}
+        for conjunction in islice(branches(nodes, depth), 256):
+            for value in samples(conjunction, depth):
+                tick(depth)
+                wire = canonical(value)
+                allocated += len(wire)
+                require(len(wire) <= MAX_OUTPUT and allocated <= 4*MAX_OUTPUT,
+                        "output_response_witness_bound")
+                if all(validator.is_valid(value) for validator in validators):
+                    found.setdefault(wire, value)
+                if len(found) == 256:
+                    return tuple(found.values())
         return tuple(found.values())
-    results=candidates(json.loads(plan.output_contract.result_schema))
+
+    results=candidates((json.loads(plan.output_contract.result_schema),))
     measurements=[]
     for result in results:
         value={"identity":plan.identity.to_json(),"prompt_plan_sha256":plan.hash,
@@ -302,9 +363,11 @@ def context_authority_hash(context):
 
 
 class DemonstrationSelector:
-    def __init__(self, verify_evidence):
+    def __init__(self, verify_evidence, redactor):
         require(callable(verify_evidence), "host_demonstration_evidence_required")
+        require(isinstance(redactor, SecretRedactor), "host_redactor")
         self.verify = verify_evidence
+        self.redactor = redactor
 
     def select(self, candidates, *, context, task_class, conditions_sha256, maximum=5):
         require(isinstance(context, ContextPlan), "demonstration_context_required")
@@ -315,7 +378,9 @@ class DemonstrationSelector:
                 and len({x.id for x in candidates}) == len(candidates), "demonstration_candidates_bound")
         chosen, rejected, diversity, sources = [], [], set(), set()
         for item in sorted(candidates, key=lambda x: (-x.relevance, x.id)):
-            reason = source_reason(item.source, context, demonstrations=True)
+            metadata = asdict(item)
+            reason = ("secret_source_reference" if self.redactor.tree(metadata) != metadata else
+                      source_reason(item.source, context, demonstrations=True))
             if item.task_class != task_class: reason = reason or "task_class"
             if item.conditions_sha256 != conditions_sha256: reason = reason or "conditions_changed"
             # Scope checks precede evidence lookup; private refs cannot be used
@@ -329,7 +394,7 @@ class DemonstrationSelector:
                 reason = reason or "duplicate_example"
             if len(chosen) >= maximum: reason = reason or "demonstration_limit"
             if reason:
-                rejected.append({"id": item.id, "reason_code": reason})
+                rejected.append({"id_sha256": digest(item.id), "reason_code": reason})
             else:
                 chosen.append(item); diversity.add(item.diversity_key); sources.add(item.source.sha256)
         return tuple(chosen), tuple(rejected)
@@ -507,7 +572,7 @@ class PromptRuntime:
                 "host_prompt_composition_required")
         self.context_compiler = context_compiler
         self.redactor = context_compiler.redactor
-        self.demonstration_selector = DemonstrationSelector(verify_demo_evidence)
+        self.demonstration_selector = DemonstrationSelector(verify_demo_evidence, self.redactor)
         self.verify_output_evidence = verify_output_evidence
 
     def _binding(self, plan, context, grant):
