@@ -11,10 +11,11 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 from herdr.security import PolicyDenied, SecurityError
+from herdr.child_ownership import ChildOwnership, ownership_schema
 
 TOOL = "herdr_delegate_child"
 TOOLSET = "herdr_delegation"
-ARGUMENTS = ("key", "role", "objective", "prompt", "tool", "permission", "cwd")
+ARGUMENTS = ("key", "role", "objective", "prompt", "tool", "permission", "cwd", "ownership")
 SCHEMA = {
     "name": TOOL,
     "description": "Delegate bounded work through the current Herdr task. Reuse the same key to reconcile the same child. Returned evidence is submitted work, subject to shared acceptance.",
@@ -31,6 +32,7 @@ SCHEMA = {
             "permission": {"type": "array", "maxItems": 64, "uniqueItems": True,
                      "items": {"type": "string", "minLength": 1, "maxLength": 128}},
             "cwd": {"type": "string", "maxLength": 4096},
+            "ownership": ownership_schema(),
         },
     },
 }
@@ -52,6 +54,8 @@ def _arguments(value):
                 or any(not isinstance(item, str) or not 0 < len(item) <= 128 or "\0" in item for item in items)
                 or len(set(items)) != len(items)):
             raise SecurityError("bounded unique delegation scope required")
+    if checked.get("ownership") is not None:
+        checked["ownership"] = ChildOwnership.from_json(checked["ownership"]).to_json()
     cwd = checked.setdefault("cwd", "")
     if not isinstance(cwd, str) or len(cwd) > 4096 or "\0" in cwd:
         raise SecurityError("bounded delegation cwd required")
@@ -109,7 +113,12 @@ def register_delegation_tool(installation, registry, authorized_call, call_diges
                 TOOL, supplied, caller_task_id=task_id,
                 consume_approval=authorized_call.get() != (
                     guard.grant.hash, TOOL, call_digest(TOOL, supplied)))
-            result = _client_delegate(_arguments(checked))
+            admitted = _arguments(checked)
+            if admitted.get("ownership") is not None:
+                owner = ChildOwnership.from_json(admitted["ownership"])
+                if owner.integration_owner != guard.grant.identity.task_id:
+                    raise PolicyDenied("delegation_integration_owner_mismatch")
+            result = _client_delegate(admitted)
             payload = json.dumps(result, ensure_ascii=False, allow_nan=False)
             if len(payload.encode()) > 524288:
                 raise SecurityError("bounded delegation result required")

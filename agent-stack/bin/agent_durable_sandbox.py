@@ -42,7 +42,7 @@ os.execv(args[0], args)
 """
 
 
-_POLICY_FD_LAUNCHER = '\nimport json, os, re, stat, sys\nif len(sys.argv) < 3 or len(sys.argv[1]) > 8192:\n    raise SystemExit("policy_fd_launch_invalid")\nentries = json.loads(sys.argv[1])\nargs = sys.argv[2:]\nif not isinstance(entries, list) or not 1 <= len(entries) <= 8:\n    raise SystemExit("policy_fd_launch_invalid")\nmapping, targets = {}, set()\nfor item in entries:\n    if not isinstance(item, dict) or set(item) != {"source","fd","device","inode","kind","target"}:\n        raise SystemExit("policy_fd_launch_invalid")\n    if (any(type(item[k]) is not int or item[k] < 0 for k in ("fd","device","inode")) or\n        item["kind"] not in ("file","directory","socket") or\n        not isinstance(item["source"], str) or\n        not re.fullmatch(r"/proc/[1-9][0-9]{0,9}/fd/[0-9]{1,10}", item["source"]) or\n        item["source"].rsplit("/",1)[-1] != str(item["fd"]) or\n        not isinstance(item["target"], str) or not item["target"].startswith("/") or\n        item["fd"] in mapping or item["target"] in targets):\n        raise SystemExit("policy_fd_launch_invalid")\n    opened = os.open(item["source"], os.O_PATH | (os.O_DIRECTORY if item["kind"] == "directory" else 0))\n    held = os.fstat(opened)\n    kind = {"directory":stat.S_ISDIR,"file":stat.S_ISREG,"socket":stat.S_ISSOCK}[item["kind"]]\n    if not kind(held.st_mode) or (held.st_dev,held.st_ino) != (item["device"],item["inode"]):\n        raise SystemExit("policy_fd_identity_mismatch")\n    mapping[item["fd"]] = (opened, item["target"])\n    targets.add(item["target"])\nused = set()\nfor index, arg in enumerate(args):\n    if arg in ("--bind-fd","--ro-bind-fd"):\n        if index + 2 >= len(args) or not args[index+1].isdigit():\n            raise SystemExit("policy_fd_launch_invalid")\n        original = int(args[index+1])\n        if original not in mapping or original in used or args[index+2] != mapping[original][1]:\n            raise SystemExit("policy_fd_launch_invalid")\n        opened, _ = mapping[original]\n        args[index+1] = str(opened)\n        os.set_inheritable(opened, True)\n        used.add(original)\nif used != set(mapping) or not args or args[0] != "/usr/bin/bwrap":\n    raise SystemExit("policy_fd_launch_invalid")\nos.execv(args[0], args)\n'
+_POLICY_FD_LAUNCHER = '\nimport json, os, re, stat, sys\nif len(sys.argv) < 3 or len(sys.argv[1]) > 65536:\n    raise SystemExit("policy_fd_launch_invalid")\nentries = json.loads(sys.argv[1])\nargs = sys.argv[2:]\nif not isinstance(entries, list) or not 1 <= len(entries) <= 72:\n    raise SystemExit("policy_fd_launch_invalid")\nmapping, targets = {}, set()\nfor item in entries:\n    if not isinstance(item, dict) or set(item) != {"source","fd","device","inode","kind","target"}:\n        raise SystemExit("policy_fd_launch_invalid")\n    if (any(type(item[k]) is not int or item[k] < 0 for k in ("fd","device","inode")) or\n        item["kind"] not in ("file","directory","socket") or\n        not isinstance(item["source"], str) or\n        not re.fullmatch(r"/proc/[1-9][0-9]{0,9}/fd/[0-9]{1,10}", item["source"]) or\n        item["source"].rsplit("/",1)[-1] != str(item["fd"]) or\n        not isinstance(item["target"], str) or not item["target"].startswith("/") or\n        item["fd"] in mapping or item["target"] in targets):\n        raise SystemExit("policy_fd_launch_invalid")\n    opened = os.open(item["source"], os.O_PATH | (os.O_DIRECTORY if item["kind"] == "directory" else 0))\n    held = os.fstat(opened)\n    kind = {"directory":stat.S_ISDIR,"file":stat.S_ISREG,"socket":stat.S_ISSOCK}[item["kind"]]\n    if not kind(held.st_mode) or (held.st_dev,held.st_ino) != (item["device"],item["inode"]):\n        raise SystemExit("policy_fd_identity_mismatch")\n    mapping[item["fd"]] = (opened, item["target"])\n    targets.add(item["target"])\nused = set()\nfor index, arg in enumerate(args):\n    if arg in ("--bind-fd","--ro-bind-fd"):\n        if index + 2 >= len(args) or not args[index+1].isdigit():\n            raise SystemExit("policy_fd_launch_invalid")\n        original = int(args[index+1])\n        if original not in mapping or original in used or args[index+2] != mapping[original][1]:\n            raise SystemExit("policy_fd_launch_invalid")\n        opened, _ = mapping[original]\n        args[index+1] = str(opened)\n        os.set_inheritable(opened, True)\n        used.add(original)\nif used != set(mapping) or not args or args[0] != "/usr/bin/bwrap":\n    raise SystemExit("policy_fd_launch_invalid")\nos.execv(args[0], args)\n'
 
 @dataclass
 class PinnedWorktree:
@@ -100,12 +100,20 @@ def command(
     child_workspace_writable: bool | None = None,
     pinned_worktree: PinnedWorktree | None = None,
     policy_mount=None,
+    owned_write_pins=None,
 ) -> list[str]:
     workspace = Path(workspace).absolute() if pinned_worktree else workspace.resolve(strict=True)
     if child_workspace_writable is not None:
         if (pinned_worktree is None or pinned_worktree.logical != workspace):
             raise RuntimeError("managed_child_worktree_unpinned")
         pinned_worktree.verify()
+    if owned_write_pins is not None:
+        from herdr.owned_write_mounts import OwnedWritePins
+        if (not isinstance(owned_write_pins,OwnedWritePins) or
+                owned_write_pins.worktree is not pinned_worktree or
+                child_workspace_writable is not False or policy_mount is None):
+            raise RuntimeError("owned_write_mount_authority_required")
+        owned_write_pins.verify()
     real_binary = real_binary.absolute()
     policy = policy or POLICY
     if not BWRAP.is_file() or not policy.is_file() or not real_binary.is_file():
@@ -168,6 +176,10 @@ def command(
         seen.add(path)
         args += ["--bind", str(path), str(path)]
 
+    if owned_write_pins is not None:
+        for entry in owned_write_pins.descriptors():
+            args += ["--bind-fd",str(entry["fd"]),entry["target"]]
+
     if child_workspace_writable is not None or policy_mount is not None:
         # The host Hermes profile (including credentials/config) stays read-only.
         # Give a managed chat only ephemeral session and cache state.
@@ -186,8 +198,9 @@ def command(
     if policy_mount is not None:
         # Host-only immutable copies override mutable checkout/runtime aliases.
         descriptors = policy_mount.descriptors()
+        if owned_write_pins is not None:descriptors.extend(owned_write_pins.descriptors())
         args += ["--tmpfs", "/run", "--dir", "/run/herdr", "--dir", "/run/herdr-policy"]
-        for entry in descriptors:
+        for entry in policy_mount.descriptors():
             args += ["--ro-bind-fd", str(entry["fd"]), entry["target"]]
         from herdr.launch_environment import STARTUP_CONTROLS
         for name in sorted(set(STARTUP_CONTROLS)|{key for key in os.environ if key.startswith("LD_")}):
@@ -270,6 +283,7 @@ def verify(
     pinned_worktree: PinnedWorktree | None = None,
     child_workspace_writable: bool | None = None,
     policy_mount=None,
+    owned_write_pins=None,
 ) -> bool:
     """Require expected mounts, hidden Herdr paths and non-host namespaces."""
     # The kernel records the canonical destination when the CLI is a symlink.
@@ -297,6 +311,8 @@ def verify(
                 workspace_matches = (
                     (mounted.st_dev, mounted.st_ino) == (pinned_worktree.device, pinned_worktree.inode)
                     and expected_mode in modes.get(str(pinned_worktree.logical), set()))
+            if owned_write_pins is not None:
+                owned_write_pins.verify_mounted(pid,modes)
             if policy_mount is not None:
                 policy_mount.verify_mounted(pid)
             env = _env(pid)

@@ -571,6 +571,7 @@ class HerdrChildRuntime:
         self.pinned_worktree = pinned_worktree
         self.policy_launch_factory = policy_launch_factory
         self._policy_launches: dict[str, PreparedPolicyLaunch] = {}
+        self._owned_write_pins = {}
         self._policy_panes: dict[str, PreparedPolicyLaunch] = {}
         self.snapshot_path = snapshot_path
         self.env = dict(env if env is not None else os.environ)
@@ -830,11 +831,24 @@ class HerdrChildRuntime:
                 parent_agent_id=rec.parent_agent_id,parent_task_id=rec.parent_task_id,
                 task_id=rec.id,run_token=rec.run_token,fencing_token=rec.fencing_token)
             original={key:proof[key] for key in ("authority","task_id","run_token","sandbox_pid",
-                      "fencing_token","agent_name","pane_id","marker","worktree_identity")
+                      "fencing_token","agent_name","pane_id","marker","worktree_identity",
+                      "ownership_sha256","owned_write_mounts")
                       if key in proof}
             try:
                 verify_retained_policy_evidence(proof.get("invocation_policy"),identity=identity,
                     pid=proof.get("sandbox_pid"),attestation=original,require_bootstrap=require_bootstrap)
+                if rec.ownership is not None:
+                    from .owned_write_mounts import validate_owned_mount_evidence,verify_owned_mount_evidence
+                    from .policy_launch import mount_rows
+                    if (self.pinned_worktree is None or self.pinned_worktree.identity!=rec.worktree_identity
+                            or original.get("ownership_sha256")!=rec.ownership.hash
+                            or rec.owned_write_mounts is None):
+                        raise SecurityError("retained owned mount binding missing")
+                    rows=validate_owned_mount_evidence(rec.ownership,original.get("owned_write_mounts"))
+                    if rows!=rec.owned_write_mounts:
+                        raise SecurityError("retained owned mount evidence changed")
+                    verify_owned_mount_evidence(self.pinned_worktree.logical,rows,
+                        proof["sandbox_pid"],mount_rows(proof["sandbox_pid"]))
             except (SecurityError,OSError,ValueError,TypeError) as exc:
                 raise HerdrRuntimeError("child_bootstrap_unverified",pane_id) from exc
         return "not-created" if missing else str(agent.get("agent_status") or agent.get("status") or "").lower()
@@ -891,6 +905,7 @@ class HerdrChildRuntime:
                 child_workspace_writable=self._child_workspace_writable(task_id),
                 pinned_worktree=self.pinned_worktree,
                 policy_mount=launch.mount,
+                owned_write_pins=self._owned_write_pins.get(task_id),
             )
             _json_result(self.runner.run(["pane", "run", pane_id,
                                           sandbox.shell_command(sandbox_args)]), "child sandbox start")
@@ -904,7 +919,7 @@ class HerdrChildRuntime:
                     sandbox_pid, Path(real), marker, policy=policy,
                     pinned_worktree=self.pinned_worktree,
                     child_workspace_writable=self._child_workspace_writable(task_id),
-                    policy_mount=launch.mount):
+                    policy_mount=launch.mount,owned_write_pins=self._owned_write_pins.get(task_id)):
                 raise HerdrRuntimeError("child_sandbox_unverified", pane_id)
             record = self.scheduler._tasks[task_id]
             node = self.scheduler.task_node(task_id)
@@ -913,8 +928,15 @@ class HerdrChildRuntime:
                            "fencing_token": record.fencing_token, "agent_name": record.agent_id,
                            "pane_id": pane_id, "marker": marker,
                            "worktree_identity": record.worktree_identity}
+            if record.ownership is not None:
+                if record.owned_write_mounts is None:
+                    raise HerdrRuntimeError("child_owned_mount_proof_missing",task_id)
+                attestation.update(ownership_sha256=record.ownership.hash,
+                    owned_write_mounts=[dict(x) for x in record.owned_write_mounts])
             policy_evidence = launch.seal(sandbox_pid, attestation, tools=node.tools,
                                           permissions=node.permissions)
+            pins=self._owned_write_pins.pop(task_id,None)
+            if pins is not None:pins.close()
             self._sandbox_proofs[pane_id] = {
                 "invocation_policy": policy_evidence,
                 "sandbox_pid": sandbox_pid,
@@ -926,6 +948,7 @@ class HerdrChildRuntime:
             raise
 
     def _child_workspace_writable(self, task_id: str) -> bool:
+        if self.scheduler._tasks[task_id].ownership is not None:return False
         node = self.scheduler.task_node(task_id)
         write_tools = {"write_file", "write", "patch"}
         return (node.role in {"writer", "reviewer"}
@@ -977,6 +1000,8 @@ class HerdrChildRuntime:
                 task_id=rec.id, fencing_token=rec.fencing_token)
 
     def _cleanup_policy_launch(self, task_id, pane_id=None):
+        pins=self._owned_write_pins.pop(task_id,None)
+        if pins is not None:pins.close()
         record = self.scheduler._tasks.get(task_id)
         launch = self._policy_launches.get(task_id) or self._policy_panes.get(pane_id)
         if launch is not None:
@@ -1168,8 +1193,20 @@ class HerdrChildRuntime:
                 raise HerdrRuntimeError("child_pane_intent_denied", lease.task_id)
             self.prepare()
             self._admit_child(lease)
-            launch = self.policy_launch_factory.prepare_child(identity=identity, workspace=self.cwd,
-                                                         tools=node.tools, permissions=node.permissions)
+            launch_arguments={}
+            if record.ownership is not None:
+                from .owned_write_mounts import OwnedWritePins
+                if (self.scheduler.ownership_registry is None or
+                        self.policy_launch_factory.parent_grant is None or
+                        self.policy_launch_factory.parent_grant.identity!=self.scheduler.ownership_parent):
+                    raise HerdrRuntimeError("child_ownership_host_binding_missing",lease.task_id)
+                self.scheduler._require_current_ownership(record)
+                pins=OwnedWritePins(record.ownership,self.pinned_worktree)
+                self._owned_write_pins[lease.task_id]=pins
+                self.scheduler.bind_owned_write_mounts(record.id,pins)
+                launch_arguments["owned_write_roots"]=pins.roots
+            launch = self.policy_launch_factory.prepare_child(identity=identity,workspace=self.cwd,
+                tools=node.tools,permissions=node.permissions,**launch_arguments)
             if not isinstance(launch, PreparedPolicyLaunch) or launch.identity != identity:
                 raise HerdrRuntimeError("child_invocation_policy_identity_mismatch", lease.task_id)
             self._policy_launches[lease.task_id] = launch
@@ -1284,6 +1321,8 @@ class HerdrChildRuntime:
                 raise PreDeliveryFailure(reason, cleanup_complete=cleaned) from exc
             raise
         finally:
+            pins=self._owned_write_pins.pop(lease.task_id,None)
+            if pins is not None:pins.close()
             if "policy" in locals():
                 try:
                     policy.unlink(missing_ok=True)

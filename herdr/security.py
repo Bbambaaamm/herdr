@@ -539,7 +539,7 @@ class SecurityGrant:
                     raise SecurityError("patch path argument must be constrained")
             if rule.tool == "herdr_delegate_child" and (
                     not rule.requires_sandbox or rule.requires_process
-                    or set(rule.allowed_arg_keys) - {"key", "role", "objective", "prompt", "tool", "permission", "cwd"}):
+                    or set(rule.allowed_arg_keys) - {"key", "role", "objective", "prompt", "tool", "permission", "cwd", "ownership"}):
                 raise SecurityError("delegation requires narrow sandboxed bridge rule")
             if rule.tool == "herdr_submit_result":
                 if (not rule.requires_sandbox or rule.requires_process or rule.path_fields
