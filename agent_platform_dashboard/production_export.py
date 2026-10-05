@@ -6,6 +6,7 @@ import time
 
 from . import production_contract as c
 from . import production_sources as sources
+from .observability import build as build_observability
 from .production_io import publication, publish, read
 
 
@@ -107,6 +108,7 @@ def collect(config, now):
                 source.update(board_id=setting['board_id'], source_epoch=setting['source_epoch'])
             c.validate(snapshot)
             if kind == 'swarm':
+                snapshot['observability'] = build_observability(snapshot)
                 c.encode(snapshot)
         except sources.StaleSource:
             source.update(rows=[], data_at=None, status='unavailable', reason='stale', board_id=None, source_epoch=None)
@@ -117,6 +119,7 @@ def collect(config, now):
     # Queue input has its own bounded parser, but the final JSON encoding may expand
     # non-ASCII display text. Enforce the real publication bound end-to-end so a
     # valid near-limit queue cannot suppress the entire production snapshot.
+    snapshot['observability'] = build_observability(snapshot)
     try:
         c.encode(snapshot)
     except ValueError:
@@ -133,6 +136,7 @@ def collect(config, now):
                 status='unavailable',
                 reason='source_failed',
             )
+        snapshot['observability'] = build_observability(snapshot)
         c.validate(snapshot)
         c.encode(snapshot)
     return snapshot

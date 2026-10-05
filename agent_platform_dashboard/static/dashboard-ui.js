@@ -730,6 +730,14 @@ export function mountDashboard(createScene) {
   }
   function renderObservability() {
     const kpis = $('#observability-kpis'), grid = $('#observability-grid');
+    const truth = $('#observability-truth');
+    if (truth) {
+      const model = liveData?.observability;
+      const fact = row => `<div class="metric"><span>${escapeHTML(row.id)}</span><strong>${row.value == null ? 'UNKNOWN' : escapeHTML(String(row.value))} ${escapeHTML(row.unit)}</strong><small>${escapeHTML(row.source)} · ${escapeHTML(row.freshness)} · age ${row.source_age_seconds == null ? 'UNKNOWN' : escapeHTML(String(row.source_age_seconds))}s · coverage ${row.coverage.covered}/${row.coverage.denominator}${row.reason ? ' · ' + escapeHTML(row.reason) : ''}${row.evidence_hash ? ' · ' + escapeHTML(row.evidence_hash) : ''}</small></div>`;
+      truth.innerHTML = model
+        ? `<article class="obs-panel"><h3>Lifecycle · durable source</h3><p>deployed_version is global release state; it does not attest task integration or deployment.</p>${model.lifecycle.map(fact).join('')}</article><article class="obs-panel"><h3>Measured router metrics · request coverage</h3>${model.metrics.map(fact).join('')}</article><article class="obs-panel full"><h3>Producer inventory</h3><p>legacy_search_router does not indicate #97 Search/Verifier availability.</p>${model.inventory.map(row => `<div class="metric"><span>${escapeHTML(row.id)}</span><strong>${escapeHTML(row.status)}</strong><small>${escapeHTML(row.source)} · ${escapeHTML(row.freshness)} · age ${row.source_age_seconds == null ? 'UNKNOWN' : escapeHTML(String(row.source_age_seconds))}s · coverage ${row.coverage.covered}/${row.coverage.denominator}${row.reason ? ' · ' + escapeHTML(row.reason) : ''}</small></div>`).join('')}</article>`
+        : '<article class="obs-panel full"><div class="obs-empty">Production observability snapshot není dostupný.</div></article>';
+    }
     if (!liveData) {
       kpis.innerHTML = '';
       grid.innerHTML = '<article class="obs-panel full"><div class="obs-empty">Živá telemetrie není dostupná.</div></article>';
@@ -776,12 +784,13 @@ export function mountDashboard(createScene) {
       .map(row => ({ ...row, tokens: row.inputTokens + row.outputTokens }))
       .sort((a,b) => b.tokens - a.tokens || b.requests - a.requests).slice(0, 8);
 
-    const totalRouterRequests = profileStats.every(v => v.requests != null) ? profileStats.reduce((s,v)=>s+v.requests,0) : 0;
+    const routerCoverageAvailable = profileStats.every(v => v.requests != null);
     const coverageMetric = (knownKey, unknownKey) => {
+      if (!routerCoverageAvailable) return null;
       const known = profileStats.reduce((s,v)=>s+(v[knownKey] ?? 0),0);
       const unknown = profileStats.reduce((s,v)=>s+(v[unknownKey] ?? 0),0);
       const denominator = known + unknown;
-      return denominator ? Math.round(known / denominator * 100) : (totalRouterRequests === 0 ? 100 : 0);
+      return denominator ? Math.round(known / denominator * 100) : null;
     };
     const coverage = [
       ['Input tokeny', coverageMetric('inputKnownRequests','inputUnknownRequests')],
@@ -800,7 +809,11 @@ export function mountDashboard(createScene) {
       admissionDenies.slice().reverse().map(row => [row.reason, row])
     ).values()].slice(0, 6);
     const searches = PROFILES.map(searchStats);
-    const searchRoutes = ['fast','deep','browser'].map(mode => ({ label: mode.toUpperCase(), value: searches.every(s=>s.routes[mode]!=null) ? searches.reduce((sum,s)=>sum+s.routes[mode],0) : 0 }));
+    const searchRoutesAvailable = searches.every(s => s.search?.status === 'available'
+      && ['fast','deep','browser'].every(mode => s.routes[mode] != null));
+    const searchRoutes = searchRoutesAvailable
+      ? ['fast','deep','browser'].map(mode => ({ label: mode.toUpperCase(), value: searches.reduce((sum,s)=>sum+s.routes[mode],0) }))
+      : [];
     const daily = (codex?.daily || []).map(row => ({ day: row.day.slice(5), tokens: row.tokens }));
     const history = codex?.limit_history || [];
 
@@ -812,10 +825,10 @@ export function mountDashboard(createScene) {
       `<article class="obs-panel"><header><div><h3>Model tokeny</h3><span>skutečně změřené router requesty</span></div><span>top 8</span></header>${bars(tokenRows,r=>r.tokens,v=>compact.format(v))}<p class="obs-note">Per-model tokeny jsou autoritativní pro Hermes router. Codex Sol/Astra zde nejsou odhadovány; jejich account-wide tokeny zůstávají v samostatném grafu.</p></article>`,
       `<article class="obs-panel"><header><div><h3>Fallback pressure</h3><span>fallbacky / požadavky</span></div><span>vyšší = horší</span></header>${bars(fallbackRows,r=>r.rate,v=>v.toFixed(1)+' %',{percent:true,alert:r=>r.rate>=25})}</article>`,
       `<article class="obs-panel"><header><div><h3>Model latency</h3><span>průměr na request</span></div><span>jen známá latence</span></header>${bars(latencyRows,r=>r.avg,v=>latency(v))}</article>`,
-      `<article class="obs-panel"><header><div><h3>Data coverage</h3><span>request-weighted completeness</span></div><span>fail-closed</span></header>${coverage.map(([name,pct])=>`<div class="coverage-row"><span>${escapeHTML(name)}</span><div class="coverage-track"><i style="width:${pct}%"></i></div><strong>${pct} %</strong></div>`).join('')}<p class="obs-note">100 % znamená, že každému requestu odpovídá měřená hodnota. Chybějící hodnoty nejsou dopočítány.</p></article>`,
+      `<article class="obs-panel"><header><div><h3>Data coverage</h3><span>request-weighted completeness</span></div><span>fail-closed</span></header>${coverage.map(([name,pct])=>`<div class="coverage-row"><span>${escapeHTML(name)}</span><div class="coverage-track"><i style="width:${pct == null ? 0 : pct}%"></i></div><strong>${pct == null ? 'UNKNOWN' : pct+' %'}</strong></div>`).join('')}<p class="obs-note">100 % znamená, že každému requestu odpovídá měřená hodnota. Chybějící hodnoty nejsou dopočítány.</p></article>`,
       `<article class="obs-panel"><header><div><h3>Durable queue</h3><span>stav práce QuantLab</span></div><span>${queueTotal} záznamů</span></header>${queueTotal ? `<div class="queue-strip">${Object.entries(queueCounts).filter(([,count])=>count).map(([status,count])=>`<i class="${status}" style="width:${(count/queueTotal*100).toFixed(1)}%" title="${escapeHTML(QUEUE_STATUS[status])}: ${count}"></i>`).join('')}</div><div class="obs-legend">${Object.entries(queueCounts).map(([status,count])=>`<span>${escapeHTML(QUEUE_STATUS[status])}: ${count}</span>`).join('')}</div>` : '<div class="obs-empty">Fronta je prázdná.</div>'}</article>`,
       `<article class="obs-panel"><header><div><h3>Swarm admission</h3><span>ALLOW / DENY před spawnem</span></div><span>${admission?.status === 'available' ? `${admissionAllows.length} / ${admissionDenies.length}` : 'nedostupné'}</span></header>${admission?.status === 'available' ? `<div class="obs-legend"><span>ALLOW: ${admissionAllows.length}</span><span>DENY: ${admissionDenies.length}</span></div>${denialReasons.length ? `<div class="admission-reasons">${denialReasons.map(row => `<span><b>${escapeHTML(row.reason)}</b> · ${escapeHTML(row.repo)} #${escapeHTML(row.issue)} · ${escapeHTML(age(row.observed_at))}</span>`).join('')}</div>` : '<p class="obs-note">V aktuálním bounded tail nejsou žádné denialy.</p>'}<p class="obs-note">Zobrazeny jsou pouze sanitizované reason codes a DAG scope. Prompt, detail toolu ani secrets se neexportují.</p>` : '<div class="obs-empty">Admission audit není v aktuálním snapshotu dostupný.</div>'}</article>`,
-      `<article class="obs-panel"><header><div><h3>Search route mix</h3><span>Fast / Deep / Browser</span></div><span>aktuální snapshot</span></header>${bars(searchRoutes,r=>r.value,v=>fmt.format(v))}</article>`,
+      `<article class="obs-panel"><header><div><h3>Legacy Search Router route mix</h3><span>Fast / Deep / Browser · není #97 verifier</span></div><span>${searchRoutesAvailable ? 'měřený snapshot' : 'UNKNOWN'}</span></header>${searchRoutesAvailable ? bars(searchRoutes,r=>r.value,v=>fmt.format(v)) : '<div class="obs-empty">Legacy Search Router není v autorizovaném snapshotu dostupný.</div>'}</article>`,
       `<article class="obs-panel"><header><div><h3>Codex účet</h3><span>read-only stav</span></div><span>data před ${codexStats().source ? escapeHTML(age(codexStats().source.observed_at)) : '—'}</span></header><div class="obs-legend"><span>Kredity: ${codex ? escapeHTML(codex.credits_balance ?? 'neznámé') : '—'}</span><span>Reset kredity: ${codex ? fmt.format(codex.reset_credits_available) : '—'}</span><span>Streak: ${codex?.current_streak_days == null ? '—' : fmt.format(codex.current_streak_days)+' dní'}</span><span>Max streak: ${codex?.longest_streak_days == null ? '—' : fmt.format(codex.longest_streak_days)+' dní'}</span></div><p class="obs-note">USD odhad se zobrazí jen pokud jej billing route skutečně poskytne. Subscription allowance se nepřepočítává na API ceník.</p></article>`,
     ].join('');
   }
@@ -1053,7 +1066,7 @@ export function mountDashboard(createScene) {
   function updateHeader() {
     const release = releaseInfo();
     const identity = release ? ` · ${release.tag} @ ${release.commit.slice(0, 12)}` : '';
-    ui.header.textContent = demo ? 'DEMO · scéna syntetická, metriky skutečné' : liveData ? `Živá data · ${age(liveData.generated_at)}${identity}` : loadReason;
+    ui.header.textContent = demo ? (liveData ? 'DEMO · scéna syntetická · metriky z production snapshotu' : 'DEMO · scéna syntetická · production metriky nedostupné') : liveData ? `Živá data · ${age(liveData.generated_at)}${identity}` : loadReason;
     const color = demo ? '#e49a34' : liveData ? '#6adf9a' : '#ff7159'; ui.liveDot.style.background = color; ui.liveDot.style.color = color;
   }
   function renderAll() {
@@ -1062,6 +1075,44 @@ export function mountDashboard(createScene) {
   }
   function validateSnapshot(value) {
     if (!value || !Number.isFinite(value.generated_at) || !Array.isArray(value.sources)) throw new Error('invalid');
+    const model = value.observability;
+    const axes = ['observed_live_execution', 'delivery_reconciliation', 'settled_control_cycle', 'verified_artifact', 'integrated_change', 'deployed_version'];
+    const inventory = ['runtime_swarm', 'model_routing', 'router', 'legacy_search_router', 'release',
+      'fabric', 'tool_fabric', 'search_verifier', 'prompt_runtime', 'human_event', 'eval_shadow',
+      'budget', 'context_skill', 'semantic_guard', 'mcp_a2a_specialist', 'reviewer',
+      'approval_hitl', 'policy_registry', 'provider_health', 'circuit_breaker',
+      'evidence_acceptance', 'execution_plan', 'work_protocol', 'route_decision_trace',
+      'verification_baseline', 'route_policy_history'];
+    const exact = (row, fields) => row && typeof row === 'object' && !Array.isArray(row)
+      && Object.keys(row).sort().join(',') === fields.slice().sort().join(',');
+    const coverage = value => exact(value, ['covered', 'denominator'])
+      && [value.covered, value.denominator].every(n => Number.isSafeInteger(n) && n >= 0)
+      && value.covered <= value.denominator;
+    if (!exact(model, ['version', 'lifecycle', 'metrics', 'inventory']) || model.version !== 1
+      || !Array.isArray(model.lifecycle) || model.lifecycle.length !== axes.length
+      || model.lifecycle.some((row, i) => row.id !== axes[i])
+      || !Array.isArray(model.metrics) || model.metrics.length > 128
+      || !Array.isArray(model.inventory) || model.inventory.length !== inventory.length
+      || model.inventory.some((row, i) => row.id !== inventory[i])) throw new Error('invalid');
+    for (const row of [...model.lifecycle, ...model.metrics]) {
+      const fields = ['id', 'value', 'unit', 'window', 'source', 'freshness', 'source_age_seconds', 'coverage', 'reason'];
+      if (!(exact(row, fields) || exact(row, [...fields, 'evidence_hash']))
+        || ['id', 'unit', 'window', 'source'].some(k => typeof row[k] !== 'string' || row[k].length > 80)
+        || !(row.value == null || typeof row.value === 'boolean' || Number.isSafeInteger(row.value)
+          || typeof row.value === 'string' && row.value.length <= 80)
+        || !['fresh', 'stale', 'unavailable', 'unknown'].includes(row.freshness)
+        || !(row.source_age_seconds == null || Number.isSafeInteger(row.source_age_seconds) && row.source_age_seconds >= 0)
+        || !coverage(row.coverage) || !(row.reason == null || typeof row.reason === 'string' && row.reason.length <= 64)
+        || row.evidence_hash != null && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(row.evidence_hash)) throw new Error('invalid');
+    }
+    for (const row of model.inventory) {
+      if (!exact(row, ['id', 'status', 'reason', 'source', 'freshness', 'source_age_seconds', 'coverage'])
+        || !['available', 'UNKNOWN'].includes(row.status)
+        || typeof row.source !== 'string' || row.source.length > 80
+        || !['fresh', 'stale', 'unavailable', 'unknown'].includes(row.freshness)
+        || !(row.source_age_seconds == null || Number.isSafeInteger(row.source_age_seconds) && row.source_age_seconds >= 0)
+        || !coverage(row.coverage) || !(row.reason == null || typeof row.reason === 'string' && row.reason.length <= 64)) throw new Error('invalid');
+    }
     if (Date.now() / 1000 - value.generated_at > 90 || value.generated_at > Date.now() / 1000 + 5) throw new Error('stale');
     for (const item of value.sources) {
       if (!item || !PROFILES.includes(item.profile) || typeof item.kind !== 'string' || !Array.isArray(item.rows)) throw new Error('invalid');
@@ -1232,7 +1283,7 @@ export function mountDashboard(createScene) {
     if (demo) { demoState = 'idle'; ui.demoStates.querySelectorAll('button').forEach(button => { const active = button.dataset.demoState === 'idle'; button.classList.toggle('is-active', active); button.setAttribute('aria-pressed', String(active)); }); }
     updateHeader(); renderProjects(); renderFace(); if (!ui.detail.hidden) renderDetail(); if (!demo) refresh(true);
   });
-  $('#demo-panel > div:first-child > span').textContent = 'Pouze animace jsou syntetické. Metriky a detaily zůstávají skutečné.';
+  $('#demo-panel > div:first-child > span').textContent = 'Pouze animace jsou syntetické. Metriky jsou pouze z production snapshotu; bez něj zůstávají nedostupné.';
   $('#motion-toggle').addEventListener('click', () => { reduced = !reduced; updateMotion(); });
   matchMedia('(prefers-reduced-motion: reduce)').addEventListener('change', event => { reduced = event.matches; updateMotion(); });
   $('#detail-close').addEventListener('click', closeDetail); ui.backdrop.addEventListener('click', closeDetail);

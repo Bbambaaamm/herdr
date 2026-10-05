@@ -74,7 +74,26 @@ function fixture() {
       last_route_model: 'gpt-6-sol', last_route_reason: 'cheap_attempts_exhausted',
     }],
   });
-  return { generated_at: now, sources };
+  const metric = (id, value = null, sourceName = 'producer_unavailable') => ({
+    id, value, unit: 'state', window: 'snapshot', source: sourceName,
+    freshness: value == null ? 'unavailable' : 'fresh', source_age_seconds: null,
+    coverage: { covered: 0, denominator: 0 }, reason: value == null ? 'producer_unavailable' : null,
+  });
+  const axes = ['observed_live_execution', 'delivery_reconciliation', 'settled_control_cycle',
+    'verified_artifact', 'integrated_change', 'deployed_version'];
+  const names = ['runtime_swarm', 'model_routing', 'router', 'legacy_search_router', 'release',
+    'fabric', 'tool_fabric', 'search_verifier', 'prompt_runtime', 'human_event', 'eval_shadow',
+    'budget', 'context_skill', 'semantic_guard', 'mcp_a2a_specialist', 'reviewer',
+    'approval_hitl', 'policy_registry', 'provider_health', 'circuit_breaker',
+    'evidence_acceptance', 'execution_plan', 'work_protocol', 'route_decision_trace',
+    'verification_baseline', 'route_policy_history'];
+  const observability = { version: 1,
+    lifecycle: axes.map(id => metric(id)), metrics: [],
+    inventory: names.map(id => ({ id, status: 'UNKNOWN', reason: 'producer_unavailable',
+      source: 'producer_unavailable', freshness: 'unavailable', source_age_seconds: null,
+      coverage: { covered: 0, denominator: 0 } })),
+  };
+  return { generated_at: now, sources, observability };
 }
 
 async function harness(t, options = {}) {
@@ -195,6 +214,26 @@ test('partial telemetry stays explicit, Codex allowance is live, and snapshot va
   assert.doesNotMatch(h.get('#project-grid').innerHTML, /<img src=x/);
   assert.equal(h.calls.agents.at(-1).length, 4);
   assert.equal(h.get('#link-layer').children.length, 0, 'live status must not fabricate communication links');
+});
+
+test('work observability renders supplied lifecycle and quality without inferring verification', async t => {
+  const h = await harness(t);
+  const snapshot = h.snapshot();
+  snapshot.observability.lifecycle[2] = { ...snapshot.observability.lifecycle[2],
+    value: 1, unit: 'tasks', source: 'quantlab/swarm', freshness: 'fresh',
+    source_age_seconds: 3, coverage: { covered: 1, denominator: 1 }, reason: null };
+  snapshot.observability.metrics.push({ id: 'majak.router.cost_microusd', value: 0,
+    unit: 'microusd', window: 'router_history', source: 'majak/router', freshness: 'fresh',
+    source_age_seconds: 2, coverage: { covered: 2, denominator: 3 }, reason: 'measurement_missing' });
+  await h.refresh();
+  const html = h.get('#observability-truth').innerHTML;
+  assert.match(html, /settled_control_cycle/);
+  assert.match(html, /verified_artifact[^]*?UNKNOWN/);
+  assert.match(html, /cost_microusd[^]*?0 microusd[^]*?coverage 2\/3/);
+  assert.match(html, /search_verifier[^]*?UNKNOWN/);
+  snapshot.observability.metrics[0].extra = 'untrusted';
+  await h.refresh();
+  assert.match(h.get('#observability-truth').innerHTML, /není dostupný/);
 });
 
 test('search layer shows bounded real telemetry without query text', async t => {
@@ -457,6 +496,7 @@ test('all eleven demo states are explicit and target a valid machine without cha
   h.click('#demo-toggle');
   assert.equal(h.ui.diagnostics().mode, 'demo');
   assert.match(h.get('#header-status').textContent, /DEMO/);
+  assert.match(h.get('#header-status').textContent, /production snapshotu/);
   const buttons = h.get('#demo-states').children;
   assert.deepEqual(buttons.map(button => button.dataset.demoState), STATES);
   for (const button of buttons) {
@@ -1589,3 +1629,17 @@ for (const fault of ['wrong_agent', 'terminal', 'ambiguous']) {
     assert.doesNotMatch(h.get('#face-task').textContent, /live práce probíhá/);
   });
 }
+
+test('legacy charts never turn missing sources into zero or complete coverage', async t => {
+  const h = await harness(t);
+  for (const item of h.snapshot().sources) {
+    if (item.kind === 'router' || item.kind === 'search') {
+      item.status = 'unavailable'; item.reason = 'not_configured'; item.rows = []; item.data_at = null;
+    }
+  }
+  await h.refresh();
+  const html = h.get('#observability-grid').innerHTML;
+  assert.match(html, /Legacy Search Router route mix/);
+  assert.match(html, /Legacy Search Router není v autorizovaném snapshotu dostupný/);
+  assert.match(html, /UNKNOWN/);
+});
