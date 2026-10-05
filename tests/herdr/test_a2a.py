@@ -1277,3 +1277,47 @@ def test_economic_claims_are_scoped_to_consumer_and_restart_stays_one_use(tmp_pa
         Gateway(first, BindingStore(tmp_path / "again.json"), card, policy).send(identity, "work")
     assert len(first.sends) == 1
     assert Gateway(second, other_store, card, policy).recover(other) == ()
+
+@pytest.mark.parametrize("label",["credential","credentials","secret","private_key","client_secret","refresh_token","Cookie","Set-Cookie"])
+def test_all_concrete_secret_classes_denied_before_outbound_claim(tmp_path,label):
+    _,card,policy,identity,store=setup(tmp_path);transport=Mock()
+    with pytest.raises(A2AError,match="secret-like"):Gateway(transport,store,card,policy).send(identity,label+": do-not-export")
+    assert transport.sends==[] and not store.path.exists()
+
+@pytest.mark.parametrize("depth",[33,1100])
+@pytest.mark.parametrize("operation",["send","poll","cancel"])
+def test_deep_untrusted_json_has_typed_denial_and_no_resend(tmp_path,depth,operation):
+    _,card,policy,identity,store=setup(tmp_path);transport=Mock();gateway=Gateway(transport,store,card,policy)
+    if operation!="send":gateway.send(identity,"work")
+    nested="leaf"
+    for _ in range(depth):nested=[nested]
+    response=task(artifacts=[{"artifactId":"nested","parts":[{"data":nested}]}])
+    transport.response=response;transport.cancel=lambda *args:response
+    with pytest.raises(A2AError):getattr(gateway,operation)(identity,"work") if operation=="send" else getattr(gateway,operation)(identity)
+    assert len(transport.sends)==1
+    with pytest.raises(A2AError,match="already started"):gateway.send(identity,"work")
+
+@pytest.mark.parametrize("operation",["send","poll","cancel"])
+def test_null_unselected_envelope_alternative_is_unset(tmp_path,operation):
+    _,card,policy,identity,store=setup(tmp_path);transport=Mock();gateway=Gateway(transport,store,card,policy)
+    if operation!="send":gateway.send(identity,"work")
+    response={**task("TASK_STATE_CANCELED" if operation=="cancel" else "TASK_STATE_WORKING"),"message":None}
+    transport.response=response;transport.cancel=lambda *args:response
+    getattr(gateway,operation)(identity,"work") if operation=="send" else getattr(gateway,operation)(identity)
+    assert store.read()["remote_task_id"]=="remote-task" and len(transport.sends)==1
+
+def test_direct_message_ignores_null_task_envelope_alternative(tmp_path):
+    _,card,policy,identity,store=setup(tmp_path)
+    transport=Mock({"task":None,"message":{"messageId":"reply","contextId":"context","role":"ROLE_AGENT","parts":[{"text":"answer"}]}})
+    candidate,=Gateway(transport,store,card,policy).send(identity,"work")
+    assert candidate.remote_task_id is None and store.read()["delivery"]=="direct"
+
+@pytest.mark.parametrize("text",["Implement password reset","Document credential rotation","Describe cookie handling"])
+def test_benign_security_child_proposal_reaches_normal_scheduler_admission(tmp_path,text):
+    _,card,policy,identity,store=setup(tmp_path)
+    raw={"child_role":"reader","child_tools":["read_file"],"child_permissions":[],"child_task":text}
+    artifacts=[{"artifactId":"proposal","parts":[{"text":json.dumps(raw)}]}]
+    candidate,=Gateway(Mock(task("TASK_STATE_COMPLETED",artifacts=artifacts)),store,card,policy).send(identity,"work")
+    proposal=decode_child_proposal(candidate,parent_role="reader",parent_tools=("read_file",),parent_permissions=())
+    scheduler=DynamicChildScheduler(audit_log=AuditLog(tmp_path/"events.jsonl"))
+    assert scheduler.evaluate_child_proposal(proposal) and scheduler.snapshot()["tasks"]==[]

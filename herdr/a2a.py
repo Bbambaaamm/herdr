@@ -38,8 +38,9 @@ ECONOMIC_CLAIM_ROOT = Path("/var/lib/herdr/a2a-economic-claims")
 _ID = re.compile(r"^[A-Za-z0-9._:@/+-]{1,256}$")
 _SECRET = re.compile(r"(?i)(secret|password|credential|private.?key|api.?key|access.?token|authorization|cookie|bearer\s|ghp_[a-z0-9]{20,}|sk-[a-z0-9]{20,}|xox[baprs]-)")
 _CARD_SECRET_VALUE = re.compile(
-    r"(?i)(bearer\s+\S{12,}|ghp_[a-z0-9]{20,}|sk-[a-z0-9]{20,}|xox[baprs]-[a-z0-9-]{12,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|(?:password|api.?key|access.?token|authorization)\s*[:=]\s*\S+)"
+    r"(?i)(bearer\s+\S{12,}|ghp_[a-z0-9]{20,}|sk-[a-z0-9]{20,}|xox[baprs]-[a-z0-9-]{12,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:secrets?|password|credentials?|private[-_. ]?key|api[-_. ]?key|client[-_. ]?secret|refresh[-_. ]?token|access[-_. ]?token|authorization|set[-_. ]?cookie|cookie)\s*[:=]\s*\S+)"
 )
+
 _STATES = frozenset("TASK_STATE_UNSPECIFIED TASK_STATE_SUBMITTED TASK_STATE_WORKING TASK_STATE_COMPLETED TASK_STATE_FAILED TASK_STATE_CANCELED TASK_STATE_REJECTED TASK_STATE_INPUT_REQUIRED TASK_STATE_AUTH_REQUIRED".split())
 # Released v1.0.1 ProtoJSON enum values; bool is not an integer enum.
 _STATE_NUMBERS=dict(enumerate("TASK_STATE_UNSPECIFIED TASK_STATE_SUBMITTED TASK_STATE_WORKING TASK_STATE_COMPLETED TASK_STATE_FAILED TASK_STATE_CANCELED TASK_STATE_INPUT_REQUIRED TASK_STATE_REJECTED TASK_STATE_AUTH_REQUIRED".split()))
@@ -73,32 +74,35 @@ def _label(value: Any, label: str) -> str:
 def _bounded(value: Any, limit: int, *, secret_scan: bool = True) -> bytes:
     try:
         data = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
-    except (TypeError, ValueError, OverflowError) as exc:
+    except (TypeError, ValueError, OverflowError, RecursionError, UnicodeError) as exc:
         raise A2AError("invalid JSON") from exc
-    if len(data) > limit or (secret_scan and _SECRET.search(data.decode())):
-        raise A2AError("oversized or secret-like metadata")
+    if len(data) > limit:
+        raise A2AError("oversized metadata")
+    if secret_scan: _reject_secret_values(value)
     return data
 
 
 def _reject_secret_values(value: Any) -> None:
-    if isinstance(value, str):
-        if _CARD_SECRET_VALUE.search(value):
-            raise A2AError("raw secret-like value")
-        return
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if (
-                isinstance(key, str)
-                and re.fullmatch(r"(?i)(password|api.?key|access.?token|authorization|credential)", key)
-                and isinstance(item, str)
-                and item
-            ):
-                raise A2AError("raw secret-like value")
-            _reject_secret_values(item)
-        return
-    if isinstance(value, list):
-        for item in value:
-            _reject_secret_values(item)
+    # Iterators bound auxiliary memory as well as depth/work, including cycles.
+    stack=[(iter((value,)),0)]
+    nodes=0
+    protected=re.compile(r"(?i)(secrets?|password|credentials?|private[-_. ]?key|api[-_. ]?key|client[-_. ]?secret|refresh[-_. ]?token|access[-_. ]?token|authorization|set[-_. ]?cookie|cookie)")
+    while stack:
+        items,depth=stack[-1]
+        try: current=next(items)
+        except StopIteration:
+            stack.pop();continue
+        nodes+=1
+        if nodes>65536 or depth>32:raise A2AError("JSON structure exceeds bound")
+        if isinstance(current,str):
+            if _CARD_SECRET_VALUE.search(current):raise A2AError("raw secret-like value")
+        elif isinstance(current,dict):
+            for key,item in current.items():
+                if isinstance(key,str) and protected.fullmatch(key) and isinstance(item,str) and item:
+                    raise A2AError("raw secret-like value")
+            stack.append((iter(current.values()),depth+1))
+        elif isinstance(current,list):
+            stack.append((iter(current),depth+1))
 
 
 def _remote_id(value: Any, label: str) -> str:
@@ -795,6 +799,8 @@ def _parse_response(
     allow_bare_task: bool = False,
     discard_history: bool = False,
 ) -> tuple[str, str | None, str | None, tuple[Candidate, ...]]:
+    if isinstance(raw,dict):
+        raw={key:value for key,value in raw.items() if key not in {"task","message"} or value is not None}
     if discard_history and isinstance(raw,dict):
         # CancelTask has no historyLength parameter. History is not a candidate
         # or authority input; discard it before bounding/scanning persisted data.
