@@ -131,7 +131,10 @@ def _object(value: Any, keys: set[str], required: set[str]) -> Mapping[str, Any]
     value = _proto_keys(value, keys)
     if not required <= value.keys() or value.keys() - keys:
         raise A2AError("invalid object fields")
-    return value
+    # ProtoJSON null means unset for declared fields. Required fields retain
+    # their null so that the field-specific validator still denies them.
+    return {key: item for key, item in value.items()
+            if item is not None or key in required}
 
 
 def _https_url(value: Any,limit: int):
@@ -223,13 +226,15 @@ def parse_card(raw: Any) -> AgentCard:
     capabilities = card["capabilities"]
     if not isinstance(capabilities, dict):
         raise A2AError("invalid capabilities")
-    extensions = capabilities.get("extensions", [])
+    extensions = capabilities.get("extensions")
+    if extensions is None: extensions = []
     if not isinstance(extensions, list) or len(extensions) > 32:
         raise A2AError("invalid capability extensions")
     for extension in extensions:
         if not isinstance(extension, dict):
             raise A2AError("invalid capability extension")
-        required = extension.get("required", False)
+        required = extension.get("required")
+        if required is None: required = False
         if type(required) is not bool:
             raise A2AError("invalid capability extension")
         if required:

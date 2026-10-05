@@ -1207,3 +1207,32 @@ def test_duplicate_proto_aliases_are_ambiguous_and_never_resend(tmp_path):
     assert len(transport.sends)==1
     with pytest.raises(A2AError):gateway.send(identity,"work")
     assert len(transport.sends)==1
+
+
+@pytest.mark.parametrize("alias", ["supportedInterfaces", "supported_interfaces"])
+def test_card_null_optional_fields_and_tenant_are_unset(tmp_path, alias):
+    raw, original, _, _, _ = setup(tmp_path)
+    raw[alias] = raw.pop("supportedInterfaces")
+    raw[alias][0]["tenant"] = None
+    raw["provider"] = None
+    raw["documentationUrl"] = None
+    raw["skills"][0]["inputModes"] = None
+    raw["skills"][0]["outputModes"] = None
+    raw["capabilities"]["extensions"] = None
+    card = parse_card(raw)
+    assert card.interfaces[0].tenant is None
+    assert card.interfaces[0].fingerprint == original.interfaces[0].fingerprint
+    assert card.supports_text_input
+    raw["capabilities"]["extensions"] = [{"uri": "https://example.test/optional", "required": None}]
+    assert parse_card(raw).interfaces == original.interfaces
+    raw[alias][0]["tenant"] = 0
+    with pytest.raises(A2AError, match="tenant"):
+        parse_card(raw)
+
+
+@pytest.mark.parametrize("field", ["name", "version", "supportedInterfaces", "capabilities", "skills", "defaultInputModes"])
+def test_card_required_null_fields_still_deny(tmp_path, field):
+    raw, _, _, _, _ = setup(tmp_path)
+    raw[field] = None
+    with pytest.raises(A2AError):
+        parse_card(raw)
