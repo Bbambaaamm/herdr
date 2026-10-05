@@ -528,6 +528,7 @@ class WorkBudgetAuthority:
             else:
                 require(trial_sha256 is None,"trial requires its authorized variant")
             try:
+                self._require_elapsed_capacity(state,allocation_id,demand,now)
                 self._require_resources(state,allocation_id,demand)
             except BudgetBlocked as exc:
                 self._stop_for_allocation(state,allocation_id,exc.reason_code,identity)
@@ -568,8 +569,14 @@ class WorkBudgetAuthority:
             op=state["operations"].get(operation_id)
             require(op is not None,"operation reservation missing")
             if op["started"] or op["usage"] is not None: return False
-            self._available(state,op["allocation_id"],self._now(state),
-                            InvocationIdentity.from_dict(op["identity"]),op["provider"])
+            now=self._now(state)
+            identity=InvocationIdentity.from_dict(op["identity"])
+            self._available(state,op["allocation_id"],now,identity,op["provider"])
+            try:
+                self._require_elapsed_capacity(state,op["allocation_id"],Demand(**op["demand"]),now)
+            except BudgetBlocked as exc:
+                self._stop_for_allocation(state,op["allocation_id"],exc.reason_code,identity)
+                raise
             self._append("start",operation_id=operation_id)
             return True
 
@@ -804,6 +811,12 @@ class WorkBudgetAuthority:
                 if "exhausted" in str(exc):self._stop_for_allocation(state,allocation_id,exc.reason_code)
                 raise
             return self._append("counter",**event)
+
+    def _require_elapsed_capacity(self,state,allocation_id,demand,now):
+        for ancestor in self._ancestors(state,allocation_id):
+            row=state["allocations"][ancestor]
+            require(now-row["created_ms"]+demand.work_ms <= row["allocation"].limits.max_elapsed_ms,
+                    "remaining elapsed work budget exhausted")
 
     def _require_resources(self,state,allocation_id,demand):
         for ancestor in self._ancestors(state,allocation_id):

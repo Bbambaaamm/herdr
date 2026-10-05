@@ -370,7 +370,7 @@ def repair_cycle(tmp_path):
     from tests.herdr.test_work_cycle import setup,trusted_git,runner
     from herdr.work_cycle import WorkCycle
     _,root,template,log=setup(tmp_path)
-    alloc=allocation(max_work_ms=1000000)
+    alloc=allocation(max_work_ms=1000000,max_elapsed_ms=1000000)
     auth=WorkBudgetAuthority(audit_log=log,authorize=lambda **kw:alloc,clock_ms=lambda:1000)
     auth.open(consumer=alloc.consumer,work_key=alloc.work_key,lineage_key=alloc.lineage_key,
         authorization_reference=alloc.authorization_reference)
@@ -720,3 +720,22 @@ def test_candidate_depth_exhaustion_has_its_own_audited_stop(tmp_path):
     state=auth.snapshot(alloc.allocation_id)
     assert state["counters"]["candidate_depth"]==0
     assert state["active_stops"][0]["reason_code"]=="cumulative_candidate_depth_exhausted"
+
+def test_remaining_elapsed_ceiling_blocks_reservation_before_new_effect(tmp_path):
+    now=[1000]
+    auth,alloc,log=authority(tmp_path,allocation(max_elapsed_ms=120),clock=lambda:now[0])
+    now[0]=1025
+    with pytest.raises(BudgetBlocked,match="remaining elapsed"):
+        reserve(auth,alloc,demand=Demand(100,1,100,100))
+    state=auth.snapshot(alloc.allocation_id)
+    assert state["inflight"]==0 and state["active_stops"]
+
+def test_delayed_original_start_rechecks_remaining_elapsed_without_effect(tmp_path):
+    now=[1000]
+    auth,alloc,log=authority(tmp_path,allocation(max_elapsed_ms=120),clock=lambda:now[0])
+    op=reserve(auth,alloc,demand=Demand(100,1,100,100))
+    now[0]=1025
+    with pytest.raises(BudgetBlocked,match="remaining elapsed"):auth.claim_start(op)
+    original=auth.reconcile(op)
+    assert original["started"] is False and original["usage"] is None
+    assert auth.snapshot(alloc.allocation_id)["active_stops"]
