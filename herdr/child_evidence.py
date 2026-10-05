@@ -154,7 +154,7 @@ class ChildCompletionAuthority:
         plan=self.store.read("plan",digest(binding(child_task(rec))))
         task=self._work_task(rec,plan)
         factory=build_root_work_factory(self.store.root.parent,task,spec_sha256=child_spec(rec))
-        preflight_handoff(factory,launch,plan)
+        preflight_handoff(factory,launch,plan,require_slot=False)
         self.work_factories[digest(child_identity(rec).to_json())]=factory
         return factory
 

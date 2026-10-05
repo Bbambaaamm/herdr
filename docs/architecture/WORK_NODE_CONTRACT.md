@@ -148,3 +148,19 @@ proper later phase. During WORK, `herdr_submit_result` is denied so an arbitrary
 early payload cannot pin the completion slot. Host verification/hygiene produces
 the bound handoff before the SDK submits it. Oversized handoff requests and
 truncated host responses become bounded policy denials.
+
+Capability preflight has two stages. Root and child entrypoints verify the
+approved hygiene profile and closed verify/result rules before splitting a pane.
+The result slot is still unbound at this stage. After the host allocates its
+attempt-specific inode, strict preflight requires the physical slot before
+baseline or SDK startup. Logical parent-ceiling comparisons omit the old slot
+from the synthetic comparison identity; the original parent's physical proof
+and grant remain unchanged and separately verified.
+
+The aggregate verification/hygiene admission limit includes thirteen seconds
+per namespace operation for bounded startup and process exit, as well as every
+declared execution timeout. A request exceeding 900 seconds is rejected.
+Repository-config parsing retains the approved config inode, verifies its
+content hash, and checks inode/content/timestamps after the separate read-only
+Git parse. Replacement, in-place mutation and restore-to-the-original-byte
+races all stop before hooks or ref effects.

@@ -1780,3 +1780,27 @@ def test_legacy_completion_spec_digest_keeps_original_meaning():
     assert completion.spec_digest(task)==digest({key:task.get(key) for key in keys})
     task["work_contract_version"]=1
     assert completion.spec_digest(task)!=digest({key:task.get(key) for key in keys})
+
+def test_modern_root_missing_hygiene_profile_blocks_before_split(tmp_path,monkeypatch):
+    from tests.policy_launch_fakes import FakeHostPolicyLaunchFactory
+    from herdr.work_contract_host import HostWorkContractFactory
+    from herdr.evidence import digest,binding
+    from agent_completion_evidence import store_for
+    configure_paths(tmp_path);task=base_task();worker.prepare_attempt(task)
+    workspace=tmp_path/"worker";workspace.mkdir()
+    task.update(work_contract_version=1,workspace=str(workspace),fencing_token=19)
+    work=object.__new__(HostWorkContractFactory);work.local_commit_policy=None
+    monkeypatch.setattr(worker,"_root_work_factory",lambda current:work)
+    calls=[]
+    def native(args,**kw):
+        calls.append(args)
+        assert args[:2]==["agent","get"],"invalid profile cannot reach split or result allocation"
+        return {"result":{"agent":{"kind":"hermes","pane_id":"coordinator","workspace_id":"workspace"}}}
+    monkeypatch.setattr(worker,"_herdr_json",native)
+    store_for(tmp_path,task).publish("plan",digest(binding(task)),{"kind":"coding"})
+    from herdr.work_cycle import WorkContractError
+    with pytest.raises(WorkContractError,match="local commit profile"):
+        worker.create_task_session(task,policy_launch_factory=FakeHostPolicyLaunchFactory())
+    session=task["execution_session"]
+    assert not session["pane_split_started"] and not session["agent_start_attempted"]
+    assert len(calls)==1 and not worker.result_path(task["id"]).exists()

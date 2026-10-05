@@ -561,7 +561,7 @@ class WorkCycle:
         require(self.phase in {WorkPhase.WORK, WorkPhase.VERIFY} and not self.verified_checks and self.verification_open
                 and not any(value is None for value in self.verification_requests.values()),
                 "new verification requires evidenced repair or invalidated checks")
-        require(sum(check.timeout_seconds for check in self.plan.checks) <= 900,
+        require(sum(check.timeout_seconds+13 for check in self.plan.checks) <= 900,
                 "host verification aggregate time exceeds bound")
         tree = digest(self.verify_scope())
         self._record("verification_requested", request_id=request_id, tree_sha256=tree)

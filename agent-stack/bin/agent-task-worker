@@ -663,6 +663,12 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
     preexisting_panes = set()
     HOST_POLICY_LAUNCHES[(task["id"],task["run_token"])]=launch
     try:
+        if modern_work_contract(task):
+            from herdr.work_configuration import preflight_handoff
+            from agent_completion_evidence import store_for
+            from herdr.evidence import binding,digest
+            preflight_handoff(work_factory,launch,store_for(ROOT,task).read("plan",digest(binding(task))),
+                              require_slot=False)
         task_env.update(launch.environment())
         profile = _task_hermes_profile(task)
         _preflight_root_provider(profile)

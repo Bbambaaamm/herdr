@@ -153,6 +153,26 @@ def private_file(path, limit):
         os.close(fd)
 
 
+def verified_config_values(common,git,expected):
+    """Keep the approved inode pinned around the separate Git config parser."""
+    path=common/"config"
+    fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC)
+    try:
+        before=os.fstat(fd)
+        require(stat.S_ISREG(before.st_mode) and before.st_nlink==1 and before.st_size<=1048576,
+                "bounded repository config required")
+        config=os.read(fd,1048577)
+        require(len(config)==before.st_size and hashlib.sha256(config).hexdigest()==expected,
+                "repository commit policy changed")
+        values=git(["config","--local","--null","--list"]).split("\0")
+        stamp=lambda x:(x.st_dev,x.st_ino,x.st_nlink,x.st_size,x.st_mtime_ns,x.st_ctime_ns)
+        require(stamp(before)==stamp(os.fstat(fd))==stamp(path.lstat()),
+                "repository config changed during parsing")
+        os.lseek(fd,0,os.SEEK_SET)
+        require(os.read(fd,1048577)==config,"repository config changed during parsing")
+        return values
+    finally:os.close(fd)
+
 def directory_fd(path):
     path = Path(path)
     require(path.is_absolute() and path.resolve(strict=True) == path, "canonical Git directory required")
@@ -207,9 +227,7 @@ class HostLocalCommitter:
         metadata = Path(git(["rev-parse", "--absolute-git-dir"]).strip())
         common = Path(git(["rev-parse", "--path-format=absolute", "--git-common-dir"]).strip())
         for path in (metadata, common): directory_fd_close(path)
-        config = private_file(common/"config", 1048576)
-        require(hashlib.sha256(config).hexdigest() == self.policy.config_sha256, "repository commit policy changed")
-        values = git(["config", "--local", "--null", "--list"]).split("\0")
+        values = verified_config_values(common,git,self.policy.config_sha256)
         selected = {}
         allowed = {"user.name", "user.email", "core.filemode", "core.autocrlf", "core.commentchar", "commit.cleanup"}
         for row in filter(None, values):

@@ -82,7 +82,12 @@ def build_host_policy_factory(*,parent_grant=None,configuration_path=HOST_POLICY
     if parent_grant is not None:
         ceiling=grants.get(parent_grant.identity.consumer)
         require(ceiling is not None and ceiling.is_active(),"current consumer policy unavailable")
+        # Compare logical capabilities under the current ceiling. Physical
+        # result slots belong to the original full identity, which is verified
+        # separately; they cannot be copied onto this synthetic identity.
         comparison=replace(parent_grant,parent_grant_hash=ceiling.hash,
+            tool_rules=tuple(replace(rule,result_slot=None) if rule.tool=="herdr_submit_result" else rule
+                             for rule in parent_grant.tool_rules),
             identity=replace(parent_grant.identity,parent_agent_id=ceiling.identity.agent_id,
                              parent_task_id=ceiling.identity.task_id))
         comparison.require_logical_subset_of(ceiling)

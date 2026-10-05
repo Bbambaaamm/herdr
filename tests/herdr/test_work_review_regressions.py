@@ -92,3 +92,69 @@ def test_truncated_or_oversized_real_socket_response_is_bounded_denial(tmp_path,
     finally:
         thread.join(5);listener.close()
     assert not thread.is_alive() and not errors
+
+@pytest.mark.parametrize("mutation",["inplace","replace","aba"])
+def test_config_change_during_git_parser_blocks_before_commit(boundary_workspace,monkeypatch,mutation):
+    import herdr.work_hygiene as module
+    committer,cycle,work,log=fixture(boundary_workspace)
+    original=module.read_only_git
+    config=work/".git/config";approved=config.read_bytes()
+    def boundary(root):
+        run=original(root)
+        def invoke(args):
+            if args==["config","--local","--null","--list"]:
+                changed=approved.replace(b"herdr-test@example.invalid",b"other@example.invalid")
+                if changed==approved:changed=approved+b"\n[user]\nemail = other@example.invalid\n"
+                if mutation=="replace":
+                    replacement=config.with_name("config.review");replacement.write_bytes(changed);replacement.replace(config)
+                else:config.write_bytes(changed)
+                result=run(args)
+                if mutation=="aba":config.write_bytes(approved)
+                return result
+            return run(args)
+        return invoke
+    monkeypatch.setattr(module,"read_only_git",boundary)
+    before=log._path.read_bytes()
+    with pytest.raises(WorkContractError,match="config changed during parsing"):committer(cycle)
+    assert git(work,"rev-parse","HEAD")==cycle.plan.base_sha
+    assert log._path.read_bytes()==before and list(committer.storage.iterdir())==[]
+
+def test_actual_host_factory_preflight_accepts_unbound_child_rule_then_requires_physical_slot(boundary_workspace,tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from tests.herdr.test_work_handoff import ready
+    from tests.herdr.test_host_configuration import approved_config
+    from herdr.host_configuration import build_host_policy_factory
+    from herdr.work_configuration import preflight_handoff
+    port,cycle,guard,result,task,plan,observations,log=ready(boundary_workspace,monkeypatch)
+    raw,unused,template=approved_config(tmp_path,monkeypatch)
+    ceiling=replace(guard.grant,tool_rules=tuple(replace(rule,result_slot=None)
+        if rule.tool=="herdr_submit_result" else rule for rule in guard.grant.tool_rules))
+    raw["templates"]={guard.grant.identity.consumer:ceiling.to_json()}
+    parent=guard.grant
+    factory=build_host_policy_factory(parent_grant=parent)
+    child=replace(parent.identity,agent_id="new-child",parent_agent_id=parent.identity.agent_id,
+                  parent_task_id=parent.identity.task_id,task_id="new-child-task",run_token="new-child-run")
+    launch=factory.prepare_child(identity=child,workspace=cycle.root,
+        tools=parent.scope.tools,permissions=parent.scope.permissions)
+    host=SimpleNamespace(local_commit_policy=port.committer.policy)
+    try:
+        rule=next(rule for rule in launch.grant.tool_rules if rule.tool=="herdr_submit_result")
+        assert rule.result_slot is None
+        preflight_handoff(host,launch,plan,require_slot=False)
+        with pytest.raises(WorkContractError,match="immutable result"):preflight_handoff(host,launch,plan)
+        slot=boundary_workspace/"child-result.json";slot.touch(mode=0o600)
+        launch.bind_result_slot(slot,"child-original")
+        preflight_handoff(host,launch,plan)
+    finally:launch.cleanup_after_pane_closed()
+
+def test_total_oracle_deadline_includes_each_namespace_startup(tmp_path):
+    from herdr.scheduler import AuditLog
+    from herdr.work_cycle import WorkCycle
+    from tests.herdr.test_work_cycle import setup,runner
+    original,root,plan,log=setup(tmp_path)
+    checks=tuple(replace(plan.checks[0],id="check-"+str(i),timeout_seconds=120) for i in range(7))
+    plan=replace(plan,checks=checks)
+    cycle=WorkCycle(plan,root,AuditLog(tmp_path/"long-checks.jsonl"),git=original.git)
+    cycle.start(runner)
+    with pytest.raises(WorkContractError,match="aggregate time"):
+        cycle.request_verification("long-host-request",lambda *a:pytest.fail("over-budget request cannot execute"))

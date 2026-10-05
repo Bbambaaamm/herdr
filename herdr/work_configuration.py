@@ -274,6 +274,10 @@ def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG
                                       storage=storage / "checks", audit_log=_audit(storage / "events.jsonl"), git=git)
     factory.host_admission = admitted
     factory.local_commit_policy = hygiene
+    checks=tuple(ValidationCheck(**item) for item in definition["checks"])
+    factory.request_wall_seconds=sum(check.timeout_seconds+13 for check in checks)
+    if hygiene is not None:factory.request_wall_seconds+=hygiene.timeout_seconds+13
+    require(factory.request_wall_seconds<=900,"full host verification request exceeds bound")
     factory.task_store_root = root
     _private_directory(storage / "results", base=Path(raw["storage"]))
     from .work_result_receipt import WorkResultAuthority
@@ -358,7 +362,7 @@ def recover_host_handoff(factory, task, cycle, completion_plan):
     return port
 
 
-def preflight_handoff(factory, launch, completion_plan):
+def preflight_handoff(factory, launch, completion_plan, *, require_slot=True):
     from .work_hygiene import LocalCommitPolicy
     require(completion_plan.get("kind") == "coding"
             and isinstance(getattr(factory, "local_commit_policy", None), LocalCommitPolicy),
@@ -368,5 +372,5 @@ def preflight_handoff(factory, launch, completion_plan):
             and "herdr_submit_result" in launch.grant.scope.tools
             and "herdr_verify_work" in rules and "herdr_submit_result" in rules
             and set(rules["herdr_verify_work"].allowed_arg_keys) == {"request_id","handoff"}
-            and rules["herdr_submit_result"].result_slot is not None,
+            and (not require_slot or rules["herdr_submit_result"].result_slot is not None),
             "closed verification and immutable result capabilities required before baseline")

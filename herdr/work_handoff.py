@@ -24,7 +24,7 @@ class HostWorkHandoff:
 
     def prepare_request(self, cycle, request_id, handoff):
         require(cycle.plan.identity == self.identity, "work handoff identity changed")
-        require(sum(check.timeout_seconds for check in cycle.plan.checks) + self.committer.policy.timeout_seconds <= 900,
+        require(sum(check.timeout_seconds+13 for check in cycle.plan.checks) + self.committer.policy.timeout_seconds+13 <= 900,
                 "verification and hygiene exceed one bounded host request")
         key = self._key(cycle, request_id)
         try:
