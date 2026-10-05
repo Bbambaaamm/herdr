@@ -315,7 +315,7 @@ Operating model:
 - select the nearest dependency-ready AUTO slice, not simply the lowest or newest issue number;
 - delegate bounded research/code/test/review work to available Herdr child agents (including herdr-codex) when useful;
 - independent dependency-safe branches may run concurrently only inside admission/resource/fanout limits;
-- use isolated clean worktrees under /home/agentops/worktrees/herdr/ for code changes;
+- use isolated clean worktrees under {str(consumer.get('worktree_root') or Path(consumer['workspace']) / 'worktrees').rstrip('/')}/ for code changes;
 - never write directly to main, bypass CI/review/rulesets, widen child permissions, create unbounded retries/fallbacks/fanout, or fabricate acceptance evidence;
 - merge only after required tests, exact-head green CI and independent exact-head review with no unresolved applicable finding;
 - after every merge re-read live main/issues/PRs and replan immediately;
@@ -386,6 +386,10 @@ def queue_issue(consumer: dict, issue: dict, records: list[dict]) -> str:
         "attempts": 0,
         "prompt": prompt_for(consumer, issue, prior),
     }
+    scope_fields = ("parent_role", "parent_tools", "parent_permissions", "worktree_root")
+    if all(field in consumer for field in scope_fields):
+        for field in scope_fields:
+            task[field] = consumer[field]
     path = PENDING / f"{task_id}.json"
     path.write_text(json.dumps(task, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.chmod(path, 0o600)

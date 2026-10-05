@@ -487,6 +487,13 @@ class ApprovedTree:
                                  max_file_bytes=self.max_file_bytes)
 
 
+_LIVE_PREPARED_LAUNCHES = {}
+
+
+def _launch_key(identity):
+    return canonical_json_bytes(identity.to_json())
+
+
 class PreparedPolicyLaunch:
     """Private host object retained until the exact owned pane closes."""
     def __init__(self, mount, grant, private_key, key_id, parent=None):
@@ -497,6 +504,7 @@ class PreparedPolicyLaunch:
         self._bootstrap_receipt = None
         self._published_bootstrap_receipt = None
         self._continuation_sink = None
+        self._ownership = None
 
     @property
     def identity(self):
@@ -511,6 +519,18 @@ class PreparedPolicyLaunch:
         from .launch_environment import require_clean_spawn_source
         _require(callable(inspect_source),"host startup source inspector required")
         require_clean_spawn_source(inspect_source())
+
+    def bind_result_slot(self, path, idempotency_key):
+        from dataclasses import replace
+        from .result_submission import ResultSlot, TOOL
+        _require(self._private_key is not None, "result slot must bind before seal")
+        rule = next((rule for rule in self.grant.tool_rules if rule.tool == TOOL), None)
+        _require(rule is not None and rule.result_slot is None, "result submission authority required")
+        slot = ResultSlot.bind(path, self.identity, idempotency_key)
+        self.grant = replace(self.grant, tool_rules=tuple(
+            replace(rule,result_slot=slot) if rule.tool == TOOL else rule for rule in self.grant.tool_rules))
+        if self._parent is not None:
+            self.grant.require_logical_subset_of(self._parent)
 
     def seal(self, pid, attestation, *, tools, permissions):
         bound, sealed = self.mount.seal(pid, self.grant, identity=self.identity, attestation=attestation,
@@ -570,16 +590,21 @@ class PreparedPolicyLaunch:
         return proof
 
     def cleanup_after_pane_closed(self):
-        # No invocation data, model argument or environment variable selects
-        # these paths. The factory created every retained object itself.
-        self.mount.stage._same_inode()
-        if self.mount.bootstrap is not None:
-            self.mount.bootstrap.cleanup_after_pane_closed()
-        self.mount.stage.close()
-        self.mount.stage.path.unlink()
-        for tree in (self.mount.code, *self.mount.runtime):
-            tree.cleanup_after_pane_closed()
-        self._private_key = None
+        if not getattr(self, "_resources_closed", False):
+            self.mount.stage._same_inode()
+            if self.mount.bootstrap is not None:
+                self.mount.bootstrap.cleanup_after_pane_closed()
+            self.mount.stage.close()
+            self.mount.stage.path.unlink()
+            for tree in (self.mount.code, *self.mount.runtime):
+                tree.cleanup_after_pane_closed()
+            self._private_key = None
+            self._resources_closed = True
+        if self._ownership is not None:
+            self._ownership.cleanup_after_pane_closed()
+            self._ownership = None
+        if _LIVE_PREPARED_LAUNCHES.get(_launch_key(self.identity)) is self:
+            del _LIVE_PREPARED_LAUNCHES[_launch_key(self.identity)]
 
 
 class HostPolicyLaunchFactory:
@@ -602,6 +627,8 @@ class HostPolicyLaunchFactory:
         self.authorize, self.writable_roots, self.parent_grant = authorize, tuple(writable_roots), parent_grant
 
     def prepare_child(self, *, identity: InvocationIdentity, workspace: Path, tools, permissions):
+        tools = tuple(tools)
+        _require("herdr_delegate_child" not in tools, "child-bound delegation transport unavailable")
         _require(isinstance(self.parent_grant, SecurityGrant), "accepted host parent grant required")
         return self.prepare(identity=identity, workspace=workspace, tools=tools, permissions=permissions)
 
@@ -622,17 +649,21 @@ class HostPolicyLaunchFactory:
                      "host parent grant identity mismatch")
             grant.require_logical_subset_of(self.parent_grant)
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from .launch_ownership import LaunchOwnership
+        ownership = LaunchOwnership.create(self.storage, identity)
         snapshots, stage = [], None
         try:
             for definition in (self.code, *self.runtime):
-                snapshots.append(definition.freeze(self.storage, (*self.writable_roots, path)))
+                snapshots.append(definition.freeze(ownership.directory, (*self.writable_roots, path)))
             import uuid
-            stage = stage_policy_bundle(self.storage / ("grant-" + uuid.uuid4().hex + ".json"))
+            stage = stage_policy_bundle(ownership.directory / ("grant-" + uuid.uuid4().hex + ".json"))
             prepared=PreparedPolicyLaunch(PolicyMount(stage, snapshots[0], snapshots[1:]),
                                           grant, Ed25519PrivateKey.generate(), "host-launch", self.parent_grant)
+            prepared._ownership = ownership
             from .host_bootstrap import HostBootstrap
             prepared.mount.bootstrap=HostBootstrap.create(
-                prepared,storage=self.storage,writable_roots=(*self.writable_roots,path))
+                prepared,storage=ownership.directory,writable_roots=(*self.writable_roots,path))
+            _LIVE_PREPARED_LAUNCHES[_launch_key(identity)] = prepared
             return prepared
         except BaseException:
             if stage is not None:
@@ -640,4 +671,16 @@ class HostPolicyLaunchFactory:
                 stage.path.unlink(missing_ok=True)
             for snapshot in snapshots:
                 snapshot.cleanup_after_pane_closed()
+            ownership.cleanup_after_pane_closed()
             raise
+
+
+    def cleanup_orphan(self, identity):
+        prepared = _LIVE_PREPARED_LAUNCHES.get(_launch_key(identity))
+        if prepared is not None:
+            _require(prepared.identity == identity and prepared._ownership.storage == self.storage,
+                     "live policy ownership changed")
+            prepared.cleanup_after_pane_closed()
+            return True
+        from .launch_ownership import cleanup_orphan
+        return cleanup_orphan(self.storage, identity)

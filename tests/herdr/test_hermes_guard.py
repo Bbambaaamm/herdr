@@ -269,7 +269,7 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
         checks = []
         approval_required = False
         approval_used = False
-        grant = types.SimpleNamespace(identity=types.SimpleNamespace(task_id="task"), scope=types.SimpleNamespace(data_classes=(DataClass.INTERNAL,)), provider_routes=(types.SimpleNamespace(provider="provider-a", base_url="https://provider-a.example.invalid/v1", api_mode="openai", regions=("eu-central",), data_classes=("internal",), max_egress="region_bound", max_retention="limited", training="excluded", credential_refs=()),))
+        grant = types.SimpleNamespace(hash="a"*64, identity=types.SimpleNamespace(task_id="task"), scope=types.SimpleNamespace(tools=(), data_classes=(DataClass.INTERNAL,)), provider_routes=(types.SimpleNamespace(provider="provider-a", base_url="https://provider-a.example.invalid/v1", api_mode="openai", regions=("eu-central",), data_classes=("internal",), max_egress="region_bound", max_retention="limited", training="excluded", credential_refs=()),))
 
         def authorize_provider(self, request):
             if request.provider != "provider-a":

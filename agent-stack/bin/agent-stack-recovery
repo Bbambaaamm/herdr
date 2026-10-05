@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 import json
+import hashlib
+import importlib.util
 import os
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from contextlib import contextmanager
+from importlib.machinery import SourceFileLoader
+from agent_durable_children import parent_attempt_guard
 
 HOME = Path("/home/agentops")
 HERDR = HOME / ".local/bin/herdr"
@@ -90,7 +96,52 @@ def matching_result(task: dict) -> tuple[dict | None, str]:
         return None, "task_id_mismatch"
     if str(payload.get("run_token") or "") != run_token:
         return None, "run_token_mismatch"
+    if task.get("parent_task_id"):
+        evidence = payload.get("evidence")
+        try:
+            evidence_hash = (hashlib.sha256(json.dumps(evidence, sort_keys=True,
+                                ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+                             if isinstance(evidence, list) and evidence else None)
+        except (TypeError, ValueError):
+            evidence_hash = None
+        if (payload.get("idempotency_key") != task.get("idempotency_key")
+                or payload.get("fencing_token") != task.get("fencing_token")
+                or not task.get("idempotency_key") or not task.get("fencing_token")
+                or payload.get("artifact_sha256") != evidence_hash):
+            return None, "child_evidence_mismatch"
     return payload, "matched"
+
+
+def observe_task_execution(task: dict) -> str:
+    session = task.get("execution_session")
+    state = "unavailable"
+    if isinstance(session, dict) and not session.get("closed_at"):
+        pane_id = str(session.get("pane_id") or "")
+        marker = str(session.get("pane_marker") or "")
+        agent_name = str(session.get("agent_name") or "")
+        routing = task.get("routing") if isinstance(task.get("routing"), dict) else {}
+        coordinator = str(routing.get("selected_agent") or task.get("agent") or "quantlab-hermes")
+        token = str(task.get("run_token") or "")
+        digest = hashlib.sha256(f"{coordinator}:{task.get('id')}:{token}".encode()).hexdigest()
+        expected_agent = f"{coordinator[:13].rstrip('-_') or 'task'}-t-{digest[:16]}"
+        expected_marker = f"durable-{digest[:20]}"
+        if (pane_id and token and agent_name == expected_agent and marker == expected_marker
+                and session.get("session_name") == expected_marker
+                and _pane_has_marker(pane_id, marker)):
+            payload = _herdr_json(["agent", "get", agent_name], timeout=10.0)
+            agent = ((payload or {}).get("result") or {}).get("agent")
+            if isinstance(agent, dict) and str(agent.get("pane_id") or "") == pane_id:
+                status = str(agent.get("agent_status") or agent.get("status") or "").lower()
+                state = {"working": "working", "busy": "working",
+                         "blocked": "blocked", "done": "settled",
+                         "idle": "settled"}.get(status, "unavailable")
+    task["observed_execution"] = {
+        "state": state, "source": "herdr_agent_get+task_pane_marker",
+        "observed_at": utcnow().isoformat(),
+        "task_id": str(task.get("id") or ""),
+        "run_token": str(task.get("run_token") or ""),
+    }
+    return state
 
 
 def move_task(path: Path, target_dir: Path, task: dict) -> None:
@@ -281,6 +332,7 @@ def cleanup_task_owned_pane(task: dict) -> bool:
         session["closed_at"] = utcnow().isoformat()
         session["cleanup_status"] = "already_absent"
         session.pop("cleanup_error", None)
+        stop_task_bridge(session)
         return True
 
     if present is None:
@@ -308,6 +360,7 @@ def cleanup_task_owned_pane(task: dict) -> bool:
                 "current_pane_close_performed": False,
             }
             session.pop("cleanup_error", None)
+            stop_task_bridge(session)
             return True
         session["cleanup_status"] = "close_unproven"
         session["cleanup_error"] = "pane ownership marker mismatch"
@@ -338,8 +391,76 @@ def cleanup_task_owned_pane(task: dict) -> bool:
     session["closed_at"] = utcnow().isoformat()
     session["cleanup_status"] = "closed"
     session.pop("cleanup_error", None)
+    stop_task_bridge(session)
     return True
+
+
+def _worker_bridge():
+    bin_dir = Path(__file__).resolve().parent
+    if str(bin_dir) not in sys.path:
+        sys.path.insert(0, str(bin_dir))
+    loader = SourceFileLoader("agent_task_worker_bridge_recovery", str(bin_dir / "agent-task-worker"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def stop_task_bridge(session: dict) -> None:
+    if session.get("bridge_pid"):
+        _worker_bridge().stop_bridge(session)
+    if session.get("policy_file"):
+        Path(session["policy_file"]).unlink(missing_ok=True)
+
+
+def ensure_live_task_bridge(path: Path, task: dict) -> bool:
+    session = task.get("execution_session")
+    if (not isinstance(session, dict) or not session.get("sandbox_verified")
+            or session.get("closed_at") or task.get("attempt_state") not in
+            {"accepted", "delivery_uncertain", "result_ready", "verifying"}):
+        return False
+    worker = _worker_bridge()
+    observed = observe_task_execution(task)
+    if observed == "unavailable":
+        if task.get("watchdog_blocker") == "active_durable_children" and worker.bridge_alive(session):
+            return True
+        if worker.bridge_alive(session):
+            worker.stop_bridge(session)
+        return False
+    if worker.bridge_alive(session):
+        return True
+    worker.LOGS = ROOT / "logs"
+    # Queue transitions move the canonical task file (running -> blocked).
+    # The sandbox client does not trust a path; the outer bridge resolves the
+    # current queue location, and recovery seeds restart with that location.
+    task["task_file"] = str(path.resolve())
+    try:
+        worker.start_bridge(task, session)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    write_json(path, task)
+    return True
+@contextmanager
+def parent_transition_guard(task: dict):
+    if task.get("parent_task_id") or not task.get("run_token"):
+        yield True
+    else:
+        with parent_attempt_guard(ROOT, str(task.get("id") or ""),
+                                  str(task["run_token"]),
+                                  reconcile_results=(
+                                      task.get("watchdog_blocker") == "active_durable_children"
+                                      or task.get("attempt_state") in {
+                                          "result_ready", "delivery_uncertain"
+                                      })) as terminal:
+            yield terminal
+
+
 def block_orphan(path: Path, task: dict, *, reason: str, age_seconds: int) -> None:
+    with parent_transition_guard(task):
+        _block_orphan_locked(path, task, reason=reason, age_seconds=age_seconds)
+
+
+def _block_orphan_locked(path: Path, task: dict, *, reason: str, age_seconds: int) -> None:
     """Quarantine unknown delivery by atomically retiring it from running."""
     task_id = str(task.get("id") or path.stem)
     blocker = "orphaned_running_unknown_delivery"
@@ -380,6 +501,13 @@ def terminalize_from_result(
     result: dict,
     age_seconds: int,
 ) -> None:
+    with parent_transition_guard(task) as all_terminal:
+        _terminalize_from_result_locked(path, task, result, age_seconds, all_terminal)
+
+
+def _terminalize_from_result_locked(
+    path: Path, task: dict, result: dict, age_seconds: int, all_terminal: bool,
+) -> None:
     status = str(result.get("status") or "")
     blocker = str(result.get("blocker") or "").strip()
 
@@ -387,7 +515,7 @@ def terminalize_from_result(
     # terminal evidence. Preserve the task-owned pane while the result
     # status is incomplete/invalid so recovery can continue fail-closed.
     if status not in {"completed", "blocked", "failed"}:
-        block_orphan(
+        _block_orphan_locked(
             path,
             task,
             reason=(
@@ -396,6 +524,16 @@ def terminalize_from_result(
             ),
             age_seconds=age_seconds,
         )
+        return
+
+    if not all_terminal:
+        task["watchdog_blocker"] = "active_durable_children"
+        task["recovery_action"] = "await_terminal_durable_children"
+        task["attempt_state"] = "result_ready"
+        task["delivery_reconcile_pending"] = True
+        task.pop("result_status", None)
+        task.pop("finished_at", None)
+        move_task(path, BLOCKED, task)
         return
 
     if not cleanup_task_owned_pane(task):
@@ -423,6 +561,8 @@ def terminalize_from_result(
 
     task.pop("watchdog_cleanup_blocker", None)
     task.pop("watchdog_blocker", None)
+    task.pop("recovery_action", None)
+    task.pop("delivery_reconcile_pending", None)
     task["watchdog_resolution"] = "exact_durable_result"
     task["watchdog_resolved_at"] = utcnow().isoformat()
 
@@ -474,6 +614,8 @@ def recover_orphan_tasks(now: datetime | None = None) -> None:
                 print(f"orphan_invalid_json_blocked file={path.name} error={exc}")
             continue
 
+        ensure_live_task_bridge(path, task)
+
         if (
             task.get("watchdog_cleanup_blocker")
             == "task_session_cleanup_failed"
@@ -491,7 +633,8 @@ def recover_orphan_tasks(now: datetime | None = None) -> None:
                 # Resume an interrupted quarantine transition. The marker may
                 # already be durable in running/ if the previous watchdog was
                 # interrupted after write_json() but before os.replace().
-                move_task(path, BLOCKED, task)
+                with parent_transition_guard(task):
+                    move_task(path, BLOCKED, task)
                 print(
                     f"orphan_quarantine_resumed task={task.get('id')} "
                     "destination=blocked"
@@ -533,11 +676,38 @@ def reconcile_watchdog_blocked_tasks() -> None:
             task = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             continue
-        if task.get("watchdog_blocker") != "orphaned_running_unknown_delivery":
+        ensure_live_task_bridge(path, task)
+        cleanup_quarantine = (task.get("watchdog_cleanup_blocker")
+                              == "task_session_cleanup_failed")
+        if (task.get("watchdog_blocker") not in {"orphaned_running_unknown_delivery", "delivery_uncertain_requires_recovery", "active_durable_children"}
+                and not task.get("delivery_reconcile_pending") and not cleanup_quarantine):
             continue
         result, _ = matching_result(task)
         if result is None:
+            with parent_transition_guard(task) as all_terminal:
+                if task.get("watchdog_blocker") == "active_durable_children" and not all_terminal:
+                    continue
+                if task.get("delivery_reconcile_pending"):
+                    try:
+                        due = datetime.fromisoformat(str(task.get("not_before") or "").replace("Z", "+00:00"))
+                    except ValueError:
+                        due = utcnow()
+                    if due <= utcnow():
+                        observed = observe_task_execution(task)
+                        count = min(int(task.get("delivery_reconcile_count") or 0) + 1,
+                                    int(task.get("max_delivery_reconciles") or 12))
+                        task["delivery_reconcile_count"] = count
+                        task["not_before"] = datetime.fromtimestamp(
+                            utcnow().timestamp() + min(300, 15 * (2 ** min(count, 4))), timezone.utc
+                        ).isoformat()
+                        if count >= int(task.get("max_delivery_reconciles") or 12):
+                            task["attempt_state"] = "delivery_uncertain"
+                            task["watchdog_blocker"] = "delivery_uncertain_requires_recovery"
+                            task["recovery_action"] = ("await_exact_result_from_live_session" if observed in {"working", "blocked", "settled"}
+                                                       else "inspect_session_and_external_evidence")
+                        write_json(path, task)
             continue
+        task.pop("delivery_reconcile_pending", None)
         terminalize_from_result(path, task, result, 0)
 
 

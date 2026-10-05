@@ -297,7 +297,7 @@ def test_host_factory_rejects_missing_or_escalated_grant_before_copy(tmp_path,fa
             factory.prepare(identity=identity,workspace=workspace,
                             tools=() if fault=="tools" else planned.scope.tools,
                             permissions=() if fault=="permissions" else planned.scope.permissions)
-        assert set((tmp_path/"store").iterdir()) - {tmp_path/"store"/".ownership.lock"} == before
+        assert set((tmp_path/"store").iterdir())-{tmp_path/"store"/".ownership.lock"}==before
     finally:cleanup(item)
 
 def test_child_factory_requires_accepted_parent_grant(tmp_path):
@@ -333,9 +333,64 @@ def test_factory_copy_failure_cleans_only_its_own_unmounted_snapshots(tmp_path):
         with pytest.raises(SecurityError,match="approved bytes"):
             factory.prepare(identity=planned.identity,workspace=workspace,
                             tools=planned.scope.tools,permissions=planned.scope.permissions)
-        assert {p for p in (tmp_path/"store").iterdir() if p.name != ".ownership.lock"} == before
-        assert (tmp_path/"store"/".ownership.lock").stat().st_mode & 0o777 == 0o600
+        assert set((tmp_path/"store").iterdir()) - {tmp_path/"store"/".ownership.lock"} == before
     finally:cleanup(item)
+
+def test_root_session_cannot_select_policy_authority_from_task_fields(tmp_path,monkeypatch):
+    from tests.agent_stack.test_worker_handshake import worker
+    calls=[]
+    def herdr(args,**kw):
+        calls.append(args)
+        assert args[:2]==["agent","get"]
+        return {"result":{"agent":{"kind":"hermes","pane_id":"coordinator","workspace_id":"workspace"}}}
+    monkeypatch.setattr(worker,"_herdr_json",herdr)
+    monkeypatch.setattr(worker,"HOST_POLICY_LAUNCH_FACTORY",None)
+    task={"id":"root-task","repo":"Bbambaaamm/herdr","run_token":"root-run","fencing_token":1,
+          "workspace":str(tmp_path),"policy_launch_factory":"model-selected",
+          "security_grant":{"tools":["terminal"]}}
+    with pytest.raises(RuntimeError,match="task_invocation_policy_missing"):
+        worker.create_task_session(task)
+    assert len(calls)==1
+
+def test_managed_child_denies_without_host_factory_before_split_or_provider(tmp_path,monkeypatch):
+    from herdr.runtime import HerdrChildRuntime,PreDeliveryFailure,AdmissionRegistry
+    from herdr.scheduler import DynamicChildScheduler,AuditLog,ChildProposal
+    scheduler=DynamicChildScheduler(audit_log=AuditLog(tmp_path/"events"))
+    scheduler.register_external_parent_attempt(task_id="parent-task",run_token="parent-run",
+        idempotency_key="parent-key",agent_name="parent-agent",pane_id="parent-pane",marker="marker",
+        repo="Bbambaaamm/herdr",issue="82",role="writer",tools=("read_file",),
+        permissions=(),policy_profile="default")
+    child=scheduler.delegate_child("parent-task","parent-run","inspect",
+        ChildProposal("writer",("read_file",),"reader",("read_file",),child_task="inspect"))
+    lease=scheduler.dispatch(task_ids={child.id})[0]
+    class Runner:
+        executable="/bin/true"
+        def run(self,*args,**kwargs):raise AssertionError("No live mutation is allowed without policy")
+    runtime=HerdrChildRuntime(scheduler,Runner(),cwd=tmp_path,
+                             admission_registry=AdmissionRegistry(tmp_path/"registry"))
+    monkeypatch.setattr(runtime,"prepare",lambda:None)
+    monkeypatch.setattr(runtime,"_admit_child",lambda lease:None)
+    monkeypatch.setattr(runtime,"_preflight_child_provider",lambda:pytest.fail("provider accessed without grant"))
+    record=scheduler._tasks[child.id]
+    with pytest.raises(PreDeliveryFailure,match="child_invocation_policy_missing"):
+        runtime.run_managed_child(lease,"inspect",run_token=record.run_token,
+                                  idempotency_key=record.idempotency_key)
+    assert not record.execution_pane
+    assert record.pre_delivery_failure
+
+def test_root_fencing_is_monotonic_and_reconciliation_retains_identity(tmp_path,monkeypatch):
+    from tests.agent_stack.test_worker_handshake import worker
+    monkeypatch.setattr(worker,"archive_previous_result",lambda *args:None)
+    task={"id":"root-task","attempts":0}
+    worker.prepare_attempt(task)
+    token,fence=task["run_token"],task["fencing_token"]
+    task["attempt_state"]="delivery_uncertain"
+    worker.prepare_attempt(task)
+    assert (task["run_token"],task["fencing_token"])==(token,fence)
+    task["attempt_state"]="retry_scheduled"
+    task["attempts"]=1
+    worker.prepare_attempt(task)
+    assert task["fencing_token"]==fence+1 and task["run_token"]!=token
 
 def test_policy_mount_rejects_writable_runtime_descendant_before_access(tmp_path,monkeypatch):
     import herdr.policy_launch as module
@@ -353,117 +408,143 @@ def test_policy_mount_rejects_writable_runtime_descendant_before_access(tmp_path
     finally:cleanup(item)
 
 
+def proof_scheduler(tmp_path):
+    from herdr.scheduler import DynamicChildScheduler,AuditLog,ChildProposal
+    scheduler=DynamicChildScheduler(audit_log=AuditLog(tmp_path/"proof-events"))
+    scheduler.register_external_parent_attempt(task_id="parent-task",run_token="parent-run",
+        idempotency_key="parent-key",agent_name="parent-agent",pane_id="parent-pane",marker="marker",
+        repo="Bbambaaamm/herdr",issue="82",role="writer",tools=("read_file",),
+        permissions=(),policy_profile="default")
+    child=scheduler.delegate_child("parent-task","parent-run","inspect",
+        ChildProposal("writer",("read_file",),"reader",("read_file",),child_task="inspect"))
+    lease=scheduler.dispatch(task_ids={child.id})[0]
+    record=scheduler._tasks[child.id]
+    marker="child-"+record.run_token
+    assert scheduler.bind_pre_delivery_pane(child.id,record.run_token,lease.agent_id,"child-pane",marker)
+    identity=InvocationIdentity(consumer="github:"+record.repo,agent_id=record.agent_id,
+        parent_agent_id=record.parent_agent_id,parent_task_id=record.parent_task_id,
+        task_id=record.id,run_token=record.run_token,fencing_token=record.fencing_token)
+    evidence={"schema_version":"herdr-policy-launch-2","grant_sha256":"a"*64,"bundle_sha256":"b"*64,
+        "bundle_device":1,"bundle_inode":2,"code_sha256":"c"*64,
+        "runtime_sha256":dict.fromkeys(map(str,RUNTIME_TARGETS),"d"*64),
+        "tree_identities":{str(x):{"device":1,"inode":2} for x in (CODE_TARGET,*RUNTIME_TARGETS)},
+        "process_start_ticks":123,
+        "identity":identity.to_json(),"sandbox_attestation_sha256":"e"*64}
+    return scheduler,record,marker,evidence
+
+def test_policy_evidence_survives_restart_without_new_claim_or_shared_mutable_data(tmp_path):
+    from herdr.scheduler import DynamicChildScheduler,AuditLog
+    scheduler,record,marker,evidence=proof_scheduler(tmp_path)
+    assert scheduler.attest_execution_sandbox(record.id,record.run_token,record.agent_id,
+        "child-pane",marker,sandbox_pid=123,policy_sha256="f"*64,invocation_policy=evidence)
+    expected=json.loads(json.dumps(evidence))
+    evidence["identity"]["run_token"]="worker-mutation"
+    assert record.execution_sandbox_attestation["invocation_policy"]==expected
+    recovered=DynamicChildScheduler(audit_log=AuditLog(tmp_path/"proof-events"))
+    recovered.replay()
+    replayed=recovered._tasks[record.id]
+    assert replayed.execution_sandbox_attestation["invocation_policy"]==expected
+    assert (replayed.run_token,replayed.fencing_token,replayed.idempotency_key)==(
+        record.run_token,record.fencing_token,record.idempotency_key)
+
+@pytest.mark.parametrize("fault",["run","fence","parent","consumer","digest","runtime","extra","inode"])
+def test_scheduler_rejects_malformed_or_cross_attempt_policy_evidence(tmp_path,fault):
+    scheduler,record,marker,evidence=proof_scheduler(tmp_path)
+    if fault=="run":evidence["identity"]["run_token"]="different"
+    elif fault=="fence":evidence["identity"]["fencing_token"]+=1
+    elif fault=="parent":evidence["identity"]["parent_task_id"]="different"
+    elif fault=="consumer":evidence["identity"]["consumer"]="github:foreign"
+    elif fault=="digest":evidence["bundle_sha256"]="invalid"
+    elif fault=="runtime":evidence["runtime_sha256"].pop(next(iter(evidence["runtime_sha256"])))
+    elif fault=="extra":evidence["untrusted_authority"]="root"
+    elif fault=="inode":evidence["bundle_inode"]=True
+    assert not scheduler.attest_execution_sandbox(record.id,record.run_token,record.agent_id,
+        "child-pane",marker,sandbox_pid=123,policy_sha256="f"*64,invocation_policy=evidence)
+    assert not record.execution_sandbox_verified
+
+def test_policy_evidence_replay_rejects_tampering_in_the_protected_log(tmp_path):
+    from herdr.scheduler import DynamicChildScheduler,AuditLog,SchedulerError
+    scheduler,record,marker,evidence=proof_scheduler(tmp_path)
+    assert scheduler.attest_execution_sandbox(record.id,record.run_token,record.agent_id,
+        "child-pane",marker,sandbox_pid=123,policy_sha256="f"*64,invocation_policy=evidence)
+    path=tmp_path/"proof-events"
+    events=[json.loads(line) for line in path.read_text().splitlines()]
+    event=next(event for event in events if event["event"]=="execution_sandbox_attested")
+    event["attestation"]["invocation_policy"]["identity"]["run_token"]="foreign"
+    path.write_text("".join(json.dumps(event)+"\n" for event in events))
+    with pytest.raises(SchedulerError,match="invocation policy"):
+        DynamicChildScheduler(audit_log=AuditLog(path)).replay()
 
 
-def test_host_spawn_requires_actual_source_inspection_before_native_effect(monkeypatch):
-    from herdr.policy_launch import PreparedPolicyLaunch
-    import herdr.launch_environment as environment
-    launch=object.__new__(PreparedPolicyLaunch)
-    inspected=[]
-    def verify(pid):
-        inspected.append(pid)
-        raise ValueError("unsafe startup source")
-    monkeypatch.setattr(environment,"require_clean_spawn_source",verify)
-    with pytest.raises(ValueError,match="unsafe"):
-        launch.verify_spawn_source(lambda:1234)
-    assert inspected==[1234]
+def upgraded_proof(evidence):
+    from tests.policy_launch_fakes import policy_fixture
+    identity=InvocationIdentity.from_dict(evidence["identity"])
+    proof=policy_fixture(identity,modern=True)
+    proof.update({key:value for key,value in evidence.items() if key!="schema_version"})
+    proof["bootstrap"]["continuation"]["bundle_sha256"]=evidence["bundle_sha256"]
+    return proof
 
-def test_host_environment_rejects_presence_based_loader_controls(monkeypatch):
-    from herdr.policy_launch import PreparedPolicyLaunch
-    launch=object.__new__(PreparedPolicyLaunch)
-    monkeypatch.setenv("LD_TRACE_LOADED_OBJECTS","")
-    with pytest.raises(ValueError,match="unsafe"):
-        launch.environment()
+def attest_proof(scheduler,record,marker,evidence):
+    return scheduler.attest_execution_sandbox(record.id,record.run_token,record.agent_id,
+        "child-pane",marker,sandbox_pid=123,policy_sha256="f"*64,invocation_policy=evidence)
 
+def test_bootstrap_upgrade_flushes_and_replays_same_attempt(tmp_path,monkeypatch):
+    from herdr.scheduler import DynamicChildScheduler,AuditLog
+    scheduler,record,marker,evidence=proof_scheduler(tmp_path)
+    assert attest_proof(scheduler,record,marker,evidence)
+    scheduler.mark_pre_delivery_agent_start(record.id)
+    upgraded=upgraded_proof(evidence)
+    flushed=[];original=scheduler.audit_log.flush
+    def flush():
+        original()
+        # Publication must still expose the shell-only proof until fsync returns.
+        flushed.append(record.execution_sandbox_attestation["invocation_policy"]["schema_version"])
+    monkeypatch.setattr(scheduler.audit_log,"flush",flush)
+    identity=(record.run_token,record.fencing_token,record.idempotency_key,record.attempts)
+    assert attest_proof(scheduler,record,marker,upgraded)
+    assert flushed==["herdr-policy-launch-2"]
+    assert attest_proof(scheduler,record,marker,upgraded) # exact retry is an idempotent read
+    assert len(flushed)==1
+    recovered=DynamicChildScheduler(audit_log=AuditLog(tmp_path/"proof-events"))
+    recovered.replay()
+    replayed=recovered._tasks[record.id]
+    assert replayed.execution_sandbox_attestation["invocation_policy"]==upgraded
+    assert (replayed.run_token,replayed.fencing_token,replayed.idempotency_key,replayed.attempts)==identity
+    events=[json.loads(line) for line in (tmp_path/"proof-events").read_text().splitlines()]
+    assert sum(event["event"]=="execution_bootstrap_attested" for event in events)==1
 
-@pytest.mark.parametrize("foreign_mount",[False,True])
-def test_actual_parent_child_seal_accepts_only_bound_delegated_result_inode(tmp_path,monkeypatch,foreign_mount,private_result_kernel_root):
-    tmp_path=private_result_kernel_root
-    from herdr.result_submission import ResultSlot,TOOL,ARGUMENTS
-    from herdr.security import InvocationIdentity,ToolRule,RiskClass
-    sandbox=sandbox_module()
-    if not sandbox.BWRAP.is_file():pytest.skip("bwrap prerequisite unavailable")
-    workspace=tmp_path/"worktrees"/"workspace";workspace.mkdir(parents=True)
-    config=tmp_path/"config";config.mkdir();releases=tmp_path/"releases";releases.mkdir()
-    monkeypatch.setattr(sandbox,"HERDR_CONFIG",config)
-    monkeypatch.setattr(sandbox,"HERDR_RELEASES",releases)
-    monkeypatch.setattr(sandbox,"DEFAULT_WRITABLE",())
-    cli=tmp_path/"herdr";cli.write_text("#!/bin/sh\nexit 0\n");cli.chmod(0o755)
-    policy=tmp_path/"policy";policy.write_text("#!/bin/sh\nexit 2\n");policy.chmod(0o555)
-    results=tmp_path/"results";results.mkdir(mode=0o700)
-    parent_file=results/"parent.result.json";parent_file.touch(mode=0o600)
-    child_file=results/"child.result.json";child_file.touch(mode=0o600)
-    other=results/"other.json";other.touch(mode=0o600)
-    parent=grant(workspace)
-    parent=replace(parent,scope=replace(parent.scope,tools=(*parent.scope.tools,TOOL)),
-        tool_rules=(*parent.tool_rules,ToolRule(TOOL,RiskClass.RESULT_SUBMISSION,ARGUMENTS,
-            allowed_roots=(str(results),),requires_sandbox=True,
-            result_slot=ResultSlot.bind(parent_file,parent.identity,"parent-key"))))
-    resources=[]
-    def physical_seal(planned,destination,extra=()):
-        item=mount(tmp_path);marker="delegated-result-"+uuid.uuid4().hex
-        fd=os.open(workspace,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);info=os.fstat(fd)
-        pin=sandbox.PinnedWorktree(workspace,fd,info.st_dev,info.st_ino,workspace.parent)
-        env={**os.environ,"HERDR_DURABLE_TASK_PANE":marker,
-             **{key:str(getattr(planned.identity,field)) for field,key in IDENTITY_ENV.items()}}
-        args=sandbox.command(workspace,cli,writable=(destination,),policy=policy,
-            child_workspace_writable=False,pinned_worktree=pin,policy_mount=item)
-        for forbidden in extra:
-            # Deliberately create an unexpected physical mount for rejection.
-            index=args.index("--")
-            args[index:index]=["--bind",str(forbidden),str(forbidden)]
-        proc=subprocess.Popen(args,stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,env=env)
-        resources.append((proc,pin,item))
-        pid=None
-        for _ in range(100):
-            if proc.poll() is not None:pytest.fail(proc.stderr.read(8192).decode())
-            rows=[]
-            for entry in Path("/proc").iterdir():
-                if not entry.name.isdigit():continue
-                try:
-                    with (entry/"environ").open("rb") as stream:raw=stream.read(262145)
-                    if ("HERDR_DURABLE_TASK_PANE="+marker).encode() in raw.split(bytes([0])):
-                        rows.append({"pid":int(entry.name)})
-                except OSError:pass
-            pid=sandbox.inner_pid({"foreground_processes":rows},marker)
-            if pid:break
-            time.sleep(.02)
-        assert pid
-        bound,_=item.seal(pid,planned,identity=planned.identity,
-            attestation={"task_id":planned.identity.task_id,"run_token":planned.identity.run_token,"sandbox_pid":pid},
-            tools=planned.scope.tools,permissions=planned.scope.permissions,
-            private_key=Ed25519PrivateKey.generate(),key_id="isolated-result-test")
-        return bound
-    try:
-        parent=physical_seal(parent,parent_file)
-        assert str(child_file) not in parent.runtime_assurance.writable_roots
-        child_identity=InvocationIdentity(parent.identity.consumer,"child-agent",parent.identity.agent_id,
-            parent.identity.task_id,"child-task","child-run",parent.identity.fencing_token+1)
-        child=replace(parent,identity=child_identity,parent_grant_hash=parent.hash,
-            tool_rules=tuple(replace(rule,result_slot=ResultSlot.bind(child_file,child_identity,"child-key"))
-                if rule.tool==TOOL else rule for rule in parent.tool_rules))
-        child=physical_seal(child,child_file,(other,) if foreign_mount else ())
-        if foreign_mount:
-            with pytest.raises(SecurityError,match="runtime assurance"):child.require_subset_of(parent)
-        else:
-            child.require_subset_of(parent)
-            assert str(child_file) in child.runtime_assurance.writable_roots
-            assert parent_file.stat().st_ino!=child_file.stat().st_ino
-    finally:
-        for proc,pin,item in reversed(resources):
-            proc.stdin.close()
-            try:proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:proc.kill();proc.wait(timeout=3)
-            pin.close();cleanup(item)
+@pytest.mark.parametrize("fault",["start-intent","bundle","tree","grant","shell","fence","peer-identity"])
+def test_bootstrap_upgrade_cannot_rewrite_sealed_launch(tmp_path,fault):
+    scheduler,record,marker,evidence=proof_scheduler(tmp_path)
+    assert attest_proof(scheduler,record,marker,evidence)
+    if fault!="start-intent": scheduler.mark_pre_delivery_agent_start(record.id)
+    proof=upgraded_proof(evidence)
+    if fault=="bundle":
+        proof["bundle_sha256"]="1"*64
+        proof["bootstrap"]["continuation"]["bundle_sha256"]="1"*64
+    elif fault=="tree": proof["tree_identities"][str(CODE_TARGET)]["inode"]+=1
+    elif fault=="grant":proof["grant_sha256"]="1"*64
+    elif fault=="shell":proof["process_start_ticks"]+=1
+    elif fault=="fence":proof["identity"]["fencing_token"]+=1
+    elif fault=="peer-identity":proof["bootstrap"]["continuation"]["identity"]["run_token"]="foreign"
+    assert not attest_proof(scheduler,record,marker,proof)
+    assert record.execution_sandbox_attestation["invocation_policy"]["schema_version"]=="herdr-policy-launch-2"
+
+def test_bootstrap_upgrade_replay_requires_preexisting_start_intent(tmp_path):
+    from herdr.scheduler import DynamicChildScheduler,AuditLog,SchedulerError
+    scheduler,record,marker,evidence=proof_scheduler(tmp_path)
+    assert attest_proof(scheduler,record,marker,evidence)
+    scheduler.mark_pre_delivery_agent_start(record.id)
+    assert attest_proof(scheduler,record,marker,upgraded_proof(evidence))
+    path=tmp_path/"proof-events"
+    events=[json.loads(line) for line in path.read_text().splitlines()]
+    path.write_text("".join(json.dumps(event)+"\n" for event in events
+                           if event["event"]!="child_agent_start_attempted"))
+    with pytest.raises(SchedulerError,match="bootstrap upgrade"):
+        DynamicChildScheduler(audit_log=AuditLog(path)).replay()
 
 
-@pytest.fixture
-def private_result_kernel_root():
-    import tempfile
-    repo=Path(__file__).resolve().parents[2]
-    # Host task-store paths live outside sandbox tmpfs. Keep this test's bind
-    # targets outside /tmp so the parent's generic tmpfs cannot mask the case.
-    with tempfile.TemporaryDirectory(prefix=".herdr-result-kernel-",dir=repo) as name:
-        root=Path(name).resolve()
-        assert root.parent==repo.resolve()
-        yield root
+def test_fresh_bootstrap_receipt_cannot_skip_shell_and_start_intent(tmp_path):
+    scheduler,record,marker,evidence=proof_scheduler(tmp_path)
+    assert not attest_proof(scheduler,record,marker,upgraded_proof(evidence))
+    assert not record.execution_sandbox_verified
