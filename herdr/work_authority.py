@@ -40,6 +40,29 @@ class WorkAuthorityClient:
             raise PolicyDenied("work_authority_unavailable") from exc
         return True
 
+    def effect(self,identity,grant_sha256,action,payload):
+        from .evidence import EvidenceError
+        try:
+            request={"op":"work-budget","identity":identity.to_json(),"grant_sha256":grant_sha256,
+                     "action":action,"payload":payload}
+            encoded=json.dumps(request,sort_keys=True,separators=(",",":")).encode()+b"\n"
+            require(len(encoded)<=8192,"bounded model budget transport required")
+            with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as connection:
+                connection.settimeout(5);connection.connect(str(SOCKET_PATH));connection.sendall(encoded)
+                result=bytearray()
+                while len(result)<=8192:
+                    chunk=connection.recv(min(1024,8193-len(result)))
+                    if not chunk:break
+                    result.extend(chunk)
+                    if b"\n" in result:break
+            require(len(result)<=8192 and result.endswith(b"\n"),"bounded budget response required")
+            parsed=json.loads(result)
+            require(isinstance(parsed,dict),"closed host budget response required")
+            return parsed
+        except PolicyDenied:raise
+        except (EvidenceError,OSError,ValueError,TypeError) as exc:
+            raise PolicyDenied("work_budget_unavailable") from exc
+
     def verify(self, identity, grant_sha256, request_id, handoff=None):
         from .evidence import EvidenceError
         try:
@@ -103,7 +126,23 @@ def dispatch_work_connection(owner, connection):
         request = _recv_line(connection)
         require(request.get("identity") == owner.launch.identity.to_json()
                 and request.get("grant_sha256") == owner.launch.grant.hash, "work authority binding invalid")
-        if request.get("op") == "work-verify":
+        if request.get("op") == "work-budget":
+            require(set(request)=={"op","identity","grant_sha256","action","payload"}
+                    and request["action"] in {"status","start","returned"} and isinstance(request["payload"],dict),
+                    "closed budget request required")
+            callback=getattr(owner,"work_budget",None)
+            if callback is None:
+                require(request["action"]=="status" and request["payload"]=={},"budget authority missing")
+                result={"required":False}
+            else:
+                result=callback(owner.launch.identity,owner.launch.grant.hash,request["action"],request["payload"])
+            after=inspect_peer(pid)
+            require(after==peer and owner.launch.grant.is_active(),"budget peer changed during reservation")
+            owner.launch.mount.verify_mounted(pid,owner.launch.sealed)
+            encoded=json.dumps(result,sort_keys=True,separators=(",",":")).encode()+b"\n"
+            require(len(encoded)<=8192,"budget response exceeds bound")
+            connection.sendall(encoded)
+        elif request.get("op") == "work-verify":
             require(set(request) in ({"op", "identity", "grant_sha256", "request_id"}, {"op", "identity", "grant_sha256", "request_id", "handoff"})
                     and "herdr_verify_work" in owner.launch.grant.scope.tools,
                     "verification tool is not granted")

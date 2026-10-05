@@ -97,7 +97,7 @@ class HostWorkHandoff:
         key = self._key(cycle, request_id)
         intent = self.store.read("work-handoff-intent", key)
         declaration = intent["handoff"]
-        artifact = self.committer(cycle)
+        artifact = self._budgeted_commit(cycle)
         raw = self._submission(artifact, declaration)
         payload = payload_for_slot(self.identity, self.slot, raw)
         receipt = self.result_authority.capture(self.task, payload, self.plan, cycle=cycle, origin_request_key=key)
@@ -109,6 +109,28 @@ class HostWorkHandoff:
                   "submission": raw, "local_receipt_sha256": receipt}
         require(len(canonical(result)) <= 8191, "work handoff response exceeds bound")
         return result
+
+    def _budgeted_commit(self,cycle):
+        authority=getattr(self,"budget_authority",None)
+        if authority is None:return self.committer(cycle)
+        from .work_budget import Demand,Usage
+        allocation=self.budget_allocation
+        require(allocation is not None and cycle.plan.budget_reference==allocation.hash,
+                "local hygiene budget binding changed")
+        semantic=digest({"purpose":"local-hygiene","identity":self.identity.to_json(),
+                         "plan":cycle.plan.hash,"tree":cycle.verified_tree,"policy":self.committer.policy.hash})
+        operation=authority.reserve(allocation_id=allocation.allocation_id,semantic_key=semantic,
+            identity=self.identity,plan_sha256=cycle.plan.hash,provider="offline-hygiene",
+            demand=Demand((self.committer.policy.timeout_seconds+13)*1000,0,0,0),
+            operation_kind="hygiene")
+        # The committer itself resumes only its original durable intent/ref.
+        # An unknown hook delivery cannot become another hook execution.
+        authority.claim_start(operation)
+        artifact=self.committer(cycle)
+        old=authority.reconcile(operation)
+        if old["usage"] is None:
+            authority.settle(operation,Usage(None,0,0,0,artifact.result_sha))
+        return artifact
 
     def deliver(self, cycle, request_id):
         """Resume the exact host-directed handoff without any model or hook retry."""

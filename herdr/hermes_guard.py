@@ -15,6 +15,7 @@ authenticated Herdr grant has been verified.  It never reads model content as
 authority.
 """
 from __future__ import annotations
+import hashlib
 
 import os
 
@@ -396,6 +397,8 @@ def _actual_aux_credential_ref(client: Any, route: Any) -> str | None:
 def _authorize_aux_transport(
     guard: InvocationGuard, client: Any, provider: Any, api_mode: Any
 ) -> None:
+    deny=getattr(guard,"deny_unbudgeted_auxiliary",None)
+    if callable(deny):deny()
     route = _effective_aux_route(guard, client, provider, api_mode)
     if len(route.regions) != 1 or len(route.data_classes) != 1:
         raise PolicyDenied("provider_route_ambiguous", str(route.provider))
@@ -902,7 +905,28 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
         authorize_agent_provider(agent)  # before any callback
         def guarded_next(payload: Any) -> Any:
             authorize_agent_provider(agent)  # after callbacks may switch routes
-            return next_call(payload)
+            begin=getattr(guard,"start_model_effect",None)
+            receipt=None
+            if callable(begin) and guard.budget_required():
+                from .evidence import canonical
+                from .work_model_deadline import validate_text_request
+                validate_text_request(payload,agent)
+                encoded=canonical(payload)
+                output=next((payload[key] for key in ("max_completion_tokens","max_output_tokens","max_tokens")
+                             if key in payload),None)
+                receipt=begin({"request_id":context.get("api_request_id"),
+                    "provider":agent.provider,"model":agent.model,"api_mode":agent.api_mode,"base_url":agent.base_url,
+                    "request_sha256":hashlib.sha256(encoded).hexdigest(),"request_bytes":len(encoded),
+                    "output_tokens":output})
+            # Failure/timeout leaves the same pre-effect reservation UNKNOWN.
+            if receipt is None:
+                response=next_call(payload)
+            else:
+                from .work_model_deadline import model_deadline
+                with model_deadline(receipt["max_work_ms"]):
+                    response=next_call(payload)
+                guard.returned_model_effect(receipt)
+            return response
         return original_middleware(request, guarded_next, **context)
 
     installation._remember(middleware, "run_llm_execution_middleware", guarded_llm_execution)

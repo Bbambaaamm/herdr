@@ -787,6 +787,7 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
             bind_root_handoff(work_factory, task, launch, cycle)
             launch.mount.bootstrap.work_authority = work_factory.authorize_invocation
             launch.mount.bootstrap.work_verify = work_factory.verify_request
+            launch.mount.bootstrap.work_budget = work_factory.budget_effect
             persist_execution_session(task)
         def publish_continuation(evidence):
             session["invocation_policy"]=evidence

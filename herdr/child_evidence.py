@@ -143,6 +143,7 @@ class ChildCompletionAuthority:
 
     def _work_task(self, rec, plan):
         task = child_task(rec)
+        if self.work_contracts["version"]==3:task["work_budget_version"]=1
         task.update(workspace=str(child_workspace(rec)[0]), work_contract_version=1,
                     completion_plan={"base_sha":plan["base_sha"]},
                     work_workspace_identity=f"{child_workspace(rec)[1]}:{child_workspace(rec)[2]}")
@@ -172,6 +173,7 @@ class ChildCompletionAuthority:
         self.work_factories[digest(child_identity(rec).to_json())] = factory
         launch.mount.bootstrap.work_authority = factory.authorize_invocation
         launch.mount.bootstrap.work_verify = factory.verify_request
+        launch.mount.bootstrap.work_budget = factory.budget_effect
         return port
 
     def recover_work(self, rec, plan):

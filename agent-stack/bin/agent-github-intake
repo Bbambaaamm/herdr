@@ -388,8 +388,10 @@ def queue_issue(consumer: dict, issue: dict, records: list[dict]) -> str:
     }
     if consumer["repository"] == "Bbambaaamm/herdr" and consumer.get("mode") != "root_only":
         task["work_contract_version"] = 1
+        task["work_budget_version"] = 1
     elif consumer["repository"] == "Bbambaaamm/herdr":
         task["child_work_contract_version"] = 1
+        task["child_work_budget_version"] = 1
     scope_fields = ("parent_role", "parent_tools", "parent_permissions", "worktree_root")
     if all(field in consumer for field in scope_fields):
         for field in scope_fields:

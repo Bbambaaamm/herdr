@@ -10,11 +10,13 @@ from .work_cycle import WorkCycle, WorkPhase, WorkPlan, require
 from .check_runner import CheckEnvironment, HostCheckRunner
 
 class HostWorkContractFactory:
-    def __init__(self, *, approve, environment, storage, audit_log, git=None):
+    def __init__(self, *, approve, environment, storage, audit_log, git=None, budget_authority=None, budget_binding=None):
         require(callable(approve) and isinstance(environment,CheckEnvironment)
                 and isinstance(audit_log,AuditLog),"host work authority required")
         self.approve,self.environment,self.storage,self.audit_log=approve,environment,Path(storage),audit_log
         self.git=git
+        self.budget_authority,self.budget_binding=budget_authority,budget_binding
+        self.allocations={}
         self.cycles={}
         self.handoffs={}
         self._lock=threading.RLock()
@@ -23,7 +25,7 @@ class HostWorkContractFactory:
         found=self.cycles.get(digest(identity.to_json()))
         require(found is not None,"work contract unavailable")
         cycle,runner=found
-        restored=WorkCycle(cycle.plan,cycle.root,self.audit_log,git=self.git)
+        restored=WorkCycle(cycle.plan,cycle.root,self.audit_log,git=self.git,budget_authority=self.budget_authority)
         # Retain references already held by the worker while refreshing durable
         # state written by another host entry point.
         cycle.__dict__.update(restored.__dict__)
@@ -55,8 +57,23 @@ class HostWorkContractFactory:
             request=check_wall_seconds(plan,getattr(self,"local_commit_policy",None))
             require_grant_lifetime(grant,check_wall_seconds(plan)+request)
             runner=HostCheckRunner(self.environment,self.storage,git=self.git)
-            cycle=WorkCycle(plan,root,self.audit_log,git=self.git)
-            cycle.start(runner)
+            cycle=WorkCycle(plan,root,self.audit_log,git=self.git,budget_authority=self.budget_authority)
+            allocation=None
+            if self.budget_authority is not None:
+                from .work_budget import BudgetAllocation,BudgetedCheckRunner
+                require(callable(self.budget_binding), 'host budget binding required')
+                approved=self.budget_binding(identity=identity,workspace=root,grant=grant,spec_sha256=spec_sha256)
+                require(isinstance(approved,BudgetAllocation) and approved.consumer==identity.consumer, 'exact approved budget required')
+                allocation=self.budget_authority.open(consumer=approved.consumer,work_key=approved.work_key,
+                    lineage_key=approved.lineage_key,authorization_reference=approved.authorization_reference)
+                require(allocation==approved and plan.budget_reference==allocation.hash, 'work budget binding mismatch')
+                cycle.start(BudgetedCheckRunner(self.budget_authority,allocation,runner,'baseline'))
+                if cycle.phase is WorkPhase.WORK:
+                    self.budget_authority.begin_implementation(allocation_id=allocation.allocation_id,identity=identity,plan_sha256=plan.hash)
+                self.allocations[digest(identity.to_json())]=allocation
+                runner=BudgetedCheckRunner(self.budget_authority,allocation,runner,'verification')
+            else:
+                cycle.start(runner)
             self.cycles[digest(identity.to_json())]=(cycle,runner)
             return cycle
 
@@ -69,9 +86,14 @@ class HostWorkContractFactory:
             require(plan.identity==identity and plan.hash==plan_sha256 and plan.spec_sha256==spec_sha256
                     and plan.grant_sha256==grant_sha256 and plan.environment_sha256==self.environment.hash,
                     "recovered work authority mismatch")
-            cycle=WorkCycle(plan,Path(workspace),self.audit_log,git=self.git)
+            cycle=WorkCycle(plan,Path(workspace),self.audit_log,git=self.git,budget_authority=self.budget_authority)
             runner=None if cycle.phase in {WorkPhase.HANDOFF,WorkPhase.FINISHED} else HostCheckRunner(
                 self.environment,self.storage,git=self.git)
+            if self.budget_authority is not None:
+                from .work_budget import BudgetedCheckRunner
+                allocation=self.budget_authority.find_allocation(plan.budget_reference)
+                self.allocations[digest(identity.to_json())]=allocation
+                if runner is not None: runner=BudgetedCheckRunner(self.budget_authority,allocation,runner,'verification')
             self.cycles[digest(identity.to_json())]=(cycle,runner)
             return cycle
 
@@ -106,6 +128,10 @@ class HostWorkContractFactory:
             if cycle.phase is WorkPhase.WORK:
                 if kind=="tool" and tool=="herdr_submit_result":
                     raise PolicyDenied("work_result_requires_host_handoff")
+                if self.budget_authority is not None:
+                    allocation=self.allocations.get(digest(identity.to_json()))
+                    require(allocation is not None,'active work budget missing')
+                    self.budget_authority.require_active(allocation.allocation_id,identity)
                 return True
             if kind=="tool" and tool=="herdr_verify_work" and cycle.phase in {WorkPhase.VERIFY,WorkPhase.HYGIENE,WorkPhase.HANDOFF}:
                 return True
@@ -126,8 +152,18 @@ class HostWorkContractFactory:
                 port.prepare_request(cycle, request_id, handoff)
             elif handoff is not None:
                 raise PolicyDenied("work_handoff_authority_unavailable")
+            new_request=request_id not in cycle.verification_requests
             outcome = cycle.request_verification(request_id, runner)
+            from .work_failure_control import after_verification
+            outcome=after_verification(self,cycle,outcome,new_request=new_request)
             return port.complete(cycle, request_id, outcome) if port is not None else outcome
+
+    def budget_effect(self,identity,grant_sha256,action,payload):
+        if action=="status":
+            return {"required":self.budget_authority is not None}
+        require(self.budget_authority is not None,"host model budget is unavailable")
+        from .work_budget_configuration import model_effect
+        return model_effect(self,identity,grant_sha256,action,payload)
 
     def bind_handoff(self, identity, port):
         from .work_handoff import HostWorkHandoff
@@ -159,6 +195,26 @@ class WorkInvocationGuard(InvocationGuard):
     def authorize_tool_call(self,tool,args,**kwargs):
         self.work_authority(self.grant.identity,self.grant.hash,kind="tool",tool=self.canonical_tool(tool))
         return super().authorize_tool_call(tool,args,**kwargs)
+
+    def budget_required(self):
+        transport=getattr(self.work_authority,"effect",None)
+        if not callable(transport):return False  # Explicit in-process historical/test port.
+        answer=transport(self.grant.identity,self.grant.hash,"status",{})
+        if set(answer)!={"required"} or type(answer["required"]) is not bool:
+            raise PolicyDenied("work_budget_status_invalid")
+        return answer["required"]
+
+    def start_model_effect(self,payload):
+        if not self.budget_required():return None
+        return self.work_authority.effect(self.grant.identity,self.grant.hash,"start",payload)
+
+    def returned_model_effect(self,receipt):
+        if receipt is not None:
+            return self.work_authority.effect(self.grant.identity,self.grant.hash,"returned",
+                                             {"operation_id":receipt["operation_id"]})
+
+    def deny_unbudgeted_auxiliary(self):
+        if self.budget_required():raise PolicyDenied("auxiliary_budget_profile_unsupported")
 
     def verify_work(self, request_id, handoff=None, *, consume_approval=True):
         args = {"request_id": request_id}
