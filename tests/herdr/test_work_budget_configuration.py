@@ -112,3 +112,21 @@ def test_unknown_budget_marker_cannot_use_historical_admission(tmp_path,monkeypa
     task["work_budget_version"]=version
     with pytest.raises(WorkContractError,match="version unsupported"):
         config.build_root_work_factory(Path(raw["task_store_root"]),task)
+
+def test_sdk_guard_blocks_short_lived_grant_before_model_callback(tmp_path):
+    from datetime import UTC,datetime,timedelta
+    from tests.herdr.test_security import grant
+    from herdr.work_contract_host import WorkInvocationGuard
+    current=grant(tmp_path)
+    current=replace(current,expires_at=(datetime.now(UTC)+timedelta(seconds=2)).isoformat())
+    messages=[]
+    class QuoteTransportFixture:
+        def __call__(self,*args,**kwargs):return True
+        def effect(self,identity,grant_hash,action,payload):
+            assert identity==current.identity and grant_hash==current.hash
+            messages.append(action)
+            if action=="status":return {"required":True}
+            return {"operation_id":"a"*64,"quote_sha256":"b"*64,"max_work_ms":60000}
+    guard=WorkInvocationGuard(current,work_authority=QuoteTransportFixture())
+    with pytest.raises(PolicyDenied,match="model_grant_lifetime_insufficient"):guard.start_model_effect({})
+    assert messages==["status","start"]  # Reservation stays held; no paid callback is authorized.

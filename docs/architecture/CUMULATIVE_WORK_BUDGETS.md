@@ -102,3 +102,9 @@ fixture; its callback is local and free. These seams are independently tested.
 They are not a whole deployed root/kernel/provider end-to-end acceptance claim.
 Joint production activation/E2E remains separately owned; no live configuration,
 provider spend, deployment or physical device change belongs to this delivery.
+
+A new reservation and its physical start must fit the remaining elapsed ceiling;
+a delayed start rechecks that bound. The guarded SDK also verifies that the
+existing signed grant covers the quoted callback deadline plus delivery margin.
+A failed lifetime check authorizes no model callback and does not pretend the
+pre-effect reservation was consumed at zero or release it as a new operation.

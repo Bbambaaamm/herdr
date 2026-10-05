@@ -211,7 +211,17 @@ class WorkInvocationGuard(InvocationGuard):
 
     def start_model_effect(self,payload):
         if not self.budget_required():return None
-        return self.work_authority.effect(self.grant.identity,self.grant.hash,"start",payload)
+        receipt=self.work_authority.effect(self.grant.identity,self.grant.hash,"start",payload)
+        from .work_lifetime import require_grant_lifetime
+        from .evidence import EvidenceError
+        try:
+            require(isinstance(receipt,dict) and set(receipt)=={"operation_id","quote_sha256","max_work_ms"}
+                    and type(receipt["max_work_ms"]) is int and 1<=receipt["max_work_ms"]<=900000,
+                    "bounded model request lease required")
+            require_grant_lifetime(self.grant,(receipt["max_work_ms"]+999)//1000)
+        except EvidenceError as exc:
+            raise PolicyDenied("model_grant_lifetime_insufficient") from exc
+        return receipt
 
     def returned_model_effect(self,receipt):
         if receipt is not None:
