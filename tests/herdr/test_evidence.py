@@ -21,7 +21,9 @@ def trusted_fixture_git(monkeypatch, request):
     # Artifact confinement tests exercise Git physically with a separate host
     # launch port. Namespace/policy confinement has its actual bwrap suite.
     monkeypatch.setattr("herdr.evidence.verify_invocation_session", launch_fixture)
-    if request.node.name.startswith("test_actual") or request.node.name == "test_bounded_git_output_failure_is_permanent_rejection":
+    if request.node.name.startswith("test_actual") or request.node.name in {
+            "test_bounded_git_output_failure_is_permanent_rejection",
+            "test_executor_git_timeout_is_transient"}:
         return
     from herdr.workspace import _real_git
     monkeypatch.setattr("herdr.evidence.read_only_git", _real_git)
@@ -511,8 +513,19 @@ def test_blob_above_explicit_limit_is_permanent_rejection(tmp_path):
     assert not list(store.root.glob("accepted-*"))
 
 
+def _simulate_artifact_executor_availability(monkeypatch):
+    # Error classification units replace the executor below; they do not attest
+    # physical isolation. Real namespace/filter/socket tests use actual bwrap.
+    actual_is_file = Path.is_file
+    monkeypatch.setattr(Path, "is_file", lambda path: True if str(path) in
+                        {"/usr/bin/bwrap", "/usr/bin/git"} else actual_is_file(path))
+    monkeypatch.setattr("herdr.evidence.network_denial_filter",
+                        lambda: os.open(os.devnull, os.O_RDONLY))
+
+
 def test_bounded_git_output_failure_is_permanent_rejection(tmp_path, monkeypatch):
     from herdr.evidence import read_only_git
+    _simulate_artifact_executor_availability(monkeypatch)
     monkeypatch.setattr("herdr.evidence.artifact_command",
                         lambda *a, **k: (_ for _ in ()).throw(ValueError("output limit")))
     with pytest.raises(EvidenceError, match="bounded") as error:
@@ -537,8 +550,9 @@ def test_unique_record_does_not_mask_a_contradictory_legacy_outcome(tmp_path):
     assert len(list(store.root.glob("accepted-*"))) == 3
 
 
-def test_actual_git_timeout_is_transient(tmp_path, monkeypatch):
+def test_executor_git_timeout_is_transient(tmp_path, monkeypatch):
     from herdr.evidence import read_only_git
+    _simulate_artifact_executor_availability(monkeypatch)
     monkeypatch.setattr("herdr.evidence.artifact_command",
                         lambda *a, **k: (_ for _ in ()).throw(ValueError("source_timeout")))
     with pytest.raises(EvidenceUnavailable, match="timed out"):
