@@ -35,7 +35,7 @@ def register_work_tool(installation, registry, authorized_call, call_digest):
                 raise PolicyDenied("work_request_invalid")
             guard.authorize_tool_call(TOOL, raw, caller_task_id=task_id,
                 consume_approval=authorized_call.get() != (guard.grant.hash, TOOL, call_digest(TOOL, raw)))
-            outcome = guard.verify_work(raw["request_id"], handoff=raw.get("handoff"))
+            outcome = guard.verify_work(raw["request_id"], handoff=raw.get("handoff"), consume_approval=False)
             if outcome.get("submission") is not None:
                 from .result_submission import submit
                 submission = submit(guard, outcome["submission"])

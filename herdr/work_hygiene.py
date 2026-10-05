@@ -68,7 +68,7 @@ open('.git/herdr-paths','wb').write(b'\0'.join(x.encode() for x in cfg['changed'
 git('add','--pathspec-from-file=.git/herdr-paths','--pathspec-file-nul')
 open('.git/herdr-message','w').write(cfg['message'])
 output=git('commit','-F','.git/herdr-message')
-names=git('ls-files','--cached','--others','--exclude-standard','-z').decode().split('\0')
+names=git('ls-files','--cached','--others','-z').decode().split('\0')
 seen={name for name in names if name}
 changed=seen!=set(cfg['inventory'])
 for name,row in cfg['inventory'].items():
@@ -456,7 +456,8 @@ class HostLocalCommitter:
                 "commit recovery tree changed")
         original_index = private_file(private/"index-original", 2097152)
         new_index = private_file(work/".git"/"index", 2097152)
-        require(private_file(metadata/"index", 2097152) in {original_index, new_index}, "foreign index changes must be preserved")
+        validated_index = private_file(metadata/"index", 2097152)
+        require(validated_index in {original_index, new_index}, "foreign index changes must be preserved")
         self._publish_objects(work/".git"/"objects", common/"objects")
         ref = common/"refs"/"heads"/self.draft.branch
         parent = directory_fd(ref.parent)
@@ -469,7 +470,7 @@ class HostLocalCommitter:
                              expected=(self.draft.base_sha+"\n").encode())
         finally: os.close(parent)
         parent = directory_fd(metadata)
-        try: publish_file(parent, "index", new_index, expected=private_file(metadata/"index", 2097152))
+        try: publish_file(parent, "index", new_index, expected=validated_index)
         finally: os.close(parent)
         manager = WorkspaceManager(cycle.root, git=git, worktrees_dir=cycle.root.parent,
                                    artifacts_dir=self.storage/"artifacts")

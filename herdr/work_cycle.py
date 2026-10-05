@@ -234,7 +234,7 @@ class CheckResult:
             "check proof digest invalid")
         require(type(self.exit_code) is int and -128 <= self.exit_code <= 255
                 and type(self.truncated) is bool and type(self.duration_ms) is int
-                and 0 <= self.duration_ms <= 901000, "check proof limits invalid")
+                and 0 <= self.duration_ms <= 913000, "check proof limits invalid")
 
     @property
     def hash(self):
@@ -242,10 +242,10 @@ class CheckResult:
 
 
 def tree_snapshot(root, *, git=None, max_bytes=67_108_864):
-    """Read physical tracked/unignored bytes without clean filters or symlinks."""
+    """Read every tracked/untracked byte, including ignored paths, without filters."""
     root = Path(root)
     query = git or read_only_git(root)
-    names = query(["ls-files", "-z", "--cached", "--others", "--exclude-standard"]).split("\0")
+    names = query(["ls-files", "-z", "--cached", "--others"]).split("\0")
     names = sorted(set(x for x in names if x))
     require(len(names) <= 4096, "work tree file count exceeded")
     directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -496,7 +496,7 @@ class WorkCycle:
     def _validate_check(self, proof, check, tree):
         require(isinstance(proof,CheckResult) and proof.check_id == check.id
                 and proof.plan_sha256 == self.plan.hash and proof.environment_sha256 == self.plan.environment_sha256
-                and proof.tree_sha256 == tree and proof.duration_ms <= check.timeout_seconds*1000+3000,
+                and proof.tree_sha256 == tree and proof.duration_ms <= (check.timeout_seconds+13)*1000,
                 "check origin/plan/environment/tree mismatch")
 
     def _protected_inputs(self,snapshot):

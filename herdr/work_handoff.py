@@ -63,19 +63,21 @@ class HostWorkHandoff:
                 "new handoff intent must precede host verification")
         launch_policy = verify_invocation_session(self.task)
         require(launch_policy["grant_sha256"] == cycle.plan.grant_sha256, "work request grant changed")
+        # Bound the exact candidate shape before verification or commit effects.
+        from dataclasses import replace
+        snapshot = cycle.verify_scope()
+        changed = tuple(sorted(name for name in set(snapshot)|set(cycle.baseline)
+                               if snapshot.get(name) != cycle.baseline.get(name)))
+        preview = replace(self.committer.draft, changed_files=changed,
+                          commit_sha="f"*64, result_sha="f"*64)
+        self._submission(preview, handoff)
         intent = {"version": 1, "identity": self.identity.to_json(),
                   "work_plan": cycle.plan.hash, "request": request_id, "handoff": handoff,
                   "launch_policy": launch_policy}
         self.store.publish("work-handoff-intent", key, intent)
         return handoff
 
-    def complete(self, cycle, request_id, outcome):
-        if outcome["status"] != "pass":
-            return outcome
-        key = self._key(cycle, request_id)
-        intent = self.store.read("work-handoff-intent", key)
-        declaration = intent["handoff"]
-        artifact = self.committer(cycle)
+    def _submission(self, artifact, declaration):
         candidate = {"version": 2, "artifact": artifact.to_json(),
                      "pr_number": declaration["pr_number"]}
         if "scope_claim" in declaration:
@@ -86,9 +88,23 @@ class HostWorkHandoff:
         raw = {"status": "completed", "evidence": [{"herdr_completion": candidate}],
                "summary": "Frozen host checks passed; exact local artifact awaits independent CI/review and integration."}
         require(len(canonical(raw)) <= 6144, "sealed result exceeds bounded work response")
+        return raw
+
+    def complete(self, cycle, request_id, outcome):
+        if outcome["status"] != "pass":
+            return outcome
+        key = self._key(cycle, request_id)
+        intent = self.store.read("work-handoff-intent", key)
+        declaration = intent["handoff"]
+        artifact = self.committer(cycle)
+        raw = self._submission(artifact, declaration)
         payload = payload_for_slot(self.identity, self.slot, raw)
         receipt = self.result_authority.capture(self.task, payload, self.plan, cycle=cycle, origin_request_key=key)
-        result = {**outcome, "next_action": "submit_exact_local_handoff",
+        # Full check proofs remain in the original private verification receipt.
+        # The bounded SDK response carries their digest and count.
+        compact = {name:value for name,value in outcome.items() if name != "checks"}
+        result = {**compact, "check_count": len(outcome["checks"]),
+                  "next_action": "submit_exact_local_handoff",
                   "submission": raw, "local_receipt_sha256": receipt}
         require(len(canonical(result)) <= 8191, "work handoff response exceeds bound")
         return result

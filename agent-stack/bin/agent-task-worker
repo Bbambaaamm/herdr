@@ -476,6 +476,30 @@ def _recover_root_work_cycle(task):
 
 
 
+def _verify_root_completion(task, result):
+    cycle=None
+    if modern_work_contract(task):
+        factory, cycle = _recover_root_work_cycle(task)
+        identity = cycle.plan.identity
+        cycle=factory.before_completion(identity,result)
+    invocation_verifier = None
+    if cycle is not None:
+        from agent_completion_evidence import store_for
+        from herdr.evidence import binding, digest
+        plan = store_for(ROOT, task).read("plan", digest(binding(task)))
+        invocation_verifier = factory.result_authority.verifier(
+            task, result, plan, work_plan_sha256=cycle.plan.hash)
+    accepted = ((verify_completion(ROOT, task, result, invocation_verifier=invocation_verifier)
+                 if invocation_verifier is not None else verify_completion(ROOT, task, result)) if verification_applies(task)
+                else {"level": "legacy_unverified_result"})
+    if cycle is not None:
+        if accepted["level"]!="verified_worker_result":
+            raise EvidenceError("modern coding contract needs verified worker artifact")
+        cycle.handed_off(accepted["bundle_hash"])
+        task["work_contract"]["phase"]=cycle.phase.value
+    return accepted
+
+
 def _recover_root_local_result(task):
     from herdr.work_cycle import WorkPhase
     from herdr.work_configuration import recover_host_handoff
@@ -1452,26 +1476,7 @@ def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool)
     blocker = str(result.get("blocker") or "").strip()
     if str(result.get("status") or "") == "completed" and (not blocker or blocker.lower() in {"none", "null"}):
         try:
-            cycle=None
-            if modern_work_contract(task):
-                factory, cycle = _recover_root_work_cycle(task)
-                identity = cycle.plan.identity
-                cycle=factory.before_completion(identity,result)
-            invocation_verifier = None
-            if cycle is not None:
-                from agent_completion_evidence import store_for
-                from herdr.evidence import binding, digest
-                plan = store_for(ROOT, task).read("plan", digest(binding(task)))
-                invocation_verifier = factory.result_authority.verifier(
-                    task, result, plan, work_plan_sha256=cycle.plan.hash)
-            accepted = ((verify_completion(ROOT, task, result, invocation_verifier=invocation_verifier)
-                         if invocation_verifier is not None else verify_completion(ROOT, task, result)) if verification_applies(task)
-                        else {"level": "legacy_unverified_result"})
-            if cycle is not None:
-                if accepted["level"]!="verified_worker_result":
-                    raise EvidenceError("modern coding contract needs verified worker artifact")
-                cycle.handed_off(accepted["bundle_hash"])
-                task["work_contract"]["phase"]=cycle.phase.value
+            accepted = _verify_root_completion(task, result)
         except EvidenceError as exc:
             waiting = record_verification_failure(task, exc)
             if waiting:

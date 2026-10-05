@@ -164,3 +164,20 @@ Repository-config parsing retains the approved config inode, verifies its
 content hash, and checks inode/content/timestamps after the separate read-only
 Git parse. Replacement, in-place mutation and restore-to-the-original-byte
 races all stop before hooks or ref effects.
+
+The worker and watchdog share receipt-backed root completion verification. A
+host-produced version-2 result does not need a model-supplied artifact workspace;
+cold recovery supplies the original admitted workspace and invocation proof and
+does not restart an SDK. Final Git index publication retains the bytes already
+validated before object/ref publication as its CAS expectation, preserving late
+foreign staging. Physical scope inventory includes Git-ignored paths, including
+their deletion and newly created ignored files. Ignored-path admission is finite
+under the same file/byte/nofollow bounds; oversized or special inputs block.
+
+Proof duration includes the approved 10-second namespace startup and bounded exit
+allowance: per-check admission and replay use timeout plus 13 seconds. The sealed
+SDK handoff transports a check count and the original check-evidence digest; full
+check proofs remain in the protected verification receipt. The exact candidate
+shape is bounded before oracle/commit effects. The registry consumes required
+one-shot tool approval once; its internal verification rechecks without consuming
+the same approval again.

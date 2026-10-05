@@ -157,10 +157,10 @@ class WorkInvocationGuard(InvocationGuard):
         self.work_authority(self.grant.identity,self.grant.hash,kind="tool",tool=self.canonical_tool(tool))
         return super().authorize_tool_call(tool,args,**kwargs)
 
-    def verify_work(self, request_id, handoff=None):
+    def verify_work(self, request_id, handoff=None, *, consume_approval=True):
         args = {"request_id": request_id}
         if handoff is not None: args["handoff"] = handoff
-        self.authorize_tool_call("herdr_verify_work", args)
+        self.authorize_tool_call("herdr_verify_work", args, consume_approval=consume_approval)
         verifier = getattr(self.work_authority, "verify", None)
         if not callable(verifier):
             raise PolicyDenied("work_verification_unavailable")
