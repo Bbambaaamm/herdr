@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -173,3 +174,36 @@ def test_explicit_write_preserves_existing_mode_under_restrictive_umask(tmp_path
         assert stat.S_IMODE(target.stat().st_mode)==mode
     finally:
         os.umask(previous);authority.close()
+
+
+def test_exact_file_root_permits_only_pinned_inode_without_parent_write(tmp_path):
+    target=tmp_path/"owned.txt";target.write_text("before")
+    foreign=tmp_path/"foreign.txt";foreign.write_text("foreign")
+    before=target.stat().st_ino
+    authority=RootFDWorkspace((str(target),))
+    try:
+        assert authority.read_text(str(target))=="before"
+        authority.write_text(str(target),"after")
+        assert target.read_text()=="after" and target.stat().st_ino==before
+        assert authority.list_regular_files(str(target))==[str(target)]
+        with pytest.raises(FileAuthorityError):authority.write_text(str(foreign),"escape")
+        with pytest.raises(FileAuthorityError):authority.write_text(str(target/"child"),"escape")
+        assert foreign.read_text()=="foreign"
+    finally:authority.close()
+
+
+def test_exact_file_root_rejects_replacement_and_new_hardlink(tmp_path):
+    target=tmp_path/"owned.txt";target.write_text("before")
+    authority=RootFDWorkspace((str(target),))
+    try:
+        target.rename(tmp_path/"original")
+        target.write_text("new")
+        with pytest.raises(FileAuthorityError,match="binding"):authority.write_text(str(target),"escape")
+        assert target.read_text()=="new"
+    finally:authority.close()
+    authority=RootFDWorkspace((str(target),))
+    try:
+        os.link(target,tmp_path/"alias")
+        with pytest.raises(FileAuthorityError,match="binding"):authority.write_text(str(target),"escape")
+        assert target.read_text()=="new" and (tmp_path/"alias").read_text()=="new"
+    finally:authority.close()

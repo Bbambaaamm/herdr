@@ -393,3 +393,35 @@ def test_claim_replay_never_adopts_modified_global_reservation(tmp_path,monkeypa
     restored=DynamicChildScheduler(audit_log=AuditLog(tmp_path/"graph.jsonl"),
         ownership_registry=store,ownership_parent=owner)
     with pytest.raises(OwnershipError,match="replay_reservation"):restored.replay()
+
+
+def test_owned_late_result_without_registry_cannot_become_terminal(tmp_path):
+    owner=parent();store=registry(tmp_path);item=scheduler(tmp_path,owner,store)
+    node=item.delegate_child(owner.task_id,owner.run_token,"unbound-late",
+        proposal(owner,ownership(owner,files=("one.py",))))
+    item.dispatch(task_ids={node.id},managed_start=True);rec=item._tasks[node.id]
+    raw=(tmp_path/"graph.jsonl").read_bytes()
+    no_registry=DynamicChildScheduler(audit_log=AuditLog(tmp_path/"graph.jsonl"))
+    no_registry.replay()
+    result=[{"artifact":"candidate"}]
+    hashed=hashlib.sha256(json.dumps(result,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+    assert not no_registry.publish_child_result(rec.id,rec.run_token,rec.agent_id,
+        rec.fencing_token,rec.idempotency_key,hashed,result)
+    assert no_registry._tasks[rec.id].state is LifecycleState.RUNNING
+    assert (tmp_path/"graph.jsonl").read_bytes()==raw
+
+
+def test_protected_recovery_restores_full_registry_parent_binding(tmp_path):
+    import sys
+    sys.path.insert(0,str(Path(__file__).resolve().parents[2]/"agent-stack/bin"))
+    from agent_durable_children import replay_host_scheduler
+    owner=parent();store=registry(tmp_path);item=scheduler(tmp_path,owner,store)
+    node=item.delegate_child(owner.task_id,owner.run_token,"recover-registry",
+        proposal(owner,ownership(owner,files=("one.py",))))
+    item.dispatch(task_ids={node.id},managed_start=True);rec=item._tasks[node.id]
+    restored=replay_host_scheduler(tmp_path,tmp_path/"graph.jsonl")
+    assert restored.ownership_parent==owner and restored.ownership_registry is not None
+    identity=InvocationIdentity(owner.consumer,rec.agent_id,owner.agent_id,owner.task_id,
+        rec.id,rec.run_token,rec.fencing_token)
+    assert restored.ownership_registry.require_current(rec.ownership_reservation,identity)
+    assert restored.dispatch(task_ids={node.id},managed_start=True)==[]

@@ -103,6 +103,38 @@ class OwnedWritePins:
                              (kind=="file" and stat.S_ISREG(held.st_mode) and held.st_nlink==1)),
                         "owned_write_binding_changed")
                 parent=fd
+        for item in self.mounts:
+            if item.kind=="directory":
+                self._verify_directory_tree(item.fd)
+
+    def _verify_directory_tree(self,fd):
+        remaining=4096
+        device=os.fstat(fd).st_dev
+        def visit(directory,depth):
+            nonlocal remaining
+            require(depth<=16,"owned_directory_depth_bound")
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    remaining-=1
+                    require(remaining>=0,"owned_directory_entry_bound")
+                    info=os.stat(entry.name,dir_fd=directory,follow_symlinks=False)
+                    require(info.st_dev==device and info.st_uid==os.geteuid()
+                            and not info.st_mode&0o022,"owned_directory_entry_untrusted")
+                    if stat.S_ISDIR(info.st_mode):
+                        child=os.open(entry.name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,
+                                      dir_fd=directory)
+                        try:
+                            held=os.fstat(child)
+                            require((held.st_dev,held.st_ino)==(info.st_dev,info.st_ino),
+                                    "owned_directory_entry_changed")
+                            visit(child,depth+1)
+                        finally:os.close(child)
+                    else:
+                        require(stat.S_ISREG(info.st_mode) and info.st_nlink==1,
+                                "owned_directory_hardlink_or_special")
+        opened=os.open(".",os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC,dir_fd=fd)
+        try:visit(opened,0)
+        finally:os.close(opened)
 
     def descriptors(self):
         self.verify()

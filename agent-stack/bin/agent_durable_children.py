@@ -247,6 +247,33 @@ def publish_exact_child_result(scheduler: DynamicChildScheduler, rec, result_pat
     return rec.result_status
 
 
+def replay_host_scheduler(root: Path, ledger: Path) -> DynamicChildScheduler:
+    """Restore host ownership ports from protected canonical reservation intents.
+
+    Reading this intent does not issue a grant or start work. Replay verifies
+    its full parent/claim bindings against the already reserved private store.
+    """
+    from herdr.security import InvocationIdentity
+    from herdr.child_ownership import OwnershipRegistry
+    from herdr.ownership_inventory import LegacyOwnershipInventory
+    audit = AuditLog(ledger)
+    owners = {}
+    for event in audit.replay():
+        if event.get("event") == "child_ownership_reserved":
+            owner = InvocationIdentity.from_dict(event.get("parent"))
+            owners[json.dumps(owner.to_json(),sort_keys=True)] = owner
+    if len(owners) > 1:
+        raise SchedulerError("multiple ownership parents in one attempt ledger")
+    owner = next(iter(owners.values()),None)
+    registry = None if owner is None else OwnershipRegistry(root,verify_legacy=LegacyOwnershipInventory(root))
+    scheduler = DynamicChildScheduler(audit_log=audit,ownership_registry=registry,ownership_parent=owner)
+    scheduler.replay()
+    if any(rec.ownership is not None and rec.ownership_reservation is None
+           for rec in scheduler._tasks.values()):
+        raise SchedulerError("declared ownership lacks protected reservation")
+    return scheduler
+
+
 def reconcile_child_results(root: Path, parent_task_id: str, run_token: str) -> None:
     """Under bridge.lock, consume exact result files from this attempt's ledger."""
     directory = attempt_directory(root, parent_task_id, run_token)
@@ -254,8 +281,7 @@ def reconcile_child_results(root: Path, parent_task_id: str, run_token: str) -> 
     if not ledger.is_file():
         return
     try:
-        scheduler = DynamicChildScheduler(audit_log=AuditLog(ledger))
-        scheduler.replay()
+        scheduler = replay_host_scheduler(root,ledger)
         events = scheduler.audit_log.replay()
         parent = scheduler._tasks.get(parent_task_id)
         children = [rec for rec in scheduler._tasks.values()
@@ -363,8 +389,7 @@ def all_children_terminal(root: Path, parent_task_id: str, run_token: str, *,
     if not ledger.is_file():
         return lock_held and not os.path.lexists(ledger) and not ledger_required(directory)
     try:
-        scheduler = DynamicChildScheduler(audit_log=AuditLog(ledger))
-        scheduler.replay()
+        scheduler = replay_host_scheduler(root,ledger)
         events = scheduler.audit_log.replay()
         parent = scheduler._tasks.get(parent_task_id)
         if not events or not any(e.get("event") == "submit" and
@@ -382,6 +407,9 @@ def all_children_terminal(root: Path, parent_task_id: str, run_token: str, *,
             e.get("parent_run_token") != run_token for e in spawned
         ):
             return False
+        for rec in children:
+            if rec.ownership is not None and rec.result_status == "completed":
+                scheduler._require_current_ownership(rec)
         return all(rec.attempt_state == "terminal" and
                    (bool(rec.pre_delivery_failure) and rec.cleanup_complete or
                     rec.result_status in {"completed", "blocked", "failed"} and

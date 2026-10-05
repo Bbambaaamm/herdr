@@ -893,7 +893,10 @@ class DynamicChildScheduler:
         return None
 
     def _require_current_ownership(self,rec):
-        if self.ownership_registry is None:return
+        if self.ownership_registry is None:
+            if rec.ownership is not None:
+                raise SchedulerError("owned child requires authenticated registry")
+            return
         from .security import InvocationIdentity
         if rec.ownership_reservation is None:
             raise SchedulerError("child ownership reservation missing")

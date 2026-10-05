@@ -97,7 +97,32 @@ def test_actual_kernel_allows_owned_write_and_denies_foreign_sibling(kind,monkey
                 "from pathlib import Path;import errno;"
                 "p=Path("+repr(str(target))+");p.write_text('changed');"
                 "q=Path("+repr(str(foreign))+");"
-                "\ntry:q.write_text('escape')\nexcept OSError as exc:assert exc.errno in (errno.EROFS,errno.EACCES)\nelse:raise AssertionError('foreign write succeeded')\n"]
+                "\ntry:q.write_text('escape')\nexcept OSError as exc:assert exc.errno in (errno.EROFS,errno.EACCES)\nelse:raise AssertionError('foreign write succeeded')\n"
+                "import os\n"
+                "try:os.link(str(q),str(p.parent/'foreign-link'))\n"
+                "except OSError as exc:assert exc.errno in (errno.EXDEV,errno.EROFS,errno.EACCES)\n"
+                "else:raise AssertionError('foreign inode linked into writable scope')\n"]
             done=subprocess.run(args,capture_output=True,text=True,timeout=20)
             assert done.returncode==0,done.stderr
             assert target.read_text()=="changed" and foreign.read_text()=="foreign"
+
+
+@pytest.mark.parametrize("kind",["hardlink","nested-hardlink","symlink","fifo"])
+def test_directory_scope_rejects_unsafe_descendant_before_any_launch(tmp_path,kind):
+    (tmp_path/"own").mkdir();(tmp_path/"foreign").write_text("foreign")
+    parent=tmp_path/"own"
+    if kind=="nested-hardlink":
+        parent=parent/"nested";parent.mkdir()
+    if kind in {"hardlink","nested-hardlink"}:os.link(tmp_path/"foreign",parent/"alias")
+    elif kind=="symlink":(parent/"alias").symlink_to(tmp_path/"foreign")
+    else:os.mkfifo(parent/"pipe")
+    with pin(tmp_path) as root,pytest.raises(OwnershipError):
+        OwnedWritePins(contract(("directory","own")),root)
+    assert (tmp_path/"foreign").read_text()=="foreign"
+
+
+def test_directory_descendant_link_introduced_after_pinning_is_rejected(tmp_path):
+    (tmp_path/"own").mkdir();(tmp_path/"foreign").write_text("foreign")
+    with pin(tmp_path) as root,OwnedWritePins(contract(("directory","own")),root) as owned:
+        os.link(tmp_path/"foreign",tmp_path/"own/alias")
+        with pytest.raises(OwnershipError,match="hardlink"):owned.descriptors()
