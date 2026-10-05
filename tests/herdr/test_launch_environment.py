@@ -70,3 +70,15 @@ def test_poisoned_spawn_parent_is_denied(monkeypatch):
     monkeypatch.setattr(module,"process_environment",lambda pid:{"LD_TRACE_LOADED_OBJECTS":""})
     with pytest.raises(ValueError,match="unsafe"):
         module.require_clean_spawn_source(120)
+
+
+def test_subprocess_runner_sanitizes_before_first_native_exec():
+    import os,sys
+    from herdr.runtime import SubprocessHerdrRunner
+    inherited={**os.environ,"LD_TRACE_LOADED_OBJECTS":"","LD_PRELOAD":"/worker/native.so",
+               "BASH_ENV":"/worker/startup","HERDR_SAFE_PROBE":"retained"}
+    runner=SubprocessHerdrRunner(executable=sys.executable,env=inherited)
+    result=runner.run(["-I","-S","-c",
+        "import os;assert not any(k.startswith('LD_') for k in os.environ);assert 'BASH_ENV' not in os.environ;print(os.environ['HERDR_SAFE_PROBE'])"])
+    assert result.returncode==0,result.stderr
+    assert result.stdout.strip()=="retained"

@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from itertools import islice
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 
@@ -170,7 +171,7 @@ def response_witness_tokens(plan, counter):
                 objects=[{}]
                 for key in node.get("required",[]):
                     variants=candidates(node["properties"][key],depth+1)
-                    objects=[{**item,key:value} for item in objects for value in variants][:256]
+                    objects=list(islice(({**item,key:value} for item in objects for value in variants),256))
                 raw.extend(objects)
             elif kind=="array":
                 size=node.get("minItems",0)

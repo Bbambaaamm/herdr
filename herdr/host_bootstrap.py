@@ -140,10 +140,16 @@ class HostBootstrap:
                 files={name: hashlib.sha256(raw).hexdigest() for name, raw in items.items()},
                 executable_files=("hermes", "agent-hermes-policy-stage1"),
                 storage=storage, writable_roots=writable_roots)
-            socket_dir = Path(tempfile.mkdtemp(prefix="herdr-bootstrap-broker-", dir="/tmp"))
+            socket_dir = Path(tempfile.mkdtemp(prefix="bootstrap-broker-", dir=storage))
             socket_path = socket_dir / "s"
             listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            listener.bind(str(socket_path))
+            # A proc directory FD keeps AF_UNIX's sockaddr under 108 bytes even
+            # when the private operation storage path is long.
+            directory_fd = os.open(socket_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                listener.bind(f"/proc/self/fd/{directory_fd}/s")
+            finally:
+                os.close(directory_fd)
             os.chmod(socket_path, 0o600)
             listener.listen(8)
             listener.settimeout(0.25)

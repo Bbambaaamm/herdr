@@ -9,9 +9,22 @@
       "coordinator_agent": "quantlab-hermes",
       "workspace": "/home/agentops/workspaces/quantlab",
       "safety_profile": "quantlab",
+      "parent_role": "writer",
+      "parent_tools": [
+        "read_file",
+        "search_files",
+        "patch",
+        "write_file",
+        "herdr_delegate_child",
+        "herdr_submit_result"
+      ],
+      "parent_permissions": [
+        "workspace-write"
+      ],
       "hermes_profile": "quantlab",
       "priority_default": 60,
-      "priority_architecture": 50
+      "priority_architecture": 50,
+      "worktree_root": "/home/agentops/workspaces/quantlab/worktrees"
     },
     {
       "consumer": "majak",
@@ -22,9 +35,22 @@
       "coordinator_agent": "dotacni-majak-hermes",
       "workspace": "/home/agentops/workspaces/dotacni-majak",
       "safety_profile": "dotacni-majak",
+      "parent_role": "writer",
+      "parent_tools": [
+        "read_file",
+        "search_files",
+        "patch",
+        "write_file",
+        "herdr_delegate_child",
+        "herdr_submit_result"
+      ],
+      "parent_permissions": [
+        "workspace-write"
+      ],
       "hermes_profile": "majak",
       "priority_default": 60,
-      "priority_architecture": 60
+      "priority_architecture": 60,
+      "worktree_root": "/home/agentops/workspaces/dotacni-majak/worktrees"
     },
     {
       "consumer": "herdr",
@@ -35,9 +61,22 @@
       "coordinator_agent": "herdr-hermes",
       "workspace": "/home/agentops/workspaces/herdr",
       "safety_profile": "herdr-core",
+      "parent_role": "writer",
+      "parent_tools": [
+        "read_file",
+        "search_files",
+        "patch",
+        "write_file",
+        "herdr_delegate_child",
+        "herdr_submit_result"
+      ],
+      "parent_permissions": [
+        "workspace-write"
+      ],
       "hermes_profile": "quantlab",
       "priority_default": 60,
-      "priority_architecture": 60
+      "priority_architecture": 60,
+      "worktree_root": "/home/agentops/workspaces/herdr/worktrees"
     },
     {
       "consumer": "heating",
