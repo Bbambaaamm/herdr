@@ -18,6 +18,8 @@ from herdr.runtime import (MAX_PROMPT_CHARS, AdmissionRegistry, HerdrChildRuntim
 from herdr.scheduler import (AuditLog, ChildProposal, DenyDecision,
                              DynamicChildScheduler, SchedulerError)
 from herdr.taskgraph import LifecycleState
+from herdr.child_ownership import ChildOwnership, OwnershipRegistry
+from herdr.ownership_inventory import LegacyOwnershipInventory
 from agent_durable_children import (attempt_directory, ledger_required,
                                     mark_ledger_required, initialization_pending, initialize_parent_scheduler,
                                     parent_attempt_guard,
@@ -224,8 +226,13 @@ def delegate(args, *, runner=None, policy_launch_factory=None):
     if isinstance(runner, SubprocessHerdrRunner):
         runner.env = {**os.environ, "HERDR_ENV": "1", "HERDR_PANE_ID": pane}
     parent_id, token = task["id"], task["run_token"]
-    with closing(_pin_child_cwd(task, args)) as pinned:
-        return _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, policy_launch_factory)
+    from herdr.ownership_epoch import legacy_admission_guard
+    state_root = Path(_required_env("HERDR_DURABLE_TASK_FILE")).resolve(strict=True).parent.parent
+    # Retain the fence from reservation to verified namespace custody, including
+    # reconciliation when the coordinator worker has already died.
+    with legacy_admission_guard(state_root):
+        with closing(_pin_child_cwd(task, args)) as pinned:
+            return _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, policy_launch_factory)
 
 
 def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, policy_launch_factory=None):
@@ -240,6 +247,23 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
     predicted_id = (f"{parent_id}-child-"
                     f"{hashlib.sha256(f'{parent_id}:{token}:{args.key}'.encode()).hexdigest()[:16]}")
     result_path = directory / "results" / f"{predicted_id}.result.json"
+    raw_ownership = getattr(args, "ownership", None)
+    ownership = ChildOwnership.from_json(raw_ownership) if raw_ownership is not None else None
+    ownership_registry = ownership_parent = None
+    if policy_launch_factory is not None or ownership is not None:
+        from herdr.policy_launch import HostPolicyLaunchFactory
+        if (not isinstance(policy_launch_factory, HostPolicyLaunchFactory)
+                or policy_launch_factory.parent_grant is None):
+            raise ValueError("verified host parent grant required for ownership")
+        ownership_parent = policy_launch_factory.parent_grant.identity
+        if (ownership_parent.task_id, ownership_parent.run_token, ownership_parent.agent_id,
+                ownership_parent.consumer) != (parent_id, token, agent, "github:"+task["repo"]):
+            raise ValueError("ownership parent differs from authenticated attempt")
+        if ownership is not None and ownership.integration_owner != parent_id:
+            raise ValueError("ownership integration owner differs from parent")
+        from herdr.ownership_release import HostOwnershipRelease
+        ownership_registry = OwnershipRegistry(state_root, verify_legacy=LegacyOwnershipInventory(state_root),
+                                                verify_release=HostOwnershipRelease(state_root))
     _validate_delivery_prompt(args.prompt, directory, predicted_id, parent_task_id=parent_id, run_token=token)
     with parent_attempt_guard(state_root, parent_id, token):
         # Recheck while holding the same lock as parent terminalization.
@@ -256,11 +280,15 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
             raise SchedulerError("durable child scheduler sentinel missing")
         if ledger_required(directory) and not ledger_preexisting:
             raise SchedulerError("durable child scheduler ledger missing")
-        scheduler = DynamicChildScheduler(audit_log=AuditLog(ledger))
+        scheduler = DynamicChildScheduler(audit_log=AuditLog(ledger),
+            ownership_registry=ownership_registry, ownership_parent=ownership_parent)
         scheduler.replay()
         # The outer preflight is conservative for concurrent claims. Recheck
         # exact identities here before registering the parent or child.
         existing = scheduler._tasks.get(predicted_id)
+        if (existing is None and ownership is None
+                and set(args.tool)-{"read_file", "search_files", "herdr_submit_result"}):
+            raise ValueError("fresh mutating child requires explicit ownership")
         fence = (existing.fencing_token if existing is not None else
                  scheduler._next_fencing_token_value + (parent_id not in scheduler._tasks))
         token_preview = (existing.run_token if existing is not None else None) or "x" * 32
@@ -301,7 +329,8 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
         if ledger_preexisting:
             scheduler.register_external_parent_attempt(**parent_binding)
         else:
-            scheduler = initialize_parent_scheduler(directory, **parent_binding)
+            scheduler = initialize_parent_scheduler(directory, ownership_registry=ownership_registry,
+                ownership_parent=ownership_parent, **parent_binding)
         if not ledger.is_file() or not ledger_required(directory):
             raise SchedulerError("durable child scheduler initialization missing")
         proposal = ChildProposal(parent_role=task["parent_role"],
@@ -311,7 +340,7 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
                                       ({"herdr_submit_result"} if "herdr_submit_result" in task["parent_tools"] else set()))),
                                  child_permissions=tuple(args.permission),
                                  child_task=args.objective,
-                                 worktree_identity=pinned.identity)
+                                 worktree_identity=pinned.identity, ownership=ownership)
         child = scheduler.delegate_child(parent_id, token, args.key, proposal)
         if isinstance(child, DenyDecision):
             raise ValueError(f"child denied: {child.reason.value}")
@@ -382,12 +411,14 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
                     # Retain verified evidence while resources and the parent gate
                     # remain quarantined. Cleanup is never semantic acceptance.
                     pass
+        scheduler.release_child_ownership(rec.id)
     # Use the fsync-protected scheduler record, never a changed worker result file.
     # These are submitted artifacts; only the shared completion gate accepts them.
     retained = rec.result_evidence_canonical
     if retained is not None and hashlib.sha256(retained).hexdigest() != rec.result_artifact_sha256:
         raise SchedulerError("retained child result digest mismatch")
-    return {"evidence": json.loads(retained) if retained is not None else None,
+    return {"handoff": rec.result_handoff,
+                "evidence": json.loads(retained) if retained is not None else None,
                 "evidence_sha256": rec.result_artifact_sha256,
                 "task_id": child.id, "parent_task_id": parent_id,
                 "run_token": rec.run_token, "agent_id": rec.agent_id,
@@ -422,6 +453,7 @@ def client_delegate(args):
         "key": args.key, "role": args.role, "objective": args.objective,
         "prompt": args.prompt, "tool": args.tool, "permission": args.permission,
         "cwd": str(getattr(args, "cwd", "") or ""),
+        "ownership": getattr(args, "ownership", None),
     }
     payload = json.dumps(request, ensure_ascii=False, allow_nan=False).encode("utf-8")
     if len(payload) > MAX_REQUEST:
@@ -460,6 +492,7 @@ def main():
     parser.add_argument("--tool", action="append", default=[])
     parser.add_argument("--permission", action="append", default=[])
     parser.add_argument("--cwd", default="")
+    parser.add_argument("--ownership", type=json.loads, default=None)
     args = parser.parse_args()
     try:
         if os.environ.get("HERDR_DURABLE_BRIDGE_SOCKET"):

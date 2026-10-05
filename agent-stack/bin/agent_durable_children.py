@@ -165,7 +165,7 @@ def repair_initialization(directory: Path, parent_task_id: str, run_token: str) 
                          json.dumps(committed, sort_keys=True, allow_nan=False).encode("utf-8"))
 
 
-def initialize_parent_scheduler(directory: Path, **binding) -> DynamicChildScheduler:
+def initialize_parent_scheduler(directory: Path, *, ownership_registry=None, ownership_parent=None, **binding) -> DynamicChildScheduler:
     """Stage the whole parent registration before publishing either required artifact."""
     ledger = directory / "scheduler.jsonl"
     if os.path.lexists(ledger) or ledger_required(directory) or os.path.lexists(directory / INITIALIZATION):
@@ -174,7 +174,8 @@ def initialize_parent_scheduler(directory: Path, **binding) -> DynamicChildSched
     os.close(fd)
     stage = Path(name)
     try:
-        scheduler = DynamicChildScheduler(audit_log=AuditLog(stage))
+        scheduler = DynamicChildScheduler(audit_log=AuditLog(stage),
+            ownership_registry=ownership_registry, ownership_parent=ownership_parent)
         scheduler.register_external_parent_attempt(**binding)
         raw = _read_control_file(stage)
         document = {"schema": 1, "parent_task_id": binding["task_id"], "run_token": binding["run_token"],
@@ -246,6 +247,75 @@ def publish_exact_child_result(scheduler: DynamicChildScheduler, rec, result_pat
     return rec.result_status
 
 
+def replay_host_scheduler(root: Path, ledger: Path) -> DynamicChildScheduler:
+    """Restore host ownership ports from protected canonical reservation intents.
+
+    Reading this intent does not issue a grant or start work. Replay verifies
+    its full parent/claim bindings against the already reserved private store.
+    """
+    from herdr.security import InvocationIdentity
+    from herdr.child_ownership import OwnershipRegistry
+    from herdr.ownership_inventory import LegacyOwnershipInventory
+    audit = AuditLog(ledger)
+    owners = {}
+    for event in audit.replay():
+        if event.get("event") == "child_ownership_reserved":
+            owner = InvocationIdentity.from_dict(event.get("parent"))
+            owners[json.dumps(owner.to_json(),sort_keys=True)] = owner
+    if len(owners) > 1:
+        raise SchedulerError("multiple ownership parents in one attempt ledger")
+    owner = next(iter(owners.values()),None)
+    from herdr.ownership_release import HostOwnershipRelease
+    registry = None if owner is None else OwnershipRegistry(root,
+        verify_legacy=LegacyOwnershipInventory(root),verify_release=HostOwnershipRelease(root))
+    scheduler = DynamicChildScheduler(audit_log=audit,ownership_registry=registry,ownership_parent=owner)
+    scheduler.replay()
+    if any(rec.ownership is not None and rec.ownership_reservation is None
+           for rec in scheduler._tasks.values()):
+        raise SchedulerError("declared ownership lacks protected reservation")
+    return scheduler
+
+
+
+@contextmanager
+def recovery_worktree_pin(rec):
+    """Reopen only the exact protected claim inode; never grant or dispatch."""
+    if rec.ownership is None:
+        yield None
+        return
+    from agent_durable_sandbox import PinnedWorktree
+    raw = rec.worktree_identity
+    if not isinstance(raw, str) or len(raw) > 4096:
+        raise ValueError("owned recovery worktree identity missing")
+    logical_raw, separator, numbers = raw.rpartition("|")
+    device, colon, inode = numbers.partition(":")
+    if not separator or not colon or not device.isdecimal() or not inode.isdecimal():
+        raise ValueError("owned recovery worktree identity invalid")
+    logical = Path(logical_raw)
+    if (not logical.is_absolute() or str(logical) != logical_raw
+            or any(part in {".", ".."} for part in logical.parts)
+            or len(logical.parts) > 128):
+        raise ValueError("owned recovery worktree path invalid")
+    flags = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open("/", flags)
+    pin = None
+    try:
+        # No symlink ancestor can redirect a retained logical worktree name.
+        for part in logical.parts[1:]:
+            next_fd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        held = os.fstat(fd)
+        if (held.st_dev, held.st_ino) != (int(device), int(inode)):
+            raise ValueError("owned recovery worktree inode changed")
+        pin = PinnedWorktree(logical, fd, held.st_dev, held.st_ino)
+        if pin.identity != raw:
+            raise ValueError("owned recovery worktree identity changed")
+        pin.verify()
+        yield pin
+    finally:
+        os.close(fd)
+
 def reconcile_child_results(root: Path, parent_task_id: str, run_token: str) -> None:
     """Under bridge.lock, consume exact result files from this attempt's ledger."""
     directory = attempt_directory(root, parent_task_id, run_token)
@@ -253,8 +323,7 @@ def reconcile_child_results(root: Path, parent_task_id: str, run_token: str) -> 
     if not ledger.is_file():
         return
     try:
-        scheduler = DynamicChildScheduler(audit_log=AuditLog(ledger))
-        scheduler.replay()
+        scheduler = replay_host_scheduler(root,ledger)
         events = scheduler.audit_log.replay()
         parent = scheduler._tasks.get(parent_task_id)
         children = [rec for rec in scheduler._tasks.values()
@@ -277,9 +346,11 @@ def reconcile_child_results(root: Path, parent_task_id: str, run_token: str) -> 
             try:
                 runner = SubprocessHerdrRunner(os.environ.get(
                     "HERDR_REAL_BINARY", "/home/agentops/.local/bin/herdr"))
-                runtime = HerdrChildRuntime(scheduler, runner, cwd=root,
-                    snapshot_path=directory / "swarm.json", admission_registry=AdmissionRegistry())
-                runtime.recover_interrupted_child_start(rec.id)
+                with recovery_worktree_pin(rec) as pin:
+                    runtime = HerdrChildRuntime(scheduler, runner, cwd=root,
+                        snapshot_path=directory / "swarm.json", admission_registry=AdmissionRegistry(),
+                        pinned_worktree=pin)
+                    runtime.recover_interrupted_child_start(rec.id)
             except (OSError, ValueError, TypeError, KeyError, RuntimeError):
                 # Retain exact intent when ownership is absent, ambiguous or unavailable.
                 continue
@@ -298,27 +369,30 @@ def reconcile_child_results(root: Path, parent_task_id: str, run_token: str) -> 
             try:
                 runner = SubprocessHerdrRunner(os.environ.get(
                     "HERDR_REAL_BINARY", "/home/agentops/.local/bin/herdr"))
-                runtime = HerdrChildRuntime(
-                    scheduler, runner, cwd=root,
-                    snapshot_path=directory / "swarm.json",
-                    admission_registry=AdmissionRegistry())
-                if rec.pre_delivery_failure and not rec.execution_pane:
-                    if rec.pre_delivery_pane_creation_attempted:
-                        runtime.recover_interrupted_child_start(rec.id)
+                with recovery_worktree_pin(rec) as pin:
+                    runtime = HerdrChildRuntime(
+                        scheduler, runner, cwd=root,
+                        snapshot_path=directory / "swarm.json",
+                        admission_registry=AdmissionRegistry(), pinned_worktree=pin)
+                    if rec.pre_delivery_failure and not rec.execution_pane:
+                        if rec.pre_delivery_pane_creation_attempted:
+                            runtime.recover_interrupted_child_start(rec.id)
+                            continue
+                        runtime.admission_registry.release(
+                            rec.agent_id, now=scheduler.current_time(),
+                            task_id=rec.id, fencing_token=rec.fencing_token)
+                        scheduler.mark_pre_delivery_cleanup_complete(rec.id)
                         continue
-                    runtime.admission_registry.release(
-                        rec.agent_id, now=scheduler.current_time(),
-                        task_id=rec.id, fencing_token=rec.fencing_token)
-                    scheduler.mark_pre_delivery_cleanup_complete(rec.id)
-                    continue
-                if rec.pre_delivery_failure:
-                    runtime.cleanup_bound_pre_delivery(rec.id)
-                else:
-                    runtime.cleanup_bound_child(rec.id)
-                scheduler.mark_pre_delivery_cleanup_complete(rec.id) if rec.pre_delivery_failure else scheduler.mark_child_cleanup_complete(rec.id)
+                    if rec.pre_delivery_failure:
+                        runtime.cleanup_bound_pre_delivery(rec.id)
+                    else:
+                        runtime.cleanup_bound_child(rec.id)
+                    scheduler.mark_pre_delivery_cleanup_complete(rec.id) if rec.pre_delivery_failure else scheduler.mark_child_cleanup_complete(rec.id)
             except (OSError, ValueError, TypeError, KeyError, RuntimeError):
                 # Retain the terminal result, but never open the parent gate.
                 continue
+        for rec in children:
+            scheduler.release_child_ownership(rec.id)
     except (OSError, ValueError, TypeError, KeyError, AttributeError, RuntimeError):
         return
 
@@ -362,8 +436,7 @@ def all_children_terminal(root: Path, parent_task_id: str, run_token: str, *,
     if not ledger.is_file():
         return lock_held and not os.path.lexists(ledger) and not ledger_required(directory)
     try:
-        scheduler = DynamicChildScheduler(audit_log=AuditLog(ledger))
-        scheduler.replay()
+        scheduler = replay_host_scheduler(root,ledger)
         events = scheduler.audit_log.replay()
         parent = scheduler._tasks.get(parent_task_id)
         if not events or not any(e.get("event") == "submit" and
@@ -381,6 +454,14 @@ def all_children_terminal(root: Path, parent_task_id: str, run_token: str, *,
             e.get("parent_run_token") != run_token for e in spawned
         ):
             return False
+        for rec in children:
+            if rec.namespace_lifetime is not None and rec.attempt_state == "terminal" and rec.cleanup_complete:
+                from herdr.ownership_release import namespace_exited
+                if not namespace_exited(rec.namespace_lifetime):
+                    return False
+            if rec.ownership is not None and (
+                    rec.result_status == "completed" or rec.attempt_state == "terminal" and rec.cleanup_complete):
+                scheduler._require_current_ownership(rec,result=rec.cleanup_complete)
         return all(rec.attempt_state == "terminal" and
                    (bool(rec.pre_delivery_failure) and rec.cleanup_complete or
                     rec.result_status in {"completed", "blocked", "failed"} and

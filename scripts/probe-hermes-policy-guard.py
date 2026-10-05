@@ -343,6 +343,30 @@ def main() -> int:
         )
         assert "HERDR_SECURITY_DENIED" not in str(write_result), write_result
         assert allowed_write.read_text(encoding="utf-8") == "ROOTFD_OK\n"
+        for control in (".git", ".herdr", ".herdr-private"):
+            attack = workspace / ("new-" + control.lstrip(".")) / control / "config"
+            denied = model_tools.handle_function_call("write_file",
+                {"path": str(attack), "content": "escape"}, **common)
+            denied_data = json.loads(denied) if isinstance(denied, str) else denied
+            assert denied_data.get("error") == "workspace control path is not writable", denied
+            assert denied_data.get("bytes_written") == 0 and denied_data.get("dirs_created") is False, denied
+            assert not attack.parent.parent.exists()
+        installation.uninstall()
+
+        # An existing file ownership root must bootstrap and use the same
+        # installed SDK guard without granting the parent directory writes.
+        exact_file_grant = replace(write_grant,grant_id="hermes-exact-file-probe",
+            tool_rules=(replace(write_grant.tool_rules[0],allowed_roots=(str(allowed_write),)),))
+        installation=install_hermes_guard(InvocationGuard(exact_file_grant))
+        exact_inode=allowed_write.stat().st_ino
+        exact_result=model_tools.handle_function_call("write_file",
+            {"path":str(allowed_write),"content":"EXACT_FILE_OK\n"},**common)
+        assert "HERDR_SECURITY_DENIED" not in str(exact_result),exact_result
+        assert allowed_write.read_text()=="EXACT_FILE_OK\n" and allowed_write.stat().st_ino==exact_inode
+        sibling=workspace/"exact-file-foreign.txt";sibling.write_text("foreign")
+        denied_sibling=model_tools.handle_function_call("write_file",
+            {"path":str(sibling),"content":"escape"},**common)
+        assert "HERDR_SECURITY_DENIED" in str(denied_sibling) and sibling.read_text()=="foreign"
         installation.uninstall()
 
         patch_scope = replace(
@@ -417,6 +441,9 @@ def main() -> int:
             "hermes_file_toolset": sorted(file_toolset),
             "read_file_allowed": True,
             "rootfd_write_allowed": True,
+            "nested_control_sdk_creation_denied": True,
+            "exact_file_sdk_write_allowed": True,
+            "exact_file_sdk_foreign_sibling_denied": True,
             "result_submission_sdk_dispatch": True,
             "result_submission_one_inode_no_process": True,
             "granted_delegation_sdk_dispatch": True,
