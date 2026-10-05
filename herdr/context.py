@@ -477,7 +477,7 @@ class ContextCompiler:
         return executor, cap, provider
 
     def preflight(self, plan: ContextPlan, *, executor_id, counter: TokenCounter,
-                  renderer="messages"):
+                  renderer="messages",allowed_data_classes=None):
         """Validate source-independent host metadata before any source loader."""
         require(isinstance(plan, ContextPlan) and plan.redaction_hash == self.redactor.policy_hash,
                 "plan_redaction_policy")
@@ -491,24 +491,36 @@ class ContextCompiler:
         budget = min(limits)
         require(renderer in {"messages", "parts"}, "renderer")
         raw = json.loads(plan.payload)
+        require(plan.project==raw["stable_prefix"]["project_map"]["project"],"context_project_binding")
+        provider_classes=set(cap.data_policy.data_classes)&set(provider.data_policy.data_classes)
+        if allowed_data_classes is not None:
+            require(isinstance(allowed_data_classes,tuple) and all(isinstance(x,DataClass) for x in allowed_data_classes)
+                    and len(set(allowed_data_classes))==len(allowed_data_classes),"host_provider_data_classes")
+            provider_classes &= set(allowed_data_classes)
         controls_class = DataClass(raw["controls"]["data_class"])
-        require(controls_class in set(cap.data_policy.data_classes) & set(provider.data_policy.data_classes),
+        require(controls_class in provider_classes,
                 "required_provider_data_class")
         for source_raw in raw["controls"]["evidence"]:
             source = SourceRef(**source_raw)
             require(_source_policy(source, plan.project, plan.context, series=plan.experiment_series,
                                    role=plan.role) is None and source.data_class in
-                    set(cap.data_policy.data_classes) & set(provider.data_policy.data_classes),
-                    "required_provider_evidence_scope")
+                    provider_classes,"required_provider_evidence_scope")
+        for item in plan.items:
+            if item.mandatory:
+                if not all(source.data_class in provider_classes for source in item.sources):
+                    raise ContextBlocked("required_provider_source_data_class")
         # The skill resolver checked this executor; a switch re-resolves skills first.
         require(raw["skill_trace"].get("binding") == {**plan.context.binding(), "executor_id": executor_id},
                 "skill_executor_binding")
         return executor, cap, provider, raw, budget
 
     def compile(self, plan: ContextPlan, *, executor_id, counter: TokenCounter, loader: Callable,
-                renderer="messages", envelope=None, input_token_limit=None):
+                renderer="messages", envelope=None, input_token_limit=None,allowed_data_classes=None):
         executor, cap, provider, raw, budget = self.preflight(
-            plan, executor_id=executor_id, counter=counter, renderer=renderer)
+            plan, executor_id=executor_id, counter=counter, renderer=renderer,
+            allowed_data_classes=allowed_data_classes)
+        provider_classes=set(cap.data_policy.data_classes)&set(provider.data_policy.data_classes)
+        if allowed_data_classes is not None:provider_classes &= set(allowed_data_classes)
         require(envelope is None or callable(envelope), "host_context_envelope")
         if input_token_limit is not None:
             require(type(input_token_limit) is int and 0 < input_token_limit <= 2**31,
@@ -547,7 +559,7 @@ class ContextCompiler:
                         and source_reason == SourceState.UNVERIFIED.value):
                     source_reason = None
                 reason = reason or source_reason
-                if source.data_class not in set(cap.data_policy.data_classes) & set(provider.data_policy.data_classes):
+                if source.data_class not in provider_classes:
                     reason = reason or "provider_data_class"
             if reason:
                 if item.mandatory:

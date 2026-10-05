@@ -7,16 +7,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 
 from jsonschema import Draft202012Validator
 
-from .capability import Feature
+from .capability import DataClass, Egress, Feature, Retention, Training
 from .context import (ContextBundle, ContextCompiler, ContextPlan, SecretRedactor,
                       SourceRef, SourceState, TokenCounter, canonical, digest,
                       hash_value, token)
-from .security import InvocationIdentity, SecurityGrant
+from .security import InvocationGuard, InvocationIdentity, PolicyDenied, ProviderRequest, SecurityGrant
 
 VERSION = "herdr.prompt.v1"
 MAX_PROMPT = 262144
@@ -110,6 +111,11 @@ def bounded_schema(schema):
         if types and "string" in types:
             integer(node.get("maxLength"), 0, 16384, "output_schema_finite_string_required")
             integer(node.get("minLength",0),0,node["maxLength"],"output_schema_string_interval")
+        for key in ("minimum","maximum"):
+            if key in node:
+                require(type(node[key]) in (int,float) and
+                        (type(node[key]) is int or math.isfinite(node[key])),
+                        "output_schema_number_bound")
         if "minimum" in node and "maximum" in node:
             require(node["minimum"] <= node["maximum"],"output_schema_number_interval")
         for key in ("anyOf", "oneOf"):
@@ -129,6 +135,71 @@ def bounded_schema(schema):
         Draft202012Validator.check_schema(schema)
     except Exception as exc:
         raise PromptBlocked("output_schema_invalid") from exc
+
+
+def response_witness_tokens(plan, counter):
+    """Bounded legal response witnesses, measured by this executor's tokenizer.
+
+    A compile without a legal witness fails closed. Witnesses reserve enough
+    output for an actual bound response, rather than a schema-independent floor.
+    """
+    work = 0
+    allocated = 0
+    def candidates(node, depth=0):
+        nonlocal work, allocated
+        work += 1
+        require(work <= 4096 and depth <= 12,"output_response_witness_bound")
+        raw = []
+        if "const" in node:raw.append(node["const"])
+        if "enum" in node:raw.extend(node["enum"])
+        for key in ("anyOf","oneOf"):
+            for child in node.get(key,[]):raw.extend(candidates(child,depth+1))
+        typ=node.get("type",[])
+        for kind in ([typ] if isinstance(typ,str) else typ):
+            if kind=="null":raw.append(None)
+            elif kind=="boolean":raw.extend((False,True))
+            elif kind=="string":
+                size=node.get("minLength",0)
+                raw.extend(("a"*size,"0"*size))
+            elif kind in ("integer","number"):
+                low=node.get("minimum",0);high=node.get("maximum",low)
+                values=(0,1,low,high)
+                if kind=="integer":values=(*values,math.ceil(low),math.floor(high))
+                raw.extend(values)
+            elif kind=="object":
+                objects=[{}]
+                for key in node.get("required",[]):
+                    variants=candidates(node["properties"][key],depth+1)
+                    objects=[{**item,key:value} for item in objects for value in variants][:256]
+                raw.extend(objects)
+            elif kind=="array":
+                size=node.get("minItems",0)
+                if size==0:raw.append([])
+                else:
+                    for value in candidates(node["items"],depth+1):
+                        require(len(canonical(value))*size <= MAX_OUTPUT,"output_response_witness_bound")
+                        raw.append([value]*size)
+        validator=Draft202012Validator(node)
+        found={}
+        for value in raw:
+            work += 1
+            require(work <= 4096,"output_response_witness_bound")
+            wire=canonical(value)
+            allocated += len(wire)
+            require(len(wire)<=MAX_OUTPUT and allocated<=4*MAX_OUTPUT,"output_response_witness_bound")
+            if validator.is_valid(value):found.setdefault(wire,value)
+            if len(found)==256:break
+        return tuple(found.values())
+    results=candidates(json.loads(plan.output_contract.result_schema))
+    measurements=[]
+    for result in results:
+        value={"identity":plan.identity.to_json(),"prompt_plan_sha256":plan.hash,
+               "status":Sufficiency.UNKNOWN,"result":result,"evidence_refs":[],"reason_code":"unknown"}
+        wire=canonical(value)
+        if len(wire)<=MAX_OUTPUT and Draft202012Validator(plan.output_contract.schema()).is_valid(value):
+            measurements.append(counter.measure(wire))
+    require(measurements,"output_response_witness_unavailable")
+    return min(measurements)
 
 
 @dataclass(frozen=True)
@@ -225,7 +296,7 @@ def context_authority_hash(context):
     return digest({"binding": context.context.binding(), "controls": raw["controls"],
                    "node_instructions": raw["node_instructions"],
                    "host_policy": prefix["host_policy"], "consumer_policy": prefix["consumer_policy"],
-                   "project_map": prefix["project_map"], "role": context.role,
+                   "project_map": prefix["project_map"], "project": context.project, "role": context.role,
                    "experiment_series": context.experiment_series})
 
 
@@ -382,9 +453,14 @@ class RendererBinding:
     native_structured_output: bool
     allow_validated_fallback: bool
     version: str = VERSION
+    region: str | None = None
+    credential_ref: str | None = None
 
     def __post_init__(self):
         for value in (self.executor_id, self.executor_version, self.provider_id): token(value)
+        if self.region is not None: token(self.region)
+        require(self.credential_ref is None or isinstance(self.credential_ref,str),
+                "prompt_credential_binding")
         require(self.renderer in {"messages", "parts"} and self.version == VERSION
                 and type(self.native_structured_output) is bool and type(self.allow_validated_fallback) is bool,
                 "prompt_renderer_binding")
@@ -449,6 +525,8 @@ class PromptRuntime:
                 and context.context.scope.hash == grant.scope.hash
                 and context.context.spec_policy_hash == digest({"spec": plan.spec_sha256, "policy": plan.policy_sha256}),
                 "prompt_context_binding")
+        require(context.project == context.stable_prefix["project_map"]["project"],
+                "prompt_project_binding")
         require(context.stable_prefix["project_map"]["base_sha"] == plan.base_revision,
                 "prompt_context_base_revision")
 
@@ -470,7 +548,28 @@ class PromptRuntime:
                 "prompt_text_output_required")
         native = binding.native_structured_output and Feature.STRUCTURED_OUTPUT in cap.features
         require(native or binding.allow_validated_fallback, "structured_output_unsupported")
-        provider_classes = set(cap.data_policy.data_classes) & set(provider.data_policy.data_classes)
+        require(all(type(limit) is int and limit > 0 for limit in
+                    (cap.context_tokens,cap.max_input_tokens,cap.max_output_tokens)),
+                "prompt_capability_limit_unknown")
+        route = next((item for item in grant.provider_routes if item.provider==binding.provider_id),None)
+        require(route is not None,"prompt_provider_route_missing")
+        regions = set(cap.data_policy.regions)&set(provider.data_policy.regions)&set(grant.scope.regions)&set(route.regions)
+        region = binding.region
+        if region is None:
+            require(len(regions)==1,"prompt_provider_region_required")
+            region=next(iter(regions))
+        require(region in regions,"prompt_provider_region_denied")
+        policy = lambda enum,field:max((getattr(cap.data_policy,field),getattr(provider.data_policy,field)),
+                                     key=lambda value:list(enum).index(value))
+        request=ProviderRequest(binding.provider_id,region,
+            DataClass(json.loads(context.payload)["controls"]["data_class"]),
+            policy(Egress,"egress"),policy(Retention,"retention"),policy(Training,"training"),
+            binding.credential_ref)
+        try:InvocationGuard(grant).authorize_provider(request)
+        except PolicyDenied as exc:raise PromptBlocked("prompt_provider_route_"+exc.reason) from None
+        provider_classes = set(cap.data_policy.data_classes)&set(provider.data_policy.data_classes)&set(route.data_classes)&set(grant.scope.data_classes)
+        self.context_compiler.preflight(context,executor_id=binding.executor_id,counter=counter,
+            renderer="messages",allowed_data_classes=tuple(sorted(provider_classes,key=str)))
         selected_resources = {resource["sha256"] for item in context.stable_prefix["selection"]["skills"]
                               for resource in item.get("resources", [])}
         stable = {"version": VERSION, "precedence": ["host", "consumer", "task", "context"],
@@ -494,8 +593,8 @@ class PromptRuntime:
         stable = self.redactor.tree(stable); dynamic = self.redactor.tree(dynamic)
         rejected, selected = [], []
         allowance = plan.output_contract.output_token_allowance
-        require(cap.max_output_tokens is None or allowance <= cap.max_output_tokens,
-                "prompt_output_capability_limit")
+        require(allowance <= cap.max_output_tokens,"prompt_output_capability_limit")
+        require(response_witness_tokens(plan,counter) <= allowance,"prompt_output_allowance_too_small")
         shared_inputs = tuple(limit-allowance for limit in
             (cap.context_tokens,grant.scope.max_context_tokens) if limit is not None)
         require(all(limit>0 for limit in shared_inputs),"prompt_output_exceeds_context")
@@ -552,7 +651,7 @@ class PromptRuntime:
             return render()
         compiled = self.context_compiler.compile(context, executor_id=binding.executor_id,
             counter=counter, loader=loader, renderer="messages", envelope=envelope,
-            input_token_limit=token_limit)
+            input_token_limit=token_limit,allowed_data_classes=tuple(sorted(provider_classes,key=str)))
         require(isinstance(compiled, ContextBundle), "compiled_context_required")
         wire = envelope(compiled.payload)
         require(fits(wire), "mandatory_prompt_exceeds_budget")
@@ -579,7 +678,8 @@ class PromptRuntime:
                            "input_bytes": len(wire), "tokenizer_input_tokens": counter.measure(wire),
                            "stable_prefix_sha256": digest(stable), "demonstrations_used": len(dynamic["demonstrations"]),
                            "selected": selected, "rejected": rejected, "cache_usage": "UNKNOWN",
-                           "provider_usage": "UNKNOWN", "schema_mode": "native" if native else "validated_fallback"})
+                           "provider_usage": "UNKNOWN", "provider_route_sha256":digest(route.to_json()),
+                           "provider_region":region, "schema_mode": "native" if native else "validated_fallback"})
         return PromptBundle(plan.hash, binding.hash, compiled.hash, canonical(stable), canonical(dynamic),
                             wire, trace, compiled.payload, compiled.trace)
 

@@ -545,3 +545,94 @@ def test_grant_shared_context_ceiling_reserves_completion_allowance(tmp_path):
     assert counter().measure(bundle.wire)+plan.output_contract.output_token_allowance<=8192
     assert json.loads(bundle.context_trace)["selected"]==[]
     assert PromptPlan.from_json(plan.to_json(),redactor=runtime.redactor).hash==plan.hash
+
+@pytest.mark.parametrize("field",["context_tokens","max_input_tokens","max_output_tokens"])
+def test_unknown_capability_ceiling_denies_before_any_source_read(tmp_path,field):
+    runtime,plan,context,grant,binding=setup(tmp_path)
+    node=replace(context.context,registry=replace(context.context.registry,
+        capabilities=tuple(replace(cap,**{field:None}) for cap in context.context.registry.capabilities)))
+    payload=json.loads(context.payload);payload["binding"]=node.binding()
+    payload["skill_trace"]["binding"]={**node.binding(),"executor_id":binding.executor_id}
+    context=replace(context,context=node,payload=canonical(payload))
+    plan=replace(plan,context_plan_sha256=context.hash,context_authority_sha256=context_authority_hash(context))
+    with pytest.raises(PromptBlocked,match="capability_limit_unknown"):
+        compile((runtime,plan,context,grant,binding),lambda _:pytest.fail("unknown ceiling loaded source"))
+
+@pytest.mark.parametrize("minimum,maximum",[(0,"1"),("0",1),(False,1),(0,True),([],1),(0,{})])
+def test_mixed_numeric_schema_bounds_are_typed_prompt_denials(minimum,maximum):
+    with pytest.raises(PromptBlocked,match="number_bound"):
+        OutputContract(canonical({"type":"number","minimum":minimum,"maximum":maximum}))
+
+def test_output_allowance_must_fit_an_actual_bound_response(tmp_path):
+    data=setup(tmp_path);runtime,plan,context,grant,binding=data
+    small=replace(plan,output_contract=replace(plan.output_contract,output_token_allowance=1))
+    with pytest.raises(PromptBlocked,match="allowance_too_small"):
+        compile((runtime,small,context,grant,binding),lambda _:pytest.fail("impossible response loaded source"))
+    from herdr.prompt_runtime import response_witness_tokens
+    allowance=response_witness_tokens(plan,counter())
+    exact=replace(plan,output_contract=replace(plan.output_contract,output_token_allowance=allowance))
+    assert response_witness_tokens(exact,counter())==allowance
+    assert compile((runtime,exact,context,grant,binding)).render()["structured_output"]["max_output_tokens"]==allowance
+
+def test_nested_required_result_is_part_of_output_reservation(tmp_path):
+    runtime,plan,context,grant,binding=setup(tmp_path)
+    schema={"type":"object","properties":{"report":{"type":"string","minLength":3000,"maxLength":3000}},
+            "required":["report"],"additionalProperties":False}
+    plan=replace(plan,output_contract=OutputContract(canonical(schema),output_token_allowance=512))
+    with pytest.raises(PromptBlocked,match="allowance_too_small"):
+        compile((runtime,plan,context,grant,binding),lambda _:pytest.fail("undersized nested result loaded source"))
+
+def test_approved_context_variant_cannot_change_project_with_same_map(tmp_path):
+    runtime,plan,context,grant,binding=setup(tmp_path)
+    changed=replace(context,project="foreign")
+    assert context_authority_hash(changed)!=context_authority_hash(context)
+    # The legacy ContextPlan digest covers payload/items, so only the explicit
+    # authority binding detects this project change even at the same digest.
+    assert changed.hash==context.hash
+    with pytest.raises(PromptBlocked,match="context_binding"):
+        compile((runtime,plan,changed,grant,binding),lambda _:pytest.fail("foreign project loaded source"))
+
+@pytest.mark.parametrize("fault",["data_class","region","retention","egress"])
+def test_selected_route_restrictions_deny_before_any_source_read(tmp_path,fault):
+    from herdr.capability import Egress,Retention
+    runtime,plan,context,grant,binding=setup(tmp_path)
+    change={"data_classes":(DataClass.PUBLIC,)} if fault=="data_class" else (
+        {"regions":("us",)} if fault=="region" else
+        {"max_retention":Retention.ZERO} if fault=="retention" else {"max_egress":Egress.NONE})
+    grant=replace(grant,provider_routes=tuple(replace(route,**change) if route.provider=="a" else route
+                                            for route in grant.provider_routes))
+    plan=replace(plan,grant_sha256=grant.hash)
+    with pytest.raises(PromptBlocked,match="provider_"):
+        compile((runtime,plan,context,grant,binding),lambda _:pytest.fail("route rejected after source read"))
+
+@pytest.mark.parametrize("mandatory",[False,True])
+def test_route_filters_context_sources_before_loading(tmp_path,mandatory):
+    from dataclasses import fields
+    from herdr.capability import CapabilityScope
+    from herdr.context import ContextBlocked
+    from tests.herdr.test_context import item
+    raw=b"Sensitive evidence"
+    runtime,plan,context,grant,binding=setup(tmp_path,
+        items=(item(raw,data_class=DataClass.SENSITIVE,mandatory=mandatory),))
+    old=context.context
+    classes=(DataClass.INTERNAL,DataClass.SENSITIVE)
+    node=replace(old,**{field.name:replace(getattr(old,field.name),data_classes=classes)
+                        for field in fields(old) if isinstance(getattr(old,field.name),CapabilityScope)},
+        registry=replace(old.registry,
+            capabilities=tuple(replace(cap,data_policy=replace(cap.data_policy,data_classes=classes))
+                               for cap in old.registry.capabilities),
+            providers=tuple(replace(provider,data_policy=replace(provider.data_policy,data_classes=classes))
+                            for provider in old.registry.providers)))
+    payload=json.loads(context.payload);payload["binding"]=node.binding()
+    payload["skill_trace"]["binding"]={**node.binding(),"executor_id":binding.executor_id}
+    context=replace(context,context=node,payload=canonical(payload))
+    grant=replace(grant,scope=node.scope)
+    plan=replace(plan,grant_sha256=grant.hash,context_plan_sha256=context.hash,
+                 context_authority_sha256=context_authority_hash(context))
+    data=(runtime,plan,context,grant,binding)
+    if mandatory:
+        with pytest.raises(ContextBlocked,match="required_provider_source_data_class"):
+            compile(data,lambda _:pytest.fail("sensitive context loaded"))
+    else:
+        bundle=compile(data,lambda _:pytest.fail("sensitive context loaded"))
+        assert any(row["code"]=="provider_data_class" for row in bundle.telemetry()["context_audit"]["rejected"])
