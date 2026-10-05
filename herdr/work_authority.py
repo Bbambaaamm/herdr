@@ -40,6 +40,15 @@ class WorkAuthorityClient:
         return True
 
     def verify(self, identity, grant_sha256, request_id, handoff=None):
+        from .evidence import EvidenceError
+        try:
+            return self._verify_transport(identity,grant_sha256,request_id,handoff)
+        except PolicyDenied:
+            raise
+        except (EvidenceError,ValueError,TypeError,OSError) as exc:
+            raise PolicyDenied("work_verification_denied") from exc
+
+    def _verify_transport(self, identity, grant_sha256, request_id, handoff=None):
         request = {"op": "work-verify", "identity": identity.to_json(),
                    "grant_sha256": grant_sha256, "request_id": request_id}
         if handoff is not None: request["handoff"] = handoff

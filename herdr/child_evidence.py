@@ -148,13 +148,23 @@ class ChildCompletionAuthority:
                     work_workspace_identity=f"{child_workspace(rec)[1]}:{child_workspace(rec)[2]}")
         return task
 
+    def preflight_work(self,rec,launch):
+        if not self.modern_work(rec):return None
+        from .work_configuration import build_root_work_factory,preflight_handoff
+        plan=self.store.read("plan",digest(binding(child_task(rec))))
+        task=self._work_task(rec,plan)
+        factory=build_root_work_factory(self.store.root.parent,task,spec_sha256=child_spec(rec))
+        preflight_handoff(factory,launch,plan)
+        self.work_factories[digest(child_identity(rec).to_json())]=factory
+        return factory
+
     def prepare_work(self, rec, launch):
         if not self.modern_work(rec):
             return None
         from .work_configuration import build_root_work_factory, bind_root_handoff, preflight_handoff
         plan = self.store.read("plan", digest(binding(child_task(rec))))
         task = self._work_task(rec, plan)
-        factory = build_root_work_factory(self.store.root.parent, task, spec_sha256=child_spec(rec))
+        factory = self.work_factories.get(digest(child_identity(rec).to_json())) or self.preflight_work(rec,launch)
         preflight_handoff(factory, launch, plan)
         cycle = factory.prepare(identity=child_identity(rec), workspace=Path(task["workspace"]),
                                 grant=launch.grant, spec_sha256=child_spec(rec))

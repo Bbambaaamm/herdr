@@ -60,14 +60,20 @@ class CheckEnvironment:
     memory_bytes: int = 536_870_912
     scratch_bytes: int = 16_777_216
     scratch_file_bytes: int = 1_048_576
+    runtime_aliases: tuple[tuple[str,str], ...] = ()
+    runtime_executables: tuple[str, ...] = ()
 
     def __post_init__(self):
         object.__setattr__(self,"system_files",tuple(tuple(x) for x in self.system_files))
         object.__setattr__(self,"executables",tuple(self.executables))
+        object.__setattr__(self,"runtime_aliases",tuple(tuple(row) for row in self.runtime_aliases))
+        object.__setattr__(self,"runtime_executables",tuple(self.runtime_executables))
+        require(len(self.runtime_executables)<=64 and set(self.runtime_executables)<={row[0] for row in self.system_files},
+                "runtime helpers must be declared inputs")
         require(isinstance(self.version,str) and 1<=len(self.version)<=64,"environment version required")
         require(self.role=="validation" and self.network=="none" and self.process_creation=="denied",
                 "unsupported check isolation profile")
-        require(self.system_files and len(self.system_files)<=256 and
+        require(self.system_files and len(self.system_files)<=8192 and
             len({x[0] for x in self.system_files})==len(self.system_files),"approved system input manifest required")
         for path,sha in self.system_files:
             require(isinstance(path,str) and Path(path).is_absolute() and ".." not in Path(path).parts
@@ -75,6 +81,14 @@ class CheckEnvironment:
                 "approved system input invalid")
         require(self.executables and len(self.executables)<=32 and
                 set(self.executables)<={x[0] for x in self.system_files},"approved executables required")
+        require(len(self.runtime_aliases)<=64 and len({row[0] for row in self.runtime_aliases})==len(self.runtime_aliases),
+                "bounded explicit runtime aliases required")
+        paths={path for path,sha in self.system_files}
+        for alias,target in self.runtime_aliases:
+            require(all(isinstance(path,str) and Path(path).is_absolute() and ".." not in Path(path).parts
+                    and (path.startswith("/usr/") or path.startswith("/lib/") or path.startswith("/lib64/")
+                         or path.startswith("/bin/")) for path in (alias,target))
+                    and target in paths, "runtime alias must target an approved file")
         for name,limit,minimum,maximum in (("memory_bytes",self.memory_bytes,16_777_216,2_147_483_648),
             ("scratch_bytes",self.scratch_bytes,1_048_576,67_108_864),
             ("scratch_file_bytes",self.scratch_file_bytes,1024,self.scratch_bytes)):
@@ -131,7 +145,10 @@ class HostCheckRunner:
             writable_roots=(Path(root),),executable_files=[name for name,item in snapshot.items() if item["mode"]==0o755],
             max_bytes=67_108_864,max_file_bytes=67_108_864)
         fd=None
+        runtime=None
         try:
+            from .check_runtime import FrozenCheckRuntime
+            runtime=FrozenCheckRuntime(self.environment,self.storage,writable_roots=(root,))
             fd=network_denial_filter(deny_process_creation=True)
             cfg={"workspace_inode":[frozen.device,frozen.inode],"tree_sha256":tree_sha256,
                  "host_namespaces":{kind:os.readlink("/proc/self/ns/"+kind) for kind in ("pid","mnt","net")},
@@ -140,8 +157,7 @@ class HostCheckRunner:
                  "scratch_file_bytes":self.environment.scratch_file_bytes,"cpu_seconds":check.timeout_seconds,
                  "command":[executable,*check.command[1:]]}
             argv=["/usr/bin/bwrap","--die-with-parent","--unshare-pid","--unshare-net","--unshare-ipc",
-                "--unshare-uts","--cap-drop","ALL","--tmpfs","/","--ro-bind","/usr","/usr",
-                "--ro-bind","/lib","/lib","--ro-bind","/lib64","/lib64","--symlink","usr/bin","/bin",
+                "--unshare-uts","--cap-drop","ALL","--tmpfs","/",*runtime.arguments(),
                 "--dir","/home","--dir","/run","--dir","/etc","--dir","/workspace","--proc","/proc","--dev","/dev","--remount-ro","/dev",
                 "--size",str(self.environment.scratch_bytes),"--tmpfs","/tmp","--remount-ro","/",
                 "--ro-bind-fd",str(frozen.fd),"/workspace","--chdir","/workspace",
@@ -150,7 +166,8 @@ class HostCheckRunner:
                 "--setenv","PYTHONNOUSERSITE","1","--setenv","LANG","C.UTF-8",
                 "--seccomp",str(fd),"--",str(Path("/usr/bin/python3").resolve()),"-I","-S","-c",
                 _BOOTSTRAP,canonical(cfg).decode()]
-            result=self._execute(argv,check,(fd,frozen.fd))
+            result=self._execute(argv,check,(fd,frozen.fd,runtime.fd))
+            runtime.verify()
             frozen.verify()
             self.environment.verify_inputs()
             first,separator,output=result[0].partition(b"\n")
@@ -169,6 +186,7 @@ class HostCheckRunner:
             if fd is not None:
                 os.close(fd)
             frozen.cleanup_after_pane_closed()
+            if runtime is not None: runtime.close()
 
     @staticmethod
     def _execute(argv,check,pass_fds):
@@ -177,7 +195,10 @@ class HostCheckRunner:
         started=time.monotonic()
         data=bytearray()
         limited=False
-        deadline=started+check.timeout_seconds
+        # Namespace setup is host work; the oracle gets its declared deadline
+        # only after its bounded attestation header. Both intervals are finite.
+        deadline=started+10
+        attested=False
         try:
             with selectors.DefaultSelector() as selector:
                 selector.register(process.stdout,selectors.EVENT_READ)
@@ -191,6 +212,11 @@ class HostCheckRunner:
                         break
                     data.extend(chunk)
                     header=data.find(b"\n")
+                    if not attested and header>=0:
+                        if header>8192 or not (data.startswith(_MARKER) or data.startswith(b"HERDR_HYGIENE_ATTESTATION ")):
+                            break
+                        attested=True
+                        deadline=time.monotonic()+check.timeout_seconds
                     if (header>=0 and len(data)-header-1>check.output_bytes) or len(data)>check.output_bytes+8192:
                         limited=True
                         break

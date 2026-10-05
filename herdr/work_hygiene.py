@@ -217,6 +217,9 @@ class HostLocalCommitter:
             require(separator and not key.startswith(("include.", "includeif.", "filter."))
                     and key not in {"core.fsmonitor", "commit.gpgsign", "commit.template"},
                     "repository commit policy needs an approved richer profile")
+            structural={"core.repositoryformatversion":"0","core.bare":"false","core.logallrefupdates":"true"}
+            require(key in allowed or key=="core.hookspath" or key in structural and value==structural[key],
+                    "repository commit policy needs an approved richer profile")
             if key in allowed:
                 require(key not in selected, "duplicate commit policy key")
                 selected[key] = value
@@ -345,11 +348,13 @@ class HostLocalCommitter:
             objects = directory_fd(common/"objects"); work_fd = directory_fd(work); hooks_fd = directory_fd(approved)
             config_fd = os.open(dotgit/"config", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
             filter_fd = network_denial_filter()
+            runtime = None
             try:
+                from .check_runtime import FrozenCheckRuntime
+                runtime = FrozenCheckRuntime(self.policy.environment,self.storage,writable_roots=(cycle.root,))
                 argv = ["/usr/bin/bwrap", "--die-with-parent", "--unshare-user", "--uid", "65534", "--gid", "65534",
                         "--disable-userns", "--unshare-pid", "--unshare-net", "--unshare-ipc",
-                        "--unshare-uts", "--cap-drop", "ALL", "--tmpfs", "/", "--ro-bind", "/usr", "/usr",
-                        "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64", "--symlink", "usr/bin", "/bin",
+                        "--unshare-uts", "--cap-drop", "ALL", "--tmpfs", "/", *runtime.arguments(),
                         "--dir", "/home", "--dir", "/run", "--dir", "/etc", "--proc", "/proc",
                         "--dev", "/dev", "--remount-ro", "/dev", "--dir", "/empty-template",
                         "--dir", str(common/"objects"), "--dir", "/workspace", "--dir", "/input",
@@ -365,10 +370,12 @@ class HostLocalCommitter:
                         "--setenv", "GIT_LITERAL_PATHSPECS", "1", "--setenv", "LANG", "C.UTF-8",
                         "--seccomp", str(filter_fd), "--", "/usr/bin/python3", "-I", "-S", "-c", _BOOTSTRAP, canonical(cfg).decode()]
                 output, status, limited, duration = HostCheckRunner._execute(
-                    argv, self.policy, (objects, work_fd, hooks_fd, config_fd, filter_fd))
+                    argv, self.policy, (objects, work_fd, hooks_fd, config_fd, filter_fd,runtime.fd))
+                runtime.verify()
                 require(status == 0 and not limited, "normal repository commit or hook failed in approved profile")
             finally:
                 for handle in (objects, work_fd, hooks_fd, config_fd, filter_fd): os.close(handle)
+                if runtime is not None: runtime.close()
             first, separator, tail = output.partition(b"\n")
             require(separator and first.startswith(b"HERDR_HYGIENE_ATTESTATION ") and len(first)<=8192,
                     "physical hygiene attestation unavailable")

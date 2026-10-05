@@ -1625,3 +1625,33 @@ def test_atomic_managed_claim_survives_crash_before_runtime_entry(tmp_path,monke
     runtime.recover_interrupted_child_start(child.id)
     assert record.cleanup_complete and record.state.value=="blocked"
     assert record.fencing_token==lease.fencing_token
+
+def test_missing_modern_work_profile_blocks_before_split_or_agent(tmp_path,monkeypatch):
+    from herdr.work_cycle import WorkContractError
+    from herdr.child_evidence import ChildCompletionAuthority
+    scheduler=DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path/"events.jsonl"))
+    scheduler.register_external_parent_attempt(task_id="parent",run_token="parent-run",
+        idempotency_key="parent-key",agent_name="parent-agent",pane_id="parent-pane",
+        marker="parent-marker",repo="Bbambaaamm/herdr",issue="86",role="writer",
+        tools=("read_file",),permissions=(),policy_profile="herdr-core")
+    child=scheduler.delegate_child("parent","parent-run","coding",
+        ChildProposal("writer",("read_file",),"reader",("read_file",),child_task="inspect"))
+    lease=scheduler.dispatch(task_ids={child.id})[0];rec=scheduler._tasks[child.id]
+    scheduler.bind_child_prompt(child.id,"inspect")
+    class Runner(FakeHerdrRunner):
+        executable="/bin/true"
+    runtime=HerdrChildRuntime(scheduler,Runner(),cwd=tmp_path)
+    monkeypatch.setattr(runtime,"prepare",lambda:None)
+    monkeypatch.setattr(runtime,"_admit_child",lambda lease:None)
+    def unavailable(authority,record,launch):
+        assert record is rec and launch.identity.task_id==child.id
+        raise WorkContractError("approved modern work profile unavailable")
+    monkeypatch.setattr(ChildCompletionAuthority,"preflight_work",unavailable)
+    monkeypatch.setattr(runtime,"_create_pane",lambda *a:pytest.fail("missing profile cannot split"))
+    monkeypatch.setattr(runtime,"_start_agent",lambda *a:pytest.fail("missing profile cannot start"))
+    monkeypatch.setattr(runtime,"cleanup_managed_pre_delivery",lambda *a,**kw:None)
+    with pytest.raises(runtime_mod.PreDeliveryFailure,match="modern work profile"):
+        runtime.run_managed_child(lease,"inspect",run_token=rec.run_token,
+                                  idempotency_key=rec.idempotency_key)
+    assert not rec.pane_split_started and rec.execution_pane is None
+    assert not any(event["event"]=="child_pane_split_started" for event in scheduler.audit_log.replay())

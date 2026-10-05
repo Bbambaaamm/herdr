@@ -14,8 +14,9 @@ from test_work_cycle import setup, runner
 def environment():
     python=str(Path("/usr/bin/python3").resolve(strict=True))
     bwrap=str(Path("/usr/bin/bwrap").resolve(strict=True))
-    files=tuple((path,hashlib.sha256(Path(path).read_bytes()).hexdigest()) for path in (python,bwrap))
-    return CheckEnvironment("offline-single-process-1",files,(python,))
+    from tests.runtime_closure import approved_runtime
+    files,aliases,helpers=approved_runtime()
+    return CheckEnvironment("offline-closure-2",files,(python,),runtime_aliases=aliases,runtime_executables=helpers)
 
 def physical(tmp_path, command, **limits):
     cycle,root,plan,log=setup(tmp_path)
@@ -85,7 +86,7 @@ def test_unsupported_network_or_process_profile_is_never_silently_weakened():
 def test_changed_approved_runtime_blocks_check(tmp_path):
     cycle,root,plan,log=setup(tmp_path)
     profile=environment()
-    bad=replace(profile,system_files=((profile.system_files[0][0],"f"*64),profile.system_files[1]))
+    bad=replace(profile,system_files=((profile.system_files[0][0],"f"*64),*profile.system_files[1:]))
     with pytest.raises(WorkContractError,match="changed"):
         HostCheckRunner(bad,tmp_path/"private",git=_real_git(root))
 

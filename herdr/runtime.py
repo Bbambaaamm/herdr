@@ -1215,6 +1215,12 @@ class HerdrChildRuntime:
                 tools=node.tools,permissions=node.permissions,**launch_arguments)
             if not isinstance(launch, PreparedPolicyLaunch) or launch.identity != identity:
                 raise HerdrRuntimeError("child_invocation_policy_identity_mismatch", lease.task_id)
+            from .child_evidence import ChildCompletionAuthority
+            authority=self.scheduler.completion_authority
+            if not isinstance(authority,ChildCompletionAuthority):
+                raise HerdrRuntimeError("child_completion_authority_missing",lease.task_id)
+            authority.prepare(record)
+            authority.preflight_work(record,launch)
             self._policy_launches[lease.task_id] = launch
             policy_env.update(launch.environment())
             self._preflight_child_provider()
@@ -1251,11 +1257,6 @@ class HerdrChildRuntime:
                 )
             ):
                 raise HerdrRuntimeError("child_sandbox_attestation_denied", lease.task_id)
-            from .child_evidence import ChildCompletionAuthority
-            authority=self.scheduler.completion_authority
-            if not isinstance(authority,ChildCompletionAuthority):
-                raise HerdrRuntimeError("child_completion_authority_missing",lease.task_id)
-            authority.prepare(record)
             work_port = authority.prepare_work(record, launch)
             def publish_continuation(evidence):
                 accepted = self.scheduler.attest_execution_sandbox(

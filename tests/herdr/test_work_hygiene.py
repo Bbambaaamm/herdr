@@ -21,17 +21,19 @@ def boundary_workspace():
     try: yield target
     finally: shutil.rmtree(target)
 
-def fixture(root, hook=None, *, grant_transform=None, defer_verify=False):
+def fixture(root, hook=None, *, grant_transform=None, defer_verify=False, repository_config=None):
     factory, work, plan, grant, log = factory_fixture(root)
     branch = WorkspaceManager(work).branch_name(86, plan.identity.task_id, 1, plan.base_sha)
     git(work, "branch", "-m", branch)
+    for key,value in (repository_config or {}).items():
+        git(work,"config","--local",key,value)
     hooks = work/".git"/"hooks"
     if hook is not None:
         (hooks/"pre-commit").write_text("#!/bin/sh\nset -eu\n"+hook+"\n"); (hooks/"pre-commit").chmod(0o700)
     manifest = () if hook is None else (("pre-commit", hashlib.sha256((hooks/"pre-commit").read_bytes()).hexdigest()),)
     executable = "/usr/bin/git"
     environment = replace(factory.environment,
-        system_files=(*factory.environment.system_files, (executable, hashlib.sha256(Path(executable).read_bytes()).hexdigest())),
+        system_files=factory.environment.system_files,
         executables=(*factory.environment.executables, executable))
     policy = LocalCommitPolicy("repo-policy-1", environment,
         hashlib.sha256((work/".git"/"config").read_bytes()).hexdigest(), str(hooks), manifest)

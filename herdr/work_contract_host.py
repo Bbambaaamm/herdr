@@ -101,6 +101,8 @@ class HostWorkContractFactory:
             cycle,_=self._refresh(identity)
             require(cycle.plan.grant_sha256==grant_sha256,"work invocation grant changed")
             if cycle.phase is WorkPhase.WORK:
+                if kind=="tool" and tool=="herdr_submit_result":
+                    raise PolicyDenied("work_result_requires_host_handoff")
                 return True
             if kind=="tool" and tool=="herdr_verify_work" and cycle.phase in {WorkPhase.VERIFY,WorkPhase.HYGIENE,WorkPhase.HANDOFF}:
                 return True

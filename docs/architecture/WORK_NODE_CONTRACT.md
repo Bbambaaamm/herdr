@@ -122,3 +122,29 @@ historical. New standalone Herdr coding intake receives the work-contract
 marker; missing configured authority blocks execution. Unsupported experiments,
 network/subprocess check profiles and richer commit config require separately
 implemented/approved profiles and are not silently relaxed.
+
+### Exact runtime closure and early admission
+
+Checks and commit hooks receive only the host-approved `CheckEnvironment.system_files`.
+Every file is hashed, copied into host-private storage, and bound individually
+read-only from its retained directory descriptor. `runtime_aliases` and
+`runtime_executables` explicitly bind loader paths and executable helpers; an
+unlisted file beside an approved library is absent. No entire host library
+directory is mounted. This basic profile requires an explicit bounded runtime
+closure; it does not discover or approve new dependencies in production.
+Namespace startup has a separate finite ten-second bound. The declared oracle
+wall deadline begins after the bootstrap attestation; recorded duration includes
+startup. Cleanup follows process-group exit.
+
+Repository configuration is closed: approved author, line-ending/comment and
+commit-cleanup settings plus supported structural defaults are reproduced.
+Unrecognized settings, including hook-specific flags, require an approved
+richer profile and block before hook/ref effects. They are never silently
+discarded. Hooks can execute only helpers in the same approved closure.
+
+Modern child work preflight verifies protected work/hygiene/result capabilities
+before pane split. Baseline and final physical binding still occur in their
+proper later phase. During WORK, `herdr_submit_result` is denied so an arbitrary
+early payload cannot pin the completion slot. Host verification/hygiene produces
+the bound handoff before the SDK submits it. Oversized handoff requests and
+truncated host responses become bounded policy denials.

@@ -15,6 +15,7 @@ SCHEMA = {"name": TOOL,
 
 def register_work_tool(installation, registry, authorized_call, call_digest):
     from .security import PolicyDenied, SecurityError
+    from .evidence import EvidenceError
     from .policy_launch import IDENTITY_ENV
     guard = installation.guard
     if TOOL not in guard.grant.scope.tools:
@@ -43,7 +44,7 @@ def register_work_tool(installation, registry, authorized_call, call_digest):
             return json.dumps(outcome, sort_keys=True)
         except PolicyDenied as exc:
             return json.dumps({"error": exc.reason})
-        except (SecurityError, ValueError, TypeError, OSError):
+        except (SecurityError, EvidenceError, ValueError, TypeError, OSError):
             return json.dumps({"error": "work_verification_denied"})
     registry.register(name=TOOL, toolset="herdr_work", schema=SCHEMA, handler=handle,
                       description=SCHEMA["description"], max_result_size_chars=8192)
