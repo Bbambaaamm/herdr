@@ -38,7 +38,7 @@ ECONOMIC_CLAIM_ROOT = Path("/var/lib/herdr/a2a-economic-claims")
 _ID = re.compile(r"^[A-Za-z0-9._:@/+-]{1,256}$")
 _SECRET = re.compile(r"(?i)(secret|password|credential|private.?key|api.?key|access.?token|authorization|cookie|bearer\s|ghp_[a-z0-9]{20,}|sk-[a-z0-9]{20,}|xox[baprs]-)")
 _CARD_SECRET_VALUE = re.compile(
-    r"(?i)(bearer\s+\S{12,}|ghp_[a-z0-9]{20,}|sk-[a-z0-9]{20,}|xox[baprs]-[a-z0-9-]{12,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:secrets?|password|credentials?|private[-_. ]?key|api[-_. ]?key|client[-_. ]?secret|refresh[-_. ]?token|access[-_. ]?token|authorization|set[-_. ]?cookie|cookie)\s*[:=]\s*\S+)"
+    r"(?i)(bearer\s+\S{12,}|ghp_[a-z0-9]{20,}|sk-[a-z0-9]{20,}|xox[baprs]-[a-z0-9-]{12,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:secrets?|password|credentials?|private[-_. ]?key|api[-_. ]?key|client[-_. ]?secret|refresh[-_. ]?token|access[-_. ]?token|authorization|set[-_. ]?cookie|cookie)\s*[\x22\x27]?\s*[:=]\s*\S+)"
 )
 
 _STATES = frozenset("TASK_STATE_UNSPECIFIED TASK_STATE_SUBMITTED TASK_STATE_WORKING TASK_STATE_COMPLETED TASK_STATE_FAILED TASK_STATE_CANCELED TASK_STATE_REJECTED TASK_STATE_INPUT_REQUIRED TASK_STATE_AUTH_REQUIRED".split())
@@ -926,7 +926,7 @@ class Gateway:
             self.store._write(directory, data, create=True)
             request = {
                 "message": {"messageId": identity.message_id, "role": "ROLE_USER", "parts": [{"text": text}]},
-                "configuration": {"returnImmediately": True},
+                "configuration": {"returnImmediately": True, "historyLength": 0},
             }
             if self.interface.tenant is not None:
                 request["tenant"] = self.interface.tenant
@@ -1002,7 +1002,47 @@ def decode_child_proposal(candidate: Candidate, *, parent_role: str, parent_tool
     parts = candidate.content["parts"]
     if len(parts) != 1 or "text" not in parts[0]:
         raise A2AError("proposal requires one text part")
-    raw = json.loads(parts[0]["text"])
+    text = parts[0]["text"]
+    try:
+        size = len(text.encode("utf-8")) if isinstance(text, str) else None
+    except UnicodeError:
+        raise A2AError("invalid proposal encoding") from None
+    if size is None or size > 4096:
+        raise A2AError("proposal text bound")
+    # Check structural nesting before the JSON decoder sees untrusted input.
+    depth, quoted, escaped = 0, False, False
+    for char in text:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char in "[{":
+            depth += 1
+            if depth > 32:
+                raise A2AError("proposal depth bound")
+        elif char in "]}":
+            depth -= 1
+            if depth < 0:
+                raise A2AError("invalid proposal JSON")
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result: raise A2AError("duplicate proposal key")
+            result[key] = value
+        return result
+    def invalid_constant(_):
+        raise A2AError("invalid proposal JSON")
+    try:
+        raw = json.loads(text, object_pairs_hook=unique, parse_constant=invalid_constant)
+    except A2AError:
+        raise
+    except (ValueError, RecursionError, UnicodeError):
+        raise A2AError("invalid proposal JSON") from None
     _bounded(raw, 4096)
     proposal = _object(raw, {"child_role", "child_tools", "child_permissions", "child_task"}, {"child_role", "child_tools", "child_permissions", "child_task"})
     for key in ("child_tools", "child_permissions"):

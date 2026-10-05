@@ -108,7 +108,7 @@ def test_send_poll_candidate_no_completion(tmp_path):
     gateway = Gateway(transport, store, card, policy)
     assert gateway.send(identity, "do bounded work") == ()
     assert transport.sends[0]["message"]["messageId"] == identity.message_id
-    assert transport.sends[0]["configuration"] == {"returnImmediately": True}
+    assert transport.sends[0]["configuration"] == {"returnImmediately": True, "historyLength": 0}
     assert store.read()["delivery"] == "bound"
     artifact = {"artifactId": "result-1", "parts": [{"text": "done"}]}
     transport.response = task("TASK_STATE_COMPLETED", artifacts=[artifact])
@@ -1321,3 +1321,47 @@ def test_benign_security_child_proposal_reaches_normal_scheduler_admission(tmp_p
     proposal=decode_child_proposal(candidate,parent_role="reader",parent_tools=("read_file",),parent_permissions=())
     scheduler=DynamicChildScheduler(audit_log=AuditLog(tmp_path/"events.jsonl"))
     assert scheduler.evaluate_child_proposal(proposal) and scheduler.snapshot()["tasks"]==[]
+
+
+@pytest.mark.parametrize("name", ["password", "credential", "private_key", "api_key",
+    "client_secret", "refresh_token", "access_token", "authorization", "cookie", "set-cookie"])
+@pytest.mark.parametrize("quote", ['"', "'"])
+def test_quoted_concrete_secret_assignments_deny_before_economic_dispatch(tmp_path,name,quote):
+    _,card,policy,identity,store=setup(tmp_path)
+    transport=Mock()
+    secret="{"+quote+name+quote+":"+quote+"do-not-export"+quote+"}"
+    with pytest.raises(A2AError):
+        Gateway(transport,store,card,policy).send(identity,secret)
+    assert transport.sends==[] and store.read() is None
+
+@pytest.mark.parametrize("text,code", [
+    ("["*800+"0"+"]"*800,"depth"),
+    ("["*10000+"0"+"]"*10000,"text bound"),
+    ("{bad JSON","invalid proposal JSON"),
+    ('{"child_role":"reader","child_role":"writer"}',"duplicate"),
+    ("[NaN]","invalid proposal JSON")])
+def test_untrusted_child_proposal_parser_failure_is_bounded_and_typed(tmp_path,text,code):
+    _,card,policy,identity,store=setup(tmp_path)
+    artifacts=[{"artifactId":"proposal","parts":[{"text":text}]}]
+    candidate,=Gateway(Mock(task("TASK_STATE_COMPLETED",artifacts=artifacts)),store,card,policy).send(identity,"work")
+    with pytest.raises(A2AError,match=code):
+        decode_child_proposal(candidate,parent_role="reader",parent_tools=("read_file",),parent_permissions=())
+
+def test_child_proposal_parser_does_not_count_quoted_brackets_as_nesting(tmp_path):
+    _,card,policy,identity,store=setup(tmp_path)
+    raw={"child_role":"reader","child_tools":["read_file"],"child_permissions":[],
+         "child_task":'Inspect "'+"["*100+'"'+"}"*100}
+    candidate,=Gateway(Mock(task("TASK_STATE_COMPLETED",artifacts=[
+        {"artifactId":"proposal","parts":[{"text":json.dumps(raw)}]}])),store,card,policy).send(identity,"work")
+    proposal=decode_child_proposal(candidate,parent_role="reader",parent_tools=("read_file",),parent_permissions=())
+    assert proposal.child_task==raw["child_task"]
+
+def test_send_explicitly_requests_no_task_history(tmp_path):
+    _,card,policy,identity,store=setup(tmp_path)
+    class HistoryServer(Mock):
+        def send(self,interface,request,headers):
+            assert request["configuration"]["historyLength"]==0
+            return super().send(interface,request,headers)
+    transport=HistoryServer()
+    Gateway(transport,store,card,policy).send(identity,"work")
+    assert store.read()["delivery"]=="bound" and len(transport.sends)==1
