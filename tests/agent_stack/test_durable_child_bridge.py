@@ -197,6 +197,7 @@ def test_bridge_flushes_claim_before_delivery_and_replay_deduplicates(tmp_path, 
         "status": "completed", "evidence": evidence, "artifact_sha256": evidence_sha,
     }))
     reconciled = bridge.delegate(args)
+    assert reconciled["evidence"] == evidence and reconciled["evidence_sha256"] == evidence_sha
     assert reconciled["state"] == "done"
     assert len(calls) == 1
     assert cleanups == [first["task_id"]]

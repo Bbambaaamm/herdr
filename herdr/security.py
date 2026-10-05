@@ -93,6 +93,7 @@ class PolicyDenied(PermissionError):
 class RiskClass(StrEnum):
     READ = "read"
     WORKSPACE_WRITE = "workspace_write"
+    DELEGATION = "delegation"
     PROCESS = "process"
     EXTERNAL_SIDE_EFFECT = "external_side_effect"
     CREDENTIAL_USE = "credential_use"
@@ -514,7 +515,8 @@ class SecurityGrant:
             raise SecurityError("tool rules must exactly cover the granted tool set")
         built_in_risk = {"read_file": RiskClass.READ, "search_files": RiskClass.READ,
                          "write_file": RiskClass.WORKSPACE_WRITE, "patch": RiskClass.WORKSPACE_WRITE,
-                         "terminal": RiskClass.PROCESS, "execute_code": RiskClass.PROCESS}
+                         "terminal": RiskClass.PROCESS, "execute_code": RiskClass.PROCESS,
+                         "herdr_delegate_child": RiskClass.DELEGATION}
         for rule in self.tool_rules:
             if rule.tool in {"read_file", "search_files", "write_file", "patch"}:
                 required = () if rule.tool == "patch" else ("path",)
@@ -522,6 +524,10 @@ class SecurityGrant:
                     raise SecurityError("file tool paths must be workspace-scoped")
                 if rule.tool == "patch" and "path" in rule.allowed_arg_keys and "path" not in rule.path_fields:
                     raise SecurityError("patch path argument must be constrained")
+            if rule.tool == "herdr_delegate_child" and (
+                    not rule.requires_sandbox or rule.requires_process
+                    or set(rule.allowed_arg_keys) - {"key", "role", "objective", "prompt", "tool", "permission", "cwd"}):
+                raise SecurityError("delegation requires narrow sandboxed bridge rule")
             if rule.risk == RiskClass.PROCESS and (not rule.requires_process or not rule.requires_sandbox):
                 raise SecurityError("process tool requires process policy and sandbox")
             if rule.tool in built_in_risk and rule.risk != built_in_risk[rule.tool]:

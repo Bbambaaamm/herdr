@@ -45,7 +45,7 @@ def test_actual_host_factory_freezes_approved_bytes_and_scopes_identity(tmp_path
         assert (launch.mount.code.path/"module.py").read_bytes()==b"approved=True\n"
         assert factory.task_store_root==Path(raw["task_store_root"])
     finally:launch.cleanup_after_pane_closed()
-    assert not list(Path(raw["storage"]).iterdir())
+    assert set(Path(raw["storage"]).iterdir()) == {Path(raw["storage"])/".ownership.lock"}
 
 @pytest.mark.parametrize("fault",["consumer","outside","tools","permission","stale"])
 def test_root_authorization_denies_before_host_files_are_created(tmp_path,monkeypatch,fault):
@@ -102,3 +102,61 @@ def test_current_consumer_restriction_cannot_be_bypassed_by_retained_parent(tmp_
     raw["templates"][template.identity.consumer]=restricted.to_json()
     with pytest.raises(SecurityError,match="argument ceiling"):
         config.build_host_policy_factory(parent_grant=parent)
+
+
+@pytest.mark.parametrize("fault", ["none", "symlink", "directory-inode", "foreign-identity"])
+def test_dead_host_cleanup_reclaims_only_owned_launch_container(tmp_path, monkeypatch, fault):
+    import os, stat
+    raw, workspace, template = approved_config(tmp_path, monkeypatch)
+    factory = config.build_host_policy_factory()
+    current = identity(task_id="orphan", agent_id="orphan-agent", run_token="orphan-run", fencing_token=12)
+    outside = tmp_path / "foreign"; outside.mkdir(); (outside / "keep").write_text("preserve")
+    pid = os.fork()
+    if pid == 0:
+        try:
+            factory.prepare(identity=current,workspace=workspace,tools=("read_file",),permissions=("repo:read",))
+            os._exit(0)
+        except BaseException:
+            import traceback; traceback.print_exc()
+            os._exit(3)
+    _, status = os.waitpid(pid,0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    storage = Path(raw["storage"]); directory, = storage.glob("launch-*")
+    record, = storage.glob("ownership-*.json")
+    assert record.stat().st_mode & 0o777 == 0o600
+    original_inode = directory.stat().st_ino
+    if fault == "symlink":
+        (directory / "unowned-link").symlink_to(outside, target_is_directory=True)
+        with pytest.raises(SecurityError): factory.cleanup_orphan(current)
+        assert directory.exists() and record.exists()
+        (directory / "unowned-link").unlink()
+    elif fault == "directory-inode":
+        original = storage / "held-original"
+        directory.rename(original); directory.mkdir(mode=0o700)
+        (directory / "keep").write_text("foreign replacement")
+        with pytest.raises(SecurityError): factory.cleanup_orphan(current)
+        assert (directory / "keep").read_text() == "foreign replacement" and record.exists()
+        (directory / "keep").unlink(); directory.rmdir(); original.rename(directory)
+    elif fault == "foreign-identity":
+        assert not factory.cleanup_orphan(identity(task_id="different", agent_id="orphan-agent", run_token="orphan-run", fencing_token=12))
+        assert directory.stat().st_ino == original_inode and record.exists()
+    assert factory.cleanup_orphan(current)
+    assert not directory.exists() and not record.exists()
+    assert not factory.cleanup_orphan(current)
+    assert (outside / "keep").read_text() == "preserve"
+
+def test_live_original_host_cannot_be_cold_reaped(tmp_path,monkeypatch):
+    from herdr.launch_ownership import cleanup_orphan
+    raw,workspace,template=approved_config(tmp_path,monkeypatch)
+    factory=config.build_host_policy_factory()
+    current=identity(task_id="still-live",agent_id="agent",run_token="run",fencing_token=14)
+    launch=factory.prepare(identity=current,workspace=workspace,tools=("read_file",),permissions=("repo:read",))
+    try:
+        with pytest.raises(SecurityError,match="still alive"):
+            cleanup_orphan(Path(raw["storage"]),current)
+        assert launch._ownership.directory.exists()
+        # A lost runtime map can still find this exact private host object.
+        assert factory.cleanup_orphan(current)
+        assert launch._ownership is None
+    finally:
+        if launch._ownership is not None: launch.cleanup_after_pane_closed()

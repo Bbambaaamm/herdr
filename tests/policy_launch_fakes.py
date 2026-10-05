@@ -49,6 +49,8 @@ class FakePreparedPolicyLaunch(PreparedPolicyLaunch):
 class FakeHostPolicyLaunchFactory(HostPolicyLaunchFactory):
     def __init__(self):
         self.created = []
+    def cleanup_orphan(self,identity):
+        return False
     def prepare_child(self,**kwargs):
         return self.prepare(**kwargs)
     def prepare(self,*,identity,workspace,tools,permissions):

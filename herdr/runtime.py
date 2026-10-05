@@ -59,12 +59,14 @@ _CHILD_RUNTIME_PERMISSIONS = frozenset({"workspace-write"})
 def _child_toolsets(tools: Iterable[str]) -> str:
     """Map admitted capabilities to an explicit Hermes model-tool allowlist."""
     selected = frozenset(tools)
-    if selected - _CHILD_FILE_TOOLS:
+    if selected - (_CHILD_FILE_TOOLS | {"herdr_delegate_child"}):
         raise HerdrRuntimeError("child_toolset_unmapped", ",".join(sorted(selected)))
     # Hermes has toolset-level (not per-tool) filtering. The file bundle is
     # constrained further by the OS workspace mount below. Empty legacy canary
     # tasks get the zero-tool bot_room bundle.
-    return "file" if selected else "bot_room"
+    groups = (["file"] if selected & _CHILD_FILE_TOOLS else [])
+    if "herdr_delegate_child" in selected: groups.append("herdr_delegation")
+    return ",".join(groups) if groups else "bot_room"
 
 
 def _validate_child_permissions(permissions: Iterable[str]) -> None:
@@ -731,14 +733,32 @@ class HerdrChildRuntime:
     def _verify_live_child(self, agent_id: str, pane_id: str, marker: str,
                            *, require_sandbox: bool = False,
                            require_owned: bool = True,
-                           require_bootstrap: bool = True) -> str:
+                           require_bootstrap: bool = True,
+                           allow_absent_agent_before_prompt: bool = False) -> str:
         if require_owned and pane_id not in self._owned_panes:
             raise HerdrRuntimeError("child_pane_unowned", pane_id)
-        payload = _json_result(self.runner.run(["agent", "get", agent_id]), "agent get")
-        agent = (payload.get("result") or {}).get("agent")
-        if (not isinstance(agent, Mapping) or agent.get("name") != agent_id
-                or agent.get("pane_id") != pane_id):
-            raise HerdrRuntimeError("child_wrong_pane", agent_id)
+        result=self.runner.run(["agent","get",agent_id])
+        missing=False
+        if allow_absent_agent_before_prompt:
+            matching=[rec for rec in self.scheduler._tasks.values()
+                if (rec.agent_id,rec.execution_agent,rec.execution_pane,rec.execution_marker)==
+                   (agent_id,agent_id,pane_id,marker)]
+            if (not require_sandbox or require_bootstrap or len(matching)!=1
+                    or matching[0].economic_delivery_attempted is not False):
+                raise HerdrRuntimeError("child_cleanup_unproven",pane_id)
+            try:
+                channel = result.stdout if not result.stderr else result.stderr if not result.stdout else ""
+                raw=json.loads(channel) if result.returncode == 1 and 0 < len(channel)<=131072 else None
+            except (TypeError,ValueError):raw=None
+            missing=(isinstance(raw,dict) and isinstance(raw.get("error"),dict)
+                     and raw["error"].get("code")=="agent_not_found")
+        if missing:
+            agent=None
+        else:
+            payload=_json_result(result,"agent get")
+            agent=(payload.get("result") or {}).get("agent")
+            if (not isinstance(agent,Mapping) or agent.get("name")!=agent_id or agent.get("pane_id")!=pane_id):
+                raise HerdrRuntimeError("child_wrong_pane",agent_id)
         info = _json_result(self.runner.run(["pane", "process-info", "--pane", pane_id]),
                             "pane process-info")
         process = (info.get("result") or {}).get("process_info")
@@ -789,7 +809,7 @@ class HerdrChildRuntime:
         if not marker_ok:
             raise HerdrRuntimeError("child_sandbox_missing" if require_sandbox
                                     else "child_marker_missing", pane_id)
-        if require_sandbox and require_bootstrap:
+        if require_sandbox and (require_bootstrap or allow_absent_agent_before_prompt):
             matching=[rec for rec in self.scheduler._tasks.values()
                       if (rec.agent_id,rec.execution_agent,rec.execution_pane,rec.execution_marker)
                          ==(agent_id,agent_id,pane_id,marker)]
@@ -809,10 +829,10 @@ class HerdrChildRuntime:
                       if key in proof}
             try:
                 verify_retained_policy_evidence(proof.get("invocation_policy"),identity=identity,
-                    pid=proof.get("sandbox_pid"),attestation=original)
+                    pid=proof.get("sandbox_pid"),attestation=original,require_bootstrap=require_bootstrap)
             except (SecurityError,OSError,ValueError,TypeError) as exc:
                 raise HerdrRuntimeError("child_bootstrap_unverified",pane_id) from exc
-        return str(agent.get("agent_status") or agent.get("status") or "").lower()
+        return "not-created" if missing else str(agent.get("agent_status") or agent.get("status") or "").lower()
 
     def _child_result_writable(self, task_id: str) -> tuple[Path, ...]:
         """Create one durable, regular result target; never expose sibling results writable."""
@@ -931,6 +951,7 @@ class HerdrChildRuntime:
                 self._verify_live_child(agent, pane_id, marker, require_sandbox=True,
                                         require_owned=False,require_bootstrap=False)
             else:
+                self._cleanup_policy_launch(rec.id, pane_id)
                 self.admission_registry.release(
                     rec.agent_id, now=self.scheduler.current_time(),
                     task_id=rec.id, fencing_token=rec.fencing_token)
@@ -943,13 +964,31 @@ class HerdrChildRuntime:
                     raise HerdrRuntimeError("child_cleanup_unproven", pane_id)
                 if any(isinstance(row, Mapping) and row.get("pane_id") == pane_id for row in panes):
                     raise HerdrRuntimeError("child_cleanup_failed", pane_id)
-        if pane_id in self._policy_panes:
-            self._policy_panes[pane_id].cleanup_after_pane_closed()
-            del self._policy_panes[pane_id]
+        self._cleanup_policy_launch(rec.id, pane_id)
         if rec.agent_id:
             self.admission_registry.release(
                 rec.agent_id, now=self.scheduler.current_time(),
                 task_id=rec.id, fencing_token=rec.fencing_token)
+
+    def _cleanup_policy_launch(self, task_id, pane_id=None):
+        record = self.scheduler._tasks.get(task_id)
+        launch = self._policy_launches.get(task_id) or self._policy_panes.get(pane_id)
+        if launch is not None:
+            launch.cleanup_after_pane_closed()
+            self._policy_launches.pop(task_id, None)
+            self._policy_panes.pop(pane_id, None)
+        elif record is not None:
+            factory=self.policy_launch_factory
+            if factory is None:
+                from .host_configuration import build_host_policy_factory
+                factory=build_host_policy_factory()
+            if not isinstance(factory,HostPolicyLaunchFactory):
+                raise HerdrRuntimeError("child_cleanup_policy_missing",task_id)
+            from .security import InvocationIdentity
+            identity=InvocationIdentity(consumer="github:"+record.repo, agent_id=record.agent_id,
+                parent_agent_id=record.parent_agent_id, parent_task_id=record.parent_task_id,
+                task_id=record.id, run_token=record.run_token, fencing_token=record.fencing_token)
+            factory.cleanup_orphan(identity)
 
     def _verify_created_pane_marker(self, pane_id: str, marker: str) -> None:
         info = _json_result(self.runner.run(["pane", "process-info", "--pane", pane_id]),
@@ -979,8 +1018,10 @@ class HerdrChildRuntime:
                 raise HerdrRuntimeError("child_cleanup_unproven", pane_id)
             self._verify_created_pane_marker(pane_id, marker)
             if agent_start_attempted:
-                self._verify_live_child(lease.agent_id, pane_id, marker,
-                                        require_sandbox=True,require_bootstrap=False)
+                record=self.scheduler._tasks.get(lease.task_id)
+                self._verify_live_child(lease.agent_id,pane_id,marker,require_sandbox=True,
+                    require_bootstrap=False,allow_absent_agent_before_prompt=(
+                        record is not None and record.economic_delivery_attempted is False))
             result = self.runner.run(["pane", "close", pane_id], timeout_seconds=15.0)
             if result.returncode != 0:
                 listed = _json_result(self.runner.run(["pane", "list"]), "pane list")
@@ -989,9 +1030,7 @@ class HerdrChildRuntime:
                         isinstance(row, Mapping) and row.get("pane_id") == pane_id
                         for row in remaining)):
                     raise HerdrRuntimeError("child_cleanup_failed", pane_id)
-        if pane_id in self._policy_panes:
-            self._policy_panes[pane_id].cleanup_after_pane_closed()
-            del self._policy_panes[pane_id]
+        self._cleanup_policy_launch(lease.task_id, pane_id)
         self._owned_panes.discard(pane_id)
         self.admission_registry.release(
             lease.agent_id, now=self.scheduler.current_time(),
@@ -999,7 +1038,7 @@ class HerdrChildRuntime:
         self._reserved_agents.discard(lease.agent_id)
         self._reservation_panes.pop(lease.agent_id, None)
 
-    def _find_pre_delivery_pane(self, rec) -> str:
+    def _find_pre_delivery_pane(self, rec) -> str | None:
         """Discover only the unique pane matching all durable split identity fields."""
         listed = _json_result(self.runner.run(["pane", "list"]), "pane list")
         panes = (listed.get("result") or {}).get("panes")
@@ -1030,8 +1069,11 @@ class HerdrChildRuntime:
             environ = {entry.decode("utf-8", errors="replace") for entry in raw.split(bytes([0]))}
             if expected <= environ:
                 matches.append(pane)
+        if not matches and rec.pane_split_started is False:
+            # A versioned, fsynced pre-effect marker proves no split was invoked.
+            # The parent bridge lock stops the original effect before recovery.
+            return None
         if len(matches) != 1:
-            # No match or duplicate ownership remains quarantined; never guess or resplit.
             raise HerdrRuntimeError("child_cleanup_unproven", rec.id)
         return matches[0]
 
@@ -1044,7 +1086,10 @@ class HerdrChildRuntime:
             raise HerdrRuntimeError("child_cleanup_unproven", task_id)
         if not rec.execution_pane:
             pane = self._find_pre_delivery_pane(rec)
-            if not self.scheduler.bind_recovered_pre_delivery_pane(task_id, pane):
+            if pane is None:
+                if rec.pane_split_started is not False:
+                    raise HerdrRuntimeError("child_cleanup_unproven", task_id)
+            elif not self.scheduler.bind_recovered_pre_delivery_pane(task_id, pane):
                 raise HerdrRuntimeError("child_cleanup_unproven", task_id)
         if rec.state is LifecycleState.RUNNING:
             if not self.scheduler.fail_child_pre_delivery(
@@ -1052,7 +1097,12 @@ class HerdrChildRuntime:
                     "child start interrupted before agent invocation", cleanup_complete=False,
                     pane_creation_attempted=True):
                 raise HerdrRuntimeError("child_pre_delivery_audit_denied", task_id)
-        self.cleanup_bound_pre_delivery(task_id)
+        if rec.execution_pane is None and rec.pane_split_started is False:
+            self._cleanup_policy_launch(task_id)
+            self.admission_registry.release(rec.agent_id,now=self.scheduler.current_time(),
+                task_id=rec.id,fencing_token=rec.fencing_token)
+        else:
+            self.cleanup_bound_pre_delivery(task_id)
         if not self.scheduler.mark_pre_delivery_cleanup_complete(task_id):
             raise HerdrRuntimeError("child_cleanup_unproven", task_id)
 
@@ -1127,6 +1177,9 @@ class HerdrChildRuntime:
                     raise HerdrRuntimeError("child_startup_source_missing",lease.task_id)
                 return process_source.get("shell_pid")
             launch.verify_spawn_source(inspect_startup_source)
+            if not self.scheduler.mark_child_split_started(
+                    lease.task_id,run_token,lease.agent_id,lease.fencing_token,idempotency_key):
+                raise HerdrRuntimeError("child_split_intent_denied",lease.task_id)
             pane_creation_attempted = True
             pane_id = self._create_pane(0, marker, policy_env)
             self._reservation_panes[lease.agent_id] = pane_id
@@ -1209,6 +1262,7 @@ class HerdrChildRuntime:
                 try:
                     if pane_id is None:
                         if not pane_creation_attempted:
+                            self._cleanup_policy_launch(lease.task_id)
                             self.admission_registry.release(
                                 lease.agent_id, now=self.scheduler.current_time(),
                                 task_id=lease.task_id, fencing_token=lease.fencing_token)

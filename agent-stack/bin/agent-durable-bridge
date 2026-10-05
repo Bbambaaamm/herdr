@@ -207,8 +207,10 @@ def serve(task_file: Path, identity: dict, real_binary: Path, *, policy_launch_f
                 except Exception as exc:
                     response = {"ok": False, "result": None, "error": str(exc)[:1000]}
 
-                payload = json.dumps(response, allow_nan=False).encode("utf-8")
-                if len(payload) <= child.MAX_REQUEST:
+                payload = json.dumps(response, ensure_ascii=False, allow_nan=False).encode("utf-8")
+                if len(payload) > child.MAX_RESPONSE:
+                    payload = json.dumps({"ok": False, "result": None, "error": "bounded child response exceeded"}).encode("utf-8")
+                if len(payload) <= child.MAX_RESPONSE:
                     try:
                         connection.sendall(len(payload).to_bytes(4, "big") + payload)
                     except OSError:

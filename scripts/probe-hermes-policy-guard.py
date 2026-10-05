@@ -348,11 +348,42 @@ def main() -> int:
         assert not outside_move.exists()
 
         installation.uninstall()
+        from herdr import delegation_tool
+        from herdr.policy_launch import IDENTITY_ENV
+        delegate_grant = replace(grant, grant_id="granted-delegation-probe",
+            scope=replace(scope,tools=("herdr_delegate_child",)),
+            tool_rules=(ToolRule(tool="herdr_delegate_child",risk=RiskClass.DELEGATION,
+                allowed_arg_keys=delegation_tool.ARGUMENTS,requires_sandbox=True),),
+            runtime_assurance=replace(grant.runtime_assurance,sandbox_verified=True,
+                sandbox_attestation_sha256="a"*64))
+        for field,key in IDENTITY_ENV.items():
+            os.environ[key]=str(getattr(identity,field))
+        os.environ.update({"HERDR_DURABLE_SANDBOX":"1","HERDR_DURABLE_TASK_ID":identity.task_id,
+            "HERDR_DURABLE_RUN_TOKEN":identity.run_token,"HERDR_DURABLE_AGENT":identity.agent_id})
+        installed=install_hermes_guard(InvocationGuard(delegate_grant))
+        client=delegation_tool._client_delegate
+        calls=[]
+        try:
+            delegation_tool._client_delegate=lambda args: calls.append(args) or {"evidence":[{"answer":"bounded findings"}]}
+            assert resolve_toolset("herdr_delegation")==["herdr_delegate_child"]
+            args={"key":"probe","role":"reader","objective":"Inspect","prompt":"Read"}
+            delegated=model_tools.handle_function_call("herdr_delegate_child",args,**common)
+            assert json.loads(delegated)["evidence"]==[{"answer":"bounded findings"}]
+            assert len(calls)==1 and not delegate_grant.process.enabled
+            denied=registry.get_entry("herdr_delegate_child").handler({**args,"command":"shell"})
+            assert "error" in json.loads(denied) and len(calls)==1
+        finally:
+            delegation_tool._client_delegate=client
+            installed.uninstall()
+        assert registry.get_entry("herdr_delegate_child") is None
         result = {
             "status": "PASS",
             "hermes_file_toolset": sorted(file_toolset),
             "read_file_allowed": True,
             "rootfd_write_allowed": True,
+            "granted_delegation_sdk_dispatch": True,
+            "delegation_direct_handler_schema_guarded": True,
+            "delegation_generic_process_disabled": True,
             "write_file_skip_flags_denied": True,
             "direct_registry_write_denied": True,
             "legacy_alias_denied": True,

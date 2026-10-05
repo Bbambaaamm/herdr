@@ -443,6 +443,18 @@ def _cleanup_prepared_root_launch(task):
     if launch is not None:
         launch.cleanup_after_pane_closed()
         del HOST_POLICY_LAUNCHES[key]
+    else:
+        session=task.get("execution_session") or {}
+        proof=session.get("invocation_policy") or {}
+        if isinstance(proof,dict) and isinstance(proof.get("identity"),dict):
+            from herdr.security import InvocationIdentity
+            identity=InvocationIdentity.from_dict(proof["identity"])
+            if (identity.consumer != "github:"+str(task["repo"])
+                    or identity.task_id != task.get("id") or identity.run_token != task.get("run_token")
+                    or identity.fencing_token != task.get("fencing_token")
+                    or identity.agent_id != session.get("agent_name")):
+                raise RuntimeError("task_launch_cleanup_identity_mismatch")
+            _root_policy_factory().cleanup_orphan(identity)
 
 
 def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
@@ -483,7 +495,7 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
     }
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from herdr.policy_launch import HostPolicyLaunchFactory, PreparedPolicyLaunch
-    from herdr.security import InvocationIdentity
+    from herdr.security import InvocationIdentity, SecurityError
     factory = policy_launch_factory if policy_launch_factory is not None else _root_policy_factory()
     if not isinstance(factory, HostPolicyLaunchFactory):
         raise RuntimeError("task_invocation_policy_missing")
@@ -491,9 +503,12 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
                                   parent_agent_id=coordinator, parent_task_id="coordinator:" + coordinator,
                                   task_id=str(task["id"]), run_token=str(task["run_token"]),
                                   fencing_token=task["fencing_token"])
-    launch = factory.prepare(identity=identity, workspace=Path(workspace),
-                             tools=tuple(task.get("parent_tools") or ()),
-                             permissions=tuple(task.get("parent_permissions") or ()))
+    try:
+        launch = factory.prepare(identity=identity, workspace=Path(workspace),
+                                 tools=tuple(task.get("parent_tools") or ()),
+                                 permissions=tuple(task.get("parent_permissions") or ()))
+    except SecurityError as exc:
+        raise RuntimeError("task_invocation_policy_denied:"+str(exc)[:512]) from exc
     if not isinstance(launch, PreparedPolicyLaunch) or launch.identity != identity:
         raise RuntimeError("task_invocation_policy_identity_mismatch")
     pane_id = ""
@@ -598,6 +613,8 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
                 "--", "-p", profile, "chat",
                 "--continue", session_name, "--create-if-missing",
                 "--in", workspace,
+                "--toolsets", __import__("herdr.runtime", fromlist=["_child_toolsets"])._child_toolsets(
+                    tuple(task.get("parent_tools") or ())),
             ],
             timeout_seconds=75.0,
         )
@@ -718,7 +735,11 @@ def cleanup_task_session(task: dict) -> bool:
     if not present or _close_owned_pane(pane_id):
         session["closed_at"] = utcnow().isoformat()
         session["cleanup_status"] = "closed"
-        _cleanup_prepared_root_launch(task)
+        try:
+            _cleanup_prepared_root_launch(task)
+        except Exception:
+            session["cleanup_status"] = "launch_cleanup_failed"
+            return False
         stop_bridge(session)
         if session.get("policy_file"):
             Path(session["policy_file"]).unlink(missing_ok=True)
@@ -812,7 +833,7 @@ TASK COMPLETION CONTRACT:
 - Use isolated clean worktrees under /home/agentops/worktrees/herdr/ for code changes. Never contaminate the persistent coordinator checkout.
 - Preserve durable task identity, run_token/idempotency, leases/fencing, bounded retries/fanout, consumer isolation, admission/resource limits and fail-closed reconciliation.
 - Before any economic child prompt, obtain a durable Herdr TaskGraph child under this exact task/run_token through admitted delegation. A direct persistent-child coding, research, or review prompt without that child identity is denied. Record denied attempts in the task audit.
-- Use {CHILD_HELPER} --key KEY --role ROLE --objective OBJECTIVE --prompt PROMPT with explicit --tool and --permission flags for economic child work. For code-writing children also pass --cwd with the exact existing issue Git worktree under the configured worktree root; the root itself is never granted writable. Direct herdr mutation/delegation and pane-input commands are blocked in this task pane.
+- Use the granted herdr_delegate_child tool with key, role, objective, prompt, tool and permission arguments for economic child work. Reuse the same key to reconcile an existing child. For code-writing children also pass cwd with the exact existing issue Git worktree under the configured worktree root; the root itself is never granted writable. Direct herdr mutation/delegation and pane-input commands are blocked in this task pane.
 - No child may widen permissions above the parent. Never write directly to main or bypass branch protection, CI, review, credentials, billing, deploy holds, release gates or acceptance gates.
 - Exact-head merge flow is tests -> CI green -> independent review with no unresolved applicable finding -> unchanged head verification -> merge only if repository protection permits.
 - A gated leaf does not block unrelated dependency-ready AUTO work. Do not fabricate elapsed soak evidence; an elapsed-time acceptance wait should end this cycle as completed with a precise next_action for later re-check.
@@ -850,11 +871,10 @@ TASK COMPLETION CONTRACT:
                      f"and idempotency_key={task['idempotency_key']} in its result JSON. "
                      "Include a nonempty evidence list and artifact_sha256 equal to the SHA-256 "
                      "of that list encoded as sorted-key UTF-8 JSON.\n")
-    contract += (f"\n- For economic child work use {CHILD_HELPER} with --key, --role, "
-                 "--objective, --prompt and explicit --tool/--permission flags. "
-                 "For any write-capable child, also pass --cwd with the exact existing issue Git worktree. "
-                 "The durable sandbox blocks every direct Herdr CLI command, including "
-                 "the absolute binary path; use this helper for economic child work.\n")
+    contract += ("\n- For economic child work use the granted herdr_delegate_child tool with "
+                 "key, role, objective, prompt, tool and permission arguments. Reuse the same key "
+                 "for reconciliation. For write-capable children set cwd to the exact existing issue Git "
+                 "worktree. Returned evidence still requires shared acceptance.\n")
     return base + contract
 
 def run_prompt(task: dict) -> tuple[int, str]:

@@ -1281,7 +1281,8 @@ def test_split_crash_recovers_durable_intent_with_actual_process_identity(tmp_pa
         intent = replay._tasks[child.id]
         assert intent.pre_delivery_pane_creation_attempted and intent.execution_pane is None
         assert intent.execution_marker == marker and intent.execution_agent == lease.agent_id
-        assert replay.audit_log.replay()[-1]["event"] == "child_pane_creation_attempted"
+        assert replay.audit_log.replay()[-1]["event"] == "child_pane_split_started"
+        assert intent.pane_split_started is True
         for pane in ("owned-pane", "foreign-pane"):
             env = {**os.environ, **policy_env, "HERDR_DURABLE_TASK_PANE": marker}
             if pane == "foreign-pane" and ownership != "duplicate":
@@ -1289,6 +1290,13 @@ def test_split_crash_recovers_durable_intent_with_actual_process_identity(tmp_pa
             if pane == "owned-pane" and ownership == "wrong_fence":
                 env["HERDR_DURABLE_FENCING_TOKEN"] = str(lease.fencing_token + 2)
             processes[pane] = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], env=env)
+            import time
+            deadline=time.monotonic()+3
+            while True:
+                observed=Path(f"/proc/{processes[pane].pid}/environ").read_bytes().split(b"\0")
+                if f"HERDR_DURABLE_FENCING_TOKEN={env['HERDR_DURABLE_FENCING_TOKEN']}".encode() in observed: break
+                if time.monotonic()>=deadline: pytest.fail("test child exec environment never became ready")
+                time.sleep(0.005)
         if phase == "created":
             raise SystemExit("bridge killed after pane creation before returned identity")
         runtime._owned_panes.add("owned-pane")
@@ -1420,3 +1428,130 @@ def test_prompt_intent_is_durable_one_use_and_prevents_pre_delivery_cleanup(tmp_
     replay=DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path/"events.jsonl"));replay.replay()
     assert replay._tasks[child.id].economic_delivery_attempted is True
     assert len([e for e in replay.audit_log.replay() if e["event"]=="child_prompt_delivery_attempted"])==1
+
+
+@pytest.mark.parametrize("case", ["exact", "exact-stderr", "mixed-json", "transport", "malformed", "other-error",
+    "prompt-maybe-sent", "legacy-unknown", "wrong-pane", "missing-grant-proof", "wrong-marker"])
+def test_no_agent_created_cleanup_requires_no_prompt_and_retained_physical_proof(tmp_path, monkeypatch, case):
+    from importlib.machinery import SourceFileLoader
+    from herdr import policy_launch
+    scheduler, child, rec = _interrupted_start_record(tmp_path)
+    marker = rec.execution_marker
+    rec.execution_sandbox_verified = case != "missing-grant-proof"
+    rec.execution_sandbox_attestation = {"sandbox_pid": 321, "invocation_policy": {"retained": True},
+        "authority": "physical", "task_id": rec.id, "run_token": rec.run_token,
+        "fencing_token": rec.fencing_token, "agent_name": rec.agent_id,
+        "pane_id": rec.execution_pane, "marker": marker, "worktree_identity": {}}
+    if case == "prompt-maybe-sent": rec.economic_delivery_attempted = True
+    if case == "legacy-unknown": rec.economic_delivery_attempted = None
+    if case == "wrong-pane": rec.execution_pane = "different"
+    response = '{"error":{"code":"agent_not_found"}}'
+    if case == "transport": response = '{"error":{"code":"transport_error"}}'
+    if case == "malformed": response = "not-json"
+    if case == "other-error": response = '{"error":{"message":"agent not found"}}'
+    class Runner:
+        def __init__(self): self.closed = []
+        def run(self, args, timeout_seconds=30.0):
+            if args[:2] == ["pane", "list"]:
+                return CommandResult(0, '{"result":{"panes":[{"pane_id":"owned-pane"}]}}', "")
+            if args[:2] == ["agent", "get"]:
+                return CommandResult(1, "" if case == "exact-stderr" else response,
+                                     response if case in {"exact-stderr", "mixed-json"} else "")
+            if args[:2] == ["pane", "process-info"]:
+                return CommandResult(0, '{"result":{"process_info":{"shell_pid":123}}}', "")
+            if args[:2] == ["pane", "close"]:
+                self.closed.append(args[2]); return CommandResult(0, "{}", "")
+            raise AssertionError(args)
+    runner = Runner(); runtime = HerdrChildRuntime(scheduler, runner, cwd=tmp_path,
+        admission_registry=_registry(tmp_path))
+    runtime._owned_panes.add("owned-pane")
+    monkeypatch.setattr(runtime, "_verify_created_pane_marker", lambda *args: None)
+    original = SourceFileLoader.exec_module
+    def load(loader, module):
+        if loader.name == "agent_durable_sandbox_verify":
+            module.inner_pid = lambda process, supplied: 0 if case == "wrong-marker" else 321
+        else: original(loader, module)
+    monkeypatch.setattr(SourceFileLoader, "exec_module", load)
+    verified = []
+    def verify(proof, *, identity, pid, attestation, require_bootstrap=True, **kw):
+        assert proof == {"retained": True} and pid == 321
+        assert identity.task_id == rec.id and identity.run_token == rec.run_token
+        assert identity.agent_id == rec.agent_id and identity.fencing_token == rec.fencing_token
+        assert identity.parent_task_id == rec.parent_task_id and identity.parent_agent_id == rec.parent_agent_id
+        assert not require_bootstrap and attestation["marker"] == marker
+        verified.append(identity.to_json())
+    monkeypatch.setattr(policy_launch, "verify_retained_policy_evidence", verify)
+    if case in {"exact", "exact-stderr"}:
+        runtime.cleanup_managed_pre_delivery(rec.lease, "owned-pane", marker, agent_start_attempted=True)
+        assert runner.closed == ["owned-pane"] and len(verified) == 1
+    else:
+        with pytest.raises(HerdrRuntimeError):
+            runtime.cleanup_managed_pre_delivery(rec.lease, "owned-pane", marker, agent_start_attempted=True)
+        assert runner.closed == [] and verified == []
+
+
+def test_parent_result_payload_retains_exact_bytes_after_source_mutation_and_restart(tmp_path):
+    scheduler, child, rec = _interrupted_start_record(tmp_path)
+    evidence = [{"answer": "reader findings", "nested": {"paths": ["example.py"]}}]
+    raw = json.dumps(evidence, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()
+    sha = hashlib.sha256(raw).hexdigest()
+    assert scheduler.publish_child_result(child.id, rec.run_token, rec.agent_id,
+        rec.fencing_token, rec.idempotency_key, sha, evidence)
+    evidence[0]["answer"] = "rewritten"
+    assert rec.result_evidence_canonical == raw
+    replay = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
+    replay.replay(); recovered = replay._tasks[child.id]
+    assert recovered.result_evidence_canonical == raw
+    assert recovered.result_artifact_sha256 == sha
+    # The public observation snapshot contains only the digest.
+    assert "reader findings" not in json.dumps(scheduler.snapshot())
+
+
+@pytest.mark.parametrize("protocol", ["before-effect", "started", "legacy"])
+def test_zero_pane_recovery_requires_versioned_no_split_proof_and_keeps_same_attempt(tmp_path,monkeypatch,protocol):
+    scheduler,child,rec=_interrupted_start_record(tmp_path)
+    # Reconstruct the durable intent boundary before any pane bind/start events.
+    events=scheduler.audit_log.replay()
+    cutoff=next(i for i,e in enumerate(events) if e["event"]=="child_pane_creation_attempted")
+    events=events[:cutoff+1]
+    if protocol=="legacy": events[-1].pop("split_protocol_version")
+    scheduler.audit_log._path.write_text("".join(json.dumps(e)+"\n" for e in events))
+    replay=DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path/"events.jsonl"));replay.replay()
+    recovered=replay._tasks[child.id]
+    if protocol=="started":
+        assert replay.mark_child_split_started(child.id,recovered.run_token,recovered.agent_id,
+            recovered.fencing_token,recovered.idempotency_key)
+    class EmptyRunner:
+        def __init__(self):self.scans=0
+        def run(self,args,timeout_seconds=30):
+            assert args==["pane","list"];self.scans+=1
+            return CommandResult(0,'{"result":{"panes":[]}}',"")
+    runner=EmptyRunner();runtime=HerdrChildRuntime(replay,runner,cwd=tmp_path,admission_registry=_registry(tmp_path))
+    released=[];cleaned=[]
+    monkeypatch.setattr(runtime.admission_registry,"release",lambda agent,**kw:released.append((agent,kw)))
+    monkeypatch.setattr(runtime,"_cleanup_policy_launch",lambda task_id,pane_id=None:cleaned.append(task_id))
+    original=(recovered.run_token,recovered.fencing_token,recovered.idempotency_key)
+    if protocol=="before-effect":
+        runtime.recover_interrupted_child_start(child.id)
+        assert recovered.cleanup_complete and recovered.state.value=="blocked"
+        assert len(released)==1 and cleaned==[child.id] and runner.scans==1
+        again=DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path/"events.jsonl"));again.replay()
+        assert again._tasks[child.id].cleanup_complete
+    else:
+        with pytest.raises(HerdrRuntimeError,match="cleanup_unproven"):
+            runtime.recover_interrupted_child_start(child.id)
+        assert not released and not cleaned and recovered.state.value=="running"
+    assert (recovered.run_token,recovered.fencing_token,recovered.idempotency_key)==original
+
+def test_split_start_is_fsync_durable_one_use_before_native_effect(tmp_path):
+    scheduler,child,rec=_interrupted_start_record(tmp_path)
+    events=scheduler.audit_log.replay()
+    cutoff=next(i for i,e in enumerate(events) if e["event"]=="child_pane_creation_attempted")
+    scheduler.audit_log._path.write_text("".join(json.dumps(e)+"\n" for e in events[:cutoff+1]))
+    replay=DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path/"events.jsonl"));replay.replay()
+    record=replay._tasks[child.id]
+    args=(child.id,record.run_token,record.agent_id,record.fencing_token,record.idempotency_key)
+    assert replay.mark_child_split_started(*args)
+    assert not replay.mark_child_split_started(*args)
+    third=DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path/"events.jsonl"));third.replay()
+    assert third._tasks[child.id].pane_split_started is True

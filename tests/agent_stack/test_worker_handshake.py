@@ -52,7 +52,7 @@ def test_existing_herdr_task_gets_explicit_consumer_scope():
     worker.ensure_parent_scope(task)
     assert task["parent_role"] == "writer"
     assert task["worktree_root"] == "/home/agentops/worktrees/herdr"
-    assert set(task["parent_tools"]) == {"read_file", "search_files", "patch", "write_file"}
+    assert set(task["parent_tools"]) == {"read_file", "search_files", "patch", "write_file", "herdr_delegate_child"}
     assert task["parent_permissions"] == ["workspace-write"]
 
 
@@ -1266,3 +1266,20 @@ def test_root_host_provider_preflight_precedes_pane_creation_and_failure_cleans_
     assert launch.events==[("closed",)]
     assert worker.HOST_POLICY_LAUNCHES=={}
     assert len(events)==1
+
+
+@pytest.mark.parametrize("reason",["workspace outside host policy","requested tools/permissions exceed host ceiling"])
+def test_deterministic_host_prepare_denial_has_permanent_policy_prefix(tmp_path,monkeypatch,reason):
+    from tests.policy_launch_fakes import FakeHostPolicyLaunchFactory
+    from herdr.security import SecurityError
+    configure_paths(tmp_path);task=base_task();worker.prepare_attempt(task);task["workspace"]=str(tmp_path)
+    calls=[]
+    def control(args,**kwargs):
+        calls.append(args);assert args[:2]==["agent","get"]
+        return {"result":{"agent":{"kind":"hermes","pane_id":"coordinator","workspace_id":"workspace"}}}
+    factory=FakeHostPolicyLaunchFactory()
+    def denied(**kwargs):raise SecurityError(reason)
+    monkeypatch.setattr(factory,"prepare",denied);monkeypatch.setattr(worker,"_herdr_json",control)
+    with pytest.raises(RuntimeError,match="task_invocation_policy_denied"):
+        worker.create_task_session(task,policy_launch_factory=factory)
+    assert len(calls)==1 and not worker.HOST_POLICY_LAUNCHES

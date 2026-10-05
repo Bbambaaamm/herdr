@@ -236,7 +236,7 @@ class HermesCompatibilityError(RuntimeError):
     """Installed Hermes dispatch contract is not the versioned surface we audited."""
 
 
-_AUTHORIZED_CALL: ContextVar[tuple[str, str] | None] = ContextVar(
+_AUTHORIZED_CALL: ContextVar[tuple[str, str, str] | None] = ContextVar(
     "herdr_authorized_call", default=None
 )
 _ACTIVE_AGENT: ContextVar[Any | None] = ContextVar("herdr_active_provider_agent", default=None)
@@ -930,7 +930,7 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
                 return _denied_result(exc.reason, exc.detail)
             except (SecurityError, TypeError, ValueError):
                 return _denied_result("security_contract_invalid")
-            token = _AUTHORIZED_CALL.set((canonical, digest))
+            token = _AUTHORIZED_CALL.set((guard.grant.hash, canonical, digest))
             try:
                 return execute(checked)
             finally:
@@ -1004,13 +1004,17 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
                 canonical,
                 args,
                 caller_task_id=kwargs.get("task_id"),
-                consume_approval=(already != (canonical, digest)),
+                consume_approval=(already != (guard.grant.hash, canonical, digest)),
             )
         except PolicyDenied as exc:
             return _denied_result(exc.reason, exc.detail)
         except (SecurityError, TypeError, ValueError):
             return _denied_result("security_contract_invalid")
-        return original_registry_dispatch(self, name, checked, *call_args, **kwargs)
+        token = _AUTHORIZED_CALL.set((guard.grant.hash, canonical, _call_digest(canonical, checked)))
+        try:
+            return original_registry_dispatch(self, name, checked, *call_args, **kwargs)
+        finally:
+            _AUTHORIZED_CALL.reset(token)
 
     installation._remember(ToolRegistry, "dispatch", guarded_registry_dispatch)
 
@@ -1033,7 +1037,7 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
                 canonical,
                 arguments,
                 caller_task_id=guard.grant.identity.task_id,
-                consume_approval=(already != (canonical, digest)),
+                consume_approval=(already != (guard.grant.hash, canonical, digest)),
             )
         except PolicyDenied as exc:
             return _denied_result(exc.reason, exc.detail)
@@ -1051,6 +1055,12 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
         installation.uninstall()
         raise HermesCompatibilityError("failed to install registry dispatch guard")
 
+    from herdr.delegation_tool import register_delegation_tool
+    try:
+        register_delegation_tool(installation, registry, _AUTHORIZED_CALL, _call_digest)
+    except BaseException:
+        installation.uninstall()
+        raise
     return installation
 
 

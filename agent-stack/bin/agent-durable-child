@@ -372,7 +372,14 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
             reconciler.cleanup_bound_child(child.id)
             if rec.execution_pane and not scheduler.mark_child_cleanup_complete(child.id):
                 raise SchedulerError("child cleanup evidence denied")
-    return {"task_id": child.id, "parent_task_id": parent_id,
+    # Use the fsync-protected scheduler record, never a changed worker result file.
+    # These are submitted artifacts; only the shared completion gate accepts them.
+    retained = rec.result_evidence_canonical
+    if retained is not None and hashlib.sha256(retained).hexdigest() != rec.result_artifact_sha256:
+        raise SchedulerError("retained child result digest mismatch")
+    return {"evidence": json.loads(retained) if retained is not None else None,
+                "evidence_sha256": rec.result_artifact_sha256,
+                "task_id": child.id, "parent_task_id": parent_id,
                 "run_token": rec.run_token, "agent_id": rec.agent_id,
                 "fencing_token": rec.fencing_token,
                 "idempotency_key": rec.idempotency_key,
@@ -384,6 +391,7 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
 
 
 MAX_REQUEST = 131072
+MAX_RESPONSE = 524288
 
 
 def client_delegate(args):
@@ -412,7 +420,7 @@ def client_delegate(args):
         connection.connect("\0" + name[1:])
         connection.sendall(len(payload).to_bytes(4, "big") + payload)
         length = int.from_bytes(_receive(connection, 4), "big")
-        if not 0 < length <= MAX_REQUEST:
+        if not 0 < length <= MAX_RESPONSE:
             raise ValueError("invalid bridge response length")
         response = json.loads(_receive(connection, length))
     if not isinstance(response, dict) or set(response) != {"ok", "result", "error"}:

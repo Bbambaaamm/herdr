@@ -275,6 +275,7 @@ def factory_for(tmp_path, item, authorize, parent=None):
     definitions=[]
     for tree in (item.code,*item.runtime):
         definitions.append(ApprovedTree(tree.path,tree.target,dict(tree.files)))
+    (tmp_path/"store").chmod(0o700)
     return HostPolicyLaunchFactory(code=definitions[0],runtime=tuple(definitions[1:]),
                                    storage=tmp_path/"store",authorize=authorize,parent_grant=parent)
 
@@ -296,7 +297,7 @@ def test_host_factory_rejects_missing_or_escalated_grant_before_copy(tmp_path,fa
             factory.prepare(identity=identity,workspace=workspace,
                             tools=() if fault=="tools" else planned.scope.tools,
                             permissions=() if fault=="permissions" else planned.scope.permissions)
-        assert set((tmp_path/"store").iterdir())==before
+        assert set((tmp_path/"store").iterdir()) - {tmp_path/"store"/".ownership.lock"} == before
     finally:cleanup(item)
 
 def test_child_factory_requires_accepted_parent_grant(tmp_path):
@@ -332,7 +333,8 @@ def test_factory_copy_failure_cleans_only_its_own_unmounted_snapshots(tmp_path):
         with pytest.raises(SecurityError,match="approved bytes"):
             factory.prepare(identity=planned.identity,workspace=workspace,
                             tools=planned.scope.tools,permissions=planned.scope.permissions)
-        assert set((tmp_path/"store").iterdir())==before
+        assert {p for p in (tmp_path/"store").iterdir() if p.name != ".ownership.lock"} == before
+        assert (tmp_path/"store"/".ownership.lock").stat().st_mode & 0o777 == 0o600
     finally:cleanup(item)
 
 def test_policy_mount_rejects_writable_runtime_descendant_before_access(tmp_path,monkeypatch):

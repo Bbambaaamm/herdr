@@ -97,3 +97,64 @@ exists, delivery remains uncertain until same-attempt reconciliation; recovery
 does not resend, reset the attempt or discard its resources. Historical start
 records without this protocol retain unknown delivery status and remain
 quarantined. Replayed duplicate starts cannot erase a possible prompt effect.
+
+## Granted delegation and protected results
+
+The explicit consumer tool scope includes herdr_delegate_child. Its fixed Hermes
+registry handler belongs to the authenticated invocation guard and resolves in
+the herdr_delegation toolset. The host template must explicitly grant a
+DELEGATION rule with sandbox verification and only key, role, objective, prompt,
+tool, permission and cwd arguments. This does not enable process execution.
+Both root and child CLI toolsets derive from the admitted tools. The handler
+checks all seven policy identity fields and the durable parent environment,
+validates bounded closed arguments and invokes only the immutable helper's
+socket client. The outer broker rechecks protected task scope and actual peer
+PID/mount namespaces before child admission. Direct handler calls cannot skip
+the guard, and effective call approval context is bound to the grant digest.
+Uninstall restores the exact registry entry only while it still belongs to this
+installation.
+
+The child result's validated canonical evidence bytes are retained in the
+fsync-protected scheduler record and reconstructed on replay. The parent reply
+returns these bytes as evidence with their SHA-256; it never rereads changed
+worker data as retained truth. Responses have an independent bounded 512 KiB
+frame limit while requests remain 128 KiB. Public status snapshots contain the
+evidence digest rather than its content. Submitted findings remain candidates
+for shared #85 acceptance.
+
+## Durable ownership after host death
+
+Before creating snapshots or a grant, the factory commits an exclusive 0600
+ownership record keyed by the complete invocation identity in private 0700
+host storage. It pins the storage and launch-container device/inode plus the
+original PID/start ticks. All frozen copies, staged grants and bootstrap socket
+resources belong to that private container. Binding the Unix socket through a
+held directory descriptor avoids sockaddr path-length limits.
+
+A process-wide private object registry retains serving brokers for later
+requests in the same host process. After host death, recovery uses only the
+fixed host composition and the protected ownership record. It refuses a
+still-live original host, a changed storage/container inode, symbolic links,
+special entries or unexpected owners/modes/hardlinks. It removes only that
+container after the exact owned pane is proven absent/closed. Other attempts
+and foreign files remain intact. Cleanup is repeatable if the container was
+already removed; a failed resource cleanup keeps the task quarantined.
+
+## Split and partial-start recovery
+
+New pane intent records carry split_protocol_version=1 with a false split-start
+state. A separate full-attempt, one-use child_pane_split_started event is fsynced
+immediately before the external split. Under the existing parent bridge lock,
+a bounded zero-match scan can release and terminalize a pre-effect attempt only
+when the versioned record proves the split was never invoked. A started or
+historical unknown split with no identifiable pane remains quarantined; a
+snapshot alone cannot prove an ambiguous server operation stopped. This
+preserves the same task/run/fence/idempotency and creates no replacement work.
+
+An interrupted agent start may also return native agent_not_found before any
+agent record exists. Only this exact typed error, a proven absent economic
+prompt and retained full-identity physical policy evidence permit closing the
+owned sandbox. Transport errors, ambiguous output, missing grants and legacy
+unknown prompt state retain the reservation. Permanent root policy/workspace/
+tool denial becomes task_invocation_policy_denied before any pane or provider
+preflight rather than consuming fresh semantic attempts.

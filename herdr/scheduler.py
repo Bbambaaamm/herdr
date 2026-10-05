@@ -327,9 +327,11 @@ class TaskRecord:
     pre_delivery_agent_start_attempted: bool = False
     economic_delivery_attempted: bool | None = None
     pre_delivery_pane_creation_attempted: bool = False
+    pane_split_started: bool | None = None
     delivery_prompt_sha256: str | None = None
     result_status: str | None = None
     result_artifact_sha256: str | None = None
+    result_evidence_canonical: bytes | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "id", self.node.id)
@@ -1399,10 +1401,26 @@ class DynamicChildScheduler:
         self.audit_log.append({"event": "child_pane_creation_attempted", "task_id": task_id,
                                "run_token": run_token, "agent_id": agent_id,
                                "fencing_token": fencing_token, "idempotency_key": idempotency_key,
-                               "marker": marker})
+                               "marker": marker, "split_protocol_version": 1})
         self.audit_log.flush()
         rec.pre_delivery_pane_creation_attempted = True
+        rec.pane_split_started = False
         rec.execution_agent, rec.execution_marker = agent_id, marker
+        return True
+
+    def mark_child_split_started(self, task_id, run_token, agent_id, fencing_token, idempotency_key):
+        rec = self._tasks.get(task_id)
+        if (rec is None or rec.state is not LifecycleState.RUNNING or rec.lease is None
+                or not rec.pre_delivery_pane_creation_attempted or rec.pane_split_started is not False
+                or rec.execution_pane is not None or rec.pre_delivery_agent_start_attempted
+                or (rec.run_token, rec.agent_id, rec.fencing_token, rec.idempotency_key) !=
+                   (run_token, agent_id, fencing_token, idempotency_key)):
+            return False
+        self.audit_log.append({"event":"child_pane_split_started", "split_protocol_version":1,
+            "task_id":task_id,"run_token":run_token,"agent_id":agent_id,
+            "fencing_token":fencing_token,"idempotency_key":idempotency_key})
+        self.audit_log.flush()
+        rec.pane_split_started = True
         return True
 
     def bind_recovered_pre_delivery_pane(self, task_id: str, pane_id: str) -> bool:
@@ -1551,7 +1569,7 @@ class DynamicChildScheduler:
                                    allow_nan=False).encode("utf-8")
         except (TypeError, ValueError):
             return False
-        if artifact_sha256 != hashlib.sha256(canonical).hexdigest():
+        if len(canonical) > 262144 or artifact_sha256 != hashlib.sha256(canonical).hexdigest():
             return False
         lease = rec.lease
         if lease is None or lease.agent_id != agent_id or lease.fencing_token != fencing_token:
@@ -1564,13 +1582,14 @@ class DynamicChildScheduler:
         rec.attempt_state = "terminal"
         rec.result_status = status
         rec.result_artifact_sha256 = artifact_sha256
+        rec.result_evidence_canonical = canonical
         rec.fencing_token = fencing_token
         rec.lease = None
         self._claims.pop(task_id, None)
         self.audit_log.append({"event": "child_result", "task_id": task_id,
                                "agent_id": agent_id, "fencing_token": fencing_token,
                                "run_token": run_token, "idempotency_key": idempotency_key,
-                               "artifact_sha256": artifact_sha256, "evidence": evidence,
+                               "artifact_sha256": artifact_sha256, "evidence": json.loads(canonical),
                                "status": status, "state": rec.state.value,
                                "ts": datetime.now(UTC).isoformat()})
         self.audit_log.flush()
@@ -1606,7 +1625,7 @@ class DynamicChildScheduler:
             return True
         if rec.execution_pane:
             return self.mark_child_cleanup_complete(task_id)
-        if rec.pre_delivery_pane_creation_attempted:
+        if rec.pre_delivery_pane_creation_attempted and rec.pane_split_started is not False:
             return False
         self.audit_log.append({"event": "child_pre_delivery_cleanup_complete",
                                "task_id": task_id, "run_token": rec.run_token,
@@ -1651,6 +1670,7 @@ class DynamicChildScheduler:
                     "pre_delivery_agent_start_attempted": rec.pre_delivery_agent_start_attempted,
                     "economic_delivery_attempted": rec.economic_delivery_attempted,
                     "pre_delivery_pane_creation_attempted": rec.pre_delivery_pane_creation_attempted,
+                    "pane_split_started": rec.pane_split_started,
                     "run_token": rec.run_token,
                     "delegation_key": rec.delegation_key,
                     "idempotency_key": rec.idempotency_key,
@@ -1757,6 +1777,7 @@ class DynamicChildScheduler:
                 "child_pre_delivery_cleanup_complete",
                 "child_agent_start_attempted",
                 "child_pane_creation_attempted",
+                "child_pane_split_started",
                 "child_pane_recovered",
                 "child_pre_delivery_failed",
                 "fail",
@@ -1884,6 +1905,11 @@ class DynamicChildScheduler:
                     rec.result_status = status if event_type == "child_result" else None
                     rec.result_artifact_sha256 = (str(e["artifact_sha256"])
                                                   if event_type == "child_result" else None)
+                    rec.result_evidence_canonical = (json.dumps(e["evidence"], sort_keys=True,
+                        ensure_ascii=False, allow_nan=False).encode("utf-8")
+                        if event_type == "child_result" else None)
+                    if rec.result_evidence_canonical is not None and len(rec.result_evidence_canonical) > 262144:
+                        raise SchedulerError("durable child evidence exceeds limit")
                     rec.lease = None
                     self._claims.pop(task_id, None)
                     if e.get("fencing_token") is not None:
@@ -2053,8 +2079,22 @@ class DynamicChildScheduler:
                            (e.get("run_token"), e.get("agent_id"), e.get("fencing_token"), e.get("idempotency_key"))
                         or e.get("marker") != f"child-{rec.run_token}"):
                     raise SchedulerError("invalid child pane intent")
+                version=e.get("split_protocol_version")
+                if version is not None and (type(version) is not int or version != 1):
+                    raise SchedulerError("invalid split protocol version")
+                rec.pane_split_started = False if version == 1 else None
                 rec.pre_delivery_pane_creation_attempted = True
                 rec.execution_agent, rec.execution_marker = rec.agent_id, str(e["marker"])
+            elif event_type == "child_pane_split_started":
+                rec=self._tasks.get(str(e.get("task_id","")))
+                if (rec is None or rec.state is not LifecycleState.RUNNING or rec.lease is None
+                        or not rec.pre_delivery_pane_creation_attempted or rec.pane_split_started is not False
+                        or rec.execution_pane is not None or rec.pre_delivery_agent_start_attempted
+                        or type(e.get("split_protocol_version")) is not int or e["split_protocol_version"] != 1
+                        or (rec.run_token,rec.agent_id,rec.fencing_token,rec.idempotency_key) !=
+                           (e.get("run_token"),e.get("agent_id"),e.get("fencing_token"),e.get("idempotency_key"))):
+                    raise SchedulerError("invalid or repeated split start")
+                rec.pane_split_started=True
             elif event_type == "child_pane_recovered":
                 rec = self._tasks.get(str(e.get("task_id", "")))
                 pane = e.get("pane_id")
@@ -2127,7 +2167,7 @@ class DynamicChildScheduler:
             elif event_type == "child_pre_delivery_cleanup_complete":
                 rec = self._tasks.get(str(e.get("task_id", "")))
                 if (rec is None or not rec.pre_delivery_failure or rec.execution_pane
-                        or rec.pre_delivery_pane_creation_attempted
+                        or rec.pre_delivery_pane_creation_attempted and rec.pane_split_started is not False
                         or rec.attempt_state != "terminal"
                         or (e.get("run_token"), e.get("fencing_token"),
                             e.get("idempotency_key")) !=
