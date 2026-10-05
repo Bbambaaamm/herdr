@@ -420,10 +420,10 @@ def test_host_known_opaque_secret_denies_before_plan_serialization(tmp_path,fiel
         replace(data[1],**kwargs)
     frozen=canonical(data[1].to_json())
     assert secret.encode() not in frozen and "_redactor" not in data[1].to_json()
-    restored=PromptPlan.from_json(data[1].to_json(),redactor=data[0].redactor)
+    restored=PromptPlan.from_json(json.loads(canonical(data[1].to_json())),redactor=data[0].redactor)
     assert restored.hash==data[1].hash
     with pytest.raises(PromptBlocked,match="redaction_policy"):
-        PromptPlan.from_json(data[1].to_json(),redactor=SecretRedactor())
+        PromptPlan.from_json(json.loads(canonical(data[1].to_json())),redactor=SecretRedactor())
 
 def test_output_token_reservation_is_pinned_and_shared_window_is_admitted(tmp_path):
     from tests.herdr.test_context import item
@@ -504,3 +504,44 @@ def test_nondefault_output_allowance_survives_host_plan_reconstruction(tmp_path,
     assert restored.output_contract.output_token_allowance==allowance
     assert restored.output_contract.hash==plan.output_contract.hash
     assert restored.hash==plan.hash
+
+
+@pytest.mark.parametrize("schema",[
+    {"type":"string","minLength":2,"maxLength":1},
+    {"type":"array","minItems":2,"maxItems":1,"items":{"type":"string","maxLength":1}},
+    {"type":"number","minimum":2,"maximum":1},
+    {"type":"object","properties":{"value":{"type":"string","minLength":2,"maxLength":1}},
+     "required":["value"],"additionalProperties":False}])
+def test_inverted_schema_intervals_deny_before_compilation(schema):
+    with pytest.raises(PromptBlocked,match="interval"):OutputContract(canonical(schema))
+
+@pytest.mark.parametrize("field",["instruction_refs","demonstrations","reminders","context_alternatives"])
+@pytest.mark.parametrize("value",["","check",{},None])
+def test_plan_reconstruction_does_not_reinterpret_scalar_sequence_fields(tmp_path,field,value):
+    data=setup(tmp_path);raw=json.loads(canonical(data[1].to_json()));raw[field]=value
+    with pytest.raises(PromptBlocked,match="sequence_required"):
+        PromptPlan.from_json(raw,redactor=data[0].redactor)
+
+def test_grant_shared_context_ceiling_reserves_completion_allowance(tmp_path):
+    from dataclasses import fields
+    from herdr.capability import CapabilityScope
+    data=setup(tmp_path,token_budget=16384)
+    runtime,plan,context,grant,binding=data
+    node=replace(context.context,**{field.name:replace(getattr(context.context,field.name),max_context_tokens=8192)
+        for field in fields(context.context) if isinstance(getattr(context.context,field.name),CapabilityScope)})
+    grant=replace(grant,scope=node.scope)
+    raw=json.loads(context.payload);raw["binding"]=node.binding()
+    raw["skill_trace"]["binding"]={**node.binding(),"executor_id":binding.executor_id}
+    context=replace(context,context=node,payload=canonical(raw))
+    plan=replace(plan,grant_sha256=grant.hash,context_plan_sha256=context.hash,
+        context_authority_sha256=context_authority_hash(context))
+    baseline=compile((runtime,plan,context,grant,binding))
+    raw_source=b"x"*max(1,(8192-counter().measure(baseline.wire)-256)*4)
+    from tests.herdr.test_context import item
+    context=replace(context,items=(item(raw_source,id="grant-window-boundary"),))
+    plan=replace(plan,context_plan_sha256=context.hash,
+        context_authority_sha256=context_authority_hash(context))
+    bundle=compile((runtime,plan,context,grant,binding),lambda _:raw_source)
+    assert counter().measure(bundle.wire)+plan.output_contract.output_token_allowance<=8192
+    assert json.loads(bundle.context_trace)["selected"]==[]
+    assert PromptPlan.from_json(plan.to_json(),redactor=runtime.redactor).hash==plan.hash

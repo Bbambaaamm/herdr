@@ -105,9 +105,13 @@ def bounded_schema(schema):
             require(types and "array" in types, "output_schema_array_type_required")
         if types and "array" in types:
             integer(node.get("maxItems"), 0, 256, "output_schema_finite_array_required")
+            integer(node.get("minItems",0),0,node["maxItems"],"output_schema_array_interval")
             walk(node.get("items"), depth+1)
         if types and "string" in types:
             integer(node.get("maxLength"), 0, 16384, "output_schema_finite_string_required")
+            integer(node.get("minLength",0),0,node["maxLength"],"output_schema_string_interval")
+        if "minimum" in node and "maximum" in node:
+            require(node["minimum"] <= node["maximum"],"output_schema_number_interval")
         for key in ("anyOf", "oneOf"):
             if key in node:
                 require(isinstance(node[key], list) and 1 <= len(node[key]) <= 8,
@@ -297,15 +301,18 @@ class PromptPlan:
         for value in (self.objective, self.immediate_instruction): safe_text(value)
         for name, typ, maximum in (("instruction_refs", InstructionRef, 32),
                                     ("demonstrations", DemonstrationRef, 5)):
+            require(isinstance(getattr(self,name),(tuple,list)),"prompt_sequence_required")
             values = tuple(getattr(self, name)); object.__setattr__(self, name, values)
             require(len(values) <= maximum and all(isinstance(x, typ) for x in values)
                     and len({x.id for x in values}) == len(values), "prompt_reference_bound")
+        require(isinstance(self.reminders,(tuple,list)),"prompt_sequence_required")
         object.__setattr__(self, "reminders", tuple(self.reminders))
         require(len(self.reminders) <= 8, "prompt_reminder_bound")
         for value in self.reminders: safe_text(value, 1024)
         require(len({x.diversity_key for x in self.demonstrations}) == len(self.demonstrations)
                 and len({x.source.sha256 for x in self.demonstrations}) == len(self.demonstrations),
                 "duplicate_demonstration")
+        require(isinstance(self.context_alternatives,(tuple,list)),"prompt_sequence_required")
         object.__setattr__(self, "context_alternatives", tuple(self.context_alternatives))
         require(len(self.context_alternatives) <= 64
                 and len(set(self.context_alternatives)) == len(self.context_alternatives)
@@ -322,6 +329,8 @@ class PromptPlan:
         raw["identity"] = self.identity.to_json()
         raw["instruction_refs"] = [asdict(ref) for ref in self.instruction_refs]
         raw["demonstrations"] = [asdict(ref) for ref in self.demonstrations]
+        raw["reminders"]=list(self.reminders)
+        raw["context_alternatives"]=list(self.context_alternatives)
         raw["redaction_policy_sha256"] = self._redactor.policy_hash
         raw["output_contract"] = {"result_schema": json.loads(self.output_contract.result_schema),
             "minimum_evidence_refs": self.output_contract.minimum_evidence_refs,
@@ -336,6 +345,8 @@ class PromptPlan:
                 and len(canonical(raw)) <= MAX_PROMPT, "prompt_plan_schema")
         require(isinstance(redactor, SecretRedactor)
                 and raw["redaction_policy_sha256"] == redactor.policy_hash, "prompt_redaction_policy")
+        for field_name in ("instruction_refs","demonstrations","reminders","context_alternatives"):
+            require(isinstance(raw[field_name],list),"prompt_sequence_required")
         values = dict(raw)
         del values["redaction_policy_sha256"]
         values["_redactor"] = redactor
@@ -485,10 +496,11 @@ class PromptRuntime:
         allowance = plan.output_contract.output_token_allowance
         require(cap.max_output_tokens is None or allowance <= cap.max_output_tokens,
                 "prompt_output_capability_limit")
-        shared_input = None if cap.context_tokens is None else cap.context_tokens - allowance
-        require(shared_input is None or shared_input > 0, "prompt_output_exceeds_context")
-        token_limit = min(x for x in (context.token_budget, grant.scope.max_context_tokens,
-            shared_input, cap.max_input_tokens) if x is not None)
+        shared_inputs = tuple(limit-allowance for limit in
+            (cap.context_tokens,grant.scope.max_context_tokens) if limit is not None)
+        require(all(limit>0 for limit in shared_inputs),"prompt_output_exceeds_context")
+        token_limit = min(x for x in (context.token_budget,*shared_inputs,cap.max_input_tokens)
+            if x is not None)
         byte_limit = min(MAX_PROMPT, context.byte_budget)
         def render():
             prefix = canonical(stable).decode()
