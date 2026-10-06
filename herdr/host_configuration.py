@@ -13,7 +13,9 @@ from .policy_launch import ApprovedTree,HostPolicyLaunchFactory,CODE_TARGET,RUNT
 from .security import SecurityError,SecurityGrant,InvocationIdentity
 
 HOST_POLICY_CONFIG=Path("/etc/herdr/host-policy.json")
-MAX_CONFIG=2097152
+# Complete pinned Hermes source, venv and Python manifests exceed 2 MiB.
+# Keep the root-owned, stable-reader input bounded at 4 MiB.
+MAX_CONFIG=4194304
 
 def require(ok,reason):
     if not ok:raise SecurityError(reason)

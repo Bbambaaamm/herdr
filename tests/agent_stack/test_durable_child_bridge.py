@@ -1119,3 +1119,60 @@ def test_parent_without_frozen_child_contract_delivers_once_and_never_invents_ve
     rec=restored._tasks[first["task_id"]]
     assert rec.lease is None and rec.completion_receipt is None
     assert rec.completion_failure["code"]=="evidence_invalid"
+
+@pytest.mark.parametrize("version,kind,parent_has_verify,expected", [
+    (2,"coding",True,True),(3,"coding",True,True),
+    (1,"coding",True,False),(3,"research",True,False),
+    (3,"coding",False,"denied"),(3,"coding",True,"role_denied"),
+])
+def test_actual_delegate_selects_only_protected_coding_verification_scope(
+        tmp_path,monkeypatch,version,kind,parent_has_verify,expected):
+    from herdr.child_evidence import ChildCompletionAuthority,child_scope_spec
+    from herdr.evidence import EvidenceStore,EvidenceError
+    from herdr.scheduler import ChildProposal
+
+    task,path=_task(tmp_path)
+    task["parent_tools"]=["read_file","search_files","herdr_submit_result"]
+    if parent_has_verify:task["parent_tools"].append("herdr_verify_work")
+    path.write_text(json.dumps(task))
+    _env(monkeypatch,path)
+    workspace=tmp_path/"child";workspace.mkdir()
+    args=argparse.Namespace(key="coding-scope",
+        role="writer" if kind=="coding" and expected!="role_denied" else "reader",objective="inspect",
+        prompt="read files",tool=["read_file"],permission=[])
+    authority=ChildCompletionAuthority(store=EvidenceStore(tmp_path/"completion"),
+        approve=lambda **kwargs:None,collector=lambda *args:None)
+    seen=[]
+    class ProposalCaptured(Exception):pass
+    def capture(self,parent_id,parent_token,key,proposal):
+        decision=self.consumer_policy.evaluate_child_proposal(proposal)
+        assert bool(decision)==(expected!="role_denied")
+        seen.append(proposal)
+        raise ProposalCaptured()
+    monkeypatch.setattr(DynamicChildScheduler,"delegate_child",capture)
+    with _test_pin(workspace) as pinned:
+        preview=ChildProposal(parent_role=task["parent_role"],
+            parent_tools=tuple(task["parent_tools"]),child_role=args.role,
+            child_tools=("herdr_submit_result","herdr_verify_work","read_file"),
+            child_task=args.objective,parent_permissions=(),child_permissions=(),
+            worktree_identity=pinned.identity)
+        document=dict(repo=task["repo"],issue=str(task["issue"]),
+            parent_task_id=task["id"],parent_agent_id="parent-agent",
+            objective=preview.child_task,role=preview.child_role,
+            tools=list(preview.child_tools),permissions=[],
+            worktree_identity=preview.worktree_identity)
+        authority.work_contracts={"version":version,"children":{
+            child_scope_spec(document):{"kind":kind,
+                "work_contract_version":1 if kind=="coding" else 0}}}
+        error=EvidenceError if expected=="denied" else ProposalCaptured
+        with pytest.raises(error):
+            bridge._delegate_pinned(args,None,Path("/bin/true"),task,
+                "parent-pane","parent-agent","marker",pinned,
+                completion_authority=authority)
+    if expected=="denied":
+        assert seen==[]
+    else:
+        assert len(seen)==1
+        assert ("herdr_verify_work" in seen[0].child_tools)==(expected is True or expected=="role_denied")
+        assert seen[0].child_role==args.role
+        assert set(seen[0].child_tools)<=set(task["parent_tools"])

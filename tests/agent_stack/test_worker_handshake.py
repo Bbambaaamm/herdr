@@ -53,7 +53,7 @@ def test_existing_herdr_task_gets_explicit_consumer_scope():
     worker.ensure_parent_scope(task)
     assert task["parent_role"] == "writer"
     assert task["worktree_root"] == "/home/agentops/workspaces/herdr/worktrees"
-    assert set(task["parent_tools"]) == {"read_file", "search_files", "patch", "write_file", "herdr_delegate_child", "herdr_submit_result"}
+    assert set(task["parent_tools"]) == {"read_file", "search_files", "patch", "write_file", "herdr_delegate_child", "herdr_verify_work", "herdr_submit_result"}
     assert task["parent_permissions"] == ["workspace-write"]
 
 
@@ -1804,3 +1804,41 @@ def test_modern_root_missing_hygiene_profile_blocks_before_split(tmp_path,monkey
     session=task["execution_session"]
     assert not session["pane_split_started"] and not session["agent_start_attempted"]
     assert len(calls)==1 and not worker.result_path(task["id"]).exists()
+
+def former_consumer_scope():
+    task=base_task()
+    task["safety_profile"]="herdr-core"
+    worker.ensure_parent_scope(task)
+    task["parent_tools"].remove("herdr_verify_work")
+    return task
+
+def test_persisted_former_consumer_scope_refreshes_only_the_new_root_request():
+    task=former_consumer_scope()
+    task.update(run_token="fresh",idempotency_key="original",fencing_token=9,
+        attempt_state="dispatching")
+    before={key:task[key] for key in ("run_token","idempotency_key","fencing_token")}
+    worker.ensure_parent_scope(task)
+    assert "herdr_verify_work" in task["parent_tools"]
+    assert {key:task[key] for key in before}==before
+
+@pytest.mark.parametrize("admitted", [
+    {"attempt_state":"delivery_uncertain"},
+    {"attempt_state":"blocked"},
+    {"parent_task_id":"parent"},
+    {"execution_session":{"owned_pane":True}},
+    {"execution_session":{"closed_at":"closed","invocation_policy":{"identity":{}}}},
+    {"work_contract":{"identity":{"run_token":"current"}}},
+])
+def test_former_scope_cannot_upgrade_an_existing_attempt_or_child(admitted):
+    task=former_consumer_scope()
+    task.update(run_token="current",**admitted)
+    before=list(task["parent_tools"])
+    with pytest.raises(RuntimeError,match="parent_scope_refresh_requires_new_admission"):
+        worker.ensure_parent_scope(task)
+    assert task["parent_tools"]==before
+
+def test_intentionally_narrowed_parent_request_is_preserved():
+    task=former_consumer_scope()
+    task["parent_tools"]=["read_file","herdr_submit_result"]
+    worker.ensure_parent_scope(task)
+    assert task["parent_tools"]==["read_file","herdr_submit_result"]

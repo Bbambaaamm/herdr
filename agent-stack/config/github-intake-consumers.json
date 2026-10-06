@@ -16,6 +16,7 @@
         "patch",
         "write_file",
         "herdr_delegate_child",
+        "herdr_verify_work",
         "herdr_submit_result"
       ],
       "parent_permissions": [
@@ -42,6 +43,7 @@
         "patch",
         "write_file",
         "herdr_delegate_child",
+        "herdr_verify_work",
         "herdr_submit_result"
       ],
       "parent_permissions": [
@@ -68,6 +70,7 @@
         "patch",
         "write_file",
         "herdr_delegate_child",
+        "herdr_verify_work",
         "herdr_submit_result"
       ],
       "parent_permissions": [
