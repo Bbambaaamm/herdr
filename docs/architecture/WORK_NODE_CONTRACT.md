@@ -200,3 +200,11 @@ Host request bounds now include a 120-second allowance for inventories, private 
 The fixed 900-second physical request deadline starts before peer/mount/request inspection and remains active through response send. The original grant is reserved for that entire bound before baseline/admission and rechecked at dispatch. One durable local-commit-invalidated event both retires the proven changed-content request and replays VERIFY; no crash window can reopen hygiene without new oracle evidence.
 
 Deadline expiry is contained inside the dispatcher and never escapes to terminate its listener. Live-tree changes around final sealing durably reopen VERIFY before returning the failure. A ready private commit is reusable only for its exact verified tree. A later fresh PASS may replace only this same attempt’s proven, unaccepted owned ref through CAS, with the original base/parent and foreign index protections intact; UNKNOWN private hook requests remain quarantined.
+
+Pending hygiene recovery selects only the current verified tree. A superseded
+private request remains original historical evidence and cannot strand a fresh
+PASS; same-tree UNKNOWN work still reconciles without repeating hooks. Handoff
+requires the exact stored original outcome and its current plan/tree before
+commit or result capture, so a stale request cannot claim a newly verified
+artifact. Hygiene executes the same approved resolved bootstrap interpreter as
+the oracle, including profiles without the logical Python alias.

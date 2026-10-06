@@ -94,6 +94,11 @@ class HostWorkHandoff:
     def complete(self, cycle, request_id, outcome):
         if outcome["status"] != "pass":
             return outcome
+        original = cycle.verification_requests.get(request_id)
+        require(original is not None and canonical(outcome) == canonical(original)
+                and outcome.get("plan_sha256") == cycle.plan.hash
+                and outcome.get("tree_sha256") == cycle.verified_tree,
+                "handoff requires the original current-tree verification")
         key = self._key(cycle, request_id)
         intent = self.store.read("work-handoff-intent", key)
         declaration = intent["handoff"]
