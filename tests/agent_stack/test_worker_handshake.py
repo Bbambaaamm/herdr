@@ -1724,3 +1724,83 @@ def test_quantlab_completion_prompt_matches_closed_result_tool(tmp_path):
     assert "Supply only status, evidence and summary" in rendered
     assert "Include keys:" not in rendered
     assert "herdr_submit_result" in rendered
+
+def test_modern_work_contract_missing_host_authority_blocks_before_pane_creation(tmp_path,monkeypatch):
+    configure_paths(tmp_path)
+    task=base_task()
+    task.update(work_contract_version=1,run_token="modern-run",workspace=str(tmp_path/"workspace"))
+    monkeypatch.setattr(worker,"HOST_WORK_CONTRACT_FACTORY",None)
+    monkeypatch.setattr(worker,"_herdr_json",lambda *a,**kw:pytest.fail("no pane or agent may be created"))
+    with pytest.raises(RuntimeError,match="authority_missing"):
+        worker.create_task_session(task)
+    assert "execution_session" not in task
+
+@pytest.mark.parametrize("version",[True,"1",2,0])
+def test_unsupported_modern_contract_is_not_treated_as_legacy(tmp_path,monkeypatch,version):
+    configure_paths(tmp_path)
+    task=base_task()
+    task.update(work_contract_version=version,run_token="modern-run",execution_session={"agent_name":"worker"})
+    original_run=worker.subprocess.run
+    def no_dispatch(argv,*args,**kwargs):
+        if argv and str(argv[0])==str(worker.HERDR):
+            pytest.fail("must not dispatch")
+        return original_run(argv,*args,**kwargs)
+    monkeypatch.setattr(worker.subprocess,"run",no_dispatch)
+    with pytest.raises(RuntimeError,match="version_unsupported"):
+        worker.run_prompt(task)
+
+def test_modern_prompt_missing_or_finished_cycle_cannot_restart_implementation(tmp_path,monkeypatch):
+    from dataclasses import replace
+    from herdr.work_cycle import WorkCycle,WorkPhase
+    from tests.herdr.test_work_cycle import setup,trusted_git
+    configure_paths(tmp_path)
+    task=base_task()
+    task.update(work_contract_version=1,run_token="modern-run",execution_session={"agent_name":"worker"})
+    monkeypatch.setattr(worker,"HOST_WORK_CYCLES",{})
+    original_run=worker.subprocess.run
+    def no_dispatch(argv,*args,**kwargs):
+        if argv and str(argv[0])==str(worker.HERDR):
+            pytest.fail("must not dispatch")
+        return original_run(argv,*args,**kwargs)
+    monkeypatch.setattr(worker.subprocess,"run",no_dispatch)
+    with pytest.raises(RuntimeError,match="forbids_implementation"):
+        worker.run_prompt(task)
+    cycle,root,plan,log=setup(tmp_path/"contract")
+    cycle.phase=WorkPhase.HYGIENE
+    worker.HOST_WORK_CYCLES[(task["id"],task["run_token"])]=cycle
+    task["work_contract"]={"plan_sha256":plan.hash}
+    with pytest.raises(RuntimeError,match="forbids_implementation"):
+        worker.run_prompt(task)
+
+def test_legacy_completion_spec_digest_keeps_original_meaning():
+    import agent_completion_evidence as completion
+    from herdr.evidence import digest
+    task=base_task()
+    keys=("repo","issue","kind","prompt","completion_kind","spec_hash","completion_contract","completion_evidence","child_completion_contracts")
+    assert completion.spec_digest(task)==digest({key:task.get(key) for key in keys})
+    task["work_contract_version"]=1
+    assert completion.spec_digest(task)!=digest({key:task.get(key) for key in keys})
+
+def test_modern_root_missing_hygiene_profile_blocks_before_split(tmp_path,monkeypatch):
+    from tests.policy_launch_fakes import FakeHostPolicyLaunchFactory
+    from herdr.work_contract_host import HostWorkContractFactory
+    from herdr.evidence import digest,binding
+    from agent_completion_evidence import store_for
+    configure_paths(tmp_path);task=base_task();worker.prepare_attempt(task)
+    workspace=tmp_path/"worker";workspace.mkdir()
+    task.update(work_contract_version=1,workspace=str(workspace),fencing_token=19)
+    work=object.__new__(HostWorkContractFactory);work.local_commit_policy=None
+    monkeypatch.setattr(worker,"_root_work_factory",lambda current:work)
+    calls=[]
+    def native(args,**kw):
+        calls.append(args)
+        assert args[:2]==["agent","get"],"invalid profile cannot reach split or result allocation"
+        return {"result":{"agent":{"kind":"hermes","pane_id":"coordinator","workspace_id":"workspace"}}}
+    monkeypatch.setattr(worker,"_herdr_json",native)
+    store_for(tmp_path,task).publish("plan",digest(binding(task)),{"kind":"coding"})
+    from herdr.work_cycle import WorkContractError
+    with pytest.raises(WorkContractError,match="local commit profile"):
+        worker.create_task_session(task,policy_launch_factory=FakeHostPolicyLaunchFactory())
+    session=task["execution_session"]
+    assert not session["pane_split_started"] and not session["agent_start_attempted"]
+    assert len(calls)==1 and not worker.result_path(task["id"]).exists()

@@ -243,6 +243,23 @@ def collect_github(plan: dict, artifact, number):
         raise EvidenceUnavailable("GitHub validation data is invalid") from exc
 
 
+def collect_local_handoff(plan, artifact, number):
+    """Read-only PR discovery for an exact host-observed local commit."""
+    if number is None:
+        rows = github(f"repos/{plan['repo']}/commits/{artifact.commit_sha}/pulls?per_page=100")
+        if not isinstance(rows, list) or len(rows) > 100:
+            raise EvidenceUnavailable("associated PR window exceeds local handoff bound")
+        matching = [row for row in rows if isinstance(row, dict)
+                    and _pr_binding(row) == (artifact.commit_sha, artifact.base_sha,
+                         plan["repo"], plan["repo"], "main")]
+        if not matching:
+            raise EvidenceMissing("exact local artifact awaits its parent-published pull request")
+        if len(matching) != 1 or type(matching[0].get("number")) is not int:
+            raise EvidenceError("local artifact has ambiguous pull request association")
+        number = matching[0]["number"]
+    return collect_github(plan, artifact, number)
+
+
 def store_for(root: Path, task: dict) -> EvidenceStore:
     store = EvidenceStore(root / "verification")
     # #82 exposes the workspace, caches and worktrees to the child. Every plan
@@ -266,8 +283,12 @@ def completion_kind(task: dict) -> str:
 
 
 def spec_digest(task: dict) -> str:
-    return digest({k: task.get(k) for k in
-                   ("repo", "issue", "kind", "prompt", "completion_kind", "spec_hash", "completion_contract", "completion_evidence", "child_completion_contracts")})
+    keys=("repo", "issue", "kind", "prompt", "completion_kind", "spec_hash", "completion_contract", "completion_evidence", "child_completion_contracts")
+    if "work_contract_version" in task:
+        keys+=("work_contract_version",)
+    if "child_work_contract_version" in task:
+        keys+=("child_work_contract_version",)
+    return digest({k:task.get(k) for k in keys})
 
 
 def typed_policy(kind: str) -> dict:
@@ -303,6 +324,12 @@ def completion_instructions(task: dict) -> str:
               "- Completed worker result, integration, deployment, and control cycle are distinct levels.\n")
     if kind == "control":
         return common + ("- This is a control cycle. Submit nonempty summary and evidence=[{herdr_control:{version:1,next_action:<nonempty text>}}] through herdr_submit_result. Its completion does not satisfy an implementation or its dependencies.\n")
+    if kind == "coding" and task.get("work_contract_version") == 1:
+        return common + ("- Use herdr_verify_work(request_id, handoff) for the frozen host oracle and exact local commit. "
+            "handoff declares pr_number (null while awaiting the parent PR) and scope_claim when required. "
+            "The host preserves repository hooks, seals the tested bytes and automatically submits the immutable local result. "
+            "PASS forbids further implementation. Preserve the worktree while independent CI/review/integration is pending.\n"
+            "- Frozen completion plan: " + json.dumps(plan, sort_keys=True) + "\n")
     from herdr.verification_binding import commit_footer
     footer = (commit_footer(plan) if {"identity","spec_hash","policy_hash","base_sha"} <= set(plan)
               else "<host must freeze and advertise this exact attempt before dispatch>")
@@ -390,11 +417,11 @@ def freeze_plan(root: Path, task: dict) -> None:
     freeze_child_completion_contracts(root, task, plan)
 
 
-def verify_completion(root: Path, task: dict, result: dict) -> dict:
+def verify_completion(root: Path, task: dict, result: dict, *, invocation_verifier=None) -> dict:
     from herdr.result_candidate import completion_candidate
     from herdr.evidence import canonical
     original_result = result
-    result = completion_candidate(result)
+    result = completion_candidate(result, workspace=task.get("workspace") if invocation_verifier is not None else None)
     kind = completion_kind(task)
     if kind not in {"coding", "control", "research", "review"}:
         raise EvidenceError(f"typed {kind} immutable completion contract is not configured")
@@ -437,7 +464,10 @@ def verify_completion(root: Path, task: dict, result: dict) -> dict:
     workspace = result.get("artifact_workspace")
     if not isinstance(workspace, str) or not Path(workspace).is_absolute():
         raise EvidenceError("immutable artifact workspace is missing")
-    return accept_artifact(task, result, plan, store, Path(workspace), collect_github)
+    collector = collect_local_handoff if invocation_verifier is not None else collect_github
+    return accept_artifact(task, result, plan, store, Path(workspace), collector,
+                           result_payload_sha256=digest(original_result) if invocation_verifier is not None else None,
+                           invocation_verifier=invocation_verifier)
 
 
 def record_verification_failure(task: dict, exc: EvidenceError) -> bool:
@@ -465,6 +495,10 @@ def freeze_child_completion_contracts(root, task, parent_plan):
     if contracts is None:
         return
     validate_contracts(contracts)
+    if task.get("child_work_contract_version") is not None:
+        if (type(task["child_work_contract_version"]) is not int or task["child_work_contract_version"] != 1
+                or contracts["version"] != 2):
+            raise EvidenceError("new coding-child admission requires the versioned work catalogue")
     if task.get("repo")!=POLICY["repo"]:
         raise EvidenceError("child completion consumer verification policy is not configured")
     base=contracts["base_sha"]

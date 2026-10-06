@@ -56,8 +56,9 @@ def _tree(raw):
 def build_host_policy_factory(*,parent_grant=None,configuration_path=HOST_POLICY_CONFIG):
     """Only executable host entrypoints select this configuration path."""
     raw=_read_configuration(configuration_path)
-    require(set(raw)=={"schema_version","host_uid","code","runtime","storage","templates",
-                      "grant_ttl_seconds","task_store_root"} and type(raw["schema_version"]) is int and raw["schema_version"]==1,
+    required={"schema_version","host_uid","code","runtime","storage","templates",
+              "grant_ttl_seconds","task_store_root"}
+    require(set(raw) in (required,required|{"work_contracts"}) and type(raw["schema_version"]) is int and raw["schema_version"]==1,
             "closed host composition schema required")
     require(type(raw["host_uid"]) is int and raw["host_uid"]==os.geteuid(),"host configuration UID mismatch")
     require(type(raw["grant_ttl_seconds"]) is int and 1<=raw["grant_ttl_seconds"]<=3600,
@@ -81,7 +82,12 @@ def build_host_policy_factory(*,parent_grant=None,configuration_path=HOST_POLICY
     if parent_grant is not None:
         ceiling=grants.get(parent_grant.identity.consumer)
         require(ceiling is not None and ceiling.is_active(),"current consumer policy unavailable")
+        # Compare logical capabilities under the current ceiling. Physical
+        # result slots belong to the original full identity, which is verified
+        # separately; they cannot be copied onto this synthetic identity.
         comparison=replace(parent_grant,parent_grant_hash=ceiling.hash,
+            tool_rules=tuple(replace(rule,result_slot=None) if rule.tool=="herdr_submit_result" else rule
+                             for rule in parent_grant.tool_rules),
             identity=replace(parent_grant.identity,parent_agent_id=ceiling.identity.agent_id,
                              parent_task_id=ceiling.identity.task_id))
         comparison.require_logical_subset_of(ceiling)

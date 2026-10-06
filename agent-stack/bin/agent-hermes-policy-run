@@ -499,7 +499,11 @@ def bootstrap(hermes_args: list[str]) -> int:
         )
         if tuple(grant.scope.executors) != (executor,):
             raise security_module.SecurityError("signed executor scope differs from audited Hermes build")
-        guard = security_module.InvocationGuard(grant)
+        work_module = importlib.import_module("herdr.work_contract_host")
+        authority_module = importlib.import_module("herdr.work_authority")
+        _require_module_origin(work_module, policy_code_root, "herdr.work_contract_host")
+        _require_module_origin(authority_module, policy_code_root, "herdr.work_authority")
+        guard = work_module.WorkInvocationGuard(grant,work_authority=authority_module.WorkAuthorityClient())
     except (security_module.SecurityError, KeyError, TypeError, ValueError) as exc:
         raise SystemExit(f"signed Herdr grant rejected: {exc}") from exc
 

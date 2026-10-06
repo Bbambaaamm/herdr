@@ -109,6 +109,8 @@ class ChildCompletionAuthority:
         if not isinstance(store,EvidenceStore) or not callable(approve) or not callable(collector):
             raise EvidenceError("host child completion authority required")
         self.store,self.approve,self.collector=store,approve,collector
+        self.work_contracts = None
+        self.work_factories = {}
 
     def prepare(self,rec):
         task=child_task(rec)
@@ -130,10 +132,99 @@ class ChildCompletionAuthority:
             if old["identity"]!=binding(task) or old["repo"]!=rec.repo or old["spec_hash"]!=child_spec(rec) or old["plan_hash"]!=plan["plan_hash"]:
                 raise EvidenceError("child plan changed across restart")
 
+    def modern_work(self, rec):
+        contracts = self.work_contracts
+        if contracts is None or contracts["version"] == 1:
+            return False
+        entry = contracts["children"].get(child_spec(rec))
+        if entry is None:
+            raise EvidenceError("child work lacks the exact protected contract")
+        return entry["kind"] == "coding" and entry["work_contract_version"] == 1
+
+    def _work_task(self, rec, plan):
+        task = child_task(rec)
+        task.update(workspace=str(child_workspace(rec)[0]), work_contract_version=1,
+                    completion_plan={"base_sha":plan["base_sha"]},
+                    work_workspace_identity=f"{child_workspace(rec)[1]}:{child_workspace(rec)[2]}")
+        return task
+
+    def preflight_work(self,rec,launch):
+        if not self.modern_work(rec):return None
+        from .work_configuration import build_root_work_factory,preflight_handoff
+        plan=self.store.read("plan",digest(binding(child_task(rec))))
+        task=self._work_task(rec,plan)
+        factory=build_root_work_factory(self.store.root.parent,task,spec_sha256=child_spec(rec))
+        preflight_handoff(factory,launch,plan,require_slot=False)
+        self.work_factories[digest(child_identity(rec).to_json())]=factory
+        return factory
+
+    def prepare_work(self, rec, launch):
+        if not self.modern_work(rec):
+            return None
+        from .work_configuration import build_root_work_factory, bind_root_handoff, preflight_handoff
+        plan = self.store.read("plan", digest(binding(child_task(rec))))
+        task = self._work_task(rec, plan)
+        factory = self.work_factories.get(digest(child_identity(rec).to_json())) or self.preflight_work(rec,launch)
+        preflight_handoff(factory, launch, plan)
+        cycle = factory.prepare(identity=child_identity(rec), workspace=Path(task["workspace"]),
+                                grant=launch.grant, spec_sha256=child_spec(rec))
+        port = bind_root_handoff(factory, task, launch, cycle)
+        self.work_factories[digest(child_identity(rec).to_json())] = factory
+        launch.mount.bootstrap.work_authority = factory.authorize_invocation
+        launch.mount.bootstrap.work_verify = factory.verify_request
+        return port
+
+    def recover_work(self, rec, plan):
+        from .work_configuration import build_root_work_factory
+        from .work_cycle import WorkPlan
+        task = self._work_task(rec, plan)
+        identity = child_identity(rec)
+        key = digest(identity.to_json())
+        factory = self.work_factories.get(key)
+        if factory is None:
+            factory = build_root_work_factory(self.store.root.parent, task, recovery=True,
+                                             spec_sha256=child_spec(rec))
+            self.work_factories[key] = factory
+        if key not in factory.cycles:
+            records = [row for row in factory.audit_log.replay() if
+                       row.get("event") == "work_plan" and row.get("work_cycle") == identity.to_json()]
+            if len(records) != 1:
+                raise EvidenceError("original child work plan is missing or ambiguous")
+            saved = WorkPlan.from_json(records[0]["plan"])
+            factory.recover(identity=identity, workspace=Path(task["workspace"]),
+                spec_sha256=child_spec(rec), grant_sha256=task["execution_session"]["invocation_policy"]["grant_sha256"],
+                plan_sha256=saved.hash)
+        return factory, task
+
+    def recover_local_result(self, rec, result_path):
+        if not self.modern_work(rec):
+            return False
+        from .work_configuration import recover_host_handoff
+        from .work_cycle import WorkPhase
+        plan = self.store.read("plan", digest(binding(child_task(rec))))
+        factory, task = self.recover_work(rec, plan)
+        cycle = factory.cycle(child_identity(rec))
+        if cycle.phase not in {WorkPhase.HYGIENE, WorkPhase.HANDOFF}:
+            return False
+        port = recover_host_handoff(factory, task, cycle, plan)
+        if Path(port.slot.path) != Path(result_path):
+            raise EvidenceError("original child result slot path changed")
+        requests = [key for key,value in cycle.verification_requests.items() if value is not None
+                    and value["status"] == "pass" and value.get("tree_sha256") == cycle.verified_tree]
+        if not requests:
+            raise EvidenceError("original passed child handoff request is missing")
+        port.deliver(cycle, requests[-1])
+        return True
+
     def instructions(self,rec):
         task=child_task(rec)
         plan=self.store.read("plan",digest(binding(task)))
         validate_plan(plan)
+        if self.modern_work(rec):
+            return ("\nHOST CHILD WORK CONTRACT: Use herdr_verify_work with a stable request_id and a handoff declaration. "
+                "The host runs the frozen oracle, preserves hooks, seals the exact tested local artifact and submits the original result. "
+                "PASS ends implementation; pending independent CI/review never starts another economic attempt.\n"
+                "Frozen completion plan: " + canonical(plan).decode() + "\n")
         artifact={"task_id":rec.node.id,"attempt":rec.attempts,"base_sha":plan["base_sha"],
             "commit_sha":"<exact result commit>","result_sha":"<sealed ArtifactRef SHA256>",
             "changed_files":["<exact changed files>"],"branch":"<isolated task branch>"}
@@ -175,7 +266,22 @@ class ChildCompletionAuthority:
             result=self.collector(*args)
             require_child_workspace(rec)
             return result
-        bundle=accept_artifact(task,candidate,plan,self.store,Path(workspace),collect,result_payload_sha256=payload_hash)
+        work_factory = cycle = invocation_verifier = None
+        if self.modern_work(rec):
+            work_factory, work_task = self.recover_work(rec, plan)
+            cycle = work_factory.before_completion(child_identity(rec), payload)
+            invocation_verifier = work_factory.result_authority.verifier(
+                work_task, payload, plan, work_plan_sha256=cycle.plan.hash)
+            from agent_completion_evidence import collect_local_handoff
+            def collect(*args):
+                require_child_workspace(rec)
+                result = collect_local_handoff(*args)
+                require_child_workspace(rec)
+                return result
+        bundle=accept_artifact(task,candidate,plan,self.store,Path(workspace),collect,result_payload_sha256=payload_hash,
+                               invocation_verifier=invocation_verifier)
+        if cycle is not None:
+            cycle.handed_off(bundle["bundle_hash"])
         receipt=AcceptedChildReceipt(2,child_identity(rec).to_json(),payload_hash,bundle["bundle_hash"],
             plan["plan_hash"],plan["spec_hash"],plan["policy_hash"],bundle["level"])
         receipt.validate(rec,payload_hash)

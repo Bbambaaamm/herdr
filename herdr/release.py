@@ -44,6 +44,8 @@ PAYLOAD_PATHS = (
     "docs/architecture/CONTEXT_MEMORY.md",
     "docs/architecture/INVOCATION_POLICY_LAUNCH.md",
     "docs/architecture/COMPLETION_EVIDENCE.md",
+
+    "docs/architecture/WORK_NODE_CONTRACT.md",
     "integrations/search-router",
     "provenance/external-runtime-dependency.txt",
 )

@@ -540,8 +540,13 @@ def _terminalize_from_result_locked(
 
     if status == "completed" and (not blocker or blocker.lower() in {"none", "null"}):
         try:
-            accepted = (verify_completion(ROOT, task, result) if verification_applies(task)
-                        else {"level": "legacy_unverified_result"})
+            worker = _worker_bridge()
+            if worker.modern_work_contract(task):
+                worker.ROOT = ROOT
+                accepted = worker._verify_root_completion(task, result)
+            else:
+                accepted = (verify_completion(ROOT, task, result) if verification_applies(task)
+                            else {"level": "legacy_unverified_result"})
         except EvidenceError as exc:
             waiting = record_verification_failure(task, exc)
             if waiting:

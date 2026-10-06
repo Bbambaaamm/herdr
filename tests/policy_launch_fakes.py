@@ -82,7 +82,9 @@ def install_child_completion_fixture(monkeypatch):
     from herdr.child_evidence import ChildCompletionAuthority,AcceptedChildReceipt,child_identity,child_spec
     from herdr.evidence import digest
     class Authority(ChildCompletionAuthority):
-        def __init__(self): pass
+        def __init__(self):
+            self.work_contracts = None  # Explicit historical transport fixture.
+            self.work_factories = {}
         def prepare(self,rec): pass
         def instructions(self,rec): return ""
         def accepted_handoff(self,rec,**kwargs): return None

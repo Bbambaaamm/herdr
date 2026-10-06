@@ -34,6 +34,7 @@ def main() -> int:
     from herdr.security import (
         InvocationGuard,
         InvocationIdentity,
+        PolicyDenied,
         NetworkAccess,
         ProcessPolicy,
         RiskClass,
@@ -312,6 +313,67 @@ def main() -> int:
                 if previous is None:os.environ.pop(key,None)
                 else:os.environ[key]=previous
 
+
+        # Real installed SDK dispatch; the host oracle transport is a fixture.
+        # Physical oracle/Git/Unix-peer behavior has separate Linux regressions.
+        from herdr.work_contract_host import WorkInvocationGuard
+        work_result = outside_file.parent / "work-result.json"
+        work_result.touch(mode=0o600)
+        work_slot = ResultSlot.bind(work_result, identity, "probe-work-result")
+        work_result_rule = replace(result_rule, result_slot=work_slot)
+        work_rule = ToolRule(tool="herdr_verify_work", risk=RiskClass.READ,
+                            allowed_arg_keys=("request_id","handoff"), requires_sandbox=True)
+        work_grant = replace(result_grant,
+            scope=replace(result_grant.scope,tools=("read_file",TOOL,"herdr_verify_work")),
+            tool_rules=tuple(rule for rule in result_grant.tool_rules if rule.tool != TOOL)
+                       + (work_result_rule, work_rule))
+        class HostTransportFixture:
+            phase = "WORK"
+            outcomes = {}
+            effects = 0
+            def __call__(self, identity_arg, grant_hash, *, kind, tool=None):
+                assert identity_arg == identity and grant_hash == work_grant.hash
+                if self.phase == "WORK" or kind == "tool" and tool in {"herdr_verify_work",TOOL}:
+                    return True
+                raise PolicyDenied("work_phase_forbids_invocation")
+            def verify(self, identity_arg, grant_hash, request_id, handoff=None):
+                assert identity_arg == identity and grant_hash == work_grant.hash
+                if request_id not in self.outcomes:
+                    self.effects += 1
+                    self.phase = "HANDOFF"
+                    self.outcomes[request_id] = {"status":"pass",
+                        "submission":{"status":"completed","evidence":[{"sdk_work_transport_fixture":True}],
+                                      "summary":"Observed installed SDK work/result dispatch"}}
+                return self.outcomes[request_id]
+        authority = HostTransportFixture()
+        phase_guard = WorkInvocationGuard(work_grant, work_authority=authority)
+        old_env = {key:os.environ.get(key) for key in (*IDENTITY_ENV.values(),"HERDR_DURABLE_SANDBOX")}
+        for field,key in IDENTITY_ENV.items():os.environ[key]=str(getattr(identity,field))
+        os.environ["HERDR_DURABLE_SANDBOX"]="1"
+        work_installation = install_hermes_guard(phase_guard)
+        try:
+            assert resolve_toolset("herdr_work") == ["herdr_verify_work"]
+            work_args={"request_id":"sdk-work-probe","handoff":{"pr_number":None}}
+            work_response=model_tools.handle_function_call("herdr_verify_work",work_args,
+                **{**common,"enabled_toolsets":["file","herdr_work","herdr_result"]})
+            observed=json.loads(work_response)
+            assert observed["status"]=="pass" and observed["result_delivery"]["submitted"],work_response
+            initial=work_result.read_bytes()
+            repeated=registry.dispatch("herdr_verify_work",work_args,task_id=identity.task_id)
+            assert json.loads(repeated)["result_delivery"]["submitted"] and authority.effects==1,repeated
+            assert work_result.read_bytes()==initial
+            after_pass=registry.dispatch("read_file",{"path":str(allowed_file)},task_id=identity.task_id)
+            assert "work_phase_forbids_invocation" in str(after_pass),after_pass
+            try:phase_guard.authorize_provider(None)
+            except PolicyDenied as exc:assert exc.reason=="work_phase_forbids_invocation"
+            else:raise AssertionError("PASS must stop provider calls")
+        finally:
+            work_installation.uninstall()
+            for key,value in old_env.items():
+                if value is None:os.environ.pop(key,None)
+                else:os.environ[key]=value
+        assert registry.get_entry("herdr_verify_work") is None
+
         # A granted local write goes through the pinned RootFDWorkspace facade,
         # not a re-opened model pathname. This proves the installed Hermes
         # registry/file_tools seam actually uses the #76 nofollow adapter.
@@ -445,6 +507,9 @@ def main() -> int:
             "exact_file_sdk_write_allowed": True,
             "exact_file_sdk_foreign_sibling_denied": True,
             "result_submission_sdk_dispatch": True,
+            "work_verification_sdk_dispatch": True,
+            "work_phase_after_pass_sdk_denied": True,
+            "work_tool_host_transport_fixture": True,
             "result_submission_one_inode_no_process": True,
             "granted_delegation_sdk_dispatch": True,
             "delegation_direct_handler_schema_guarded": True,

@@ -298,7 +298,7 @@ class WorkspaceManager:
         path = self.artifacts_dir / name
         if path.exists():
             existing = json.loads(path.read_text(encoding="utf-8"))
-            if existing != artifact.to_json():
+            if existing != json.loads(json.dumps(artifact.to_json())):
                 raise ArtifactIntegrityError("artifact record collision")
             return path
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)

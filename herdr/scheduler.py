@@ -109,11 +109,11 @@ class _DefaultConsumerPolicy:
     ROLE_TOOL_ALLOWLIST: ClassVar[dict[str, set[str]]] = {
         "reader": frozenset({"herdr_submit_result", "read_file", "search_files", "read"}),
         "writer": frozenset(
-            {"herdr_submit_result", "read_file", "search_files", "read", "patch", "write_file", "write"}
+            {"herdr_submit_result", "herdr_verify_work", "read_file", "search_files", "read", "patch", "write_file", "write"}
         ),
         "reviewer": frozenset(
             {
-                "herdr_submit_result", "read_file",
+                "herdr_submit_result", "herdr_verify_work", "read_file",
                 "search_files",
                 "read",
                 "patch",

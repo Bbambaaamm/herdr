@@ -529,7 +529,8 @@ class SecurityGrant:
                          "write_file": RiskClass.WORKSPACE_WRITE, "patch": RiskClass.WORKSPACE_WRITE,
                          "terminal": RiskClass.PROCESS, "execute_code": RiskClass.PROCESS,
                          "herdr_delegate_child": RiskClass.DELEGATION,
-                         "herdr_submit_result": RiskClass.RESULT_SUBMISSION}
+                         "herdr_submit_result": RiskClass.RESULT_SUBMISSION,
+                         "herdr_verify_work": RiskClass.READ}
         for rule in self.tool_rules:
             if rule.tool in {"read_file", "search_files", "write_file", "patch"}:
                 required = () if rule.tool == "patch" else ("path",)
@@ -550,6 +551,10 @@ class SecurityGrant:
                     if (not _roots_subset((rule.result_slot.path,),rule.allowed_roots)
                             or rule.result_slot.identity_sha256 != canonical_digest(self.identity.to_json())):
                         raise SecurityError("result slot identity/root mismatch")
+            if rule.tool == "herdr_verify_work" and (
+                    not rule.requires_sandbox or rule.requires_process or rule.path_fields
+                    or rule.credential_ref_fields or set(rule.allowed_arg_keys) not in ({"request_id"}, {"request_id", "handoff"})):
+                raise SecurityError("work verification requires a closed sandboxed rule")
             if rule.risk == RiskClass.PROCESS and (not rule.requires_process or not rule.requires_sandbox):
                 raise SecurityError("process tool requires process policy and sandbox")
             if rule.tool in built_in_risk and rule.risk != built_in_risk[rule.tool]:

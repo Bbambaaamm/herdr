@@ -61,7 +61,7 @@ def _child_toolsets(tools: Iterable[str], *, allow_delegation: bool = False) -> 
     selected = frozenset(tools)
     if "herdr_delegate_child" in selected and not allow_delegation:
         raise HerdrRuntimeError("child_nested_delegation_unavailable", "child-bound transport required")
-    if selected - (_CHILD_FILE_TOOLS | {"herdr_delegate_child", "herdr_submit_result"}):
+    if selected - (_CHILD_FILE_TOOLS | {"herdr_delegate_child", "herdr_submit_result", "herdr_verify_work"}):
         raise HerdrRuntimeError("child_toolset_unmapped", ",".join(sorted(selected)))
     # Hermes has toolset-level (not per-tool) filtering. The file bundle is
     # constrained further by the OS workspace mount below. Empty legacy canary
@@ -69,6 +69,7 @@ def _child_toolsets(tools: Iterable[str], *, allow_delegation: bool = False) -> 
     groups = (["file"] if selected & _CHILD_FILE_TOOLS else [])
     if "herdr_delegate_child" in selected: groups.append("herdr_delegation")
     if "herdr_submit_result" in selected: groups.append("herdr_result")
+    if "herdr_verify_work" in selected: groups.append("herdr_work")
     return ",".join(groups) if groups else "bot_room"
 
 
@@ -1214,6 +1215,12 @@ class HerdrChildRuntime:
                 tools=node.tools,permissions=node.permissions,**launch_arguments)
             if not isinstance(launch, PreparedPolicyLaunch) or launch.identity != identity:
                 raise HerdrRuntimeError("child_invocation_policy_identity_mismatch", lease.task_id)
+            from .child_evidence import ChildCompletionAuthority
+            authority=self.scheduler.completion_authority
+            if not isinstance(authority,ChildCompletionAuthority):
+                raise HerdrRuntimeError("child_completion_authority_missing",lease.task_id)
+            authority.prepare(record)
+            authority.preflight_work(record,launch)
             self._policy_launches[lease.task_id] = launch
             policy_env.update(launch.environment())
             self._preflight_child_provider()
@@ -1250,16 +1257,15 @@ class HerdrChildRuntime:
                 )
             ):
                 raise HerdrRuntimeError("child_sandbox_attestation_denied", lease.task_id)
-            from .child_evidence import ChildCompletionAuthority
-            authority=self.scheduler.completion_authority
-            if not isinstance(authority,ChildCompletionAuthority):
-                raise HerdrRuntimeError("child_completion_authority_missing",lease.task_id)
-            authority.prepare(record)
+            work_port = authority.prepare_work(record, launch)
             def publish_continuation(evidence):
-                return self.scheduler.attest_execution_sandbox(
+                accepted = self.scheduler.attest_execution_sandbox(
                     lease.task_id,run_token,lease.agent_id,pane_id,marker,
                     sandbox_pid=int(proof["sandbox_pid"]),policy_sha256=str(proof["policy_sha256"]),
                     invocation_policy=evidence)
+                if accepted and work_port is not None:
+                    work_port.task["execution_session"] = authority._work_task(record, work_port.plan)["execution_session"]
+                return accepted
             launch.set_continuation_sink(publish_continuation)
             launch.arm_bootstrap()
             self.scheduler.mark_pre_delivery_agent_start(lease.task_id)

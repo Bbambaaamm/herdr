@@ -24,6 +24,8 @@ FILES = (
     Path("docs/architecture/INVOCATION_POLICY_LAUNCH.md"),
     Path("docs/architecture/COMPLETION_EVIDENCE.md"),
     Path("docs/architecture/PROMPT_RUNTIME.md"),
+
+    Path("docs/architecture/WORK_NODE_CONTRACT.md"),
     Path("package.json"),
     Path("package-lock.json"),
     Path("requirements-mcp.txt"),
