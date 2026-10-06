@@ -302,7 +302,8 @@ class HostLocalCommitter:
         owned_commits={e["commit_sha"] for e in ready}
         old = [e for e in ready if e["tree_sha256"]==cycle.verified_tree]
         pending = [e for e in events if e["event"] == "work_local_commit_requested"
-                   and e["private_repository"] not in retired|completed]
+                   and e["private_repository"] not in retired|completed
+                   and e["tree_sha256"]==cycle.verified_tree]
         if old:
             record = old[-1]; private = Path(record["private_repository"])
             require(private.parent == self.storage and private.resolve(strict=True) == private,
@@ -404,7 +405,8 @@ class HostLocalCommitter:
                         "--setenv", "PATH", "/usr/bin:/bin", "--setenv", "HOME", "/tmp",
                         "--setenv", "GIT_CONFIG_NOSYSTEM", "1", "--setenv", "GIT_CONFIG_GLOBAL", "/dev/null",
                         "--setenv", "GIT_LITERAL_PATHSPECS", "1", "--setenv", "LANG", "C.UTF-8",
-                        "--seccomp", str(filter_fd), "--", "/usr/bin/python3", "-I", "-S", "-c", _BOOTSTRAP, canonical(cfg).decode()]
+                        "--seccomp", str(filter_fd), "--", str(Path("/usr/bin/python3").resolve()),
+                        "-I", "-S", "-c", _BOOTSTRAP, canonical(cfg).decode()]
                 output, status, limited, duration = HostCheckRunner._execute(
                     argv, self.policy, (objects, work_fd, hooks_fd, config_fd, filter_fd,runtime.fd))
                 runtime.verify()

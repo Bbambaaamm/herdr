@@ -65,6 +65,8 @@ def test_many_long_check_ids_fit_the_sealed_handoff_transport(boundary_workspace
     # A transport-sized stress fixture preserves the real sealed host artifact.
     many={**outcome,"checks":[{**outcome["checks"][0],"check_id":str(i).zfill(64)} for i in range(32)]}
     many["evidence_sha256"]=digest(many["checks"])
+    # Explicit host-owned transport fixture, not a 32-oracle execution claim.
+    cycle.verification_requests["original"]=many
     response=port.complete(cycle,"original",many)
     assert len(canonical(response))<=8191 and response["check_count"]==32
     assert response["evidence_sha256"]==many["evidence_sha256"] and "checks" not in response
@@ -388,3 +390,60 @@ def test_expired_dispatch_does_not_terminate_the_listener(tmp_path,monkeypatch):
     assert authority.dispatch_work_connection(None,None) is True
     assert authority.dispatch_work_connection(None,None) is True
     assert len(calls)==2
+
+def test_stale_pending_hygiene_tree_does_not_block_fresh_pass(boundary_workspace,monkeypatch):
+    from herdr.check_runner import HostCheckRunner
+    port,cycle,guard,result,task,plan,observed,log=ready(boundary_workspace,monkeypatch)
+    oracle=HostCheckRunner(port.committer.policy.environment,boundary_workspace/"host"/"checks",git=cycle.git)
+    port.prepare_request(cycle,"old-pending",{"pr_number":None})
+    outcome=cycle.request_verification("old-pending",oracle)
+    original=HostCheckRunner._execute;fired=[]
+    def late_write(*args,**kwargs):
+        response=original(*args,**kwargs)
+        if not fired:
+            fired.append(True)
+            with (cycle.root/"result.py").open("a") as stream:stream.write("\n# pending late write\n")
+        return response
+    monkeypatch.setattr(HostCheckRunner,"_execute",staticmethod(late_write))
+    with pytest.raises(Exception):port.complete(cycle,"old-pending",outcome)
+    events=cycle._events()
+    assert any(e["event"]=="work_local_commit_requested" for e in events)
+    assert not any(e["event"]=="work_local_commit_ready" for e in events)
+    with pytest.raises(Exception):port.complete(cycle,"old-pending",outcome)
+    cold=WorkCycle(cycle.plan,cycle.root,log,git=cycle.git)
+    assert cold.phase is WorkPhase.VERIFY and cold.verification_open
+    port.prepare_request(cold,"fresh-pending",{"pr_number":None})
+    fresh=cold.request_verification("fresh-pending",oracle)
+    assert port.complete(cold,"fresh-pending",fresh)["status"]=="pass"
+    port.deliver(cold,"fresh-pending")
+    assert result.read_bytes() and git(cold.root,"rev-parse","HEAD^")==cold.plan.base_sha
+
+
+def test_stale_pass_cannot_capture_new_tree_or_origin_request(boundary_workspace,monkeypatch):
+    from herdr.check_runner import HostCheckRunner
+    port,cycle,guard,result,task,plan,observed,log=ready(boundary_workspace,monkeypatch)
+    oracle=HostCheckRunner(port.committer.policy.environment,boundary_workspace/"host"/"checks",git=cycle.git)
+    port.prepare_request(cycle,"old-pass",{"pr_number":None})
+    old=cycle.request_verification("old-pass",oracle)
+    with (cycle.root/"result.py").open("a") as stream:stream.write("\n# new verified content\n")
+    cycle.invalidate_if_live_changed("test_original_changed")
+    cold=WorkCycle(cycle.plan,cycle.root,log,git=cycle.git)
+    port.prepare_request(cold,"fresh-pass",{"pr_number":None})
+    fresh=cold.request_verification("fresh-pass",oracle)
+    assert cold.request_verification("old-pass",oracle)==old and old["tree_sha256"]!=fresh["tree_sha256"]
+    with pytest.raises(WorkContractError,match="current-tree"):port.complete(cold,"old-pass",old)
+    assert result.read_bytes()==b"" and git(cold.root,"rev-parse","HEAD")==cold.plan.base_sha
+    assert port.complete(cold,"fresh-pass",fresh)["tree_sha256"]==cold.verified_tree
+    port.deliver(cold,"fresh-pass")
+    assert result.read_bytes()
+
+
+def test_hygiene_executes_approved_resolved_interpreter_without_alias(boundary_workspace):
+    def resolved_only(environment):
+        return replace(environment,runtime_aliases=tuple(row for row in environment.runtime_aliases
+                                                         if row[0]!="/usr/bin/python3"))
+    committer,cycle,work,log=fixture(boundary_workspace,environment_transform=resolved_only)
+    assert all(row[0]!="/usr/bin/python3" for row in committer.policy.environment.runtime_aliases)
+    artifact=committer(cycle)
+    assert artifact.commit_sha!=cycle.plan.base_sha and cycle.phase is WorkPhase.HANDOFF
+    assert WorkCycle(cycle.plan,work,log,git=cycle.git).phase is WorkPhase.HANDOFF

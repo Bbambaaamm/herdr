@@ -112,3 +112,12 @@ pre-effect reservation was consumed at zero or release it as a new operation.
 Protected budget admission validates the exact root-to-selected ancestor chain before opening a ledger. Each baseline or immutable verification/hygiene request shares one 120-second host-overhead admission charge introduced by #86; individual check/hygiene reservations hold their own subprocess allowances. Full host elapsed measurements are not inferred from subprocess proof duration: the shared overhead remains UNKNOWN time. The generic historical checker retains its original quote/measurement semantics when no new host-overhead profile is supplied.
 
 Cold factory recovery reconciles original hygiene operations only from durable original invalidation/ready proofs before another checker can reserve concurrency. Reconciliation creates no new operation and retains the original UNKNOWN time charge.
+
+Implementation attempt ceilings count descendants at every ancestor and use the
+same serialized admission/replay path; resume cannot erase an exhausted ancestor.
+Historical work-budget-1 permits only its original lifecycle counter defaults,
+while richer versioned profiles bind every counter into the allocation hash.
+The model effect seam rechecks the exact request, quote, allocation and series
+binding before the original claim. SDK deadline expiry rearms the alarm and
+rejects a late returned callback even if SDK code caught the first exception;
+the original operation remains UNKNOWN and is not settled by that return.

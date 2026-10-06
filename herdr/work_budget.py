@@ -106,6 +106,10 @@ class BudgetLimits:
         token(self.consumer_policy_version)
         for key in _COUNTERS:
             integer(getattr(self,"max_"+key),maximum=4096)
+        if self.consumer_policy_version=="work-budget-1":
+            defaults=(0,0,0,0,0,1,1,64)
+            require(all(getattr(self,"max_"+key)==value for key,value in zip(_COUNTERS,defaults)),
+                    "historical counter defaults require work-budget-2 for changes")
         if self.max_implementation_attempts!=3:
             sha(self.attempt_override_reference)
 
@@ -611,10 +615,17 @@ class WorkBudgetAuthority:
         require(found is not None,"new host checker failure required")
         return found
 
+    def _attempt_used(self,state,allocation_id):
+        return sum(len(rows) for child,rows in state["attempts"].items()
+                   if allocation_id in self._ancestors(state,child))
+
+    def _require_attempt_capacity(self,state,allocation_id):
+        for ancestor in self._ancestors(state,allocation_id):
+            require(self._attempt_used(state,ancestor)<state["allocations"][ancestor]["allocation"].limits.max_implementation_attempts,
+                    "implementation_attempts_exhausted")
+
     def _validate_attempt(self,state,allocation_id,attempts,event):
-        allocation=state["allocations"][allocation_id]["allocation"]
-        require(len(attempts)<allocation.limits.max_implementation_attempts,
-                "implementation_attempts_exhausted")
+        self._require_attempt_capacity(state,allocation_id)
         require(all(x["plan_sha256"]==event["plan_sha256"] for x in attempts),
                 "repair cannot replace the approved work plan")
         if attempts:
@@ -923,8 +934,7 @@ class WorkBudgetAuthority:
             expected={StopScope.TASK:identity.task_id,StopScope.EXECUTOR:identity.agent_id,
                       StopScope.CONSUMER:identity.consumer}
             require(scope is StopScope.PROVIDER or stop["target"]==expected[scope],"resume stop scope mismatch")
-            require(len(state["attempts"].get(allocation_id,[])) <
-                    allocation["allocation"].limits.max_implementation_attempts,"implementation attempts exhausted")
+            self._require_attempt_capacity(state,allocation_id)
             now=self._now(state)
             require(host_approval(stop,identity,valid_grant_sha256) is True,"resume conditions or grant not valid")
             # Check remaining limits without resetting any consumption.
@@ -965,7 +975,7 @@ class WorkBudgetAuthority:
             used,inflight,unknown=self._charged(state,allocation_id)
             return {"version":1,"allocation_id":allocation_id,"charged_upper_bounds":used,
                 "inflight":inflight,"unknown_measurements":sorted(unknown),
-                "implementation_attempts":len(state["attempts"].get(allocation_id,[])),
+                "implementation_attempts":self._attempt_used(state,allocation_id),
                 "fallbacks":sum(len(rows) for (child,kind),rows in state["alternatives"].items()
                     if kind==FailureKind.PROVIDER.value and allocation_id in self._ancestors(state,child)),
                 "variants":self._count_markers(state,allocation_id,"variants"),
@@ -1086,11 +1096,16 @@ class BudgetModelPort:
                 "model grant or work phase invalid")
         guard.authorize_provider(request)
 
-    def reserve(self,request,*,guard,cycle):
-        self._authorize(request,guard,cycle)
+    def _reservation(self,request):
         selected=self.quote(request)
         require(isinstance(selected,ModelReservation) and selected.provider==request.provider,
                 "trusted model price upper bound and matching route required")
+        return ModelReservation(digest({"quote_semantic_key":selected.semantic_key,"request":asdict(request)}),
+                                selected.demand,selected.provider)
+
+    def reserve(self,request,*,guard,cycle):
+        self._authorize(request,guard,cycle)
+        selected=self._reservation(request)
         return self.authority.reserve(allocation_id=self.allocation.allocation_id,
             semantic_key=selected.semantic_key,identity=self.identity,plan_sha256=self.plan_sha256,
             provider=selected.provider,demand=selected.demand,
@@ -1102,7 +1117,16 @@ class BudgetModelPort:
         old=self.authority.reconcile(operation_id)
         require(old["identity"]==self.identity.to_json() and old["plan_sha256"]==self.plan_sha256
                 and old["provider"]==request.provider,"physical model operation binding changed")
-        require(self.authority.claim_start(operation_id),"model operation already started; reconcile original")
+        selected=self._reservation(request)
+        with self.authority._serialized():
+            reserved=self.authority._state()["operations"][operation_id]
+            binding={"allocation_id":self.allocation.allocation_id,"semantic_key":selected.semantic_key,
+                     "identity":self.identity.to_json(),"plan_sha256":self.plan_sha256,
+                     "provider":selected.provider,"demand":asdict(selected.demand),"operation_kind":"model",
+                     "variant_sha256":self.variant_sha256,"trial_sha256":self.trial_sha256}
+            require(all(reserved[key]==value for key,value in binding.items()),
+                    "physical model reservation or request binding changed")
+            require(self.authority.claim_start(operation_id),"model operation already started; reconcile original")
         return self.authority.reconcile(operation_id)
 
     def reconcile(self,operation_id):

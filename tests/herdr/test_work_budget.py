@@ -760,3 +760,75 @@ def test_multiple_checks_share_one_phase_overhead_ceiling_and_cold_charge(tmp_pa
     before=log._path.read_bytes()
     reserve_host_phase_overhead(cold,alloc,plan,"verification:original",require_existing=True)
     assert log._path.read_bytes()==before and cold.snapshot(alloc.allocation_id)["inflight"]==0
+
+
+def test_parent_attempt_ceiling_serializes_descendants_and_survives_cold_replay(tmp_path):
+    parent=allocation("attempt-parent")
+    children=[allocation("attempt-child-"+str(i),parent.allocation_id) for i in range(3)]
+    rows={row.work_key:row for row in [parent,*children]}
+    log=AuditLog(tmp_path/"host"/"audit.jsonl")
+    auth=WorkBudgetAuthority(audit_log=log,authorize=lambda **kw:rows[kw["work_key"]],clock_ms=lambda:1000)
+    for row in rows.values():
+        auth.open(consumer=row.consumer,work_key=row.work_key,lineage_key=row.lineage_key,
+                  authorization_reference=row.authorization_reference)
+    begin(auth,parent,identity=identity(task_id="parent"))
+    begin(auth,children[0],identity=identity(task_id="first-child"))
+    def last_slot(child):
+        try:return begin(auth,child,identity=identity(task_id=child.work_key))
+        except BudgetBlocked as exc:return exc
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results=list(pool.map(last_slot,children[1:]))
+    assert sum(not isinstance(row,BudgetBlocked) for row in results)==1
+    assert auth.snapshot(parent.allocation_id)["implementation_attempts"]==3
+    cold=WorkBudgetAuthority(audit_log=AuditLog(log._path),authorize=lambda **kw:pytest.fail("no refill"),
+                             clock_ms=lambda:1000)
+    assert cold.snapshot(parent.allocation_id)["implementation_attempts"]==3
+    assert sum(cold.snapshot(row.allocation_id)["implementation_attempts"] for row in children)==2
+    failure_proof=failure(label="new-parent-repair")
+    cold.record_failure(parent.allocation_id,failure_proof)
+    with pytest.raises(BudgetBlocked,match="attempts_exhausted"):
+        begin(cold,parent,identity=identity(task_id="parent"),reason_code="fix_checker",
+              failure_check_sha256=failure_proof.check_sha256,diff_sha256=h("repair"),
+              changed_files=1,changed_lines=1)
+
+
+@pytest.mark.parametrize("field,value",[("max_candidate_executions",4096),("max_tool_fallbacks",0),
+                                        ("max_delivery_reconciliations",65)])
+def test_historical_budget_hash_rejects_nondefault_counter_authority(field,value):
+    original=allocation()
+    with pytest.raises(BudgetBlocked,match="historical counter defaults"):
+        replace(original,limits=replace(original.limits,**{field:value}))
+    richer=replace(original,limits=replace(original.limits,consumer_policy_version="work-budget-2",**{field:value}))
+    other=replace(richer,limits=replace(richer.limits,**{field:value-1 if value else 1}))
+    assert richer.hash!=other.hash
+
+
+@pytest.mark.parametrize("changed",["demand","semantic","request"])
+def test_model_effect_rechecks_original_request_and_quote_before_claim(tmp_path,monkeypatch,changed):
+    from herdr.work_budget import BudgetModelPort,ModelReservation
+    from herdr.security import InvocationGuard,ProviderRequest
+    from herdr.capability import DataClass,Egress,Retention,Training
+    factory,root,plan,granted,log=budget_factory_fixture(tmp_path)
+    cycle=factory.prepare(identity=plan.identity,workspace=root,grant=granted,spec_sha256=plan.spec_sha256)
+    auth=factory.budget_authority
+    alloc=factory.allocations[digest(plan.identity.to_json())]
+    guard=InvocationGuard(granted)
+    request=ProviderRequest("provider-a","eu-central",DataClass.INTERNAL,Egress.REGION_BOUND,
+                            Retention.LIMITED,Training.EXCLUDED)
+    selected=[ModelReservation(h("original-model-seam"),Demand(100,1,100,100),request.provider)]
+    port=BudgetModelPort(authority=auth,allocation=alloc,identity=cycle.plan.identity,plan_sha256=cycle.plan.hash,
+                         grant_sha256=granted.hash,quote=lambda request:selected[0])
+    operation=port.reserve(request,guard=guard,cycle=cycle)
+    candidate=request
+    if changed=="demand":selected[0]=replace(selected[0],demand=Demand(200,1,200,200))
+    elif changed=="semantic":selected[0]=replace(selected[0],semantic_key=h("different-model-seam"))
+    else:
+        # Explicit policy fixture permits both routes; the budget must still bind the exact original request.
+        monkeypatch.setattr(guard,"authorize_provider",lambda request:True)
+        candidate=replace(request,region="eu-other")
+    with pytest.raises(BudgetBlocked,match="request binding changed"):
+        port.begin_effect(operation,candidate,guard=guard,cycle=cycle)
+    assert port.reconcile(operation)["started"] is False and port.reconcile(operation)["usage"] is None
+    selected[0]=ModelReservation(h("original-model-seam"),Demand(100,1,100,100),request.provider)
+    port.begin_effect(operation,request,guard=guard,cycle=cycle)
+    assert port.reconcile(operation)["started"] is True

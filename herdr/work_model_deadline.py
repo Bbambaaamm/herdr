@@ -2,6 +2,7 @@
 from contextlib import contextmanager
 import signal
 import threading
+import time
 from .security import PolicyDenied
 
 @contextmanager
@@ -11,11 +12,19 @@ def model_deadline(milliseconds):
             or signal.getitimer(signal.ITIMER_REAL)!=(0.0,0.0)):
         raise PolicyDenied("budgeted_transport_deadline_unavailable")
     previous=signal.getsignal(signal.SIGALRM)
+    deadline=time.monotonic()+milliseconds/1000
+    timed_out=False
     def expired(signum,frame):
+        nonlocal timed_out
+        timed_out=True
+        signal.setitimer(signal.ITIMER_REAL,0.01)
         raise PolicyDenied("budgeted_transport_timeout_reconcile_original")
     signal.signal(signal.SIGALRM,expired)
     signal.setitimer(signal.ITIMER_REAL,milliseconds/1000)
-    try:yield
+    try:
+        yield
+        if timed_out or time.monotonic()>=deadline:
+            raise PolicyDenied("budgeted_transport_timeout_reconcile_original")
     finally:
         signal.setitimer(signal.ITIMER_REAL,0)
         signal.signal(signal.SIGALRM,previous)

@@ -170,3 +170,18 @@ def test_exact_ancestor_chain_charges_the_declared_parent_ceiling(tmp_path):
         bound.budget_authority.reserve(allocation_id=child.allocation_id,semantic_key=digest("parent-capped"),
             identity=item.identity,plan_sha256=plan.hash,provider="provider-a",demand=Demand(1,1,1,6))
     assert bound.budget_authority.snapshot(parent.allocation_id)["inflight"]==0
+
+
+def test_caught_sdk_alarm_cannot_settle_overlong_original_operation(tmp_path):
+    factory,root,plan,grant,cycle,raw,allocation,quote=approved_factory(tmp_path)
+    original=factory.budget_effect(grant.identity,grant.hash,"start",model_request(quote))
+    caught=[]
+    with pytest.raises(PolicyDenied,match="reconcile_original"):
+        with model_deadline(20):
+            until=time.monotonic()+0.09
+            while time.monotonic()<until:
+                try:time.sleep(0.01)
+                except OSError as exc:caught.append(exc)
+    assert len(caught)>=2 and signal.getitimer(signal.ITIMER_REAL)==(0,0)
+    assert factory.budget_authority.reconcile(original["operation_id"])["usage"] is None
+    assert factory.budget_authority.snapshot(allocation.allocation_id)["inflight"]==1
