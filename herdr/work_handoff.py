@@ -102,7 +102,7 @@ class HostWorkHandoff:
         key = self._key(cycle, request_id)
         intent = self.store.read("work-handoff-intent", key)
         declaration = intent["handoff"]
-        artifact = self.committer(cycle)
+        artifact = self._budgeted_commit(cycle,request_id)
         raw = self._submission(artifact, declaration)
         payload = payload_for_slot(self.identity, self.slot, raw)
         from .work_lifetime import require_work_time
@@ -116,6 +116,45 @@ class HostWorkHandoff:
                   "submission": raw, "local_receipt_sha256": receipt}
         require(len(canonical(result)) <= 8191, "work handoff response exceeds bound")
         return result
+
+    def _budgeted_commit(self,cycle,request_id):
+        authority=getattr(self,"budget_authority",None)
+        if authority is None:return self.committer(cycle)
+        from .work_budget import Demand,Usage,reserve_host_phase_overhead,reconcile_known_hygiene
+        allocation=self.budget_allocation
+        require(allocation is not None and cycle.plan.budget_reference==allocation.hash,
+                "local hygiene budget binding changed")
+        from .work_budget import hygiene_semantic,hygiene_generation_events
+        semantic=hygiene_semantic(cycle.plan,cycle.verified_tree,self.committer.policy.hash,request_id)
+        from .work_cycle import WorkPhase
+        reconcile_known_hygiene(authority,allocation,cycle)
+        reserve_host_phase_overhead(authority,allocation,cycle.plan,"verification:"+request_id,
+            require_existing=cycle.phase in {WorkPhase.HANDOFF,WorkPhase.FINISHED})
+        if cycle.phase in {WorkPhase.HANDOFF,WorkPhase.FINISHED}:
+            with authority._serialized():
+                require(digest({"allocation_id":allocation.allocation_id,"semantic_key":semantic})
+                        in authority._state()["operations"],"original hygiene reservation unavailable")
+        operation=authority.reserve(allocation_id=allocation.allocation_id,semantic_key=semantic,
+            identity=self.identity,plan_sha256=cycle.plan.hash,provider="offline-hygiene",
+            demand=Demand((self.committer.policy.timeout_seconds+13)*1000,0,0,0),
+            operation_kind="hygiene")
+        # The committer itself resumes only its original durable intent/ref.
+        # An unknown hook delivery cannot become another hook execution.
+        if not authority.claim_start(operation):
+            original=authority.reconcile(operation)
+            require(original["usage"] is not None or any(event["event"]=="work_local_commit_requested"
+                    and event["tree_sha256"]==cycle.verified_tree and generation==request_id
+                    for event,generation in hygiene_generation_events(cycle)),
+                    "hygiene delivery uncertain; reconcile original intent")
+        try:
+            artifact=self.committer(cycle)
+        except Exception:
+            reconcile_known_hygiene(authority,allocation,cycle)
+            raise
+        old=authority.reconcile(operation)
+        if old["usage"] is None:
+            authority.settle(operation,Usage(None,0,0,0,artifact.result_sha))
+        return artifact
 
     def deliver(self, cycle, request_id):
         """Resume the exact host-directed handoff without any model or hook retry."""

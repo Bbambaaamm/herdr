@@ -434,6 +434,10 @@ HOST_WORK_FACTORIES = {}
 
 def modern_work_contract(task):
     value=task.get("work_contract_version")
+    if "work_budget_version" in task:
+        budget=task["work_budget_version"]
+        if type(budget) is not int or budget!=1 or value is None:
+            raise EvidenceError("task_work_budget_version_unsupported")
     if value is None:
         return False
     if type(value) is not int or value!=1:
@@ -787,6 +791,7 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
             bind_root_handoff(work_factory, task, launch, cycle)
             launch.mount.bootstrap.work_authority = work_factory.authorize_invocation
             launch.mount.bootstrap.work_verify = work_factory.verify_request
+            launch.mount.bootstrap.work_budget = work_factory.budget_effect
             persist_execution_session(task)
         def publish_continuation(evidence):
             session["invocation_policy"]=evidence

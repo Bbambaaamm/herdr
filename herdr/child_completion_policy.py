@@ -24,7 +24,7 @@ def require(ok, reason):
 
 def validate_contracts(value):
     require(isinstance(value, dict) and set(value) == {"version", "base_sha", "children"}
-        and type(value["version"]) is int and value["version"] in {1, 2}
+        and type(value["version"]) is int and value["version"] in {1, 2, 3}
         and isinstance(value["base_sha"], str) and GIT_SHA.fullmatch(value["base_sha"]),
         "closed preapproved child contracts required")
     children = value["children"]
@@ -36,7 +36,10 @@ def validate_contracts(value):
             and entry["kind"] in {"coding", "research", "review"},
             "child contract specification or kind invalid")
         kind = entry["kind"]
-        fields = {"kind", "criteria"} | ({"work_contract_version"} if value["version"] == 2 and kind == "coding" else set())
+        fields = {"kind", "criteria"} | ({"work_contract_version"} if value["version"] in {2,3} and kind == "coding" else set())
+        if value["version"]==3 and kind=="coding":fields.add("work_budget_version")
+        require("work_budget_version" not in fields or type(entry.get("work_budget_version")) is int
+                and entry["work_budget_version"]==1,"new child cumulative budget required")
         require(set(entry) == fields
             and ("work_contract_version" not in fields or type(entry["work_contract_version"]) is int
                  and entry["work_contract_version"] == 1),

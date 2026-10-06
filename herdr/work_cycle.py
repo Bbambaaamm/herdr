@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import difflib
 import copy
 import hashlib
 import json
@@ -310,10 +311,12 @@ def python_symbols(text):
 
 class WorkCycle:
     """Lifecycle guard on the existing ledger; no new queue or scheduler."""
-    def __init__(self, plan, root, audit_log, *, git=None):
+    def __init__(self, plan, root, audit_log, *, git=None, budget_authority=None):
         require(isinstance(plan, WorkPlan), "host work plan required")
         self.plan, self.root, self.audit_log = plan, Path(root), audit_log
         self.git = git or read_only_git(self.root)
+        self.budget_authority=budget_authority
+        self.repair_context=None
         self.phase, self.baseline, self.verified_tree = WorkPhase.PREPARE, None, None
         self.verified_checks, self.commit_sha = {}, None
         self.artifact, self.bundle_hash = None, None
@@ -401,6 +404,20 @@ class WorkCycle:
                 self._validate_check(proof,check,proof.tree_sha256)
                 self.phase = WorkPhase.VERIFY
                 self.verified_checks[proof.check_id] = event["check"]
+            elif kind == "work_repair":
+                require(self.phase is WorkPhase.VERIFY,"repair replay phase invalid")
+                from .work_budget import RepairPermit,WorkBudgetAuthority
+                require(isinstance(self.budget_authority,WorkBudgetAuthority),"durable repair budget authority missing")
+                raw=event["permit"]
+                permit=RepairPermit(**{**raw,"identity":InvocationIdentity.from_dict(raw["identity"])})
+                require(any(CheckResult(**x).hash==permit.failure_check_sha256
+                            for x in self.verified_checks.values()),"repair must bind the current failed check")
+                self.budget_authority.validate_repair_permit(permit,self,historical=True)
+                self.repair_context=event.get("repair_context")
+                self._validate_repair_context(self.repair_context,permit)
+                self.verified_checks,self.verified_tree={},None
+                self.verification_open=True
+                self.phase=WorkPhase.WORK
             elif kind == "work_pass":
                 require(self.phase is WorkPhase.VERIFY, "PASS replay phase invalid")
                 tree = event["tree_sha256"]
@@ -545,7 +562,10 @@ class WorkCycle:
 
     def verify(self, runner):
         require(self.phase in {WorkPhase.WORK,WorkPhase.VERIFY}, "implementation already ended")
+        require(not self.verified_checks, "failed check needs approved repair before another verification")
         snapshot = self.verify_scope()
+        if self.repair_context is not None:
+            self._verify_repair_delta(snapshot)
         tree = digest(snapshot)
         for check in self.plan.checks:
             proof = runner(check,self.root,self.plan,tree)
@@ -592,6 +612,101 @@ class WorkCycle:
         self._record("verification_finished", request_id=request_id, outcome=outcome)
         self.verification_requests[request_id] = outcome
         return outcome
+
+    def reopen_repair(self, *, allocation_id, failure, reason_code, diff_sha256,
+                      changed_files, changed_lines, repair_paths):
+        from .work_budget import Failure,FailureKind,WorkBudgetAuthority
+        require(self.phase is WorkPhase.VERIFY and isinstance(self.budget_authority,WorkBudgetAuthority),
+                "repair requires failed verification and durable host budget")
+        require(isinstance(failure,Failure) and failure.kind is FailureKind.IMPLEMENTATION
+                and any(CheckResult(**x).hash==failure.check_sha256 and
+                        (x["exit_code"]!=0 or x["truncated"]) for x in self.verified_checks.values()),
+                "repair requires current failed approved checker evidence")
+        require(isinstance(repair_paths,(tuple,list)) and 1<=len(repair_paths)<=8
+                and len(repair_paths)==len(set(repair_paths)) and len(repair_paths)<=changed_files,
+                "explicit bounded repair paths required")
+        require(not any(value is None for value in self.verification_requests.values()),
+                "uncertain verification must reconcile before repair")
+        snapshot=tree_snapshot(self.root,git=self.git)
+        require(digest(snapshot)==failure.tree_sha256,"failed repair inputs changed before authorization")
+        texts={}
+        for path in repair_paths:
+            relative(path)
+            require(path in snapshot and any(scope.covers(path) for scope in self.plan.files),
+                    "repair path outside original work scope")
+            texts[path]=self._repair_text(path)
+        context={"tree":snapshot,"texts":texts,"max_files":changed_files,"max_lines":changed_lines}
+        self.budget_authority.record_failure(allocation_id,failure)
+        permit=self.budget_authority.begin_implementation(allocation_id=allocation_id,
+            identity=self.plan.identity,plan_sha256=self.plan.hash,reason_code=reason_code,
+            failure_check_sha256=failure.check_sha256,diff_sha256=diff_sha256,
+            changed_files=changed_files,changed_lines=changed_lines)
+        self.budget_authority.validate_repair_permit(permit,self)
+        self._validate_repair_context(context,permit)
+        self._record("repair",permit=asdict(permit),repair_context=context)
+        self.repair_context=context
+        self.verified_checks,self.verified_tree={},None
+        self.verification_open=True
+        self.phase=WorkPhase.WORK
+        return permit
+
+    def _repair_text(self,path):
+        directory=os.open(self.root,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        fd=None
+        try:
+            fd=_open_relative(directory,path)
+            before=os.fstat(fd)
+            require(stat.S_ISREG(before.st_mode) and before.st_size<=65536,
+                    "bounded textual repair input required")
+            data=os.read(fd,65537)
+            after=os.fstat(fd)
+            require(len(data)==before.st_size and (before.st_dev,before.st_ino,before.st_size,
+                before.st_mtime_ns,before.st_ctime_ns)==(after.st_dev,after.st_ino,after.st_size,
+                after.st_mtime_ns,after.st_ctime_ns),"repair input changed while reading")
+            text=data.decode("utf-8")
+            require(len(text.splitlines())<=2048,"repair source line count exceeds bound")
+            return text
+        except UnicodeError as exc:
+            raise WorkContractError("binary repair requires a separate approved contract") from exc
+        finally:
+            if fd is not None: os.close(fd)
+            os.close(directory)
+
+    def _validate_repair_context(self,context,permit):
+        require(isinstance(context,dict) and set(context)=={"tree","texts","max_files","max_lines"}
+                and isinstance(context["tree"],dict) and isinstance(context["texts"],dict)
+                and 1<=len(context["texts"])<=context["max_files"]<=8
+                and type(context["max_lines"]) is int and 1<=context["max_lines"]<=200,
+                "repair baseline bounds invalid")
+        from .work_budget import FailureKind
+        with self.budget_authority._serialized():
+            state=self.budget_authority._state()
+            failure=self.budget_authority._failure(state,permit.allocation_id,permit.failure_check_sha256)
+            require(failure.kind is FailureKind.IMPLEMENTATION and digest(context["tree"])==failure.tree_sha256,
+                    "repair baseline differs from failed checker")
+        for path,text in context["texts"].items():
+            relative(path)
+            require(isinstance(text,str) and len(text.encode("utf-8"))<=65536
+                    and context["tree"].get(path,{}).get("sha256")==hashlib.sha256(text.encode("utf-8")).hexdigest()
+                    and any(scope.covers(path) for scope in self.plan.files),"repair baseline content invalid")
+
+    def _verify_repair_delta(self,current):
+        context=self.repair_context
+        previous=context["tree"]
+        changed={path for path in set(previous)|set(current) if previous.get(path)!=current.get(path)}
+        require(changed and changed<=set(context["texts"]) and len(changed)<=context["max_files"],
+                "repair escaped its bounded change paths")
+        lines=0
+        for path in changed:
+            require(path in current and path in previous and current[path]["mode"]==previous[path]["mode"],
+                    "repair cannot create/delete files or change modes under this contract")
+            after=self._repair_text(path)
+            require(hashlib.sha256(after.encode("utf-8")).hexdigest()==current[path]["sha256"],
+                    "repair changed during delta verification")
+            matcher=difflib.SequenceMatcher(None,context["texts"][path].splitlines(),after.splitlines(),autojunk=False)
+            for kind,a,b,c,d in matcher.get_opcodes():
+                if kind!="equal": lines+=(b-a)+(d-c)
+        require(1<=lines<=context["max_lines"],"repair exceeded its approved line budget")
 
     def invalidate_verification(self, reason):
         require(self.phase in {WorkPhase.HYGIENE,WorkPhase.VERIFY},

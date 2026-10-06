@@ -174,6 +174,9 @@ def inspect_discovery(workspace, paths, snapshot):
 def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG, git=None, recovery=False, spec_sha256=None):
     """Only standalone host code selects the protected configuration path."""
     from agent_completion_evidence import spec_digest
+    if "work_budget_version" in task:
+        require(type(task["work_budget_version"]) is int and task["work_budget_version"]==1,
+                "work budget version unsupported")
     raw = _read_configuration(configuration_path)
     policy_factory = build_host_policy_factory(configuration_path=configuration_path)
     require(raw == _read_configuration(configuration_path), "host configuration changed during work admission")
@@ -224,7 +227,7 @@ def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG
     names = {"spec_version", "policy_version", "base_sha", "files", "criteria", "checks",
              "budget_reference", "mode", "baseline_omission_reason", "phases", "prerequisite_commits",
              "purpose", "baseline_policy", "discovery_files", "planning"}
-    closed(definition, names | ({"hygiene"} if "hygiene" in definition else set()), "approved work definition")
+    closed(definition, names | ({"hygiene"} if "hygiene" in definition else set()) | ({"budget"} if "budget" in definition else set()), "approved work definition")
     hygiene = None
     if "hygiene" in definition:
         from .work_hygiene import LocalCommitPolicy
@@ -260,7 +263,7 @@ def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG
                 "host fills actual planning identity and discovery")
         planning.update(version=1, identity=identity.to_json(), spec_sha256=spec_sha256,
                         base_sha=definition["base_sha"], discovery=discovery.to_json())
-        data = {key: value for key, value in definition.items() if key not in {"discovery_files", "planning", "hygiene"}}
+        data = {key: value for key, value in definition.items() if key not in {"discovery_files", "planning", "hygiene", "budget"}}
         data["mode"] = WorkMode(data["mode"])
         data["files"] = tuple(FileScope(**item) for item in data["files"])
         data["checks"] = tuple(ValidationCheck(**item) for item in data["checks"])
@@ -272,6 +275,12 @@ def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG
 
     factory = HostWorkContractFactory(approve=approve, environment=environment,
                                       storage=storage / "checks", audit_log=_audit(storage / "events.jsonl"), git=git)
+    if "budget" in definition:
+        from .work_budget_configuration import bind_budget
+        bind_budget(factory,definition["budget"],storage=Path(raw["storage"]),
+                    writable_roots=policy_factory.writable_roots,recovery=recovery)
+    require(task.get("work_budget_version") != 1 or factory.budget_authority is not None,
+            "new coding work has no cumulative host budget")
     factory.host_admission = admitted
     factory.local_commit_policy = hygiene
     checks=tuple(ValidationCheck(**item) for item in definition["checks"])
@@ -338,6 +347,8 @@ def bind_root_handoff(factory, task, launch, cycle):
         {"version":1, "identity":cycle.plan.identity.to_json(), "work_plan_sha256":cycle.plan.hash,
          "completion_plan_hash":plan["plan_hash"], "slot":rule.result_slot.to_json(),
          "draft":draft.to_json(), "workspace_identity":workspace_identity})
+    port.budget_authority=factory.budget_authority
+    port.budget_allocation=factory.allocations.get(digest(cycle.plan.identity.to_json()))
     factory.bind_handoff(cycle.plan.identity, port)
     return port
 
@@ -360,6 +371,8 @@ def recover_host_handoff(factory, task, cycle, completion_plan):
         ArtifactRef(**record["draft"]), completion_plan=completion_plan, workspace_identity=record["workspace_identity"])
     port = HostWorkHandoff(identity=cycle.plan.identity, task=task, completion_plan=completion_plan,
         store=factory.result_authority.store, slot=ResultSlot.from_dict(record["slot"]), committer=committer)
+    port.budget_authority=factory.budget_authority
+    port.budget_allocation=factory.allocations.get(digest(cycle.plan.identity.to_json()))
     factory.bind_handoff(cycle.plan.identity, port)
     return port
 

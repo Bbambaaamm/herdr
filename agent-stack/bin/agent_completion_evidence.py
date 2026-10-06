@@ -286,6 +286,8 @@ def spec_digest(task: dict) -> str:
     keys=("repo", "issue", "kind", "prompt", "completion_kind", "spec_hash", "completion_contract", "completion_evidence", "child_completion_contracts")
     if "work_contract_version" in task:
         keys+=("work_contract_version",)
+    for marker in ("work_budget_version","child_work_budget_version"):
+        if marker in task: keys+=(marker,)
     if "child_work_contract_version" in task:
         keys+=("child_work_contract_version",)
     return digest({k:task.get(k) for k in keys})
@@ -497,8 +499,12 @@ def freeze_child_completion_contracts(root, task, parent_plan):
     validate_contracts(contracts)
     if task.get("child_work_contract_version") is not None:
         if (type(task["child_work_contract_version"]) is not int or task["child_work_contract_version"] != 1
-                or contracts["version"] != 2):
+                or contracts["version"] not in {2,3}):
             raise EvidenceError("new coding-child admission requires the versioned work catalogue")
+    if task.get("child_work_budget_version") is not None:
+        if (type(task["child_work_budget_version"]) is not int or task["child_work_budget_version"]!=1
+                or contracts["version"]!=3):
+            raise EvidenceError("new child admission requires cumulative budget catalogue")
     if task.get("repo")!=POLICY["repo"]:
         raise EvidenceError("child completion consumer verification policy is not configured")
     base=contracts["base_sha"]

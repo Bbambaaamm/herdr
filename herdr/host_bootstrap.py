@@ -109,6 +109,7 @@ class HostBootstrap:
         self._guard = threading.Lock()
         self.work_authority = None
         self.work_verify = None
+        self.work_budget = None
 
     @classmethod
     def create(cls, launch, *, storage, writable_roots):
