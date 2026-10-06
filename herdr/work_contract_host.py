@@ -56,7 +56,7 @@ class HostWorkContractFactory:
             from .work_lifetime import check_wall_seconds, require_grant_lifetime
             request=check_wall_seconds(plan,getattr(self,"local_commit_policy",None))
             require(request<=900,"complete host request exceeds bound")
-            require_grant_lifetime(grant,check_wall_seconds(plan)+request)
+            require_grant_lifetime(grant,check_wall_seconds(plan)+900)
             runner=HostCheckRunner(self.environment,self.storage,git=self.git)
             cycle=WorkCycle(plan,root,self.audit_log,git=self.git)
             from .work_lifetime import bounded_host_request

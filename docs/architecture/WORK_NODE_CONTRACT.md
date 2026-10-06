@@ -196,3 +196,5 @@ Unknown original hook/commit delivery still requires original evidence and does
 not authorize repeating hooks.
 
 Host request bounds now include a 120-second allowance for inventories, private Git construction, publication and receipt capture. A monotonic request deadline covers the complete protected callback; local reads, Git commands and publication gates consume that deadline. Admission never extends the original signed grant. Direct model result submissions stay denied in every work phase; only the verification handler opens an exact-payload internal submission context. Proven hook content invalidation retires its original private commit request; UNKNOWN delivery remains held. Formatter content promotion is not automatic.
+
+The fixed 900-second physical request deadline starts before peer/mount/request inspection and remains active through response send. The original grant is reserved for that entire bound before baseline/admission and rechecked at dispatch. One durable local-commit-invalidated event both retires the proven changed-content request and replays VERIFY; no crash window can reopen hygiene without new oracle evidence.
