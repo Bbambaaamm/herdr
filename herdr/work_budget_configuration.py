@@ -26,6 +26,11 @@ def bind_budget(factory, raw, *, storage, writable_roots=(), recovery=False):
     require(len(rows)==len(ancestors)+1 and all(row.consumer==selected.consumer
             and row.lineage_key==selected.lineage_key for row in rows.values()),
             "budget lineage is conflicting")
+    chain=(*ancestors,selected)
+    require(len({row.work_key for row in chain})==len(chain),"budget ancestry work key is ambiguous")
+    for index,row in enumerate(chain):
+        expected=None if index==0 else chain[index-1].allocation_id
+        require(row.parent_allocation_id==expected,"declared budget ancestry is not the exact parent chain")
     # The immutable host work key, rather than a task/session/name, locates the ledger.
     from .work_configuration import _private_directory, _audit
     directory=Path(storage)/"work-budget"/selected.lineage_key

@@ -109,4 +109,6 @@ existing signed grant covers the quoted callback deadline plus delivery margin.
 A failed lifetime check authorizes no model callback and does not pretend the
 pre-effect reservation was consumed at zero or release it as a new operation.
 
-The protected baseline/verification and hygiene reservations include the complete 120-second host-phase allowance introduced by #86. Full host elapsed measurements are not inferred from the subprocess proof duration: the time ceiling remains held explicitly as UNKNOWN. The generic historical checker keeps its original quote/measurement semantics when no new host-overhead profile is supplied.
+Protected budget admission validates the exact root-to-selected ancestor chain before opening a ledger. Each baseline or immutable verification/hygiene request shares one 120-second host-overhead admission charge introduced by #86; individual check/hygiene reservations hold their own subprocess allowances. Full host elapsed measurements are not inferred from subprocess proof duration: the shared overhead remains UNKNOWN time. The generic historical checker retains its original quote/measurement semantics when no new host-overhead profile is supplied.
+
+Cold factory recovery reconciles original hygiene operations only from durable original invalidation/ready proofs before another checker can reserve concurrency. Reconciliation creates no new operation and retains the original UNKNOWN time charge.

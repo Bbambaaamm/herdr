@@ -137,3 +137,36 @@ def test_protected_check_reservation_includes_host_work_time_and_holds_unknown(t
     state=factory.budget_authority.snapshot(allocation.allocation_id)
     assert state["charged_upper_bounds"]["work_ms"]>120000
     assert "work_ms" in state["unknown_measurements"]
+
+
+@pytest.mark.parametrize("fault",["orphan","skipped","reversed"])
+def test_declared_ancestor_chain_rejected_before_creating_ledger(tmp_path,fault):
+    factory,root,plan,item,cycle,raw,selected,quote=approved_factory(tmp_path)
+    parent=replace(selected,allocation_id=digest("parent-id"),work_key=digest("parent-work"))
+    middle=replace(selected,allocation_id=digest("middle-id"),work_key=digest("middle-work"),
+                   parent_allocation_id=parent.allocation_id)
+    child=replace(selected,parent_allocation_id=middle.allocation_id)
+    ancestors=[parent,middle]
+    if fault=="orphan":child=replace(child,parent_allocation_id=None)
+    elif fault=="skipped":child=replace(child,parent_allocation_id=parent.allocation_id)
+    else:ancestors=[middle,parent]
+    target=tmp_path/"unadmitted";target.mkdir(mode=0o700)
+    invalid={**raw,"allocation":asdict(child),"ancestors":[asdict(a) for a in ancestors]}
+    with pytest.raises(WorkContractError,match="exact parent chain"):
+        bind_budget(SimpleNamespace(),invalid,storage=target,writable_roots=(root,))
+    assert list(target.iterdir())==[]
+
+def test_exact_ancestor_chain_charges_the_declared_parent_ceiling(tmp_path):
+    from herdr.work_budget import Demand
+    factory,root,plan,item,cycle,raw,selected,quote=approved_factory(tmp_path)
+    parent=replace(selected,allocation_id=digest("parent-id"),work_key=digest("parent-work"),
+                   limits=replace(selected.limits,max_cost_microusd=5))
+    child=replace(selected,parent_allocation_id=parent.allocation_id)
+    target=tmp_path/"valid-chain";target.mkdir(mode=0o700)
+    bound=SimpleNamespace()
+    bind_budget(bound,{**raw,"allocation":asdict(child),"ancestors":[asdict(parent)]},
+                storage=target,writable_roots=(root,))
+    with pytest.raises(BudgetBlocked):
+        bound.budget_authority.reserve(allocation_id=child.allocation_id,semantic_key=digest("parent-capped"),
+            identity=item.identity,plan_sha256=plan.hash,provider="provider-a",demand=Demand(1,1,1,6))
+    assert bound.budget_authority.snapshot(parent.allocation_id)["inflight"]==0

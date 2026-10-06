@@ -38,7 +38,7 @@ def test_actual_unix_budget_peer_reserves_before_callback_and_reconciles_origina
     assert factory.budget_authority.snapshot(allocation.allocation_id)["inflight"]==0
     assert len(observed)>=4
 
-@pytest.mark.parametrize("changed_hook",[False,True])
+@pytest.mark.parametrize("changed_hook",[False,True,"crash"])
 def test_actual_hygiene_uses_existing_budget_and_never_reserves_second_commit(boundary_workspace,monkeypatch,changed_hook):
     import tests.herdr.test_work_hygiene as hygiene
     from tests.herdr.test_work_handoff import ready,committer_policy
@@ -51,7 +51,7 @@ def test_actual_hygiene_uses_existing_budget_and_never_reserves_second_commit(bo
             digest("lineage"),digest("approval"),BudgetLimits(1000000,1000000,5,10000,1000,1,1,1,1))
         authority=WorkBudgetAuthority(audit_log=AuditLog(root/"host"/"budget.jsonl"),authorize=lambda **kw:allocation)
         factory.budget_authority=authority;factory.budget_binding=lambda **kw:allocation
-        captured.update(authority=authority,allocation=allocation)
+        captured.update(authority=authority,allocation=allocation,factory=factory)
         return factory,workspace,replace(plan,budget_reference=allocation.hash),grant,log
     monkeypatch.setattr(hygiene,"factory_fixture",admitted)
     hook='found=0; while IFS= read -r row; do case "$row" in \'# formatted\') found=1;; esac; done < result.py; if [ "$found" = 0 ]; then printf \'\\n# formatted\\n\' >> result.py; fi' if changed_hook else "true"
@@ -63,7 +63,30 @@ def test_actual_hygiene_uses_existing_budget_and_never_reserves_second_commit(bo
         HostCheckRunner(committer_policy(port),boundary_workspace/"host"/"checks",git=cycle.git),"verification")
     outcome=cycle.request_verification("original",runner)
     if changed_hook:
-        with pytest.raises(ValueError,match="invalidated"):port.complete(cycle,"original",outcome)
+        if changed_hook=="crash":
+            original_settle=authority.settle
+            def crash_settle(operation,usage,**kwargs):
+                with authority._serialized():
+                    kind=authority._state()["operations"][operation]["operation_kind"]
+                if kind=="hygiene":raise SystemExit("crash before settle")
+                return original_settle(operation,usage,**kwargs)
+            monkeypatch.setattr(authority,"settle",crash_settle)
+            with pytest.raises(SystemExit):port.complete(cycle,"original",outcome)
+            assert authority.snapshot(allocation.allocation_id)["inflight"]==1
+            from herdr.work_contract_host import HostWorkContractFactory
+            cold_authority=WorkBudgetAuthority(audit_log=AuditLog(authority.audit_log._path),authorize=lambda **kw:allocation)
+            admitted=captured["factory"]
+            cold=HostWorkContractFactory(approve=admitted.approve,environment=admitted.environment,
+                storage=admitted.storage,audit_log=log,git=cycle.git,budget_authority=cold_authority,
+                budget_binding=admitted.budget_binding)
+            cold.local_commit_policy=port.committer.policy
+            cycle=cold.recover(identity=cycle.plan.identity,workspace=cycle.root,
+                spec_sha256=cycle.plan.spec_sha256,grant_sha256=cycle.plan.grant_sha256,plan_sha256=cycle.plan.hash)
+            authority=cold_authority;port.budget_authority=authority
+            runner=BudgetedCheckRunner(authority,allocation,
+                HostCheckRunner(committer_policy(port),boundary_workspace/"host"/"checks",git=cycle.git),"verification")
+        else:
+            with pytest.raises(ValueError,match="invalidated"):port.complete(cycle,"original",outcome)
         assert authority.snapshot(allocation.allocation_id)["inflight"]==0
         with (cycle.root/"result.py").open("a") as stream:stream.write("\n# formatted\n")
         port.prepare_request(cycle,"reverified",{"pr_number":None})

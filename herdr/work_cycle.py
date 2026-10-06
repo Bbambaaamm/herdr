@@ -708,6 +708,23 @@ class WorkCycle:
                 if kind!="equal": lines+=(b-a)+(d-c)
         require(1<=lines<=context["max_lines"],"repair exceeded its approved line budget")
 
+    def invalidate_verification(self, reason):
+        require(self.phase in {WorkPhase.HYGIENE,WorkPhase.VERIFY},
+                "verification invalidation phase invalid")
+        self._record("invalidate",reason=reason)
+        self.verified_tree,self.verified_checks=None,{}
+        self.verification_open=True
+        self.phase=WorkPhase.VERIFY
+
+    def invalidate_if_live_changed(self, reason):
+        if self.phase is not WorkPhase.HYGIENE or self.verified_tree is None:return False
+        try:
+            changed=digest(tree_snapshot(self.root,git=self.git))!=self.verified_tree
+        except Exception:
+            changed=True
+        if changed:self.invalidate_verification(reason)
+        return changed
+
     def committed(self, artifact):
         if self.phase in {WorkPhase.HANDOFF,WorkPhase.FINISHED}:
             require(isinstance(artifact,ArtifactRef) and json.loads(canonical(artifact.to_json())) == self.artifact,
@@ -718,13 +735,15 @@ class WorkCycle:
         require(artifact.task_id == self.plan.identity.task_id and artifact.base_sha == self.plan.base_sha,
                 "commit artifact belongs to another work plan")
         manager = WorkspaceManager(self.root,git=self.git)
-        manager.verify(artifact,self.root)
-        from .evidence import verify_committed_bytes
-        verify_committed_bytes(artifact,self.root,self.git)
-        if digest(self.verify_scope()) != self.verified_tree:
-            self._record("invalidate",reason="committed_tree_changed")
-            self.verified_tree, self.verified_checks, self.phase = None, {}, WorkPhase.VERIFY
-            raise WorkContractError("commit hook or hygiene changed tested content")
+        try:
+            manager.verify(artifact,self.root)
+            from .evidence import verify_committed_bytes
+            verify_committed_bytes(artifact,self.root,self.git)
+            require(digest(self.verify_scope())==self.verified_tree,
+                    "commit hook or hygiene changed tested content")
+        except Exception:
+            self.invalidate_if_live_changed("committed_tree_changed")
+            raise
         self._record("commit",commit_sha=artifact.commit_sha,artifact=artifact.to_json())
         self.artifact = json.loads(canonical(artifact.to_json()))
         self.commit_sha, self.phase = artifact.commit_sha, WorkPhase.HANDOFF

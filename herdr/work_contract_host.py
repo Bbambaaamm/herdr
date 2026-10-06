@@ -31,6 +31,10 @@ class HostWorkContractFactory:
         # Retain references already held by the worker while refreshing durable
         # state written by another host entry point.
         cycle.__dict__.update(restored.__dict__)
+        allocation=self.allocations.get(digest(identity.to_json()))
+        if self.budget_authority is not None and allocation is not None:
+            from .work_budget import reconcile_known_hygiene
+            reconcile_known_hygiene(self.budget_authority,allocation,cycle)
         return cycle,runner
 
     def prepare(self, *, identity, workspace, grant, spec_sha256):
@@ -76,8 +80,11 @@ class HostWorkContractFactory:
                 allocation=self.budget_authority.open(consumer=approved.consumer,work_key=approved.work_key,
                     lineage_key=approved.lineage_key,authorization_reference=approved.authorization_reference)
                 require(allocation==approved and plan.budget_reference==allocation.hash, 'work budget binding mismatch')
+                from .work_budget import reserve_host_phase_overhead
+                reserve_host_phase_overhead(self.budget_authority,allocation,plan,"baseline")
                 with bounded_host_request(check_wall_seconds(plan)):
-                    cycle.start(BudgetedCheckRunner(self.budget_authority,allocation,runner,'baseline',host_overhead_seconds=120))
+                    cycle.start(BudgetedCheckRunner(self.budget_authority,allocation,runner,'baseline',
+                        host_overhead_seconds=120,phase_key="baseline"))
                 if cycle.phase is WorkPhase.WORK:
                     self.budget_authority.begin_implementation(allocation_id=allocation.allocation_id,identity=identity,plan_sha256=plan.hash)
                 self.allocations[digest(identity.to_json())]=allocation
@@ -104,6 +111,8 @@ class HostWorkContractFactory:
                 from .work_budget import BudgetedCheckRunner
                 allocation=self.budget_authority.find_allocation(plan.budget_reference)
                 self.allocations[digest(identity.to_json())]=allocation
+                from .work_budget import reconcile_known_hygiene
+                reconcile_known_hygiene(self.budget_authority,allocation,cycle)
                 if runner is not None: runner=BudgetedCheckRunner(self.budget_authority,allocation,runner,'verification',host_overhead_seconds=120)
             self.cycles[digest(identity.to_json())]=(cycle,runner)
             return cycle
@@ -164,6 +173,12 @@ class HostWorkContractFactory:
             require(cycle.plan.grant_sha256 == grant_sha256, "verification invocation grant changed")
             require(runner is not None or request_id in cycle.verification_requests,
                     "verification runner unavailable")
+            if self.budget_authority is not None:
+                from .work_budget import reserve_host_phase_overhead
+                phase_key="verification:"+request_id
+                reserve_host_phase_overhead(self.budget_authority,self.allocations[digest(identity.to_json())],
+                    cycle.plan,phase_key,require_existing=cycle.phase in {WorkPhase.HANDOFF,WorkPhase.FINISHED})
+                if runner is not None:runner.phase_key=phase_key
             port = self.handoffs.get(digest(identity.to_json()))
             if port is not None:
                 port.prepare_request(cycle, request_id, handoff)

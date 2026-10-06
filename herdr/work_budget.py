@@ -979,25 +979,72 @@ class WorkBudgetAuthority:
                 "active_stops":[x for x in state["stops"].values() if x["active"]]}
 
 
+
+def reserve_host_phase_overhead(authority,allocation,plan,phase_key,*,require_existing=False,
+                                variant_sha256=None,trial_sha256=None):
+    """Charge one immutable phase ceiling before effects; never infer zero time."""
+    require(isinstance(phase_key,str) and 1<=len(phase_key)<=128,"bounded host phase identity required")
+    semantic=digest({"purpose":"host-phase-overhead","identity":plan.identity.to_json(),
+                     "plan":plan.hash,"phase":phase_key})
+    expected=digest({"allocation_id":allocation.allocation_id,"semantic_key":semantic})
+    with authority._serialized():
+        if require_existing:
+            require(expected in authority._state()["operations"],"original host overhead reservation missing")
+        operation=authority.reserve(allocation_id=allocation.allocation_id,semantic_key=semantic,
+            identity=plan.identity,plan_sha256=plan.hash,provider="offline-host",
+            demand=Demand(120000,0,0,0),operation_kind="host-overhead",
+            variant_sha256=variant_sha256,trial_sha256=trial_sha256)
+        original=authority.reconcile(operation)
+        if original["usage"] is None:
+            # This is the host's admission charge, not an external effect receipt.
+            # The full unknown time ceiling remains consumed after this append.
+            authority.claim_start(operation)
+            authority.settle(operation,Usage(None,0,0,0,digest({"phase_admission":semantic})))
+    return operation
+
+def reconcile_known_hygiene(authority,allocation,cycle):
+    """Only durable original hook/commit proofs release a held executor slot."""
+    require(cycle.plan.budget_reference==allocation.hash,"hygiene reconciliation budget changed")
+    for event in cycle._events():
+        if event["event"] not in {"work_local_commit_invalidated","work_local_commit_ready"}:continue
+        if event.get("policy_sha256")!=cycle.plan.hygiene_sha256:continue
+        semantic=digest({"purpose":"local-hygiene","identity":cycle.plan.identity.to_json(),
+            "plan":cycle.plan.hash,"tree":event["tree_sha256"],"policy":event["policy_sha256"]})
+        operation=digest({"allocation_id":allocation.allocation_id,"semantic_key":semantic})
+        with authority._serialized():
+            row=authority._state()["operations"].get(operation)
+            if row is None or row["usage"] is not None:continue
+            require(row["started"] and row["operation_kind"]=="hygiene"
+                    and row["identity"]==cycle.plan.identity.to_json()
+                    and row["plan_sha256"]==cycle.plan.hash,"original hygiene proof binding changed")
+            authority.settle(operation,Usage(None,0,0,0,digest(event)))
+
+
 class BudgetedCheckRunner:
     """Physical checks share the same budget, including baseline and holdout."""
-    def __init__(self,authority,allocation,runner,purpose,*,variant_sha256=None,trial_sha256=None,host_overhead_seconds=0):
+    def __init__(self,authority,allocation,runner,purpose,*,variant_sha256=None,trial_sha256=None,host_overhead_seconds=0,phase_key=None):
         require(isinstance(authority,WorkBudgetAuthority) and isinstance(allocation,BudgetAllocation)
                 and callable(runner),"host budgeted checker required")
         token(purpose)
         self.authority,self.allocation,self.runner,self.purpose=authority,allocation,runner,purpose
         require(type(host_overhead_seconds) is int and host_overhead_seconds in {0,120},"closed host overhead profile required")
         self.host_overhead_seconds=host_overhead_seconds
+        self.phase_key=phase_key
         self.variant_sha256,self.trial_sha256=variant_sha256,trial_sha256
 
     def __call__(self,check,root,plan,tree):
         from .work_cycle import CheckResult
         state=self.authority.snapshot(self.allocation.allocation_id)
-        semantic=digest({"purpose":self.purpose,"plan":plan.hash,"tree":tree,"check":check.id,
-                         "implementation_attempt":state["implementation_attempts"]})
+        if self.host_overhead_seconds:
+            reserve_host_phase_overhead(self.authority,self.allocation,plan,
+                self.phase_key or self.purpose,variant_sha256=self.variant_sha256,trial_sha256=self.trial_sha256)
+        binding={"purpose":self.purpose,"plan":plan.hash,"tree":tree,"check":check.id,
+                 "implementation_attempt":state["implementation_attempts"]}
+        if self.phase_key is not None:binding["phase"]=self.phase_key
+        semantic=digest(binding)
         operation=self.authority.reserve(allocation_id=self.allocation.allocation_id,
             semantic_key=semantic,identity=plan.identity,plan_sha256=plan.hash,provider="offline-check",
-            demand=Demand((check.timeout_seconds+13+self.host_overhead_seconds)*1000,0,0,0),operation_kind="check",
+            demand=Demand((check.timeout_seconds+13)*1000,0,0,0),operation_kind="check",
             variant_sha256=self.variant_sha256,trial_sha256=self.trial_sha256)
         if not self.authority.claim_start(operation):
             old=self.authority.reconcile(operation)
@@ -1006,7 +1053,7 @@ class BudgetedCheckRunner:
         result=self.runner(check,root,plan,tree)
         require(isinstance(result,CheckResult) and result.plan_sha256==plan.hash
                 and result.tree_sha256==tree,"physical budgeted checker result invalid")
-        self.authority.settle(operation,Usage(None if self.host_overhead_seconds else result.duration_ms,0,0,0,result.hash),check_result=result)
+        self.authority.settle(operation,Usage(result.duration_ms,0,0,0,result.hash),check_result=result)
         return result
 
 

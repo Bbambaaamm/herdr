@@ -739,3 +739,24 @@ def test_delayed_original_start_rechecks_remaining_elapsed_without_effect(tmp_pa
     original=auth.reconcile(op)
     assert original["started"] is False and original["usage"] is None
     assert auth.snapshot(alloc.allocation_id)["active_stops"]
+
+
+def test_multiple_checks_share_one_phase_overhead_ceiling_and_cold_charge(tmp_path):
+    from tests.herdr.test_work_cycle import runner
+    from herdr.work_budget import BudgetedCheckRunner,reserve_host_phase_overhead
+    cycle,_,_,root,_=repair_cycle(tmp_path)
+    check=cycle.plan.checks[0]
+    cap=120000+2*(check.timeout_seconds+13)*1000
+    auth,alloc,log=authority(tmp_path/"finite",allocation(max_work_ms=cap,max_elapsed_ms=cap))
+    plan=replace(cycle.plan,budget_reference=alloc.hash)
+    wrapped=BudgetedCheckRunner(auth,alloc,runner,"verification",host_overhead_seconds=120,
+                                phase_key="verification:original")
+    wrapped(check,root,plan,h("same tree"))
+    wrapped(replace(check,id="holdout"),root,plan,h("same tree"))
+    events=auth.audit_log.replay()
+    assert len([e for e in events if e.get("operation_kind")=="host-overhead"])==1
+    assert auth.snapshot(alloc.allocation_id)["charged_upper_bounds"]["work_ms"]==120002
+    cold=WorkBudgetAuthority(audit_log=AuditLog(log._path),authorize=lambda **kw:alloc,clock_ms=lambda:1000)
+    before=log._path.read_bytes()
+    reserve_host_phase_overhead(cold,alloc,plan,"verification:original",require_existing=True)
+    assert log._path.read_bytes()==before and cold.snapshot(alloc.allocation_id)["inflight"]==0
