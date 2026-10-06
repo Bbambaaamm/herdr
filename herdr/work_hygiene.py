@@ -288,13 +288,21 @@ class HostLocalCommitter:
                 and cycle.plan.base_sha == self.draft.base_sha
                 and cycle.plan.hygiene_sha256 == self.policy.hash, "local commit work binding mismatch")
         git, metadata, common, configuration = self._repository(cycle)
-        source = cycle.verify_scope()
-        require(digest(source) == cycle.verified_tree, "local commit tree differs from tested bytes")
+        try:
+            source = cycle.verify_scope()
+            require(digest(source) == cycle.verified_tree, "local commit tree differs from tested bytes")
+        except Exception:
+            cycle.invalidate_if_live_changed("live_tree_changed_before_hygiene")
+            raise
         hooks = self._hooks(); self.policy.environment.verify_inputs()
         events=cycle._events()
         retired={e["private_repository"] for e in events if e["event"]=="work_local_commit_invalidated"}
-        old = [e for e in events if e["event"] == "work_local_commit_ready" and e["private_repository"] not in retired]
-        pending = [e for e in events if e["event"] == "work_local_commit_requested" and e["private_repository"] not in retired]
+        ready = [e for e in events if e["event"]=="work_local_commit_ready" and e["private_repository"] not in retired]
+        completed={e["private_repository"] for e in ready}
+        owned_commits={e["commit_sha"] for e in ready}
+        old = [e for e in ready if e["tree_sha256"]==cycle.verified_tree]
+        pending = [e for e in events if e["event"] == "work_local_commit_requested"
+                   and e["private_repository"] not in retired|completed]
         if old:
             record = old[-1]; private = Path(record["private_repository"])
             require(private.parent == self.storage and private.resolve(strict=True) == private,
@@ -318,8 +326,9 @@ class HostLocalCommitter:
             cycle._record("local_commit_ready", private_repository=str(private), commit_sha=commit,
                           tree_sha256=cycle.verified_tree, policy_sha256=self.policy.hash)
         else:
-            require(git(["rev-parse", "HEAD"]).strip() == self.draft.base_sha, "local commit base changed")
-            require(not git(["diff", "--cached", "--name-only", "-z", self.draft.base_sha]),
+            current_owned=git(["rev-parse","HEAD"]).strip()
+            require(current_owned in {self.draft.base_sha,*owned_commits},"local commit base changed")
+            require(not git(["diff", "--cached", "--name-only", "-z", current_owned]),
                     "foreign staged work must be preserved")
             private = Path(tempfile.mkdtemp(prefix="commit-", dir=self.storage))
             work = private/"work"; work.mkdir(mode=0o700)
@@ -474,11 +483,11 @@ class HostLocalCommitter:
         parent = directory_fd(ref.parent)
         try:
             current = git(["rev-parse", "HEAD"]).strip()
-            require(current in {self.draft.base_sha, commit}, "owned branch advanced during local commit")
-            if current == self.draft.base_sha:
+            require(current in {self.draft.base_sha,commit,*owned_commits}, "owned branch advanced during local commit")
+            if current != commit:
                 # Managed worktree refs are loose, created by WorkspaceManager.
                 publish_file(parent, ref.name, (commit+"\n").encode(),
-                             expected=(self.draft.base_sha+"\n").encode())
+                             expected=(current+"\n").encode())
         finally: os.close(parent)
         parent = directory_fd(metadata)
         try: publish_file(parent, "index", new_index, expected=validated_index)
@@ -486,9 +495,13 @@ class HostLocalCommitter:
         manager = WorkspaceManager(cycle.root, git=git, worktrees_dir=cycle.root.parent,
                                    artifacts_dir=self.storage/"artifacts")
         require_work_time()
-        sealed = manager.seal(self.draft, cycle.root)
-        verify_committed_bytes(sealed, cycle.root, git)
-        cycle.committed(sealed)
+        try:
+            sealed = manager.seal(self.draft, cycle.root)
+            verify_committed_bytes(sealed, cycle.root, git)
+            cycle.committed(sealed)
+        except Exception:
+            cycle.invalidate_if_live_changed("live_tree_changed_during_final_seal")
+            raise
         return sealed
 
     @staticmethod

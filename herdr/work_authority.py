@@ -6,7 +6,7 @@ import struct
 
 from .bootstrap_authority import SOCKET_PATH, _recv_line, inspect_peer
 from .security import InvocationIdentity, PolicyDenied
-from .work_cycle import require
+from .work_cycle import require, WorkContractError
 from .evidence import canonical
 
 
@@ -82,8 +82,13 @@ def dispatch_work_connection(owner, connection):
     from .work_lifetime import bounded_host_request
     # This starts before receipt/peer/mount/request checks and remains active
     # through response encoding and delivery, on this same broker thread.
-    with bounded_host_request(900):
-        return _dispatch_work_connection(owner,connection)
+    try:
+        with bounded_host_request(900):
+            return _dispatch_work_connection(owner,connection)
+    except WorkContractError:
+        # _dispatch already closes accepted peers and sends its bounded denial.
+        # Context-exit expiry must never kill the authority listener.
+        return True
 
 def _dispatch_work_connection(owner, connection):
     """Only the exact observed stage-two process can ask about its phase.

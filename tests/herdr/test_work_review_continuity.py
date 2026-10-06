@@ -332,5 +332,59 @@ def test_transport_prechecks_consume_the_original_request_deadline(tmp_path,monk
     left,right=socket.socketpair()
     right.sendall(canonical({"op":"work-verify","identity":item.identity.to_json(),
         "grant_sha256":item.hash,"request_id":"precheck"})+b"\n")
-    with pytest.raises(WorkContractError,match="deadline"):dispatch_work_connection(owner,left)
+    assert dispatch_work_connection(owner,left) is True
     assert right.recv(8193)==b"denied\n";right.close()
+
+
+@pytest.mark.parametrize("race",["before_live_seal","after_live_seal"])
+def test_late_owned_write_reverifies_and_replaces_only_own_unaccepted_commit(boundary_workspace,monkeypatch,race):
+    from herdr.check_runner import HostCheckRunner
+    from herdr.workspace import WorkspaceManager
+    port,cycle,guard,result,task,plan,observed,log=ready(boundary_workspace,monkeypatch)
+    oracle=HostCheckRunner(port.committer.policy.environment,boundary_workspace/"host"/"checks",git=cycle.git)
+    port.prepare_request(cycle,"old-tree",{"pr_number":None})
+    outcome=cycle.request_verification("old-tree",oracle)
+    fired=[]
+    original=WorkspaceManager.seal
+    def seal(manager,draft,work):
+        if work!=cycle.root or fired:return original(manager,draft,work)
+        fired.append(True)
+        if race=="before_live_seal":
+            with (work/"result.py").open("a") as stream:stream.write("\n# late owned write\n")
+            return original(manager,draft,work)
+        artifact=original(manager,draft,work)
+        with (work/"result.py").open("a") as stream:stream.write("\n# late owned write\n")
+        return artifact
+    monkeypatch.setattr(WorkspaceManager,"seal",seal)
+    with pytest.raises(Exception):port.complete(cycle,"old-tree",outcome)
+    assert fired and cycle.phase is WorkPhase.VERIFY and cycle.verification_open
+    assert not cycle.verified_checks and result.read_bytes()==b""
+    prior=git(cycle.root,"rev-parse","HEAD")
+    assert prior!=cycle.plan.base_sha
+    cold=WorkCycle(cycle.plan,cycle.root,log,git=cycle.git)
+    assert cold.phase is WorkPhase.VERIFY
+    port.prepare_request(cold,"new-tree",{"pr_number":None})
+    fresh=cold.request_verification("new-tree",oracle)
+    response=port.complete(cold,"new-tree",fresh)
+    assert response["status"]=="pass" and cold.phase is WorkPhase.HANDOFF
+    assert git(cold.root,"rev-parse","HEAD")!=prior
+    assert git(cold.root,"rev-parse","HEAD^")==cold.plan.base_sha
+    assert (cold.root/"result.py").read_text().endswith("# late owned write\n")
+    ready_records=[e for e in cold._events() if e["event"]=="work_local_commit_ready"]
+    assert len(ready_records)==2 and ready_records[0]["tree_sha256"]!=ready_records[1]["tree_sha256"]
+    port.deliver(cold,"new-tree")
+    assert result.read_bytes()
+
+def test_expired_dispatch_does_not_terminate_the_listener(tmp_path,monkeypatch):
+    import herdr.work_authority as authority
+    import herdr.work_lifetime as lifetime
+    now=[10.0];monkeypatch.setattr(lifetime.time,"monotonic",lambda:now[0])
+    calls=[]
+    def dispatched(*a):
+        calls.append(1)
+        if len(calls)==1:now[0]=911.0
+        return True
+    monkeypatch.setattr(authority,"_dispatch_work_connection",dispatched)
+    assert authority.dispatch_work_connection(None,None) is True
+    assert authority.dispatch_work_connection(None,None) is True
+    assert len(calls)==2
