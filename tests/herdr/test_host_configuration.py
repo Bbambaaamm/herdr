@@ -181,3 +181,67 @@ def test_canonical_nested_child_worktree_passes_actual_factory_parent_ceiling(tm
         launch.grant.require_logical_subset_of(parent)
         assert launch.grant.workspace_root==str(child_workspace)
     finally:launch.cleanup_after_pane_closed()
+
+@pytest.mark.parametrize("repository", [
+    "Bbambaaamm/Autonomous-Quant-Lab",
+    "Bbambaaamm/dotacni-majak",
+    "Bbambaaamm/herdr",
+])
+def test_enabled_consumer_narrowing_retains_coding_handoff_for_root_and_child(
+        tmp_path, monkeypatch, repository):
+    from types import SimpleNamespace
+    from herdr.security import InvocationIdentity, RiskClass, ToolRule
+    from herdr.work_configuration import preflight_handoff
+    from herdr.work_hygiene import LocalCommitPolicy
+    from tests.herdr.test_check_runner import environment
+
+    consumers=json.loads((Path(__file__).resolve().parents[2]/
+        "agent-stack/config/github-intake-consumers.json").read_text())["consumers"]
+    consumer=next(item for item in consumers if item["repository"]==repository)
+    assert consumer["enabled"]
+    raw,workspace,template=approved_config(tmp_path,monkeypatch)
+    # The host allows verification, but intake must actually request it:
+    # host configuration deliberately narrows both scope and rules.
+    ceiling_tools=tuple(dict.fromkeys((*consumer["parent_tools"],"herdr_verify_work")))
+    special={"herdr_delegate_child","herdr_verify_work","herdr_submit_result"}
+    file_tools=tuple(tool for tool in ceiling_tools if tool not in special)
+    rules=(*grant(workspace,tools=file_tools).tool_rules,
+        ToolRule(tool="herdr_delegate_child",risk=RiskClass.DELEGATION,
+            allowed_arg_keys=("key","role","objective","prompt","tool","permission","cwd","ownership"),
+            requires_sandbox=True),
+        ToolRule(tool="herdr_verify_work",risk=RiskClass.READ,
+            allowed_arg_keys=("request_id","handoff"),requires_sandbox=True),
+        ToolRule(tool="herdr_submit_result",risk=RiskClass.RESULT_SUBMISSION,
+            allowed_arg_keys=("status","evidence","summary"),
+            allowed_roots=(str(workspace),),requires_sandbox=True))
+    template=grant(workspace,tools=ceiling_tools,rules=rules)
+    template=replace(template,
+        identity=replace(template.identity,consumer="github:"+repository),
+        scope=replace(template.scope,permissions=tuple(consumer["parent_permissions"])),
+        tool_rules=rules)
+    raw["templates"]={template.identity.consumer:template.to_json()}
+    profile=environment()
+    profile=replace(profile,executables=(*profile.executables,"/usr/bin/git"))
+    work=SimpleNamespace(local_commit_policy=LocalCommitPolicy(
+        "consumer-handoff-test",profile,"0"*64,str(tmp_path/"hooks"),()))
+    factory=config.build_host_policy_factory()
+    parent=factory.prepare(identity=template.identity,workspace=workspace,
+        tools=tuple(consumer["parent_tools"]),
+        permissions=tuple(consumer["parent_permissions"]))
+    try:
+        preflight_handoff(work,parent,{"kind":"coding"},require_slot=False)
+        child_workspace=workspace/"worktrees"/"child"
+        child_workspace.mkdir(parents=True)
+        child_identity=InvocationIdentity(parent.identity.consumer,"nested-agent",
+            parent.identity.agent_id,parent.identity.task_id,"nested-task",
+            "nested-run",parent.identity.fencing_token+1)
+        child_factory=config.build_host_policy_factory(parent_grant=parent.grant)
+        child=child_factory.prepare_child(identity=child_identity,
+            workspace=child_workspace,
+            tools=tuple(tool for tool in parent.grant.scope.tools if tool!="herdr_delegate_child"),
+            permissions=parent.grant.scope.permissions)
+        try:
+            child.grant.require_logical_subset_of(parent.grant)
+            preflight_handoff(work,child,{"kind":"coding"},require_slot=False)
+        finally:child.cleanup_after_pane_closed()
+    finally:parent.cleanup_after_pane_closed()
