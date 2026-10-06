@@ -302,7 +302,8 @@ def read_only_git(root: Path):
             "-c", "diff.external=", "-C", str(root), *args,
         ]
         try:
-            return artifact_command(command, limit=2_000_000, timeout=30,
+            from .work_lifetime import remaining_work_seconds
+            return artifact_command(command, limit=2_000_000, timeout=remaining_work_seconds(30),
                                     pass_fds=(seccomp_fd,))
         except ValueError as exc:
             if str(exc) == "source_timeout":

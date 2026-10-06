@@ -199,13 +199,99 @@ def test_short_grant_blocks_socket_before_verification_callback(boundary_workspa
 def test_modifying_hook_allows_new_immutable_reverification_intent(boundary_workspace,monkeypatch):
     from herdr.check_runner import HostCheckRunner
     port,cycle,guard,result,task,plan,observed,log=ready(boundary_workspace,monkeypatch,
-        hook="printf '\\n# formatter changed tested content\\n' >> result.py")
+        hook='found=0; while IFS= read -r row; do case "$row" in \'# formatter changed tested content\') found=1;; esac; done < result.py; if [ "$found" = 0 ]; then printf \'\\n# formatter changed tested content\\n\' >> result.py; fi')
     oracle=HostCheckRunner(port.committer.policy.environment,boundary_workspace/"host"/"checks",git=cycle.git)
     port.prepare_request(cycle,"before-hook",{"pr_number":None})
     outcome=cycle.request_verification("before-hook",oracle)
     with pytest.raises(ValueError,match="invalidated"):port.complete(cycle,"before-hook",outcome)
     assert cycle.phase is WorkPhase.VERIFY and cycle.verification_open and not cycle.verified_checks
+    # Explicit trusted formatter-repair fixture: the disposable hook never
+    # promotes content automatically. These exact new bytes need a fresh oracle.
+    with (cycle.root/"result.py").open("a") as stream:stream.write("\n# formatter changed tested content\n")
     port.prepare_request(cycle,"after-hook",{"pr_number":None})
     repeated=cycle.request_verification("after-hook",oracle)
     assert repeated["status"]=="pass" and cycle.phase is WorkPhase.HYGIENE
     assert result.read_bytes()==b"" and git(cycle.root,"rev-parse","HEAD")==cycle.plan.base_sha
+
+    response=port.complete(cycle,"after-hook",repeated)
+    assert response["status"]=="pass" and cycle.phase is WorkPhase.HANDOFF
+    assert git(cycle.root,"rev-parse","HEAD")!=cycle.plan.base_sha
+    retired=[e for e in cycle._events() if e["event"]=="work_local_commit_invalidated"]
+    assert len(retired)==1
+    cold=WorkCycle(cycle.plan,cycle.root,log,git=cycle.git)
+    assert cold.phase is WorkPhase.HANDOFF
+
+
+def test_actual_client_preserves_canonical_unicode_request(tmp_path,monkeypatch):
+    import socket,threading
+    from herdr.work_authority import WorkAuthorityClient,dispatch_work_connection
+    from tests.herdr.test_work_authority import owner_for
+    from tests.herdr.test_security import grant
+    from herdr.security import ToolRule,RiskClass
+    item=grant(tmp_path,tools=("herdr_verify_work",),rules=(ToolRule("herdr_verify_work",RiskClass.READ,
+        ("request_id","handoff"),requires_sandbox=True),))
+    owner,_=owner_for(SimpleNamespace(authorize_invocation=lambda *a,**kw:True),item)
+    seen=[]
+    owner.work_verify=lambda *a,**kw:seen.append(kw["handoff"]) or {"status":"failed"}
+    path=tmp_path/"unicode.sock";monkeypatch.setattr("herdr.work_authority.SOCKET_PATH",path)
+    listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);listener.bind(str(path));listener.listen(1)
+    def server():
+        connection,_=listener.accept();dispatch_work_connection(owner,connection)
+    thread=threading.Thread(target=server,daemon=True);thread.start()
+    handoff={"pr_number":None,"scope_claim":{"narrative":"ž"*1400}}
+    assert len(canonical(handoff))<4096 and len(json.dumps(handoff).encode())>8192
+    try:
+        assert WorkAuthorityClient().verify(item.identity,item.hash,"unicode",handoff)=={"status":"failed"}
+        thread.join(5);assert not thread.is_alive() and seen==[handoff]
+    finally:listener.close()
+
+
+def test_host_result_context_is_exact_and_direct_model_cannot_pin_slot(boundary_workspace,monkeypatch):
+    from herdr.work_contract_host import WorkInvocationGuard
+    from herdr.security import PolicyDenied
+    from herdr.result_submission import submit
+    port,cycle,original,result,task,plan,observed,log=ready(boundary_workspace,monkeypatch)
+    calls=[]
+    class ProtectedPhase:
+        def __call__(self,*a,kind,tool):
+            calls.append(tool)
+            if tool=="herdr_submit_result":raise PolicyDenied("work_phase_forbids_invocation")
+            return True
+    guard=WorkInvocationGuard(original.grant,work_authority=ProtectedPhase())
+    raw={"status":"blocked","evidence":[{"fixture":"host-original"}],"summary":"original"}
+    with pytest.raises(PolicyDenied):submit(guard,raw)
+    assert result.read_bytes()==b""
+    with guard.host_result_submission(raw):
+        with pytest.raises(PolicyDenied):submit(guard,{**raw,"summary":"model substitution"})
+        assert result.read_bytes()==b""
+        assert submit(guard,raw)["submitted"]
+    with pytest.raises(PolicyDenied):submit(guard,raw)
+    assert json.loads(result.read_bytes())["summary"]=="original"
+
+
+def test_host_elapsed_time_blocks_metadata_publication_before_effect(tmp_path,monkeypatch):
+    import herdr.work_lifetime as lifetime
+    from herdr.work_hygiene import publish_file,directory_fd
+    now=[10.0];monkeypatch.setattr(lifetime.time,"monotonic",lambda:now[0])
+    target=tmp_path/"owned-ref";target.write_bytes(b"base\n")
+    fd=directory_fd(tmp_path)
+    try:
+        with pytest.raises(WorkContractError,match="deadline"):
+            with lifetime.bounded_host_request(130):
+                now[0]=141.0
+                publish_file(fd,"owned-ref",b"new\n",expected=b"base\n")
+        assert target.read_bytes()==b"base\n" and not (tmp_path/"owned-ref.lock").exists()
+    finally:os.close(fd)
+
+
+def test_original_grant_reserves_host_phase_allowance_before_baseline(tmp_path,monkeypatch):
+    from datetime import UTC,datetime,timedelta
+    from tests.herdr.test_work_contract_host import factory_fixture
+    factory,root,plan,item,log=factory_fixture(tmp_path)
+    command_seconds=2*sum(c.timeout_seconds+13 for c in plan.checks)
+    item=replace(item,expires_at=(datetime.now(UTC)+timedelta(seconds=command_seconds+20)).isoformat())
+    factory.approve=lambda **kw:replace(plan,grant_sha256=item.hash)
+    monkeypatch.setattr("herdr.check_runner.HostCheckRunner.__call__",lambda *a:pytest.fail("no effect"))
+    with pytest.raises(WorkContractError,match="lifetime"):
+        factory.prepare(identity=item.identity,workspace=root,grant=item,spec_sha256=plan.spec_sha256)
+    assert log.replay()==[]

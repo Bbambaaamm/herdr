@@ -24,7 +24,7 @@ class HostWorkHandoff:
 
     def prepare_request(self, cycle, request_id, handoff):
         require(cycle.plan.identity == self.identity, "work handoff identity changed")
-        require(sum(check.timeout_seconds+13 for check in cycle.plan.checks) + self.committer.policy.timeout_seconds+13 <= 900,
+        require(sum(check.timeout_seconds+13 for check in cycle.plan.checks) + self.committer.policy.timeout_seconds+13+120 <= 900,
                 "verification and hygiene exceed one bounded host request")
         key = self._key(cycle, request_id)
         try:
@@ -100,6 +100,8 @@ class HostWorkHandoff:
         artifact = self._budgeted_commit(cycle)
         raw = self._submission(artifact, declaration)
         payload = payload_for_slot(self.identity, self.slot, raw)
+        from .work_lifetime import require_work_time
+        require_work_time()
         receipt = self.result_authority.capture(self.task, payload, self.plan, cycle=cycle, origin_request_key=key)
         # Full check proofs remain in the original private verification receipt.
         # The bounded SDK response carries their digest and count.
@@ -126,12 +128,22 @@ class HostWorkHandoff:
                         in authority._state()["operations"],"original hygiene reservation unavailable")
         operation=authority.reserve(allocation_id=allocation.allocation_id,semantic_key=semantic,
             identity=self.identity,plan_sha256=cycle.plan.hash,provider="offline-hygiene",
-            demand=Demand((self.committer.policy.timeout_seconds+13)*1000,0,0,0),
+            demand=Demand((self.committer.policy.timeout_seconds+13+120)*1000,0,0,0),
             operation_kind="hygiene")
         # The committer itself resumes only its original durable intent/ref.
         # An unknown hook delivery cannot become another hook execution.
         authority.claim_start(operation)
-        artifact=self.committer(cycle)
+        before={e["private_repository"] for e in cycle._events() if e["event"]=="work_local_commit_invalidated"}
+        original_tree=cycle.verified_tree
+        try:
+            artifact=self.committer(cycle)
+        except ValueError:
+            proven=[e for e in cycle._events() if e["event"]=="work_local_commit_invalidated"
+                and e["private_repository"] not in before and e["tree_sha256"]==original_tree
+                and e["policy_sha256"]==self.committer.policy.hash]
+            if proven:
+                authority.settle(operation,Usage(None,0,0,0,digest(proven[-1])))
+            raise
         old=authority.reconcile(operation)
         if old["usage"] is None:
             authority.settle(operation,Usage(None,0,0,0,artifact.result_sha))

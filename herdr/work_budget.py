@@ -981,11 +981,13 @@ class WorkBudgetAuthority:
 
 class BudgetedCheckRunner:
     """Physical checks share the same budget, including baseline and holdout."""
-    def __init__(self,authority,allocation,runner,purpose,*,variant_sha256=None,trial_sha256=None):
+    def __init__(self,authority,allocation,runner,purpose,*,variant_sha256=None,trial_sha256=None,host_overhead_seconds=0):
         require(isinstance(authority,WorkBudgetAuthority) and isinstance(allocation,BudgetAllocation)
                 and callable(runner),"host budgeted checker required")
         token(purpose)
         self.authority,self.allocation,self.runner,self.purpose=authority,allocation,runner,purpose
+        require(type(host_overhead_seconds) is int and host_overhead_seconds in {0,120},"closed host overhead profile required")
+        self.host_overhead_seconds=host_overhead_seconds
         self.variant_sha256,self.trial_sha256=variant_sha256,trial_sha256
 
     def __call__(self,check,root,plan,tree):
@@ -995,7 +997,7 @@ class BudgetedCheckRunner:
                          "implementation_attempt":state["implementation_attempts"]})
         operation=self.authority.reserve(allocation_id=self.allocation.allocation_id,
             semantic_key=semantic,identity=plan.identity,plan_sha256=plan.hash,provider="offline-check",
-            demand=Demand((check.timeout_seconds+13)*1000,0,0,0),operation_kind="check",
+            demand=Demand((check.timeout_seconds+13+self.host_overhead_seconds)*1000,0,0,0),operation_kind="check",
             variant_sha256=self.variant_sha256,trial_sha256=self.trial_sha256)
         if not self.authority.claim_start(operation):
             old=self.authority.reconcile(operation)
@@ -1004,7 +1006,7 @@ class BudgetedCheckRunner:
         result=self.runner(check,root,plan,tree)
         require(isinstance(result,CheckResult) and result.plan_sha256==plan.hash
                 and result.tree_sha256==tree,"physical budgeted checker result invalid")
-        self.authority.settle(operation,Usage(result.duration_ms,0,0,0,result.hash),check_result=result)
+        self.authority.settle(operation,Usage(None if self.host_overhead_seconds else result.duration_ms,0,0,0,result.hash),check_result=result)
         return result
 
 

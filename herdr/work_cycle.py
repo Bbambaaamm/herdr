@@ -253,6 +253,8 @@ def tree_snapshot(root, *, git=None, max_bytes=67_108_864):
     records, total = {}, 0
     try:
         for name in names:
+            from .work_lifetime import require_work_time
+            require_work_time()
             relative(name)
             try:
                 fd = _open_relative(directory, name)
@@ -265,6 +267,7 @@ def tree_snapshot(root, *, git=None, max_bytes=67_108_864):
                 require(total <= max_bytes, "work tree bytes exceeded")
                 hasher, read = hashlib.sha256(), 0
                 while True:
+                    require_work_time()
                     chunk = os.read(fd, min(1_048_576, max_bytes-read+1))
                     if not chunk:
                         break
@@ -325,6 +328,8 @@ class WorkCycle:
         return [x for x in self.audit_log.replay() if x.get("work_cycle") == self.plan.identity.to_json()]
 
     def _record(self, kind, **data):
+        from .work_lifetime import require_work_time
+        require_work_time()
         self.audit_log.append({"event":"work_"+kind, "work_cycle":self.plan.identity.to_json(),
                                "plan_sha256":self.plan.hash, **data})
         self.audit_log.flush()
@@ -424,7 +429,7 @@ class WorkCycle:
                                 for x in self.verified_checks.values()), "incomplete PASS replay")
                 self.verified_tree = tree
                 self.phase = WorkPhase.HYGIENE
-            elif kind in {"work_local_commit_requested", "work_local_commit_ready"}:
+            elif kind in {"work_local_commit_requested", "work_local_commit_ready", "work_local_commit_invalidated"}:
                 require(self.phase is WorkPhase.HYGIENE and self.plan.hygiene_sha256 is not None
                         and event.get("policy_sha256") == self.plan.hygiene_sha256
                         and event.get("tree_sha256") == self.verified_tree

@@ -2,6 +2,8 @@
 from pathlib import Path
 import threading
 import re
+import contextvars
+from contextlib import contextmanager
 
 from .evidence import digest
 from .security import InvocationGuard, InvocationIdentity, PolicyDenied, SecurityGrant
@@ -55,8 +57,10 @@ class HostWorkContractFactory:
                 plan.planning.require_binding(plan, grant)
             from .work_lifetime import check_wall_seconds, require_grant_lifetime
             request=check_wall_seconds(plan,getattr(self,"local_commit_policy",None))
+            require(request<=900,"complete host request exceeds bound")
             require_grant_lifetime(grant,check_wall_seconds(plan)+request)
             runner=HostCheckRunner(self.environment,self.storage,git=self.git)
+            from .work_lifetime import bounded_host_request
             cycle=WorkCycle(plan,root,self.audit_log,git=self.git,budget_authority=self.budget_authority)
             allocation=None
             if self.budget_authority is not None:
@@ -72,13 +76,15 @@ class HostWorkContractFactory:
                 allocation=self.budget_authority.open(consumer=approved.consumer,work_key=approved.work_key,
                     lineage_key=approved.lineage_key,authorization_reference=approved.authorization_reference)
                 require(allocation==approved and plan.budget_reference==allocation.hash, 'work budget binding mismatch')
-                cycle.start(BudgetedCheckRunner(self.budget_authority,allocation,runner,'baseline'))
+                with bounded_host_request(check_wall_seconds(plan)):
+                    cycle.start(BudgetedCheckRunner(self.budget_authority,allocation,runner,'baseline',host_overhead_seconds=120))
                 if cycle.phase is WorkPhase.WORK:
                     self.budget_authority.begin_implementation(allocation_id=allocation.allocation_id,identity=identity,plan_sha256=plan.hash)
                 self.allocations[digest(identity.to_json())]=allocation
-                runner=BudgetedCheckRunner(self.budget_authority,allocation,runner,'verification')
+                runner=BudgetedCheckRunner(self.budget_authority,allocation,runner,'verification',host_overhead_seconds=120)
             else:
-                cycle.start(runner)
+                with bounded_host_request(check_wall_seconds(plan)):
+                    cycle.start(runner)
             self.cycles[digest(identity.to_json())]=(cycle,runner)
             return cycle
 
@@ -98,7 +104,7 @@ class HostWorkContractFactory:
                 from .work_budget import BudgetedCheckRunner
                 allocation=self.budget_authority.find_allocation(plan.budget_reference)
                 self.allocations[digest(identity.to_json())]=allocation
-                if runner is not None: runner=BudgetedCheckRunner(self.budget_authority,allocation,runner,'verification')
+                if runner is not None: runner=BudgetedCheckRunner(self.budget_authority,allocation,runner,'verification',host_overhead_seconds=120)
             self.cycles[digest(identity.to_json())]=(cycle,runner)
             return cycle
 
@@ -140,11 +146,17 @@ class HostWorkContractFactory:
                 return True
             if kind=="tool" and tool=="herdr_verify_work" and cycle.phase in {WorkPhase.VERIFY,WorkPhase.HYGIENE,WorkPhase.HANDOFF}:
                 return True
-            if kind=="tool" and tool=="herdr_submit_result" and cycle.phase in {WorkPhase.HYGIENE,WorkPhase.HANDOFF}:
-                return True
             raise PolicyDenied("work_phase_forbids_invocation")
 
     def verify_request(self, identity, grant_sha256, request_id, handoff=None):
+        from .work_lifetime import bounded_host_request, check_wall_seconds
+        with self._lock:
+            cycle,_=self._refresh(identity)
+            seconds=check_wall_seconds(cycle.plan,getattr(self,"local_commit_policy",None))
+            with bounded_host_request(seconds):
+                return self._verify_request(identity,grant_sha256,request_id,handoff)
+
+    def _verify_request(self, identity, grant_sha256, request_id, handoff=None):
         with self._lock:
             require(isinstance(request_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", request_id),
                     "bounded verification request identity required")
@@ -192,12 +204,16 @@ class WorkInvocationGuard(InvocationGuard):
         require(callable(work_authority),"host work phase authority required")
         super().__init__(grant,**kwargs)
         self.work_authority=work_authority
+        self._host_result=contextvars.ContextVar("herdr-host-result",default=None)
 
     def authorize_provider(self,request,**kwargs):
         self.work_authority(self.grant.identity,self.grant.hash,kind="provider",tool=None)
         return super().authorize_provider(request,**kwargs)
 
     def authorize_tool_call(self,tool,args,**kwargs):
+        if self.canonical_tool(tool)=="herdr_submit_result" and self._host_result.get()==digest(args):
+            # Only the internal verification handler holds this exact payload context.
+            return super().authorize_tool_call(tool,args,**kwargs)
         self.work_authority(self.grant.identity,self.grant.hash,kind="tool",tool=self.canonical_tool(tool))
         return super().authorize_tool_call(tool,args,**kwargs)
 
@@ -239,3 +255,9 @@ class WorkInvocationGuard(InvocationGuard):
         if not callable(verifier):
             raise PolicyDenied("work_verification_unavailable")
         return verifier(self.grant.identity, self.grant.hash, request_id, handoff=handoff) if handoff is not None else verifier(self.grant.identity, self.grant.hash, request_id)
+
+    @contextmanager
+    def host_result_submission(self, raw):
+        token=self._host_result.set(digest(raw))
+        try:yield
+        finally:self._host_result.reset(token)

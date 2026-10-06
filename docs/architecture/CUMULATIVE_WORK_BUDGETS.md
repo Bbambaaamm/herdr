@@ -108,3 +108,5 @@ a delayed start rechecks that bound. The guarded SDK also verifies that the
 existing signed grant covers the quoted callback deadline plus delivery margin.
 A failed lifetime check authorizes no model callback and does not pretend the
 pre-effect reservation was consumed at zero or release it as a new operation.
+
+The protected baseline/verification and hygiene reservations include the complete 120-second host-phase allowance introduced by #86. Full host elapsed measurements are not inferred from the subprocess proof duration: the time ceiling remains held explicitly as UNKNOWN. The generic historical checker keeps its original quote/measurement semantics when no new host-overhead profile is supplied.

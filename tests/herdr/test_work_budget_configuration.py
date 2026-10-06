@@ -130,3 +130,10 @@ def test_sdk_guard_blocks_short_lived_grant_before_model_callback(tmp_path):
     guard=WorkInvocationGuard(current,work_authority=QuoteTransportFixture())
     with pytest.raises(PolicyDenied,match="model_grant_lifetime_insufficient"):guard.start_model_effect({})
     assert messages==["status","start"]  # Reservation stays held; no paid callback is authorized.
+
+
+def test_protected_check_reservation_includes_host_work_time_and_holds_unknown(tmp_path):
+    factory,root,plan,item,cycle,raw,allocation,quote=approved_factory(tmp_path)
+    state=factory.budget_authority.snapshot(allocation.allocation_id)
+    assert state["charged_upper_bounds"]["work_ms"]>120000
+    assert "work_ms" in state["unknown_measurements"]
