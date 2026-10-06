@@ -63,13 +63,15 @@ def child_task(rec):
         task["owned_write_mounts"] = None if rec.owned_write_mounts is None else [dict(x) for x in rec.owned_write_mounts]
     return task
 
-def child_spec(rec):
-    task=child_task(rec)
+def child_scope_spec(task, ownership=None):
     spec={key:task[key] for key in ("repo","issue","parent_task_id","parent_agent_id",
         "objective","role","tools","permissions","worktree_identity")}
-    if rec.ownership is not None:
-        spec["ownership_sha256"] = rec.ownership.hash
+    if ownership is not None:
+        spec["ownership_sha256"] = ownership.hash
     return digest(spec)
+
+def child_spec(rec):
+    return child_scope_spec(child_task(rec),rec.ownership)
 
 def child_identity(rec):
     return InvocationIdentity("github:"+rec.repo,rec.agent_id,rec.parent_agent_id,
@@ -111,6 +113,28 @@ class ChildCompletionAuthority:
         self.store,self.approve,self.collector=store,approve,collector
         self.work_contracts = None
         self.work_factories = {}
+
+    def prepare_delegation(self, proposal, *, parent_task_id, parent_agent_id, repo, issue):
+        """Add verification only for an exact protected modern coding scope."""
+        from dataclasses import replace
+        contracts=self.work_contracts
+        if contracts is None or contracts["version"]==1 or "herdr_verify_work" in proposal.child_tools:
+            return proposal
+        if contracts["version"] not in (2,3):
+            raise EvidenceError("child work catalogue version unsupported")
+        candidate=replace(proposal,child_tools=tuple(sorted(
+            set(proposal.child_tools)|{"herdr_verify_work"})))
+        task=dict(repo=repo,issue=issue,parent_task_id=parent_task_id,
+            parent_agent_id=parent_agent_id,objective=candidate.child_task,
+            role=candidate.child_role,tools=list(candidate.child_tools),
+            permissions=list(candidate.child_permissions),
+            worktree_identity=candidate.worktree_identity)
+        entry=contracts["children"].get(child_scope_spec(task,candidate.ownership))
+        if entry is None or entry["kind"]!="coding" or entry["work_contract_version"]!=1:
+            return proposal
+        if "herdr_verify_work" not in proposal.parent_tools:
+            raise EvidenceError("approved coding child needs verification in the parent scope")
+        return candidate
 
     def prepare(self,rec):
         task=child_task(rec)

@@ -310,19 +310,37 @@ def stop_bridge(session: dict) -> None:
 
 
 def ensure_parent_scope(task: dict) -> None:
-    """Copy only an explicit matching consumer scope into older queued tasks."""
+    """Request the current consumer scope only before a new root admission."""
     scope_fields = ("parent_role", "parent_tools", "parent_permissions", "worktree_root")
-    if all(field in task for field in scope_fields):
-        return
     config = Path(__file__).resolve().parents[1] / "config/github-intake-consumers.json"
     consumers = json.loads(config.read_text(encoding="utf-8"))["consumers"]
     matching = [entry for entry in consumers
-                if entry.get("repository") == task.get("repo")
+                if entry.get("enabled") and entry.get("repository") == task.get("repo")
                 and entry.get("safety_profile") == task.get("safety_profile")]
     if len(matching) != 1 or not all(field in matching[0] for field in scope_fields):
         return
+    current = matching[0]
+    if all(field in task for field in scope_fields):
+        # Upgrade only the former complete consumer request, never an
+        # intentionally narrower scope or an admitted child/attempt.
+        if (set(current["parent_tools"]) == set(task["parent_tools"]) | {"herdr_verify_work"}
+                and "herdr_verify_work" not in task["parent_tools"]
+                and all(task[field] == current[field] for field in
+                        ("parent_role", "parent_permissions", "worktree_root"))):
+            session = task.get("execution_session")
+            contract = task.get("work_contract")
+            bound_contract = (contract and (not isinstance(contract, dict)
+                or (contract.get("identity") or {}).get("run_token") == task.get("run_token")))
+            if (task.get("parent_task_id") or task.get("attempt_state") in {
+                    "accepted", "blocked", "delivery_uncertain", "verification_pending",
+                    "result_ready", "verifying"}
+                    or bound_contract or isinstance(session, dict) and (
+                        not session.get("closed_at") or session.get("invocation_policy"))):
+                raise RuntimeError("parent_scope_refresh_requires_new_admission")
+            task["parent_tools"] = list(current["parent_tools"])
+        return
     for field in scope_fields:
-        task.setdefault(field, matching[0][field])
+        task.setdefault(field, current[field])
 
 
 def _pane_has_marker(pane_id: str, marker: str) -> bool:

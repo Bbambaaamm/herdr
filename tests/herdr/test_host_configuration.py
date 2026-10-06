@@ -193,7 +193,7 @@ def test_enabled_consumer_narrowing_retains_coding_handoff_for_root_and_child(
     from herdr.security import InvocationIdentity, RiskClass, ToolRule
     from herdr.work_configuration import preflight_handoff
     from herdr.work_hygiene import LocalCommitPolicy
-    from tests.herdr.test_check_runner import environment
+    from herdr.check_runner import CheckEnvironment
 
     consumers=json.loads((Path(__file__).resolve().parents[2]/
         "agent-stack/config/github-intake-consumers.json").read_text())["consumers"]
@@ -220,8 +220,9 @@ def test_enabled_consumer_narrowing_retains_coding_handoff_for_root_and_child(
         scope=replace(template.scope,permissions=tuple(consumer["parent_permissions"])),
         tool_rules=rules)
     raw["templates"]={template.identity.consumer:template.to_json()}
-    profile=environment()
-    profile=replace(profile,executables=(*profile.executables,"/usr/bin/git"))
+    # This checks policy objects, not a validation subprocess.
+    profile=CheckEnvironment("consumer-scope-test",
+        (("/usr/bin/git","0"*64),),("/usr/bin/git",))
     work=SimpleNamespace(local_commit_policy=LocalCommitPolicy(
         "consumer-handoff-test",profile,"0"*64,str(tmp_path/"hooks"),()))
     factory=config.build_host_policy_factory()
