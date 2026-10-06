@@ -13,7 +13,7 @@ from herdr.work_model_deadline import model_deadline,validate_text_request
 from herdr.work_cycle import WorkPhase, WorkContractError
 from tests.herdr.test_work_contract_host import factory_fixture
 
-def approved_factory(tmp_path,*,repair=False):
+def approved_factory(tmp_path,*,repair=False,quote_overrides=None):
     factory,root,original,grant,log=factory_fixture(tmp_path)
     limits=BudgetLimits(1000000,1000000,5,100000,100000,2,1,1,1)
     allocation=BudgetAllocation(digest("allocation"),grant.identity.consumer,digest("stable-work"),
@@ -21,6 +21,7 @@ def approved_factory(tmp_path,*,repair=False):
     quote={"provider":"provider-a","model":"quoted-text-model","api_mode":"chat_completions",
            "base_url":"https://quote.invalid/v1","max_request_bytes":4096,"max_output_tokens":100,
            "max_tokens":5000,"max_cost_microusd":1000,"max_work_ms":1000}
+    quote.update(quote_overrides or {})
     raw={"version":1,"allocation":asdict(allocation),"ancestors":[],"model_quotes":[quote]}
     if repair:raw["repair"]={"version":1,"reason_code":"approved_behavior_repair",
                             "paths":["result.py"],"max_changed_lines":20,"failure_outputs":[original.checks[0].expected_baseline_output_sha256]}
@@ -202,3 +203,158 @@ def test_fresh_admission_rejects_changed_persisted_ancestor_limits(tmp_path):
     with pytest.raises((BudgetBlocked,WorkContractError),match="differs from original"):
         bind_budget(factory,{**declared,"ancestors":[asdict(tighter)]},storage=storage,writable_roots=(root,))
     assert log._path.read_bytes()==before
+
+
+@pytest.mark.parametrize("overrides,field,limit",[
+    ({}, "max_tokens", 100),
+    ({"max_output_tokens":4200,"max_request_bytes":100}, "max_tokens", 4096),
+    ({"model":"o1"}, "max_completion_tokens", 100),
+    ({"model":"o3-2025-04-16"}, "max_completion_tokens", 100),
+    ({"model":"openai/o4-mini"}, "max_completion_tokens", 100),
+    ({"output_token_field":"max_completion_tokens"}, "max_completion_tokens", 100),
+])
+def test_protected_request_ceiling_respects_quote_without_an_economic_effect(tmp_path,overrides,field,limit):
+    from herdr.work_contract_host import WorkInvocationGuard
+    factory,root,plan,grant,cycle,raw,allocation,quote=approved_factory(tmp_path,quote_overrides=overrides)
+    route={key:quote[key] for key in ("provider","model","api_mode","base_url")}
+    class Port:
+        def __call__(self,*args,**kwargs):return True
+        def effect(self,*args):return factory.budget_effect(*args)
+    guard=WorkInvocationGuard(grant,work_authority=Port())
+    original=factory.budget_authority.audit_log._path.read_bytes()
+    assert guard.model_request_ceiling(route)=={"output_token_field":field,"max_output_tokens":limit}
+    for invalid in ({**route,"model":"unquoted"},{**route,"max_output_tokens":999}):
+        with pytest.raises(WorkContractError):guard.model_request_ceiling(invalid)
+    with pytest.raises(WorkContractError):
+        factory.budget_effect(grant.identity,"f"*64,"ceiling",route)
+    with pytest.raises(WorkContractError):
+        factory.budget_effect(replace(grant.identity,run_token="foreign"),grant.hash,"ceiling",route)
+    assert factory.budget_authority.audit_log._path.read_bytes()==original
+    factory.verify_request(grant.identity,grant.hash,"ceiling-phase-check")
+    with pytest.raises(WorkContractError,match="ended"):guard.model_request_ceiling(route)
+
+
+@pytest.mark.parametrize("answer",[
+    None,{},{"output_token_field":"max_tokens","max_output_tokens":True},
+    {"output_token_field":"max_tokens","max_output_tokens":0},
+    {"output_token_field":"max_tokens","max_output_tokens":4097},
+    {"output_token_field":"max_output_tokens","max_output_tokens":100},
+    {"output_token_field":"max_tokens","max_output_tokens":100,"extra":True},
+])
+def test_sdk_rejects_malformed_protected_ceiling_before_reservation(tmp_path,answer):
+    from tests.herdr.test_security import grant
+    from herdr.work_contract_host import WorkInvocationGuard
+    class Port:
+        def __call__(self,*args,**kwargs):return True
+        def effect(self,identity,grant_hash,action,payload):
+            assert action=="ceiling"
+            return answer
+    guard=WorkInvocationGuard(grant(tmp_path),work_authority=Port())
+    with pytest.raises(PolicyDenied,match="model_quote_ceiling_invalid"):guard.model_request_ceiling({})
+
+
+@pytest.mark.parametrize("field",[None,True,"max_output_tokens"])
+def test_invalid_quote_output_field_is_not_admitted(tmp_path,field):
+    with pytest.raises(WorkContractError,match="token field"):
+        approved_factory(tmp_path,quote_overrides={"output_token_field":field})
+
+
+def test_openai_quote_defaults_to_completion_field_and_rejects_legacy_o_series_field():
+    from herdr.work_budget_configuration import model_request_ceiling
+    quote={"provider":"openai","model":"gpt-4o","max_output_tokens":100}
+    assert model_request_ceiling(quote)=={"output_token_field":"max_completion_tokens","max_output_tokens":100}
+    with pytest.raises(WorkContractError,match="token field"):
+        model_request_ceiling({**quote,"model":"o3","output_token_field":"max_tokens"})
+
+
+def test_bounded_native_nous_metadata_is_preserved():
+    agent=SimpleNamespace(provider="nous",api_mode="chat_completions",model="quoted-text-model",
+                          base_url="https://inference-api.nousresearch.com/v1")
+    body={"tags":["product=hermes-agent","client=fixture","conversation=offline-unit"],"session_id":"offline-unit"}
+    for reasoning in (None,{"enabled":True,"effort":"medium"},{"enabled":False,"effort":"none"}):
+        extras={**body,**({"reasoning":reasoning} if reasoning is not None else {})}
+        request={"model":agent.model,"messages":[{"role":"user","content":"bounded text"}],
+                 "max_tokens":100,"extra_body":extras}
+        original=digest(request)
+        validate_text_request(request,agent)
+        assert digest(request)==original
+
+
+def test_nous_extensions_deny_routing_overrides_foreign_routes_and_unbounded_metadata():
+    agent=SimpleNamespace(provider="nous",api_mode="chat_completions",model="quoted-text-model",
+                          base_url="https://inference-api.nousresearch.com/v1")
+    original={"model":agent.model,"messages":[{"role":"user","content":"bounded text"}],"max_tokens":100}
+    invalids=[{"provider":{"only":["foreign"]}},{"api_key":"forbidden"},{"model":"foreign"},
+              {"tags":"not-a-list"},{"tags":["x"]*9},{"tags":["x"*257]},{"session_id":True},
+              {"reasoning":{"enabled":1}},{"reasoning":{"effort":"ultra"}},
+              {"reasoning":{"max_tokens":100000}},{"reasoning":{"effort":[]}}]
+    for extra in invalids:
+        with pytest.raises(WorkContractError):validate_text_request({**original,"extra_body":extra},agent)
+    for changes in ({"provider":"provider-a"},{"base_url":"https://unquoted.invalid/v1"}):
+        foreign=SimpleNamespace(**{**vars(agent),**changes})
+        with pytest.raises(WorkContractError):
+            validate_text_request({**original,"extra_body":{"tags":["fixture"]}},foreign)
+
+
+@pytest.mark.parametrize("mode",["success","exception","timeout"])
+def test_real_worker_thread_deadline_preserves_original_budget_record(tmp_path,mode):
+    """Offline SDK transport in real threads/processes, never a provider call."""
+    import json,subprocess,sys
+    child=tmp_path/"deadline-child";child.mkdir()
+    code=r"""
+from pathlib import Path
+import json,sys,threading,time,signal
+from herdr.work_model_deadline import model_deadline
+from herdr.work_budget import BudgetLimits,BudgetAllocation,WorkBudgetAuthority,Demand,Usage
+from herdr.scheduler import AuditLog
+from herdr.security import InvocationIdentity
+from herdr.evidence import digest
+root=Path(sys.argv[1]);mode=sys.argv[2]
+identity=InvocationIdentity("github:fixture/repo","offline-worker","offline-parent",
+                            "offline-parent-task","offline-task","offline-run",1)
+allocation=BudgetAllocation(digest("offline-allocation"),identity.consumer,digest("offline-work"),
+    digest("offline-lineage"),digest("offline-approval"),BudgetLimits(1000000,1000000,5,100000,100000,2,0,1,1))
+authority=WorkBudgetAuthority(audit_log=AuditLog(root/"budget.jsonl"),authorize=lambda **kw:allocation)
+authority.open(consumer=identity.consumer,work_key=allocation.work_key,
+    lineage_key=allocation.lineage_key,authorization_reference=allocation.authorization_reference)
+outcomes=[]
+previous=signal.getsignal(signal.SIGALRM)
+def worker():
+    operation=authority.reserve(allocation_id=allocation.allocation_id,semantic_key=digest("offline-sdk-request"),
+        identity=identity,plan_sha256=digest("offline-contract"),provider="offline-fixture",demand=Demand(1000,1,1000,1000))
+    assert authority.claim_start(operation)
+    (root/"receipt.json").write_text(json.dumps({"operation_id":operation,
+        "allocation_id":allocation.allocation_id,"audit":str(authority.audit_log._path)}))
+    try:
+        with model_deadline(120 if mode=="timeout" else 500):
+            if mode=="timeout":
+                while True:
+                    try:time.sleep(0.01)
+                    except BaseException:pass
+            time.sleep(0.005)
+            if mode=="exception":raise ValueError("offline transport failure")
+        authority.settle(operation,Usage(None,1,None,None,digest("offline-transport-return")))
+        outcomes.append("returned")
+    except BaseException as exc:outcomes.append(type(exc).__name__)
+thread=threading.Thread(target=worker);thread.start();thread.join(3)
+assert not thread.is_alive()
+time.sleep(0.65)
+assert signal.getsignal(signal.SIGALRM)==previous and signal.getitimer(signal.ITIMER_REAL)==(0,0)
+print(json.dumps(outcomes))
+"""
+    result=subprocess.run([sys.executable,"-c",code,str(child),mode],capture_output=True,text=True,timeout=20)
+    assert (child/"receipt.json").is_file(), result.stderr
+    receipt=json.loads((child/"receipt.json").read_text())
+    from herdr.scheduler import AuditLog
+    from herdr.work_budget import WorkBudgetAuthority
+    authority=WorkBudgetAuthority(audit_log=AuditLog(Path(receipt["audit"])),
+        authorize=lambda **kw:pytest.fail("deadline read cannot open a new allocation"))
+    row=authority.reconcile(receipt["operation_id"])
+    assert row["started"]
+    if mode=="timeout":
+        assert result.returncode==124 and row["usage"] is None
+    elif mode=="exception":
+        assert result.returncode==0 and json.loads(result.stdout)==["ValueError"] and row["usage"] is None
+    else:
+        assert result.returncode==0 and json.loads(result.stdout)==["returned"]
+        assert row["usage"]["model_calls"]==1 and row["usage"]["cost_microusd"] is None

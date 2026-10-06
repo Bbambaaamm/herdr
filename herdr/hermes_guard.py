@@ -918,10 +918,13 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
             if callable(begin) and guard.budget_required():
                 from .evidence import canonical
                 from .work_model_deadline import validate_text_request
-                # Hermes may omit its main request ceiling; bound the exact SDK payload.
+                # Bound the exact SDK payload using the protected route's quote.
                 if isinstance(payload,dict) and not any(key in payload for key in
                         ("max_tokens","max_completion_tokens","max_output_tokens")):
-                    payload={**payload,"max_tokens":4096}
+                    resolve=getattr(guard,"model_request_ceiling",None)
+                    if not callable(resolve):raise PolicyDenied("model_quote_ceiling_unavailable")
+                    ceiling=resolve({key:getattr(agent,key) for key in ("provider","model","api_mode","base_url")})
+                    payload={**payload,ceiling["output_token_field"]:ceiling["max_output_tokens"]}
                 validate_text_request(payload,agent)
                 encoded=canonical(payload)
                 output=next((payload[key] for key in ("max_completion_tokens","max_output_tokens","max_tokens")

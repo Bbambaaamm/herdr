@@ -240,6 +240,14 @@ class WorkInvocationGuard(InvocationGuard):
             raise PolicyDenied("work_budget_status_invalid")
         return answer["required"]
 
+    def model_request_ceiling(self,payload):
+        answer=self.work_authority.effect(self.grant.identity,self.grant.hash,"ceiling",payload)
+        if (not isinstance(answer,dict) or set(answer)!={"output_token_field","max_output_tokens"}
+                or answer["output_token_field"] not in ("max_tokens","max_completion_tokens")
+                or type(answer["max_output_tokens"]) is not int or not 1<=answer["max_output_tokens"]<=4096):
+            raise PolicyDenied("model_quote_ceiling_invalid")
+        return answer
+
     def start_model_effect(self,payload):
         if not self.budget_required():return None
         receipt=self.work_authority.effect(self.grant.identity,self.grant.hash,"start",payload)

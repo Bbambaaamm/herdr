@@ -92,3 +92,27 @@ def test_irrelevant_uid_retains_connection_for_original_bootstrap_broker(tmp_pat
         left.sendall(b"original-broker-still-owns-connection")
         assert right.recv(128)==b"original-broker-still-owns-connection"
     finally:left.close();right.close()
+
+
+@pytest.mark.parametrize("budgeted",[True,False])
+def test_actual_peer_request_ceiling_requires_a_bound_host_budget(tmp_path,budgeted):
+    from tests.herdr.test_work_budget_configuration import approved_factory
+    factory,root,plan,grant,cycle,raw,allocation,quote=approved_factory(tmp_path)
+    owner,observed=owner_for(factory,grant)
+    if budgeted:owner.work_budget=factory.budget_effect
+    route={key:quote[key] for key in ("provider","model","api_mode","base_url")}
+    original=factory.budget_authority.audit_log._path.read_bytes()
+    left,right=socket.socketpair()
+    try:
+        right.sendall(json.dumps({"op":"work-budget","identity":grant.identity.to_json(),
+            "grant_sha256":grant.hash,"action":"ceiling","payload":route}).encode()+b"\n")
+        assert dispatch_work_connection(owner,left)
+        response=right.recv(8192)
+        if budgeted:
+            assert json.loads(response)=={"output_token_field":"max_tokens","max_output_tokens":100}
+            assert len(observed)==2
+        else:
+            assert response==b"denied\n" and len(observed)==1
+        assert factory.budget_authority.audit_log._path.read_bytes()==original
+    finally:
+        left.close();right.close()

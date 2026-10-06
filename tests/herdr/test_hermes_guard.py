@@ -419,6 +419,7 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
         from herdr.work_cycle import WorkContractError
         effects = []
         policy.budget_required = lambda: True
+        policy.model_request_ceiling = lambda route: {"output_token_field": "max_tokens", "max_output_tokens": 100}
         policy.start_model_effect = lambda request: effects.append(("start", dict(request))) or {
             "operation_id": "a"*64, "quote_sha256": "b"*64, "max_work_ms": 1000}
         policy.returned_model_effect = lambda receipt: effects.append(("returned", dict(receipt)))
@@ -432,7 +433,7 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
             agent._test_model_request = request
             loop.perform_api_call(agent)
             sent = network_requests[-1]
-            expected = next(iter(cap.values()), 4096)
+            expected = next(iter(cap.values()), 100)
             assert next(sent[key] for key in ("max_tokens", "max_completion_tokens") if key in sent) == expected
             assert request == {**original, **cap}  # The middleware's request was not mutated.
             start, returned = effects[-2:]
