@@ -194,3 +194,5 @@ VERIFY when proofs are cleared and verification is explicitly reopened. It
 cannot reuse the original PASS as a new check or silently submit modified bytes.
 Unknown original hook/commit delivery still requires original evidence and does
 not authorize repeating hooks.
+
+Host request bounds now include a 120-second allowance for inventories, private Git construction, publication and receipt capture. A monotonic request deadline covers the complete protected callback; local reads, Git commands and publication gates consume that deadline. Admission never extends the original signed grant. Direct model result submissions stay denied in every work phase; only the verification handler opens an exact-payload internal submission context. Proven hook content invalidation retires its original private commit request; UNKNOWN delivery remains held. Formatter content promotion is not automatic.

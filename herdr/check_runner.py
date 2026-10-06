@@ -190,6 +190,8 @@ class HostCheckRunner:
 
     @staticmethod
     def _execute(argv,check,pass_fds):
+        from .work_lifetime import require_work_time
+        require_work_time(check.timeout_seconds+13)
         process=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
             env={"PATH":"/usr/bin:/bin","LANG":"C.UTF-8"},start_new_session=True,close_fds=True,pass_fds=pass_fds)
         started=time.monotonic()

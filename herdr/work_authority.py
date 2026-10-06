@@ -17,7 +17,7 @@ class WorkAuthorityClient:
                 "exact work authority request required")
         request = {"op": "work-authorize", "identity": identity.to_json(),
                    "grant_sha256": grant_sha256, "kind": kind, "tool": tool}
-        payload = json.dumps(request, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        payload = canonical(request) + b"\n"
         require(len(payload) <= 8192, "work authority request exceeds bound")
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
@@ -53,7 +53,7 @@ class WorkAuthorityClient:
         request = {"op": "work-verify", "identity": identity.to_json(),
                    "grant_sha256": grant_sha256, "request_id": request_id}
         if handoff is not None: request["handoff"] = handoff
-        payload = json.dumps(request, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        payload = canonical(request) + b"\n"
         require(len(payload) <= 8192, "verification request exceeds bound")
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
@@ -117,8 +117,10 @@ def dispatch_work_connection(owner, connection):
             else:
                 seconds=900  # Closed host transport fixture without an exact plan.
             require_grant_lifetime(owner.launch.grant,seconds)
-            outcome = (callback(owner.launch.identity, owner.launch.grant.hash, request["request_id"], handoff=request["handoff"])
-                       if "handoff" in request else callback(owner.launch.identity, owner.launch.grant.hash, request["request_id"]))
+            from .work_lifetime import bounded_host_request
+            with bounded_host_request(seconds):
+                outcome = (callback(owner.launch.identity, owner.launch.grant.hash, request["request_id"], handoff=request["handoff"])
+                           if "handoff" in request else callback(owner.launch.identity, owner.launch.grant.hash, request["request_id"]))
             after = inspect_peer(pid)
             require(after == peer and owner.launch.grant.is_active(),
                     "work authority peer or grant changed during verification")

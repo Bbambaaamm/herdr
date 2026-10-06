@@ -38,7 +38,8 @@ def register_work_tool(installation, registry, authorized_call, call_digest):
             outcome = guard.verify_work(raw["request_id"], handoff=raw.get("handoff"), consume_approval=False)
             if outcome.get("submission") is not None:
                 from .result_submission import submit
-                submission = submit(guard, outcome["submission"])
+                with guard.host_result_submission(outcome["submission"]):
+                    submission = submit(guard, outcome["submission"])
                 outcome = {key:value for key,value in outcome.items() if key != "submission"}
                 outcome["result_delivery"] = submission
             return json.dumps(outcome, sort_keys=True)

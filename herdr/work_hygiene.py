@@ -19,6 +19,7 @@ from .policy_launch import _open_relative
 from .work_cycle import require, WorkPhase, tree_snapshot
 from .evidence import EvidenceUnavailable, parse_artifact
 from .workspace import ArtifactRef, WorkspaceManager
+from .work_lifetime import require_work_time
 
 _BOOTSTRAP = r"""
 import base64,hashlib,json,os,resource,shutil,socket,stat,subprocess,sys
@@ -134,6 +135,7 @@ class LocalCommitPolicy:
 
 
 def private_file(path, limit):
+    require_work_time()
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     try:
         before = os.fstat(fd)
@@ -141,6 +143,7 @@ def private_file(path, limit):
                 "bounded regular Git input required")
         raw = bytearray()
         while len(raw) <= limit:
+            require_work_time()
             part = os.read(fd, min(65536, limit + 1 - len(raw)))
             if not part: break
             raw.extend(part)
@@ -182,6 +185,7 @@ def directory_fd(path):
 def publish_file(parent, name, raw, *, expected=None):
     """Normal exclusive Git lock protocol, one literal name, durable rename."""
     require("/" not in name and name not in {".", ".."}, "literal metadata name required")
+    require_work_time()
     lock = name + ".lock"
     fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=parent)
     try:
@@ -192,6 +196,7 @@ def publish_file(parent, name, raw, *, expected=None):
             finally: os.close(current)
         pending = memoryview(raw)
         while pending:
+            require_work_time()
             written = os.write(fd, pending)
             require(written > 0, "metadata write made no progress")
             pending = pending[written:]
@@ -286,8 +291,10 @@ class HostLocalCommitter:
         source = cycle.verify_scope()
         require(digest(source) == cycle.verified_tree, "local commit tree differs from tested bytes")
         hooks = self._hooks(); self.policy.environment.verify_inputs()
-        old = [e for e in cycle._events() if e["event"] == "work_local_commit_ready"]
-        pending = [e for e in cycle._events() if e["event"] == "work_local_commit_requested"]
+        events=cycle._events()
+        retired={e["private_repository"] for e in events if e["event"]=="work_local_commit_invalidated"}
+        old = [e for e in events if e["event"] == "work_local_commit_ready" and e["private_repository"] not in retired]
+        pending = [e for e in events if e["event"] == "work_local_commit_requested" and e["private_repository"] not in retired]
         if old:
             record = old[-1]; private = Path(record["private_repository"])
             require(private.parent == self.storage and private.resolve(strict=True) == private,
@@ -320,10 +327,12 @@ class HostLocalCommitter:
             directory = directory_fd(cycle.root)
             try:
                 for name, row in source.items():
+                    require_work_time()
                     handle = _open_relative(directory, name)
                     try:
                         data = bytearray()
                         while len(data) <= 67108864:
+                            require_work_time()
                             part = os.read(handle, 65536)
                             if not part: break
                             data.extend(part)
@@ -406,6 +415,8 @@ class HostLocalCommitter:
             require(rows, "bounded hygiene export unavailable")
             exported=json.loads(rows[-1])
             if exported=={"status":"changed"}:
+                cycle._record("local_commit_invalidated", private_repository=str(private),
+                              tree_sha256=cycle.verified_tree, policy_sha256=self.policy.hash)
                 cycle._record("invalidate", reason="commit_hook_changed_tested_content")
                 cycle.verified_tree,cycle.verified_checks,cycle.phase=None,{},WorkPhase.VERIFY
                 cycle.verification_open=True
@@ -432,6 +443,8 @@ class HostLocalCommitter:
             require(read_only_git(work)(["rev-parse", "HEAD^"]).strip() == self.draft.base_sha, "hook changed commit ancestry")
             private_tree = tree_snapshot(work, git=read_only_git(work))
             if private_tree != source:
+                cycle._record("local_commit_invalidated", private_repository=str(private),
+                              tree_sha256=cycle.verified_tree, policy_sha256=self.policy.hash)
                 cycle._record("invalidate", reason="commit_hook_changed_tested_content")
                 cycle.verified_tree, cycle.verified_checks, cycle.phase = None, {}, WorkPhase.VERIFY
                 cycle.verification_open = True
@@ -474,6 +487,7 @@ class HostLocalCommitter:
         finally: os.close(parent)
         manager = WorkspaceManager(cycle.root, git=git, worktrees_dir=cycle.root.parent,
                                    artifacts_dir=self.storage/"artifacts")
+        require_work_time()
         sealed = manager.seal(self.draft, cycle.root)
         verify_committed_bytes(sealed, cycle.root, git)
         cycle.committed(sealed)
@@ -491,6 +505,7 @@ class HostLocalCommitter:
             parent = directory_fd(destination)
             try:
                 for item in directory.iterdir():
+                    require_work_time()
                     require(re.fullmatch("[0-9a-f]{38}", item.name), "private object name invalid")
                     compressed = private_file(item, 67108864)
                     decoder = zlib.decompressobj()
@@ -509,6 +524,7 @@ class HostLocalCommitter:
                     try:
                         pending = memoryview(compressed)
                         while pending:
+                            require_work_time()
                             written = os.write(fd, pending); require(written > 0, "object write stalled")
                             pending = pending[written:]
                         os.fchmod(fd, 0o444); os.fsync(fd)
