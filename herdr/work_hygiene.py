@@ -417,7 +417,6 @@ class HostLocalCommitter:
             if exported=={"status":"changed"}:
                 cycle._record("local_commit_invalidated", private_repository=str(private),
                               tree_sha256=cycle.verified_tree, policy_sha256=self.policy.hash)
-                cycle._record("invalidate", reason="commit_hook_changed_tested_content")
                 cycle.verified_tree,cycle.verified_checks,cycle.phase=None,{},WorkPhase.VERIFY
                 cycle.verification_open=True
                 raise ValueError("commit hook invalidated tested content")
@@ -445,7 +444,6 @@ class HostLocalCommitter:
             if private_tree != source:
                 cycle._record("local_commit_invalidated", private_repository=str(private),
                               tree_sha256=cycle.verified_tree, policy_sha256=self.policy.hash)
-                cycle._record("invalidate", reason="commit_hook_changed_tested_content")
                 cycle.verified_tree, cycle.verified_checks, cycle.phase = None, {}, WorkPhase.VERIFY
                 cycle.verification_open = True
                 raise ValueError("commit hook invalidated tested content")

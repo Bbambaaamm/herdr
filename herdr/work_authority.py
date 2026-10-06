@@ -102,6 +102,13 @@ class WorkAuthorityClient:
 
 
 def dispatch_work_connection(owner, connection):
+    from .work_lifetime import bounded_host_request
+    # This starts before receipt/peer/mount/request checks and remains active
+    # through response encoding and delivery, on this same broker thread.
+    with bounded_host_request(900):
+        return _dispatch_work_connection(owner,connection)
+
+def _dispatch_work_connection(owner, connection):
     """Only the exact observed stage-two process can ask about its phase.
 
     Other peers go through the unchanged stage-one admission broker. The
@@ -116,14 +123,18 @@ def dispatch_work_connection(owner, connection):
         if pid != receipt.peer_pid or uid != os.geteuid():
             return False
         accepted_peer = True
+        from .work_lifetime import require_work_time,remaining_work_seconds
+        require_work_time()
         peer = inspect_peer(pid)
         require(peer.start_ticks == receipt.process_start_ticks
                 and (peer.exe_device, peer.exe_inode) == (receipt.python_device, receipt.python_inode),
                 "work authority peer changed")
         owner.launch.mount.verify_mounted(pid, owner.launch.sealed)
+        require_work_time()
         require(owner.launch.grant.is_active(), "work authority grant expired")
-        connection.settimeout(5)
+        connection.settimeout(remaining_work_seconds(5))
         request = _recv_line(connection)
+        require_work_time()
         require(request.get("identity") == owner.launch.identity.to_json()
                 and request.get("grant_sha256") == owner.launch.grant.hash, "work authority binding invalid")
         if request.get("op") == "work-budget":
@@ -155,18 +166,23 @@ def dispatch_work_connection(owner, connection):
                 seconds=check_wall_seconds(current.plan,getattr(target,"local_commit_policy",None))
             else:
                 seconds=900  # Closed host transport fixture without an exact plan.
-            require_grant_lifetime(owner.launch.grant,seconds)
+            require_grant_lifetime(owner.launch.grant,900)
             from .work_lifetime import bounded_host_request
             with bounded_host_request(seconds):
                 outcome = (callback(owner.launch.identity, owner.launch.grant.hash, request["request_id"], handoff=request["handoff"])
                            if "handoff" in request else callback(owner.launch.identity, owner.launch.grant.hash, request["request_id"]))
+            require_work_time()
             after = inspect_peer(pid)
             require(after == peer and owner.launch.grant.is_active(),
                     "work authority peer or grant changed during verification")
             owner.launch.mount.verify_mounted(pid, owner.launch.sealed)
+            require_work_time()
             encoded = canonical(outcome) + b"\n"
             require(len(encoded) <= 8192, "verification outcome exceeds bound")
+            connection.settimeout(remaining_work_seconds(5))
+            require_work_time()
             connection.sendall(encoded)
+            require_work_time()
         else:
             require(set(request) == {"op", "identity", "grant_sha256", "kind", "tool"}
                     and request["op"] == "work-authorize" and request["kind"] in {"provider", "tool"}

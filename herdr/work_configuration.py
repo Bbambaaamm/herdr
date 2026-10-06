@@ -288,6 +288,7 @@ def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG
     factory.request_wall_seconds=factory.baseline_wall_seconds
     if hygiene is not None:factory.request_wall_seconds+=hygiene.timeout_seconds+13
     require(factory.request_wall_seconds<=900,"full host verification request exceeds bound")
+    factory.request_wall_seconds=900  # Includes transport and protected callback.
     factory.task_store_root = root
     _private_directory(storage / "results", base=Path(raw["storage"]))
     from .work_result_receipt import WorkResultAuthority

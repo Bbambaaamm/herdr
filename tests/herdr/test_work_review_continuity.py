@@ -295,3 +295,42 @@ def test_original_grant_reserves_host_phase_allowance_before_baseline(tmp_path,m
     with pytest.raises(WorkContractError,match="lifetime"):
         factory.prepare(identity=item.identity,workspace=root,grant=item,spec_sha256=plan.spec_sha256)
     assert log.replay()==[]
+
+
+def test_crash_after_single_hook_invalidation_replays_verify_not_hygiene(boundary_workspace,monkeypatch):
+    from herdr.check_runner import HostCheckRunner
+    port,cycle,guard,result,task,plan,observed,log=ready(boundary_workspace,monkeypatch,
+        hook="printf '\\n# formatter changed tested content\\n' >> result.py")
+    oracle=HostCheckRunner(port.committer.policy.environment,boundary_workspace/"host"/"checks",git=cycle.git)
+    port.prepare_request(cycle,"crash-after-invalidated",{"pr_number":None})
+    outcome=cycle.request_verification("crash-after-invalidated",oracle)
+    original=cycle._record
+    def crash(kind,**data):
+        original(kind,**data)
+        if kind=="local_commit_invalidated":raise SystemExit("crash after durable retirement")
+    monkeypatch.setattr(cycle,"_record",crash)
+    with pytest.raises(SystemExit):port.complete(cycle,"crash-after-invalidated",outcome)
+    cold=WorkCycle(cycle.plan,cycle.root,log,git=cycle.git)
+    assert cold.phase is WorkPhase.VERIFY and cold.verification_open and not cold.verified_checks
+    assert result.read_bytes()==b"" and git(cycle.root,"rev-parse","HEAD")==cycle.plan.base_sha
+    monkeypatch.setattr(HostCheckRunner,"_execute",lambda *a:pytest.fail("cannot repeat hooks before new verification"))
+    with pytest.raises(WorkContractError):port.committer(cold)
+
+def test_transport_prechecks_consume_the_original_request_deadline(tmp_path,monkeypatch):
+    import socket
+    import herdr.work_lifetime as lifetime
+    from herdr.work_authority import dispatch_work_connection
+    from tests.herdr.test_work_authority import owner_for
+    from tests.herdr.test_security import grant
+    from herdr.security import ToolRule,RiskClass
+    item=grant(tmp_path,tools=("herdr_verify_work",),rules=(ToolRule("herdr_verify_work",RiskClass.READ,
+        ("request_id","handoff"),requires_sandbox=True),))
+    owner,_=owner_for(SimpleNamespace(authorize_invocation=lambda *a,**kw:True),item)
+    owner.work_verify=lambda *a,**kw:pytest.fail("expired prechecks cannot invoke host effects")
+    now=[10.0];monkeypatch.setattr(lifetime.time,"monotonic",lambda:now[0])
+    owner.launch.mount.verify_mounted=lambda *a:now.__setitem__(0,911.0)
+    left,right=socket.socketpair()
+    right.sendall(canonical({"op":"work-verify","identity":item.identity.to_json(),
+        "grant_sha256":item.hash,"request_id":"precheck"})+b"\n")
+    with pytest.raises(WorkContractError,match="deadline"):dispatch_work_connection(owner,left)
+    assert right.recv(8193)==b"denied\n";right.close()

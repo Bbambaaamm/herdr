@@ -438,6 +438,10 @@ class WorkCycle:
                 if kind == "work_local_commit_ready":
                     require(isinstance(event.get("commit_sha"), str) and _GIT.fullmatch(event["commit_sha"]),
                             "local commit replay digest invalid")
+                if kind == "work_local_commit_invalidated":
+                    self.verified_tree,self.verified_checks=None,{}
+                    self.verification_open=True
+                    self.phase=WorkPhase.VERIFY
             elif kind == "work_commit":
                 require(self.phase is WorkPhase.HYGIENE, "commit replay phase invalid")
                 from .evidence import parse_artifact
