@@ -918,6 +918,10 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
             if callable(begin) and guard.budget_required():
                 from .evidence import canonical
                 from .work_model_deadline import validate_text_request
+                # Hermes may omit its main request ceiling; bound the exact SDK payload.
+                if isinstance(payload,dict) and not any(key in payload for key in
+                        ("max_tokens","max_completion_tokens","max_output_tokens")):
+                    payload={**payload,"max_tokens":4096}
                 validate_text_request(payload,agent)
                 encoded=canonical(payload)
                 output=next((payload[key] for key in ("max_completion_tokens","max_output_tokens","max_tokens")
