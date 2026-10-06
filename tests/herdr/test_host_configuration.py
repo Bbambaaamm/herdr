@@ -245,3 +245,31 @@ def test_enabled_consumer_narrowing_retains_coding_handoff_for_root_and_child(
             preflight_handoff(work,child,{"kind":"coding"},require_slot=False)
         finally:child.cleanup_after_pane_closed()
     finally:parent.cleanup_after_pane_closed()
+
+@pytest.mark.parametrize("payload_bytes", [3500000,4194305])
+def test_protected_reader_supports_complete_runtime_manifest_with_a_finite_bound(
+        tmp_path,monkeypatch,payload_bytes):
+    from types import SimpleNamespace
+    path=tmp_path/"host-policy.json"
+    path.write_text(json.dumps({"inventory": "x"*payload_bytes}))
+    path.chmod(0o600)
+    original_lstat=Path.lstat
+    original_fstat=os.fstat
+    protected={path,*path.parents}
+    def protected_metadata(info):
+        # Simulate only trusted ownership; size and stable inode/timestamps
+        # still come from the actual file and reader syscalls.
+        names=("st_dev","st_ino","st_size","st_mtime_ns","st_ctime_ns","st_mode")
+        raw={name:getattr(info,name) for name in names}
+        raw.update(st_uid=0,st_mode=info.st_mode&~0o022)
+        return SimpleNamespace(**raw)
+    def trusted_lstat(target,*args,**kwargs):
+        info=original_lstat(target,*args,**kwargs)
+        return protected_metadata(info) if target in protected else info
+    monkeypatch.setattr(Path,"lstat",trusted_lstat)
+    monkeypatch.setattr(os,"fstat",lambda fd:protected_metadata(original_fstat(fd)))
+    if payload_bytes==3500000:
+        assert len(config._read_configuration(path)["inventory"])==payload_bytes
+    else:
+        with pytest.raises(SecurityError,match="host configuration is untrusted"):
+            config._read_configuration(path)
