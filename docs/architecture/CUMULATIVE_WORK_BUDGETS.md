@@ -121,3 +121,12 @@ The model effect seam rechecks the exact request, quote, allocation and series
 binding before the original claim. SDK deadline expiry rearms the alarm and
 rejects a late returned callback even if SDK code caught the first exception;
 the original operation remains UNKNOWN and is not settled by that return.
+
+Admission compares every persisted ancestor with its exact immutable declaration.
+A hygiene operation binds the original verification request as well as its tree;
+new verification of identical bytes still reserves a new hook generation.
+Reconciliation derives that original generation from the durable verification
+and hygiene events, with lookup-only compatibility for historical reservations.
+A started operation without an original hygiene intent remains UNKNOWN.
+Recurring internally generated stop conditions durably reactivate a resumed
+stop; replay preserves both the host-approved resume and the later stop.

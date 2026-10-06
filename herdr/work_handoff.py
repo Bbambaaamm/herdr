@@ -124,8 +124,8 @@ class HostWorkHandoff:
         allocation=self.budget_allocation
         require(allocation is not None and cycle.plan.budget_reference==allocation.hash,
                 "local hygiene budget binding changed")
-        semantic=digest({"purpose":"local-hygiene","identity":self.identity.to_json(),
-                         "plan":cycle.plan.hash,"tree":cycle.verified_tree,"policy":self.committer.policy.hash})
+        from .work_budget import hygiene_semantic,hygiene_generation_events
+        semantic=hygiene_semantic(cycle.plan,cycle.verified_tree,self.committer.policy.hash,request_id)
         from .work_cycle import WorkPhase
         reconcile_known_hygiene(authority,allocation,cycle)
         reserve_host_phase_overhead(authority,allocation,cycle.plan,"verification:"+request_id,
@@ -140,7 +140,12 @@ class HostWorkHandoff:
             operation_kind="hygiene")
         # The committer itself resumes only its original durable intent/ref.
         # An unknown hook delivery cannot become another hook execution.
-        authority.claim_start(operation)
+        if not authority.claim_start(operation):
+            original=authority.reconcile(operation)
+            require(original["usage"] is not None or any(event["event"]=="work_local_commit_requested"
+                    and event["tree_sha256"]==cycle.verified_tree and generation==request_id
+                    for event,generation in hygiene_generation_events(cycle)),
+                    "hygiene delivery uncertain; reconcile original intent")
         try:
             artifact=self.committer(cycle)
         except Exception:

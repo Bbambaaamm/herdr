@@ -832,3 +832,22 @@ def test_model_effect_rechecks_original_request_and_quote_before_claim(tmp_path,
     selected[0]=ModelReservation(h("original-model-seam"),Demand(100,1,100,100),request.provider)
     port.begin_effect(operation,request,guard=guard,cycle=cycle)
     assert port.reconcile(operation)["started"] is True
+
+
+def test_repeated_internal_overquote_reactivates_stop_and_cold_replay(tmp_path):
+    auth,alloc,log=authority(tmp_path)
+    first=reserve(auth,alloc,"overquote-first")
+    settle(auth,first,tokens=150)
+    stop=auth.snapshot(alloc.allocation_id)["active_stops"][0]
+    auth.resume(stop_id=stop["stop_id"],allocation_id=alloc.allocation_id,identity=identity(),
+                valid_grant_sha256=h("reviewed-grant"),host_approval=lambda *a:True)
+    assert auth.snapshot(alloc.allocation_id)["active_stops"]==[]
+    second=reserve(auth,alloc,"overquote-second")
+    settle(auth,second,tokens=150)
+    cold=WorkBudgetAuthority(audit_log=AuditLog(log._path),authorize=lambda **kw:pytest.fail("no refill"),
+                             clock_ms=lambda:1000)
+    active=cold.snapshot(alloc.allocation_id)["active_stops"]
+    assert len(active)==1 and active[0]["stop_id"]==stop["stop_id"]
+    assert sum(row.get("event")=="work_budget_stop_reactivated" for row in log.replay())==1
+    with pytest.raises(BudgetBlocked,match="stopped"):reserve(cold,alloc,"after-second-overquote")
+    assert cold.reconcile(first)["usage"]["tokens"]==cold.reconcile(second)["usage"]["tokens"]==150

@@ -47,8 +47,9 @@ def bind_budget(factory, raw, *, storage, writable_roots=(), recovery=False):
         if recovery:
             require(authority.find_allocation(row.hash)==row,"original cumulative allocation changed")
             continue
-        authority.open(consumer=row.consumer,work_key=row.work_key,lineage_key=row.lineage_key,
+        persisted=authority.open(consumer=row.consumer,work_key=row.work_key,lineage_key=row.lineage_key,
                        authorization_reference=row.authorization_reference)
+        require(persisted==row,"declared cumulative allocation differs from original")
     require(isinstance(raw["model_quotes"],list) and len(raw["model_quotes"])<=16,"bounded model quotes required")
     quotes={}
     for quote in raw["model_quotes"]:

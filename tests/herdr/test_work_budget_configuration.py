@@ -185,3 +185,20 @@ def test_caught_sdk_alarm_cannot_settle_overlong_original_operation(tmp_path):
     assert len(caught)>=2 and signal.getitimer(signal.ITIMER_REAL)==(0,0)
     assert factory.budget_authority.reconcile(original["operation_id"])["usage"] is None
     assert factory.budget_authority.snapshot(allocation.allocation_id)["inflight"]==1
+
+
+def test_fresh_admission_rejects_changed_persisted_ancestor_limits(tmp_path):
+    factory,root,plan,grant,cycle,raw,allocation,quote=approved_factory(tmp_path)
+    parent=replace(allocation,allocation_id=digest("existing-parent"),work_key=digest("parent-work"),
+                   limits=replace(allocation.limits,max_model_calls=10))
+    child=replace(allocation,parent_allocation_id=parent.allocation_id)
+    declared={**raw,"allocation":asdict(child),"ancestors":[asdict(parent)]}
+    storage=tmp_path/"original-ancestor-ledger"
+    storage.mkdir(mode=0o700)
+    bind_budget(factory,declared,storage=storage,writable_roots=(root,))
+    log=factory.budget_authority.audit_log
+    before=log._path.read_bytes()
+    tighter=replace(parent,limits=replace(parent.limits,max_model_calls=4))
+    with pytest.raises((BudgetBlocked,WorkContractError),match="differs from original"):
+        bind_budget(factory,{**declared,"ancestors":[asdict(tighter)]},storage=storage,writable_roots=(root,))
+    assert log._path.read_bytes()==before

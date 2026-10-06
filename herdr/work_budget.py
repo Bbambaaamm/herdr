@@ -431,6 +431,11 @@ class WorkBudgetAuthority:
                     require(stop["allocation_id"] in state["allocations"],"stop allocation missing")
                 for name in ("target","source","reason_code","resume_condition"): token(stop[name])
                 state["stops"][stop["stop_id"]]={**stop,"active":True}
+            elif kind=="stop_reactivated":
+                stop=state["stops"].get(event["stop_id"])
+                require(stop is not None and not stop["active"] and stop["source"]=="work-budget-authority",
+                        "internal stop reactivation replay invalid")
+                stop["active"]=True
             elif kind=="resume":
                 stop=state["stops"].get(event["stop_id"])
                 require(stop is not None and stop["active"],"resume replay invalid")
@@ -903,6 +908,8 @@ class WorkBudgetAuthority:
             self._append("stop",stop={"stop_id":stop_id,"scope":scope.value,"target":target,
                 "source":"work-budget-authority","reason_code":reason,"resume_condition":"host-review-and-remaining-budget",
                 "allocation_id":allocation_id})
+        elif not state["stops"][stop_id]["active"]:
+            self._append("stop_reactivated",stop_id=stop_id)
 
     def stop(self,*,stop_id,scope,target,source,reason_code,resume_condition):
         sha(stop_id)
@@ -1012,22 +1019,41 @@ def reserve_host_phase_overhead(authority,allocation,plan,phase_key,*,require_ex
             authority.settle(operation,Usage(None,0,0,0,digest({"phase_admission":semantic})))
     return operation
 
+def hygiene_generation_events(cycle):
+    request_id=None
+    for event in cycle._events():
+        if event["event"]=="work_verification_finished":
+            request_id=event["request_id"] if event["outcome"]["status"]=="pass" else None
+        if event["event"] in {"work_local_commit_requested","work_local_commit_invalidated","work_local_commit_ready"}:
+            yield event,request_id
+
+
+def hygiene_semantic(plan,tree,policy,request_id=None):
+    binding={"purpose":"local-hygiene","identity":plan.identity.to_json(),
+             "plan":plan.hash,"tree":tree,"policy":policy}
+    if request_id is not None:binding["verification_request"]=request_id
+    return digest(binding)
+
+
 def reconcile_known_hygiene(authority,allocation,cycle):
     """Only durable original hook/commit proofs release a held executor slot."""
     require(cycle.plan.budget_reference==allocation.hash,"hygiene reconciliation budget changed")
-    for event in cycle._events():
+    for event,request_id in hygiene_generation_events(cycle):
         if event["event"] not in {"work_local_commit_invalidated","work_local_commit_ready"}:continue
         if event.get("policy_sha256")!=cycle.plan.hygiene_sha256:continue
-        semantic=digest({"purpose":"local-hygiene","identity":cycle.plan.identity.to_json(),
-            "plan":cycle.plan.hash,"tree":event["tree_sha256"],"policy":event["policy_sha256"]})
-        operation=digest({"allocation_id":allocation.allocation_id,"semantic_key":semantic})
-        with authority._serialized():
-            row=authority._state()["operations"].get(operation)
-            if row is None or row["usage"] is not None:continue
-            require(row["started"] and row["operation_kind"]=="hygiene"
-                    and row["identity"]==cycle.plan.identity.to_json()
-                    and row["plan_sha256"]==cycle.plan.hash,"original hygiene proof binding changed")
-            authority.settle(operation,Usage(None,0,0,0,digest(event)))
+        semantics=[hygiene_semantic(cycle.plan,event["tree_sha256"],event["policy_sha256"],request_id)]
+        # Historical operations omitted the request; reconcile their existing row only.
+        if request_id is not None:
+            semantics.append(hygiene_semantic(cycle.plan,event["tree_sha256"],event["policy_sha256"]))
+        for semantic in semantics:
+            operation=digest({"allocation_id":allocation.allocation_id,"semantic_key":semantic})
+            with authority._serialized():
+                row=authority._state()["operations"].get(operation)
+                if row is None or row["usage"] is not None:continue
+                require(row["started"] and row["operation_kind"]=="hygiene"
+                        and row["identity"]==cycle.plan.identity.to_json()
+                        and row["plan_sha256"]==cycle.plan.hash,"original hygiene proof binding changed")
+                authority.settle(operation,Usage(None,0,0,0,digest(event)))
 
 
 class BudgetedCheckRunner:

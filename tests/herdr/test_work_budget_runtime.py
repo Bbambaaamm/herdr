@@ -38,7 +38,7 @@ def test_actual_unix_budget_peer_reserves_before_callback_and_reconciles_origina
     assert factory.budget_authority.snapshot(allocation.allocation_id)["inflight"]==0
     assert len(observed)>=4
 
-@pytest.mark.parametrize("changed_hook",[False,True,"crash"])
+@pytest.mark.parametrize("changed_hook",[False,True,"crash","same_tree"])
 def test_actual_hygiene_uses_existing_budget_and_never_reserves_second_commit(boundary_workspace,monkeypatch,changed_hook):
     import tests.herdr.test_work_hygiene as hygiene
     from tests.herdr.test_work_handoff import ready,committer_policy
@@ -88,10 +88,27 @@ def test_actual_hygiene_uses_existing_budget_and_never_reserves_second_commit(bo
         else:
             with pytest.raises(ValueError,match="invalidated"):port.complete(cycle,"original",outcome)
         assert authority.snapshot(allocation.allocation_id)["inflight"]==0
-        with (cycle.root/"result.py").open("a") as stream:stream.write("\n# formatted\n")
+        if changed_hook!="same_tree":
+            with (cycle.root/"result.py").open("a") as stream:stream.write("\n# formatted\n")
         port.prepare_request(cycle,"reverified",{"pr_number":None})
         outcome=cycle.request_verification("reverified",runner)
     request="reverified" if changed_hook else "original"
+    if changed_hook=="same_tree":
+        assert outcome["tree_sha256"]==cycle.verification_requests["original"]["tree_sha256"]
+        physical=HostCheckRunner._execute
+        observed=[]
+        def budget_before_hook(*args,**kwargs):
+            observed.append(authority.snapshot(allocation.allocation_id)["inflight"])
+            assert observed[-1]==1
+            return physical(*args,**kwargs)
+        monkeypatch.setattr(HostCheckRunner,"_execute",staticmethod(budget_before_hook))
+        with pytest.raises(ValueError,match="invalidated"):port.complete(cycle,request,outcome)
+        events=authority.audit_log.replay()
+        operations=[row for row in events if row.get("operation_kind")=="hygiene"]
+        assert len(operations)==2 and operations[0]["operation_id"]!=operations[1]["operation_id"]
+        assert observed==[1] and authority.snapshot(allocation.allocation_id)["inflight"]==0
+        assert all(authority.reconcile(row["operation_id"])["usage"] is not None for row in operations)
+        return
     response=port.complete(cycle,request,outcome)
     before=authority.audit_log._path.read_bytes()
     assert port.complete(cycle,request,outcome)==response
