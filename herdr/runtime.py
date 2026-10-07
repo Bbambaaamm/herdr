@@ -12,6 +12,7 @@ import fcntl
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import time
 import stat
@@ -701,41 +702,89 @@ class HerdrChildRuntime:
         self._owned_panes.add(pane_id)
         return pane_id
 
+    def _get_agent_optional(self, target: str) -> Mapping[str, object] | None:
+        """Return a live agent, or None only for Herdr's typed agent_not_found."""
+        result = self.runner.run(["agent", "get", target], timeout_seconds=10.0)
+        if result.returncode == 0:
+            payload = _json_result(result, "agent get")
+            agent = (payload.get("result") or {}).get("agent")
+            if not isinstance(agent, Mapping):
+                raise HerdrRuntimeError("child_agent_get_invalid", target)
+            return agent
+        channel = result.stdout if result.stdout and not result.stderr else (
+            result.stderr if result.stderr and not result.stdout else "")
+        try:
+            payload = json.loads(channel) if channel and len(channel.encode()) <= 131072 else None
+        except json.JSONDecodeError:
+            payload = None
+        if (
+            result.returncode == 1
+            and isinstance(payload, Mapping)
+            and isinstance(payload.get("error"), Mapping)
+            and payload["error"].get("code") == "agent_not_found"
+        ):
+            return None
+        _json_result(result, "agent get")
+        raise AssertionError("unreachable")
+
+    def _wait_for_started_agent(self, lease: _Lease, pane_id: str,
+                                *, timeout_seconds: float = 60.0) -> None:
+        deadline = time.monotonic() + timeout_seconds
+        renamed = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HerdrRuntimeError("child_agent_not_ready", lease.agent_id)
+            agent = self._get_agent_optional(pane_id)
+            if agent is None:
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                continue
+            if agent.get("pane_id") != pane_id:
+                raise HerdrRuntimeError("child_wrong_pane", pane_id)
+            kind = str(agent.get("agent") or agent.get("kind") or "")
+            if kind != "hermes":
+                raise HerdrRuntimeError("child_agent_kind_mismatch", kind or "unknown")
+            if agent.get("name") != lease.agent_id:
+                if renamed:
+                    raise HerdrRuntimeError("child_agent_rename_unstable", lease.agent_id)
+                _json_result(
+                    self.runner.run(["agent", "rename", pane_id, lease.agent_id],
+                                    timeout_seconds=min(10.0, remaining)),
+                    "agent rename",
+                )
+                renamed = True
+                continue
+            status = (_agent_status(agent) or str(agent.get("status") or "")).lower()
+            if status == "blocked":
+                raise HerdrRuntimeError("child_agent_blocked", lease.agent_id)
+            if status in {"idle", "done", "unknown"}:
+                return
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
     def _start_agent(self, lease: _Lease, pane_id: str) -> None:
         self._assert_prepared()
         node = self.scheduler.task_node(lease.task_id)
         toolsets = _child_toolsets(node.tools)
         _validate_child_permissions(node.permissions)
-        result = self.runner.run(
-            [
-                "agent",
-                "start",
-                lease.agent_id,
-                "--kind",
-                "hermes",
-                "--pane",
-                pane_id,
-                "--timeout",
-                "60000",
-                "--",
-                "-p",
-                self.env.get("HERDR_HERMES_PROFILE", DEFAULT_PROFILE),
-                "chat",
-                "--toolsets",
-                toolsets,
-                "--max-turns",
-                "1",
-                "--run-budget",
-                "600",
-            ],
-            timeout_seconds=75.0,
-        )
-        payload = _json_result(result, "agent start")
-        started = (payload.get("result") or {}).get("agent")
-        if not isinstance(started, Mapping) or started.get("name") != lease.agent_id:
-            raise HerdrRuntimeError("child_agent_start_mismatch", lease.agent_id)
-        if started.get("pane_id") and started["pane_id"] != pane_id:
-            raise HerdrRuntimeError("child_wrong_pane", pane_id)
+        # The verified sandbox shell already owns this pane. agent start
+        # only accepts a host shell prompt, so launch the immutable Hermes shim
+        # inside bwrap and let Herdr detect it in-place.
+        command = "exec " + shlex.join([
+            "hermes",
+            "-p",
+            self.env.get("HERDR_HERMES_PROFILE", DEFAULT_PROFILE),
+            "chat",
+            "--toolsets",
+            toolsets,
+            "--max-turns",
+            "1",
+            "--run-budget",
+            "600",
+        ])
+        result = self.runner.run(["pane", "run", pane_id, command], timeout_seconds=15.0)
+        if not (result.returncode == 0 and result.stdout == result.stderr == ""):
+            raise HerdrRuntimeError("child_agent_launch_unverified", pane_id)
+        self._wait_for_started_agent(lease, pane_id, timeout_seconds=60.0)
 
     def _verify_live_child(self, agent_id: str, pane_id: str, marker: str,
                            *, require_sandbox: bool = False,
