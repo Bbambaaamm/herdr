@@ -3,9 +3,13 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from herdr.launch_environment import sanitize_environment
 
 HOME = Path("/home/agentops")
 BIN = Path(__file__).resolve().parent
@@ -39,9 +43,9 @@ def mark(name):
     p.touch()
     os.chmod(p, 0o600)
 
-def run(args, timeout=180):
+def run(args, timeout=180, *, env=None):
     p = subprocess.run([str(x) for x in args], text=True, capture_output=True,
-                       timeout=timeout, env=ENV)
+                       timeout=timeout, env=ENV if env is None else env)
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 def _vtuple(value):
@@ -281,7 +285,7 @@ def weekly_self_review():
 def agent_task_maintenance():
     for name in ("agent-github-intake", "agent-task-dispatcher", "agent-task-export", "agent-swarm-export"):
         script = BIN / name
-        rc, text = run([script], 30)
+        rc, text = run([script], 30, env=sanitize_environment(ENV))
         if rc:
             log(f"{name} ERROR rc={rc}: {text[-1000:]}")
     heartbeat = STATE / "task-maintenance-heartbeat"
