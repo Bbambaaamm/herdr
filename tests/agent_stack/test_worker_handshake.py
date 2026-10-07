@@ -1842,3 +1842,32 @@ def test_intentionally_narrowed_parent_request_is_preserved():
     task["parent_tools"]=["read_file","herdr_submit_result"]
     worker.ensure_parent_scope(task)
     assert task["parent_tools"]==["read_file","herdr_submit_result"]
+
+@pytest.mark.parametrize("command", [["pane", "get", "owned"], ["agent", "get", "owned"]])
+def test_native_json_commands_still_require_json(monkeypatch, command):
+    monkeypatch.setattr(worker.subprocess, "run",
+        lambda args, **kwargs: worker.subprocess.CompletedProcess(args, 0, stdout="", stderr=""))
+    with pytest.raises(RuntimeError, match="no JSON response"):
+        worker._herdr_json(command)
+
+
+def test_native_pane_run_accepts_void_success_without_sandbox_claim(monkeypatch):
+    calls = []
+    def native(args, **kwargs):
+        calls.append(args)
+        return worker.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+    monkeypatch.setattr(worker.subprocess, "run", native)
+    assert worker._herdr_json(["pane", "run", "owned", "true"]) is None
+    assert calls == [[str(worker.HERDR), "pane", "run", "owned", "true"]]
+
+
+@pytest.mark.parametrize("code,stdout,stderr", [
+    (1, "", '{"error":{"code":"pane_not_found"}}'),
+    (0, "unexpected text", ""),
+    (0, "", "unexpected warning"),
+])
+def test_native_pane_run_rejects_failure_and_unexpected_output(monkeypatch, code, stdout, stderr):
+    monkeypatch.setattr(worker.subprocess, "run",
+        lambda args, **kwargs: worker.subprocess.CompletedProcess(args, code, stdout=stdout, stderr=stderr))
+    with pytest.raises(RuntimeError):
+        worker._herdr_json(["pane", "run", "owned", "true"])

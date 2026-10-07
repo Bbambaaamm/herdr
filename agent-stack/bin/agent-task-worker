@@ -167,7 +167,7 @@ def _parse_herdr_json(proc: subprocess.CompletedProcess[str], context: str) -> d
     raise RuntimeError(f"{context}: no JSON response")
 
 
-def _herdr_json(args: list[str], *, timeout_seconds: float = 30.0) -> dict:
+def _herdr_json(args: list[str], *, timeout_seconds: float = 30.0) -> dict | None:
     proc = subprocess.run(
         [str(HERDR), *args],
         text=True,
@@ -175,6 +175,12 @@ def _herdr_json(args: list[str], *, timeout_seconds: float = 30.0) -> dict:
         timeout=timeout_seconds,
         env=ENV,
     )
+    # Pinned native 0.9.1 pane.run uses send_ok_request: empty success,
+    # typed errors on stderr with a nonzero status. It is not sandbox proof.
+    if args[:2] == ["pane", "run"] and proc.returncode == 0:
+        if (proc.stdout or "").strip() or (proc.stderr or "").strip():
+            raise RuntimeError("herdr pane run: unexpected acknowledgement output")
+        return None
     return _parse_herdr_json(proc, "herdr " + " ".join(args[:2]))
 
 
