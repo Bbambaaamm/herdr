@@ -1057,6 +1057,9 @@ def test_actual_child_sandbox_proof_persists_exact_attestation(tmp_path, monkeyp
                 module.HERDR_CONFIG = config
                 module.HERDR_RELEASES = releases
                 module.DEFAULT_WRITABLE = ()
+                # This fixture launches bwrap through a pipe; native TTY readiness
+                # is covered separately by real-PTY and owned-server checks.
+                module.pane_input_ready = lambda *args: True
                 loaded["sandbox"] = module
         monkeypatch.setattr(SourceFileLoader, "exec_module", load)
         scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(root / "events.jsonl"))
@@ -1086,6 +1089,8 @@ def test_actual_child_sandbox_proof_persists_exact_attestation(tmp_path, monkeyp
                              "HERDR_DURABLE_TASK_PANE": marker})
                     return CommandResult(0, json.dumps({"result": {}}), "")
                 assert args[:2] == ["pane", "process-info"]
+                if sandbox_process is None:
+                    return CommandResult(0, json.dumps({"result": {"process_info": {}}}), "")
                 processes = []
                 for _ in range(50):
                     assert sandbox_process.poll() is None, sandbox_process.stderr.read(8192).decode()
@@ -1202,7 +1207,14 @@ def test_child_sandbox_failure_removes_frozen_policy(tmp_path, monkeypatch, phas
             return ["bwrap", "/bin/bash"]
         module.command = command
         module.inner_pid = lambda *a: 123
+        module.pane_input_ready = lambda *a: True
         module.verify = lambda *a, **k: phase != "verify"
+    if phase == "verify":
+        from herdr import runtime as runtime_module
+        clock = [0.0]
+        monkeypatch.setattr(runtime_module.time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(runtime_module.time, "sleep",
+                            lambda seconds: clock.__setitem__(0, clock[0] + seconds))
     monkeypatch.setattr(SourceFileLoader, "exec_module", load)
     class Runner:
         def run(self, args, **kwargs):
@@ -1655,3 +1667,73 @@ def test_missing_modern_work_profile_blocks_before_split_or_agent(tmp_path,monke
                                   idempotency_key=rec.idempotency_key)
     assert not rec.pane_split_started and rec.execution_pane is None
     assert not any(event["event"]=="child_pane_split_started" for event in scheduler.audit_log.replay())
+
+
+@pytest.mark.parametrize("case", ["delayed", "input-unready", "native-error"])
+def test_managed_child_waits_before_single_native_launch_and_full_verification(tmp_path, monkeypatch, case):
+    from importlib.machinery import SourceFileLoader
+    from types import SimpleNamespace
+    from herdr import runtime as runtime_module
+    from tests.policy_launch_fakes import FakePreparedPolicyLaunch
+    from tests.herdr.test_security import identity
+    clock = [0.0]
+    monkeypatch.setattr(runtime_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(runtime_module.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    policy = tmp_path / "frozen-policy"
+    policy.write_text("frozen")
+    verification = []
+    original = SourceFileLoader.exec_module
+    def load(loader, module):
+        original(loader, module)
+        if loader.name != "agent_durable_sandbox_runtime":
+            return
+        module.frozen_policy = lambda: policy
+        module.command = lambda *args, **kwargs: ["/bin/true"]
+        module.pane_input_ready = lambda info, marker: info.get("ready") is True
+        module.inner_pid = lambda info, marker: info.get("pid")
+        def verify(pid, real, marker, **kwargs):
+            verification.append((pid, marker, kwargs))
+            return True
+        module.verify = verify
+    monkeypatch.setattr(SourceFileLoader, "exec_module", load)
+    record = SimpleNamespace(idempotency_key="slot-key", agent_id="child", run_token="run",
+                             fencing_token=1, worktree_identity=None, ownership=None,
+                             parent_agent_id=None, parent_task_id=None, id="task")
+    scheduler = SimpleNamespace(_tasks={"task": record},
+        task_node=lambda task: SimpleNamespace(tools=(), permissions=()))
+    class Runner:
+        def __init__(self):
+            self.input_checks = self.sandbox_checks = self.launches = 0
+        def run(self, args, *, timeout_seconds=30.0):
+            if args[:2] == ["pane", "process-info"]:
+                assert args[2:] == ["--pane", "owned"]
+                assert 0 < timeout_seconds <= 10
+                if not self.launches:
+                    self.input_checks += 1
+                    value = {"ready": case != "input-unready" and self.input_checks >= 2}
+                else:
+                    self.sandbox_checks += 1
+                    value = {"pid": 123 if self.sandbox_checks >= 2 else None}
+                return CommandResult(0, json.dumps({"result": {"process_info": value}}), "")
+            assert args[:3] == ["pane", "run", "owned"]
+            assert self.input_checks >= 2
+            self.launches += 1
+            return CommandResult(1, "", "native launch failed") if case == "native-error" else CommandResult(0, "", "")
+    runner = Runner()
+    runtime = HerdrChildRuntime(scheduler, runner, cwd=tmp_path, snapshot_path=tmp_path / "swarm.json")
+    launch = FakePreparedPolicyLaunch(identity(task_id="task"))
+    runtime._policy_launches["task"] = launch
+    monkeypatch.setattr(runtime, "_child_workspace_writable", lambda task: False)
+    if case == "delayed":
+        assert runtime._sandbox_child_pane("owned", "marker", "/bin/true", "task") == policy
+        assert runner.input_checks == runner.sandbox_checks == 2 and runner.launches == 1
+        assert verification[0][0:2] == (123, "marker")
+        assert verification[0][2]["attempts"] == 1
+        assert verification[0][2]["policy_mount"] is launch.mount
+        assert runtime._sandbox_proofs["owned"]["sandbox_pid"] == 123
+    else:
+        with pytest.raises(HerdrRuntimeError):
+            runtime._sandbox_child_pane("owned", "marker", "/bin/true", "task")
+        assert runner.launches == (0 if case == "input-unready" else 1)
+        assert runner.sandbox_checks == 0 and verification == []
+        assert not policy.exists() and "owned" not in runtime._sandbox_proofs

@@ -1942,23 +1942,45 @@ def test_task_sandbox_wait_propagates_native_error_without_resubmitting(monkeypa
     assert calls == [["pane", "process-info", "--pane", "owned-pane"]]
 
 
-@pytest.mark.parametrize("canonical,correct_marker,expected", [
-    (True, True, False), (False, True, True), (False, False, False)])
-def test_native_pane_input_requires_owned_noncanonical_terminal(canonical, correct_marker, expected):
+@pytest.mark.parametrize("canonical,correct_marker,foreground_hook,expected", [
+    (True, True, False, False), (False, True, False, True),
+    (False, False, False, False), (False, True, True, False)])
+def test_native_pane_input_requires_owned_foreground_terminal(canonical, correct_marker, foreground_hook, expected):
     import os
     import subprocess
     import termios
     import agent_durable_sandbox as sandbox
     master, slave = os.openpty()
     process = None
+    code = """
+import fcntl,os,signal,subprocess,sys,termios,time
+fcntl.ioctl(0,termios.TIOCSCTTY,0)
+os.tcsetpgrp(0,os.getpid())
+hook=None
+def stopped(*args):raise SystemExit(0)
+signal.signal(signal.SIGTERM,stopped)
+try:
+    if sys.argv[1]=="hook":
+        hook=subprocess.Popen(["/usr/bin/python3","-I","-B","-c","import time;time.sleep(10)"],
+                              preexec_fn=lambda:os.setpgid(0,0))
+        os.tcsetpgrp(0,hook.pid)
+    print("ready",flush=True)
+    time.sleep(10)
+finally:
+    if hook is not None:
+        hook.terminate()
+        hook.wait(timeout=5)
+"""
     try:
         attributes = termios.tcgetattr(slave)
         attributes[3] = (attributes[3] | termios.ICANON) if canonical else (attributes[3] & ~termios.ICANON)
         termios.tcsetattr(slave, termios.TCSANOW, attributes)
-        process = subprocess.Popen(["/usr/bin/python3", "-I", "-B", "-c", "import time;time.sleep(10)"],
-            stdin=slave, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        process = subprocess.Popen(["/usr/bin/python3", "-I", "-B", "-c", code,
+            "hook" if foreground_hook else "shell"], stdin=slave, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True,
             env={"HERDR_DURABLE_TASK_PANE": "owned-marker" if correct_marker else "foreign-marker"},
             start_new_session=True)
+        assert process.stdout.readline().strip() == "ready"
         assert sandbox.pane_input_ready({"shell_pid": process.pid}, "owned-marker") is expected
     finally:
         if process is not None:

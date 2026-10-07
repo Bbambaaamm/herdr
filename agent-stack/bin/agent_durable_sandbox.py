@@ -264,10 +264,24 @@ def pane_input_ready(process_info: dict, marker: str) -> bool:
             return False
         attributes = termios.tcgetattr(fd)
         named = os.stat(source)
+        def terminal_owner():
+            # Linux proc_pid_stat(5): pgrp, tty_nr, tpgid, starttime.
+            data = Path(f"/proc/{pid}/stat").read_text()
+            fields = data[data.rfind(")") + 2:].split()
+            group, tty, foreground, start = map(int, (fields[2], fields[4], fields[5], fields[19]))
+            tty &= 0xffffffff
+            device = os.makedev((tty >> 8) & 0xff, (tty & 0xff) | ((tty >> 12) & 0xfff00))
+            return group, foreground, device, start
+        before = terminal_owner()
+        shell_group, foreground_group, controlling_device, start_ticks = before
         return (not attributes[3] & termios.ICANON
+                and foreground_group == shell_group
+                and shell_group > 0 and start_ticks > 0
+                and held.st_rdev == controlling_device
+                and terminal_owner() == before
                 and (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino)
                 and expected in _env(pid))
-    except (OSError, ValueError, TypeError, termios.error):
+    except (OSError, ValueError, TypeError, IndexError, termios.error):
         return False
     finally:
         if fd is not None:
