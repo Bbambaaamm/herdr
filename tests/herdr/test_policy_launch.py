@@ -345,6 +345,9 @@ def test_root_session_cannot_select_policy_authority_from_task_fields(tmp_path,m
         return {"result":{"agent":{"kind":"hermes","pane_id":"coordinator","workspace_id":"workspace"}}}
     monkeypatch.setattr(worker,"_herdr_json",herdr)
     monkeypatch.setattr(worker,"HOST_POLICY_LAUNCH_FACTORY",None)
+    monkeypatch.setattr(worker,"_root_policy_factory",lambda:None)  # Explicitly test absent host authority.
+    monkeypatch.setattr(worker,"ROOT",tmp_path/"tasks")
+    monkeypatch.setattr(worker,"RUNNING",tmp_path/"tasks"/"running")
     task={"id":"root-task","repo":"Bbambaaamm/herdr","run_token":"root-run","fencing_token":1,
           "workspace":str(tmp_path),"policy_launch_factory":"model-selected",
           "security_grant":{"tools":["terminal"]}}
