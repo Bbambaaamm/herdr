@@ -426,27 +426,44 @@ def test_create_task_session_uses_fresh_owned_pane_and_named_chat(tmp_path, monk
     monkeypatch.setattr(worker, "inner_pid", lambda *args, **kwargs: 123)
     monkeypatch.setattr(worker, "_setup_pane_ids", lambda: {"persistent-pane"})
 
+    task_agent = {"name": None}
     def fake_herdr_json(args, *, timeout_seconds=30.0):
         calls.append(list(args))
         if args[:2] == ["agent", "get"]:
-            return {
-                "result": {
-                    "agent": {
-                        "agent": "hermes",
-                        "name": "quantlab-hermes",
-                        "pane_id": "persistent-pane",
-                        "workspace_id": "w2",
+            target = args[2]
+            if target == "quantlab-hermes":
+                return {
+                    "result": {
+                        "agent": {
+                            "agent": "hermes",
+                            "name": "quantlab-hermes",
+                            "pane_id": "persistent-pane",
+                            "workspace_id": "w2",
+                        }
                     }
                 }
-            }
+            if target == "owned-task-pane" or target == task_agent["name"]:
+                return {"result": {"agent": {
+                    "agent": "hermes",
+                    "name": task_agent["name"] or "manual-hermes",
+                    "pane_id": "owned-task-pane",
+                    "workspace_id": "w2",
+                    "agent_status": "idle",
+                }}}
+            raise RuntimeError('{"error":{"code":"agent_not_found"}}')
+        if args[:2] == ["agent", "rename"]:
+            assert args[2] == "owned-task-pane"
+            task_agent["name"] = args[3]
+            return {"result": {"agent": {
+                "agent": "hermes", "name": args[3],
+                "pane_id": "owned-task-pane", "agent_status": "idle",
+            }}}
         if args[:2] == ["pane", "split"]:
             return {"result": {"pane": {"pane_id": "owned-task-pane"}}}
         if args[:2] == ["pane", "run"]:
-            return {"result": {}}
+            return None
         if args[:2] == ["pane", "process-info"]:
             return {"result": {"process_info": {"shell_pid": 123}}}
-        if args[:2] == ["agent", "start"]:
-            return {"result": {"agent": {"name": args[2]}}}
         raise AssertionError(args)
 
     monkeypatch.setattr(worker, "_herdr_json", fake_herdr_json)
@@ -473,13 +490,16 @@ def test_create_task_session_uses_fresh_owned_pane_and_named_chat(tmp_path, monk
     assert f"HERDR_DURABLE_AGENT={session['agent_name']}" in split
     path_env = next(value for value in split if value.startswith(f"PATH={worker.POLICY_BIN}:"))
     assert str(worker.AGENT_BIN) in path_env
-    start = next(call for call in calls if call[:2] == ["agent", "start"])
-    assert start[2] == session["agent_name"]
-    assert "--continue" in start
-    assert start[start.index("--continue") + 1] == session["session_name"]
-    assert "--create-if-missing" in start
-    assert "--in" in start
-    assert start[start.index("--in") + 1] == task["workspace"]
+    hermes_runs = [call for call in calls
+                   if call[:2] == ["pane", "run"] and len(call) >= 4
+                   and "exec hermes " in call[3]]
+    assert len(hermes_runs) == 1
+    command = hermes_runs[0][3]
+    assert f"--continue {session['session_name']}" in command
+    assert "--create-if-missing" in command
+    assert f"--in {task['workspace']}" in command
+    assert not any(call[:2] == ["agent", "start"] for call in calls)
+    assert ["agent", "rename", "owned-task-pane", session["agent_name"]] in calls
 
 
 def test_run_prompt_targets_task_session_never_persistent_coordinator(tmp_path, monkeypatch):
@@ -1083,9 +1103,11 @@ def test_setup_failure_cleanup_proves_pane_identity(
             if args[2] == "quantlab-hermes":
                 return {"result": {"agent": {"agent": "hermes", "pane_id": "coordinator",
                                               "workspace_id": "w2"}}}
-            return {"result": {"agent": {"name": "other-agent" if case == "wrong_agent"
+            return {"result": {"agent": {"agent": "hermes",
+                                              "name": "other-agent" if case == "wrong_agent"
                                               else args[2], "pane_id": "other-pane" if
-                                              case == "wrong_pane" else "owned-pane"}}}
+                                              case == "wrong_pane" else "owned-pane",
+                                              "agent_status": "idle"}}}
         if args[:2] == ["pane", "split"]:
             return {"result": {"pane": {"pane_id": "owned-pane"}}}
         if args[:2] == ["pane", "list"]:
@@ -1094,11 +1116,11 @@ def test_setup_failure_cleanup_proves_pane_identity(
                        if case == "reused_pane" else []) if len(lists) == 1 else
                        ([] if case == "absent" else [{"pane_id": "owned-pane"}])}}
         if args[:2] == ["pane", "run"]:
-            return {"result": {}}
+            if after_start and len(args) >= 4 and "exec hermes " in args[3]:
+                raise RuntimeError("start failed")
+            return None
         if args[:2] == ["pane", "process-info"]:
             return {"result": {"process_info": {"shell_pid": 123}}}
-        if args[:2] == ["agent", "start"]:
-            raise RuntimeError("start failed")
         raise AssertionError(args)
     lists = []
     monkeypatch.setattr(worker, "_herdr_json", fake_herdr_json)
@@ -1432,12 +1454,10 @@ def test_canonical_queue_owns_session_before_worker_crash(tmp_path, monkeypatch,
         if args[:2] == ["pane", "split"]:
             return {"result": {"pane": {"pane_id": "owned"}}}
         if args[:2] == ["pane", "run"]:
-            crash_if("sandbox")
-            return {"result": {}}
+            crash_if("agent" if len(args) >= 4 and "exec hermes " in args[3] else "sandbox")
+            return None
         if args[:2] == ["pane", "process-info"]:
             return {"result": {"process_info": {}}}
-        if args[:2] == ["agent", "start"]:
-            crash_if("agent")
         raise AssertionError(args)
     monkeypatch.setattr(worker, "start_bridge", bridge)
     monkeypatch.setattr(worker, "_herdr_json", herdr)
@@ -1699,8 +1719,9 @@ def test_actual_root_setup_failure_passes_task_to_absent_agent_cleanup(tmp_path,
         if args[:2]==["pane","list"]:return {"result":{"panes":[{"pane_id":"coordinator"}]}}
         if args[:2]==["pane","split"]:return {"result":{"pane":{"pane_id":"owned"}}}
         if args[:2]==["pane","process-info"]:return {"result":{"process_info":{"shell_pid":123}}}
-        if args[:2]==["pane","run"]:return {"result":{}}
-        if args[:2]==["agent","start"]:raise RuntimeError("native start absent")
+        if args[:2]==["pane","run"]:
+            if len(args)>=4 and "exec hermes " in args[3]:raise RuntimeError("native start absent")
+            return None
         raise AssertionError(args)
     monkeypatch.setattr(worker,"_herdr_json",native)
     monkeypatch.setattr(worker,"start_bridge",lambda *args:None)

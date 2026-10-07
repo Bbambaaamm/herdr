@@ -41,6 +41,7 @@ class FakeHerdrRunner:
         self.calls: list[tuple[str, ...]] = []
         self.created: list[str] = []
         self.closed: list[str] = []
+        self.agents: dict[str, dict[str, str]] = {}
         self.active_prompts = 0
         self.max_active_prompts = 0
         self.prompt_status = "done"
@@ -58,6 +59,32 @@ class FakeHerdrRunner:
             self.created.append(pane_id)
             payload = {"result": {"pane": {"pane_id": pane_id}}}
             return CommandResult(0, json.dumps(payload), "")
+        if call[:2] == ("pane", "run"):
+            if len(call) >= 4 and "exec hermes " in call[3]:
+                pane_id = call[2]
+                self.agents[pane_id] = {
+                    "agent": "hermes",
+                    "name": f"manual-{pane_id.replace(':', '-')}",
+                    "pane_id": pane_id,
+                    "agent_status": "idle",
+                }
+            return CommandResult(0, "", "")
+        if call[:2] == ("agent", "get"):
+            target = call[2]
+            agent = self.agents.get(target)
+            if agent is None:
+                agent = next((row for row in self.agents.values()
+                              if row.get("name") == target), None)
+            if agent is None:
+                return CommandResult(1, json.dumps({"error": {"code": "agent_not_found"}}), "")
+            return CommandResult(0, json.dumps({"result": {"agent": agent}}), "")
+        if call[:2] == ("agent", "rename"):
+            target, name = call[2], call[3]
+            agent = self.agents.get(target)
+            if agent is None:
+                return CommandResult(1, json.dumps({"error": {"code": "agent_not_found"}}), "")
+            agent["name"] = name
+            return CommandResult(0, json.dumps({"result": {"agent": agent}}), "")
         if call[:2] == ("agent", "start"):
             payload = {"result": {"agent": {"name": call[2]}}}
             return CommandResult(0, json.dumps(payload), "")
@@ -75,6 +102,7 @@ class FakeHerdrRunner:
             )
         if call[:2] == ("pane", "close"):
             self.closed.append(call[2])
+            self.agents.pop(call[2], None)
             return CommandResult(0, json.dumps({"result": {"closed": True}}), "")
         raise AssertionError(f"unexpected Herdr call: {call}")
 
@@ -467,12 +495,17 @@ def test_managed_agent_start_uses_explicit_admitted_toolset(tmp_path, tools, exp
 
     runtime._start_agent(lease, "child-pane")
 
-    call = next(call for call in runner.calls if call[:2] == ("agent", "start"))
-    assert call[call.index("--toolsets") + 1] == expected
-    assert call.index("--toolsets") > call.index("chat")
-    assert not any(value in call for value in (
+    call = next(call for call in runner.calls
+                if call[:2] == ("pane", "run") and len(call) >= 4 and "exec hermes " in call[3])
+    command = call[3]
+    assert f"--toolsets {expected}" in command
+    assert command.index("--toolsets") > command.index("chat")
+    assert not any(value in command for value in (
         "terminal", "code_execution", "web", "browser", "delegation",
         "connections", "computer_use", "cron", "mcp", "plugins"))
+    assert not any(item[:2] == ("agent", "start") for item in runner.calls)
+    assert any(item[:2] == ("agent", "rename") and item[2] == "child-pane"
+               and item[3] == lease.agent_id for item in runner.calls)
 
 
 def _write_profile_auth(profile_dir, expires_at):
@@ -803,13 +836,12 @@ def test_two_real_child_contract_parallel_cleanup_and_snapshot(tmp_path: Path) -
     assert sorted(runner.closed) == sorted(runner.created)
     assert len(runner.created) == 2
     assert any(call == ("--skill",) for call in runner.calls)
-    starts = [call for call in runner.calls if call[:2] == ("agent", "start")]
+    starts = [call for call in runner.calls
+              if call[:2] == ("pane", "run") and len(call) >= 4 and "exec hermes " in call[3]]
     assert len(starts) == 2
-    assert all("--toolsets" in call and
-               call[call.index("--toolsets") + 1] == "bot_room" for call in starts)
-    assert all(
-        "--max-turns" in call and call[call.index("--max-turns") + 1] == "1" for call in starts
-    )
+    assert all("--toolsets bot_room" in call[3] for call in starts)
+    assert all("--max-turns 1" in call[3] for call in starts)
+    assert not any(call[:2] == ("agent", "start") for call in runner.calls)
 
     payload = json.loads(snapshot_path.read_text())
     assert {

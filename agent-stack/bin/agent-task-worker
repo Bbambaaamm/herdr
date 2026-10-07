@@ -184,6 +184,60 @@ def _herdr_json(args: list[str], *, timeout_seconds: float = 30.0) -> dict | Non
     return _parse_herdr_json(proc, "herdr " + " ".join(args[:2]))
 
 
+def _agent_get_optional(target: str, *, timeout_seconds: float = 10.0) -> dict | None:
+    """Return one live agent, or None only for Herdr's typed agent_not_found."""
+    try:
+        payload = _herdr_json(["agent", "get", target], timeout_seconds=timeout_seconds)
+    except RuntimeError as exc:
+        try:
+            error_payload = json.loads(str(exc))
+        except json.JSONDecodeError:
+            raise
+        if (
+            isinstance(error_payload, dict)
+            and isinstance(error_payload.get("error"), dict)
+            and error_payload["error"].get("code") == "agent_not_found"
+        ):
+            return None
+        raise
+    agent = (payload.get("result") or {}).get("agent")
+    if not isinstance(agent, dict):
+        raise RuntimeError("task_session_agent_get_invalid")
+    return agent
+
+
+def _wait_for_task_agent(pane_id: str, agent_name: str, *, timeout_seconds: float = 60.0) -> dict:
+    """Wait for a manually launched Hermes agent, then bind its stable task name."""
+    deadline = time.monotonic() + timeout_seconds
+    renamed = False
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("task_session_agent_not_ready")
+        agent = _agent_get_optional(pane_id, timeout_seconds=min(10.0, remaining))
+        if agent is None:
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+            continue
+        if str(agent.get("pane_id") or "") != pane_id:
+            raise RuntimeError("task_session_agent_wrong_pane")
+        kind = str(agent.get("agent") or agent.get("kind") or "")
+        if kind != "hermes":
+            raise RuntimeError(f"task_session_agent_kind_mismatch:{kind or 'unknown'}")
+        if str(agent.get("name") or "") != agent_name:
+            if renamed:
+                raise RuntimeError("task_session_agent_rename_unstable")
+            _herdr_json(["agent", "rename", pane_id, agent_name],
+                        timeout_seconds=min(10.0, remaining))
+            renamed = True
+            continue
+        status = str(agent.get("agent_status") or agent.get("status") or "").lower()
+        if status == "blocked":
+            raise RuntimeError("task_session_agent_blocked")
+        if status in {"idle", "done", "unknown"}:
+            return agent
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+
 def _task_session_identity(task: dict) -> tuple[str, str]:
     run_token = str(task.get("run_token") or "")
     if not run_token:
@@ -860,26 +914,21 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         agent_start_attempted = True
         session["agent_start_attempted"] = True
         persist_execution_session(task)
-        started = _herdr_json(
-            [
-                "agent", "start", agent_name,
-                "--kind", "hermes", "--pane", pane_id, "--timeout", "60000",
-                "--", "-p", profile, "chat",
-                "--continue", session_name, "--create-if-missing",
-                "--in", workspace,
-                "--toolsets", __import__("herdr.runtime", fromlist=["_child_toolsets"])._child_toolsets(
-                    tuple(task.get("parent_tools") or ()), allow_delegation=True),
-            ],
-            timeout_seconds=75.0,
-        )
-        started_agent = (started.get("result") or {}).get("agent")
-        if (
-            not isinstance(started_agent, dict)
-            or str(started_agent.get("name") or "") != agent_name
-        ):
-            raise RuntimeError("task_session_agent_start_invalid")
-        started_pane = str(started_agent.get("pane_id") or "")
-        if started_pane and started_pane != pane_id:
+        hermes_args = [
+            "hermes", "-p", profile, "chat",
+            "--continue", session_name, "--create-if-missing",
+            "--in", workspace,
+            "--toolsets", __import__("herdr.runtime", fromlist=["_child_toolsets"])._child_toolsets(
+                tuple(task.get("parent_tools") or ()), allow_delegation=True),
+        ]
+        # The pane is already occupied by the verified bwrap shell. Native
+        # agent start requires a host shell prompt and must therefore never
+        # be used here. Launch the pinned Hermes shim inside the sandbox;
+        # Herdr detects manual agents in-place, then we bind the durable name.
+        _herdr_json(["pane", "run", pane_id, shell_command(hermes_args)],
+                    timeout_seconds=15.0)
+        started_agent = _wait_for_task_agent(pane_id, agent_name, timeout_seconds=60.0)
+        if str(started_agent.get("pane_id") or "") != pane_id:
             raise RuntimeError("task_session_agent_wrong_pane")
         session["invocation_policy"] = launch.confirm_bootstrap()
         session["agent_started"] = True
