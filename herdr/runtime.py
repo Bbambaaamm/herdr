@@ -707,7 +707,7 @@ class HerdrChildRuntime:
         node = self.scheduler.task_node(lease.task_id)
         toolsets = _child_toolsets(node.tools)
         _validate_child_permissions(node.permissions)
-        command = shlex.join([
+        command = "HERDR_AGENT=hermes " + shlex.join([
             "hermes",
             "-p", self.env.get("HERDR_HERMES_PROFILE", DEFAULT_PROFILE),
             "chat",

@@ -674,7 +674,7 @@ def _typed_native_error_code(exc: RuntimeError) -> str | None:
 def _wait_for_manual_task_agent(pane_id: str, agent_name: str, argv: list[str],
                                 *, timeout_seconds: float = 60.0) -> dict:
     """Launch Hermes inside the verified sandbox and bind Herdr to it."""
-    command = shlex.join(["hermes", *argv])
+    command = "HERDR_AGENT=hermes " + shlex.join(["hermes", *argv])
     _herdr_json(["pane", "run", pane_id, command], timeout_seconds=15.0)
     deadline = time.monotonic() + timeout_seconds
     renamed = False

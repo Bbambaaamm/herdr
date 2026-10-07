@@ -492,9 +492,9 @@ def test_create_task_session_uses_fresh_owned_pane_and_named_chat(tmp_path, monk
     assert str(worker.AGENT_BIN) in path_env
     manual = next(call for call in calls
                   if call[:3] == ["pane", "run", "owned-task-pane"]
-                  and len(call) > 3 and call[3].startswith("hermes "))
+                  and len(call) > 3 and call[3].startswith("HERDR_AGENT=hermes hermes "))
     argv = shlex.split(manual[3])
-    assert argv[0] == "hermes"
+    assert argv[:2] == ["HERDR_AGENT=hermes", "hermes"]
     assert "--continue" in argv
     assert argv[argv.index("--continue") + 1] == session["session_name"]
     assert "--create-if-missing" in argv

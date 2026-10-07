@@ -60,7 +60,7 @@ class FakeHerdrRunner:
             payload = {"result": {"pane": {"pane_id": pane_id}}}
             return CommandResult(0, json.dumps(payload), "")
         if call[:2] == ("pane", "run"):
-            if len(call) > 3 and call[3].startswith("hermes "):
+            if len(call) > 3 and call[3].startswith("HERDR_AGENT=hermes hermes "):
                 self.manual_agents[call[2]] = {
                     "agent": "hermes", "name": "detected-hermes",
                     "pane_id": call[2], "agent_status": "idle",
@@ -494,7 +494,7 @@ def test_managed_agent_start_uses_explicit_admitted_toolset(tmp_path, tools, exp
 
     call = next(call for call in runner.calls
                 if call[:3] == ("pane", "run", "child-pane")
-                and len(call) > 3 and call[3].startswith("hermes "))
+                and len(call) > 3 and call[3].startswith("HERDR_AGENT=hermes hermes "))
     argv = runtime_mod.shlex.split(call[3])
     assert argv[argv.index("--toolsets") + 1] == expected
     assert argv.index("--toolsets") > argv.index("chat")
@@ -835,7 +835,7 @@ def test_two_real_child_contract_parallel_cleanup_and_snapshot(tmp_path: Path) -
     assert any(call == ("--skill",) for call in runner.calls)
     launches = [call for call in runner.calls
                 if call[:2] == ("pane", "run") and len(call) > 3
-                and call[3].startswith("hermes ")]
+                and call[3].startswith("HERDR_AGENT=hermes hermes ")]
     assert len(launches) == 2
     renames = [call for call in runner.calls if call[:2] == ("agent", "rename")]
     assert len(renames) == 2
