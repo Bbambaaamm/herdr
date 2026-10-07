@@ -44,6 +44,7 @@ class FakeHerdrRunner:
         self.active_prompts = 0
         self.max_active_prompts = 0
         self.prompt_status = "done"
+        self.manual_agents: dict[str, dict[str, str]] = {}
         self._lock = threading.Lock()
 
     def run(self, args, timeout_seconds: float = 30.0) -> CommandResult:
@@ -58,6 +59,31 @@ class FakeHerdrRunner:
             self.created.append(pane_id)
             payload = {"result": {"pane": {"pane_id": pane_id}}}
             return CommandResult(0, json.dumps(payload), "")
+        if call[:2] == ("pane", "run"):
+            if len(call) > 3 and call[3].startswith("HERDR_AGENT=hermes hermes "):
+                self.manual_agents[call[2]] = {
+                    "agent": "hermes", "name": "detected-hermes",
+                    "pane_id": call[2], "agent_status": "idle",
+                    "interactive_ready": True,
+                }
+            return CommandResult(0, "", "")
+        if call[:2] == ("agent", "get"):
+            target = call[2]
+            agent = self.manual_agents.get(target)
+            if agent is None:
+                agent = next((row for row in self.manual_agents.values()
+                              if row.get("name") == target), None)
+            if agent is None:
+                return CommandResult(1, json.dumps({
+                    "error": {"code": "agent_not_found", "message": "not found"}}), "")
+            return CommandResult(0, json.dumps({"result": {"agent": dict(agent)}}), "")
+        if call[:2] == ("agent", "rename"):
+            agent = self.manual_agents.get(call[2])
+            if agent is None:
+                return CommandResult(1, json.dumps({
+                    "error": {"code": "agent_not_found", "message": "not found"}}), "")
+            agent["name"] = call[3]
+            return CommandResult(0, json.dumps({"result": {"agent": dict(agent)}}), "")
         if call[:2] == ("agent", "start"):
             payload = {"result": {"agent": {"name": call[2]}}}
             return CommandResult(0, json.dumps(payload), "")
@@ -467,12 +493,58 @@ def test_managed_agent_start_uses_explicit_admitted_toolset(tmp_path, tools, exp
 
     runtime._start_agent(lease, "child-pane")
 
-    call = next(call for call in runner.calls if call[:2] == ("agent", "start"))
-    assert call[call.index("--toolsets") + 1] == expected
-    assert call.index("--toolsets") > call.index("chat")
-    assert not any(value in call for value in (
+    call = next(call for call in runner.calls
+                if call[:3] == ("pane", "run", "child-pane")
+                and len(call) > 3 and call[3].startswith("HERDR_AGENT=hermes hermes "))
+    argv = runtime_mod.shlex.split(call[3])
+    assert argv[argv.index("--toolsets") + 1] == expected
+    assert argv.index("--toolsets") > argv.index("chat")
+    assert not any(value in argv for value in (
         "terminal", "code_execution", "web", "browser", "delegation",
         "connections", "computer_use", "cron", "mcp", "plugins"))
+    assert ("agent", "rename", "child-pane", lease.agent_id) in runner.calls
+    assert not any(call[:2] == ("agent", "start") for call in runner.calls)
+
+
+def test_managed_agent_start_waits_for_interactive_ready(tmp_path, monkeypatch):
+    scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
+    tools = ("read_file", "search_files")
+    scheduler.register_external_parent_attempt(
+        task_id="parent", run_token="parent-run", idempotency_key="parent-key",
+        agent_name="parent-agent", pane_id="parent-pane", marker="parent-marker",
+        repo="repo", issue="82", role="writer", tools=tools,
+        permissions=("workspace-write",), policy_profile="default")
+    child = scheduler.delegate_child("parent", "parent-run", "scope",
+        ChildProposal("writer", tools, "reader", tools, child_task="inspect"))
+    lease = scheduler.dispatch(task_ids={child.id})[0]
+
+    class DelayedReadyRunner(FakeHerdrRunner):
+        def __init__(self):
+            super().__init__()
+            self.named_reads = 0
+
+        def run(self, args, timeout_seconds=30.0):
+            result = super().run(args, timeout_seconds=timeout_seconds)
+            if tuple(args[:2]) == ("agent", "get") and result.returncode == 0:
+                payload = json.loads(result.stdout)
+                agent = payload["result"]["agent"]
+                if agent.get("name") == lease.agent_id:
+                    self.named_reads += 1
+                    agent["interactive_ready"] = self.named_reads >= 2
+                    return CommandResult(0, json.dumps(payload), "")
+            return result
+
+    runner = DelayedReadyRunner()
+    runtime = HerdrChildRuntime(
+        scheduler, runner, cwd=tmp_path,
+        env={"HERDR_ENV": "1", "HERDR_PANE_ID": "parent-pane"})
+    runtime._skill_checked = True
+    monkeypatch.setattr(runtime_mod.time, "sleep", lambda _: None)
+
+    runtime._start_agent(lease, "child-pane")
+
+    assert runner.named_reads == 2
+    assert not any(call[:2] == ("agent", "prompt") for call in runner.calls)
 
 
 def _write_profile_auth(profile_dir, expires_at):
@@ -803,12 +875,19 @@ def test_two_real_child_contract_parallel_cleanup_and_snapshot(tmp_path: Path) -
     assert sorted(runner.closed) == sorted(runner.created)
     assert len(runner.created) == 2
     assert any(call == ("--skill",) for call in runner.calls)
-    starts = [call for call in runner.calls if call[:2] == ("agent", "start")]
-    assert len(starts) == 2
-    assert all("--toolsets" in call and
-               call[call.index("--toolsets") + 1] == "bot_room" for call in starts)
+    launches = [call for call in runner.calls
+                if call[:2] == ("pane", "run") and len(call) > 3
+                and call[3].startswith("HERDR_AGENT=hermes hermes ")]
+    assert len(launches) == 2
+    renames = [call for call in runner.calls if call[:2] == ("agent", "rename")]
+    assert len(renames) == 2
+    assert not any(call[:2] == ("agent", "start") for call in runner.calls)
+    launch_argv = [runtime_mod.shlex.split(call[3]) for call in launches]
+    assert all("--toolsets" in argv and
+               argv[argv.index("--toolsets") + 1] == "bot_room" for argv in launch_argv)
     assert all(
-        "--max-turns" in call and call[call.index("--max-turns") + 1] == "1" for call in starts
+        "--max-turns" in argv and argv[argv.index("--max-turns") + 1] == "1"
+        for argv in launch_argv
     )
 
     payload = json.loads(snapshot_path.read_text())
