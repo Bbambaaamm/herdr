@@ -428,7 +428,10 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
         agent.model = "quoted-text-model"
         agent.client = types.SimpleNamespace(max_retries=0)
         original = {"model": agent.model, "messages": [{"role": "user", "content": "bounded text"}]}
-        for cap in ({}, {"max_tokens": 17}, {"max_completion_tokens": 18}):
+        for cap, quoted_field in (({}, "max_tokens"), ({"max_tokens": 17}, "max_tokens"),
+                                  ({"max_completion_tokens": 18}, "max_completion_tokens")):
+            policy.model_request_ceiling = lambda route, field=quoted_field: {
+                "output_token_field": field, "max_output_tokens": 100}
             request = {**original, **cap}
             agent._test_model_request = request
             loop.perform_api_call(agent)
@@ -450,6 +453,21 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
             with pytest.raises(WorkContractError):
                 loop.perform_api_call(agent)
             assert (len(effects), len(network_requests)) == before
+        # A preexisting incompatible cap must stop before either reservation or transport.
+        from herdr.work_budget_configuration import model_request_ceiling
+        policy.model_request_ceiling = lambda route: model_request_ceiling({**route, "max_output_tokens": 100})
+        for model_name, wrong_cap in (("openai/o3-2025-04-16", {"max_tokens": 17}),
+                                      ("quoted-text-model", {"max_completion_tokens": 18})):
+            agent.model = model_name
+            request = {**original, "model": model_name, **wrong_cap}
+            agent._test_model_request = request
+            before = (len(effects), len(network_requests))
+            with pytest.raises(PolicyDenied, match="model_quote_token_field_mismatch"):
+                loop.perform_api_call(agent)
+            assert (len(effects), len(network_requests)) == before
+            assert request == {**original, "model": model_name, **wrong_cap}
+            assert agent._disable_streaming is False
+        agent.model = original["model"]
         policy.budget_required = lambda: False
         policy.grant.provider_routes[0].api_mode = "openai"
         agent.api_mode = "openai"
