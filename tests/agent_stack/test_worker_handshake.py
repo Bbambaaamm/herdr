@@ -421,6 +421,7 @@ def test_create_task_session_uses_fresh_owned_pane_and_named_chat(tmp_path, monk
     policy.write_text("policy", encoding="utf-8")
     monkeypatch.setattr(worker, "frozen_policy", lambda: policy)
     monkeypatch.setattr(worker, "sandbox_command", sandbox_command)
+    monkeypatch.setattr(worker, "_wait_for_task_pane_input", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker, "verify_sandbox", lambda *args, **kwargs: True)
     monkeypatch.setattr(worker, "inner_pid", lambda *args, **kwargs: 123)
     monkeypatch.setattr(worker, "_setup_pane_ids", lambda: {"persistent-pane"})
@@ -1012,6 +1013,7 @@ def test_create_task_session_rejects_wrong_started_agent(tmp_path, monkeypatch):
     monkeypatch.setattr(worker, "start_bridge", lambda task, session: None)
     monkeypatch.setattr(worker, "frozen_policy", lambda: _policy_file(tmp_path))
     monkeypatch.setattr(worker, "sandbox_command", lambda *args, **kwargs: ["bwrap", "/bin/bash"])
+    monkeypatch.setattr(worker, "_wait_for_task_pane_input", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker, "verify_sandbox", lambda *args, **kwargs: True)
     monkeypatch.setattr(worker, "inner_pid", lambda *args, **kwargs: 123)
 
@@ -1069,6 +1071,7 @@ def test_setup_failure_cleanup_proves_pane_identity(
     monkeypatch.setattr(worker, "start_bridge", lambda *args: None)
     monkeypatch.setattr(worker, "frozen_policy", lambda: _policy_file(tmp_path))
     monkeypatch.setattr(worker, "sandbox_command", lambda *args, **kw: ["bwrap"])
+    monkeypatch.setattr(worker, "_wait_for_task_pane_input", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker, "verify_sandbox", lambda *args, **kw: True)
     monkeypatch.setattr(worker, "inner_pid", lambda *args, **kw: 123)
     monkeypatch.setattr(worker, "_pane_has_marker",
@@ -1407,6 +1410,7 @@ def test_canonical_queue_owns_session_before_worker_crash(tmp_path, monkeypatch,
     policy = _policy_file(tmp_path)
     monkeypatch.setattr(worker, "frozen_policy", lambda: policy)
     monkeypatch.setattr(worker, "sandbox_command", lambda *a, **k: ["bwrap", "/bin/bash"])
+    monkeypatch.setattr(worker, "_wait_for_task_pane_input", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker, "verify_sandbox", lambda *a, **k: True)
     monkeypatch.setattr(worker, "inner_pid", lambda *a, **k: 123)
     monkeypatch.setattr(worker, "_setup_pane_ids", lambda: {"coordinator"})
@@ -1704,6 +1708,7 @@ def test_actual_root_setup_failure_passes_task_to_absent_agent_cleanup(tmp_path,
     monkeypatch.setattr(worker,"frozen_policy",lambda:_policy_file(tmp_path))
     monkeypatch.setattr(worker,"sandbox_command",lambda *args,**kw:["/bin/true"])
     monkeypatch.setattr(worker,"inner_pid",lambda *args:123)
+    monkeypatch.setattr(worker, "_wait_for_task_pane_input", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker,"verify_sandbox",lambda *args,**kw:True)
     cleaned=[]
     def clean(*args,**kw):
@@ -1893,6 +1898,7 @@ def test_task_sandbox_waits_for_native_process_and_full_mount_verification(tmp_p
 
     monkeypatch.setattr(worker, "_herdr_json", process_info)
     monkeypatch.setattr(worker, "inner_pid", lambda info, marker: next(candidates))
+    monkeypatch.setattr(worker, "_wait_for_task_pane_input", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker, "verify_sandbox", verify)
     assert worker._wait_for_task_sandbox("owned-pane", "owned-marker",
         policy=policy, policy_mount=mount) == 733
@@ -1911,6 +1917,7 @@ def test_task_sandbox_wait_deadline_never_accepts_unverified_candidate(tmp_path,
     monkeypatch.setattr(worker, "_herdr_json", lambda args, **kwargs:
         calls.append(args) or {"result": {"process_info": {"shell_pid": 700}}})
     monkeypatch.setattr(worker, "inner_pid", lambda info, marker: 733)
+    monkeypatch.setattr(worker, "_wait_for_task_pane_input", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker, "verify_sandbox", lambda *args, **kwargs: False)
     with pytest.raises(RuntimeError, match="^durable_sandbox_unverified$"):
         worker._wait_for_task_sandbox("owned-pane", "owned-marker",
@@ -1926,9 +1933,64 @@ def test_task_sandbox_wait_propagates_native_error_without_resubmitting(monkeypa
         calls.append(args)
         raise RuntimeError("pane_not_found")
     monkeypatch.setattr(worker, "_herdr_json", missing)
+    monkeypatch.setattr(worker, "_wait_for_task_pane_input", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker, "verify_sandbox", lambda *args, **kwargs:
         pytest.fail("native error must prevent sandbox acceptance"))
     with pytest.raises(RuntimeError, match="^pane_not_found$"):
         worker._wait_for_task_sandbox("owned-pane", "owned-marker",
             policy=_policy_file(tmp_path), policy_mount=object())
     assert calls == [["pane", "process-info", "--pane", "owned-pane"]]
+
+
+@pytest.mark.parametrize("canonical,correct_marker,expected", [
+    (True, True, False), (False, True, True), (False, False, False)])
+def test_native_pane_input_requires_owned_noncanonical_terminal(canonical, correct_marker, expected):
+    import os
+    import subprocess
+    import termios
+    import agent_durable_sandbox as sandbox
+    master, slave = os.openpty()
+    process = None
+    try:
+        attributes = termios.tcgetattr(slave)
+        attributes[3] = (attributes[3] | termios.ICANON) if canonical else (attributes[3] & ~termios.ICANON)
+        termios.tcsetattr(slave, termios.TCSANOW, attributes)
+        process = subprocess.Popen(["/usr/bin/python3", "-I", "-B", "-c", "import time;time.sleep(10)"],
+            stdin=slave, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env={"HERDR_DURABLE_TASK_PANE": "owned-marker" if correct_marker else "foreign-marker"},
+            start_new_session=True)
+        assert sandbox.pane_input_ready({"shell_pid": process.pid}, "owned-marker") is expected
+    finally:
+        if process is not None:
+            process.terminate()
+            process.wait(timeout=5)
+        os.close(master)
+        os.close(slave)
+
+
+def test_task_pane_input_waits_without_sending_launch(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(worker.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    ready = iter([False, True])
+    calls = []
+    monkeypatch.setattr(worker, "_herdr_json", lambda args, **kwargs:
+        calls.append(args) or {"result": {"process_info": {"shell_pid": 733}}})
+    monkeypatch.setattr(worker, "pane_input_ready", lambda info, marker: next(ready))
+    worker._wait_for_task_pane_input("owned-pane", "owned-marker")
+    assert calls == [["pane", "process-info", "--pane", "owned-pane"]] * 2
+
+
+def test_task_pane_input_deadline_stops_without_sending_launch(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(worker.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    calls = []
+    monkeypatch.setattr(worker, "_herdr_json", lambda args, **kwargs:
+        calls.append(args) or {"result": {"process_info": {"shell_pid": 733}}})
+    monkeypatch.setattr(worker, "pane_input_ready", lambda info, marker: False)
+    with pytest.raises(RuntimeError, match="^durable_pane_input_unready$"):
+        worker._wait_for_task_pane_input("owned-pane", "owned-marker", timeout_seconds=0.1)
+    assert clock[0] == pytest.approx(0.1)
+    assert len(calls) <= 3
+    assert all(args == ["pane", "process-info", "--pane", "owned-pane"] for args in calls)

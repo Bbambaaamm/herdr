@@ -6,6 +6,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import termios
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -242,6 +243,35 @@ def shell_command(args: list[str]) -> str:
 
 def _env(pid: int) -> set[bytes]:
     return set(Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"))
+
+
+def pane_input_ready(process_info: dict, marker: str) -> bool:
+    """Require the owned host shell's terminal to accept an untruncated command."""
+    fd = None
+    try:
+        pid = int(process_info.get("shell_pid") or 0)
+        if pid <= 0:
+            return False
+        expected = f"HERDR_DURABLE_TASK_PANE={marker}".encode()
+        if expected not in _env(pid):
+            return False
+        if os.readlink(f"/proc/{pid}/ns/pid") != os.readlink("/proc/self/ns/pid"):
+            return False
+        source = f"/proc/{pid}/fd/0"
+        fd = os.open(source, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK | os.O_CLOEXEC)
+        held = os.fstat(fd)
+        if not stat.S_ISCHR(held.st_mode) or not os.isatty(fd):
+            return False
+        attributes = termios.tcgetattr(fd)
+        named = os.stat(source)
+        return (not attributes[3] & termios.ICANON
+                and (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino)
+                and expected in _env(pid))
+    except (OSError, ValueError, TypeError, termios.error):
+        return False
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def inner_pid(process_info: dict, marker: str) -> int | None:
