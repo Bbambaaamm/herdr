@@ -12,7 +12,6 @@ import fcntl
 import hashlib
 import json
 import os
-import shlex
 import subprocess
 import time
 import stat
@@ -573,6 +572,7 @@ class HerdrChildRuntime:
         self.pinned_worktree = pinned_worktree
         self.policy_launch_factory = policy_launch_factory
         self._policy_launches: dict[str, PreparedPolicyLaunch] = {}
+        self._managed_launch_panes: set[str] = set()
         self._owned_write_pins = {}
         self._policy_panes: dict[str, PreparedPolicyLaunch] = {}
         self.snapshot_path = snapshot_path
@@ -766,25 +766,61 @@ class HerdrChildRuntime:
         node = self.scheduler.task_node(lease.task_id)
         toolsets = _child_toolsets(node.tools)
         _validate_child_permissions(node.permissions)
-        # The verified sandbox shell already owns this pane. agent start
-        # only accepts a host shell prompt, so launch the immutable Hermes shim
-        # inside bwrap and let Herdr detect it in-place.
-        command = "exec " + shlex.join([
-            "hermes",
-            "-p",
-            self.env.get("HERDR_HERMES_PROFILE", DEFAULT_PROFILE),
-            "chat",
-            "--toolsets",
-            toolsets,
-            "--max-turns",
-            "1",
-            "--run-budget",
-            "600",
-        ])
-        result = self.runner.run(["pane", "run", pane_id, command], timeout_seconds=15.0)
-        if not (result.returncode == 0 and result.stdout == result.stderr == ""):
-            raise HerdrRuntimeError("child_agent_launch_unverified", pane_id)
-        self._wait_for_started_agent(lease, pane_id, timeout_seconds=60.0)
+        hermes_args = ["-p", self.env.get("HERDR_HERMES_PROFILE", DEFAULT_PROFILE),
+                       "chat", "--toolsets", toolsets, "--max-turns", "1",
+                       "--run-budget", "600"]
+        launch = self._policy_launches.get(lease.task_id)
+        record = self.scheduler._tasks[lease.task_id]
+        if (pane_id in self._managed_launch_panes
+                or record.execution_pane == pane_id and record.execution_marker):
+            proof = self._sandbox_proofs.get(pane_id)
+            if (not isinstance(launch, PreparedPolicyLaunch)
+                    or self._policy_panes.get(pane_id) is not launch
+                    or not isinstance(proof, dict)
+                    or proof.get("invocation_policy") is None
+                    or type(proof.get("sandbox_pid")) is not int
+                    or not record.execution_marker):
+                raise HerdrRuntimeError("child_invocation_policy_missing", lease.task_id)
+            import importlib.util
+            from importlib.machinery import SourceFileLoader
+            sandbox_file = Path(__file__).resolve().parents[1] / "agent-stack/bin/agent_durable_sandbox.py"
+            loader = SourceFileLoader("agent_durable_sandbox_start", str(sandbox_file))
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            sandbox = importlib.util.module_from_spec(spec)
+            loader.exec_module(sandbox)
+            def invoke(args, *, timeout_seconds):
+                result = self.runner.run(args, timeout_seconds=timeout_seconds)
+                if args[:2] == ["pane", "run"]:
+                    if not (result.returncode == 0 and result.stdout == result.stderr == ""):
+                        raise HerdrRuntimeError("child_agent_input_unacknowledged", pane_id)
+                    return None
+                return _json_result(result, "child sandbox agent")
+            try:
+                payload = sandbox.start_sandbox_agent(
+                    invoke, pane_id, record.execution_marker, proof["sandbox_pid"],
+                    lease.agent_id, hermes_args,
+                    verify_boundary=lambda: (
+                        hashlib.sha256(Path(proof["policy_file"]).read_bytes()).hexdigest()
+                        == proof["policy_sha256"]
+                        and sandbox.verify(
+                            proof["sandbox_pid"], Path(proof["real_binary"]),
+                            record.execution_marker, policy=proof["policy_file"],
+                            attempts=1, pinned_worktree=self.pinned_worktree,
+                            child_workspace_writable=self._child_workspace_writable(lease.task_id),
+                            policy_mount=launch.mount)),
+                    timeout_seconds=60.0)
+            except RuntimeError as exc:
+                raise HerdrRuntimeError("child_agent_start_unverified", str(exc)) from exc
+        else:
+            result = self.runner.run(
+                ["agent", "start", lease.agent_id, "--kind", "hermes", "--pane", pane_id,
+                 "--timeout", "60000", "--", *hermes_args], timeout_seconds=75.0)
+            payload = _json_result(result, "agent start")
+        started = (payload.get("result") or {}).get("agent")
+        if not isinstance(started, Mapping) or started.get("name") != lease.agent_id:
+            raise HerdrRuntimeError("child_agent_start_mismatch", lease.agent_id)
+        if started.get("pane_id") and started["pane_id"] != pane_id:
+            raise HerdrRuntimeError("child_wrong_pane", pane_id)
 
     def _verify_live_child(self, agent_id: str, pane_id: str, marker: str,
                            *, require_sandbox: bool = False,
@@ -1029,6 +1065,7 @@ class HerdrChildRuntime:
                 "invocation_policy": policy_evidence,
                 "sandbox_pid": sandbox_pid,
                 "policy_sha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
+                "policy_file": policy, "real_binary": real,
             }
             return policy
         except BaseException:
@@ -1088,6 +1125,7 @@ class HerdrChildRuntime:
                 task_id=rec.id, fencing_token=rec.fencing_token)
 
     def _cleanup_policy_launch(self, task_id, pane_id=None):
+        self._managed_launch_panes.discard(pane_id)
         pins=self._owned_write_pins.pop(task_id,None)
         if pins is not None:pins.close()
         record = self.scheduler._tasks.get(task_id)
@@ -1319,6 +1357,7 @@ class HerdrChildRuntime:
                 raise HerdrRuntimeError("child_split_intent_denied",lease.task_id)
             pane_creation_attempted = True
             pane_id = self._create_pane(0, marker, policy_env)
+            self._managed_launch_panes.add(pane_id)
             self._reservation_panes[lease.agent_id] = pane_id
             if not self.scheduler.bind_pre_delivery_pane(lease.task_id, run_token,
                                                           lease.agent_id, pane_id, marker):

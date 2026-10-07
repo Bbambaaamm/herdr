@@ -1,5 +1,6 @@
 """Construct and verify the durable task pane's mount and PID boundary."""
 import os
+import re
 import json
 import shlex
 import secrets
@@ -246,17 +247,14 @@ def _env(pid: int) -> set[bytes]:
     return set(Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"))
 
 
-def pane_input_ready(process_info: dict, marker: str) -> bool:
-    """Require the owned host shell's terminal to accept an untruncated command."""
+def _terminal_input_ready(pid: int, marker: str) -> bool:
+    """Require the marked process to own an active, noncanonical foreground TTY."""
     fd = None
     try:
-        pid = int(process_info.get("shell_pid") or 0)
         if pid <= 0:
             return False
         expected = f"HERDR_DURABLE_TASK_PANE={marker}".encode()
         if expected not in _env(pid):
-            return False
-        if os.readlink(f"/proc/{pid}/ns/pid") != os.readlink("/proc/self/ns/pid"):
             return False
         source = f"/proc/{pid}/fd/0"
         fd = os.open(source, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK | os.O_CLOEXEC)
@@ -289,6 +287,17 @@ def pane_input_ready(process_info: dict, marker: str) -> bool:
             os.close(fd)
 
 
+def pane_input_ready(process_info: dict, marker: str) -> bool:
+    """Require the owned host shell's terminal to accept an untruncated command."""
+    try:
+        pid = int(process_info.get("shell_pid") or 0)
+        return (pid > 0
+                and os.readlink(f"/proc/{pid}/ns/pid") == os.readlink("/proc/self/ns/pid")
+                and _terminal_input_ready(pid, marker))
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def _pane_shell_instance(process_info: dict, marker: str) -> tuple[int, int] | None:
     if not pane_input_ready(process_info, marker):
         return None
@@ -300,13 +309,15 @@ def _pane_shell_instance(process_info: dict, marker: str) -> tuple[int, int] | N
         return None
 
 
-def verify_pane_prompt(invoke, pane_id: str, marker: str, *, timeout_seconds=10.0) -> None:
+def verify_pane_prompt(invoke, pane_id: str, marker: str, *, timeout_seconds=10.0,
+                       _instance_reader=None) -> None:
     """Prove the owned shell executed a short challenge before sending its launch.
 
     A startup builtin read shares the shell PID and terminal flags. An encoded,
     fresh nonce cannot match the echoed input; only command execution produces
     the expected complete output line. Never resend a consumed challenge.
     """
+    instance_reader = _instance_reader or _pane_shell_instance
     deadline = time.monotonic() + timeout_seconds
     def remaining():
         value = deadline - time.monotonic()
@@ -318,7 +329,7 @@ def verify_pane_prompt(invoke, pane_id: str, marker: str, *, timeout_seconds=10.
                        timeout_seconds=min(10.0, remaining()))
         info = (reply.get("result") or {}).get("process_info")
         return info if isinstance(info, dict) else {}
-    instance = _pane_shell_instance(process_info(), marker)
+    instance = instance_reader(process_info(), marker)
     if instance is None:
         raise RuntimeError("durable_pane_prompt_unverified")
     nonce = "HERDR_PROMPT_" + secrets.token_hex(24)
@@ -339,9 +350,138 @@ def verify_pane_prompt(invoke, pane_id: str, marker: str, *, timeout_seconds=10.
             or type(result.get("revision")) is not int or result["revision"] < 0):
         raise RuntimeError("durable_pane_prompt_unverified")
     while True:
-        if _pane_shell_instance(process_info(), marker) == instance:
+        if instance_reader(process_info(), marker) == instance:
             remaining()
             return
+        time.sleep(min(0.05, remaining()))
+
+
+def start_sandbox_agent(invoke, pane_id: str, marker: str, sandbox_pid: int,
+                        agent_name: str, hermes_args: list[str], *,
+                        verify_boundary, timeout_seconds=60.0) -> dict:
+    """Launch the fixed guarded Hermes entry once inside an attested owned pane.
+
+    Native agent.start requires a bare host shell and rejects an existing bwrap
+    boundary. This route proves the inner prompt, sends one fixed executable,
+    waits for native detection of the actual Hermes process, then names it.
+    The caller must still confirm authenticated bootstrap before task delivery.
+    """
+    if (not isinstance(agent_name, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", agent_name)
+            or type(sandbox_pid) is not int or sandbox_pid <= 0
+            or not isinstance(hermes_args, list)
+            or any(not isinstance(arg, str) or any(ord(c) < 32 or ord(c) == 127 for c in arg)
+                   for arg in hermes_args)
+            or type(timeout_seconds) not in (int, float)
+            or not 0 < timeout_seconds <= 75):
+        raise RuntimeError("durable_agent_launch_invalid")
+    command = "exec " + shlex.join(["/run/herdr-bootstrap/hermes", *hermes_args])
+    if len(command.encode("utf-8")) >= 4096:
+        raise RuntimeError("durable_agent_launch_invalid")
+    deadline = time.monotonic() + timeout_seconds
+    expected_process = None
+    def remaining():
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise RuntimeError("durable_agent_launch_unverified")
+        return value
+    def process_instance():
+        try:
+            fields = Path(f"/proc/{sandbox_pid}/stat").read_text().rsplit(")", 1)[1].split()
+            return (sandbox_pid, int(fields[19]),
+                    os.readlink(f"/proc/{sandbox_pid}/ns/pid"),
+                    os.readlink(f"/proc/{sandbox_pid}/ns/mnt"))
+        except (OSError, ValueError, IndexError):
+            return None
+    def boundary():
+        if verify_boundary() is not True:
+            raise RuntimeError("durable_agent_boundary_unverified")
+        if expected_process is not None and process_instance() != expected_process:
+            raise RuntimeError("durable_agent_process_changed")
+        remaining()
+    def pane():
+        reply = invoke(["pane", "get", pane_id], timeout_seconds=min(10.0, remaining()))
+        result = reply.get("result") if isinstance(reply, dict) else None
+        row = result.get("pane") if isinstance(result, dict) else None
+        if (not isinstance(row, dict) or row.get("pane_id") != pane_id
+                or not isinstance(row.get("terminal_id"), str) or not row["terminal_id"]):
+            raise RuntimeError("durable_agent_pane_unverified")
+        return row
+    boundary()
+    initial = pane()
+    if initial.get("agent") is not None:
+        raise RuntimeError("durable_agent_pane_busy")
+    terminal_id = initial["terminal_id"]
+    def inner_instance(info, expected_marker):
+        boundary()
+        if inner_pid(info, expected_marker) != sandbox_pid:
+            return None
+        if not _terminal_input_ready(sandbox_pid, expected_marker):
+            return None
+        return process_instance()
+    def acknowledged(args, *, timeout_seconds):
+        response = invoke(args, timeout_seconds=timeout_seconds)
+        if args[:2] == ["pane", "run"] and response is not None:
+            raise RuntimeError("durable_agent_input_unacknowledged")
+        return response
+    # bwrap verification can precede readline's first inner prompt.
+    while True:
+        reply = invoke(["pane", "process-info", "--pane", pane_id],
+                       timeout_seconds=min(10.0, remaining()))
+        info = (reply.get("result") or {}).get("process_info") if isinstance(reply, dict) else None
+        instance = inner_instance(info, marker) if isinstance(info, dict) else None
+        if instance is not None:
+            expected_process = instance
+            break
+        time.sleep(min(0.05, remaining()))
+    verify_pane_prompt(acknowledged, pane_id, marker,
+                       timeout_seconds=remaining(), _instance_reader=inner_instance)
+    boundary()
+    current = pane()
+    if current["terminal_id"] != terminal_id or current.get("agent") is not None:
+        raise RuntimeError("durable_agent_pane_changed")
+    acknowledged(["pane", "run", pane_id, command], timeout_seconds=min(10.0, remaining()))
+    while True:
+        boundary()
+        current = pane()
+        if current["terminal_id"] != terminal_id:
+            raise RuntimeError("durable_agent_pane_changed")
+        detected = current.get("agent")
+        if detected == "hermes":
+            break
+        if detected is not None:
+            raise RuntimeError("durable_agent_kind_mismatch")
+        time.sleep(min(0.05, remaining()))
+    boundary()
+    reply = invoke(["agent", "rename", pane_id, agent_name],
+                   timeout_seconds=min(10.0, remaining()))
+    result = reply.get("result") if isinstance(reply, dict) else None
+    agent = result.get("agent") if isinstance(result, dict) else None
+    if (not isinstance(agent, dict) or agent.get("name") != agent_name
+            or agent.get("pane_id") != pane_id or agent.get("terminal_id") != terminal_id
+            or agent.get("agent") != "hermes"):
+        raise RuntimeError("durable_agent_identity_unverified")
+    # Process discovery precedes Hermes' interactive initialization. Keep the
+    # task prompt on the host until native screen detection AND the same
+    # foreground process' noncanonical input terminal are ready.
+    while True:
+        boundary()
+        ready = invoke(["agent", "get", agent_name],
+                       timeout_seconds=min(10.0, remaining()))
+        result = ready.get("result") if isinstance(ready, dict) else None
+        current = result.get("agent") if isinstance(result, dict) else None
+        if (not isinstance(current, dict) or current.get("name") != agent_name
+                or current.get("pane_id") != pane_id or current.get("terminal_id") != terminal_id
+                or current.get("agent") != "hermes"):
+            raise RuntimeError("durable_agent_identity_unverified")
+        status = current.get("agent_status")
+        if status == "blocked":
+            raise RuntimeError("durable_agent_startup_blocked")
+        if status not in {"idle", "done", "working", "unknown"}:
+            raise RuntimeError("durable_agent_status_unverified")
+        if status in {"idle", "done"} and _terminal_input_ready(sandbox_pid, marker):
+            boundary()
+            return ready
         time.sleep(min(0.05, remaining()))
 
 

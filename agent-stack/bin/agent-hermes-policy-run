@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
+from contextlib import contextmanager
 from typing import Any
 
 BUNDLE_PATH = Path("/run/herdr-policy/grant.bundle.json")
@@ -462,6 +463,39 @@ def _verify_hermes_build(root: Path) -> str:
     return HERMES_EXECUTOR
 
 
+@contextmanager
+def _native_hermes_process_label():
+    """Expose the verified running Hermes program to Linux native detection.
+
+    This process label is UI metadata, never invocation or budget authority.
+    Set it only after authenticating the frozen entry and installing the guard.
+    """
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.restype = ctypes.c_int
+    prctl.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong,
+                     ctypes.c_ulong, ctypes.c_ulong]
+    old = ctypes.create_string_buffer(16)
+    def checked(operation, buffer):
+        if prctl(operation, ctypes.cast(buffer, ctypes.c_void_p), 0, 0, 0) != 0:
+            raise SystemExit("native Hermes process label unavailable")
+    checked(16, old)  # PR_GET_NAME
+    label = ctypes.create_string_buffer(b"hermes", 16)
+    changed = False
+    try:
+        checked(15, label)  # PR_SET_NAME, fixed actual program name
+        changed = True
+        actual = ctypes.create_string_buffer(16)
+        checked(16, actual)
+        if actual.value != b"hermes":
+            raise SystemExit("native Hermes process label mismatch")
+        yield
+    finally:
+        if changed:
+            checked(15, old)
+
+
 def bootstrap(hermes_args: list[str]) -> int:
     """Every entry uses the fixed authenticated production path."""
     bundle_path,policy_code_root,hermes_root=BUNDLE_PATH,POLICY_CODE_ROOT,HERMES_ROOT
@@ -512,7 +546,8 @@ def bootstrap(hermes_args: list[str]) -> int:
     hermes_main_module = importlib.import_module("hermes_cli.main")
     _require_module_origin(hermes_main_module, hermes_root, "hermes_cli.main")
     sys.argv = [str(hermes_root / "hermes"), *hermes_args]
-    result = hermes_main_module.main()
+    with _native_hermes_process_label():
+        result = hermes_main_module.main()
     return 0 if result is None else int(result)
 
 
