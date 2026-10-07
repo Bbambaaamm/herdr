@@ -17,7 +17,8 @@ from contextlib import contextmanager
 from agent_model_policy import decide as decide_model_route, record as record_model_route
 from agent_completion_evidence import EvidenceError, record_verification_failure, verification_applies, freeze_plan, verify_completion, completion_instructions
 from agent_durable_sandbox import (command as sandbox_command, frozen_policy, inner_pid,
-                                   shell_command, pane_input_ready, verify_pane_prompt, verify as verify_sandbox)
+                                   shell_command, pane_input_ready, verify_pane_prompt, start_sandbox_agent,
+                                   verify as verify_sandbox)
 from agent_durable_children import parent_attempt_guard
 
 HOME = Path("/home/agentops")
@@ -914,21 +915,25 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         agent_start_attempted = True
         session["agent_start_attempted"] = True
         persist_execution_session(task)
-        hermes_args = [
-            "hermes", "-p", profile, "chat",
-            "--continue", session_name, "--create-if-missing",
-            "--in", workspace,
-            "--toolsets", __import__("herdr.runtime", fromlist=["_child_toolsets"])._child_toolsets(
-                tuple(task.get("parent_tools") or ()), allow_delegation=True),
-        ]
-        # The pane is already occupied by the verified bwrap shell. Native
-        # agent start requires a host shell prompt and must therefore never
-        # be used here. Launch the pinned Hermes shim inside the sandbox;
-        # Herdr detects manual agents in-place, then we bind the durable name.
-        _herdr_json(["pane", "run", pane_id, shell_command(hermes_args)],
-                    timeout_seconds=15.0)
-        started_agent = _wait_for_task_agent(pane_id, agent_name, timeout_seconds=60.0)
-        if str(started_agent.get("pane_id") or "") != pane_id:
+        started = start_sandbox_agent(
+            _herdr_json, pane_id, pane_marker, sandbox_pid, agent_name,
+            ["-p", profile, "chat", "--continue", session_name, "--create-if-missing",
+             "--in", workspace, "--toolsets",
+             __import__("herdr.runtime", fromlist=["_child_toolsets"])._child_toolsets(
+                 tuple(task.get("parent_tools") or ()), allow_delegation=True)],
+            verify_boundary=lambda: verify_sandbox(
+                sandbox_pid, HERDR, pane_marker, policy=policy,
+                policy_mount=launch.mount, attempts=1),
+            timeout_seconds=60.0,
+        )
+        started_agent = (started.get("result") or {}).get("agent")
+        if (
+            not isinstance(started_agent, dict)
+            or str(started_agent.get("name") or "") != agent_name
+        ):
+            raise RuntimeError("task_session_agent_start_invalid")
+        started_pane = str(started_agent.get("pane_id") or "")
+        if started_pane and started_pane != pane_id:
             raise RuntimeError("task_session_agent_wrong_pane")
         session["invocation_policy"] = launch.confirm_bootstrap()
         session["agent_started"] = True

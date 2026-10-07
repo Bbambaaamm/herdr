@@ -101,6 +101,7 @@ def test_same_process_guard_precedes_hermes_main(monkeypatch, tmp_path):
     fake_main.__file__ = str(hermes / 'hermes')
     def main():
         assert events == ['verified', 'installed']
+        assert Path('/proc/self/comm').read_text().strip() == 'hermes'
         assert os.environ["HERMES_SAFE_MODE"] == "1"
         assert os.environ["HERMES_ENABLE_PROJECT_PLUGINS"] == "0"
         assert sys.argv == [str(hermes / 'hermes'), 'chat', '--profile', 'test']
@@ -568,3 +569,24 @@ def test_stage1_checks_native_libraries_outside_stdlib_before_exec(tmp_path,monk
     shared.write_bytes(b"malicious-native")
     with pytest.raises(SystemExit,match="complete Python runtime tree"):
         module._verify_pinned_startup_imports()
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_native_actual_hermes_label_is_kernel_visible_and_restored(raises):
+    module = _launcher()
+    before = Path("/proc/self/comm").read_bytes()
+    with pytest.raises(ValueError) if raises else __import__("contextlib").nullcontext():
+        with module._native_hermes_process_label():
+            assert Path("/proc/self/comm").read_text().strip() == "hermes"
+            if raises:
+                raise ValueError("main failed")
+    assert Path("/proc/self/comm").read_bytes() == before
+
+
+def test_unauthenticated_bootstrap_never_sets_native_agent_label(monkeypatch):
+    module = _launcher()
+    monkeypatch.setattr(module, "_require_host_bootstrap_authority",
+        lambda: (_ for _ in ()).throw(SystemExit("host authority denied")))
+    monkeypatch.setattr(module, "_native_hermes_process_label",
+        lambda: pytest.fail("unverified program must not be labelled Hermes"))
+    with pytest.raises(SystemExit, match="host authority denied"):
+        module.bootstrap([])

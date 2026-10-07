@@ -1784,3 +1784,21 @@ def test_managed_child_waits_before_single_native_launch_and_full_verification(t
         assert runner.launches == (0 if case in {"input-unready", "prompt-unverified"} else 1)
         assert runner.sandbox_checks == 0 and verification == []
         assert not policy.exists() and "owned" not in runtime._sandbox_proofs
+
+def test_managed_start_cannot_fall_back_to_native_bare_shell_when_proof_missing(tmp_path):
+    scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
+    scheduler.register_external_parent_attempt(task_id="parent", run_token="run",
+        idempotency_key="key", agent_name="parent", pane_id="parent-pane", marker="marker",
+        repo="repo", issue="82", role="writer", tools=("read_file",),
+        permissions=(), policy_profile="default")
+    child = scheduler.delegate_child("parent", "run", "scope",
+        ChildProposal("writer", ("read_file",), "reader", ("read_file",), child_task="inspect"))
+    lease = scheduler.dispatch(task_ids={child.id})[0]
+    runner = FakeHerdrRunner()
+    runtime = HerdrChildRuntime(scheduler, runner, cwd=tmp_path,
+        env={"HERDR_ENV": "1", "HERDR_PANE_ID": "parent-pane"})
+    runtime._skill_checked = True
+    runtime._managed_launch_panes.add("owned-pane")
+    with pytest.raises(HerdrRuntimeError, match="child_invocation_policy_missing"):
+        runtime._start_agent(lease, "owned-pane")
+    assert runner.calls == []
