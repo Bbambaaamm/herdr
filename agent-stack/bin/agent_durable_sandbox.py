@@ -379,14 +379,25 @@ def start_sandbox_agent(invoke, pane_id: str, marker: str, sandbox_pid: int,
     if len(command.encode("utf-8")) >= 4096:
         raise RuntimeError("durable_agent_launch_invalid")
     deadline = time.monotonic() + timeout_seconds
+    expected_process = None
     def remaining():
         value = deadline - time.monotonic()
         if value <= 0:
             raise RuntimeError("durable_agent_launch_unverified")
         return value
+    def process_instance():
+        try:
+            fields = Path(f"/proc/{sandbox_pid}/stat").read_text().rsplit(")", 1)[1].split()
+            return (sandbox_pid, int(fields[19]),
+                    os.readlink(f"/proc/{sandbox_pid}/ns/pid"),
+                    os.readlink(f"/proc/{sandbox_pid}/ns/mnt"))
+        except (OSError, ValueError, IndexError):
+            return None
     def boundary():
         if verify_boundary() is not True:
             raise RuntimeError("durable_agent_boundary_unverified")
+        if expected_process is not None and process_instance() != expected_process:
+            raise RuntimeError("durable_agent_process_changed")
         remaining()
     def pane():
         reply = invoke(["pane", "get", pane_id], timeout_seconds=min(10.0, remaining()))
@@ -407,13 +418,7 @@ def start_sandbox_agent(invoke, pane_id: str, marker: str, sandbox_pid: int,
             return None
         if not _terminal_input_ready(sandbox_pid, expected_marker):
             return None
-        try:
-            fields = Path(f"/proc/{sandbox_pid}/stat").read_text().rsplit(")", 1)[1].split()
-            return (sandbox_pid, int(fields[19]),
-                    os.readlink(f"/proc/{sandbox_pid}/ns/pid"),
-                    os.readlink(f"/proc/{sandbox_pid}/ns/mnt"))
-        except (OSError, ValueError, IndexError):
-            return None
+        return process_instance()
     def acknowledged(args, *, timeout_seconds):
         response = invoke(args, timeout_seconds=timeout_seconds)
         if args[:2] == ["pane", "run"] and response is not None:
@@ -424,7 +429,9 @@ def start_sandbox_agent(invoke, pane_id: str, marker: str, sandbox_pid: int,
         reply = invoke(["pane", "process-info", "--pane", pane_id],
                        timeout_seconds=min(10.0, remaining()))
         info = (reply.get("result") or {}).get("process_info") if isinstance(reply, dict) else None
-        if isinstance(info, dict) and inner_instance(info, marker) is not None:
+        instance = inner_instance(info, marker) if isinstance(info, dict) else None
+        if instance is not None:
+            expected_process = instance
             break
         time.sleep(min(0.05, remaining()))
     verify_pane_prompt(acknowledged, pane_id, marker,

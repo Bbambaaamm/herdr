@@ -28,6 +28,11 @@ def setup_transport(monkeypatch, *, fault=None):
     monkeypatch.setattr(module.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
     # Unit doubles only: the owned probe uses real TTY/namespace verification.
     monkeypatch.setattr(module, "inner_pid", lambda info, marker: os.getpid())
+    original_readlink = module.os.readlink
+    def readlink(path):
+        result = original_readlink(path)
+        return result + "-changed" if fault == "namespace" and state["launched"] else result
+    monkeypatch.setattr(module.os, "readlink", readlink)
     monkeypatch.setattr(module, "_terminal_input_ready", lambda pid, marker: not (fault == "canonical" and state["launched"]))
     def prompt(invoke, pane, marker, **kwargs):
         reader = kwargs["_instance_reader"]
@@ -97,7 +102,7 @@ def test_launch_once_proves_prompt_and_names_actual_detected_agent(monkeypatch):
     ("kind", "kind_mismatch", 1), ("name", "identity_unverified", 1),
     ("pane", "identity_unverified", 1), ("timeout", "launch_unverified", 1),
     ("canonical", "launch_unverified", 1), ("not-ready", "launch_unverified", 1),
-    ("blocked", "startup_blocked", 1),
+    ("blocked", "startup_blocked", 1), ("namespace", "process_changed", 1),
 ])
 def test_failure_never_resends_launch_or_uses_bare_shell_fallback(monkeypatch, fault, error, inputs):
     module, invoke, boundary, calls, state = setup_transport(monkeypatch, fault=fault)

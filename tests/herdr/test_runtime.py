@@ -476,7 +476,7 @@ def test_child_workspace_write_requires_role_tool_and_permission(
     (("read_file", "search_files"), "file"),
     (("read_file", "write_file", "patch"), "file"),
 ])
-def test_managed_agent_start_uses_explicit_admitted_toolset(tmp_path, tools, expected):
+def test_legacy_canary_agent_start_uses_explicit_admitted_toolset(tmp_path, tools, expected):
     scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
     role = "writer" if set(tools) & {"patch","write_file"} else "reader"
     parent_role = "reviewer" if role == "reviewer" else "writer"
@@ -495,17 +495,12 @@ def test_managed_agent_start_uses_explicit_admitted_toolset(tmp_path, tools, exp
 
     runtime._start_agent(lease, "child-pane")
 
-    call = next(call for call in runner.calls
-                if call[:2] == ("pane", "run") and len(call) >= 4 and "exec hermes " in call[3])
-    command = call[3]
-    assert f"--toolsets {expected}" in command
-    assert command.index("--toolsets") > command.index("chat")
-    assert not any(value in command for value in (
+    call = next(call for call in runner.calls if call[:2] == ("agent", "start"))
+    assert call[call.index("--toolsets") + 1] == expected
+    assert call.index("--toolsets") > call.index("chat")
+    assert not any(value in call for value in (
         "terminal", "code_execution", "web", "browser", "delegation",
         "connections", "computer_use", "cron", "mcp", "plugins"))
-    assert not any(item[:2] == ("agent", "start") for item in runner.calls)
-    assert any(item[:2] == ("agent", "rename") and item[2] == "child-pane"
-               and item[3] == lease.agent_id for item in runner.calls)
 
 
 def _write_profile_auth(profile_dir, expires_at):
@@ -836,12 +831,10 @@ def test_two_real_child_contract_parallel_cleanup_and_snapshot(tmp_path: Path) -
     assert sorted(runner.closed) == sorted(runner.created)
     assert len(runner.created) == 2
     assert any(call == ("--skill",) for call in runner.calls)
-    starts = [call for call in runner.calls
-              if call[:2] == ("pane", "run") and len(call) >= 4 and "exec hermes " in call[3]]
+    starts = [call for call in runner.calls if call[:2] == ("agent", "start")]
     assert len(starts) == 2
-    assert all("--toolsets bot_room" in call[3] for call in starts)
-    assert all("--max-turns 1" in call[3] for call in starts)
-    assert not any(call[:2] == ("agent", "start") for call in runner.calls)
+    assert all(call[call.index("--toolsets") + 1] == "bot_room" for call in starts)
+    assert all(call[call.index("--max-turns") + 1] == "1" for call in starts)
 
     payload = json.loads(snapshot_path.read_text())
     assert {
@@ -1802,3 +1795,63 @@ def test_managed_start_cannot_fall_back_to_native_bare_shell_when_proof_missing(
     with pytest.raises(HerdrRuntimeError, match="child_invocation_policy_missing"):
         runtime._start_agent(lease, "owned-pane")
     assert runner.calls == []
+
+@pytest.mark.parametrize("ack", ["", "{\"result\":{}}"])
+def test_managed_start_uses_guarded_adapter_and_strict_empty_ack(tmp_path, monkeypatch, ack):
+    import importlib.machinery
+    scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
+    scheduler.register_external_parent_attempt(task_id="parent", run_token="run",
+        idempotency_key="key", agent_name="parent", pane_id="parent-pane", marker="marker",
+        repo="repo", issue="82", role="writer", tools=("read_file",),
+        permissions=(), policy_profile="default")
+    child = scheduler.delegate_child("parent", "run", "scope",
+        ChildProposal("writer", ("read_file",), "reader", ("read_file",), child_task="inspect"))
+    lease = scheduler.dispatch(task_ids={child.id})[0]
+    class Runner:
+        calls = []
+        def run(self, args, timeout_seconds=30):
+            self.calls.append(args)
+            assert args[:2] == ["pane", "run"]
+            return CommandResult(0, ack, "")
+    runner = Runner()
+    runtime = HerdrChildRuntime(scheduler, runner, cwd=tmp_path,
+        env={"HERDR_ENV": "1", "HERDR_PANE_ID": "parent-pane"})
+    runtime._skill_checked = True
+    runtime._managed_launch_panes.add("owned-pane")
+    record = scheduler._tasks[child.id]
+    record.execution_marker = "child-marker"
+    launch = runtime._policy_launches[child.id]  # Explicit policy fixture.
+    runtime._policy_panes["owned-pane"] = launch
+    policy = tmp_path / "policy"
+    policy.write_text("frozen-policy")
+    runtime._sandbox_proofs["owned-pane"] = {"invocation_policy": {"test": True},
+        "sandbox_pid": 123, "policy_file": policy, "real_binary": "/native/herdr",
+        "policy_sha256": hashlib.sha256(policy.read_bytes()).hexdigest()}
+    original = importlib.machinery.SourceFileLoader.exec_module
+    observed = []
+    def execute(loader, module):
+        original(loader, module)
+        if loader.name != "agent_durable_sandbox_start":
+            return
+        def verify(pid, real, marker, **kwargs):
+            observed.append((pid, real, marker, kwargs))
+            return True
+        def start(invoke, pane, marker, pid, name, args, **kwargs):
+            assert kwargs["verify_boundary"]() is True
+            assert pane == "owned-pane" and marker == "child-marker" and pid == 123
+            assert args == ["-p", "quantlab", "chat", "--toolsets", "file",
+                            "--max-turns", "1", "--run-budget", "600"]
+            invoke(["pane", "run", pane, "owned adapter input"], timeout_seconds=5)
+            return {"result": {"agent": {"name": name, "pane_id": pane}}}
+        module.verify = verify
+        module.start_sandbox_agent = start
+    monkeypatch.setattr(importlib.machinery.SourceFileLoader, "exec_module", execute)
+    if ack:
+        with pytest.raises(HerdrRuntimeError, match="child_agent_input_unacknowledged"):
+            runtime._start_agent(lease, "owned-pane")
+    else:
+        runtime._start_agent(lease, "owned-pane")
+    assert observed == [(123, Path("/native/herdr"), "child-marker",
+        {"policy": policy, "attempts": 1, "pinned_worktree": None,
+         "child_workspace_writable": False, "policy_mount": launch.mount})]
+    assert not any(call[:2] == ["agent", "start"] for call in runner.calls)

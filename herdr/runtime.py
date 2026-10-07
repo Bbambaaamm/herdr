@@ -12,7 +12,6 @@ import fcntl
 import hashlib
 import json
 import os
-import shlex
 import subprocess
 import time
 import stat
@@ -800,12 +799,15 @@ class HerdrChildRuntime:
                 payload = sandbox.start_sandbox_agent(
                     invoke, pane_id, record.execution_marker, proof["sandbox_pid"],
                     lease.agent_id, hermes_args,
-                    verify_boundary=lambda: sandbox.verify(
-                        proof["sandbox_pid"], Path(proof["real_binary"]),
-                        record.execution_marker, policy=proof["policy_file"],
-                        attempts=1, pinned_worktree=self.pinned_worktree,
-                        child_workspace_writable=self._child_workspace_writable(lease.task_id),
-                        policy_mount=launch.mount),
+                    verify_boundary=lambda: (
+                        hashlib.sha256(Path(proof["policy_file"]).read_bytes()).hexdigest()
+                        == proof["policy_sha256"]
+                        and sandbox.verify(
+                            proof["sandbox_pid"], Path(proof["real_binary"]),
+                            record.execution_marker, policy=proof["policy_file"],
+                            attempts=1, pinned_worktree=self.pinned_worktree,
+                            child_workspace_writable=self._child_workspace_writable(lease.task_id),
+                            policy_mount=launch.mount)),
                     timeout_seconds=60.0)
             except RuntimeError as exc:
                 raise HerdrRuntimeError("child_agent_start_unverified", str(exc)) from exc

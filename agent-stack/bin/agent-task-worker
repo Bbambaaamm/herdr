@@ -921,9 +921,11 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
              "--in", workspace, "--toolsets",
              __import__("herdr.runtime", fromlist=["_child_toolsets"])._child_toolsets(
                  tuple(task.get("parent_tools") or ()), allow_delegation=True)],
-            verify_boundary=lambda: verify_sandbox(
-                sandbox_pid, HERDR, pane_marker, policy=policy,
-                policy_mount=launch.mount, attempts=1),
+            verify_boundary=lambda: (
+                hashlib.sha256(policy.read_bytes()).hexdigest()
+                == session["sandbox_attestation"]["policy_sha256"]
+                and verify_sandbox(sandbox_pid, HERDR, pane_marker, policy=policy,
+                                   policy_mount=launch.mount, attempts=1)),
             timeout_seconds=60.0,
         )
         started_agent = (started.get("result") or {}).get("agent")
