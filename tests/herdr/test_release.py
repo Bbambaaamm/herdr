@@ -1366,3 +1366,51 @@ def test_already_deployed_requires_full_coherence(
             candidate,
             release_doc,
         )
+
+
+def test_rc22_readability_bridge_is_exact_and_reviewed():
+    identity = (
+        "v0.3.0-rc.22",
+        "34444b733b401d6c6c2feb0956bae224a2e40fdd",
+    )
+    assert cutover.BOOTSTRAP_VERSIONED_UNIT_HASHES[identity] == {
+        "agent-platform-web.service":
+            "c5a834ae268d02f5b27938f90c3d9bf766118399f65ae07d9f3016a530460e5e",
+        "agent-platform-export.service":
+            "f674e5d42bea703c48d1dd7156bff56d07d21f314c8379f6a9255114c946e608",
+        "agent-platform-herdr.service":
+            "d02e097c200e4c28290b24029ec7cbe6a73aec2a46635df86929c1b4e266d4da",
+        "agent-platform-export.timer":
+            "e568c8d2a5fb27f9e968868952d296191e3be30962c0dba1fc415c35c994cf04",
+        "agent-platform-herdr.timer":
+            "875c7512d5504a0f10cd2b975cffc5ff8116529cc8d147d37c5fee8c83cf8e28",
+        "agent-stack-watchdog.service":
+            "0cd5b8fa59a650223fa72a35bff8df885212106ff8e1988cf18852d8f4774564",
+    }
+
+
+def test_deployed_marker_is_root_owned_readable_but_not_writable(monkeypatch):
+    writes = []
+    monkeypatch.setattr(cutover.grp, "getgrnam",
+                        lambda name: type("Group", (), {"gr_gid": 982})())
+    monkeypatch.setattr(
+        cutover,
+        "atomic_write",
+        lambda target, data, mode, uid=0, gid=0:
+            writes.append((target, data, mode, uid, gid)),
+    )
+    document = {
+        "version": 1,
+        "tag": "v0.3.0-rc.24",
+        "commit": "a" * 40,
+        "config_sha256": "b" * 64,
+        "payload_manifest_sha256": "c" * 64,
+        "deployed_at": 1,
+    }
+    cutover.write_deployed(document)
+    assert len(writes) == 1
+    target, data, mode, uid, gid = writes[0]
+    assert target == cutover.PUBLIC_STATE
+    assert json.loads(data) == document
+    assert mode == 0o644
+    assert uid == 0 and gid == 982

@@ -115,6 +115,29 @@ BOOTSTRAP_VERSIONED_UNIT_HASHES = {
         "agent-stack-watchdog.service":
             "4263cadfa131fe3e117989751d3966058ab74748b82ca28683a99d5e7c61a413",
     },
+    # One-time readability bridge for RC22. RC22 has a manifest-bound public
+    # marker, but the deployed file is root:agent-platform-read 0640 while the
+    # unprivileged preflight owner agentops is not a member of that group.
+    # Accept only this exact immutable identity and the six reviewed unit
+    # hashes already bound by RC22. RC24+ writes the bounded marker read-only
+    # for the directory owner, so no later release may need this exception.
+    (
+        "v0.3.0-rc.22",
+        "34444b733b401d6c6c2feb0956bae224a2e40fdd",
+    ): {
+        "agent-platform-web.service":
+            "c5a834ae268d02f5b27938f90c3d9bf766118399f65ae07d9f3016a530460e5e",
+        "agent-platform-export.service":
+            "f674e5d42bea703c48d1dd7156bff56d07d21f314c8379f6a9255114c946e608",
+        "agent-platform-herdr.service":
+            "d02e097c200e4c28290b24029ec7cbe6a73aec2a46635df86929c1b4e266d4da",
+        "agent-platform-export.timer":
+            "e568c8d2a5fb27f9e968868952d296191e3be30962c0dba1fc415c35c994cf04",
+        "agent-platform-herdr.timer":
+            "875c7512d5504a0f10cd2b975cffc5ff8116529cc8d147d37c5fee8c83cf8e28",
+        "agent-stack-watchdog.service":
+            "0cd5b8fa59a650223fa72a35bff8df885212106ff8e1988cf18852d8f4774564",
+    },
 }
 
 
@@ -988,7 +1011,10 @@ def deployed_document(release: dict[str, object], config_digest: str, deployed_a
 def write_deployed(document: dict[str, object]) -> None:
     need(grp is not None, "linux_group_database_required")
     group = grp.getgrnam("agent-platform-read").gr_gid
-    atomic_write(PUBLIC_STATE, canonical_json(document), 0o640, 0, group)
+    # This is bounded non-secret deployment identity. The parent directory is
+    # 0750, so 0644 makes it readable by its agentops owner while preserving
+    # root ownership and a strict no-write boundary for non-root callers.
+    atomic_write(PUBLIC_STATE, canonical_json(document), 0o644, 0, group)
 
 
 def assert_hardening() -> None:
