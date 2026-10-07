@@ -195,9 +195,14 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
     middleware = types.ModuleType("hermes_cli.middleware")
     callbacks = []
     middleware.run_llm_execution_middleware = lambda request, next_call, **context: (callbacks.append("callback"), next_call(request))[1]
+    network_requests = []
     def perform(agent, **kwargs):
         from hermes_cli.middleware import run_llm_execution_middleware
-        return run_llm_execution_middleware({}, lambda request: callbacks.append("network"), provider=agent.provider)
+        def transport(request):
+            network_requests.append(dict(request))
+            callbacks.append("network")
+        return run_llm_execution_middleware(getattr(agent, "_test_model_request", {}), transport,
+                                            provider=agent.provider, api_request_id="sdk:fixture")
     turn.perform_api_call = perform
     loop.perform_api_call = perform
     agent_pkg = types.ModuleType("agent")
@@ -409,6 +414,64 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
         agent.base_url = "https://provider-a.example.invalid/v1"
         loop.perform_api_call(agent)
         assert callbacks == ["callback", "network"]
+        assert network_requests == [{}]  # Unbudgeted calls keep their original request.
+        from herdr.evidence import canonical, digest
+        from herdr.work_cycle import WorkContractError
+        effects = []
+        policy.budget_required = lambda: True
+        policy.model_request_ceiling = lambda route: {"output_token_field": "max_tokens", "max_output_tokens": 100}
+        policy.start_model_effect = lambda request: effects.append(("start", dict(request))) or {
+            "operation_id": "a"*64, "quote_sha256": "b"*64, "max_work_ms": 1000}
+        policy.returned_model_effect = lambda receipt: effects.append(("returned", dict(receipt)))
+        policy.grant.provider_routes[0].api_mode = "chat_completions"
+        agent.api_mode = "chat_completions"
+        agent.model = "quoted-text-model"
+        agent.client = types.SimpleNamespace(max_retries=0)
+        original = {"model": agent.model, "messages": [{"role": "user", "content": "bounded text"}]}
+        for cap, quoted_field in (({}, "max_tokens"), ({"max_tokens": 17}, "max_tokens"),
+                                  ({"max_completion_tokens": 18}, "max_completion_tokens")):
+            policy.model_request_ceiling = lambda route, field=quoted_field: {
+                "output_token_field": field, "max_output_tokens": 100}
+            request = {**original, **cap}
+            agent._test_model_request = request
+            loop.perform_api_call(agent)
+            sent = network_requests[-1]
+            expected = next(iter(cap.values()), 100)
+            assert next(sent[key] for key in ("max_tokens", "max_completion_tokens") if key in sent) == expected
+            assert request == {**original, **cap}  # The middleware's request was not mutated.
+            start, returned = effects[-2:]
+            assert start[0] == "start" and returned[0] == "returned"
+            assert start[1]["request_sha256"] == digest(sent)
+            assert start[1]["request_bytes"] == len(canonical(sent))
+            assert start[1]["output_tokens"] == expected
+            assert agent._disable_streaming is False
+        before = (len(effects), len(network_requests))
+        for invalid in ({"max_tokens": None}, {"max_tokens": True}, {"max_tokens": 0},
+                        {"max_tokens": 1, "max_completion_tokens": 2}, {"max_output_tokens": 1},
+                        {"stream": True}):
+            agent._test_model_request = {**original, **invalid}
+            with pytest.raises(WorkContractError):
+                loop.perform_api_call(agent)
+            assert (len(effects), len(network_requests)) == before
+        # A preexisting incompatible cap must stop before either reservation or transport.
+        from herdr.work_budget_configuration import model_request_ceiling
+        policy.model_request_ceiling = lambda route: model_request_ceiling({**route, "max_output_tokens": 100})
+        for model_name, wrong_cap in (("openai/o3-2025-04-16", {"max_tokens": 17}),
+                                      ("quoted-text-model", {"max_completion_tokens": 18})):
+            agent.model = model_name
+            request = {**original, "model": model_name, **wrong_cap}
+            agent._test_model_request = request
+            before = (len(effects), len(network_requests))
+            with pytest.raises(PolicyDenied, match="model_quote_token_field_mismatch"):
+                loop.perform_api_call(agent)
+            assert (len(effects), len(network_requests)) == before
+            assert request == {**original, "model": model_name, **wrong_cap}
+            assert agent._disable_streaming is False
+        agent.model = original["model"]
+        policy.budget_required = lambda: False
+        policy.grant.provider_routes[0].api_mode = "openai"
+        agent.api_mode = "openai"
+        del agent._test_model_request
         callbacks.clear()
         def switch(request, next_call, **context):
             callbacks.append("switch_callback")

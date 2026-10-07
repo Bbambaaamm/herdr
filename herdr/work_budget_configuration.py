@@ -8,6 +8,18 @@ from .work_planning import bounded, closed
 from .work_cycle import require, WorkPhase
 from .work_budget import BudgetAllocation, BudgetLimits, Demand, Usage, WorkBudgetAuthority, BudgetBlocked
 
+def model_request_ceiling(quote):
+    """Use the protected route's field and finite output allowance."""
+    model=quote["model"].rsplit("/",1)[-1]
+    o_series=bool(re.match(r"^o[1-9][0-9]*(?:$|[-.])",model))
+    field=quote.get("output_token_field",
+        "max_completion_tokens" if quote["provider"]=="openai" or o_series else "max_tokens")
+    require(isinstance(field,str) and field in {"max_tokens","max_completion_tokens"}
+            and (not o_series or field=="max_completion_tokens"),"unsupported quoted token field")
+    limit=quote["max_output_tokens"]
+    require(type(limit) is int and 1<=limit<=1000000,"finite quoted output ceiling required")
+    return {"output_token_field":field,"max_output_tokens":min(4096,limit)}
+
 def parse_allocation(raw):
     closed(raw, ("allocation_id","consumer","work_key","lineage_key","authorization_reference","limits",
                  "parent_allocation_id","series_plan_sha256"), "approved work allocation")
@@ -53,8 +65,9 @@ def bind_budget(factory, raw, *, storage, writable_roots=(), recovery=False):
     require(isinstance(raw["model_quotes"],list) and len(raw["model_quotes"])<=16,"bounded model quotes required")
     quotes={}
     for quote in raw["model_quotes"]:
-        closed(quote,("provider","model","api_mode","base_url","max_request_bytes","max_output_tokens",
-                     "max_tokens","max_cost_microusd","max_work_ms"),"host model quote")
+        fields={"provider","model","api_mode","base_url","max_request_bytes","max_output_tokens",
+                "max_tokens","max_cost_microusd","max_work_ms"}
+        closed(quote,fields|({"output_token_field"} if "output_token_field" in quote else set()),"host model quote")
         for key in ("provider","model","api_mode","base_url"):
             require(isinstance(quote[key],str) and 1<=len(quote[key])<=1024,"exact quoted route required")
         for key in ("max_request_bytes","max_output_tokens","max_tokens","max_work_ms"):
@@ -64,6 +77,7 @@ def bind_budget(factory, raw, *, storage, writable_roots=(), recovery=False):
         require(quote["api_mode"]=="chat_completions" and quote["max_work_ms"]<=900000
                 and quote["max_tokens"]>=quote["max_request_bytes"]+quote["max_output_tokens"],
                 "unsupported or insufficient text-route ceiling")
+        model_request_ceiling(quote)
         key=(quote["provider"],quote["model"],quote["api_mode"],quote["base_url"])
         require(key not in quotes,"duplicate model price quote")
         quotes[key]=dict(quote)
@@ -84,6 +98,13 @@ def model_effect(factory,identity,grant_sha256,action,payload):
         allocation=factory.allocations.get(digest(identity.to_json()))
         require(allocation is not None,"model work budget unavailable")
         authority=factory.budget_authority
+        if action=="ceiling":
+            require(cycle.phase is WorkPhase.WORK,"model implementation has ended")
+            closed(payload,("provider","model","api_mode","base_url"),"physical SDK quote route")
+            quote=factory.budget_quotes.get(tuple(payload[key] for key in ("provider","model","api_mode","base_url")))
+            require(quote is not None,"trusted finite price quote unavailable")
+            authority.require_active(allocation.allocation_id,identity)
+            return model_request_ceiling(quote)
         if action=="start":
             require(cycle.phase is WorkPhase.WORK,"model implementation has ended")
             closed(payload,("request_id","provider","model","api_mode","base_url","request_sha256",

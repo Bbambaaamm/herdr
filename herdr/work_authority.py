@@ -144,7 +144,7 @@ def _dispatch_work_connection(owner, connection):
                 and request.get("grant_sha256") == owner.launch.grant.hash, "work authority binding invalid")
         if request.get("op") == "work-budget":
             require(set(request)=={"op","identity","grant_sha256","action","payload"}
-                    and request["action"] in {"status","start","returned"} and isinstance(request["payload"],dict),
+                    and request["action"] in {"status","ceiling","start","returned"} and isinstance(request["payload"],dict),
                     "closed budget request required")
             callback=getattr(owner,"work_budget",None)
             if callback is None:
