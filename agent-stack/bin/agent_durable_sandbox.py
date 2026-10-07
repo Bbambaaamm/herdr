@@ -2,10 +2,12 @@
 import os
 import json
 import shlex
+import secrets
 import shutil
 import stat
 import sys
 import tempfile
+import termios
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -242,6 +244,105 @@ def shell_command(args: list[str]) -> str:
 
 def _env(pid: int) -> set[bytes]:
     return set(Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"))
+
+
+def pane_input_ready(process_info: dict, marker: str) -> bool:
+    """Require the owned host shell's terminal to accept an untruncated command."""
+    fd = None
+    try:
+        pid = int(process_info.get("shell_pid") or 0)
+        if pid <= 0:
+            return False
+        expected = f"HERDR_DURABLE_TASK_PANE={marker}".encode()
+        if expected not in _env(pid):
+            return False
+        if os.readlink(f"/proc/{pid}/ns/pid") != os.readlink("/proc/self/ns/pid"):
+            return False
+        source = f"/proc/{pid}/fd/0"
+        fd = os.open(source, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK | os.O_CLOEXEC)
+        held = os.fstat(fd)
+        if not stat.S_ISCHR(held.st_mode) or not os.isatty(fd):
+            return False
+        attributes = termios.tcgetattr(fd)
+        named = os.stat(source)
+        def terminal_owner():
+            # Linux proc_pid_stat(5): pgrp, tty_nr, tpgid, starttime.
+            data = Path(f"/proc/{pid}/stat").read_text()
+            fields = data[data.rfind(")") + 2:].split()
+            group, tty, foreground, start = map(int, (fields[2], fields[4], fields[5], fields[19]))
+            tty &= 0xffffffff
+            device = os.makedev((tty >> 8) & 0xff, (tty & 0xff) | ((tty >> 12) & 0xfff00))
+            return group, foreground, device, start
+        before = terminal_owner()
+        shell_group, foreground_group, controlling_device, start_ticks = before
+        return (not attributes[3] & termios.ICANON
+                and foreground_group == shell_group
+                and shell_group > 0 and start_ticks > 0
+                and held.st_rdev == controlling_device
+                and terminal_owner() == before
+                and (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino)
+                and expected in _env(pid))
+    except (OSError, ValueError, TypeError, IndexError, termios.error):
+        return False
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _pane_shell_instance(process_info: dict, marker: str) -> tuple[int, int] | None:
+    if not pane_input_ready(process_info, marker):
+        return None
+    try:
+        pid = int(process_info["shell_pid"])
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return pid, int(fields[19])
+    except (OSError, ValueError, KeyError, IndexError):
+        return None
+
+
+def verify_pane_prompt(invoke, pane_id: str, marker: str, *, timeout_seconds=10.0) -> None:
+    """Prove the owned shell executed a short challenge before sending its launch.
+
+    A startup builtin read shares the shell PID and terminal flags. An encoded,
+    fresh nonce cannot match the echoed input; only command execution produces
+    the expected complete output line. Never resend a consumed challenge.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    def remaining():
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise RuntimeError("durable_pane_prompt_unverified")
+        return value
+    def process_info():
+        reply = invoke(["pane", "process-info", "--pane", pane_id],
+                       timeout_seconds=min(10.0, remaining()))
+        info = (reply.get("result") or {}).get("process_info")
+        return info if isinstance(info, dict) else {}
+    instance = _pane_shell_instance(process_info(), marker)
+    if instance is None:
+        raise RuntimeError("durable_pane_prompt_unverified")
+    nonce = "HERDR_PROMPT_" + secrets.token_hex(24)
+    encoded = "".join(f"\\x{byte:02x}" for byte in nonce.encode("ascii"))
+    challenge = "builtin printf '%b\\n' '" + encoded + "'"
+    assert nonce not in challenge and len(challenge.encode()) < 4096
+    invoke(["pane", "run", pane_id, challenge], timeout_seconds=min(10.0, remaining()))
+    reply = invoke(["pane", "wait-output", pane_id, "--regex", "^" + nonce + "$",
+                    "--source", "recent-unwrapped", "--lines", "20",
+                    "--timeout", str(max(1, int(remaining() * 1000)))],
+                   timeout_seconds=min(10.0, remaining()))
+    result = reply.get("result") if isinstance(reply, dict) else None
+    read = result.get("read") if isinstance(result, dict) else None
+    if (not isinstance(result, dict) or result.get("type") != "output_matched"
+            or result.get("pane_id") != pane_id or result.get("matched_line") != nonce
+            or not isinstance(read, dict) or read.get("pane_id") != pane_id
+            or not isinstance(read.get("text"), str) or nonce not in read["text"].splitlines()
+            or type(result.get("revision")) is not int or result["revision"] < 0):
+        raise RuntimeError("durable_pane_prompt_unverified")
+    while True:
+        if _pane_shell_instance(process_info(), marker) == instance:
+            remaining()
+            return
+        time.sleep(min(0.05, remaining()))
 
 
 def inner_pid(process_info: dict, marker: str) -> int | None:

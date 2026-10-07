@@ -910,20 +910,53 @@ class HerdrChildRuntime:
                 admission_root=(self.scheduler.ownership_registry.root
                                 if getattr(self.scheduler, "ownership_registry", None) is not None else None),
             )
-            _json_result(self.runner.run(["pane", "run", pane_id,
-                                          sandbox.shell_command(sandbox_args)]), "child sandbox start")
-            info = _json_result(self.runner.run(["pane", "process-info", "--pane", pane_id]),
-                                "child sandbox process-info")
-            process_info = (info.get("result") or {}).get("process_info")
-            sandbox_pid = sandbox.inner_pid(
-                dict(process_info) if isinstance(process_info, Mapping) else {}, marker
-            )
-            if not sandbox_pid or not sandbox.verify(
-                    sandbox_pid, Path(real), marker, policy=policy,
-                    pinned_worktree=self.pinned_worktree,
-                    child_workspace_writable=self._child_workspace_writable(task_id),
-                    policy_mount=launch.mount,owned_write_pins=self._owned_write_pins.get(task_id)):
-                raise HerdrRuntimeError("child_sandbox_unverified", pane_id)
+            deadline = time.monotonic() + 10.0
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise HerdrRuntimeError("child_pane_input_unready", pane_id)
+                info = _json_result(self.runner.run(
+                    ["pane", "process-info", "--pane", pane_id],
+                    timeout_seconds=min(10.0, remaining)), "child shell process-info")
+                process_info = (info.get("result") or {}).get("process_info")
+                if sandbox.pane_input_ready(
+                        dict(process_info) if isinstance(process_info, Mapping) else {}, marker):
+                    if time.monotonic() <= deadline:
+                        break
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+            def invoke(args, *, timeout_seconds):
+                result = self.runner.run(args, timeout_seconds=timeout_seconds)
+                if args[:2] == ["pane", "run"]:
+                    if not (result.returncode == 0 and result.stdout == result.stderr == ""):
+                        raise HerdrRuntimeError("child_sandbox_start_unverified", pane_id)
+                    return None
+                return _json_result(result, "child native readiness")
+            try:
+                sandbox.verify_pane_prompt(invoke, pane_id, marker,
+                                          timeout_seconds=max(0.001, deadline - time.monotonic()))
+            except RuntimeError as exc:
+                raise HerdrRuntimeError("child_pane_prompt_unverified", pane_id) from exc
+            invoke(["pane", "run", pane_id, sandbox.shell_command(sandbox_args)],
+                   timeout_seconds=15.0)
+            deadline = time.monotonic() + 10.0
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise HerdrRuntimeError("child_sandbox_unverified", pane_id)
+                info = _json_result(self.runner.run(
+                    ["pane", "process-info", "--pane", pane_id],
+                    timeout_seconds=min(10.0, remaining)), "child sandbox process-info")
+                process_info = (info.get("result") or {}).get("process_info")
+                sandbox_pid = sandbox.inner_pid(
+                    dict(process_info) if isinstance(process_info, Mapping) else {}, marker)
+                if sandbox_pid and sandbox.verify(
+                        sandbox_pid, Path(real), marker, policy=policy, attempts=1,
+                        pinned_worktree=self.pinned_worktree,
+                        child_workspace_writable=self._child_workspace_writable(task_id),
+                        policy_mount=launch.mount, owned_write_pins=self._owned_write_pins.get(task_id)):
+                    if time.monotonic() <= deadline:
+                        break
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
             record = self.scheduler._tasks[task_id]
             node = self.scheduler.task_node(task_id)
             attestation = {"authority": "herdr-runtime", "task_id": task_id,
