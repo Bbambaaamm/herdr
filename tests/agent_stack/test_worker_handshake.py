@@ -1999,7 +1999,11 @@ def test_task_pane_input_waits_without_sending_launch(monkeypatch):
     monkeypatch.setattr(worker, "_herdr_json", lambda args, **kwargs:
         calls.append(args) or {"result": {"process_info": {"shell_pid": 733}}})
     monkeypatch.setattr(worker, "pane_input_ready", lambda info, marker: next(ready))
+    prompt_checks = []
+    monkeypatch.setattr(worker, "verify_pane_prompt", lambda invoke, pane, marker, **kw:
+                        prompt_checks.append((pane, marker)))
     worker._wait_for_task_pane_input("owned-pane", "owned-marker")
+    assert prompt_checks == [("owned-pane", "owned-marker")]
     assert calls == [["pane", "process-info", "--pane", "owned-pane"]] * 2
 
 
@@ -2016,3 +2020,38 @@ def test_task_pane_input_deadline_stops_without_sending_launch(monkeypatch):
     assert clock[0] == pytest.approx(0.1)
     assert len(calls) <= 3
     assert all(args == ["pane", "process-info", "--pane", "owned-pane"] for args in calls)
+
+
+@pytest.mark.parametrize("case", ["executed", "echo-only", "foreign-pane", "missing-line", "shell-replaced", "startup-reader"])
+def test_prompt_proof_requires_executed_nonce_and_same_owned_shell(monkeypatch, case):
+    import agent_durable_sandbox as sandbox
+    clock = [0.0]
+    monkeypatch.setattr(sandbox.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(sandbox.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr(sandbox, "_pane_shell_instance",
+                        lambda info, marker: (733, info["start"]))
+    calls = []
+    challenge = []
+    def invoke(args, **kwargs):
+        calls.append(args)
+        if args[:2] == ["pane", "process-info"]:
+            return {"result": {"process_info": {"start": 2 if case == "shell-replaced" and challenge else 1}}}
+        if args[:2] == ["pane", "run"]:
+            challenge.append(args[3])
+            return None
+        assert args[:2] == ["pane", "wait-output"]
+        nonce = args[args.index("--regex") + 1][1:-1]
+        assert nonce not in challenge[0] and len(challenge[0].encode()) < 4096
+        if case == "startup-reader":
+            raise RuntimeError("output_wait_timeout")
+        text = challenge[0] if case == "echo-only" else nonce
+        return {"result": {"type": "output_matched", "pane_id": "foreign" if case == "foreign-pane" else "owned",
+                "revision": 3, "matched_line": None if case == "missing-line" else nonce,
+                "read": {"pane_id": "owned", "text": text}}}
+    if case == "executed":
+        sandbox.verify_pane_prompt(invoke, "owned", "marker", timeout_seconds=0.1)
+    else:
+        with pytest.raises(RuntimeError):
+            sandbox.verify_pane_prompt(invoke, "owned", "marker", timeout_seconds=0.1)
+    assert len(challenge) == 1
+    assert all(args[3].startswith("builtin printf ") for args in calls if args[:2] == ["pane", "run"])

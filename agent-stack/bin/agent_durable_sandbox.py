@@ -2,6 +2,7 @@
 import os
 import json
 import shlex
+import secrets
 import shutil
 import stat
 import sys
@@ -286,6 +287,62 @@ def pane_input_ready(process_info: dict, marker: str) -> bool:
     finally:
         if fd is not None:
             os.close(fd)
+
+
+def _pane_shell_instance(process_info: dict, marker: str) -> tuple[int, int] | None:
+    if not pane_input_ready(process_info, marker):
+        return None
+    try:
+        pid = int(process_info["shell_pid"])
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return pid, int(fields[19])
+    except (OSError, ValueError, KeyError, IndexError):
+        return None
+
+
+def verify_pane_prompt(invoke, pane_id: str, marker: str, *, timeout_seconds=10.0) -> None:
+    """Prove the owned shell executed a short challenge before sending its launch.
+
+    A startup builtin read shares the shell PID and terminal flags. An encoded,
+    fresh nonce cannot match the echoed input; only command execution produces
+    the expected complete output line. Never resend a consumed challenge.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    def remaining():
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise RuntimeError("durable_pane_prompt_unverified")
+        return value
+    def process_info():
+        reply = invoke(["pane", "process-info", "--pane", pane_id],
+                       timeout_seconds=min(10.0, remaining()))
+        info = (reply.get("result") or {}).get("process_info")
+        return info if isinstance(info, dict) else {}
+    instance = _pane_shell_instance(process_info(), marker)
+    if instance is None:
+        raise RuntimeError("durable_pane_prompt_unverified")
+    nonce = "HERDR_PROMPT_" + secrets.token_hex(24)
+    encoded = "".join(f"\\x{byte:02x}" for byte in nonce.encode("ascii"))
+    challenge = "builtin printf '%b\\n' '" + encoded + "'"
+    assert nonce not in challenge and len(challenge.encode()) < 4096
+    invoke(["pane", "run", pane_id, challenge], timeout_seconds=min(10.0, remaining()))
+    reply = invoke(["pane", "wait-output", pane_id, "--regex", "^" + nonce + "$",
+                    "--source", "recent-unwrapped", "--lines", "20",
+                    "--timeout", str(max(1, int(remaining() * 1000)))],
+                   timeout_seconds=min(10.0, remaining()))
+    result = reply.get("result") if isinstance(reply, dict) else None
+    read = result.get("read") if isinstance(result, dict) else None
+    if (not isinstance(result, dict) or result.get("type") != "output_matched"
+            or result.get("pane_id") != pane_id or result.get("matched_line") != nonce
+            or not isinstance(read, dict) or read.get("pane_id") != pane_id
+            or not isinstance(read.get("text"), str) or nonce not in read["text"].splitlines()
+            or type(result.get("revision")) is not int or result["revision"] < 0):
+        raise RuntimeError("durable_pane_prompt_unverified")
+    while True:
+        if _pane_shell_instance(process_info(), marker) == instance:
+            remaining()
+            return
+        time.sleep(min(0.05, remaining()))
 
 
 def inner_pid(process_info: dict, marker: str) -> int | None:

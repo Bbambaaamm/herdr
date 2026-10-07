@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from agent_model_policy import decide as decide_model_route, record as record_model_route
 from agent_completion_evidence import EvidenceError, record_verification_failure, verification_applies, freeze_plan, verify_completion, completion_instructions
 from agent_durable_sandbox import (command as sandbox_command, frozen_policy, inner_pid,
-                                   shell_command, pane_input_ready, verify as verify_sandbox)
+                                   shell_command, pane_input_ready, verify_pane_prompt, verify as verify_sandbox)
 from agent_durable_children import parent_attempt_guard
 
 HOME = Path("/home/agentops")
@@ -644,7 +644,7 @@ def _cleanup_prepared_root_launch(task):
 
 
 def _wait_for_task_pane_input(pane_id, pane_marker, *, timeout_seconds=10.0):
-    """Do not send the launch until the newly created shell leaves canonical input."""
+    """Require terminal readiness and actual owned shell command execution."""
     deadline = time.monotonic() + timeout_seconds
     while True:
         remaining = deadline - time.monotonic()
@@ -655,6 +655,8 @@ def _wait_for_task_pane_input(pane_id, pane_marker, *, timeout_seconds=10.0):
         process_info = (info.get("result") or {}).get("process_info")
         if isinstance(process_info, dict) and pane_input_ready(process_info, pane_marker):
             if time.monotonic() <= deadline:
+                verify_pane_prompt(_herdr_json, pane_id, pane_marker,
+                                   timeout_seconds=max(0.001, deadline - time.monotonic()))
                 return
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 

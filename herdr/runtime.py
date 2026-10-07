@@ -924,12 +924,20 @@ class HerdrChildRuntime:
                     if time.monotonic() <= deadline:
                         break
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
-            acknowledgement = self.runner.run(
-                ["pane", "run", pane_id, sandbox.shell_command(sandbox_args)],
-                timeout_seconds=15.0)
-            if not (acknowledgement.returncode == 0
-                    and acknowledgement.stdout == acknowledgement.stderr == ""):
-                _json_result(acknowledgement, "child sandbox start")
+            def invoke(args, *, timeout_seconds):
+                result = self.runner.run(args, timeout_seconds=timeout_seconds)
+                if args[:2] == ["pane", "run"]:
+                    if not (result.returncode == 0 and result.stdout == result.stderr == ""):
+                        raise HerdrRuntimeError("child_sandbox_start_unverified", pane_id)
+                    return None
+                return _json_result(result, "child native readiness")
+            try:
+                sandbox.verify_pane_prompt(invoke, pane_id, marker,
+                                          timeout_seconds=max(0.001, deadline - time.monotonic()))
+            except RuntimeError as exc:
+                raise HerdrRuntimeError("child_pane_prompt_unverified", pane_id) from exc
+            invoke(["pane", "run", pane_id, sandbox.shell_command(sandbox_args)],
+                   timeout_seconds=15.0)
             deadline = time.monotonic() + 10.0
             while True:
                 remaining = deadline - time.monotonic()
