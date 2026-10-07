@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import shlex
 import signal
 import socket
 import stat
@@ -661,6 +662,58 @@ def _wait_for_task_pane_input(pane_id, pane_marker, *, timeout_seconds=10.0):
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 
+def _typed_native_error_code(exc: RuntimeError) -> str | None:
+    try:
+        payload = json.loads(str(exc))
+    except (TypeError, ValueError):
+        return None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    return str(error.get("code") or "") if isinstance(error, dict) else None
+
+
+def _wait_for_manual_task_agent(pane_id: str, agent_name: str, argv: list[str],
+                                *, timeout_seconds: float = 60.0) -> dict:
+    """Launch Hermes inside the verified sandbox and bind Herdr to it."""
+    command = shlex.join(["hermes", *argv])
+    _herdr_json(["pane", "run", pane_id, command], timeout_seconds=15.0)
+    deadline = time.monotonic() + timeout_seconds
+    renamed = False
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("task_session_agent_start_unready")
+        target = agent_name if renamed else pane_id
+        try:
+            payload = _herdr_json(["agent", "get", target],
+                                  timeout_seconds=min(10.0, remaining))
+        except RuntimeError as exc:
+            if not renamed and _typed_native_error_code(exc) == "agent_not_found":
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                continue
+            raise
+        agent = (payload.get("result") or {}).get("agent") if isinstance(payload, dict) else None
+        if not isinstance(agent, dict):
+            raise RuntimeError("task_session_agent_start_invalid")
+        if str(agent.get("pane_id") or "") != pane_id:
+            raise RuntimeError("task_session_agent_wrong_pane")
+        kind = str(agent.get("agent") or agent.get("kind") or "")
+        if kind != "hermes":
+            raise RuntimeError("task_session_agent_wrong_kind")
+        if not renamed:
+            _herdr_json(["agent", "rename", pane_id, agent_name],
+                        timeout_seconds=min(10.0, remaining))
+            renamed = True
+            continue
+        if str(agent.get("name") or "") != agent_name:
+            raise RuntimeError("task_session_agent_start_invalid")
+        status = str(agent.get("agent_status") or agent.get("status") or "").lower()
+        if status in {"idle", "done"}:
+            return agent
+        if status == "blocked":
+            raise RuntimeError("task_session_agent_start_blocked")
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+
 def _wait_for_task_sandbox(pane_id, pane_marker, *, policy, policy_mount, timeout_seconds=10.0):
     """Wait for native pane.run to become a fully verified physical sandbox."""
     deadline = time.monotonic() + timeout_seconds
@@ -860,27 +913,18 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         agent_start_attempted = True
         session["agent_start_attempted"] = True
         persist_execution_session(task)
-        started = _herdr_json(
+        started_agent = _wait_for_manual_task_agent(
+            pane_id,
+            agent_name,
             [
-                "agent", "start", agent_name,
-                "--kind", "hermes", "--pane", pane_id, "--timeout", "60000",
-                "--", "-p", profile, "chat",
+                "-p", profile, "chat",
                 "--continue", session_name, "--create-if-missing",
                 "--in", workspace,
                 "--toolsets", __import__("herdr.runtime", fromlist=["_child_toolsets"])._child_toolsets(
                     tuple(task.get("parent_tools") or ()), allow_delegation=True),
             ],
-            timeout_seconds=75.0,
+            timeout_seconds=60.0,
         )
-        started_agent = (started.get("result") or {}).get("agent")
-        if (
-            not isinstance(started_agent, dict)
-            or str(started_agent.get("name") or "") != agent_name
-        ):
-            raise RuntimeError("task_session_agent_start_invalid")
-        started_pane = str(started_agent.get("pane_id") or "")
-        if started_pane and started_pane != pane_id:
-            raise RuntimeError("task_session_agent_wrong_pane")
         session["invocation_policy"] = launch.confirm_bootstrap()
         session["agent_started"] = True
         persist_execution_session(task)
