@@ -707,7 +707,7 @@ def _wait_for_manual_task_agent(pane_id: str, agent_name: str, argv: list[str],
         if str(agent.get("name") or "") != agent_name:
             raise RuntimeError("task_session_agent_start_invalid")
         status = str(agent.get("agent_status") or agent.get("status") or "").lower()
-        if status in {"idle", "done"}:
+        if status in {"idle", "done"} and agent.get("interactive_ready") is True:
             return agent
         if status == "blocked":
             raise RuntimeError("task_session_agent_start_blocked")

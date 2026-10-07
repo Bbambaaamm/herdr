@@ -64,6 +64,7 @@ class FakeHerdrRunner:
                 self.manual_agents[call[2]] = {
                     "agent": "hermes", "name": "detected-hermes",
                     "pane_id": call[2], "agent_status": "idle",
+                    "interactive_ready": True,
                 }
             return CommandResult(0, "", "")
         if call[:2] == ("agent", "get"):
@@ -503,6 +504,47 @@ def test_managed_agent_start_uses_explicit_admitted_toolset(tmp_path, tools, exp
         "connections", "computer_use", "cron", "mcp", "plugins"))
     assert ("agent", "rename", "child-pane", lease.agent_id) in runner.calls
     assert not any(call[:2] == ("agent", "start") for call in runner.calls)
+
+
+def test_managed_agent_start_waits_for_interactive_ready(tmp_path, monkeypatch):
+    scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
+    tools = ("read_file", "search_files")
+    scheduler.register_external_parent_attempt(
+        task_id="parent", run_token="parent-run", idempotency_key="parent-key",
+        agent_name="parent-agent", pane_id="parent-pane", marker="parent-marker",
+        repo="repo", issue="82", role="writer", tools=tools,
+        permissions=("workspace-write",), policy_profile="default")
+    child = scheduler.delegate_child("parent", "parent-run", "scope",
+        ChildProposal("writer", tools, "reader", tools, child_task="inspect"))
+    lease = scheduler.dispatch(task_ids={child.id})[0]
+
+    class DelayedReadyRunner(FakeHerdrRunner):
+        def __init__(self):
+            super().__init__()
+            self.named_reads = 0
+
+        def run(self, args, timeout_seconds=30.0):
+            result = super().run(args, timeout_seconds=timeout_seconds)
+            if tuple(args[:2]) == ("agent", "get") and result.returncode == 0:
+                payload = json.loads(result.stdout)
+                agent = payload["result"]["agent"]
+                if agent.get("name") == lease.agent_id:
+                    self.named_reads += 1
+                    agent["interactive_ready"] = self.named_reads >= 2
+                    return CommandResult(0, json.dumps(payload), "")
+            return result
+
+    runner = DelayedReadyRunner()
+    runtime = HerdrChildRuntime(
+        scheduler, runner, cwd=tmp_path,
+        env={"HERDR_ENV": "1", "HERDR_PANE_ID": "parent-pane"})
+    runtime._skill_checked = True
+    monkeypatch.setattr(runtime_mod.time, "sleep", lambda _: None)
+
+    runtime._start_agent(lease, "child-pane")
+
+    assert runner.named_reads == 2
+    assert not any(call[:2] == ("agent", "prompt") for call in runner.calls)
 
 
 def _write_profile_auth(profile_dir, expires_at):

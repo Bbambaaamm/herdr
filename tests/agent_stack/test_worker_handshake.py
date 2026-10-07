@@ -446,18 +446,21 @@ def test_create_task_session_uses_fresh_owned_pane_and_named_chat(tmp_path, monk
             if target == "owned-task-pane":
                 return {"result": {"agent": {
                     "agent": "hermes", "name": "detected-hermes",
-                    "pane_id": "owned-task-pane", "agent_status": "idle"}}}
+                    "pane_id": "owned-task-pane", "agent_status": "idle",
+                    "interactive_ready": True}}}
             if target == renamed.get("name"):
                 return {"result": {"agent": {
                     "agent": "hermes", "name": target,
-                    "pane_id": "owned-task-pane", "agent_status": "idle"}}}
+                    "pane_id": "owned-task-pane", "agent_status": "idle",
+                    "interactive_ready": True}}}
             raise AssertionError(args)
         if args[:2] == ["agent", "rename"]:
             assert args[2] == "owned-task-pane"
             renamed["name"] = args[3]
             return {"result": {"agent": {
                 "agent": "hermes", "name": args[3],
-                "pane_id": "owned-task-pane", "agent_status": "idle"}}}
+                "pane_id": "owned-task-pane", "agent_status": "idle",
+                "interactive_ready": True}}}
         if args[:2] == ["pane", "split"]:
             return {"result": {"pane": {"pane_id": "owned-task-pane"}}}
         if args[:2] == ["pane", "run"]:
@@ -502,6 +505,42 @@ def test_create_task_session_uses_fresh_owned_pane_and_named_chat(tmp_path, monk
     assert argv[argv.index("--in") + 1] == task["workspace"]
     assert ["agent", "rename", "owned-task-pane", session["agent_name"]] in calls
     assert not any(call[:2] == ["agent", "start"] for call in calls)
+
+
+def test_manual_task_agent_waits_for_interactive_ready(monkeypatch):
+    calls = []
+    ready = iter([False, True])
+
+    def native(args, *, timeout_seconds=30.0):
+        calls.append(list(args))
+        if args[:2] == ["pane", "run"]:
+            assert args[2] == "owned-pane"
+            assert args[3].startswith("HERDR_AGENT=hermes hermes ")
+            return {"result": {}}
+        if args[:2] == ["agent", "get"]:
+            target = args[2]
+            if target == "owned-pane":
+                return {"result": {"agent": {
+                    "agent": "hermes", "name": "detected",
+                    "pane_id": "owned-pane", "agent_status": "idle",
+                    "interactive_ready": False}}}
+            if target == "durable-agent":
+                return {"result": {"agent": {
+                    "agent": "hermes", "name": "durable-agent",
+                    "pane_id": "owned-pane", "agent_status": "idle",
+                    "interactive_ready": next(ready)}}}
+        if args[:2] == ["agent", "rename"]:
+            assert args == ["agent", "rename", "owned-pane", "durable-agent"]
+            return {"result": {}}
+        raise AssertionError(args)
+
+    monkeypatch.setattr(worker, "_herdr_json", native)
+    monkeypatch.setattr(worker.time, "sleep", lambda _: None)
+    agent = worker._wait_for_manual_task_agent(
+        "owned-pane", "durable-agent", ["-p", "quantlab", "chat"], timeout_seconds=1.0)
+
+    assert agent["interactive_ready"] is True
+    assert sum(call == ["agent", "get", "durable-agent"] for call in calls) == 2
 
 
 def test_run_prompt_targets_task_session_never_persistent_coordinator(tmp_path, monkeypatch):

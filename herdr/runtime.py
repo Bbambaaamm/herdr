@@ -758,7 +758,7 @@ class HerdrChildRuntime:
             if agent.get("name") != lease.agent_id:
                 raise HerdrRuntimeError("child_agent_start_mismatch", lease.agent_id)
             status = str(agent.get("agent_status") or agent.get("status") or "").lower()
-            if status in {"idle", "done"}:
+            if status in {"idle", "done"} and agent.get("interactive_ready") is True:
                 return
             if status == "blocked":
                 raise HerdrRuntimeError("child_agent_start_blocked", pane_id)
