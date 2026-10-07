@@ -1871,3 +1871,64 @@ def test_native_pane_run_rejects_failure_and_unexpected_output(monkeypatch, code
         lambda args, **kwargs: worker.subprocess.CompletedProcess(args, code, stdout=stdout, stderr=stderr))
     with pytest.raises(RuntimeError):
         worker._herdr_json(["pane", "run", "owned", "true"])
+
+
+def test_task_sandbox_waits_for_native_process_and_full_mount_verification(tmp_path, monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(worker.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    candidates = iter([None, 733, 733])
+    checks = iter([False, True])
+    calls, verified = [], []
+    policy = _policy_file(tmp_path)
+    mount = object()
+
+    def process_info(args, *, timeout_seconds):
+        calls.append((args, timeout_seconds))
+        return {"result": {"process_info": {"shell_pid": 700}}}
+
+    def verify(pid, binary, marker, **kwargs):
+        verified.append((pid, binary, marker, kwargs))
+        return next(checks)
+
+    monkeypatch.setattr(worker, "_herdr_json", process_info)
+    monkeypatch.setattr(worker, "inner_pid", lambda info, marker: next(candidates))
+    monkeypatch.setattr(worker, "verify_sandbox", verify)
+    assert worker._wait_for_task_sandbox("owned-pane", "owned-marker",
+        policy=policy, policy_mount=mount) == 733
+    assert len(calls) == 3
+    assert all(args == ["pane", "process-info", "--pane", "owned-pane"]
+               and 0 < timeout <= 10 for args, timeout in calls)
+    assert verified == [(733, worker.HERDR, "owned-marker",
+        {"policy": policy, "policy_mount": mount, "attempts": 1})] * 2
+
+
+def test_task_sandbox_wait_deadline_never_accepts_unverified_candidate(tmp_path, monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(worker.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    calls = []
+    monkeypatch.setattr(worker, "_herdr_json", lambda args, **kwargs:
+        calls.append(args) or {"result": {"process_info": {"shell_pid": 700}}})
+    monkeypatch.setattr(worker, "inner_pid", lambda info, marker: 733)
+    monkeypatch.setattr(worker, "verify_sandbox", lambda *args, **kwargs: False)
+    with pytest.raises(RuntimeError, match="^durable_sandbox_unverified$"):
+        worker._wait_for_task_sandbox("owned-pane", "owned-marker",
+            policy=_policy_file(tmp_path), policy_mount=object(), timeout_seconds=0.2)
+    assert clock[0] == pytest.approx(0.2)
+    assert 1 <= len(calls) <= 5
+    assert all(args == ["pane", "process-info", "--pane", "owned-pane"] for args in calls)
+
+
+def test_task_sandbox_wait_propagates_native_error_without_resubmitting(monkeypatch, tmp_path):
+    calls = []
+    def missing(args, **kwargs):
+        calls.append(args)
+        raise RuntimeError("pane_not_found")
+    monkeypatch.setattr(worker, "_herdr_json", missing)
+    monkeypatch.setattr(worker, "verify_sandbox", lambda *args, **kwargs:
+        pytest.fail("native error must prevent sandbox acceptance"))
+    with pytest.raises(RuntimeError, match="^pane_not_found$"):
+        worker._wait_for_task_sandbox("owned-pane", "owned-marker",
+            policy=_policy_file(tmp_path), policy_mount=object())
+    assert calls == [["pane", "process-info", "--pane", "owned-pane"]]
