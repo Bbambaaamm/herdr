@@ -117,6 +117,12 @@ def _ephemeral_sdk_runtime_dirs(home: Path) -> tuple[Path, ...]:
     # workspace. Every runtime alias must fail closed, even if dangling.
     if any(p.is_symlink() for p in candidates):
         raise RuntimeError("durable_sdk_runtime_alias_unverified")
+    # A named profile that lacks these directories cannot initialize Hermes
+    # with an otherwise read-only host root. Fail before consuming any model
+    # budget; do not silently launch with unmasked runtime state.
+    if any(not (p / name).is_dir() for p in roots[1:]
+           for name in ("sessions", "cache", "logs")):
+        raise RuntimeError("durable_sdk_profile_runtime_missing")
     return tuple(p for p in candidates if p.is_dir())
 
 
@@ -260,11 +266,19 @@ def command(
     return args
 
 
+MAX_PANE_SHELL_COMMAND_BYTES = 32768
+
+
 def shell_command(args: list[str]) -> str:
     from herdr.launch_environment import STARTUP_CONTROLS
     controls=sorted(set(STARTUP_CONTROLS)|{key for key in os.environ
                     if key.startswith("LD_") and key.replace("_","").isalnum()})
-    return "unset " + " ".join(map(shlex.quote,controls)) + "; exec " + shlex.join(args)
+    rendered = "unset " + " ".join(map(shlex.quote,controls)) + "; exec " + shlex.join(args)
+    # Herdr pane.run carries this as ONE argv element. Reject a huge profile
+    # inventory instead of hitting Linux MAX_ARG_STRLEN / E2BIG ambiguously.
+    if len(rendered.encode("utf-8")) > MAX_PANE_SHELL_COMMAND_BYTES:
+        raise RuntimeError("durable_sandbox_shell_command_too_large")
+    return rendered
 
 
 def _env(pid: int) -> set[bytes]:

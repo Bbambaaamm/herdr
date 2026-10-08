@@ -244,3 +244,26 @@ def test_runtime_masks_reject_profile_root_alias(tmp_path):
     (root / "profiles").symlink_to(outside, target_is_directory=True)
     with pytest.raises(RuntimeError, match="profile_alias_unverified"):
         module._ephemeral_sdk_runtime_dirs(tmp_path)
+
+
+
+@pytest.mark.parametrize("missing", ["sessions", "cache", "logs"])
+def test_named_profile_runtime_requires_preprovisioned_mountpoint(tmp_path, missing):
+    module = sandbox_module()
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "quantlab"
+    profile.mkdir(parents=True)
+    for name in ("sessions", "cache", "logs"):
+        if name != missing:
+            (profile / name).mkdir()
+    with pytest.raises(RuntimeError, match="profile_runtime_missing"):
+        module._ephemeral_sdk_runtime_dirs(tmp_path)
+
+
+def test_shell_command_has_fixed_byte_limit_before_pane_delivery():
+    module = sandbox_module()
+    minimal = module.shell_command(["/usr/bin/bwrap", "--", "/bin/true"])
+    assert "exec /usr/bin/bwrap" in minimal
+    oversized = ["/usr/bin/bwrap", "--setenv", "MANY_PROFILES", "x" * 40000]
+    with pytest.raises(RuntimeError, match="shell_command_too_large"):
+        module.shell_command(oversized)
