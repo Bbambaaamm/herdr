@@ -105,6 +105,20 @@ def test_same_process_guard_precedes_hermes_main(monkeypatch, tmp_path, profile_
     (hermes / 'hermes_state.py').write_text('')
     fake_state.__file__ = str(hermes / 'hermes_state.py')
     fake_state.DEFAULT_DB_PATH = hermes / 'state.db'
+    fake_cli = types.ModuleType("cli")
+    (hermes / "cli.py").write_text("")
+    fake_cli.__file__ = str(hermes / "cli.py")
+    approved_home = hermes / "approved-profile"
+    fake_cli._hermes_home = approved_home
+    config = {"model": "approved-model", "agent": {"prefill_messages_file": "prompts/approved.json"}}
+    fake_cli.CLI_CONFIG = config
+    fake_cli._resolve_prefill_messages_file = lambda cfg: (
+        os.getenv("HERMES_PREFILL_MESSAGES_FILE", "")
+        or cfg.get("prefill_messages_file", "")
+        or cfg.get("agent", {}).get("prefill_messages_file", "")
+    )
+    fake_cli.get_hermes_home = lambda: approved_home
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
     private_state = Path('/tmp') / ('herdr-sdk-state-test-' + uuid.uuid4().hex)
     monkeypatch.setattr(module, '_EPHEMERAL_SDK_STATE_ROOT', private_state)
     monkeypatch.setattr(module, '_require_private_sdk_tmp', lambda: 123)
@@ -113,6 +127,17 @@ def test_same_process_guard_precedes_hermes_main(monkeypatch, tmp_path, profile_
     def main():
         assert events == ['verified', 'installed']
         assert fake_state.DEFAULT_DB_PATH == private_state / 'state.db'
+        assert fake_cli._hermes_home == private_state
+        assert fake_cli.get_hermes_home() == approved_home
+        assert fake_cli.CLI_CONFIG is config
+        # Prefill is loaded after CLI initialization: relative paths must still
+        # resolve against the approved profile, never the writable SDK home.
+        assert fake_cli._resolve_prefill_messages_file(config) == str(
+            approved_home / "prompts/approved.json"
+        )
+        assert fake_cli._resolve_prefill_messages_file(
+            {"prefill_messages_file": "/approved/external.json"}
+        ) == "/approved/external.json"
         assert private_state.stat().st_mode & 0o777 == 0o700
         assert Path('/proc/self/comm').read_text().strip() == 'hermes'
         assert os.environ["HERMES_SAFE_MODE"] == "1"
@@ -656,6 +681,12 @@ def test_sdk_state_rejects_existing_directory(monkeypatch, tmp_path):
     fake_state.__file__ = str(tmp_path / "hermes_state.py")
     (tmp_path / "hermes_state.py").write_text("")
     fake_state.DEFAULT_DB_PATH = tmp_path / "host-state.db"
+    fake_cli = types.ModuleType("cli")
+    (tmp_path / "cli.py").write_text("")
+    fake_cli.__file__ = str(tmp_path / "cli.py")
+    fake_cli._hermes_home = tmp_path / "host-home"
+    fake_cli._resolve_prefill_messages_file = lambda cfg: cfg.get("prefill_messages_file", "")
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
     directory = Path("/tmp") / ("herdr-sdk-state-existing-" + uuid.uuid4().hex)
     directory.mkdir(mode=0o700)
     monkeypatch.setattr(module, "_EPHEMERAL_SDK_STATE_ROOT", directory)
@@ -666,5 +697,32 @@ def test_sdk_state_rejects_existing_directory(monkeypatch, tmp_path):
         with pytest.raises(SystemExit, match="fresh private SDK state unavailable"):
             module._configure_ephemeral_sdk_state(tmp_path)
         assert fake_state.DEFAULT_DB_PATH == tmp_path / "host-state.db"
+        assert fake_cli._hermes_home == tmp_path / "host-home"
     finally:
         directory.rmdir()
+
+
+@pytest.mark.parametrize("untrusted", ["hermes_state", "cli"])
+def test_sdk_state_rejects_untrusted_modules_before_redirect(monkeypatch, tmp_path, untrusted):
+    module = _launcher()
+    monkeypatch.setattr(module, "_require_private_sdk_tmp", lambda: 123)
+    monkeypatch.setattr(module, "_sdk_state_mount_id", lambda path: 123)
+    state = types.ModuleType("hermes_state")
+    cli = types.ModuleType("cli")
+    (tmp_path / "hermes_state.py").write_text("")
+    (tmp_path / "cli.py").write_text("")
+    state.__file__ = str(tmp_path / "hermes_state.py")
+    cli.__file__ = str(tmp_path / "cli.py")
+    state.DEFAULT_DB_PATH = tmp_path / "host-state.db"
+    cli._hermes_home = tmp_path / "host-home"
+    modules = {"hermes_state": state, "cli": cli}
+    modules[untrusted].__file__ = str(tmp_path.parent / "untrusted.py")
+    for name, value in modules.items():
+        monkeypatch.setitem(sys.modules, name, value)
+    directory = Path("/tmp") / ("herdr-sdk-state-untrusted-" + uuid.uuid4().hex)
+    monkeypatch.setattr(module, "_EPHEMERAL_SDK_STATE_ROOT", directory)
+    with pytest.raises(SystemExit):
+        module._configure_ephemeral_sdk_state(tmp_path)
+    assert not directory.exists()
+    assert state.DEFAULT_DB_PATH == tmp_path / "host-state.db"
+    assert cli._hermes_home == tmp_path / "host-home"

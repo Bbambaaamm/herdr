@@ -180,3 +180,90 @@ def test_bootstrap_callback_is_required_before_native_input(monkeypatch):
     with pytest.raises(RuntimeError,match="launch_invalid"):
         launch(module,invoke,boundary)
     assert calls==[]
+
+
+def test_named_profile_runtime_masks_do_not_include_credentials_or_aliases(tmp_path):
+    module = sandbox_module()
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "quantlab"
+    for parent in (root, profile):
+        for name in ("sessions", "cache", "logs"):
+            (parent / name).mkdir(parents=True)
+        (parent / "config.yaml").write_text("approved")
+        (parent / ".env").write_text("approved")
+    actual = module._ephemeral_sdk_runtime_dirs(tmp_path)
+    assert profile / "sessions" in actual
+    assert profile / "cache" in actual
+    assert profile / "logs" in actual
+    assert all(p.name in {"sessions", "cache", "logs", ".cache"} for p in actual)
+
+
+@pytest.mark.parametrize("runtime_name", ["sessions", "cache", "logs"])
+@pytest.mark.parametrize("target_exists", [True, False])
+def test_runtime_masks_reject_nested_runtime_alias(tmp_path, runtime_name, target_exists):
+    module = sandbox_module()
+    profile = tmp_path / ".hermes" / "profiles" / "quantlab"
+    profile.mkdir(parents=True)
+    workspace = tmp_path / "task-workspace"
+    if target_exists:
+        workspace.mkdir()
+    (profile / runtime_name).symlink_to(workspace, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="runtime_alias_unverified"):
+        module._ephemeral_sdk_runtime_dirs(tmp_path)
+
+
+def test_runtime_masks_reject_global_cache_alias(tmp_path):
+    module = sandbox_module()
+    workspace = tmp_path / "task-workspace"
+    workspace.mkdir()
+    (tmp_path / ".cache").symlink_to(workspace, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="runtime_alias_unverified"):
+        module._ephemeral_sdk_runtime_dirs(tmp_path)
+
+
+@pytest.mark.parametrize("target_exists", [True, False])
+def test_runtime_masks_reject_named_profile_alias(tmp_path, target_exists):
+    module = sandbox_module()
+    profiles = tmp_path / ".hermes" / "profiles"
+    profiles.mkdir(parents=True)
+    workspace = tmp_path / "task-workspace"
+    if target_exists:
+        workspace.mkdir()
+        (workspace / "config.yaml").write_text("untrusted")
+    (profiles / "quantlab").symlink_to(workspace, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="profile_alias_unverified"):
+        module._ephemeral_sdk_runtime_dirs(tmp_path)
+
+
+def test_runtime_masks_reject_profile_root_alias(tmp_path):
+    module = sandbox_module()
+    root = tmp_path / ".hermes"
+    root.mkdir()
+    outside = tmp_path / "foreign"
+    outside.mkdir()
+    (root / "profiles").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="profile_alias_unverified"):
+        module._ephemeral_sdk_runtime_dirs(tmp_path)
+
+
+
+@pytest.mark.parametrize("missing", ["sessions", "cache", "logs"])
+def test_named_profile_runtime_requires_preprovisioned_mountpoint(tmp_path, missing):
+    module = sandbox_module()
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "quantlab"
+    profile.mkdir(parents=True)
+    for name in ("sessions", "cache", "logs"):
+        if name != missing:
+            (profile / name).mkdir()
+    with pytest.raises(RuntimeError, match="profile_runtime_missing"):
+        module._ephemeral_sdk_runtime_dirs(tmp_path)
+
+
+def test_shell_command_has_fixed_byte_limit_before_pane_delivery():
+    module = sandbox_module()
+    minimal = module.shell_command(["/usr/bin/bwrap", "--", "/bin/true"])
+    assert "exec /usr/bin/bwrap" in minimal
+    oversized = ["/usr/bin/bwrap", "--setenv", "MANY_PROFILES", "x" * 40000]
+    with pytest.raises(RuntimeError, match="shell_command_too_large"):
+        module.shell_command(oversized)

@@ -985,18 +985,6 @@ class HerdrChildRuntime:
         try:
             writable = self._child_result_writable(task_id)
             launch.bind_result_slot(writable[0],self.scheduler._tasks[task_id].idempotency_key)
-            sandbox_args = sandbox.command(
-                self.cwd,
-                Path(real),
-                writable=writable,
-                policy=policy,
-                child_workspace_writable=self._child_workspace_writable(task_id),
-                pinned_worktree=self.pinned_worktree,
-                policy_mount=launch.mount,
-                owned_write_pins=self._owned_write_pins.get(task_id),
-                admission_root=(self.scheduler.ownership_registry.root
-                                if getattr(self.scheduler, "ownership_registry", None) is not None else None),
-            )
             deadline = time.monotonic() + 10.0
             while True:
                 remaining = deadline - time.monotonic()
@@ -1023,6 +1011,21 @@ class HerdrChildRuntime:
                                           timeout_seconds=max(0.001, deadline - time.monotonic()))
             except RuntimeError as exc:
                 raise HerdrRuntimeError("child_pane_prompt_unverified", pane_id) from exc
+            # Do not carry profile path checks across the pane-readiness wait.
+            # The sealed launcher revalidates the runtime targets once more
+            # immediately before the bwrap exec, and verify() attests mounts.
+            sandbox_args = sandbox.command(
+                self.cwd,
+                Path(real),
+                writable=writable,
+                policy=policy,
+                child_workspace_writable=self._child_workspace_writable(task_id),
+                pinned_worktree=self.pinned_worktree,
+                policy_mount=launch.mount,
+                owned_write_pins=self._owned_write_pins.get(task_id),
+                admission_root=(self.scheduler.ownership_registry.root
+                                if getattr(self.scheduler, "ownership_registry", None) is not None else None),
+            )
             invoke(["pane", "run", pane_id, sandbox.shell_command(sandbox_args)],
                    timeout_seconds=15.0)
             deadline = time.monotonic() + 10.0

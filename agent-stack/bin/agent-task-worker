@@ -857,11 +857,13 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         if not task_result.exists():
             task_result.touch(mode=0o600)
         launch.bind_result_slot(task_result, str(task["idempotency_key"]))
+        _wait_for_task_pane_input(pane_id, pane_marker)
+        # Resolve runtime mounts only after the terminal becomes ready; a
+        # profile/path may change during the bounded pane-readiness wait.
         command = sandbox_command(
             Path(workspace), HERDR, writable=(task_result,), policy=policy,
             policy_mount=launch.mount, admission_root=ROOT,
         )
-        _wait_for_task_pane_input(pane_id, pane_marker)
         _herdr_json(["pane", "run", pane_id, shell_command(command)], timeout_seconds=15.0)
         sandbox_pid = _wait_for_task_sandbox(pane_id, pane_marker,
                                              policy=policy, policy_mount=launch.mount)
