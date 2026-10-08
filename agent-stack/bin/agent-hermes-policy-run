@@ -463,6 +463,73 @@ def _verify_hermes_build(root: Path) -> str:
     return HERMES_EXECUTOR
 
 
+_EPHEMERAL_SDK_STATE_ROOT = Path("/tmp/herdr-policy-sdk-state")
+
+
+def _sdk_state_mount_id(path: Path) -> int:
+    fd = os.open(path, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        raw = Path(f"/proc/self/fdinfo/{fd}").read_bytes()
+        if len(raw) > 4096:
+            raise ValueError("SDK state mount evidence exceeds bound")
+        rows = [row.split()[1] for row in raw.decode("ascii").splitlines()
+                if row.startswith("mnt_id:")]
+        if len(rows) != 1:
+            raise ValueError("SDK state mount identity unavailable")
+        return int(rows[0])
+    finally:
+        os.close(fd)
+
+
+def _require_private_sdk_tmp() -> int:
+    """Use the opened mount, including hosts whose /tmp has a covered lower mount."""
+    try:
+        mount_id = _sdk_state_mount_id(Path("/tmp"))
+        raw = Path("/proc/self/mountinfo").read_bytes()
+        if len(raw) > 1_048_576:
+            raise ValueError("SDK state mount evidence exceeds bound")
+        lines = raw.decode("utf-8").splitlines()
+        if len(lines) > 4096:
+            raise ValueError("SDK state mount count exceeds bound")
+        selected = []
+        for row in lines:
+            before, after = row.split(" - ", 1)
+            fields, filesystem = before.split(), after.split()
+            if int(fields[0]) == mount_id:
+                selected.append((fields, filesystem))
+        if len(selected) != 1:
+            raise ValueError("SDK state mount identity ambiguous")
+        fields, filesystem = selected[0]
+        if (fields[3] != "/" or _unescape_mount(fields[4]) != "/tmp"
+                or "rw" not in fields[5].split(",") or filesystem[0] != "tmpfs"):
+            raise ValueError("SDK state is not on its private writable temporary mount")
+        return mount_id
+    except (OSError, ValueError, UnicodeError, IndexError) as exc:
+        raise SystemExit("private writable SDK state mount unavailable") from exc
+
+
+def _configure_ephemeral_sdk_state(hermes_root: Path) -> None:
+    """Keep SDK session writes inside the invocation's private temporary mount."""
+    mount_id = _require_private_sdk_tmp()
+    directory = _EPHEMERAL_SDK_STATE_ROOT
+    if directory.parent != Path("/tmp"):
+        raise SystemExit("SDK state must be inside the private temporary mount")
+    state = importlib.import_module("hermes_state")
+    _require_module_origin(state, hermes_root, "hermes_state")
+    try:
+        directory.mkdir(mode=0o700)
+        actual = directory.lstat()
+        if (directory.resolve(strict=True) != directory or not stat.S_ISDIR(actual.st_mode)
+                or actual.st_uid != os.geteuid() or stat.S_IMODE(actual.st_mode) != 0o700
+                or _sdk_state_mount_id(directory) != mount_id):
+            raise ValueError("SDK state directory differs from its fresh private identity")
+    except (OSError, ValueError) as exc:
+        raise SystemExit("fresh private SDK state unavailable") from exc
+    # The pinned SDK resolves this override at each SessionDB acquisition.
+    # Configuration, credentials and the host's session database stay read-only.
+    state.DEFAULT_DB_PATH = directory / "state.db"
+
+
 @contextmanager
 def _native_hermes_process_label():
     """Expose the verified running Hermes program to Linux native detection.
@@ -543,9 +610,12 @@ def bootstrap(hermes_args: list[str]) -> int:
 
     guard_module.install_hermes_guard(guard)
 
+    # Hermes consumes profile flags while its CLI module is imported.
+    # Set the approved argv first and retain the module's consumed argv.
+    sys.argv = [str(hermes_root / "hermes"), *hermes_args]
     hermes_main_module = importlib.import_module("hermes_cli.main")
     _require_module_origin(hermes_main_module, hermes_root, "hermes_cli.main")
-    sys.argv = [str(hermes_root / "hermes"), *hermes_args]
+    _configure_ephemeral_sdk_state(hermes_root)
     with _native_hermes_process_label():
         result = hermes_main_module.main()
     return 0 if result is None else int(result)

@@ -356,17 +356,45 @@ def verify_pane_prompt(invoke, pane_id: str, marker: str, *, timeout_seconds=10.
         time.sleep(min(0.05, remaining()))
 
 
+def _authenticated_agent_instance(receipt, sandbox_pid, marker, agent_name):
+    """Bind readiness to the host-authenticated child of the retained shell."""
+    from herdr.bootstrap_authority import BootstrapContinuation, inspect_peer
+    try:
+        if (not isinstance(receipt, BootstrapContinuation)
+                or receipt.identity["agent_id"] != agent_name
+                or receipt.peer_pid == sandbox_pid):
+            return None
+        peer = inspect_peer(receipt.peer_pid)
+        if (peer.ppid != sandbox_pid or peer.start_ticks != receipt.process_start_ticks
+                or (peer.exe_device, peer.exe_inode) != (receipt.python_device, receipt.python_inode)):
+            return None
+        namespaces = tuple(os.readlink(f"/proc/{peer.pid}/ns/{name}") for name in ("pid", "mnt"))
+        if namespaces != tuple(os.readlink(f"/proc/{sandbox_pid}/ns/{name}") for name in ("pid", "mnt")):
+            return None
+        env = _env(peer.pid)
+        if (b"HERDR_DURABLE_SANDBOX=1" not in env
+                or f"HERDR_DURABLE_TASK_PANE={marker}".encode() not in env):
+            return None
+        again = inspect_peer(peer.pid)
+        if again != peer:
+            return None
+        return peer.pid, peer.start_ticks, *namespaces
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
 def start_sandbox_agent(invoke, pane_id: str, marker: str, sandbox_pid: int,
                         agent_name: str, hermes_args: list[str], *,
-                        verify_boundary, timeout_seconds=60.0) -> dict:
+                        verify_boundary, bootstrap_peer, timeout_seconds=60.0) -> dict:
     """Launch the fixed guarded Hermes entry once inside an attested owned pane.
 
     Native agent.start requires a bare host shell and rejects an existing bwrap
     boundary. This route proves the inner prompt, sends one fixed executable,
-    waits for native detection of the actual Hermes process, then names it.
+    retains the registered shell, waits for detection, and names its authenticated child.
     The caller must still confirm authenticated bootstrap before task delivery.
     """
-    if (not isinstance(agent_name, str)
+    if (not callable(bootstrap_peer) or not callable(verify_boundary)
+            or not isinstance(agent_name, str)
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", agent_name)
             or type(sandbox_pid) is not int or sandbox_pid <= 0
             or not isinstance(hermes_args, list)
@@ -375,7 +403,9 @@ def start_sandbox_agent(invoke, pane_id: str, marker: str, sandbox_pid: int,
             or type(timeout_seconds) not in (int, float)
             or not 0 < timeout_seconds <= 75):
         raise RuntimeError("durable_agent_launch_invalid")
-    command = "exec " + shlex.join(["/run/herdr-bootstrap/hermes", *hermes_args])
+    # The sealed bootstrap authorizes a child of the registered shell.
+    # Replacing that shell with exec makes the stage-one peer ineligible.
+    command = shlex.join(["/run/herdr-bootstrap/hermes", *hermes_args])
     if len(command.encode("utf-8")) >= 4096:
         raise RuntimeError("durable_agent_launch_invalid")
     deadline = time.monotonic() + timeout_seconds
@@ -461,9 +491,10 @@ def start_sandbox_agent(invoke, pane_id: str, marker: str, sandbox_pid: int,
             or agent.get("pane_id") != pane_id or agent.get("terminal_id") != terminal_id
             or agent.get("agent") != "hermes"):
         raise RuntimeError("durable_agent_identity_unverified")
+    expected_peer = None
     # Process discovery precedes Hermes' interactive initialization. Keep the
     # task prompt on the host until native screen detection AND the same
-    # foreground process' noncanonical input terminal are ready.
+    # authenticated child process' noncanonical input terminal are ready.
     while True:
         boundary()
         ready = invoke(["agent", "get", agent_name],
@@ -479,8 +510,17 @@ def start_sandbox_agent(invoke, pane_id: str, marker: str, sandbox_pid: int,
             raise RuntimeError("durable_agent_startup_blocked")
         if status not in {"idle", "done", "working", "unknown"}:
             raise RuntimeError("durable_agent_status_unverified")
-        if status in {"idle", "done"} and _terminal_input_ready(sandbox_pid, marker):
+        receipt = bootstrap_peer(timeout_seconds=min(10.0, remaining()))
+        peer = _authenticated_agent_instance(receipt, sandbox_pid, marker, agent_name)
+        if peer is None or expected_peer is not None and peer != expected_peer:
+            raise RuntimeError("durable_agent_bootstrap_peer_unverified")
+        expected_peer = peer
+        if status in {"idle", "done"} and _terminal_input_ready(peer[0], marker):
             boundary()
+            if _authenticated_agent_instance(
+                    bootstrap_peer(timeout_seconds=min(10.0, remaining())),
+                    sandbox_pid, marker, agent_name) != expected_peer:
+                raise RuntimeError("durable_agent_bootstrap_peer_changed")
             return ready
         time.sleep(min(0.05, remaining()))
 
