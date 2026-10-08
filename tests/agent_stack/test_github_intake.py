@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[2] / "agent-stack" / "bin" / "agent-github-intake"
+if str(SCRIPT.parent) not in sys.path:
+    sys.path.insert(0, str(SCRIPT.parent))
 
 
 def load_module():
@@ -448,11 +450,76 @@ class GitHubIntakeTests(unittest.TestCase):
         self.assertEqual(self._run_main_with_majak(), 0)
         self.assertEqual(list(self.intake.PENDING.glob("*.json")), [])
         state = json.loads(self.intake.STATE.read_text())
-        self.assertEqual(state["Bbambaaamm/dotacni-majak#662"]["scheduler_state"], "active")
+        self.assertEqual(state["Bbambaaamm/dotacni-majak#662"]["scheduler_state"], "blocked")
+        self.assertEqual(state["Bbambaaamm/dotacni-majak#662"]["blocker"],
+                         "durable_task_requires_reconciliation")
         records = self.intake.task_index()["Bbambaaamm/dotacni-majak#662"]
         self.assertEqual(self.intake.intervention_blocker(records, allow_failed_replan=True),
                          ("verification-pending", "evidence_unavailable"))
 
+
+
+    def _run_main_with_herdr(self):
+        self.write_config([self.herdr_consumer()])
+        self.intake.fetch_issues = lambda _consumer: [{
+            "number": 53, "state": "open",
+            "title": "HERDR CONTROL: autonomous backlog drain",
+            "html_url": "https://github.com/Bbambaaamm/herdr/issues/53",
+            "body": "Drain only with admission and existing cost grant",
+        }]
+        original_argv = list(self.intake.sys.argv)
+        try:
+            self.intake.sys.argv = ["agent-github-intake", "--force"]
+            return self.intake.main()
+        finally:
+            self.intake.sys.argv = original_argv
+
+    def test_blocked_herdr_root_stays_blocked_and_does_not_duplicate(self):
+        blocked = self.intake.ROOT / "blocked" / "root-53-original.json"
+        original = {
+            "id": "root-53-original", "issue": 53,
+            "repo": "Bbambaaamm/herdr", "consumer": "herdr",
+            "attempt_state": "blocked",
+            "watchdog_blocker": "delivery_uncertain_requires_recovery",
+            "run_token": "original-run", "attempts": 3, "max_attempts": 3,
+        }
+        blocked.write_text(json.dumps(original))
+        before = blocked.read_bytes()
+        self.intake.disk_headroom_blocker = lambda *_: None
+        for _ in range(2):
+            self.assertEqual(self._run_main_with_herdr(), 0)
+            self.assertEqual(list(self.intake.PENDING.glob("*.json")), [])
+            self.assertEqual(before, blocked.read_bytes())
+            state = json.loads(self.intake.STATE.read_text())
+            root = state["Bbambaaamm/herdr#53"]
+            self.assertEqual(root["scheduler_state"], "blocked")
+            self.assertEqual(root["blocker"], "delivery_uncertain_requires_recovery")
+            self.assertEqual(root["task_ids"], ["root-53-original"])
+            self.assertEqual(root["task_id"], "root-53-original")
+
+    def test_herdr_capacity_gate_auto_recovers_for_new_eligible_episode(self):
+        self.intake.disk_headroom_blocker = (
+            lambda *_: "autonomy_disk_headroom_insufficient"
+        )
+        self.assertEqual(self._run_main_with_herdr(), 0)
+        self.assertEqual(list(self.intake.PENDING.glob("*.json")), [])
+        state = json.loads(self.intake.STATE.read_text())
+        self.assertEqual(state["Bbambaaamm/herdr#53"]["scheduler_state"], "blocked")
+        self.assertEqual(state["Bbambaaamm/herdr#53"]["blocker"],
+                         "autonomy_disk_headroom_insufficient")
+
+        # A later scheduler tick can create one new root only after the capacity
+        # gate has cleared; no prior blocked/running task exists in this fixture.
+        self.intake.disk_headroom_blocker = lambda *_: None
+        self.assertEqual(self._run_main_with_herdr(), 0)
+        pending = list(self.intake.PENDING.glob("github-herdr-issue-53-*.json"))
+        self.assertEqual(len(pending), 1)
+        task = json.loads(pending[0].read_text())
+        self.assertEqual(task["kind"], "github_root_orchestration")
+        self.assertEqual(task["issue"], 53)
+        self.assertEqual(task["agent"], "herdr-hermes")
+        self.assertEqual(self._run_main_with_herdr(), 0)
+        self.assertEqual(len(list(self.intake.PENDING.glob("*.json"))), 1)
 
 
 if __name__ == "__main__":
