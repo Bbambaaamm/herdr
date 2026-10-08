@@ -28,7 +28,8 @@ def parse_allocation(raw):
 
 def bind_budget(factory, raw, *, storage, writable_roots=(), recovery=False):
     bounded(raw)
-    closed(raw, {"version","allocation","ancestors","model_quotes"} | ({"repair"} if "repair" in raw else set()), "approved cumulative budget")
+    optional={name for name in ("repair","pre_effect_readmission") if name in raw}
+    closed(raw, {"version","allocation","ancestors","model_quotes"} | optional, "approved cumulative budget")
     require(type(raw["version"]) is int and raw["version"]==1,"budget policy version unsupported")
     selected=parse_allocation(raw["allocation"])
     require(isinstance(raw["ancestors"],list) and len(raw["ancestors"])<=32,
@@ -87,6 +88,8 @@ def bind_budget(factory, raw, *, storage, writable_roots=(), recovery=False):
     factory.budget_definition=raw
     from .work_failure_control import bind_repair
     bind_repair(factory,raw.get("repair"))
+    from .work_pre_effect_readmission import bind_pre_effect_readmission
+    bind_pre_effect_readmission(factory,raw.get("pre_effect_readmission"),selected)
     return selected
 
 def model_effect(factory,identity,grant_sha256,action,payload):

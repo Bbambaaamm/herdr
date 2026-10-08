@@ -631,7 +631,31 @@ class WorkBudgetAuthority:
 
     def _validate_attempt(self,state,allocation_id,attempts,event):
         self._require_attempt_capacity(state,allocation_id)
-        require(all(x["plan_sha256"]==event["plan_sha256"] for x in attempts),
+        if event["reason_code"]=="pre_effect_readmission":
+            require(attempts and state["allocations"][allocation_id]["allocation"].parent_allocation_id is None,
+                    "pre-effect re-admission requires original root implementation")
+            previous=attempts[-1]
+            before=InvocationIdentity.from_dict(previous["identity"])
+            after=InvocationIdentity.from_dict(event["identity"])
+            require(event.get("previous_attempt_sha256")==previous["event_sha256"],
+                    "pre-effect re-admission predecessor changed")
+            sha(event.get("pre_effect_approval_sha256"))
+            require(after.consumer==before.consumer and after.task_id==before.task_id
+                    and after.parent_agent_id==before.parent_agent_id
+                    and after.parent_task_id==before.parent_task_id
+                    and after.fencing_token==before.fencing_token+1 and after.run_token!=before.run_token,
+                    "pre-effect re-admission invocation changed")
+            require(event["failure_check_sha256"] is None and event["diff_sha256"] is None
+                    and event["changed_files"]==event["changed_lines"]==0,
+                    "pre-effect re-admission cannot claim implementation failure or changes")
+            require(not any(row["operation_kind"]=="model"
+                    and allocation_id in self._ancestors(state,row["allocation_id"])
+                    for row in state["operations"].values()),
+                    "model reservation requires original reconciliation, not pre-effect re-admission")
+            require(not self._charged(state,allocation_id)[1],
+                    "inflight operation requires original reconciliation")
+            return
+        require(not attempts or attempts[-1]["plan_sha256"]==event["plan_sha256"],
                 "repair cannot replace the approved work plan")
         if attempts:
             sha(event["failure_check_sha256"]);sha(event["diff_sha256"])
@@ -658,7 +682,8 @@ class WorkBudgetAuthority:
             event["reason_code"],event["diff_sha256"],event["event_sha256"])
 
     def begin_implementation(self,*,allocation_id,identity,plan_sha256,reason_code="initial",
-                             failure_check_sha256=None,diff_sha256=None,changed_files=0,changed_lines=0):
+                             failure_check_sha256=None,diff_sha256=None,changed_files=0,changed_lines=0,
+                             pre_effect_approval=None):
         sha(allocation_id);sha(plan_sha256);token(reason_code)
         require(isinstance(identity,InvocationIdentity),"admitted implementation identity required")
         with self._serialized():
@@ -669,11 +694,31 @@ class WorkBudgetAuthority:
                 "plan_sha256":plan_sha256,"attempt":len(attempts)+1,"reason_code":reason_code,
                 "failure_check_sha256":failure_check_sha256,"diff_sha256":diff_sha256,
                 "changed_files":changed_files,"changed_lines":changed_lines}
+            def approved_event(source):
+                require(callable(pre_effect_approval) and attempts and reason_code=="initial"
+                        and failure_check_sha256 is None and diff_sha256 is None
+                        and changed_files==changed_lines==0,
+                        "bounded host pre-effect approval required")
+                approval=pre_effect_approval(previous=deepcopy(source),
+                                            identity=identity.to_json(),plan_sha256=plan_sha256)
+                require(isinstance(approval,dict)
+                        and set(approval)=={"previous_attempt_sha256","approval_sha256"},
+                        "exact host pre-effect decision required")
+                return {"reason_code":"pre_effect_readmission",
+                        "previous_attempt_sha256":sha(approval["previous_attempt_sha256"]),
+                        "pre_effect_approval_sha256":sha(approval["approval_sha256"])}
             previous=next((x for x in attempts if x["identity"]==event["identity"]
                            and x["failure_check_sha256"]==failure_check_sha256),None)
             if previous is not None:
+                if previous["reason_code"]=="pre_effect_readmission":
+                    source=next((x for x in attempts if x["event_sha256"]==previous["previous_attempt_sha256"]),None)
+                    require(source is not None,"original pre-effect predecessor unavailable")
+                    event.update(approved_event(source))
                 require(all(previous[k]==v for k,v in event.items() if k!="attempt"),"repair evidence changed")
                 return self._permit(previous)
+            if pre_effect_approval is not None:
+                require(attempts,"original pre-effect implementation unavailable")
+                event.update(approved_event(attempts[-1]))
             now=self._now(state)
             self._available(state,allocation_id,now,identity)
             allocation=state["allocations"][allocation_id]["allocation"]
