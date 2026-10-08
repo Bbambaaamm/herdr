@@ -113,7 +113,11 @@ def _ephemeral_sdk_runtime_dirs(home: Path) -> tuple[Path, ...]:
         roots.extend(p for p in entries if p.is_dir())
     candidates = [home / ".cache"]
     candidates.extend(p / name for p in roots for name in ("sessions", "cache", "logs"))
-    return tuple(p for p in candidates if p.is_dir() and not p.is_symlink())
+    # A skipped alias remains visible to Hermes and may point into the writable
+    # workspace. Every runtime alias must fail closed, even if dangling.
+    if any(p.is_symlink() for p in candidates):
+        raise RuntimeError("durable_sdk_runtime_alias_unverified")
+    return tuple(p for p in candidates if p.is_dir())
 
 
 def command(
