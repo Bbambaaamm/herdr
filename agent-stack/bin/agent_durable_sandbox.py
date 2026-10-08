@@ -105,7 +105,12 @@ def _ephemeral_sdk_runtime_dirs(home: Path) -> tuple[Path, ...]:
         entries = sorted(profiles.iterdir())
         if len(entries) > 128:
             raise RuntimeError("durable_sdk_profile_count_exceeded")
-        roots.extend(p for p in entries if p.is_dir() and not p.is_symlink())
+        # A profile alias can resolve to the writable task workspace after the
+        # sandbox binds are installed, exposing credentials/config to writes.
+        # Skipping its runtime masks does not stop Hermes from loading it.
+        if any(p.is_symlink() for p in entries):
+            raise RuntimeError("durable_sdk_profile_alias_unverified")
+        roots.extend(p for p in entries if p.is_dir())
     candidates = [home / ".cache"]
     candidates.extend(p / name for p in roots for name in ("sessions", "cache", "logs"))
     return tuple(p for p in candidates if p.is_dir() and not p.is_symlink())

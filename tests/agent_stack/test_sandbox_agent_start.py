@@ -193,7 +193,6 @@ def test_named_profile_runtime_masks_do_not_include_credentials_or_aliases(tmp_p
         (parent / ".env").write_text("approved")
     outside = tmp_path / "foreign"
     outside.mkdir()
-    (root / "profiles" / "alias").symlink_to(outside, target_is_directory=True)
     (profile / "logs").rmdir()
     (profile / "logs").symlink_to(outside, target_is_directory=True)
     actual = module._ephemeral_sdk_runtime_dirs(tmp_path)
@@ -202,7 +201,20 @@ def test_named_profile_runtime_masks_do_not_include_credentials_or_aliases(tmp_p
     assert profile / "logs" not in actual
     assert outside not in actual
     assert all(p.name in {"sessions", "cache", "logs", ".cache"} for p in actual)
-    assert all("alias" not in p.parts for p in actual)
+
+
+@pytest.mark.parametrize("target_exists", [True, False])
+def test_runtime_masks_reject_named_profile_alias(tmp_path, target_exists):
+    module = sandbox_module()
+    profiles = tmp_path / ".hermes" / "profiles"
+    profiles.mkdir(parents=True)
+    workspace = tmp_path / "task-workspace"
+    if target_exists:
+        workspace.mkdir()
+        (workspace / "config.yaml").write_text("untrusted")
+    (profiles / "quantlab").symlink_to(workspace, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="profile_alias_unverified"):
+        module._ephemeral_sdk_runtime_dirs(tmp_path)
 
 
 def test_runtime_masks_reject_profile_root_alias(tmp_path):

@@ -110,8 +110,13 @@ def test_same_process_guard_precedes_hermes_main(monkeypatch, tmp_path, profile_
     fake_cli.__file__ = str(hermes / "cli.py")
     approved_home = hermes / "approved-profile"
     fake_cli._hermes_home = approved_home
-    config = {"model": "approved-model"}
+    config = {"model": "approved-model", "agent": {"prefill_messages_file": "prompts/approved.json"}}
     fake_cli.CLI_CONFIG = config
+    fake_cli._resolve_prefill_messages_file = lambda cfg: (
+        os.getenv("HERMES_PREFILL_MESSAGES_FILE", "")
+        or cfg.get("prefill_messages_file", "")
+        or cfg.get("agent", {}).get("prefill_messages_file", "")
+    )
     fake_cli.get_hermes_home = lambda: approved_home
     monkeypatch.setitem(sys.modules, "cli", fake_cli)
     private_state = Path('/tmp') / ('herdr-sdk-state-test-' + uuid.uuid4().hex)
@@ -125,6 +130,14 @@ def test_same_process_guard_precedes_hermes_main(monkeypatch, tmp_path, profile_
         assert fake_cli._hermes_home == private_state
         assert fake_cli.get_hermes_home() == approved_home
         assert fake_cli.CLI_CONFIG is config
+        # Prefill is loaded after CLI initialization: relative paths must still
+        # resolve against the approved profile, never the writable SDK home.
+        assert fake_cli._resolve_prefill_messages_file(config) == str(
+            approved_home / "prompts/approved.json"
+        )
+        assert fake_cli._resolve_prefill_messages_file(
+            {"prefill_messages_file": "/approved/external.json"}
+        ) == "/approved/external.json"
         assert private_state.stat().st_mode & 0o777 == 0o700
         assert Path('/proc/self/comm').read_text().strip() == 'hermes'
         assert os.environ["HERMES_SAFE_MODE"] == "1"
@@ -672,6 +685,7 @@ def test_sdk_state_rejects_existing_directory(monkeypatch, tmp_path):
     (tmp_path / "cli.py").write_text("")
     fake_cli.__file__ = str(tmp_path / "cli.py")
     fake_cli._hermes_home = tmp_path / "host-home"
+    fake_cli._resolve_prefill_messages_file = lambda cfg: cfg.get("prefill_messages_file", "")
     monkeypatch.setitem(sys.modules, "cli", fake_cli)
     directory = Path("/tmp") / ("herdr-sdk-state-existing-" + uuid.uuid4().hex)
     directory.mkdir(mode=0o700)
