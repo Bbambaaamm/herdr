@@ -130,3 +130,28 @@ and hygiene events, with lookup-only compatibility for historical reservations.
 A started operation without an original hygiene intent remains UNKNOWN.
 Recurring internally generated stop conditions durably reactivate a resumed
 stop; replay preserves both the host-approved resume and the later stop.
+
+### Pre-effect native re-admission
+
+A closed native invocation may have consumed an implementation attempt before its
+model could start. The default contract still rejects a new identity or plan.
+An immutable host definition may supply `budget.pre_effect_readmission` for one
+specific transition: version 1, the previous attempt event, identity and plan
+hashes, the verified failed task hash, the operator authority reference, the
+unchanged specification hash, exact accepted Git base, definition digest
+(excluding this rule), and the next native fencing token.
+
+The operator must verify that the failed task is closed, its physical resources
+are absent, its result is empty, and no model delivery was attempted. This is
+host authority; task input and worker RPC cannot grant re-admission. Runtime
+validation requires the original root allocation and predecessor, the same task,
+consumer and parent identities, a changed run token and exactly one fencing
+increment. Any model reservation, including a returned reservation, or an
+unsettled host operation prevents re-admission.
+
+Re-admission appends another implementation attempt in the original audit.
+It preserves the allocation, original attempt, unknown usage holds, stops and
+all cumulative limits. An idempotent repeat returns the same permit without
+adding an attempt. Later implementation repairs remain bound to the newly
+admitted plan and spend the remaining attempt allowance. A further native
+transition cannot reuse the same host rule.

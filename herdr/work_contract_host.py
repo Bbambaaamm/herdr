@@ -86,7 +86,10 @@ class HostWorkContractFactory:
                     cycle.start(BudgetedCheckRunner(self.budget_authority,allocation,runner,'baseline',
                         host_overhead_seconds=120,phase_key="baseline"))
                 if cycle.phase is WorkPhase.WORK:
-                    self.budget_authority.begin_implementation(allocation_id=allocation.allocation_id,identity=identity,plan_sha256=plan.hash)
+                    readmission=getattr(self,"pre_effect_readmission",None)
+                    approval=None if readmission is None else lambda **kwargs:readmission(plan=plan,**kwargs)
+                    self.budget_authority.begin_implementation(allocation_id=allocation.allocation_id,
+                        identity=identity,plan_sha256=plan.hash,pre_effect_approval=approval)
                 self.allocations[digest(identity.to_json())]=allocation
                 runner=BudgetedCheckRunner(self.budget_authority,allocation,runner,'verification',host_overhead_seconds=120)
             else:
