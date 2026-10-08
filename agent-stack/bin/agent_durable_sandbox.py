@@ -45,7 +45,7 @@ os.execv(args[0], args)
 """
 
 
-_POLICY_FD_LAUNCHER = '\nimport json, os, re, stat, sys\nif len(sys.argv) < 3 or len(sys.argv[1]) > 65536:\n    raise SystemExit("policy_fd_launch_invalid")\nentries = json.loads(sys.argv[1])\nargs = sys.argv[2:]\nif not isinstance(entries, list) or not 1 <= len(entries) <= 72:\n    raise SystemExit("policy_fd_launch_invalid")\nmapping, targets = {}, set()\nfor item in entries:\n    if not isinstance(item, dict) or set(item) != {"source","fd","device","inode","kind","target"}:\n        raise SystemExit("policy_fd_launch_invalid")\n    if (any(type(item[k]) is not int or item[k] < 0 for k in ("fd","device","inode")) or\n        item["kind"] not in ("file","directory","socket") or\n        not isinstance(item["source"], str) or\n        not re.fullmatch(r"/proc/[1-9][0-9]{0,9}/fd/[0-9]{1,10}", item["source"]) or\n        item["source"].rsplit("/",1)[-1] != str(item["fd"]) or\n        not isinstance(item["target"], str) or not item["target"].startswith("/") or\n        item["fd"] in mapping or item["target"] in targets):\n        raise SystemExit("policy_fd_launch_invalid")\n    opened = os.open(item["source"], os.O_PATH | (os.O_DIRECTORY if item["kind"] == "directory" else 0))\n    held = os.fstat(opened)\n    kind = {"directory":stat.S_ISDIR,"file":stat.S_ISREG,"socket":stat.S_ISSOCK}[item["kind"]]\n    if not kind(held.st_mode) or (held.st_dev,held.st_ino) != (item["device"],item["inode"]):\n        raise SystemExit("policy_fd_identity_mismatch")\n    mapping[item["fd"]] = (opened, item["target"])\n    targets.add(item["target"])\nused = set()\nfor index, arg in enumerate(args):\n    if arg in ("--bind-fd","--ro-bind-fd"):\n        if index + 2 >= len(args) or not args[index+1].isdigit():\n            raise SystemExit("policy_fd_launch_invalid")\n        original = int(args[index+1])\n        if original not in mapping or original in used or args[index+2] != mapping[original][1]:\n            raise SystemExit("policy_fd_launch_invalid")\n        opened, _ = mapping[original]\n        args[index+1] = str(opened)\n        os.set_inheritable(opened, True)\n        used.add(original)\nif used != set(mapping) or not args or args[0] != "/usr/bin/bwrap":\n    raise SystemExit("policy_fd_launch_invalid")\nos.execv(args[0], args)\n'
+_POLICY_FD_LAUNCHER = '\nimport json, os, re, stat, sys\nif len(sys.argv) < 3 or len(sys.argv[1]) > 65536:\n    raise SystemExit("policy_fd_launch_invalid")\nentries = json.loads(sys.argv[1])\nargs = sys.argv[2:]\nif not isinstance(entries, list) or not 1 <= len(entries) <= 72:\n    raise SystemExit("policy_fd_launch_invalid")\nmapping, targets = {}, set()\nfor item in entries:\n    if not isinstance(item, dict) or set(item) != {"source","fd","device","inode","kind","target"}:\n        raise SystemExit("policy_fd_launch_invalid")\n    if (any(type(item[k]) is not int or item[k] < 0 for k in ("fd","device","inode")) or\n        item["kind"] not in ("file","directory","socket") or\n        not isinstance(item["source"], str) or\n        not re.fullmatch(r"/proc/[1-9][0-9]{0,9}/fd/[0-9]{1,10}", item["source"]) or\n        item["source"].rsplit("/",1)[-1] != str(item["fd"]) or\n        not isinstance(item["target"], str) or not item["target"].startswith("/") or\n        item["fd"] in mapping or item["target"] in targets):\n        raise SystemExit("policy_fd_launch_invalid")\n    opened = os.open(item["source"], os.O_PATH | (os.O_DIRECTORY if item["kind"] == "directory" else 0))\n    held = os.fstat(opened)\n    kind = {"directory":stat.S_ISDIR,"file":stat.S_ISREG,"socket":stat.S_ISSOCK}[item["kind"]]\n    if not kind(held.st_mode) or (held.st_dev,held.st_ino) != (item["device"],item["inode"]):\n        raise SystemExit("policy_fd_identity_mismatch")\n    mapping[item["fd"]] = (opened, item["target"])\n    targets.add(item["target"])\nused = set()\nfor index, arg in enumerate(args):\n    if arg in ("--bind-fd","--ro-bind-fd"):\n        if index + 2 >= len(args) or not args[index+1].isdigit():\n            raise SystemExit("policy_fd_launch_invalid")\n        original = int(args[index+1])\n        if original not in mapping or original in used or args[index+2] != mapping[original][1]:\n            raise SystemExit("policy_fd_launch_invalid")\n        opened, _ = mapping[original]\n        args[index+1] = str(opened)\n        os.set_inheritable(opened, True)\n        used.add(original)\nif used != set(mapping) or not args or args[0] != "/usr/bin/bwrap":\n    raise SystemExit("policy_fd_launch_invalid")\n# The pane readiness wait has finished. Reject aliases/new runtime paths\n# immediately before bwrap, not only when the caller constructed its argv.\nfrom pathlib import Path\nh=Path("/home/agentops"); r=h/".hermes"; q=r/"profiles"\nif r.is_symlink() or q.is_symlink():\n    raise SystemExit("policy_fd_runtime_profile_alias")\nroots=[r]\nif q.is_dir():\n    entries=list(q.iterdir())\n    if len(entries)>128 or any(p.is_symlink() for p in entries):\n        raise SystemExit("policy_fd_runtime_profile_alias")\n    roots += [p for p in entries if p.is_dir()]\ncandidates=[h/".cache"]+[p/n for p in roots for n in ("sessions","cache","logs")]\nif any(p.is_symlink() for p in candidates):\n    raise SystemExit("policy_fd_runtime_directory_alias")\nmounted={args[i+1] for i in range(len(args)-1) if args[i]=="--tmpfs"}\nruntime_mounts={v for v in mounted if v==str(h/".cache") or v.startswith(str(r)+"/")}\nrequired={str(p) for p in candidates if p.is_dir()}\nif runtime_mounts != required:\n    raise SystemExit("policy_fd_runtime_mount_mismatch")\nos.execv(args[0], args)\n'
 
 @dataclass
 class PinnedWorktree:
@@ -587,6 +587,40 @@ def inner_pid(process_info: dict, marker: str) -> int | None:
     return None
 
 
+def _sdk_runtime_masks_verified(root: Path, modes: dict[str, set[str]],
+                                filesystems: dict[str, str]) -> bool:
+    """A verified namespace must mask every *present* SDK write directory.
+
+    This independent post-bwrap check rejects a path changed after the
+    pre-exec inventory, including a candidate that was absent until launch.
+    """
+    def inside(path: Path) -> Path:
+        return root / str(path).lstrip("/")
+
+    hermes = HOME / ".hermes"
+    profiles = hermes / "profiles"
+    if inside(hermes).is_symlink() or inside(profiles).is_symlink():
+        return False
+    roots = [hermes]
+    if inside(profiles).is_dir():
+        entries = list(inside(profiles).iterdir())
+        if len(entries) > 128 or any(p.is_symlink() for p in entries):
+            return False
+        roots.extend(profiles / p.name for p in entries if p.is_dir())
+    paths = [HOME / ".cache"]
+    paths.extend(p / name for p in roots for name in ("sessions", "cache", "logs"))
+    for path in paths:
+        actual = inside(path)
+        if actual.is_symlink():
+            return False
+        if actual.is_dir() and (
+            "rw" not in modes.get(str(path), set())
+            or filesystems.get(str(path)) != "tmpfs"
+        ):
+            return False
+    return True
+
+
 def verify(
     pid: int,
     real_binary: Path,
@@ -616,6 +650,11 @@ def verify(
                     value = value.replace(old, new)
                 return value
             modes = {unescape(row[4]): set(row[5].split(",")) for row in rows}
+            filesystems = {
+                unescape(line.split(" - ", 1)[0].split()[4]):
+                    line.split(" - ", 1)[1].split()[0]
+                for line in mounts.splitlines()
+            }
             targets = set(modes)
             workspace_matches = True
             if pinned_worktree is not None:
@@ -645,6 +684,8 @@ def verify(
                 expected <= targets
                 and "ro" in modes.get("/", set())
                 and workspace_matches
+                and (policy_mount is None or _sdk_runtime_masks_verified(
+                    root, modes, filesystems))
                 and hidden
                 and policy_matches
                 and ns
