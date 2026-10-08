@@ -492,7 +492,7 @@ def test_create_task_session_uses_fresh_owned_pane_and_named_chat(tmp_path, monk
     assert str(worker.AGENT_BIN) in path_env
     hermes_runs = [call for call in calls
                    if call[:2] == ["pane", "run"] and len(call) >= 4
-                   and "exec /run/herdr-bootstrap/hermes " in call[3]]
+                   and "/run/herdr-bootstrap/hermes " in call[3]]
     assert len(hermes_runs) == 1
     command = hermes_runs[0][3]
     assert f"--continue {session['session_name']}" in command
@@ -1116,7 +1116,7 @@ def test_setup_failure_cleanup_proves_pane_identity(
                        if case == "reused_pane" else []) if len(lists) == 1 else
                        ([] if case == "absent" else [{"pane_id": "owned-pane"}])}}
         if args[:2] == ["pane", "run"]:
-            if after_start and len(args) >= 4 and "exec /run/herdr-bootstrap/hermes " in args[3]:
+            if after_start and len(args) >= 4 and "/run/herdr-bootstrap/hermes " in args[3]:
                 raise RuntimeError("start failed")
             return None
         if args[:2] == ["pane", "process-info"]:
@@ -1454,7 +1454,7 @@ def test_canonical_queue_owns_session_before_worker_crash(tmp_path, monkeypatch,
         if args[:2] == ["pane", "split"]:
             return {"result": {"pane": {"pane_id": "owned"}}}
         if args[:2] == ["pane", "run"]:
-            crash_if("agent" if len(args) >= 4 and "exec /run/herdr-bootstrap/hermes " in args[3] else "sandbox")
+            crash_if("agent" if len(args) >= 4 and "/run/herdr-bootstrap/hermes " in args[3] else "sandbox")
             return None
         if args[:2] == ["pane", "process-info"]:
             return {"result": {"process_info": {}}}
@@ -1534,7 +1534,7 @@ def explicit_host_policy_for_worker_lifecycle_tests(monkeypatch):
     # Lifecycle tests use an explicit native transport double. The guarded
     # sandbox launch itself has separate namespace/TTY and native integration tests.
     def transport(invoke, pane, marker, pid, name, args, **kwargs):
-        invoke(["pane", "run", pane, "exec " + __import__("shlex").join(
+        invoke(["pane", "run", pane, __import__("shlex").join(
             ["/run/herdr-bootstrap/hermes", *args])], timeout_seconds=15.0)
         return {"result": {"agent": worker._wait_for_task_agent(pane, name)}}
     monkeypatch.setattr(worker, "start_sandbox_agent", transport)
@@ -1727,7 +1727,7 @@ def test_actual_root_setup_failure_passes_task_to_absent_agent_cleanup(tmp_path,
         if args[:2]==["pane","split"]:return {"result":{"pane":{"pane_id":"owned"}}}
         if args[:2]==["pane","process-info"]:return {"result":{"process_info":{"shell_pid":123}}}
         if args[:2]==["pane","run"]:
-            if len(args)>=4 and "exec /run/herdr-bootstrap/hermes " in args[3]:raise RuntimeError("native start absent")
+            if len(args)>=4 and "/run/herdr-bootstrap/hermes " in args[3]:raise RuntimeError("native start absent")
             return None
         raise AssertionError(args)
     monkeypatch.setattr(worker,"_herdr_json",native)

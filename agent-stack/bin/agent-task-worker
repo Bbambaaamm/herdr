@@ -926,6 +926,8 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
                 == session["sandbox_attestation"]["policy_sha256"]
                 and verify_sandbox(sandbox_pid, HERDR, pane_marker, policy=policy,
                                    policy_mount=launch.mount, attempts=1)),
+            bootstrap_peer=lambda *, timeout_seconds: launch.mount.bootstrap.confirm(
+                timeout_seconds=timeout_seconds),
             timeout_seconds=60.0,
         )
         started_agent = (started.get("result") or {}).get("agent")

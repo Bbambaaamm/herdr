@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import types
+import uuid
 from pathlib import Path
 
 import pytest
@@ -69,7 +70,8 @@ def test_policy_bin_hermes_invokes_guarded_launcher():
         module._require_production_mount(module.BUNDLE_PATH, exact=True)
 
 
-def test_same_process_guard_precedes_hermes_main(monkeypatch, tmp_path):
+@pytest.mark.parametrize("profile_consumed", [False, True])
+def test_same_process_guard_precedes_hermes_main(monkeypatch, tmp_path, profile_consumed):
     module = _launcher()
     monkeypatch.setattr(module, '_verify_hermes_build', lambda root: module.HERMES_EXECUTOR)
     monkeypatch.setattr(module,'_require_host_bootstrap_authority',lambda:None)
@@ -99,12 +101,24 @@ def test_same_process_guard_precedes_hermes_main(monkeypatch, tmp_path):
     fake_guard.InvocationGuard = lambda grant: grant
     fake_main = types.ModuleType('hermes_cli.main')
     fake_main.__file__ = str(hermes / 'hermes')
+    fake_state = types.ModuleType('hermes_state')
+    (hermes / 'hermes_state.py').write_text('')
+    fake_state.__file__ = str(hermes / 'hermes_state.py')
+    fake_state.DEFAULT_DB_PATH = hermes / 'state.db'
+    private_state = Path('/tmp') / ('herdr-sdk-state-test-' + uuid.uuid4().hex)
+    monkeypatch.setattr(module, '_EPHEMERAL_SDK_STATE_ROOT', private_state)
+    monkeypatch.setattr(module, '_require_private_sdk_tmp', lambda: 123)
+    monkeypatch.setattr(module, '_sdk_state_mount_id', lambda path: 123)
+    monkeypatch.setitem(sys.modules, 'hermes_state', fake_state)
     def main():
         assert events == ['verified', 'installed']
+        assert fake_state.DEFAULT_DB_PATH == private_state / 'state.db'
+        assert private_state.stat().st_mode & 0o777 == 0o700
         assert Path('/proc/self/comm').read_text().strip() == 'hermes'
         assert os.environ["HERMES_SAFE_MODE"] == "1"
         assert os.environ["HERMES_ENABLE_PROJECT_PLUGINS"] == "0"
-        assert sys.argv == [str(hermes / 'hermes'), 'chat', '--profile', 'test']
+        assert sys.argv == ([str(hermes / 'hermes'), 'chat'] if profile_consumed
+                            else [str(hermes / 'hermes'), 'chat', '--profile', 'test'])
         events.append('main')
         return 0
     fake_main.main = main
@@ -124,12 +138,23 @@ def test_same_process_guard_precedes_hermes_main(monkeypatch, tmp_path):
                             events.append('verified') if root == tmp_path / 'bundle' and got == identity
                             else (_ for _ in ()).throw(AssertionError('alternate authority used'))
                         ) or types.SimpleNamespace(scope=types.SimpleNamespace(executors=(module.HERMES_EXECUTOR,))))
+    original_import = module.importlib.import_module
+    def import_with_profile_processing(name, *args, **kwargs):
+        if name == "hermes_cli.main":
+            assert events == ["verified", "installed"]
+            assert sys.argv == [str(hermes / "hermes"), "chat", "--profile", "test"]
+            if profile_consumed:
+                del sys.argv[-2:]
+        return original_import(name, *args, **kwargs)
+    monkeypatch.setattr(module.importlib, "import_module", import_with_profile_processing)
     saved_path, saved_argv = sys.path[:], sys.argv[:]
     try:
         assert module.bootstrap(['chat', '--profile', 'test']) == 0
     finally:
         sys.path[:] = saved_path
         sys.argv[:] = saved_argv
+        if private_state.exists():
+            private_state.rmdir()
     assert events == ['verified', 'installed', 'main']
 
 
@@ -590,3 +615,56 @@ def test_unauthenticated_bootstrap_never_sets_native_agent_label(monkeypatch):
         lambda: pytest.fail("unverified program must not be labelled Hermes"))
     with pytest.raises(SystemExit, match="host authority denied"):
         module.bootstrap([])
+
+
+@pytest.mark.parametrize("fields,filesystem", [
+    ("3 1 0:2 / / rw", "ext4 root rw"),
+    ("3 1 0:2 / /tmp ro", "tmpfs tmpfs rw"),
+    ("3 1 0:2 /tmp /tmp rw", "tmpfs tmpfs rw"),
+    ("4 1 0:2 / /tmp rw", "tmpfs tmpfs rw"),
+])
+def test_sdk_state_rejects_unverified_mount_before_import(monkeypatch, fields, filesystem):
+    module = _launcher()
+    monkeypatch.setattr(module, "_sdk_state_mount_id", lambda path: 3)
+    original_read = Path.read_bytes
+    def read(path):
+        if path == Path("/proc/self/mountinfo"):
+            return (fields + " - " + filesystem + "\n").encode()
+        return original_read(path)
+    monkeypatch.setattr(Path, "read_bytes", read)
+    monkeypatch.setattr(module.importlib, "import_module",
+                        lambda name: (_ for _ in ()).throw(AssertionError("SDK imported before mount check")))
+    with pytest.raises(SystemExit, match="private writable SDK state mount unavailable"):
+        module._configure_ephemeral_sdk_state(Path("/untrusted-sdk"))
+
+
+def test_sdk_state_uses_opened_mount_over_covered_host_tmp(monkeypatch):
+    module = _launcher()
+    monkeypatch.setattr(module, "_sdk_state_mount_id", lambda path: 4)
+    original_read = Path.read_bytes
+    def read(path):
+        if path == Path("/proc/self/mountinfo"):
+            return b"3 1 0:2 / /tmp ro - tmpfs tmpfs rw\n4 3 0:3 / /tmp rw - tmpfs tmpfs rw\n"
+        return original_read(path)
+    monkeypatch.setattr(Path, "read_bytes", read)
+    assert module._require_private_sdk_tmp() == 4
+
+
+def test_sdk_state_rejects_existing_directory(monkeypatch, tmp_path):
+    module = _launcher()
+    fake_state = types.ModuleType("hermes_state")
+    fake_state.__file__ = str(tmp_path / "hermes_state.py")
+    (tmp_path / "hermes_state.py").write_text("")
+    fake_state.DEFAULT_DB_PATH = tmp_path / "host-state.db"
+    directory = Path("/tmp") / ("herdr-sdk-state-existing-" + uuid.uuid4().hex)
+    directory.mkdir(mode=0o700)
+    monkeypatch.setattr(module, "_EPHEMERAL_SDK_STATE_ROOT", directory)
+    monkeypatch.setattr(module, "_require_private_sdk_tmp", lambda: 123)
+    monkeypatch.setattr(module, "_sdk_state_mount_id", lambda path: 123)
+    monkeypatch.setitem(sys.modules, "hermes_state", fake_state)
+    try:
+        with pytest.raises(SystemExit, match="fresh private SDK state unavailable"):
+            module._configure_ephemeral_sdk_state(tmp_path)
+        assert fake_state.DEFAULT_DB_PATH == tmp_path / "host-state.db"
+    finally:
+        directory.rmdir()

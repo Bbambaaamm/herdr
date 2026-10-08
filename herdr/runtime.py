@@ -808,6 +808,8 @@ class HerdrChildRuntime:
                             attempts=1, pinned_worktree=self.pinned_worktree,
                             child_workspace_writable=self._child_workspace_writable(lease.task_id),
                             policy_mount=launch.mount)),
+                    bootstrap_peer=lambda *, timeout_seconds: launch.mount.bootstrap.confirm(
+                        timeout_seconds=timeout_seconds),
                     timeout_seconds=60.0)
             except RuntimeError as exc:
                 raise HerdrRuntimeError("child_agent_start_unverified", str(exc)) from exc
