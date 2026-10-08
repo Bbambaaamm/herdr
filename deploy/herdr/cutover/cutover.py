@@ -988,7 +988,10 @@ def deployed_document(release: dict[str, object], config_digest: str, deployed_a
 def write_deployed(document: dict[str, object]) -> None:
     need(grp is not None, "linux_group_database_required")
     group = grp.getgrnam("agent-platform-read").gr_gid
-    atomic_write(PUBLIC_STATE, canonical_json(document), 0o640, 0, group)
+    # The bounded marker is non-secret release identity. The state directory
+    # remains 0750, with execute-only ACL for the audited preflight operator.
+    # Readability must not grant the operator access to the private queue.
+    atomic_write(PUBLIC_STATE, canonical_json(document), 0o644, 0, group)
 
 
 def assert_hardening() -> None:

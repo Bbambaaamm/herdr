@@ -19,6 +19,34 @@ validated consumer policy overlays, `RELEASE.json`, and `MANIFEST.sha256`. It do
 not contain secrets, credentials, databases, logs, prompts, raw queries, or the
 external Herdr binary.
 
+## One-time RC26 operator-marker access migration
+
+The current RC26 marker is `root:agent-platform-read 0640` inside an
+`agentops:agent-platform-read 0750` directory. The documented unprivileged
+cutover operator `quantadmin` cannot traverse that directory. Do not expose
+`queue.json`, usage ledgers, or the directory listing by changing the directory
+to 0755 or adding the operator to `agent-platform-read`.
+
+Only after independent review of the **signed candidate release** and restoration
+of staging disk headroom (#126), extract the verified archive into a fresh
+mode-0700 operator directory. From that reviewed extracted release root, execute
+this **explicit, one-time privileged command** before unprivileged preflight:
+
+```sh
+sudo /usr/bin/python3 -I -B deploy/herdr/cutover/bootstrap_operator_marker.py
+```
+
+This operation is pinned to the exact current RC26 tag/commit. As root it verifies
+the current immutable release metadata, manifest and installed unit hashes
+*before* changing anything. It grants `quantadmin` execute-only directory
+traversal (`u:quantadmin:--x` POSIX ACL) and makes only the root-owned bounded,
+nonsecret `deployed-release.json` readable (`0644`); the remaining state files
+and directory listing remain inaccessible. It also probes real operator access.
+Any unsupported identity or ACL result fails closed. Neither an old RC22 bridge
+nor a generic permission-bypass exception is introduced. Once the bridge has
+succeeded, perform the normal unprivileged preflight below; it must still check
+manifest, content and unit identity exactly.
+
 ## Unprivileged preflight
 
 Extract the verified archive into a fresh private operator directory. Run the
