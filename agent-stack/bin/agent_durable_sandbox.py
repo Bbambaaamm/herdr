@@ -94,6 +94,23 @@ def frozen_policy() -> Path:
         raise
 
 
+def _ephemeral_sdk_runtime_dirs(home: Path) -> tuple[Path, ...]:
+    """Mask only SDK data directories; named profiles keep immutable inputs."""
+    root = home / ".hermes"
+    profiles = root / "profiles"
+    if root.is_symlink() or profiles.is_symlink():
+        raise RuntimeError("durable_sdk_profile_alias_unverified")
+    roots = [root]
+    if profiles.is_dir():
+        entries = sorted(profiles.iterdir())
+        if len(entries) > 128:
+            raise RuntimeError("durable_sdk_profile_count_exceeded")
+        roots.extend(p for p in entries if p.is_dir() and not p.is_symlink())
+    candidates = [home / ".cache"]
+    candidates.extend(p / name for p in roots for name in ("sessions", "cache", "logs"))
+    return tuple(p for p in candidates if p.is_dir() and not p.is_symlink())
+
+
 def command(
     workspace: Path,
     real_binary: Path,
@@ -190,10 +207,8 @@ def command(
     if child_workspace_writable is not None or policy_mount is not None:
         # The host Hermes profile (including credentials/config) stays read-only.
         # Give a managed chat only ephemeral session and cache state.
-        for runtime_dir in (HOME / ".cache", HOME / ".hermes/sessions",
-                            HOME / ".hermes/cache", HOME / ".hermes/logs"):
-            if runtime_dir.is_dir():
-                args += ["--tmpfs", str(runtime_dir)]
+        for runtime_dir in _ephemeral_sdk_runtime_dirs(HOME):
+            args += ["--tmpfs", str(runtime_dir)]
         # Keep the host network namespace: Hermes needs provider egress and
         # the durable delegation bridge uses an abstract AF_UNIX socket, which
         # is scoped by the network namespace. Network-capable model tools are

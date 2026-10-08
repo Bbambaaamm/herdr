@@ -180,3 +180,37 @@ def test_bootstrap_callback_is_required_before_native_input(monkeypatch):
     with pytest.raises(RuntimeError,match="launch_invalid"):
         launch(module,invoke,boundary)
     assert calls==[]
+
+
+def test_named_profile_runtime_masks_do_not_include_credentials_or_aliases(tmp_path):
+    module = sandbox_module()
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "quantlab"
+    for parent in (root, profile):
+        for name in ("sessions", "cache", "logs"):
+            (parent / name).mkdir(parents=True)
+        (parent / "config.yaml").write_text("approved")
+        (parent / ".env").write_text("approved")
+    outside = tmp_path / "foreign"
+    outside.mkdir()
+    (root / "profiles" / "alias").symlink_to(outside, target_is_directory=True)
+    (profile / "logs").rmdir()
+    (profile / "logs").symlink_to(outside, target_is_directory=True)
+    actual = module._ephemeral_sdk_runtime_dirs(tmp_path)
+    assert profile / "sessions" in actual
+    assert profile / "cache" in actual
+    assert profile / "logs" not in actual
+    assert outside not in actual
+    assert all(p.name in {"sessions", "cache", "logs", ".cache"} for p in actual)
+    assert all("alias" not in p.parts for p in actual)
+
+
+def test_runtime_masks_reject_profile_root_alias(tmp_path):
+    module = sandbox_module()
+    root = tmp_path / ".hermes"
+    root.mkdir()
+    outside = tmp_path / "foreign"
+    outside.mkdir()
+    (root / "profiles").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="profile_alias_unverified"):
+        module._ephemeral_sdk_runtime_dirs(tmp_path)

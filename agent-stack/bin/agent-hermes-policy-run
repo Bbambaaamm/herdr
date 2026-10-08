@@ -516,6 +516,11 @@ def _configure_ephemeral_sdk_state(hermes_root: Path) -> None:
         raise SystemExit("SDK state must be inside the private temporary mount")
     state = importlib.import_module("hermes_state")
     _require_module_origin(state, hermes_root, "hermes_state")
+    # Import after profile consumption so configuration and credentials are still
+    # loaded from the approved read-only home. The pinned CLI uses _hermes_home
+    # for paste files and interactive history, independently of SessionDB.
+    cli = importlib.import_module("cli")
+    _require_module_origin(cli, hermes_root, "cli")
     try:
         directory.mkdir(mode=0o700)
         actual = directory.lstat()
@@ -528,6 +533,7 @@ def _configure_ephemeral_sdk_state(hermes_root: Path) -> None:
     # The pinned SDK resolves this override at each SessionDB acquisition.
     # Configuration, credentials and the host's session database stay read-only.
     state.DEFAULT_DB_PATH = directory / "state.db"
+    cli._hermes_home = directory
 
 
 @contextmanager
