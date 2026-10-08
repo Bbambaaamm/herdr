@@ -29,12 +29,48 @@ to 0755 or adding the operator to `agent-platform-read`.
 
 Only after independent review of the **signed candidate release** and restoration
 of staging disk headroom (#126), extract the verified archive into a fresh
-mode-0700 operator directory. From that reviewed extracted release root, execute
-this **explicit, one-time privileged command** before unprivileged preflight:
+mode-0700 operator directory. Never execute Python with `sudo` from that
+operator-writable extracted tree: Python `-I` does not authenticate imported
+source files.
+
+From the *verified* archive's extracted source root, copy **only** the four
+reviewed bootstrap code files to an explicitly root-owned, non-writable tree.
+Verify the exact pinned SHA-256 for each copied file **before** executing any
+Python as root. This block is deliberately pinned to the reviewed files and
+must fail if their content differs; future edits require an independent
+re-review and regenerated published hashes.
 
 ```sh
-sudo /usr/bin/python3 -I -B deploy/herdr/cutover/bootstrap_operator_marker.py
+REVIEWED_EXTRACTED=/home/quantadmin/herdr-cutover/VERIFIED-RELEASE-TREE
+ROOT=/var/lib/herdr/marker-bootstrap-rc26
+test -d "$REVIEWED_EXTRACTED" || exit 1
+sudo /usr/bin/install -d -o root -g root -m 0700 "$ROOT"
+for directory in deploy deploy/herdr deploy/herdr/cutover herdr; do
+  sudo /usr/bin/install -d -o root -g root -m 0755 "$ROOT/$directory"
+done
+for file in \
+  deploy/herdr/cutover/bootstrap_operator_marker.py \
+  deploy/herdr/cutover/cutover.py \
+  herdr/release.py \
+  herdr/__init__.py
+do
+  sudo /usr/bin/install -o root -g root -m 0444 \
+    "$REVIEWED_EXTRACTED/$file" "$ROOT/$file"
+done
+sudo /usr/bin/sha256sum -c - <<'REVIEWED-RC26-MARKER-HASHES'
+77644732d05af4718ea54d761fbc91c0b85a054c4e1b8347b4d633ebb01158df  /var/lib/herdr/marker-bootstrap-rc26/deploy/herdr/cutover/bootstrap_operator_marker.py
+cc7364794891bef2fd4d2959052d5082f39465daf18acb51e08bf62126db637a  /var/lib/herdr/marker-bootstrap-rc26/deploy/herdr/cutover/cutover.py
+626f3b7f15559f786a1744fd468e0459bde3133552977d948f3136ceefe48124  /var/lib/herdr/marker-bootstrap-rc26/herdr/release.py
+0245395e84000b625b82b0ebf6e9a059cd7c1a496e89896d448cdb2073b3433b  /var/lib/herdr/marker-bootstrap-rc26/herdr/__init__.py
+REVIEWED-RC26-MARKER-HASHES
+[ "$?" -eq 0 ] || exit 1
+sudo /usr/bin/python3 -I -B \
+  "$ROOT/deploy/herdr/cutover/bootstrap_operator_marker.py"
 ```
+
+The root-owned tree is not a new production release; it is a temporary,
+pinned tool for one strictly scoped access migration. Preserve its provenance
+and operator audit evidence, and do not repurpose it for task execution.
 
 This operation is pinned to the exact current RC26 tag/commit. As root it verifies
 the current immutable release metadata, manifest and installed unit hashes
