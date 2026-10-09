@@ -180,13 +180,13 @@ def test_opt_in_sandbox_rejects_profile_selection_or_authority_mismatch(tmp_path
                 sandbox.command(workspace, hermes, policy=policy, policy_mount=StubMount(),
                                 private_profile_snapshot=snapshot, hermes_profile="quantlab",
                                 pinned_worktree=pin, writable=(policy,))
-            command = sandbox.command(workspace, hermes, policy=policy,
-                                      policy_mount=StubMount(), pinned_worktree=pin,
-                                      private_profile_snapshot=snapshot, hermes_profile="quantlab")
-            assert command[0:4] == ["/usr/bin/python3", "-I", "-S", "-c"]
-            assert "--remount-ro" in command
-            assert command[-3:] == ["--noprofile", "--norc", "-i"]
-            assert "FIXTURE_TOKEN=not-a-real-credential" not in str(command)
+            # An arbitrary host mount or a merely digest-checked,
+            # agentops-owned code copy does not grant private-profile launch.
+            with pytest.raises(RuntimeError, match="durable_private_runtime_not_immutable"):
+                sandbox.command(workspace, hermes, policy=policy,
+                                policy_mount=StubMount(), pinned_worktree=pin,
+                                private_profile_snapshot=snapshot,
+                                hermes_profile="quantlab")
         finally:
             pin.close()
 
@@ -222,9 +222,9 @@ def test_real_host_selected_private_profile_mounts_and_attestation(tmp_path, mon
     config = tmp_path / "fake-config-control"
     config.mkdir()
     monkeypatch.setattr(sandbox, "HERDR_CONFIG", config)
-
-    class StubMount:
-        def descriptors(self): return []
+    immutable_policy_mount, immutable_stage = _root_published_mount_for_physical_test(
+        tmp_path
+    )
 
     with approved.freeze() as snapshot:
         fd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -232,7 +232,8 @@ def test_real_host_selected_private_profile_mounts_and_attestation(tmp_path, mon
         pin = sandbox.PinnedWorktree(workspace, fd, info.st_dev, info.st_ino, workspace.parent)
         args = sandbox.command(
             workspace, hermes, policy=policy,
-            policy_mount=StubMount(), private_profile_snapshot=snapshot,
+            policy_mount=immutable_policy_mount,
+            private_profile_snapshot=snapshot,
             pinned_worktree=pin, hermes_profile=approved.name,
         )
         assert "FIXTURE_TOKEN" not in str(args)
@@ -285,6 +286,10 @@ def test_real_host_selected_private_profile_mounts_and_attestation(tmp_path, mon
                 except subprocess.TimeoutExpired:
                     proc.kill()
             pin.close()
+            for tree in (immutable_policy_mount.code, *immutable_policy_mount.runtime):
+                tree.cleanup_after_pane_closed()
+            immutable_stage.close()
+            immutable_stage.path.unlink(missing_ok=True)
 
 
 def test_host_profile_refresh_is_required_before_seal(tmp_path, monkeypatch):
@@ -507,3 +512,42 @@ def test_retained_profile_identity_must_match_signed_attestation(tmp_path):
             proof, identity=planned.identity, pid=os.getpid(),
             attestation=attestation, require_bootstrap=False,
         )
+
+
+def _root_published_mount_for_physical_test(tmp_path):
+    """A nonsecret, root-owned released file stands in for code and Python.
+
+    No running Hermes, secret or provider is accessed. The production
+    publisher must independently publish the *real* signed code/runtime.
+    """
+    from herdr.policy_launch import (
+        FrozenTree, PolicyMount, CODE_TARGET, RUNTIME_TARGETS,
+    )
+    from herdr.security import stage_policy_bundle
+    published = Path(
+        "/opt/herdr/releases/v0.3.0-rc.26-4d09b58b4416/provenance"
+    )
+    filename = "external-runtime-dependency.txt"
+    if not (published / filename).is_file():
+        pytest.skip("staging operator-published test fixture unavailable")
+    manifest = {
+        filename: hashlib.sha256((published / filename).read_bytes()).hexdigest()
+    }
+    stage = stage_policy_bundle(tmp_path / "policy-stage.json")
+    trees = []
+    try:
+        for target in [CODE_TARGET, *sorted(RUNTIME_TARGETS)]:
+            trees.append(
+                FrozenTree.attach_immutable(
+                    published, target=target, files=manifest,
+                )
+            )
+        result = PolicyMount(stage, trees[0], tuple(trees[1:]))
+        result.require_immutable_runtime()
+        return result, stage
+    except BaseException:
+        for tree in trees:
+            tree.cleanup_after_pane_closed()
+        stage.close()
+        stage.path.unlink(missing_ok=True)
+        raise

@@ -59,9 +59,34 @@ def _open_relative(root_fd, name):
         os.close(directory)
 
 
+def _verify_root_owned_ancestry(path: Path) -> None:
+    """Require every source ancestor to be a non-alias root-controlled inode.
+
+    A readonly bwrap mount of a same-UID-writable directory is NOT immutable:
+    the host user can rename or rewrite children after bwrap starts. Trusted
+    release trees must therefore live under a root-owned, non-writable chain.
+    """
+    path = Path(path)
+    _require(path.is_absolute() and str(path) == os.path.normpath(str(path))
+             and ".." not in path.parts, "immutable root path invalid")
+    current = Path("/")
+    for component in ("", *path.parts[1:]):
+        if component:
+            current /= component
+        info = os.lstat(current)
+        _require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0
+                 and not stat.S_IMODE(info.st_mode) & 0o022,
+                 "immutable source ancestor not root protected")
+
+
+def _verify_immutable_entry(info: os.stat_result) -> None:
+    _require(info.st_uid == 0 and not stat.S_IMODE(info.st_mode) & 0o022,
+             "immutable source entry writable by host user")
+
+
 @dataclass
 class FrozenTree:
-    """A private copy, not a read-only alias of a mutable worker checkout."""
+    """An approved code tree, either transient or root-owned and immutable."""
     path: Path
     target: Path
     fd: int
@@ -70,12 +95,15 @@ class FrozenTree:
     source_digest: str
     files: tuple[tuple[str, str], ...]
     max_file_bytes: int = 4_194_304
+    immutable_host_source: bool = False
 
     @property
     def source(self):
         return f"/proc/{os.getpid()}/fd/{self.fd}"
 
     def verify(self):
+        if self.immutable_host_source:
+            _verify_root_owned_ancestry(self.path)
         expected_files = {name for name, _ in self.files}
         expected_dirs = {"/".join(name.split("/")[:i]) for name in expected_files
                          for i in range(1, len(name.split("/")))}
@@ -84,6 +112,8 @@ class FrozenTree:
             for child in os.listdir(directory_fd):
                 name = prefix + child
                 info = os.stat(child, dir_fd=directory_fd, follow_symlinks=False)
+                if self.immutable_host_source:
+                    _verify_immutable_entry(info)
                 if stat.S_ISDIR(info.st_mode):
                     _require(name in expected_dirs, "unexpected frozen directory")
                     found_dirs.add(name)
@@ -100,6 +130,9 @@ class FrozenTree:
         _require(found_files == expected_files and found_dirs == expected_dirs,
                  "frozen inventory differs from approved manifest")
         held, named = os.fstat(self.fd), os.lstat(self.path)
+        if self.immutable_host_source:
+            _verify_immutable_entry(held)
+            _verify_immutable_entry(named)
         _require(stat.S_ISDIR(held.st_mode) and stat.S_ISDIR(named.st_mode)
                  and (held.st_dev, held.st_ino) == (self.device, self.inode)
                  and (named.st_dev, named.st_ino) == (self.device, self.inode),
@@ -110,6 +143,8 @@ class FrozenTree:
                 info = os.fstat(fd)
                 _require(stat.S_ISREG(info.st_mode) and info.st_size <= self.max_file_bytes,
                          "frozen source shape changed")
+                if self.immutable_host_source:
+                    _verify_immutable_entry(info)
                 digest, remaining = hashlib.sha256(), info.st_size
                 while remaining:
                     chunk = os.read(fd, min(1_048_576, remaining))
@@ -195,12 +230,75 @@ class FrozenTree:
         finally:
             os.close(root_fd)
 
+    @classmethod
+    def attach_immutable(cls, source: Path, *, target: Path,
+                         files: Mapping[str, str], max_bytes=33_554_432,
+                         max_file_bytes=4_194_304):
+        """Pin an operator-published root-owned tree, never a user-writable copy.
+
+        The complete manifest is already approved by the trusted host policy.
+        This method verifies bytes/ownership without creating or modifying
+        *any* host file; source directory FD remains live until pane cleanup.
+        """
+        _require(isinstance(files, Mapping) and 0 < len(files) <= 65536
+                 and all(isinstance(name, str) and 0 < len(name) <= 1024
+                         and isinstance(digest, str) and _SHA.fullmatch(digest)
+                         for name, digest in files.items()),
+                 "immutable approved manifest invalid")
+        _require(type(max_bytes) is int and 0 < max_bytes <= 2_147_483_648
+                 and type(max_file_bytes) is int and 0 < max_file_bytes <= 268_435_456,
+                 "immutable source bounds invalid")
+        source, target = Path(source), Path(target)
+        _require(target.is_absolute() and ".." not in target.parts,
+                 "immutable mount target invalid")
+        _verify_root_owned_ancestry(source)
+        fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(fd)
+            _verify_immutable_entry(info)
+            # Bound the approved published asset before walking or hashing.
+            # An unlisted file/dir is rejected by verify(), never ignored.
+            total = 0
+            for name in sorted(files):
+                item_fd = _open_relative(fd, name)
+                try:
+                    entry = os.fstat(item_fd)
+                    _require(stat.S_ISREG(entry.st_mode)
+                             and entry.st_size <= max_file_bytes,
+                             "immutable published asset file invalid")
+                    _verify_immutable_entry(entry)
+                    total += entry.st_size
+                    _require(total <= max_bytes,
+                             "immutable published asset exceeds bound")
+                finally:
+                    os.close(item_fd)
+            result = cls(
+                source, target, fd, info.st_dev, info.st_ino,
+                hashlib.sha256(canonical_json_bytes(dict(sorted(files.items())))).hexdigest(),
+                tuple(sorted(files.items())), max_file_bytes, True,
+            )
+            result.verify()
+            return result
+        except BaseException:
+            os.close(fd)
+            raise
+
     def close(self):
         if self.fd >= 0:
             os.close(self.fd)
             self.fd = -1
 
     def cleanup_after_pane_closed(self):
+        if self.immutable_host_source:
+            # Never chmod, unlink or delete an operator-published immutable
+            # release tree. The host controller owns publication/retention;
+            # the worker only closes its held read-only directory descriptor,
+            # even if the independent verification reported root-side drift.
+            try:
+                self.verify()
+            finally:
+                self.close()
+            return
         self.verify()
         # Refuse cleanup if the named storage directory was replaced. This
         # method may only be called after the caller proves its pane is closed.
@@ -244,6 +342,16 @@ class PolicyMount:
         self.bootstrap = None
         targets = [str(BUNDLE_TARGET), str(code.target), *(str(x.target) for x in runtime)]
         _require(len(targets) == len(set(targets)), "duplicate policy mount target")
+
+    def require_immutable_runtime(self) -> None:
+        """Hard activation gate, separate from one-time SHA attestation."""
+        _require(all(tree.immutable_host_source for tree in
+                     (self.code, *self.runtime)),
+                 "private profile requires root-protected runtime sources")
+        # Do not trust only a boolean asserted by a caller. Recheck the held
+        # read-only inodes and all roots before any sandbox spawn.
+        for tree in (self.code, *self.runtime):
+            tree.verify()
 
     def descriptors(self):
         self.stage._same_inode()
@@ -527,6 +635,45 @@ class ApprovedTree:
 
 
 @dataclass(frozen=True)
+class ApprovedImmutableTree:
+    """Reviewed root-published Hermes/Python code, immutable against host UID.
+
+    This deliberately does not copy source files into agentops-owned storage.
+    The host release operator must first publish the complete approved tree
+    under a root-owned, non-writable ancestry. No runtime chmod/chown or sudo.
+    """
+    source: Path
+    target: Path
+    files: Mapping[str, str]
+    max_bytes: int = 33_554_432
+    max_file_bytes: int = 4_194_304
+
+    def __post_init__(self):
+        from types import MappingProxyType
+        _require(isinstance(self.source, Path) and self.source.is_absolute(),
+                 "immutable approved tree source invalid")
+        _require(isinstance(self.target, Path) and self.target.is_absolute(),
+                 "immutable approved tree target invalid")
+        _require(isinstance(self.files, Mapping) and len(self.files) > 0,
+                 "immutable approved tree manifest required")
+        object.__setattr__(self, "files", MappingProxyType(dict(self.files)))
+
+    def freeze(self, storage, writable_roots):
+        # Avoid path aliases via worker writable roots even when a temporary
+        # directory happens to have root ownership. This is a separate
+        # root-owned publisher, never a child-created copy.
+        path = self.source
+        for raw in writable_roots:
+            root = Path(raw).absolute()
+            _require(not (path == root or root in path.parents),
+                     "immutable source overlaps writable workspace")
+        return FrozenTree.attach_immutable(
+            path, target=self.target, files=self.files,
+            max_bytes=self.max_bytes, max_file_bytes=self.max_file_bytes,
+        )
+
+
+@dataclass(frozen=True)
 class ApprovedProfile:
     """Host-owned, review-bound profile digests (never sourced from a task).
 
@@ -624,6 +771,10 @@ class PreparedPolicyLaunch:
         _require(isinstance(attestation, dict)
                  and attestation.get("approved_profile") == approved,
                  "approved profile must match signed sandbox attestation")
+        if approved is not None:
+            # Identity-consistent profile is not sufficient if the live host
+            # can rewrite imported Hermes/Python code after first attestation.
+            self.mount.require_immutable_runtime()
         bound, sealed = self.mount.seal(pid, self.grant, identity=self.identity, attestation=attestation,
                                        tools=tools, permissions=permissions, private_key=self._private_key,
                                        key_id=self._key_id, parent=self._parent)
@@ -714,16 +865,19 @@ class HostPolicyLaunchFactory:
     a TaskGraph, prompt or queue record. It must return the grant accepted by the
     consumer/provider policy. Missing grants deny before a pane is created.
     """
-    def __init__(self, *, code: ApprovedTree, runtime: tuple[ApprovedTree, ...],
+    def __init__(self, *, code: ApprovedTree | ApprovedImmutableTree,
+                 runtime: tuple[ApprovedTree | ApprovedImmutableTree, ...],
                  storage: Path, authorize, writable_roots=(), parent_grant=None,
                  approved_profile: ApprovedProfile | None = None,
                  profile_preflight=None,
                  parent_approved_profile: ApprovedProfile | None = None,
                  parent_launch: PreparedPolicyLaunch | None = None):
-        _require(isinstance(code, ApprovedTree) and code.target == CODE_TARGET,
+        approved_types = (ApprovedTree, ApprovedImmutableTree)
+        _require(isinstance(code, approved_types) and code.target == CODE_TARGET,
                  "approved policy code required")
-        _require(len(runtime) == 2 and all(isinstance(x, ApprovedTree) for x in runtime)
-                 and {x.target for x in runtime} == RUNTIME_TARGETS, "approved exact runtime required")
+        _require(len(runtime) == 2 and all(isinstance(x, approved_types) for x in runtime)
+                 and {x.target for x in runtime} == RUNTIME_TARGETS,
+                 "approved exact runtime required")
         _require(callable(authorize), "host policy authority required")
         _require(parent_grant is None or isinstance(parent_grant, SecurityGrant),
                  "typed parent grant required")

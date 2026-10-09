@@ -466,6 +466,17 @@ def command(
         # complete FD-owned write mounts; don't regress legacy behavior.
         if pinned_worktree is None or writable:
             raise RuntimeError("durable_private_profile_sources_unpinned")
+        from herdr.policy_launch import PolicyMount
+        from herdr.security import SecurityError
+        # A readonly bind of an agentops-owned snapshot is mutable *from the
+        # host* even when its contents passed SHA checks at launch. Only
+        # complete root-published source trees can back a private profile.
+        if not isinstance(policy_mount, PolicyMount):
+            raise RuntimeError("durable_private_runtime_not_immutable")
+        try:
+            policy_mount.require_immutable_runtime()
+        except SecurityError as exc:
+            raise RuntimeError("durable_private_runtime_not_immutable") from exc
         private_profile_mounts = private_profile_snapshot.mount_arguments()
     else:
         private_profile_mounts = []
