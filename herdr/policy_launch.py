@@ -487,6 +487,42 @@ class ApprovedTree:
                                  max_file_bytes=self.max_file_bytes)
 
 
+@dataclass(frozen=True)
+class ApprovedProfile:
+    """Host-owned, review-bound profile digests (never sourced from a task).
+
+    Only the host launch factory can supply this object. The untrusted agent
+    receives neither the authority to approve file hashes nor raw credentials.
+    """
+    name: str
+    source: Path
+    files: Mapping[str, str]
+
+    def __post_init__(self):
+        from types import MappingProxyType
+        from .private_profile_namespace import _PROFILE, _relative, _HEX, _MAX_FILES
+        _require(isinstance(self.name, str) and bool(_PROFILE.fullmatch(self.name)),
+                 "approved profile name invalid")
+        _require(isinstance(self.source, Path) and self.source.is_absolute()
+                 and self.source.name == self.name,
+                 "approved profile source invalid")
+        _require(isinstance(self.files, Mapping)
+                 and 2 <= len(self.files) <= _MAX_FILES
+                 and {"config.yaml", ".env"} <= set(self.files),
+                 "approved profile manifest required")
+        for relative, digest in self.files.items():
+            _relative(relative)
+            _require(isinstance(digest, str) and bool(_HEX.fullmatch(digest)),
+                     "approved profile digest invalid")
+        object.__setattr__(self, "files", MappingProxyType(dict(self.files)))
+
+    def freeze(self):
+        from .private_profile_namespace import PrivateProfileSnapshot
+        return PrivateProfileSnapshot.from_approved(
+            self.source, name=self.name, approved_sha256=self.files,
+        )
+
+
 _LIVE_PREPARED_LAUNCHES = {}
 
 
@@ -496,8 +532,14 @@ def _launch_key(identity):
 
 class PreparedPolicyLaunch:
     """Private host object retained until the exact owned pane closes."""
-    def __init__(self, mount, grant, private_key, key_id, parent=None):
+    def __init__(self, mount, grant, private_key, key_id, parent=None,
+                 private_profile_snapshot=None):
+        from .private_profile_namespace import PrivateProfileSnapshot
+        _require(private_profile_snapshot is None
+                 or isinstance(private_profile_snapshot, PrivateProfileSnapshot),
+                 "typed host profile snapshot required")
         self.mount, self.grant = mount, grant
+        self.private_profile_snapshot = private_profile_snapshot
         self._private_key, self._key_id, self._parent = private_key, key_id, parent
         self.sealed = None
         self._process_start_ticks = None
@@ -598,6 +640,8 @@ class PreparedPolicyLaunch:
             self.mount.stage.path.unlink()
             for tree in (self.mount.code, *self.mount.runtime):
                 tree.cleanup_after_pane_closed()
+            if self.private_profile_snapshot is not None:
+                self.private_profile_snapshot.close()
             self._private_key = None
             self._resources_closed = True
         if self._ownership is not None:
@@ -615,7 +659,8 @@ class HostPolicyLaunchFactory:
     consumer/provider policy. Missing grants deny before a pane is created.
     """
     def __init__(self, *, code: ApprovedTree, runtime: tuple[ApprovedTree, ...],
-                 storage: Path, authorize, writable_roots=(), parent_grant=None):
+                 storage: Path, authorize, writable_roots=(), parent_grant=None,
+                 approved_profile: ApprovedProfile | None = None):
         _require(isinstance(code, ApprovedTree) and code.target == CODE_TARGET,
                  "approved policy code required")
         _require(len(runtime) == 2 and all(isinstance(x, ApprovedTree) for x in runtime)
@@ -623,6 +668,9 @@ class HostPolicyLaunchFactory:
         _require(callable(authorize), "host policy authority required")
         _require(parent_grant is None or isinstance(parent_grant, SecurityGrant),
                  "typed parent grant required")
+        _require(approved_profile is None or isinstance(approved_profile, ApprovedProfile),
+                 "typed host approved profile required")
+        self.approved_profile = approved_profile
         self.code, self.runtime, self.storage = code, tuple(runtime), Path(storage)
         self.authorize, self.writable_roots, self.parent_grant = authorize, tuple(writable_roots), parent_grant
 
@@ -669,14 +717,20 @@ class HostPolicyLaunchFactory:
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
         from .launch_ownership import LaunchOwnership
         ownership = LaunchOwnership.create(self.storage, identity)
-        snapshots, stage = [], None
+        snapshots, stage, profile_snapshot = [], None, None
         try:
             for definition in (self.code, *self.runtime):
                 snapshots.append(definition.freeze(ownership.directory, (*self.writable_roots, path)))
+            # A trusted host-owned manifest is the only way to enable the new
+            # profile. Bind it after the existing grant/parent admission, never
+            # to model-supplied profile hashes or task routing metadata.
+            if self.approved_profile is not None:
+                profile_snapshot = self.approved_profile.freeze()
             import uuid
             stage = stage_policy_bundle(ownership.directory / ("grant-" + uuid.uuid4().hex + ".json"))
             prepared=PreparedPolicyLaunch(PolicyMount(stage, snapshots[0], snapshots[1:]),
-                                          grant, Ed25519PrivateKey.generate(), "host-launch", self.parent_grant)
+                                          grant, Ed25519PrivateKey.generate(), "host-launch", self.parent_grant,
+                                          private_profile_snapshot=profile_snapshot)
             prepared._ownership = ownership
             from .host_bootstrap import HostBootstrap
             prepared.mount.bootstrap=HostBootstrap.create(
@@ -689,6 +743,8 @@ class HostPolicyLaunchFactory:
                 stage.path.unlink(missing_ok=True)
             for snapshot in snapshots:
                 snapshot.cleanup_after_pane_closed()
+            if profile_snapshot is not None:
+                profile_snapshot.close()
             ownership.cleanup_after_pane_closed()
             raise
 

@@ -807,7 +807,10 @@ class HerdrChildRuntime:
                             record.execution_marker, policy=proof["policy_file"],
                             attempts=1, pinned_worktree=self.pinned_worktree,
                             child_workspace_writable=self._child_workspace_writable(lease.task_id),
-                            policy_mount=launch.mount)),
+                            policy_mount=launch.mount,
+                            **({"private_profile_snapshot": launch.private_profile_snapshot}
+                               if getattr(launch, "private_profile_snapshot", None)
+                               is not None else {}))),
                     bootstrap_peer=lambda *, timeout_seconds: launch.mount.bootstrap.confirm(
                         timeout_seconds=timeout_seconds),
                     timeout_seconds=60.0)
@@ -980,6 +983,10 @@ class HerdrChildRuntime:
         launch = self._policy_launches.get(task_id)
         if not isinstance(launch, PreparedPolicyLaunch):
             raise HerdrRuntimeError("child_invocation_policy_missing", task_id)
+        private_snapshot = getattr(launch, "private_profile_snapshot", None)
+        approved_name = self.env.get("HERDR_HERMES_PROFILE", DEFAULT_PROFILE)
+        if private_snapshot is not None and private_snapshot.name != approved_name:
+            raise HerdrRuntimeError("child_approved_profile_identity_mismatch", task_id)
         self._policy_panes[pane_id] = launch
         policy = sandbox.frozen_policy()
         try:
@@ -1025,6 +1032,8 @@ class HerdrChildRuntime:
                 owned_write_pins=self._owned_write_pins.get(task_id),
                 admission_root=(self.scheduler.ownership_registry.root
                                 if getattr(self.scheduler, "ownership_registry", None) is not None else None),
+                **({"private_profile_snapshot": private_snapshot,
+                    "hermes_profile": approved_name} if private_snapshot is not None else {}),
             )
             invoke(["pane", "run", pane_id, sandbox.shell_command(sandbox_args)],
                    timeout_seconds=15.0)
@@ -1043,7 +1052,9 @@ class HerdrChildRuntime:
                         sandbox_pid, Path(real), marker, policy=policy, attempts=1,
                         pinned_worktree=self.pinned_worktree,
                         child_workspace_writable=self._child_workspace_writable(task_id),
-                        policy_mount=launch.mount, owned_write_pins=self._owned_write_pins.get(task_id)):
+                        policy_mount=launch.mount, owned_write_pins=self._owned_write_pins.get(task_id),
+                        **({"private_profile_snapshot": private_snapshot}
+                           if private_snapshot is not None else {})):
                     if time.monotonic() <= deadline:
                         break
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))

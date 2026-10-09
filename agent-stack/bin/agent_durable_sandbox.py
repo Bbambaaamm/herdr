@@ -2,6 +2,7 @@
 import os
 import re
 import json
+import hashlib
 import shlex
 import secrets
 import shutil
@@ -412,7 +413,18 @@ def command(
     policy_mount=None,
     owned_write_pins=None,
     admission_root: Path | None = None,
+    private_profile_snapshot=None,
+    hermes_profile: str | None = None,
 ) -> list[str]:
+    if private_profile_snapshot is not None:
+        from herdr.private_profile_namespace import PrivateProfileSnapshot
+        if (policy_mount is None
+                or not isinstance(private_profile_snapshot, PrivateProfileSnapshot)
+                or hermes_profile != private_profile_snapshot.name):
+            raise RuntimeError("durable_private_profile_authority_required")
+        private_profile_mounts = private_profile_snapshot.mount_arguments()
+    else:
+        private_profile_mounts = []
     if admission_root is not None and policy_mount is None:
         raise RuntimeError("ownership_epoch_authenticated_launch_required")
     workspace = Path(workspace).absolute() if pinned_worktree else workspace.resolve(strict=True)
@@ -459,6 +471,7 @@ def command(
         "--unshare-pid",
         *(["--die-with-parent"] if admission_root is not None else []),
         "--tmpfs", "/tmp",
+        *(private_profile_mounts[:-2] if private_profile_mounts else []),
         *([] if pinned_worktree is None else
           ["--tmpfs", str(workspace.parent), "--dir", str(workspace)]),
         (("--bind-fd" if child_workspace_writable is not False else "--ro-bind-fd")
@@ -495,10 +508,12 @@ def command(
             args += ["--bind-fd",str(entry["fd"]),entry["target"]]
 
     if child_workspace_writable is not None or policy_mount is not None:
-        # The host Hermes profile (including credentials/config) stays read-only.
-        # Give a managed chat only ephemeral session and cache state.
-        for runtime_dir in _ephemeral_sdk_runtime_dirs(HOME):
-            args += ["--tmpfs", str(runtime_dir)]
+        # With a reviewed, signed profile snapshot, the private HOME and
+        # exact writable runtime submounts already hide all mutable host
+        # profiles. Never overlay host-controlled profile directories here.
+        if private_profile_snapshot is None:
+            for runtime_dir in _ephemeral_sdk_runtime_dirs(HOME):
+                args += ["--tmpfs", str(runtime_dir)]
         # Keep the host network namespace: Hermes needs provider egress and
         # the durable delegation bridge uses an abstract AF_UNIX socket, which
         # is scoped by the network namespace. Network-capable model tools are
@@ -511,6 +526,8 @@ def command(
         # Host-only immutable copies override mutable checkout/runtime aliases.
         descriptors = policy_mount.descriptors()
         if owned_write_pins is not None:descriptors.extend(owned_write_pins.descriptors())
+        if private_profile_snapshot is not None:
+            descriptors.extend(private_profile_snapshot.fd_descriptors())
         args += ["--tmpfs", "/run", "--dir", "/run/herdr", "--dir", "/run/herdr-policy"]
         for entry in policy_mount.descriptors():
             args += ["--ro-bind-fd", str(entry["fd"]), entry["target"]]
@@ -520,6 +537,7 @@ def command(
         args += ["--setenv", "PATH", "/run/herdr-bootstrap:/usr/bin:/bin"]
     args += [
         "--setenv", "HERDR_DURABLE_SANDBOX", "1",
+        *(private_profile_mounts[-2:] if private_profile_mounts else []),
         "--", "/bin/bash", "--noprofile", "--norc", "-i",
     ]
     if policy_mount is not None:
@@ -910,6 +928,60 @@ def _sdk_runtime_masks_verified(root: Path, modes: dict[str, set[str]],
     return True
 
 
+def _private_profile_namespace_verified(
+    root: Path, modes: dict[str, set[str]],
+    filesystems: dict[str, str], snapshot,
+) -> bool:
+    """Attest selected sealed profile, readonly home and private runtimes.
+
+    This is additional physical evidence; it does not authorize an economic
+    attempt, relax the grant, or replace the verified code/worktree mounts.
+    """
+    from herdr.private_profile_namespace import PrivateProfileSnapshot
+    if not isinstance(snapshot, PrivateProfileSnapshot):
+        return False
+    try:
+        snapshot.verify()
+        if ("ro" not in modes.get(str(HOME), set())
+                or filesystems.get(str(HOME)) != "tmpfs"):
+            return False
+        profiles_dir = root / str(HOME / ".hermes/profiles").lstrip("/")
+        children = list(profiles_dir.iterdir())
+        if (len(children) != 1 or children[0].name != snapshot.name
+                or children[0].is_symlink() or not children[0].is_dir()):
+            return False
+        writable = {
+            str(snapshot.destination / name)
+            for name in ("sessions", "cache", "logs", "pastes")
+        }
+        for path in writable:
+            target = root / path.lstrip("/")
+            if (target.is_symlink() or not target.is_dir()
+                    or "rw" not in modes.get(path, set())
+                    or filesystems.get(path) != "tmpfs"):
+                return False
+        protected = HOME / ".hermes"
+        for mountpath, options in modes.items():
+            candidate = Path(mountpath)
+            if (candidate == protected or protected in candidate.parents):
+                if "rw" in options and mountpath not in writable:
+                    return False
+        for entry in snapshot.files:
+            destination = snapshot.destination / entry.relative
+            target = root / str(destination).lstrip("/")
+            if (target.is_symlink() or not target.is_file()
+                    or "ro" not in modes.get(str(destination), set())
+                    or filesystems.get(str(destination)) != "tmpfs"):
+                return False
+            raw = target.read_bytes()
+            if (len(raw) != entry.size
+                    or hashlib.sha256(raw).hexdigest() != entry.sha256):
+                return False
+        return True
+    except (OSError, RuntimeError, ValueError, IndexError):
+        return False
+
+
 def verify(
     pid: int,
     real_binary: Path,
@@ -921,6 +993,7 @@ def verify(
     child_workspace_writable: bool | None = None,
     policy_mount=None,
     owned_write_pins=None,
+    private_profile_snapshot=None,
 ) -> bool:
     """Require expected mounts, hidden Herdr paths and non-host namespaces."""
     # The kernel records the canonical destination when the CLI is a symlink.
@@ -975,6 +1048,9 @@ def verify(
                 and workspace_matches
                 and (policy_mount is None or _sdk_runtime_masks_verified(
                     root, modes, filesystems))
+                and (private_profile_snapshot is None
+                     or _private_profile_namespace_verified(
+                         root, modes, filesystems, private_profile_snapshot))
                 and hidden
                 and policy_matches
                 and ns
