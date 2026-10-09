@@ -175,6 +175,28 @@ class PrivateProfileSnapshot:
     def destination(self) -> Path:
         return self.home / ".hermes/profiles" / self.name
 
+    def fd_descriptors(self) -> list[dict[str, str | int]]:
+        """Typed descriptor metadata for the host-pinned bwrap FD launcher.
+
+        Do not include contents or credentials in command strings; the host
+        launcher reopens each sealed memfd by immutable inode and digest.
+        """
+        self.verify()
+        result: list[dict[str, str | int]] = []
+        for record in self.files:
+            info = os.fstat(record.fd)
+            result.append({
+                "source": f"/proc/{os.getpid()}/fd/{record.fd}",
+                "fd": record.fd,
+                "device": info.st_dev,
+                "inode": info.st_ino,
+                "kind": "sealed-profile-data",
+                "target": str(self.destination / record.relative),
+                "sha256": record.sha256,
+                "size": record.size,
+            })
+        return result
+
     def mount_arguments(self) -> list[str]:
         """Construct only profile/home mounts; caller must pin code/workspace.
 

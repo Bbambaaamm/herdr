@@ -44,17 +44,24 @@ connected to the live Herdr agent launcher.
    symlink have no effect on the profile snapshot visible to the sandbox.
 
 The prototype is fail-closed and does not silently select a model or call an
-external provider.
+external provider. It also tests the sealed FD transfer through the actual
+host policy launcher and the bwrap child, not just a direct bwrap invocation.
 
 ## Required production integration (NOT complete)
 
 - A trusted pre-admission authority must pin and sign the **approved digest
   manifest**, profile identity and referenced prefill inputs. Never let the
   untrusted worker approve its own `config.yaml`/`.env` hashes.
-- Extend the existing `_POLICY_FD_LAUNCHER` to transport the sealed file
-  descriptors via `--ro-bind-data` with exact identity, digest, size, seal
-  and target checks. Retain the pinned launch owner and descriptors until bwrap
-  has completed mounting them. No second scheduler or persistence backend.
+- The existing `_POLICY_FD_LAUNCHER` now has **dormant, opt-in** support
+  for transporting sealed descriptors via `--ro-bind-data`. It verifies
+  inode/device, seal bits, bounded size, digest, profile identity, target and
+  private HOME mount order; it rejects nested host rebinds over profile paths
+  and preserves the legacy launch path. A real subprocess/child namespace
+  test proves that the FD handoff works and that changing host input files
+  after launch does not alter the sandbox view. **The production root/child
+  caller has not yet been connected to this option.** The host authority must
+  retain the pinned snapshot FDs until bwrap finishes their mounts. No new
+  scheduler or persistence backend is introduced.
 - Reconstruct **only** explicitly admitted worktree, result slot, frozen Hermes
   code, frozen Python runtime and required bootstrap transport within private
   HOME using existing policy-owned FD bindings. Never restore the general

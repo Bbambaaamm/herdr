@@ -106,7 +106,7 @@ def test_policy_fd_launcher_rechecks_runtime_at_exec(tmp_path, attack):
                 "device": st.st_dev, "inode": st.st_ino,
                 "kind": "directory", "target": "/tmp/herdr-policy-race-fixture"}
         code = sandbox._POLICY_FD_LAUNCHER.replace(
-            'h=Path("/home/agentops")', "h=Path(" + repr(str(home)) + ")"
+            'home = Path("/home/agentops")', "home = Path(" + repr(str(home)) + ")"
         )
         assert code != sandbox._POLICY_FD_LAUNCHER
         arguments = ["/usr/bin/bwrap", "--ro-bind-fd", str(fd), item["target"],
