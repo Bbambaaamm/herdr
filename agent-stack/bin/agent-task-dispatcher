@@ -8,6 +8,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from agent_autonomy_gate import disk_headroom_blocker
+
 HOME = Path("/home/agentops")
 BIN = Path(__file__).resolve().parent
 WORKER = BIN / "agent-task-worker"
@@ -70,6 +72,10 @@ def due_tasks() -> list[Path]:
             log(f"invalid task {path.name}: {exc}")
             continue
         if when <= current:
+            # Do not claim pending Herdr work on a saturated server. Keep the
+            # exact task/run identity intact for a later safe scheduler tick.
+            if disk_headroom_blocker(data.get("repo"), data.get("consumer")):
+                continue
             due.append((priority, when, path))
     return [path for _, _, path in sorted(due, key=lambda item: (item[0], item[1], item[2].name))]
 
@@ -83,6 +89,12 @@ def launch(path: Path, dry_run: bool = False) -> int:
 
     task = json.loads(path.read_text(encoding="utf-8"))
     task_id = str(task["id"])
+    # Recheck immediately before the pending→running claim, closing the gap
+    # if disk pressure changed after due_tasks() selected this path.
+    blocker = disk_headroom_blocker(task.get("repo"), task.get("consumer"))
+    if blocker:
+        log(f"withhold dispatch {task_id}: {blocker}")
+        return 0
     running = RUNNING / f"{task_id}.json"
     if running.exists():
         log(f"refuse duplicate running task {task_id}")

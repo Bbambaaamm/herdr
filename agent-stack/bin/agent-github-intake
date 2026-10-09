@@ -10,6 +10,8 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+from agent_autonomy_gate import disk_headroom_blocker
+
 HOME = Path("/home/agentops")
 ROOT = HOME / ".local/state/agent-stack/tasks"
 PENDING = ROOT / "pending"
@@ -462,10 +464,22 @@ def main() -> int:
             }
 
             if active:
-                current["scheduler_state"] = "active"
                 current["task_ids"] = [
                     str(record["task"].get("id") or "") for record in active
                 ]
+                # blocked/ is durable and must prevent new economic episodes,
+                # but it must not be reported as a working/active coordinator.
+                if any(record["state"] in {"pending", "running"} for record in active):
+                    current["scheduler_state"] = "active"
+                else:
+                    current["scheduler_state"] = "blocked"
+                    current["task_id"] = current["task_ids"][0]
+                    task = active[0]["task"]
+                    reason = str(task.get("watchdog_blocker") or "")
+                    current["blocker"] = (
+                        reason if re.fullmatch(r"[a-z][a-z0-9_]{0,79}", reason)
+                        else "durable_task_requires_reconciliation"
+                    )
                 new_state[key] = current
                 continue
 
@@ -476,6 +490,15 @@ def main() -> int:
                 current["scheduler_state"] = "blocked"
                 current["task_id"] = blocker[0]
                 current["blocker"] = blocker[1]
+                new_state[key] = current
+                continue
+
+            # Root autonomy is allowed to resume naturally after a certified
+            # durable resolution, but never while staging lacks safe capacity.
+            capacity_block = disk_headroom_blocker(repo, consumer["consumer"])
+            if capacity_block:
+                current["scheduler_state"] = "blocked"
+                current["blocker"] = capacity_block
                 new_state[key] = current
                 continue
 
