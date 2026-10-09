@@ -2,6 +2,8 @@
 import hashlib
 import errno
 import os
+import stat
+from dataclasses import replace
 from pathlib import Path
 import pytest
 from herdr.policy_launch import ApprovedTree, CODE_TARGET
@@ -28,6 +30,42 @@ def test_worker_uid_cannot_publish_or_read_an_approval_as_a_publish_attempt(tmp_
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize("fault", [None, "hermes-shim", "herdr-cli", "python-bit", "python-missing"])
+def test_publication_requires_every_directly_executed_entrypoint(tmp_path, monkeypatch, fault):
+    from herdr import host_configuration, runtime_publication
+    from herdr.host_bootstrap import SHIM_SOURCE, STAGE1_SOURCE, STAGE2_SOURCE, PYTHON_TARGET, PYTHON_EXECUTABLE
+    from herdr.policy_launch import RUNTIME_TARGETS
+    def raw_tree(name, target, files, executable):
+        return {"source": "/approved/" + name, "target": str(target),
+                "files": {path: "a" * 64 for path in files}, "executable_files": executable,
+                "max_bytes": 33554432, "max_file_bytes": 4194304}
+    cli = "agent-stack/policy-bin/herdr"
+    raw = {"schema_version": "herdr-runtime-publication-1", "version": "fixture",
+           "destination": str(tmp_path), "trees": {
+               "code": raw_tree("code", CODE_TARGET, [SHIM_SOURCE, STAGE1_SOURCE, STAGE2_SOURCE, cli], [SHIM_SOURCE, cli]),
+               "hermes": raw_tree("hermes", next(t for t in RUNTIME_TARGETS if t != PYTHON_TARGET), ["module.py"], []),
+               "python": raw_tree("python", PYTHON_TARGET, [PYTHON_EXECUTABLE], [PYTHON_EXECUTABLE]),
+           }}
+    if fault == "hermes-shim":
+        raw["trees"]["code"]["executable_files"].remove(SHIM_SOURCE)
+    elif fault == "herdr-cli":
+        raw["trees"]["code"]["executable_files"].remove(cli)
+    elif fault == "python-bit":
+        raw["trees"]["python"]["executable_files"].clear()
+    elif fault == "python-missing":
+        raw["trees"]["python"]["files"].clear()
+    # Pure schema fixture only. No test claims a real root record or runs the
+    # privileged publisher; actual source/destination checks remain mandatory.
+    monkeypatch.setattr(host_configuration, "_read_configuration", lambda path: raw)
+    monkeypatch.setattr(runtime_publication, "_verify_root_owned_ancestry", lambda path: None)
+    if fault:
+        with pytest.raises(SecurityError, match="executable entrypoint approval"):
+            publish_reviewed_runtime(Path("/etc/herdr/runtime-publication.json"))
+    else:
+        assert publish_reviewed_runtime(Path("/etc/herdr/runtime-publication.json"))["published"] is False
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_publication_copy_creates_new_inodes_even_with_old_writable_fd(tmp_path):
     tree, storage = fixture(tmp_path)
     old_fd = os.open(tree.source / "program", os.O_RDWR)
@@ -36,9 +74,21 @@ def test_publication_copy_creates_new_inodes_even_with_old_writable_fd(tmp_path)
         assert (copied.path / "program").stat().st_ino != (tree.source / "program").stat().st_ino
         os.pwrite(old_fd, b"ATTACK", 0)
         assert (copied.path / "program").read_bytes() == b"reviewed-bytes"
+        assert stat.S_IMODE(copied.path.stat().st_mode) == 0o555
+        assert stat.S_IMODE((copied.path / "program").stat().st_mode) == 0o555
         copied.verify()
     finally:
         os.close(old_fd)
+        copied.cleanup_after_pane_closed()
+
+
+def test_nonexecutable_runtime_payload_is_readable_without_write_authority(tmp_path):
+    tree, storage = fixture(tmp_path)
+    copied = copy_reviewed_payload(replace(tree, executable_files=()), storage)
+    try:
+        assert stat.S_IMODE((copied.path / "program").stat().st_mode) == 0o444
+        assert stat.S_IMODE(copied.path.stat().st_mode) == 0o555
+    finally:
         copied.cleanup_after_pane_closed()
 
 

@@ -39,11 +39,28 @@ def copy_reviewed_payload(tree, storage):
                 os.close(item)
         # Holding the root prevents source-ancestor rename from substituting
         # another tree. create() hashes the independently copied payload.
-        return FrozenTree.create(
+        copied = FrozenTree.create(
             f"/proc/{os.getpid()}/fd/{fd}/.", target=tree.target,
             files=tree.files, storage=storage, executable_files=tree.executable_files,
             max_bytes=tree.max_bytes, max_file_bytes=tree.max_file_bytes,
         )
+        try:
+            # Runtime payloads contain no credentials and must be readable by
+            # agentops after root creates them. Root ownership and no write
+            # bits provide integrity; owner-only 0400/0500 would deny launch.
+            for name in tree.files:
+                item = _open_relative(copied.fd, name)
+                try:
+                    os.fchmod(item, 0o555 if name in tree.executable_files else 0o444)
+                finally:
+                    os.close(item)
+            for directory in [*(p for p in copied.path.rglob("*") if p.is_dir()), copied.path]:
+                directory.chmod(0o555)
+            copied.verify()
+            return copied
+        except BaseException:
+            copied.close()
+            raise
     finally:
         os.close(fd)
 
@@ -81,9 +98,16 @@ def publish_reviewed_runtime(configuration_path, *, publish=False):
     require(trees["code"].target == CODE_TARGET
             and {trees["hermes"].target, trees["python"].target} == RUNTIME_TARGETS,
             "runtime publication targets invalid")
-    from .host_bootstrap import SHIM_SOURCE, STAGE1_SOURCE, STAGE2_SOURCE
+    from .host_bootstrap import SHIM_SOURCE, STAGE1_SOURCE, STAGE2_SOURCE, PYTHON_TARGET, PYTHON_EXECUTABLE
+    require(trees["python"].target == PYTHON_TARGET
+            and trees["hermes"].target == next(t for t in RUNTIME_TARGETS if t != PYTHON_TARGET),
+            "runtime publication role targets invalid")
     require({SHIM_SOURCE, STAGE1_SOURCE, STAGE2_SOURCE, "agent-stack/policy-bin/herdr"}
             <= set(trees["code"].files), "complete runtime entrypoints required")
+    require({SHIM_SOURCE, "agent-stack/policy-bin/herdr"} <= set(trees["code"].executable_files)
+            and PYTHON_EXECUTABLE in trees["python"].files
+            and PYTHON_EXECUTABLE in trees["python"].executable_files,
+            "runtime executable entrypoint approval required")
     parent = Path(raw["destination"])
     _verify_root_owned_ancestry(parent)
     require(parent != Path("/"), "runtime publication destination too broad")
@@ -115,13 +139,13 @@ def publish_reviewed_runtime(configuration_path, *, publish=False):
         with (stage / "publication.json").open("xb") as stream:
             stream.write(canonical_json_bytes(record))
             stream.flush()
-            os.fchmod(stream.fileno(), 0o400)
+            os.fchmod(stream.fileno(), 0o444)
             os.fsync(stream.fileno())
         # Persist every directory entry before the atomic version publication.
         for directory in [*(p for p in stage.rglob("*") if p.is_dir()), stage]:
             fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
             try:
-                os.fchmod(fd, 0o500)
+                os.fchmod(fd, 0o555)
                 os.fsync(fd)
             finally:
                 os.close(fd)

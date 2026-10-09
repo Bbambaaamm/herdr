@@ -985,7 +985,7 @@ def start_sandbox_agent(invoke, pane_id: str, marker: str, sandbox_pid: int,
         raise RuntimeError("durable_agent_launch_invalid")
     # The sealed bootstrap authorizes a child of the registered shell.
     # Replacing that shell with exec makes the stage-one peer ineligible.
-    command = shlex.join(["/run/herdr-bootstrap/hermes", *hermes_args])
+    command = shlex.join(["/run/herdr/policy-code/agent-stack/policy-bin/hermes", *hermes_args])
     if len(command.encode("utf-8")) >= 4096:
         raise RuntimeError("durable_agent_launch_invalid")
     deadline = time.monotonic() + timeout_seconds

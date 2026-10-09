@@ -116,6 +116,8 @@ Its default mode validates the root-approved request and reports the intended
 new version. `--publish` requires UID 0, copies verified payload bytes into
 new inodes, fsyncs files/directories, validates root ownership and complete
 inventories, and publishes using Linux `renameat2(RENAME_NOREPLACE)`.
+Published nonsecret files use 0444 (0555 for approved executables) and
+directories use 0555, so agentops can read/execute without write authority.
 Existing versions cannot be replaced. Partial unpublished staging directories
 are retained for operator diagnosis, with no deployment symlink change.
 
@@ -144,7 +146,9 @@ The values above are schema placeholders, not an approved runtime. Each
 include `agent-stack/policy-bin/hermes`, `agent-stack/policy-bin/herdr`,
 `agent-stack/bin/agent-hermes-policy-stage1` and
 `agent-stack/bin/agent-hermes-policy-run`; mark actual executable files in
-`executable_files`. The reviewed Python closure must cover the interpreter,
+`executable_files`. The request must mark the policy `hermes`/`herdr` shims
+and Python `bin/python3.11` executable; missing execute approval is refused.
+The reviewed Python closure must cover the interpreter,
 stdlib, shared libraries, extension modules and Hermes dependencies actually
 used by native Hermes. Credentials are never runtime publication payload.
 

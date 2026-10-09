@@ -119,7 +119,7 @@ def test_launch_once_proves_prompt_and_names_actual_detected_agent(monkeypatch):
     reply = launch(module, invoke, boundary, bootstrap_peer=state["bootstrap_peer"])
     launches = [c for c in calls if c[:2] == ("pane", "run")]
     assert len(launches) == 1
-    assert shlex.split(launches[0][3]) == ["/run/herdr-bootstrap/hermes",
+    assert shlex.split(launches[0][3]) == ["/run/herdr/policy-code/agent-stack/policy-bin/hermes",
                                          "chat", "--in", "/path with spaces"]
     assert calls.index(("inner-prompt-proof",)) < calls.index(launches[0])
     assert ("agent", "rename", "owned", "owned-agent") in calls
