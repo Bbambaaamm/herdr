@@ -45,7 +45,182 @@ os.execv(args[0], args)
 """
 
 
-_POLICY_FD_LAUNCHER = '\nimport fcntl\nimport hashlib\nimport json\nimport os\nimport re\nimport stat\nimport sys\nfrom pathlib import Path\n\nif len(sys.argv) < 3 or len(sys.argv[1]) > 65536:\n    raise SystemExit("policy_fd_launch_invalid")\nentries = json.loads(sys.argv[1])\nargs = sys.argv[2:]\nif not isinstance(entries, list) or not 1 <= len(entries) <= 96:\n    raise SystemExit("policy_fd_launch_invalid")\nmapping, targets, approved_files = {}, set(), set()\nprofile_name = None\ntotal_profile_bytes = 0\nfor item in entries:\n    if not isinstance(item, dict):\n        raise SystemExit("policy_fd_launch_invalid")\n    kind = item.get("kind")\n    sealed = kind == "sealed-profile-data"\n    ordinary = {"source", "fd", "device", "inode", "kind", "target"}\n    expected_keys = ordinary | ({"sha256", "size"} if sealed else set())\n    if set(item) != expected_keys:\n        raise SystemExit("policy_fd_launch_invalid")\n    if (any(type(item[k]) is not int or item[k] < 0\n            for k in ("fd", "device", "inode"))\n        or kind not in ("file", "directory", "socket", "sealed-profile-data")\n        or not isinstance(item["source"], str)\n        or not re.fullmatch(r"/proc/[1-9][0-9]{0,9}/fd/[0-9]{1,10}", item["source"])\n        or item["source"].rsplit("/", 1)[-1] != str(item["fd"])\n        or not isinstance(item["target"], str)\n        or not item["target"].startswith("/")\n        or item["fd"] in mapping or item["target"] in targets):\n        raise SystemExit("policy_fd_launch_invalid")\n    if sealed:\n        match = re.fullmatch(\n            r"/home/agentops/\\.hermes/profiles/"\n            r"([a-z0-9][a-z0-9_-]{0,31})/([a-zA-Z0-9_.\\-/]{1,256})",\n            item["target"],\n        )\n        if (match is None or any(p in ("", ".", "..") for p in match.group(2).split("/"))\n            or match.group(2).split("/")[0] in\n            {"sessions", "cache", "logs", "pastes", "state.db", ".hermes_history",\n             "state.db-wal", "state.db-shm"}):\n            raise SystemExit("policy_fd_profile_target_invalid")\n        if profile_name is None:\n            profile_name = match.group(1)\n        if profile_name != match.group(1):\n            raise SystemExit("policy_fd_profile_mismatch")\n        size, digest = item["size"], item["sha256"]\n        if (type(size) is not int or not 0 <= size <= 131072\n            or not isinstance(digest, str)\n            or re.fullmatch(r"[a-f0-9]{64}", digest) is None):\n            raise SystemExit("policy_fd_profile_manifest_invalid")\n        total_profile_bytes += size\n        if total_profile_bytes > 524288:\n            raise SystemExit("policy_fd_profile_manifest_invalid")\n        approved_files.add(match.group(2))\n    opened = os.open(\n        item["source"],\n        (os.O_RDONLY | os.O_CLOEXEC) if sealed\n        else (os.O_PATH | (os.O_DIRECTORY if kind == "directory" else 0)),\n    )\n    held = os.fstat(opened)\n    correct = (\n        stat.S_ISDIR(held.st_mode) if kind == "directory"\n        else stat.S_ISSOCK(held.st_mode) if kind == "socket"\n        else stat.S_ISREG(held.st_mode)\n    )\n    if not correct or (held.st_dev, held.st_ino) != (item["device"], item["inode"]):\n        raise SystemExit("policy_fd_identity_mismatch")\n    if sealed:\n        required_seals = 1 | 2 | 4 | 8\n        if (held.st_size != size\n            or fcntl.fcntl(opened, getattr(fcntl, "F_GET_SEALS", 1034))\n            & required_seals != required_seals):\n            raise SystemExit("policy_fd_profile_not_sealed")\n        if hashlib.sha256(os.pread(opened, size, 0)).hexdigest() != digest:\n            raise SystemExit("policy_fd_profile_digest_mismatch")\n    mapping[item["fd"]] = (opened, item["target"], kind)\n    targets.add(item["target"])\n\nused = set()\nfor index, arg in enumerate(args):\n    if arg in ("--bind-fd", "--ro-bind-fd", "--ro-bind-data"):\n        if index + 2 >= len(args) or not args[index + 1].isdigit():\n            raise SystemExit("policy_fd_launch_invalid")\n        original = int(args[index + 1])\n        if original not in mapping or original in used:\n            raise SystemExit("policy_fd_launch_invalid")\n        opened, target, kind = mapping[original]\n        if (args[index + 2] != target\n            or (arg == "--ro-bind-data") != (kind == "sealed-profile-data")):\n            raise SystemExit("policy_fd_launch_invalid")\n        if kind == "sealed-profile-data":\n            os.lseek(opened, 0, os.SEEK_SET)\n        args[index + 1] = str(opened)\n        os.set_inheritable(opened, True)\n        used.add(original)\nif used != set(mapping) or not args or args[0] != "/usr/bin/bwrap":\n    raise SystemExit("policy_fd_launch_invalid")\n\nhome = Path("/home/agentops")\nroot = home / ".hermes"\nprofiles = root / "profiles"\ntmpfs_targets = [args[i + 1] for i in range(len(args) - 1)\n                 if args[i] == "--tmpfs"]\nprivate_home = str(home) in tmpfs_targets\nif private_home:\n    if not approved_files or not {"config.yaml", ".env"} <= approved_files:\n        raise SystemExit("policy_fd_profile_required")\n    if tmpfs_targets.count(str(home)) != 1:\n        raise SystemExit("policy_fd_private_home_invalid")\n    parent = os.lstat(home.parent)\n    if (not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0\n        or stat.S_IMODE(parent.st_mode) & 0o022):\n        raise SystemExit("policy_fd_home_anchor_untrusted")\n    # The home mount must be in force before any profile data is copied.\n    home_mask = next(i for i in range(len(args) - 1)\n                     if args[i] == "--tmpfs" and args[i + 1] == str(home))\n    # Protect all profile ancestors and descendants for the *entire*\n    # invocation: no late rw bind, readonly alias or nested tmpfs may shadow\n    # sealed inputs. The sole trusted exception is the policy-owned immutable\n    # Hermes code directory bind from a verified runtime FD.\n    for i, arg in enumerate(args):\n        if i + 2 >= len(args):\n            continue\n        if arg == "--ro-bind-data" and i < home_mask:\n            raise SystemExit("policy_fd_private_home_order_invalid")\n        if arg in ("--bind", "--ro-bind", "--dev-bind",\n                   "--bind-fd", "--ro-bind-fd"):\n            destination = Path(args[i + 2])\n            within_hermes = destination == root or root in destination.parents\n            if (destination == home or within_hermes) and not (\n                arg == "--ro-bind-fd" and destination == root / "hermes-agent"\n            ):\n                raise SystemExit("policy_fd_private_home_shadowed")\n        if arg == "--tmpfs" and i + 1 < len(args):\n            destination = Path(args[i + 1])\n            if (destination == root or root in destination.parents):\n                raise SystemExit("policy_fd_private_home_shadowed")\n    profile_dirs = {str(home / ".hermes/profiles" / profile_name / n)\n                    for n in ("sessions", "cache", "logs", "pastes")}\n    created_dirs = {args[i + 1] for i in range(len(args) - 1)\n                    if args[i] == "--dir"}\n    if not profile_dirs <= created_dirs:\n        raise SystemExit("policy_fd_private_runtime_missing")\nelse:\n    if approved_files:\n        raise SystemExit("policy_fd_profile_data_without_private_home")\n    # Legacy mask inventory must remain strict until the production caller\n    # is migrated to private HOME and sealed profile configuration.\n    if root.is_symlink() or profiles.is_symlink():\n        raise SystemExit("policy_fd_runtime_profile_alias")\n    roots = [root]\n    if profiles.is_dir():\n        profiles_list = list(profiles.iterdir())\n        if len(profiles_list) > 128 or any(p.is_symlink() for p in profiles_list):\n            raise SystemExit("policy_fd_runtime_profile_alias")\n        roots += [p for p in profiles_list if p.is_dir()]\n    candidates = [home / ".cache"] + [\n        p / n for p in roots for n in ("sessions", "cache", "logs")\n    ]\n    if any(p.is_symlink() for p in candidates):\n        raise SystemExit("policy_fd_runtime_directory_alias")\n    actual = {t for t in tmpfs_targets\n              if t == str(home / ".cache") or t.startswith(str(root) + "/")}\n    required = {str(p) for p in candidates if p.is_dir()}\n    if actual != required:\n        raise SystemExit("policy_fd_runtime_mount_mismatch")\nos.execv(args[0], args)\n'
+_POLICY_FD_LAUNCHER = r"""
+import fcntl
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+
+if len(sys.argv) < 3 or len(sys.argv[1]) > 65536:
+    raise SystemExit("policy_fd_launch_invalid")
+entries = json.loads(sys.argv[1])
+args = sys.argv[2:]
+if not isinstance(entries, list) or not 1 <= len(entries) <= 96:
+    raise SystemExit("policy_fd_launch_invalid")
+mapping, targets, approved_files = {}, set(), set()
+profile_name = None
+total_profile_bytes = 0
+for item in entries:
+    if not isinstance(item, dict):
+        raise SystemExit("policy_fd_launch_invalid")
+    kind = item.get("kind")
+    sealed = kind == "sealed-profile-data"
+    ordinary = {"source", "fd", "device", "inode", "kind", "target"}
+    expected_keys = ordinary | ({"sha256", "size"} if sealed else set())
+    if set(item) != expected_keys:
+        raise SystemExit("policy_fd_launch_invalid")
+    if (any(type(item[k]) is not int or item[k] < 0
+            for k in ("fd", "device", "inode"))
+        or kind not in ("file", "directory", "socket", "sealed-profile-data")
+        or not isinstance(item["source"], str)
+        or not re.fullmatch(r"/proc/[1-9][0-9]{0,9}/fd/[0-9]{1,10}", item["source"])
+        or item["source"].rsplit("/", 1)[-1] != str(item["fd"])
+        or not isinstance(item["target"], str)
+        or not item["target"].startswith("/")
+        or item["fd"] in mapping or item["target"] in targets):
+        raise SystemExit("policy_fd_launch_invalid")
+    if sealed:
+        match = re.fullmatch(
+            r"/home/agentops/\.hermes/profiles/"
+            r"([a-z0-9][a-z0-9_-]{0,31})/([a-zA-Z0-9_.\-/]{1,256})",
+            item["target"],
+        )
+        if (match is None or any(p in ("", ".", "..") for p in match.group(2).split("/"))
+            or match.group(2).split("/")[0] in
+            {"sessions", "cache", "logs", "pastes", "state.db", ".hermes_history",
+             "state.db-wal", "state.db-shm"}):
+            raise SystemExit("policy_fd_profile_target_invalid")
+        if profile_name is None:
+            profile_name = match.group(1)
+        if profile_name != match.group(1):
+            raise SystemExit("policy_fd_profile_mismatch")
+        size, digest = item["size"], item["sha256"]
+        if (type(size) is not int or not 0 <= size <= 131072
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[a-f0-9]{64}", digest) is None):
+            raise SystemExit("policy_fd_profile_manifest_invalid")
+        total_profile_bytes += size
+        if total_profile_bytes > 524288:
+            raise SystemExit("policy_fd_profile_manifest_invalid")
+        approved_files.add(match.group(2))
+    opened = os.open(
+        item["source"],
+        (os.O_RDONLY | os.O_CLOEXEC) if sealed
+        else (os.O_PATH | (os.O_DIRECTORY if kind == "directory" else 0)),
+    )
+    held = os.fstat(opened)
+    correct = (
+        stat.S_ISDIR(held.st_mode) if kind == "directory"
+        else stat.S_ISSOCK(held.st_mode) if kind == "socket"
+        else stat.S_ISREG(held.st_mode)
+    )
+    if not correct or (held.st_dev, held.st_ino) != (item["device"], item["inode"]):
+        raise SystemExit("policy_fd_identity_mismatch")
+    if sealed:
+        required_seals = 1 | 2 | 4 | 8
+        if (held.st_size != size
+            or fcntl.fcntl(opened, getattr(fcntl, "F_GET_SEALS", 1034))
+            & required_seals != required_seals):
+            raise SystemExit("policy_fd_profile_not_sealed")
+        if hashlib.sha256(os.pread(opened, size, 0)).hexdigest() != digest:
+            raise SystemExit("policy_fd_profile_digest_mismatch")
+    mapping[item["fd"]] = (opened, item["target"], kind)
+    targets.add(item["target"])
+
+used = set()
+for index, arg in enumerate(args):
+    if arg in ("--bind-fd", "--ro-bind-fd", "--ro-bind-data"):
+        if index + 2 >= len(args) or not args[index + 1].isdigit():
+            raise SystemExit("policy_fd_launch_invalid")
+        original = int(args[index + 1])
+        if original not in mapping or original in used:
+            raise SystemExit("policy_fd_launch_invalid")
+        opened, target, kind = mapping[original]
+        if (args[index + 2] != target
+            or (arg == "--ro-bind-data") != (kind == "sealed-profile-data")):
+            raise SystemExit("policy_fd_launch_invalid")
+        if kind == "sealed-profile-data":
+            os.lseek(opened, 0, os.SEEK_SET)
+        args[index + 1] = str(opened)
+        os.set_inheritable(opened, True)
+        used.add(original)
+if used != set(mapping) or not args or args[0] != "/usr/bin/bwrap":
+    raise SystemExit("policy_fd_launch_invalid")
+
+home = Path("/home/agentops")
+root = home / ".hermes"
+profiles = root / "profiles"
+tmpfs_targets = [args[i + 1] for i in range(len(args) - 1)
+                 if args[i] == "--tmpfs"]
+private_home = str(home) in tmpfs_targets
+if private_home:
+    if not approved_files or not {"config.yaml", ".env"} <= approved_files:
+        raise SystemExit("policy_fd_profile_required")
+    if tmpfs_targets.count(str(home)) != 1:
+        raise SystemExit("policy_fd_private_home_invalid")
+    parent = os.lstat(home.parent)
+    if (not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0
+        or stat.S_IMODE(parent.st_mode) & 0o022):
+        raise SystemExit("policy_fd_home_anchor_untrusted")
+    # The home mount must be in force before any profile data is copied.
+    home_mask = next(i for i in range(len(args) - 1)
+                     if args[i] == "--tmpfs" and args[i + 1] == str(home))
+    # Protect all profile ancestors and descendants for the *entire*
+    # invocation: no late rw bind, readonly alias or nested tmpfs may shadow
+    # sealed inputs. The sole trusted exception is the policy-owned immutable
+    # Hermes code directory bind from a verified runtime FD.
+    for i, arg in enumerate(args):
+        if i + 2 >= len(args):
+            continue
+        if arg == "--ro-bind-data" and i < home_mask:
+            raise SystemExit("policy_fd_private_home_order_invalid")
+        if arg in ("--bind", "--ro-bind", "--dev-bind",
+                   "--bind-fd", "--ro-bind-fd"):
+            destination = Path(args[i + 2])
+            within_hermes = destination == root or root in destination.parents
+            if (destination == home or within_hermes) and not (
+                arg == "--ro-bind-fd" and destination == root / "hermes-agent"
+            ):
+                raise SystemExit("policy_fd_private_home_shadowed")
+        if arg == "--tmpfs" and i + 1 < len(args):
+            destination = Path(args[i + 1])
+            if (destination == root or root in destination.parents):
+                raise SystemExit("policy_fd_private_home_shadowed")
+    profile_dirs = {str(home / ".hermes/profiles" / profile_name / n)
+                    for n in ("sessions", "cache", "logs", "pastes")}
+    created_dirs = {args[i + 1] for i in range(len(args) - 1)
+                    if args[i] == "--dir"}
+    if not profile_dirs <= created_dirs:
+        raise SystemExit("policy_fd_private_runtime_missing")
+else:
+    if approved_files:
+        raise SystemExit("policy_fd_profile_data_without_private_home")
+    # Legacy mask inventory must remain strict until the production caller
+    # is migrated to private HOME and sealed profile configuration.
+    if root.is_symlink() or profiles.is_symlink():
+        raise SystemExit("policy_fd_runtime_profile_alias")
+    roots = [root]
+    if profiles.is_dir():
+        profiles_list = list(profiles.iterdir())
+        if len(profiles_list) > 128 or any(p.is_symlink() for p in profiles_list):
+            raise SystemExit("policy_fd_runtime_profile_alias")
+        roots += [p for p in profiles_list if p.is_dir()]
+    candidates = [home / ".cache"] + [
+        p / n for p in roots for n in ("sessions", "cache", "logs")
+    ]
+    if any(p.is_symlink() for p in candidates):
+        raise SystemExit("policy_fd_runtime_directory_alias")
+    actual = {t for t in tmpfs_targets
+              if t == str(home / ".cache") or t.startswith(str(root) + "/")}
+    required = {str(p) for p in candidates if p.is_dir()}
+    if actual != required:
+        raise SystemExit("policy_fd_runtime_mount_mismatch")
+os.execv(args[0], args)
+"""
 
 @dataclass
 class PinnedWorktree:
