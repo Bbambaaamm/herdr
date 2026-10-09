@@ -55,6 +55,8 @@ def command_for(sandbox, snapshot, *, descriptors=None, opts=None):
 def test_host_policy_fd_launcher_binds_sealed_profile_without_raw_secrets(tmp_path):
     if shutil.which("bwrap") is None:
         pytest.skip("bubblewrap unavailable")
+    if not Path("/home/agentops").is_dir():
+        pytest.skip("physical profile FD test requires the fixed staging home")
     sandbox = bridge_module()
     source, values, snapshot = fixture_snapshot(tmp_path)
     with snapshot:

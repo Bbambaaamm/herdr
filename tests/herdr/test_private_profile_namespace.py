@@ -133,6 +133,8 @@ def test_same_uid_host_cannot_replace_profile_view_through_private_home(tmp_path
     """Actual bwrap CHILD mount namespace; not the unisolated bwrap supervisor."""
     if shutil.which("bwrap") is None or not hasattr(os, "memfd_create"):
         pytest.skip("Linux bwrap with memfd is unavailable")
+    if not HOME.is_dir():
+        pytest.skip("physical private-HOME test requires the fixed staging home")
     source, values, approved = fixture_profile(tmp_path)
     with PrivateProfileSnapshot.from_approved(
         source, name="quantlab", approved_sha256=approved,
