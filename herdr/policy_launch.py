@@ -44,6 +44,19 @@ def _require(ok, code):
         raise SecurityError(code)
 
 
+def _finish_cleanup(actions):
+    """Attempt every independent release while retaining the first failure."""
+    first = None
+    for action in actions:
+        try:
+            action()
+        except BaseException as error:
+            if first is None:
+                first = (error, error.__traceback__)
+    if first is not None:
+        raise first[0].with_traceback(first[1])
+
+
 def _open_relative(root_fd, name):
     parts = name.split("/")
     _require(parts and all(x not in {"", ".", ".."} for x in parts) and "\\" not in name,
@@ -289,6 +302,8 @@ class FrozenTree:
             self.fd = -1
 
     def cleanup_after_pane_closed(self):
+        if self.fd < 0:
+            return
         if self.immutable_host_source:
             # Never chmod, unlink or delete an operator-published immutable
             # release tree. The host controller owns publication/retention;
@@ -299,15 +314,16 @@ class FrozenTree:
             finally:
                 self.close()
             return
-        self.verify()
-        # Refuse cleanup if the named storage directory was replaced. This
-        # method may only be called after the caller proves its pane is closed.
-        for directory in self.path.rglob("*"):
-            if directory.is_dir():
-                directory.chmod(0o700)
-        self.path.chmod(0o700)
-        self.close()
-        shutil.rmtree(self.path)
+        try:
+            self.verify()
+            # Refuse deletion if the named storage directory was replaced.
+            for directory in self.path.rglob("*"):
+                if directory.is_dir():
+                    directory.chmod(0o700)
+            self.path.chmod(0o700)
+            shutil.rmtree(self.path)
+        finally:
+            self.close()
 
 
 def mount_rows(pid):
@@ -340,6 +356,11 @@ class PolicyMount:
                  "exact immutable Hermes/Python snapshots required")
         self.stage, self.code, self.runtime = stage, code, tuple(runtime)
         self.bootstrap = None
+        self.private_workspace_pin = None
+        self.private_result_pin = None
+        self.private_mount_plan = None
+        self.private_identity = None
+        self.private_cli_pins = {}
         targets = [str(BUNDLE_TARGET), str(code.target), *(str(x.target) for x in runtime)]
         _require(len(targets) == len(set(targets)), "duplicate policy mount target")
 
@@ -352,6 +373,25 @@ class PolicyMount:
         # read-only inodes and all roots before any sandbox spawn.
         for tree in (self.code, *self.runtime):
             tree.verify()
+    def immutable_source_evidence(self):
+        self.require_immutable_runtime()
+        from .host_bootstrap import read_frozen_file, SHIM_SOURCE, STAGE1_SOURCE, STAGE2_SOURCE
+        for artifact in (SHIM_SOURCE, STAGE1_SOURCE, STAGE2_SOURCE):
+            read_frozen_file(self.code, artifact)
+        from .private_mount_plan import ApprovedPrivateMountPlan
+        _require(isinstance(self.private_mount_plan, ApprovedPrivateMountPlan)
+                 and ApprovedPrivateMountPlan.read(self.private_mount_plan.path, self.private_identity)
+                     == self.private_mount_plan, "private mount approval unavailable or changed")
+        return {
+            "schema_version": "herdr-immutable-sources-1",
+            "authority": "root-published",
+            "trees": {str(tree.target): {"source": str(tree.path),
+                      "manifest_sha256": tree.source_digest}
+                      for tree in (self.code, *self.runtime)},
+            "executables": {name: dict(self.code.files)[name]
+                            for name in (SHIM_SOURCE, STAGE1_SOURCE, STAGE2_SOURCE)},
+            "mount_plan": self.private_mount_plan.evidence(),
+        }
 
     def descriptors(self):
         self.stage._same_inode()
@@ -371,6 +411,11 @@ class PolicyMount:
 
     def verify_mounted(self, pid, sealed: SealedPolicyBundle | None = None):
         rows = mount_rows(pid)
+        if self.private_workspace_pin is not None:
+            from .private_mount_plan import ApprovedPrivateMountPlan
+            _require(isinstance(self.private_mount_plan, ApprovedPrivateMountPlan),
+                     "private mount plan unavailable")
+            self.private_mount_plan.verify_mounted(pid, rows)
         root = Path(f"/proc/{pid}/root")
         for entry in self.descriptors():
             if entry["kind"] == "directory":
@@ -451,6 +496,7 @@ def validate_policy_evidence(evidence, *, identity: InvocationIdentity):
     if modern: keys.add("bootstrap")
     if isinstance(evidence, dict) and "approved_profile" in evidence:
         keys.add("approved_profile")
+        keys.add("immutable_sources")
     _require(isinstance(evidence, dict) and set(evidence) == keys
              and len(canonical_json_bytes(evidence)) <= 16384, "bounded policy evidence required")
     _require(evidence["schema_version"] in {"herdr-policy-launch-2","herdr-policy-launch-3"}
@@ -487,6 +533,39 @@ def validate_policy_evidence(evidence, *, identity: InvocationIdentity):
         except (PrivateProfileError, TypeError, ValueError) as exc:
             raise SecurityError("approved profile evidence malformed") from exc
         _require(profile == canonical, "approved profile evidence digest mismatch")
+        sources = evidence["immutable_sources"]
+        from .host_bootstrap import SHIM_SOURCE, STAGE1_SOURCE, STAGE2_SOURCE
+        _require(isinstance(sources, dict)
+                 and set(sources) == {"schema_version", "authority", "trees", "executables", "mount_plan"}
+                 and sources["schema_version"] == "herdr-immutable-sources-1"
+                 and sources["authority"] == "root-published"
+                 and isinstance(sources["trees"], dict)
+                 and set(sources["trees"]) == set(trees)
+                 and isinstance(sources["executables"], dict)
+                 and set(sources["executables"]) == {SHIM_SOURCE, STAGE1_SOURCE, STAGE2_SOURCE}
+                 and all(isinstance(v, str) and _SHA.fullmatch(v)
+                         for v in sources["executables"].values()),
+                 "immutable source evidence malformed")
+        plan = sources["mount_plan"]
+        from .private_mount_plan import AUTHORITY_ROOT, VERSION
+        _require(isinstance(plan, dict)
+                 and set(plan) == {"schema_version", "authority", "sha256", "device", "inode"}
+                 and plan["schema_version"] == VERSION
+                 and isinstance(plan["authority"], str)
+                 and Path(plan["authority"]).parent == AUTHORITY_ROOT
+                 and Path(plan["authority"]).name == hashlib.sha256(canonical_json_bytes(identity.to_json())).hexdigest() + ".json"
+                 and isinstance(plan["sha256"], str) and _SHA.fullmatch(plan["sha256"])
+                 and all(type(plan[k]) is int and 0 < plan[k] < 2**64 for k in ("device", "inode")),
+                 "immutable mount plan evidence malformed")
+        for target, source in sources["trees"].items():
+            digest = evidence["code_sha256"] if target == str(CODE_TARGET) else runtime[target]
+            _require(isinstance(source, dict)
+                     and set(source) == {"source", "manifest_sha256"}
+                     and isinstance(source["source"], str)
+                     and Path(source["source"]).is_absolute()
+                     and os.path.normpath(source["source"]) == source["source"]
+                     and source["manifest_sha256"] == digest,
+                     "immutable source evidence binding mismatch")
     if modern:
         from .host_bootstrap import validate_continuation
         bootstrap=evidence["bootstrap"]
@@ -500,6 +579,70 @@ def validate_policy_evidence(evidence, *, identity: InvocationIdentity):
                  and isinstance(tree["source_digest"],str) and _SHA.fullmatch(tree["source_digest"]),
                  "bootstrap tree evidence malformed")
     return json.loads(canonical_json_bytes(evidence))
+
+
+def verify_retained_immutable_sources(proof):
+    """Re-establish root publication after restart using the signed manifest hash.
+
+    Reconstructing the manifest here is safe only because its digest and exact
+    source inode are already authenticated by the retained launch bundle.
+    """
+    from .private_mount_plan import ApprovedPrivateMountPlan
+    expected = proof["immutable_sources"]["mount_plan"]
+    approval = ApprovedPrivateMountPlan.read(Path(expected["authority"]), InvocationIdentity.from_dict(proof["identity"]))
+    _require(approval.evidence() == expected, "retained private mount approval changed")
+    for target, source in proof["immutable_sources"]["trees"].items():
+        path = Path(source["source"])
+        _verify_root_owned_ancestry(path)
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        files, total, entries = {}, [0], [0]
+        def walk(directory, prefix="", depth=0):
+            _require(depth <= 32, "retained immutable source depth exceeds bound")
+            for name in os.listdir(directory):
+                entries[0] += 1
+                _require(entries[0] <= 131072, "retained immutable inventory exceeds bound")
+                relative = prefix + name
+                info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                _verify_immutable_entry(info)
+                if stat.S_ISDIR(info.st_mode):
+                    child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                    dir_fd=directory)
+                    try:
+                        walk(child, relative + "/", depth + 1)
+                    finally:
+                        os.close(child)
+                else:
+                    _require(stat.S_ISREG(info.st_mode) and len(files) < 65536
+                             and info.st_size <= 268435456,
+                             "retained immutable source shape changed")
+                    total[0] += info.st_size
+                    _require(total[0] <= 2147483648, "retained immutable source exceeds bound")
+                    item = _open_relative(fd, relative)
+                    try:
+                        digest = hashlib.sha256()
+                        remaining = info.st_size
+                        while remaining:
+                            chunk = os.read(item, min(1048576, remaining))
+                            _require(bool(chunk), "retained immutable source shortened")
+                            digest.update(chunk)
+                            remaining -= len(chunk)
+                        _require(not os.read(item, 1), "retained immutable source grew")
+                        files[relative] = digest.hexdigest()
+                    finally:
+                        os.close(item)
+        try:
+            held = os.fstat(fd)
+            _require({"device": held.st_dev, "inode": held.st_ino} == proof["tree_identities"][target],
+                     "retained immutable source inode changed")
+            walk(fd)
+            _require(hashlib.sha256(canonical_json_bytes(dict(sorted(files.items())))).hexdigest()
+                     == source["manifest_sha256"], "retained immutable source manifest changed")
+            if target == str(CODE_TARGET):
+                _require(all(files.get(name) == digest for name, digest in
+                             proof["immutable_sources"]["executables"].items()),
+                         "retained immutable bootstrap executable changed")
+        finally:
+            os.close(fd)
 
 
 def process_start_ticks(pid):
@@ -524,7 +667,15 @@ def verify_retained_policy_evidence(evidence, *, identity, pid, attestation, now
                  == proof["sandbox_attestation_sha256"], "retained attestation mismatch")
     _require(attestation.get("approved_profile") == proof.get("approved_profile"),
              "retained approved profile differs from signed attestation")
+    _require(attestation.get("immutable_sources") == proof.get("immutable_sources"),
+             "retained immutable sources differ from signed attestation")
+    if "approved_profile" in proof:
+        verify_retained_immutable_sources(proof)
     rows = mount_rows(pid)
+    if "approved_profile" in proof:
+        from .private_mount_plan import ApprovedPrivateMountPlan
+        ApprovedPrivateMountPlan.read(
+            Path(proof["immutable_sources"]["mount_plan"]["authority"]), identity).verify_mounted(pid, rows)
     _require("ro" in rows.get("/", set()), "host root is not read-only")
     _require(os.readlink(f"/proc/{pid}/ns/mnt") != os.readlink("/proc/self/ns/mnt")
              and os.readlink(f"/proc/{pid}/ns/pid") != os.readlink("/proc/self/ns/pid"),
@@ -738,6 +889,10 @@ class PreparedPolicyLaunch:
         self._published_bootstrap_receipt = None
         self._continuation_sink = None
         self._ownership = None
+        if private_profile_snapshot is not None and isinstance(mount, PolicyMount):
+            from .private_mount_plan import PinnedLaunchPath
+            mount.private_workspace_pin = PinnedLaunchPath(Path(grant.workspace_root), directory=True)
+            mount.private_identity = grant.identity
 
     @property
     def identity(self):
@@ -760,10 +915,21 @@ class PreparedPolicyLaunch:
         rule = next((rule for rule in self.grant.tool_rules if rule.tool == TOOL), None)
         _require(rule is not None and rule.result_slot is None, "result submission authority required")
         slot = ResultSlot.bind(path, self.identity, idempotency_key)
+        if self.private_profile_snapshot is not None:
+            from .private_mount_plan import PinnedLaunchPath
+            self.mount.private_result_pin = PinnedLaunchPath(
+                Path(slot.path), directory=False, expected=(slot.device, slot.inode))
         self.grant = replace(self.grant, tool_rules=tuple(
             replace(rule,result_slot=slot) if rule.tool == TOOL else rule for rule in self.grant.tool_rules))
         if self._parent is not None:
             self.grant.require_logical_subset_of(self._parent)
+
+    def bind_private_mount_plan(self, path):
+        from .private_mount_plan import ApprovedPrivateMountPlan
+        _require(self.private_profile_snapshot is not None and self.sealed is None,
+                 "private mount plan must bind before seal")
+        _require(self.mount.private_mount_plan is None, "private mount plan is one-shot")
+        self.mount.private_mount_plan = ApprovedPrivateMountPlan.read(path, self.identity)
 
     def seal(self, pid, attestation, *, tools, permissions):
         approved = (self.private_profile_snapshot.identity
@@ -775,6 +941,11 @@ class PreparedPolicyLaunch:
             # Identity-consistent profile is not sufficient if the live host
             # can rewrite imported Hermes/Python code after first attestation.
             self.mount.require_immutable_runtime()
+            sources = self.mount.immutable_source_evidence()
+            _require("immutable_sources" not in attestation
+                     or attestation["immutable_sources"] == sources,
+                     "immutable source attestation mismatch")
+            attestation["immutable_sources"] = sources
         bound, sealed = self.mount.seal(pid, self.grant, identity=self.identity, attestation=attestation,
                                        tools=tools, permissions=permissions, private_key=self._private_key,
                                        key_id=self._key_id, parent=self._parent)
@@ -828,34 +999,48 @@ class PreparedPolicyLaunch:
                 "sandbox_attestation_sha256": self.grant.runtime_assurance.sandbox_attestation_sha256}
         if self.private_profile_snapshot is not None:
             proof["approved_profile"] = self.private_profile_snapshot.identity
+            proof["immutable_sources"] = self.mount.immutable_source_evidence()
         if self._bootstrap_receipt is not None:
             proof["schema_version"]="herdr-policy-launch-3"
             proof["bootstrap"]=self.mount.bootstrap.evidence(self._bootstrap_receipt)
         return proof
 
     def cleanup_after_pane_closed(self):
-        # Credential-bearing memfds must close even when the stage identity,
-        # bootstrap transport or frozen-tree cleanup fails. Keep the original
-        # error observable and never declare other resources cleaned on failure.
-        try:
-            if not getattr(self, "_resources_closed", False):
-                self.mount.stage._same_inode()
-                if self.mount.bootstrap is not None:
-                    self.mount.bootstrap.cleanup_after_pane_closed()
-                self.mount.stage.close()
-                self.mount.stage.path.unlink()
-                for tree in (self.mount.code, *self.mount.runtime):
-                    tree.cleanup_after_pane_closed()
-                self._private_key = None
-                self._resources_closed = True
-            if self._ownership is not None:
+        actions = []
+        if not getattr(self, "_resources_closed", False):
+            for pin in (getattr(self.mount, "private_workspace_pin", None),
+                        getattr(self.mount, "private_result_pin", None)):
+                if pin is not None:
+                    actions.append(pin.close)
+            actions.extend(lambda fd=fd: os.close(fd)
+                           for fd in getattr(self.mount, "private_cli_pins", {}).values())
+            if hasattr(self.mount, "private_cli_pins"):
+                self.mount.private_cli_pins = {}
+            def release_stage():
+                try:
+                    self.mount.stage._same_inode()
+                    self.mount.stage.path.unlink()
+                finally:
+                    self.mount.stage.close()
+            actions.append(release_stage)
+            if self.mount.bootstrap is not None:
+                actions.append(self.mount.bootstrap.cleanup_after_pane_closed)
+            actions.extend(tree.cleanup_after_pane_closed
+                           for tree in (self.mount.code, *self.mount.runtime))
+        if self.private_profile_snapshot is not None:
+            actions.append(self.private_profile_snapshot.close)
+        if self._ownership is not None:
+            def release_ownership():
                 self._ownership.cleanup_after_pane_closed()
                 self._ownership = None
+            actions.append(release_ownership)
+        try:
+            _finish_cleanup(actions)
+        finally:
+            self._private_key = None
+            self._resources_closed = True
             if _LIVE_PREPARED_LAUNCHES.get(_launch_key(self.identity)) is self:
                 del _LIVE_PREPARED_LAUNCHES[_launch_key(self.identity)]
-        finally:
-            if self.private_profile_snapshot is not None:
-                self.private_profile_snapshot.close()
 
 
 class HostPolicyLaunchFactory:
@@ -981,14 +1166,22 @@ class HostPolicyLaunchFactory:
             _LIVE_PREPARED_LAUNCHES[_launch_key(identity)] = prepared
             return prepared
         except BaseException:
+            actions = []
+            if "prepared" in locals():
+                for pin in (prepared.mount.private_workspace_pin, prepared.mount.private_result_pin):
+                    if pin is not None:
+                        actions.append(pin.close)
             if stage is not None:
-                stage.close()
-                stage.path.unlink(missing_ok=True)
-            for snapshot in snapshots:
-                snapshot.cleanup_after_pane_closed()
+                actions.extend((stage.close, lambda: stage.path.unlink(missing_ok=True)))
+            actions.extend(snapshot.cleanup_after_pane_closed for snapshot in snapshots)
             if profile_snapshot is not None:
-                profile_snapshot.close()
-            ownership.cleanup_after_pane_closed()
+                actions.append(profile_snapshot.close)
+            actions.append(ownership.cleanup_after_pane_closed)
+            try:
+                _finish_cleanup(actions)
+            except BaseException:
+                # The preparation failure remains primary; all closes ran.
+                pass
             raise
 
 

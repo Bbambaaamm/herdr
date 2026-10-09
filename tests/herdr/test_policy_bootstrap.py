@@ -56,9 +56,9 @@ def test_policy_bin_hermes_invokes_guarded_launcher():
     assert POLICY_BIN.read_text() == (
         '#!/bin/sh\n'
         'unset LD_PRELOAD LD_AUDIT LD_LIBRARY_PATH GLIBC_TUNABLES GCONV_PATH LOCPATH NLSPATH BASH_ENV ENV\n'
-        'exec /usr/bin/python3 -I -S /run/herdr-bootstrap/agent-hermes-policy-stage1 "$@"\n'
+        'exec /usr/bin/python3 -I -S /run/herdr/policy-code/agent-stack/bin/agent-hermes-policy-stage1 "$@"\n'
     )
-    assert "/run/herdr/policy-code" not in POLICY_BIN.read_text()
+    assert "/run/herdr/policy-code" in POLICY_BIN.read_text()
     assert POLICY_BIN.stat().st_mode & 0o111
     assert LAUNCHER.read_text(encoding="utf-8").splitlines()[0] == (
         "#!/usr/bin/python3 -I -S"

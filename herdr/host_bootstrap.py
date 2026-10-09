@@ -99,7 +99,10 @@ class HostBootstrap:
         self.listener, self.socket_path, self.socket_fd = listener, socket_path, socket_fd
         info = os.fstat(socket_fd)
         self.socket_identity = (info.st_dev, info.st_ino)
-        self.authority = _DurableBootstrapAuthority(owner=self,peer_authorizer=self._authorize_peer)
+        self.authority = _DurableBootstrapAuthority(
+            owner=self, peer_authorizer=self._authorize_peer,
+            stage1_path=str(launch.mount.code.target / STAGE1_SOURCE),
+        )
         self._stop = threading.Event()
         self._thread = None
         self._armed_ticks = None
@@ -198,7 +201,8 @@ class HostBootstrap:
         self._attestation = json.loads(canonical_json_bytes(attestation))
         python = next(tree for tree in self.launch.mount.runtime if tree.target == PYTHON_TARGET)
         pyraw, pydev, pyino = read_frozen_file(python, PYTHON_EXECUTABLE, 268_435_456)
-        stage1, dev, ino = read_frozen_file(self.tree, "agent-hermes-policy-stage1")
+        # Execute the approved code-tree inode, never the mutable transport copy.
+        stage1, dev, ino = read_frozen_file(self.launch.mount.code, STAGE1_SOURCE)
         stage2, _, _ = read_frozen_file(self.launch.mount.code, STAGE2_SOURCE)
         expectation = BootstrapExpectation(
             identity=self.launch.identity.to_json(),
@@ -292,18 +296,34 @@ class HostBootstrap:
                                    "source_digest": self.tree.source_digest}}
 
     def cleanup_after_pane_closed(self):
-        self.descriptors()
-        self._stop.set()
-        self.listener.close()
-        self.authority.close(timeout_seconds=6)
-        if self._thread is not None:
-            self._thread.join(6)
-            _require(not self._thread.is_alive(), "bootstrap broker still serving")
-        os.close(self.socket_fd)
-        self.socket_fd = -1
-        self.socket_path.unlink()
-        self.socket_path.parent.rmdir()
-        self.tree.cleanup_after_pane_closed()
+        from .policy_launch import _finish_cleanup
+        if self.socket_fd < 0 and self.tree.fd < 0:
+            return
+        def stop_listener():
+            self._stop.set()
+            self.listener.close()
+        def join_thread():
+            if self._thread is not None:
+                self._thread.join(6)
+                _require(not self._thread.is_alive(), "bootstrap broker still serving")
+        def close_socket():
+            if self.socket_fd >= 0:
+                os.close(self.socket_fd)
+                self.socket_fd = -1
+        def unlink_socket():
+            # Verify the named socket before unlinking; never remove a replacement.
+            try:
+                info = self.socket_path.lstat()
+            except FileNotFoundError:
+                return
+            _require((info.st_dev, info.st_ino) == self.socket_identity,
+                     "bootstrap broker socket identity changed")
+            self.socket_path.unlink()
+            self.socket_path.parent.rmdir()
+        _finish_cleanup([self.descriptors, stop_listener,
+                         lambda: self.authority.close(timeout_seconds=6),
+                         join_thread, close_socket, unlink_socket,
+                         self.tree.cleanup_after_pane_closed])
 
 
 def _read_regular(path, limit):

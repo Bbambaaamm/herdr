@@ -2,6 +2,20 @@
 from herdr.policy_launch import HostPolicyLaunchFactory, PreparedPolicyLaunch, IDENTITY_ENV, CODE_TARGET, RUNTIME_TARGETS
 from herdr.security import InvocationIdentity
 
+def immutable_sources_fixture(proof):
+    from herdr.host_bootstrap import SHIM_SOURCE, STAGE1_SOURCE, STAGE2_SOURCE
+    import hashlib
+    from herdr.security import canonical_json_bytes
+    return {"schema_version": "herdr-immutable-sources-1", "authority": "root-published",
+        "mount_plan": {"schema_version": "herdr-private-mount-plan-1",
+                       "authority": "/etc/herdr/launch-plans/" + hashlib.sha256(canonical_json_bytes(proof["identity"])).hexdigest() + ".json",
+                       "sha256": "e" * 64, "device": 1, "inode": 5},
+        "trees": {target: {"source": "/opt/herdr/test-published/" + str(index),
+                          "manifest_sha256": proof["code_sha256"] if target == str(CODE_TARGET)
+                          else proof["runtime_sha256"][target]}
+                  for index, target in enumerate(proof["tree_identities"])},
+        "executables": dict.fromkeys((SHIM_SOURCE, STAGE1_SOURCE, STAGE2_SOURCE), "f" * 64)}
+
 def policy_fixture(identity, *, modern=False):
     proof={"schema_version":"herdr-policy-launch-2","grant_sha256":"a"*64,"bundle_sha256":"b"*64,
         "bundle_device":1,"bundle_inode":2,"code_sha256":"c"*64,

@@ -1,7 +1,8 @@
 #!/usr/bin/python3 -I -S
 """Immutable stage-one bootstrap for Herdr #76 policy mode.
 
-This file is executed only from the host-owned /run/herdr-bootstrap FrozenTree.
+This file executes from the approved policy-code mount. The private launch
+requires that source to be root-published and immutable for its whole lifetime.
 It uses stdlib only, validates the independently frozen policy/runtime mounts,
 then execs stage two through the exact pinned Python inode. No code from the
 policy tree is imported or executed before these checks succeed.
@@ -18,7 +19,7 @@ from pathlib import Path
 
 BOOTSTRAP_ROOT = Path("/run/herdr-bootstrap")
 PROOF_PATH = BOOTSTRAP_ROOT / "immutable-trees.json"
-STAGE1_PATH = BOOTSTRAP_ROOT / "agent-hermes-policy-stage1"
+STAGE1_PATH = Path("/run/herdr/policy-code/agent-stack/bin/agent-hermes-policy-stage1")
 BUNDLE_PATH = Path("/run/herdr-policy/grant.bundle.json")
 POLICY_CODE_ROOT = Path("/run/herdr/policy-code")
 HERMES_ROOT = Path("/home/agentops/.hermes/hermes-agent")

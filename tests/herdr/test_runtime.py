@@ -7,6 +7,7 @@ import os
 import re
 import threading
 import time
+import types
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -1082,6 +1083,12 @@ def test_actual_child_sandbox_proof_persists_exact_attestation(tmp_path, monkeyp
                 module.HERDR_CONFIG = config
                 module.HERDR_RELEASES = releases
                 module.DEFAULT_WRITABLE = ()
+                # Exercise the real copy routine on this fixture's filesystem;
+                # shared /tmp can have a separate per-UID quota on staging.
+                module.tempfile = types.SimpleNamespace(
+                    mkstemp=lambda **kwargs: tempfile.mkstemp(
+                        **{**kwargs, "dir": root}),
+                )
                 # This fixture launches bwrap through a pipe; native TTY readiness
                 # is covered separately by real-PTY and owned-server checks.
                 module.pane_input_ready = lambda *args: True

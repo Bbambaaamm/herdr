@@ -204,96 +204,34 @@ def test_private_snapshot_mount_attestation_only_accepts_its_exact_ro_view(tmp_p
             tmp_path, modes, filesystems, snapshot)
 
 
-def test_real_host_selected_private_profile_mounts_and_attestation(tmp_path, monkeypatch):
-    """Actual bwrap CHILD with host-selected manifest, no native SDK/model."""
-    import shutil
-    if shutil.which("bwrap") is None or not Path("/home/agentops").is_dir():
-        pytest.skip("fixed staging HOME/bwrap unavailable")
+def test_root_owned_inert_fixture_cannot_impersonate_approved_cli(tmp_path, monkeypatch):
+    """Root ownership alone cannot authorize an unrelated release artifact."""
     sandbox = sandbox_module()
-    approved, values = approved_profile(tmp_path)
+    approved, _ = approved_profile(tmp_path)
     workspace = tmp_path / "task-workspace"
     workspace.mkdir()
-    # Private HOME only admits a pinned policy shim from a root-owned
-    # release. This nonsecret RC26 text file is a mounting fixture ONLY:
-    # the child runs /bin/sleep, never this fake shim or any native SDK.
-    hermes = Path("/home/agentops/.local/bin/herdr")
-    policy = Path(
-        "/opt/herdr/releases/v0.3.0-rc.26-4d09b58b4416/"
-        "provenance/external-runtime-dependency.txt"
-    )
-    if not (hermes.is_file() and policy.is_file()):
-        pytest.skip("root-published inert shim fixture unavailable")
     config = tmp_path / "fake-config-control"
     config.mkdir()
     monkeypatch.setattr(sandbox, "HERDR_CONFIG", config)
-    immutable_policy_mount, immutable_stage = _root_published_mount_for_physical_test(
-        tmp_path
-    )
-
+    policy_mount, stage = _root_published_mount_for_physical_test(tmp_path)
     with approved.freeze() as snapshot:
         fd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         info = os.fstat(fd)
         pin = sandbox.PinnedWorktree(workspace, fd, info.st_dev, info.st_ino, workspace.parent)
-        args = sandbox.command(
-            workspace, hermes, policy=policy,
-            policy_mount=immutable_policy_mount,
-            private_profile_snapshot=snapshot,
-            pinned_worktree=pin, hermes_profile=approved.name,
-        )
-        assert "FIXTURE_TOKEN" not in str(args)
-        delimiter = args.index("--")
-        args[delimiter + 1:] = ["/bin/sleep", "4"]
-        proc = subprocess.Popen(args, stdin=subprocess.DEVNULL,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         try:
-            time.sleep(0.4)
-            if proc.poll() is not None:
-                error = (proc.stderr.read() or b"")[:800].decode(errors="replace")
-                if "Operation not permitted" in error:
-                    pytest.skip("CI runner does not permit unprivileged bubblewrap")
-                pytest.fail("host-approved private HOME sandbox failed: " + error)
-            children = Path(f"/proc/{proc.pid}/task/{proc.pid}/children").read_text().split()
-            assert len(children) == 1
-            child = int(children[0])
-            namespace_root = Path(f"/proc/{child}/root")
-            mount_lines = Path(f"/proc/{child}/mountinfo").read_text().splitlines()
-            modes = {}
-            filesystems = {}
-            for line in mount_lines:
-                before, after = line.split(" - ", 1)
-                parts = before.split()
-                modes[parts[4]] = set(parts[5].split(","))
-                filesystems[parts[4]] = after.split()[0]
-            assert sandbox._private_profile_namespace_verified(
-                namespace_root, modes, filesystems, snapshot,
-            )
-            for entry in snapshot.files:
-                name = namespace_root / str(snapshot.destination / entry.relative).lstrip("/")
-                assert name.read_bytes() == values[entry.relative]
-            # Host-side same-UID rename cannot redirect the sealed profile.
-            approved.source.rename(tmp_path / "profile-original")
-            attacker = tmp_path / "attacker"
-            attacker.mkdir()
-            (attacker / "config.yaml").write_bytes(b"changed")
-            approved.source.symlink_to(attacker, target_is_directory=True)
-            assert sandbox._private_profile_namespace_verified(
-                namespace_root, modes, filesystems, snapshot,
-            )
-            private_log = namespace_root / str(snapshot.destination / "logs/proof.txt").lstrip("/")
-            private_log.write_bytes(b"runtime-only")
-            assert private_log.read_bytes() == b"runtime-only"
+            with pytest.raises(RuntimeError, match="durable_private_cli_artifact_unapproved"):
+                sandbox.command(
+                    workspace, Path("/home/agentops/.local/bin/herdr"),
+                    policy=policy_mount.code.path / "external-runtime-dependency.txt",
+                    policy_mount=policy_mount, private_profile_snapshot=snapshot,
+                    pinned_worktree=pin, hermes_profile=approved.name,
+                )
         finally:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
             pin.close()
-            for tree in (immutable_policy_mount.code, *immutable_policy_mount.runtime):
+            for tree in (policy_mount.code, *policy_mount.runtime):
                 tree.cleanup_after_pane_closed()
-            immutable_stage.close()
-            immutable_stage.path.unlink(missing_ok=True)
+            stage.close()
+            stage.path.unlink(missing_ok=True)
 
 
 def test_host_profile_refresh_is_required_before_seal(tmp_path, monkeypatch):
@@ -401,6 +339,8 @@ def test_profile_identity_is_canonical_and_signed_evidence_shape_is_bounded(tmp_
         for modern in (False, True):
             proof = policy_fixture(planned.identity, modern=modern)
             proof["approved_profile"] = snapshot.identity
+            from tests.policy_launch_fakes import immutable_sources_fixture
+            proof["immutable_sources"] = immutable_sources_fixture(proof)
             assert validate_policy_evidence(proof, identity=planned.identity) == proof
             # Attempting to replace only profile digest or profile files
             # without updating both and the signature must be rejected.
@@ -500,6 +440,8 @@ def test_retained_profile_identity_must_match_signed_attestation(tmp_path):
     planned = grant(workspace)
     proof = policy_fixture(planned.identity)
     proof["approved_profile"] = approved.identity
+    from tests.policy_launch_fakes import immutable_sources_fixture
+    proof["immutable_sources"] = immutable_sources_fixture(proof)
     proof["process_start_ticks"] = process_start_ticks(os.getpid())
     attacker = {**approved.identity, "manifest_sha256": "0" * 64}
     attestation = {

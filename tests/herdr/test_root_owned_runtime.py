@@ -26,6 +26,8 @@ FILENAME = "external-runtime-dependency.txt"
 
 
 def approved_nonsecret_release_tree():
+    if os.geteuid() == 0:
+        pytest.skip("same-UID adversary proof must never write released files as root")
     if not PUBLISHED.is_dir() or not (PUBLISHED / FILENAME).is_file():
         pytest.skip("staging RC26 root-published nonsecret fixture is absent")
     assert [p.name for p in PUBLISHED.iterdir()] == [FILENAME]

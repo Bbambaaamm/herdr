@@ -60,6 +60,13 @@ if len(sys.argv) < 3 or len(sys.argv[1]) > 65536:
     raise SystemExit("policy_fd_launch_invalid")
 entries = json.loads(sys.argv[1])
 args = sys.argv[2:]
+plan_envelope = None
+if isinstance(entries, dict):
+    plan_envelope = entries
+    if (set(entries) != {"schema_version", "authority", "authority_sha256", "entries"}
+        or entries["schema_version"] != "herdr-private-mount-plan-1"):
+        raise SystemExit("policy_fd_private_plan_invalid")
+    entries = entries["entries"]
 if not isinstance(entries, list) or not 1 <= len(entries) <= 96:
     raise SystemExit("policy_fd_launch_invalid")
 mapping, targets, approved_files = {}, set(), set()
@@ -165,6 +172,62 @@ tmpfs_targets = [args[i + 1] for i in range(arg_end - 1)
                  if args[i] == "--tmpfs"]
 private_home = str(home) in tmpfs_targets
 if private_home:
+    if (plan_envelope is not None or any(item["kind"] != "sealed-profile-data" for item in entries)
+        or any(args[i] in ("--bind", "--ro-bind") and i != 1
+               for i in range(arg_end))):
+        # A caller's inode tuples are claims, not host approval. Require the
+        # exact descriptor and argv plan published by the existing root host
+        # authority. The worker cannot create this record or self-approve it.
+        if plan_envelope is None:
+            raise SystemExit("policy_fd_private_plan_required")
+        authority = Path(plan_envelope["authority"])
+        if authority.parent != Path("/etc/herdr/launch-plans"):
+            raise SystemExit("policy_fd_private_plan_untrusted")
+        for parent_path in (*reversed(authority.parents), authority):
+            info = os.lstat(parent_path)
+            if (info.st_uid != 0 or info.st_mode & 0o022
+                or not (stat.S_ISREG(info.st_mode) if parent_path == authority
+                        else stat.S_ISDIR(info.st_mode))):
+                raise SystemExit("policy_fd_private_plan_untrusted")
+        authority_fd = os.open(authority, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            before = os.fstat(authority_fd)
+            raw = os.read(authority_fd, 65537)
+            after = os.fstat(authority_fd)
+            if not 0 < len(raw) <= 65536 or os.read(authority_fd, 1):
+                raise SystemExit("policy_fd_private_plan_invalid")
+            stamp = lambda x: (x.st_dev, x.st_ino, x.st_size, x.st_mtime_ns, x.st_ctime_ns, x.st_uid, x.st_mode)
+            if stamp(before) != stamp(after) or stamp(before) != stamp(os.lstat(authority)):
+                raise SystemExit("policy_fd_private_plan_changed")
+            approved_plan = json.loads(raw)
+        finally:
+            os.close(authority_fd)
+        canonical = lambda value: json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                             ensure_ascii=False, allow_nan=False).encode()
+        # Restore the original FD tokens for the root-approved argv digest:
+        # descriptor duplication above changes local numbers, never authority.
+        original_args = sys.argv[2:]
+        if (not isinstance(approved_plan, dict)
+            or set(approved_plan) != {"schema_version", "identity", "descriptors", "argv_sha256", "writable_targets"}
+            or approved_plan["schema_version"] != "herdr-private-mount-plan-1"
+            or approved_plan["descriptors"] != entries
+            or approved_plan["argv_sha256"] != hashlib.sha256(canonical(original_args)).hexdigest()
+            or hashlib.sha256(canonical(approved_plan)).hexdigest() != plan_envelope["authority_sha256"]):
+            raise SystemExit("policy_fd_private_plan_mismatch")
+        writes = sorted(original_args[i + 2] for i in range(arg_end - 2)
+                        if original_args[i] == "--bind-fd")
+        if approved_plan["writable_targets"] != writes:
+            raise SystemExit("policy_fd_private_plan_mode_mismatch")
+        identity_env = {"consumer": "HERDR_POLICY_CONSUMER", "agent_id": "HERDR_POLICY_AGENT_ID",
+                        "parent_agent_id": "HERDR_POLICY_PARENT_AGENT_ID", "parent_task_id": "HERDR_POLICY_PARENT_TASK_ID",
+                        "task_id": "HERDR_POLICY_TASK_ID", "run_token": "HERDR_POLICY_RUN_TOKEN",
+                        "fencing_token": "HERDR_POLICY_FENCING_TOKEN"}
+        if (not isinstance(approved_plan["identity"], dict)
+            or set(approved_plan["identity"]) != set(identity_env)
+            or any(str(approved_plan["identity"][field]) != os.environ.get(key)
+                   for field, key in identity_env.items())
+            or authority.name != hashlib.sha256(canonical(approved_plan["identity"])).hexdigest() + ".json"):
+            raise SystemExit("policy_fd_private_plan_identity_mismatch")
     if not approved_files or not {"config.yaml", ".env"} <= approved_files:
         raise SystemExit("policy_fd_profile_required")
     if tmpfs_targets.count(str(home)) != 1:
@@ -272,7 +335,10 @@ if private_home:
            for option, value, position in parsed if position > 1):
         raise SystemExit("policy_fd_private_proc_shadowed")
     if (args[end - 2:end] != ["--remount-ro", str(home)]
-        or sum(args[i] == "--remount-ro" for i in range(end)) != 1):
+        or sum(op == "--remount-ro" and value == [str(home)]
+               for op, value, _ in parsed) != 1
+        or any(op == "--remount-ro" and value[0] not in tmpfs_targets
+               for op, value, _ in parsed)):
         raise SystemExit("policy_fd_private_home_not_readonly")
     home_mask = next(i for i in range(end - 1)
                      if args[i] == "--tmpfs" and args[i + 1] == str(home))
@@ -349,6 +415,9 @@ if private_home:
     sensitive = (Path("/"), Path("/home"), home, root,
                  home / ".ssh", home / ".aws", home / ".gnupg",
                  home / ".config", home / ".kube", Path("/proc"))
+    if workspace is not None and any(workspace == p or p in workspace.parents
+                                    for p in sensitive[3:]):
+        raise SystemExit("policy_fd_private_workspace_sensitive")
     approved_dir_targets = {
         Path("/run/herdr/policy-code"),
         Path("/run/herdr-bootstrap"),
@@ -359,6 +428,11 @@ if private_home:
     approved_file_targets = {
         Path("/run/herdr-policy/grant.bundle.json"),
     }
+    if plan_envelope is not None:
+        approved_dir_targets.update(Path(e["target"]) for e in approved_plan["descriptors"]
+                                    if e["kind"] == "directory")
+        approved_file_targets.update(Path(e["target"]) for e in approved_plan["descriptors"]
+                                     if e["kind"] == "file")
     approved_socket_targets = {
         Path("/run/herdr-policy/bootstrap-authority.sock"),
     }
@@ -373,6 +447,16 @@ if private_home:
         }[item["kind"]]
         if target not in allowed:
             raise SystemExit("policy_fd_private_fd_target_untrusted")
+        bind_mode = next(op for op, value, _ in parsed
+                         if op in ("--bind-fd", "--ro-bind-fd")
+                         and value == [str(mapping[item["fd"]][0]), str(target)])
+        if (target in {Path("/run/herdr/policy-code"), Path("/run/herdr-bootstrap"),
+                      root / "hermes-agent", home / ".local/share/uv/python/cpython-3.11.16-linux-x86_64-gnu",
+                      Path("/run/herdr-policy/grant.bundle.json"),
+                      Path("/run/herdr-policy/bootstrap-authority.sock")}
+            or re.fullmatch(r"/home/agentops/\.local/(?:bin/[^/]+|share/uv/tools/.+)", str(target))):
+            if bind_mode != "--ro-bind-fd":
+                raise SystemExit("policy_fd_private_authority_writable")
         opened = mapping[item["fd"]][0]
         if item["kind"] != "socket":
             actual = os.readlink("/proc/self/fd/" + str(opened))
@@ -388,56 +472,14 @@ if private_home:
                 raise SystemExit("policy_fd_private_fd_source_untrusted")
             if target == workspace and path != workspace:
                 raise SystemExit("policy_fd_private_fd_source_untrusted")
-    # Pin any remaining literal bind by a no-follow O_PATH FD *before*
-    # execv(), eliminating the host rename/symlink gap between realpath()
-    # validation and bwrap consuming its mount source.
-    #
-    # Only the one exact admitted working directory can be writable. A
-    # root-published, immutable shim may be bound readonly over a known CLI
-    # executable location. Unknown destinations (including /mnt/tree/alias)
-    # and HOME credential paths are always denied, even if source==target.
+    # Every additional source comes from the exact root-approved descriptor
+    # plan. Reopening a literal caller path would reintroduce a rename race.
     for option, values, position in parsed:
         if option not in ("--bind", "--ro-bind") or position == 1:
             continue
-        source_text, target_text = values
-        destination = Path(target_text)
-        is_workspace = (workspace is not None
-                        and destination == workspace
-                        and source_text == str(workspace))
-        is_cli = (option == "--ro-bind"
-                  and re.fullmatch(
-                      r"/home/agentops/\.local/(?:bin/[a-zA-Z0-9._-]+|"
-                      r"share/uv/tools/[a-zA-Z0-9._/-]+)", target_text) is not None)
-        if not (is_workspace or is_cli):
-            raise SystemExit("policy_fd_private_literal_target_untrusted")
-        source_fd = os.open(
-            source_text, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
-        )
-        info = os.fstat(source_fd)
-        if (is_workspace and not stat.S_ISDIR(info.st_mode)
-            or is_cli and not stat.S_ISREG(info.st_mode)):
-            raise SystemExit("policy_fd_private_literal_source_invalid")
-        original_inode = os.readlink("/proc/self/fd/" + str(source_fd))
-        if (original_inode != source_text
-            or os.path.realpath(original_inode) != source_text
-            or original_inode.endswith(" (deleted)")):
-            raise SystemExit("policy_fd_private_literal_source_invalid")
-        if is_cli:
-            # Do not put user-owned policy shell code into an otherwise
-            # immutable namespace. The real publisher must create new
-            # root-owned source inodes under root-controlled ancestors.
-            source_root = Path("/")
-            for component in Path(source_text).parts[1:]:
-                source_root /= component
-                ancestor = os.lstat(source_root)
-                if (ancestor.st_uid != 0
-                    or stat.S_IMODE(ancestor.st_mode) & 0o022):
-                    raise SystemExit("policy_fd_private_literal_source_untrusted")
-            if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022:
-                raise SystemExit("policy_fd_private_literal_source_untrusted")
-        args[position] = "--bind-fd" if option == "--bind" else "--ro-bind-fd"
-        args[position + 1] = str(source_fd)
-        os.set_inheritable(source_fd, True)
+        # Root-authorized plans use descriptors for every mutable source and
+        # exact CLI artefact. Never reopen a caller pathname for these mounts.
+        raise SystemExit("policy_fd_private_literal_source_unpinned")
     # The pinned FD is the only source Bubblewrap may mount; pathname
     # swaps performed after this check cannot alter that inode's identity.
 else:
@@ -571,7 +613,11 @@ def command(
         # root nor child currently supplies a pinned writable result-slot FD.
         # Fail CLOSED for the new mode until both root/child paths provide
         # complete FD-owned write mounts; don't regress legacy behavior.
-        if pinned_worktree is None or writable:
+        pinned_worktree = pinned_worktree or getattr(policy_mount, "private_workspace_pin", None)
+        private_result_pin = getattr(policy_mount, "private_result_pin", None)
+        if (pinned_worktree is None
+            or writable and (private_result_pin is None
+                             or tuple(map(Path, writable)) != (private_result_pin.logical,))):
             raise RuntimeError("durable_private_profile_sources_unpinned")
         from herdr.policy_launch import PolicyMount
         from herdr.security import SecurityError
@@ -585,6 +631,16 @@ def command(
         except SecurityError as exc:
             raise RuntimeError("durable_private_runtime_not_immutable") from exc
         private_profile_mounts = private_profile_snapshot.mount_arguments()
+        from herdr.private_mount_plan import isolated_destination_anchor
+        destinations = [Path(workspace), *map(Path, writable)]
+        anchors = {isolated_destination_anchor(path) for path in destinations}
+        private_anchors = sorted((p for p in anchors if p != HOME and p != Path("/tmp")
+                                  and not any(q != p and q in p.parents for q in anchors)), key=str)
+        private_destination_setup = []
+        for anchor in private_anchors:
+            private_destination_setup.extend(("--tmpfs", str(anchor)))
+        for path in sorted({Path(workspace), *(Path(p).parent for p in writable)}, key=str):
+            private_destination_setup.extend(("--dir", str(path)))
     else:
         private_profile_mounts = []
     if admission_root is not None and policy_mount is None:
@@ -634,7 +690,8 @@ def command(
         *(["--die-with-parent"] if admission_root is not None else []),
         "--tmpfs", "/tmp",
         *(private_profile_mounts[:-2] if private_profile_mounts else []),
-        *([] if pinned_worktree is None else
+        *(private_destination_setup if private_profile_mounts else []),
+        *([] if pinned_worktree is None or private_profile_mounts else
           ["--tmpfs", str(workspace.parent), "--dir", str(workspace)]),
         (("--bind-fd" if child_workspace_writable is not False else "--ro-bind-fd")
          if pinned_worktree else
@@ -663,7 +720,11 @@ def command(
         if path in seen:
             continue
         seen.add(path)
-        args += ["--bind", str(path), str(path)]
+        if private_profile_snapshot is not None:
+            private_result_pin.verify()
+            args += ["--bind-fd", str(private_result_pin.fd), str(path)]
+        else:
+            args += ["--bind", str(path), str(path)]
 
     if owned_write_pins is not None:
         for entry in owned_write_pins.descriptors():
@@ -683,12 +744,29 @@ def command(
 
     args += ["--tmpfs", str(HERDR_CONFIG), "--tmpfs", str(HERDR_RELEASES)]
     for path in {real_binary, real_binary.resolve(strict=True)}:
-        args += ["--ro-bind", str(policy), str(path)]
+        if private_profile_snapshot is not None:
+            from herdr.policy_launch import _open_relative
+            source = "agent-stack/policy-bin/herdr"
+            if source not in dict(policy_mount.code.files):
+                raise RuntimeError("durable_private_cli_artifact_unapproved")
+            key = str(path)
+            if key not in policy_mount.private_cli_pins:
+                policy_mount.private_cli_pins[key] = _open_relative(policy_mount.code.fd, source)
+            args += ["--ro-bind-fd", str(policy_mount.private_cli_pins[key]), str(path)]
+        else:
+            args += ["--ro-bind", str(policy), str(path)]
     if policy_mount is not None:
         # Host-only immutable copies override mutable checkout/runtime aliases.
         descriptors = policy_mount.descriptors()
         if owned_write_pins is not None:descriptors.extend(owned_write_pins.descriptors())
         if private_profile_snapshot is not None:
+            if private_result_pin is not None:
+                descriptors.append(private_result_pin.descriptor())
+            for target, fd in policy_mount.private_cli_pins.items():
+                held = os.fstat(fd)
+                descriptors.append({"source": f"/proc/{os.getpid()}/fd/{fd}", "fd": fd,
+                                    "device": held.st_dev, "inode": held.st_ino,
+                                    "kind": "file", "target": target})
             descriptors.extend(private_profile_snapshot.fd_descriptors())
         args += ["--tmpfs", "/run", "--dir", "/run/herdr", "--dir", "/run/herdr-policy"]
         for entry in policy_mount.descriptors():
@@ -696,9 +774,11 @@ def command(
         from herdr.launch_environment import STARTUP_CONTROLS
         for name in sorted(set(STARTUP_CONTROLS)|{key for key in os.environ if key.startswith("LD_")}):
             args += ["--unsetenv",name]
-        args += ["--setenv", "PATH", "/run/herdr-bootstrap:/usr/bin:/bin"]
+        args += ["--setenv", "PATH", "/run/herdr/policy-code/agent-stack/policy-bin:/usr/bin:/bin"]
     args += [
         "--setenv", "HERDR_DURABLE_SANDBOX", "1",
+        *(part for anchor in (private_anchors if private_profile_mounts else [])
+          for part in ("--remount-ro", str(anchor))),
         *(private_profile_mounts[-2:] if private_profile_mounts else []),
         "--", "/bin/bash", "--noprofile", "--norc", "-i",
     ]
@@ -707,6 +787,13 @@ def command(
             descriptors.insert(0, {"source": pinned_worktree.source, "fd": pinned_worktree.fd,
                                   "device": pinned_worktree.device, "inode": pinned_worktree.inode,
                                   "kind": "directory", "target": str(pinned_worktree.logical)})
+        if private_profile_snapshot is not None:
+            from herdr.private_mount_plan import request_for, ApprovedPrivateMountPlan
+            policy_mount.private_mount_request = request_for(policy_mount.private_identity, descriptors, args)
+            plan = policy_mount.private_mount_plan
+            if not isinstance(plan, ApprovedPrivateMountPlan):
+                raise RuntimeError("durable_private_mount_plan_unapproved")
+            descriptors = plan.authorize(descriptors, args)
         result_command = ["/usr/bin/python3", "-I", "-S", "-c", _POLICY_FD_LAUNCHER,
                           json.dumps(descriptors, separators=(",", ":")), *args]
         if admission_root is not None:
