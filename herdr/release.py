@@ -45,6 +45,7 @@ PAYLOAD_PATHS = (
     "docs/architecture/INVOCATION_POLICY_LAUNCH.md",
     "docs/architecture/IMMUTABLE_PROFILE_NAMESPACE_129.md",
     "docs/architecture/PROFILE_HANDOFF_132.md",
+    "docs/architecture/ROOT_PUBLISHED_RUNTIME_129.md",
     "docs/architecture/COMPLETION_EVIDENCE.md",
 
     "docs/architecture/WORK_NODE_CONTRACT.md",
