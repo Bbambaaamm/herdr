@@ -37,6 +37,7 @@ def _reader_tools() -> frozenset[str]:
             "grep",
             "web_search",
             "web_extract",
+            "herdr_external_knowledge",
             "git_status",
             "git_log",
         }

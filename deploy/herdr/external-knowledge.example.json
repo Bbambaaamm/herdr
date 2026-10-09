@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "consumers": {
+    "github:Example/project": {
+      "providers": {
+        "example-provider": [
+          "mail",
+          "chat",
+          "documents"
+        ]
+      }
+    }
+  }
+}

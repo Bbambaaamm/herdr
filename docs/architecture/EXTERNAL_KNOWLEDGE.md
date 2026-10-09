@@ -79,3 +79,43 @@ This contract is intentionally dormant infrastructure. Shipping it does not
 register any live provider, does not create a model tool, does not open network
 egress and does not activate credentials. Runtime activation requires a separate
 reviewed provider installation plus explicit host-owned authority.
+
+
+## Guarded host bridge
+
+A model may see an external knowledge provider only through the protected
+herdr_external_knowledge read tool. The tool is inert unless all of the following
+are true:
+
+- the exact signed SecurityGrant contains the tool and its fixed READ ToolRule;
+- the current TaskGraph/parent tool scope contains the tool;
+- the physically authenticated bootstrap peer still matches the admitted
+  process, interpreter, mount namespace, attempt and fence;
+- the current work phase allows the invocation;
+- the root-owned external-knowledge policy explicitly allows the consumer,
+  provider id and every requested logical source;
+- a private host provider daemon is available.
+
+The worker sends its bounded request through the already authenticated Herdr
+bootstrap authority socket. The host checks peer/grant/mount/phase before the
+provider call and repeats those checks after the provider returns, before any
+result crosses back into the sandbox. A phase/fence/peer change therefore
+withholds the result rather than delivering stale authority.
+
+The provider daemon socket lives outside the sandbox and is not mounted into the
+worker namespace. Provider credentials, OAuth caches and network endpoints stay
+host-only. The external provider receives only provider_id plus the bounded
+generic KnowledgeRequest; Herdr invocation identity and grant hashes are not
+forwarded to it.
+
+The fixed host allowlist is /etc/herdr/external-knowledge.json. It contains only
+consumer/provider/source identifiers, never credentials. The repository example
+at deploy/herdr/external-knowledge.example.json documents its closed version-1
+shape.
+
+AUTH_REQUIRED and provider availability failures are returned as source-level
+knowledge errors. They do not stop unrelated Herdr capabilities.
+
+Activation remains separate from this contract. Shipping the bridge does not add
+herdr_external_knowledge to an active consumer task profile, install a provider,
+create credentials, or start a daemon.
