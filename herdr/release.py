@@ -43,6 +43,7 @@ PAYLOAD_PATHS = (
     "docs/architecture/AGENT_SKILLS.md",
     "docs/architecture/CONTEXT_MEMORY.md",
     "docs/architecture/INVOCATION_POLICY_LAUNCH.md",
+    "docs/architecture/IMMUTABLE_PROFILE_NAMESPACE_129.md",
     "docs/architecture/COMPLETION_EVIDENCE.md",
 
     "docs/architecture/WORK_NODE_CONTRACT.md",
