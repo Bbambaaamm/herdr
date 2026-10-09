@@ -19,6 +19,70 @@ validated consumer policy overlays, `RELEASE.json`, and `MANIFEST.sha256`. It do
 not contain secrets, credentials, databases, logs, prompts, raw queries, or the
 external Herdr binary.
 
+## One-time RC26 operator-marker access migration
+
+The current RC26 marker is `root:agent-platform-read 0640` inside an
+`agentops:agent-platform-read 0750` directory. The documented unprivileged
+cutover operator `quantadmin` cannot traverse that directory. Do not expose
+`queue.json`, usage ledgers, or the directory listing by changing the directory
+to 0755 or adding the operator to `agent-platform-read`.
+
+Only after independent review of the **signed candidate release** and restoration
+of staging disk headroom (#126), extract the verified archive into a fresh
+mode-0700 operator directory. Never execute Python with `sudo` from that
+operator-writable extracted tree: Python `-I` does not authenticate imported
+source files.
+
+From the *verified* archive's extracted source root, copy **only** the four
+reviewed bootstrap code files to an explicitly root-owned, non-writable tree.
+Verify the exact pinned SHA-256 for each copied file **before** executing any
+Python as root. This block is deliberately pinned to the reviewed files and
+must fail if their content differs; future edits require an independent
+re-review and regenerated published hashes.
+
+```sh
+REVIEWED_EXTRACTED=/home/quantadmin/herdr-cutover/VERIFIED-RELEASE-TREE
+ROOT=/var/lib/herdr/marker-bootstrap-rc26
+test -d "$REVIEWED_EXTRACTED" || exit 1
+sudo /usr/bin/install -d -o root -g root -m 0700 "$ROOT"
+for directory in deploy deploy/herdr deploy/herdr/cutover herdr; do
+  sudo /usr/bin/install -d -o root -g root -m 0755 "$ROOT/$directory"
+done
+for file in \
+  deploy/herdr/cutover/bootstrap_operator_marker.py \
+  deploy/herdr/cutover/cutover.py \
+  herdr/release.py \
+  herdr/__init__.py
+do
+  sudo /usr/bin/install -o root -g root -m 0444 \
+    "$REVIEWED_EXTRACTED/$file" "$ROOT/$file"
+done
+sudo /usr/bin/sha256sum -c - <<'REVIEWED-RC26-MARKER-HASHES'
+77644732d05af4718ea54d761fbc91c0b85a054c4e1b8347b4d633ebb01158df  /var/lib/herdr/marker-bootstrap-rc26/deploy/herdr/cutover/bootstrap_operator_marker.py
+cc7364794891bef2fd4d2959052d5082f39465daf18acb51e08bf62126db637a  /var/lib/herdr/marker-bootstrap-rc26/deploy/herdr/cutover/cutover.py
+626f3b7f15559f786a1744fd468e0459bde3133552977d948f3136ceefe48124  /var/lib/herdr/marker-bootstrap-rc26/herdr/release.py
+0245395e84000b625b82b0ebf6e9a059cd7c1a496e89896d448cdb2073b3433b  /var/lib/herdr/marker-bootstrap-rc26/herdr/__init__.py
+REVIEWED-RC26-MARKER-HASHES
+[ "$?" -eq 0 ] || exit 1
+sudo /usr/bin/python3 -I -B \
+  "$ROOT/deploy/herdr/cutover/bootstrap_operator_marker.py"
+```
+
+The root-owned tree is not a new production release; it is a temporary,
+pinned tool for one strictly scoped access migration. Preserve its provenance
+and operator audit evidence, and do not repurpose it for task execution.
+
+This operation is pinned to the exact current RC26 tag/commit. As root it verifies
+the current immutable release metadata, manifest and installed unit hashes
+*before* changing anything. It grants `quantadmin` execute-only directory
+traversal (`u:quantadmin:--x` POSIX ACL) and makes only the root-owned bounded,
+nonsecret `deployed-release.json` readable (`0644`); the remaining state files
+and directory listing remain inaccessible. It also probes real operator access.
+Any unsupported identity or ACL result fails closed. Neither an old RC22 bridge
+nor a generic permission-bypass exception is introduced. Once the bridge has
+succeeded, perform the normal unprivileged preflight below; it must still check
+manifest, content and unit identity exactly.
+
 ## Unprivileged preflight
 
 Extract the verified archive into a fresh private operator directory. Run the
