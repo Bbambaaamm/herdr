@@ -166,36 +166,79 @@ if private_home:
     if (not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0
         or stat.S_IMODE(parent.st_mode) & 0o022):
         raise SystemExit("policy_fd_home_anchor_untrusted")
-    # The home mount must be in force before any profile data is copied.
-    home_mask = next(i for i in range(len(args) - 1)
+    # The entire private HOME base must be remounted read-only *after* the
+    # sealed inputs and every other mount operation. A writable ancestor
+    # allows a same-UID process to rename the mounted profile and replace the
+    # logical pathname while Hermes is still running. The four runtime tmpfs
+    # submounts are separate and remain writable (nonrecursive remount).
+    if args[:4] != ["/usr/bin/bwrap", "--ro-bind", "/", "/"]:
+        raise SystemExit("policy_fd_private_home_base_invalid")
+    try:
+        end = args.index("--")
+    except ValueError:
+        raise SystemExit("policy_fd_launch_invalid")
+    if (args[end - 2:end] != ["--remount-ro", str(home)]
+        or sum(args[i] == "--remount-ro" for i in range(end)) != 1):
+        raise SystemExit("policy_fd_private_home_not_readonly")
+    home_mask = next(i for i in range(end - 1)
                      if args[i] == "--tmpfs" and args[i + 1] == str(home))
-    # Protect all profile ancestors and descendants for the *entire*
-    # invocation: no late rw bind, readonly alias or nested tmpfs may shadow
-    # sealed inputs. The sole trusted exception is the policy-owned immutable
-    # Hermes code directory bind from a verified runtime FD.
-    for i, arg in enumerate(args):
-        if i + 2 >= len(args):
-            continue
+    if home_mask >= end - 2:
+        raise SystemExit("policy_fd_private_home_order_invalid")
+    selected_profile = profiles / profile_name
+    profile_runtime = {str(selected_profile / n)
+                       for n in ("sessions", "cache", "logs", "pastes")}
+    runtime_mounts = [args[i + 1] for i in range(end - 1)
+                      if args[i] == "--tmpfs" and args[i + 1] in profile_runtime]
+    if len(runtime_mounts) != len(profile_runtime) or set(runtime_mounts) != profile_runtime:
+        raise SystemExit("policy_fd_private_runtime_missing")
+    for i, arg in enumerate(args[:end]):
         if arg == "--ro-bind-data" and i < home_mask:
             raise SystemExit("policy_fd_private_home_order_invalid")
         if arg in ("--bind", "--ro-bind", "--dev-bind",
+                   "--bind-try", "--ro-bind-try", "--dev-bind-try",
                    "--bind-fd", "--ro-bind-fd"):
+            if i + 2 >= end:
+                raise SystemExit("policy_fd_launch_invalid")
             destination = Path(args[i + 2])
-            within_hermes = destination == root or root in destination.parents
-            if (destination == home or within_hermes) and not (
-                arg == "--ro-bind-fd" and destination == root / "hermes-agent"
-            ):
-                raise SystemExit("policy_fd_private_home_shadowed")
-        if arg == "--tmpfs" and i + 1 < len(args):
+            # /home and / are ancestors of HOME. A *later* bind there
+            # shadows the complete profile namespace even when the private
+            # /home/agentops tmpfs itself has already been mounted.
+            if destination == home or destination in home.parents:
+                if not (i == 1 and arg == "--ro-bind"
+                        and args[i + 1:i + 3] == ["/", "/"]):
+                    raise SystemExit("policy_fd_private_home_shadowed")
+            if destination == root or root in destination.parents:
+                # Only the independently verified immutable Hermes SDK tree
+                # may live outside the sealed selected-profile input files.
+                if not (arg == "--ro-bind-fd"
+                        and destination == root / "hermes-agent"):
+                    raise SystemExit("policy_fd_private_home_shadowed")
+        if arg in ("--tmpfs", "--dev", "--proc", "--mqueue",
+                   "--tmp-overlay", "--ro-overlay"):
+            if i + 1 >= end:
+                raise SystemExit("policy_fd_launch_invalid")
             destination = Path(args[i + 1])
-            if (destination == root or root in destination.parents):
+            if destination in home.parents:
                 raise SystemExit("policy_fd_private_home_shadowed")
-    profile_dirs = {str(home / ".hermes/profiles" / profile_name / n)
-                    for n in ("sessions", "cache", "logs", "pastes")}
-    created_dirs = {args[i + 1] for i in range(len(args) - 1)
-                    if args[i] == "--dir"}
-    if not profile_dirs <= created_dirs:
-        raise SystemExit("policy_fd_private_runtime_missing")
+            if destination == root or root in destination.parents:
+                if not (arg == "--tmpfs" and str(destination) in profile_runtime):
+                    raise SystemExit("policy_fd_private_home_shadowed")
+        if arg in ("--file", "--bind-data", "--symlink"):
+            if i + 2 >= end:
+                raise SystemExit("policy_fd_launch_invalid")
+            destination = Path(args[i + 2])
+            if (destination == home or destination in home.parents
+                or destination == root or root in destination.parents):
+                raise SystemExit("policy_fd_private_home_shadowed")
+        if arg == "--overlay":
+            raise SystemExit("policy_fd_private_home_shadowed")
+    # Runtime tmpfs mounts must be installed *after* the private home root,
+    # and before its final read-only remount; otherwise data can leak or be
+    # destroyed by an overmount without violating a simple target-set check.
+    for i in range(end - 1):
+        if args[i] == "--tmpfs" and args[i + 1] in profile_runtime:
+            if not home_mask < i < end - 2:
+                raise SystemExit("policy_fd_private_home_order_invalid")
 else:
     if approved_files:
         raise SystemExit("policy_fd_profile_data_without_private_home")

@@ -1,4 +1,5 @@
 """Production FD-launcher extension is tested without any model invocation."""
+import errno
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -78,6 +79,28 @@ def test_host_policy_fd_launcher_binds_sealed_profile_without_raw_secrets(tmp_pa
             child = int(children[0])
             inside = Path(f"/proc/{child}/root")
             assert os.readlink(f"/proc/{child}/ns/mnt") != os.readlink("/proc/self/ns/mnt")
+            mount_lines = Path(f"/proc/{child}/mountinfo").read_text().splitlines()
+            def mounted_flags(target):
+                rows = [line for line in mount_lines
+                        if line.split(" - ", 1)[0].split()[4] == target]
+                assert len(rows) == 1
+                return rows[0].split(" - ", 1)[0].split()[5].split(",")
+            assert "ro" in mounted_flags("/home/agentops")
+            assert "rw" in mounted_flags("/home/agentops/.hermes/profiles/quantlab/logs")
+            readonly_profile = inside / "home/agentops/.hermes/profiles/quantlab"
+            attacker_target = inside / "home/agentops/.hermes/profiles/attacker"
+            with pytest.raises(OSError) as denied_rename:
+                readonly_profile.rename(attacker_target)
+            assert denied_rename.value.errno == errno.EROFS
+            with pytest.raises(OSError) as denied_chmod:
+                readonly_profile.chmod(0o777)
+            assert denied_chmod.value.errno == errno.EROFS
+            private_log = readonly_profile / "logs/runtime-fixture.txt"
+            private_log.write_bytes(b"private runtime allowed")
+            assert private_log.read_bytes() == b"private runtime allowed"
+            with pytest.raises(OSError) as denied_config:
+                (readonly_profile / "config.yaml").write_bytes(b"forbidden")
+            assert denied_config.value.errno == errno.EROFS
             assert (inside / "home/agentops/.hermes/profiles/quantlab/config.yaml").read_bytes() == values["config.yaml"]
             assert (inside / "home/agentops/.hermes/profiles/quantlab/.env").read_bytes() == values[".env"]
             source.rename(tmp_path / "approved-old")
@@ -105,6 +128,11 @@ def test_host_policy_fd_launcher_binds_sealed_profile_without_raw_secrets(tmp_pa
     ("wrong_target", "policy_fd_profile_target_invalid"),
     ("profile_override", "policy_fd_private_home_shadowed"),
     ("nested_tmpfs", "policy_fd_private_home_shadowed"),
+    ("parent_bind_home", "policy_fd_private_home_shadowed"),
+    ("parent_bind_root", "policy_fd_private_home_shadowed"),
+    ("parent_tmpfs_home", "policy_fd_private_home_shadowed"),
+    ("missing_ro_remount", "policy_fd_private_home_not_readonly"),
+    ("early_ro_remount", "policy_fd_private_home_not_readonly"),
     ("data_before_home", "policy_fd_private_home_order_invalid"),
 ])
 def test_sealed_fd_policy_launcher_fails_before_bwrap_on_invalid_metadata(
@@ -128,7 +156,7 @@ def test_sealed_fd_policy_launcher_fails_before_bwrap_on_invalid_metadata(
             del flags[index:index + 2]
         elif mutation == "missing_runtime_dir":
             index = flags.index(str(snapshot.destination / "logs"))
-            assert flags[index - 1] == "--dir"
+            assert flags[index - 1] == "--tmpfs"
             del flags[index - 1:index + 1]
         elif mutation == "wrong_target":
             descriptions[0]["target"] = (
@@ -137,9 +165,21 @@ def test_sealed_fd_policy_launcher_fails_before_bwrap_on_invalid_metadata(
             index = flags.index("--ro-bind-data")
             flags[index + 2] = descriptions[0]["target"]
         elif mutation == "profile_override":
-            flags.extend(["--ro-bind", str(source), str(snapshot.destination)])
+            flags[-2:-2] = ["--ro-bind", str(source), str(snapshot.destination)]
         elif mutation == "nested_tmpfs":
-            flags.extend(["--tmpfs", str(snapshot.destination)])
+            flags[-2:-2] = ["--tmpfs", str(snapshot.destination)]
+        elif mutation == "parent_bind_home":
+            flags[-2:-2] = ["--bind", str(source), "/home"]
+        elif mutation == "parent_bind_root":
+            flags[-2:-2] = ["--ro-bind", "/", "/"]
+        elif mutation == "parent_tmpfs_home":
+            flags[-2:-2] = ["--tmpfs", "/home"]
+        elif mutation == "missing_ro_remount":
+            del flags[-2:]
+        elif mutation == "early_ro_remount":
+            readonly = flags[-2:]
+            del flags[-2:]
+            flags[:0] = readonly
         elif mutation == "data_before_home":
             index = flags.index("--ro-bind-data")
             item = flags[index:index + 3]

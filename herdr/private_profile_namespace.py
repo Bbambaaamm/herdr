@@ -228,8 +228,14 @@ class PrivateProfileSnapshot:
             args.extend([
                 "--ro-bind-data", str(file.fd), str(self.destination/file.relative),
             ])
+        # The base HOME and all profile path ancestors must become immutable
+        # for the entire sandbox lifetime. Runtime writes are allowed only
+        # through separately mounted, non-recursive RW tmpfs submounts.
         for name in _RUNTIME:
-            args.extend(["--dir", str(self.destination/name)])
+            args.extend(["--tmpfs", str(self.destination / name)])
+        # bwrap's --remount-ro is NONRECURSIVE: runtime submounts stay RW.
+        # The host launcher must enforce this as the last mount operation.
+        args.extend(["--remount-ro", str(self.home)])
         return args
 
     def verify(self) -> None:

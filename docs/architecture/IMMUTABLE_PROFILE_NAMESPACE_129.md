@@ -37,11 +37,21 @@ connected to the live Herdr agent launcher.
    `/home/agentops/.hermes` ancestors for the entire session lifetime.
 4. Under the private root, bwrap recreates only the selected profile directory
    and copies sealed file-descriptor contents with `--ro-bind-data`.
-   Writable `sessions/cache/logs/pastes` are private temporary directories
-   **inside that isolated home**, never host profile aliases.
-5. Physical tests read from the **sandbox child namespace**. Changes to the
-   host source bytes and replacement of the host source directory with a
-   symlink have no effect on the profile snapshot visible to the sandbox.
+   `sessions/cache/logs/pastes` each receive a separate **RW tmpfs submount**.
+   After *all* mounts, bwrap executes `--remount-ro /home/agentops` as the
+   **last mount operation**. This remount is nonrecursive: runtime tmpfs
+   submounts remain writable, while profile ancestors and sealed inputs
+   become **EROFS** even for the same-UID host via `/proc/<child>/root`.
+5. The host FD launcher fail-closes if the remount is absent, repeated or
+   not last; if a bind/tmpfs shadows `/home`, `/`, HOME or the sealed
+   profile tree; or if the exact four runtime submounts are missing.
+   The required initial `--ro-bind / /` is the sole permitted ancestor bind.
+6. Physical tests read from the **sandbox child namespace**, not the
+   unisolated bwrap supervisor. Host source edits/renames/symlink replacement
+   do not alter sealed bytes. **Destination-side** profile rename/chmod
+   and configuration writes fail with `EROFS`; an isolated logs tmpfs write
+   succeeds. Both bypasses raised as P1 on review of head `c51a9d2`
+   now have direct regression tests.
 
 The prototype is fail-closed and does not silently select a model or call an
 external provider. It also tests the sealed FD transfer through the actual
@@ -55,8 +65,11 @@ host policy launcher and the bwrap child, not just a direct bwrap invocation.
 - The existing `_POLICY_FD_LAUNCHER` now has **dormant, opt-in** support
   for transporting sealed descriptors via `--ro-bind-data`. It verifies
   inode/device, seal bits, bounded size, digest, profile identity, target and
-  private HOME mount order; it rejects nested host rebinds over profile paths
-  and preserves the legacy launch path. A real subprocess/child namespace
+  private HOME mount order; it requires a final read-only base remount,
+  rejects ancestor mounts that would shadow the private HOME (including
+  `/home`) and keeps the approved profile ancestry immutable for life.
+  The isolated runtime tmpfs submounts remain writable. The legacy launch
+  path is preserved. A real subprocess/child namespace
   test proves that the FD handoff works and that changing host input files
   after launch does not alter the sandbox view. **The production root/child
   caller has not yet been connected to this option.** The host authority must

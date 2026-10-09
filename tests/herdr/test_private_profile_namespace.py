@@ -50,7 +50,13 @@ def test_freezes_approved_inputs_and_cannot_mutate_sealed_memfd(tmp_path):
                 for record in profile.files} == values
         mount = profile.mount_arguments()
         assert mount[:2] == ["--tmpfs", str(HOME)]
+        assert mount[-2:] == ["--remount-ro", str(HOME)]
         assert "--ro-bind-data" in mount
+        for name in ("sessions", "cache", "logs", "pastes"):
+            assert ["--tmpfs", str(profile.destination / name)] == mount[
+                mount.index(str(profile.destination / name)) - 1:
+                mount.index(str(profile.destination / name)) + 1
+            ]
         assert not any(str(source) in value for value in mount)
     with pytest.raises(PrivateProfileError, match="profile_seal_closed"):
         profile.verify()
@@ -150,10 +156,11 @@ def test_same_uid_host_cannot_replace_profile_view_through_private_home(tmp_path
         (owned_worktree / "task.txt").write_bytes(b"workspace fixture\\n")
         # Never use a real model/provider. The sandbox only runs sleep.
         args = ["/usr/bin/bwrap", "--ro-bind", "/", "/", "--dev", "/dev",
-                "--proc", "/proc", "--unshare-pid", *mounts,
+                "--proc", "/proc", "--unshare-pid", *mounts[:-2],
+                "--dir", str(HOME / "workspaces"),
                 "--ro-bind", str(signed_sdk), str(HOME / ".hermes/hermes-agent"),
                 "--ro-bind", str(owned_worktree), str(HOME / "workspaces/owned"),
-                "--", "/bin/sleep", "4"]
+                *mounts[-2:], "--", "/bin/sleep", "4"]
         with subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                               stderr=subprocess.PIPE,
                               pass_fds=tuple(item.fd for item in frozen.files)) as proc:
