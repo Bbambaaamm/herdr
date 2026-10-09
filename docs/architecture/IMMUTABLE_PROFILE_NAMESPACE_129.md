@@ -60,6 +60,25 @@ connected to the live Herdr agent launcher.
    command delimiter; program arguments cannot satisfy mandatory mounts.
    The same policy is exercised through negative subprocess tests before
    the pinned launcher could execute `bwrap`.
+   All *ordinary FD* mounts are additionally restricted to exact policy-code,
+   Hermes/Python runtime, bootstrap/grant or selected workspace destinations.
+   The launcher inspects the actually opened FD inode and rejects aliases to
+   host `/`, `/proc`, HOME, live `.hermes`, SSH, AWS, GPG, kube and
+   configuration stores. Arbitrary destinations such as `/mnt/alias` cannot
+   be introduced through `--bind-fd` or `--ro-bind-fd`, even with otherwise
+   valid inode metadata. Nested writable FD mounts within the worktree
+   **remain disallowed** pending a separately audited descendant-mount
+   contract.
+   Any non-initial literal bind is restricted to the exact working-directory
+   mount or a root-owned, non-writable CLI shim source. The source is opened
+   with `O_PATH|O_NOFOLLOW`, revalidated against its actual held inode and
+   rewritten to `--bind-fd` / `--ro-bind-fd` before `execv`. A late host
+   rename/symlink substitution therefore cannot change its source inode.
+   Same-UID-writable shim binaries and arbitrary `/mnt/tree/alias` mount
+   destinations fail closed. A real bwrap child test also verifies a pinned
+   worktree source remains unchanged after the host pathname is replaced.
+   These are **security primitives**, not authorization to use a model or
+   evidence of completed end-to-end root/child isolation.
    The required initial `--ro-bind / /` is the sole permitted ancestor bind.
 6. Physical tests read from the **sandbox child namespace**, not the
    unisolated bwrap supervisor. Host source edits/renames/symlink replacement

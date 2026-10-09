@@ -333,6 +333,113 @@ if private_home:
         if args[i] == "--tmpfs" and args[i + 1] in profile_runtime:
             if not home_mask < i < end - 2:
                 raise SystemExit("policy_fd_private_home_order_invalid")
+
+    # All FD-backed mounts must also be host-policy destinations, not just
+    # correct caller-supplied inode tuples. Without this check an attacker can
+    # re-export the host /proc, HOME or credential subtree under /mnt/alias.
+    # The *opened* FD path (not a caller-supplied "source" string) is checked.
+    workspace_dirs = [v[0] for op, v, _ in parsed if op == "--chdir"]
+    ordinary_entries = [item for item in entries
+                        if item["kind"] != "sealed-profile-data"]
+    # Disposable no-agent kernel tests may carry only sealed file data.
+    # Any launch with ordinary code/workspace FDs requires an exact cwd.
+    if len(workspace_dirs) > 1 or (ordinary_entries and len(workspace_dirs) != 1):
+        raise SystemExit("policy_fd_private_workspace_invalid")
+    workspace = Path(workspace_dirs[0]) if workspace_dirs else None
+    sensitive = (Path("/"), Path("/home"), home, root,
+                 home / ".ssh", home / ".aws", home / ".gnupg",
+                 home / ".config", home / ".kube", Path("/proc"))
+    approved_dir_targets = {
+        Path("/run/herdr/policy-code"),
+        Path("/run/herdr-bootstrap"),
+        root / "hermes-agent",
+        home / ".local/share/uv/python/cpython-3.11.16-linux-x86_64-gnu",
+        workspace,
+    }
+    approved_file_targets = {
+        Path("/run/herdr-policy/grant.bundle.json"),
+    }
+    approved_socket_targets = {
+        Path("/run/herdr-policy/bootstrap-authority.sock"),
+    }
+    for item in entries:
+        if item["kind"] == "sealed-profile-data":
+            continue
+        target = Path(item["target"])
+        allowed = {
+            "directory": approved_dir_targets,
+            "file": approved_file_targets,
+            "socket": approved_socket_targets,
+        }[item["kind"]]
+        if target not in allowed:
+            raise SystemExit("policy_fd_private_fd_target_untrusted")
+        opened = mapping[item["fd"]][0]
+        if item["kind"] != "socket":
+            actual = os.readlink("/proc/self/fd/" + str(opened))
+            if (not actual.startswith("/") or actual.endswith(" (deleted)")
+                or os.path.normpath(actual) != actual
+                or os.path.realpath(actual) != actual):
+                raise SystemExit("policy_fd_private_fd_source_untrusted")
+            path = Path(actual)
+            if any(path == root_path for root_path in sensitive):
+                raise SystemExit("policy_fd_private_fd_source_untrusted")
+            if (root in path.parents or Path("/proc") in path.parents
+                or any(x in path.parents for x in sensitive[4:-1])):
+                raise SystemExit("policy_fd_private_fd_source_untrusted")
+            if target == workspace and path != workspace:
+                raise SystemExit("policy_fd_private_fd_source_untrusted")
+    # Pin any remaining literal bind by a no-follow O_PATH FD *before*
+    # execv(), eliminating the host rename/symlink gap between realpath()
+    # validation and bwrap consuming its mount source.
+    #
+    # Only the one exact admitted working directory can be writable. A
+    # root-published, immutable shim may be bound readonly over a known CLI
+    # executable location. Unknown destinations (including /mnt/tree/alias)
+    # and HOME credential paths are always denied, even if source==target.
+    for option, values, position in parsed:
+        if option not in ("--bind", "--ro-bind") or position == 1:
+            continue
+        source_text, target_text = values
+        destination = Path(target_text)
+        is_workspace = (workspace is not None
+                        and destination == workspace
+                        and source_text == str(workspace))
+        is_cli = (option == "--ro-bind"
+                  and re.fullmatch(
+                      r"/home/agentops/\.local/(?:bin/[a-zA-Z0-9._-]+|"
+                      r"share/uv/tools/[a-zA-Z0-9._/-]+)", target_text) is not None)
+        if not (is_workspace or is_cli):
+            raise SystemExit("policy_fd_private_literal_target_untrusted")
+        source_fd = os.open(
+            source_text, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        info = os.fstat(source_fd)
+        if (is_workspace and not stat.S_ISDIR(info.st_mode)
+            or is_cli and not stat.S_ISREG(info.st_mode)):
+            raise SystemExit("policy_fd_private_literal_source_invalid")
+        original_inode = os.readlink("/proc/self/fd/" + str(source_fd))
+        if (original_inode != source_text
+            or os.path.realpath(original_inode) != source_text
+            or original_inode.endswith(" (deleted)")):
+            raise SystemExit("policy_fd_private_literal_source_invalid")
+        if is_cli:
+            # Do not put user-owned policy shell code into an otherwise
+            # immutable namespace. The real publisher must create new
+            # root-owned source inodes under root-controlled ancestors.
+            source_root = Path("/")
+            for component in Path(source_text).parts[1:]:
+                source_root /= component
+                ancestor = os.lstat(source_root)
+                if (ancestor.st_uid != 0
+                    or stat.S_IMODE(ancestor.st_mode) & 0o022):
+                    raise SystemExit("policy_fd_private_literal_source_untrusted")
+            if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022:
+                raise SystemExit("policy_fd_private_literal_source_untrusted")
+        args[position] = "--bind-fd" if option == "--bind" else "--ro-bind-fd"
+        args[position + 1] = str(source_fd)
+        os.set_inheritable(source_fd, True)
+    # The pinned FD is the only source Bubblewrap may mount; pathname
+    # swaps performed after this check cannot alter that inode's identity.
 else:
     if approved_files:
         raise SystemExit("policy_fd_profile_data_without_private_home")

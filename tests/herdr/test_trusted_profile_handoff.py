@@ -213,12 +213,16 @@ def test_real_host_selected_private_profile_mounts_and_attestation(tmp_path, mon
     approved, values = approved_profile(tmp_path)
     workspace = tmp_path / "task-workspace"
     workspace.mkdir()
-    hermes = tmp_path / "fake-herdr"
-    hermes.write_bytes(b"#!/bin/sh\nexit 0\n")
-    hermes.chmod(0o755)
-    policy = tmp_path / "fake-cli-policy"
-    policy.write_bytes(b"#!/bin/sh\nexit 3\n")
-    policy.chmod(0o555)
+    # Private HOME only admits a pinned policy shim from a root-owned
+    # release. This nonsecret RC26 text file is a mounting fixture ONLY:
+    # the child runs /bin/sleep, never this fake shim or any native SDK.
+    hermes = Path("/home/agentops/.local/bin/herdr")
+    policy = Path(
+        "/opt/herdr/releases/v0.3.0-rc.26-4d09b58b4416/"
+        "provenance/external-runtime-dependency.txt"
+    )
+    if not (hermes.is_file() and policy.is_file()):
+        pytest.skip("root-published inert shim fixture unavailable")
     config = tmp_path / "fake-config-control"
     config.mkdir()
     monkeypatch.setattr(sandbox, "HERDR_CONFIG", config)

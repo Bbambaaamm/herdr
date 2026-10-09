@@ -326,3 +326,175 @@ def test_sealed_profile_fd_mounts_after_delimiter_never_satisfy_policy(tmp_path)
         result = subprocess.run(cmd, capture_output=True, timeout=8)
         assert result.returncode != 0
         assert b"policy_fd_launch_invalid" in result.stderr
+
+
+
+@pytest.mark.parametrize("origin,destination,expected", [
+    ("/proc", "/mnt/host-proc", "policy_fd_private_fd_target_untrusted"),
+    ("/", "/mnt/host-root", "policy_fd_private_fd_target_untrusted"),
+    ("/home/agentops", "/run/herdr/policy-code", "policy_fd_private_fd_source_untrusted"),
+    ("/proc", "/run/herdr/policy-code", "policy_fd_private_fd_source_untrusted"),
+    ("/home/agentops/.hermes", "/run/herdr/policy-code",
+     "policy_fd_private_fd_source_untrusted"),
+    ("/tmp", "/mnt/other", "policy_fd_private_fd_target_untrusted"),
+    ("/tmp", "/home/agentops/.ssh", "policy_fd_private_fd_target_untrusted"),
+])
+def test_private_home_rejects_protected_fd_sources_and_unauthorized_targets(
+    tmp_path, origin, destination, expected,
+):
+    sandbox = bridge_module()
+    _, _, snapshot = fixture_snapshot(tmp_path)
+    with snapshot:
+        fd = os.open(origin, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(fd)
+            entries = snapshot.fd_descriptors()
+            entries.append({
+                "source": f"/proc/{os.getpid()}/fd/{fd}",
+                "fd": fd, "device": info.st_dev, "inode": info.st_ino,
+                "kind": "directory", "target": destination,
+            })
+            opts = snapshot.mount_arguments()
+            opts[-2:-2] = [
+                "--chdir", str(tmp_path),
+                "--ro-bind-fd", str(fd), destination,
+            ]
+            result = subprocess.run(
+                command_for(sandbox, snapshot, descriptors=entries, opts=opts),
+                capture_output=True, timeout=8,
+            )
+            assert result.returncode != 0
+            assert expected.encode() in result.stderr
+        finally:
+            os.close(fd)
+
+
+@pytest.mark.parametrize("origin,destination", [
+    ("/home/agentops/.ssh", "/home/agentops/.ssh"),
+    ("/home/agentops/.aws", "/home/agentops/.aws"),
+    ("/tmp", "/mnt/tree"),
+    ("/tmp", "/mnt/tree/alias/config.yaml"),
+])
+def test_private_home_never_accepts_unaudited_literal_bind_target(
+    tmp_path, origin, destination,
+):
+    sandbox = bridge_module()
+    _, _, snapshot = fixture_snapshot(tmp_path)
+    with snapshot:
+        opts = snapshot.mount_arguments()
+        opts[-2:-2] = ["--bind", origin, destination]
+        result = subprocess.run(
+            command_for(sandbox, snapshot, opts=opts),
+            capture_output=True, timeout=8,
+        )
+        assert result.returncode != 0
+        assert b"policy_fd_private_literal_target_untrusted" in result.stderr
+
+
+def test_private_home_pins_admitted_literal_workspace_before_bwrap(tmp_path):
+    """Actual bwrap child: host source rename does not redirect pinned workspace."""
+    if shutil.which("bwrap") is None or not Path("/home/agentops").is_dir():
+        pytest.skip("bwrap or staging private-HOME anchor unavailable")
+    sandbox = bridge_module()
+    _, _, snapshot = fixture_snapshot(tmp_path)
+    workdir = tmp_path / "task-workspace"
+    workdir.mkdir()
+    (workdir / "sentinel.txt").write_bytes(b"approved-owned-workspace")
+    with snapshot:
+        opts = snapshot.mount_arguments()
+        opts[-2:-2] = [
+            "--tmpfs", "/tmp", "--dir", str(tmp_path), "--dir", str(workdir),
+            "--chdir", str(workdir),
+            "--bind", str(workdir), str(workdir),
+        ]
+        cmd = command_for(sandbox, snapshot, opts=opts)
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            time.sleep(.35)
+            if proc.poll() is not None:
+                reason = (proc.stderr.read() or b"")[:700].decode(errors="replace")
+                if "Operation not permitted" in reason:
+                    pytest.skip("unprivileged bubblewrap unavailable")
+                pytest.fail("literal workspace pin failed: " + reason)
+            children_file = Path(f"/proc/{proc.pid}/task/{proc.pid}/children")
+            children = children_file.read_text().split()
+            assert len(children) == 1
+            child = int(children[0])
+            mounted = Path(f"/proc/{child}/root{workdir}")
+            assert (mounted / "sentinel.txt").read_bytes() == b"approved-owned-workspace"
+            workdir.rename(tmp_path / "old-workspace")
+            workdir.symlink_to("/home/agentops/.hermes", target_is_directory=True)
+            assert (mounted / "sentinel.txt").read_bytes() == b"approved-owned-workspace"
+            assert not (mounted / "profiles").exists()
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+
+
+def test_private_home_binds_root_published_cli_source_by_held_fd():
+    """A root-owned nonsecret release source is pinned before bwrap execution."""
+    published = Path(
+        "/opt/herdr/releases/v0.3.0-rc.26-4d09b58b4416/provenance/external-runtime-dependency.txt"
+    )
+    if not published.is_file() or not shutil.which("bwrap"):
+        pytest.skip("operator-published staging fixture missing")
+    import tempfile
+    sandbox = bridge_module()
+    with tempfile.TemporaryDirectory(prefix="herdr-shim-proof-") as dirname:
+        _, _, snapshot = fixture_snapshot(Path(dirname))
+        with snapshot:
+            opts = snapshot.mount_arguments()
+            destination = "/home/agentops/.local/bin/herdr"
+            opts[-2:-2] = ["--ro-bind", str(published), destination]
+            cmd = command_for(sandbox, snapshot, opts=opts)
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                time.sleep(.3)
+                if proc.poll() is not None:
+                    failure = (proc.stderr.read() or b"")[:450].decode(errors="replace")
+                    if "Operation not permitted" in failure:
+                        pytest.skip("unprivileged bwrap unavailable")
+                    pytest.fail("readonly CLI source FD launch failed: " + failure)
+                children = Path(f"/proc/{proc.pid}/task/{proc.pid}/children").read_text().split()
+                assert len(children) == 1
+                child = int(children[0])
+                view = Path(f"/proc/{child}/root{destination}")
+                assert view.read_bytes() == published.read_bytes()
+                assert view.stat().st_ino == published.stat().st_ino
+                assert view.stat().st_dev == published.stat().st_dev
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+
+
+def test_private_home_denies_host_user_mutable_cli_bytes(tmp_path):
+    sandbox = bridge_module()
+    mutable_shim = tmp_path / "mutable-policy-shim"
+    mutable_shim.write_bytes(b"fake-reviewed-code")
+    _, _, snapshot = fixture_snapshot(tmp_path)
+    with snapshot:
+        opts = snapshot.mount_arguments()
+        opts[-2:-2] = [
+            "--ro-bind", str(mutable_shim), "/home/agentops/.local/bin/herdr",
+        ]
+        result = subprocess.run(
+            command_for(sandbox, snapshot, opts=opts),
+            capture_output=True, timeout=8,
+        )
+        assert result.returncode != 0
+        assert b"policy_fd_private_literal_source_untrusted" in result.stderr
