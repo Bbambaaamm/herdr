@@ -1323,6 +1323,10 @@ class HerdrChildRuntime:
                 raise HerdrRuntimeError("real_herdr_required", "managed child needs real binary")
             if not isinstance(self.policy_launch_factory, HostPolicyLaunchFactory):
                 raise HerdrRuntimeError("child_invocation_policy_missing", lease.task_id)
+            approved_profile = getattr(self.policy_launch_factory, "approved_profile", None)
+            if (approved_profile is not None
+                    and approved_profile.name != self.env.get("HERDR_HERMES_PROFILE", DEFAULT_PROFILE)):
+                raise HerdrRuntimeError("child_approved_profile_identity_mismatch", lease.task_id)
             record = self.scheduler._tasks[lease.task_id]
             node = self.scheduler.task_node(lease.task_id)
             context = self.scheduler.task_context(lease.task_id)
@@ -1353,6 +1357,10 @@ class HerdrChildRuntime:
                 tools=node.tools,permissions=node.permissions,**launch_arguments)
             if not isinstance(launch, PreparedPolicyLaunch) or launch.identity != identity:
                 raise HerdrRuntimeError("child_invocation_policy_identity_mismatch", lease.task_id)
+            approved_snapshot = getattr(launch, "private_profile_snapshot", None)
+            if (approved_snapshot is not None
+                    and approved_snapshot.name != self.env.get("HERDR_HERMES_PROFILE", DEFAULT_PROFILE)):
+                raise HerdrRuntimeError("child_approved_profile_identity_mismatch", lease.task_id)
             from .child_evidence import ChildCompletionAuthority
             authority=self.scheduler.completion_authority
             if not isinstance(authority,ChildCompletionAuthority):

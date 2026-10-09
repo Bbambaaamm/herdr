@@ -458,6 +458,14 @@ def command(
                 or not isinstance(private_profile_snapshot, PrivateProfileSnapshot)
                 or hermes_profile != private_profile_snapshot.name):
             raise RuntimeError("durable_private_profile_authority_required")
+        # A host-writable workspace or durable result slot mounted by pathname
+        # can be swapped after host validation and before bwrap consumes it.
+        # The child already has an admitted pinned worktree FD, but neither
+        # root nor child currently supplies a pinned writable result-slot FD.
+        # Fail CLOSED for the new mode until both root/child paths provide
+        # complete FD-owned write mounts; don't regress legacy behavior.
+        if pinned_worktree is None or writable:
+            raise RuntimeError("durable_private_profile_sources_unpinned")
         private_profile_mounts = private_profile_snapshot.mount_arguments()
     else:
         private_profile_mounts = []

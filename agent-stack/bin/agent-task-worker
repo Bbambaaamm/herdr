@@ -785,6 +785,9 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
                                   parent_agent_id=coordinator, parent_task_id="coordinator:" + coordinator,
                                   task_id=str(task["id"]), run_token=str(task["run_token"]),
                                   fencing_token=task["fencing_token"])
+    approved_profile = getattr(factory, "approved_profile", None)
+    if approved_profile is not None and approved_profile.name != _task_hermes_profile(task):
+        raise RuntimeError("task_approved_profile_identity_mismatch")
     session = {
         "agent_name": agent_name, "session_name": session_name, "pane_id": "",
         "pane_marker": pane_marker, "coordinator_agent": coordinator,

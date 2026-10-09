@@ -166,12 +166,29 @@ def test_opt_in_sandbox_rejects_profile_selection_or_authority_mismatch(tmp_path
         with pytest.raises(RuntimeError, match="durable_private_profile_authority_required"):
             sandbox.command(workspace, hermes, policy=policy, policy_mount=StubMount(),
                             private_profile_snapshot=snapshot, hermes_profile="majak")
-        command = sandbox.command(workspace, hermes, policy=policy, policy_mount=StubMount(),
-                                  private_profile_snapshot=snapshot, hermes_profile="quantlab")
-        assert command[0:4] == ["/usr/bin/python3", "-I", "-S", "-c"]
-        assert "--remount-ro" in command
-        assert command[-3:] == ["--noprofile", "--norc", "-i"]
-        assert "FIXTURE_TOKEN=not-a-real-credential" not in str(command)
+        # Path-based root workspace and result mounts are not yet safe
+        # against same-UID rename/symlink races. No production launch may
+        # opt into the private profile until these sources are FD-pinned.
+        with pytest.raises(RuntimeError, match="durable_private_profile_sources_unpinned"):
+            sandbox.command(workspace, hermes, policy=policy, policy_mount=StubMount(),
+                            private_profile_snapshot=snapshot, hermes_profile="quantlab")
+        fd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        info = os.fstat(fd)
+        pin = sandbox.PinnedWorktree(workspace, fd, info.st_dev, info.st_ino, workspace.parent)
+        try:
+            with pytest.raises(RuntimeError, match="durable_private_profile_sources_unpinned"):
+                sandbox.command(workspace, hermes, policy=policy, policy_mount=StubMount(),
+                                private_profile_snapshot=snapshot, hermes_profile="quantlab",
+                                pinned_worktree=pin, writable=(policy,))
+            command = sandbox.command(workspace, hermes, policy=policy,
+                                      policy_mount=StubMount(), pinned_worktree=pin,
+                                      private_profile_snapshot=snapshot, hermes_profile="quantlab")
+            assert command[0:4] == ["/usr/bin/python3", "-I", "-S", "-c"]
+            assert "--remount-ro" in command
+            assert command[-3:] == ["--noprofile", "--norc", "-i"]
+            assert "FIXTURE_TOKEN=not-a-real-credential" not in str(command)
+        finally:
+            pin.close()
 
 
 def test_private_snapshot_mount_attestation_only_accepts_its_exact_ro_view(tmp_path):
@@ -210,10 +227,13 @@ def test_real_host_selected_private_profile_mounts_and_attestation(tmp_path, mon
         def descriptors(self): return []
 
     with approved.freeze() as snapshot:
+        fd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        info = os.fstat(fd)
+        pin = sandbox.PinnedWorktree(workspace, fd, info.st_dev, info.st_ino, workspace.parent)
         args = sandbox.command(
             workspace, hermes, policy=policy,
             policy_mount=StubMount(), private_profile_snapshot=snapshot,
-            hermes_profile=approved.name,
+            pinned_worktree=pin, hermes_profile=approved.name,
         )
         assert "FIXTURE_TOKEN" not in str(args)
         delimiter = args.index("--")
@@ -264,6 +284,7 @@ def test_real_host_selected_private_profile_mounts_and_attestation(tmp_path, mon
                     proc.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+            pin.close()
 
 
 def test_host_profile_refresh_is_required_before_seal(tmp_path, monkeypatch):

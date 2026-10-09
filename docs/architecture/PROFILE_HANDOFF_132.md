@@ -51,12 +51,24 @@ server and blocked root task #53 have **not** changed.
   After a restart a host must first reattach/revalidate the parent authority;
   no synthetic, model-supplied or stale parent proof may authorize a child.
   There is **no secondary scheduler** or new persistence/cost authority.
-- The sandbox constructs a private `--tmpfs /home/agentops`, mounts approved
-  profile data by sealed file descriptors, pins code/runtime/workspace from
-  existing policy objects, and finishes mounting with nonrecursive
-  `--remount-ro /home/agentops`. Runtime session/cache/log/paste submounts
-  retain RW permissions. The hardened launcher refuses untrusted bwrap
-  options, HOME/XDG path relocation, PID/proc bypasses and mount shadows.
+- The sandbox implements a private `--tmpfs /home/agentops`, mounts
+  approved profile data by sealed file descriptors, and finishes with
+  nonrecursive `--remount-ro /home/agentops`. Runtime
+  session/cache/log/paste submounts retain RW permissions. The hardened
+  launcher refuses untrusted bwrap options, HOME/XDG path relocation,
+  PID/proc bypasses and mount shadows.
+  **New P1 safety hold:** both the workspace and exact writable result-slot
+  sources must be pinned by immutable file/directory descriptors before
+  this opt-in may run. Merely checking a mutable pathname and later issuing
+  `--bind` permits a same-UID host rename/symlink attack into live Hermes
+  credentials. Consequently `sandbox.command()` now FAILS CLOSED for any
+  private-profile invocation without a `PinnedWorktree`, or with any
+  remaining path-based `writable` mount. Root and managed-child production
+  callers still supply path-based result slots, so private-profile execution
+  remains deliberately disabled until the trusted host pins and retains
+  those exact result FDs through bwrap/attestation. Existing legacy launches
+  are unchanged. The physical test uses a deliberately FD-pinned workspace
+  and no result slot (no model invocation).
 - `sandbox.verify()` adds an independent attestation of the readonly
   HOME mount, exactly one selected profile, readonly sealed file contents,
   and four private RW runtimes. The pre-existing code/runtime and owned
