@@ -129,7 +129,7 @@ def test_host_policy_fd_launcher_binds_sealed_profile_without_raw_secrets(tmp_pa
     ("profile_override", "policy_fd_private_home_shadowed"),
     ("nested_tmpfs", "policy_fd_private_home_shadowed"),
     ("parent_bind_home", "policy_fd_private_home_shadowed"),
-    ("parent_bind_root", "policy_fd_private_home_shadowed"),
+    ("parent_bind_root", "policy_fd_private_source_exposes_host"),
     ("parent_tmpfs_home", "policy_fd_private_home_shadowed"),
     ("missing_ro_remount", "policy_fd_private_home_not_readonly"),
     ("early_ro_remount", "policy_fd_private_home_not_readonly"),
@@ -241,6 +241,13 @@ def test_unsealed_regular_fd_cannot_impersonate_profile_memfd(tmp_path):
     ("missing_explicit_home", "policy_fd_private_home_env_invalid"),
     ("missing_hermes_unset", "policy_fd_private_home_env_invalid"),
     ("duplicate_xdg_unset", "policy_fd_private_home_env_invalid"),
+    ("bind_host_home_alias", "policy_fd_private_source_exposes_host"),
+    ("bind_host_proc_alias", "policy_fd_private_source_exposes_host"),
+    ("bind_host_root_alias", "policy_fd_private_source_exposes_host"),
+    ("bind_host_home_parent", "policy_fd_private_source_exposes_host"),
+    ("bind_host_profile", "policy_fd_private_source_exposes_host"),
+    ("bind_other_home_worktree", "policy_fd_private_source_exposes_host"),
+    ("symlink_source_alias", "policy_fd_private_source_exposes_host"),
 ])
 def test_private_home_rejects_bubblewrap_grammar_and_environment_bypasses(
     tmp_path, attack, expected,
@@ -263,8 +270,18 @@ def test_private_home_rejects_bubblewrap_grammar_and_environment_bypasses(
             "untrusted_profile_env": ["--setenv", "HERMES_HOME", "/tmp/untrusted"],
             "clearenv": ["--clearenv"],
             "shadow_proc": ["--ro-bind", str(source), "/proc"],
+            "bind_host_home_alias": ["--bind", "/home/agentops", "/mnt/host-home"],
+            "bind_host_proc_alias": ["--ro-bind", "/proc", "/mnt/host-proc"],
+            "bind_host_root_alias": ["--ro-bind", "/", "/mnt/host-root"],
+            "bind_host_home_parent": ["--ro-bind", "/home", "/mnt/host-parent"],
+            "bind_host_profile": ["--ro-bind", "/home/agentops/.hermes", "/mnt/host-profile"],
+            "bind_other_home_worktree": ["--bind", "/home/agentops/workspaces", "/mnt/other-worktree"],
         }
-        if attack in injected:
+        if attack == "symlink_source_alias":
+            alias = tmp_path / "host-home-alias"
+            alias.symlink_to("/home/agentops", target_is_directory=True)
+            opts[-2:-2] = ["--bind", str(alias), "/mnt/alias"]
+        elif attack in injected:
             opts[-2:-2] = injected[attack]
         elif attack == "missing_explicit_home":
             index = opts.index("HOME")
@@ -285,3 +302,27 @@ def test_private_home_rejects_bubblewrap_grammar_and_environment_bypasses(
         result = subprocess.run(command, capture_output=True, timeout=8)
         assert result.returncode != 0
         assert expected.encode() in result.stderr
+
+
+def test_sealed_profile_fd_mounts_after_delimiter_never_satisfy_policy(tmp_path):
+    """After -- they are command arguments, NOT secure bwrap bindings."""
+    sandbox = bridge_module()
+    _, _, snapshot = fixture_snapshot(tmp_path)
+    with snapshot:
+        cmd = command_for(sandbox, snapshot)
+        triples = []
+        # The option stream starts after the embedded Python launcher metadata.
+        options_start = cmd.index("/usr/bin/bwrap") + 1
+        delimiter = cmd.index("--", options_start)
+        for i in reversed(range(options_start, delimiter)):
+            if cmd[i] == "--ro-bind-data":
+                triples.insert(0, cmd[i:i + 3])
+                del cmd[i:i + 3]
+        assert len(triples) == len(snapshot.files)
+        # An attacker may add fake FD tuples to a program's argv; they must
+        # never be accepted as mounts by the policy launcher.
+        for triple in triples:
+            cmd.extend(triple)
+        result = subprocess.run(cmd, capture_output=True, timeout=8)
+        assert result.returncode != 0
+        assert b"policy_fd_launch_invalid" in result.stderr

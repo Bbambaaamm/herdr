@@ -53,6 +53,11 @@ connected to the live Herdr agent launcher.
    and a fresh `--proc /proc` are required, and proc shadowing is denied.
    The child HOME is pinned to `/home/agentops`; Hermes and XDG profile
    relocation variables are explicitly unset and cannot be overwritten.
+   The launcher also rejects literal pathname binds that would re-export
+   the protected **host** HOME, a host-home ancestor, or host procfs under
+   another destination, including symlink aliases. Sealed profile FDs must
+   appear as actual bwrap `--ro-bind-data` operations **before** the `--`
+   command delimiter; program arguments cannot satisfy mandatory mounts.
    The same policy is exercised through negative subprocess tests before
    the pinned launcher could execute `bwrap`.
    The required initial `--ro-bind / /` is the sole permitted ancestor bind.

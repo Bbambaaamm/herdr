@@ -110,7 +110,7 @@ def test_policy_fd_launcher_rechecks_runtime_at_exec(tmp_path, attack):
         )
         assert code != sandbox._POLICY_FD_LAUNCHER
         arguments = ["/usr/bin/bwrap", "--ro-bind-fd", str(fd), item["target"],
-                     "--tmpfs", *planned]
+                     "--tmpfs", *planned, "--", "/bin/true"]
         result = subprocess.run(
             ["/usr/bin/python3", "-I", "-S", "-c", code,
              json.dumps([item]), *arguments],

@@ -131,10 +131,16 @@ for item in entries:
     mapping[item["fd"]] = (opened, item["target"], kind)
     targets.add(item["target"])
 
+try:
+    arg_end = args.index("--")
+except ValueError:
+    raise SystemExit("policy_fd_launch_invalid")
 used = set()
-for index, arg in enumerate(args):
+# Consume FD bindings only inside bwrap's option grammar. Command arguments
+# after -- can never satisfy a required sealed-profile mount.
+for index, arg in enumerate(args[:arg_end]):
     if arg in ("--bind-fd", "--ro-bind-fd", "--ro-bind-data"):
-        if index + 2 >= len(args) or not args[index + 1].isdigit():
+        if index + 2 >= arg_end or not args[index + 1].isdigit():
             raise SystemExit("policy_fd_launch_invalid")
         original = int(args[index + 1])
         if original not in mapping or original in used:
@@ -154,7 +160,7 @@ if used != set(mapping) or not args or args[0] != "/usr/bin/bwrap":
 home = Path("/home/agentops")
 root = home / ".hermes"
 profiles = root / "profiles"
-tmpfs_targets = [args[i + 1] for i in range(len(args) - 1)
+tmpfs_targets = [args[i + 1] for i in range(arg_end - 1)
                  if args[i] == "--tmpfs"]
 private_home = str(home) in tmpfs_targets
 if private_home:
@@ -213,6 +219,36 @@ if private_home:
             raise SystemExit("policy_fd_private_home_env_invalid")
         parsed.append((option, values, offset))
         offset += 1 + width
+    # A destination-only mount guard is insufficient. Aliasing the original
+    # host HOME or host procfs to an unrelated destination re-exposes it even
+    # when private HOME is readonly and /proc is a fresh PID namespace.
+    for option, values, position in parsed:
+        if option not in ("--bind", "--ro-bind"):
+            continue
+        source_text, destination_text = values
+        if (not source_text.startswith("/")
+            or os.path.normpath(source_text) != source_text
+            or "//" in source_text):
+            raise SystemExit("policy_fd_private_mount_path_invalid")
+        source = Path(source_text)
+        resolved = Path(os.path.realpath(source_text))
+        destination = Path(destination_text)
+        if (position == 1 and option == "--ro-bind"
+            and values == ["/", "/"]):
+            continue
+        if (source == Path("/") or resolved == Path("/")
+            or source == home.parent or resolved == home.parent
+            or source == home or resolved == home
+            or source == root or root in source.parents
+            or resolved == root or root in resolved.parents
+            or source == Path("/proc") or Path("/proc") in source.parents
+            or resolved == Path("/proc") or Path("/proc") in resolved.parents):
+            raise SystemExit("policy_fd_private_source_exposes_host")
+        # Approved worker/result binds must preserve their absolute target
+        # identity. Never move a host-home subtree beneath another alias.
+        if ((home in source.parents or home in resolved.parents)
+            and (source != destination or resolved != source)):
+            raise SystemExit("policy_fd_private_source_exposes_host")
     if (sum(option == "--unshare-pid" for option, _, _ in parsed) != 1
         or sum(option == "--proc" and value == ["/proc"]
                for option, value, _ in parsed) != 1):
