@@ -341,6 +341,8 @@ def validate_policy_evidence(evidence, *, identity: InvocationIdentity):
             "tree_identities", "process_start_ticks"}
     modern=isinstance(evidence,dict) and evidence.get("schema_version")=="herdr-policy-launch-3"
     if modern: keys.add("bootstrap")
+    if isinstance(evidence, dict) and "approved_profile" in evidence:
+        keys.add("approved_profile")
     _require(isinstance(evidence, dict) and set(evidence) == keys
              and len(canonical_json_bytes(evidence)) <= 16384, "bounded policy evidence required")
     _require(evidence["schema_version"] in {"herdr-policy-launch-2","herdr-policy-launch-3"}
@@ -365,6 +367,18 @@ def validate_policy_evidence(evidence, *, identity: InvocationIdentity):
                  and tree["inode"] > 0, "policy tree inode malformed")
     _require(type(evidence["process_start_ticks"]) is int
              and 0 < evidence["process_start_ticks"] < 2**64, "policy process identity malformed")
+    if "approved_profile" in evidence:
+        from .private_profile_namespace import profile_identity, PrivateProfileError
+        profile = evidence["approved_profile"]
+        _require(isinstance(profile, dict)
+                 and set(profile) == {"name", "files", "manifest_sha256"}
+                 and isinstance(profile["files"], dict),
+                 "approved profile evidence malformed")
+        try:
+            canonical = profile_identity(profile["name"], profile["files"])
+        except (PrivateProfileError, TypeError, ValueError) as exc:
+            raise SecurityError("approved profile evidence malformed") from exc
+        _require(profile == canonical, "approved profile evidence digest mismatch")
     if modern:
         from .host_bootstrap import validate_continuation
         bootstrap=evidence["bootstrap"]
@@ -400,6 +414,8 @@ def verify_retained_policy_evidence(evidence, *, identity, pid, attestation, now
              and attestation.get("sandbox_pid") == pid
              and hashlib.sha256(canonical_json_bytes(attestation)).hexdigest()
                  == proof["sandbox_attestation_sha256"], "retained attestation mismatch")
+    _require(attestation.get("approved_profile") == proof.get("approved_profile"),
+             "retained approved profile differs from signed attestation")
     rows = mount_rows(pid)
     _require("ro" in rows.get("/", set()), "host root is not read-only")
     _require(os.readlink(f"/proc/{pid}/ns/mnt") != os.readlink("/proc/self/ns/mnt")
@@ -455,6 +471,29 @@ def verify_retained_policy_evidence(evidence, *, identity, pid, attestation, now
              and set(assurance.writable_roots) == {name for name,modes in rows.items() if "rw" in modes},
              "retained runtime assurance mismatch")
     _require(process_start_ticks(pid) == proof["process_start_ticks"], "policy process changed during verification")
+    if "approved_profile" in proof:
+        approved = proof["approved_profile"]
+        profile_root = root / "home/agentops/.hermes/profiles" / approved["name"]
+        _require("ro" in rows.get("/home/agentops", set())
+                 and "ro" in rows.get("/home/agentops/.hermes/profiles/"
+                                      + approved["name"] + "/config.yaml", set()),
+                 "retained approved profile mount unverified")
+        for relative, digest in approved["files"].items():
+            target = "/home/agentops/.hermes/profiles/" + approved["name"] + "/" + relative
+            _require("ro" in rows.get(target, set()),
+                     "retained approved profile file is not readonly")
+            file = profile_root / relative
+            fd = os.open(file, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                info = os.fstat(fd)
+                _require(stat.S_ISREG(info.st_mode) and info.st_size <= 131072,
+                         "retained approved profile file shape changed")
+                raw = os.read(fd, 131073)
+                _require(len(raw) == info.st_size
+                         and hashlib.sha256(raw).hexdigest() == digest,
+                         "retained approved profile bytes changed")
+            finally:
+                os.close(fd)
     if require_bootstrap:
         _require(proof["schema_version"]=="herdr-policy-launch-3",
                  "authenticated agent bootstrap proof required")
@@ -487,6 +526,47 @@ class ApprovedTree:
                                  max_file_bytes=self.max_file_bytes)
 
 
+@dataclass(frozen=True)
+class ApprovedProfile:
+    """Host-owned, review-bound profile digests (never sourced from a task).
+
+    Only the host launch factory can supply this object. The untrusted agent
+    receives neither the authority to approve file hashes nor raw credentials.
+    """
+    name: str
+    source: Path
+    files: Mapping[str, str]
+
+    def __post_init__(self):
+        from types import MappingProxyType
+        from .private_profile_namespace import _PROFILE, _relative, _HEX, _MAX_FILES
+        _require(isinstance(self.name, str) and bool(_PROFILE.fullmatch(self.name)),
+                 "approved profile name invalid")
+        _require(isinstance(self.source, Path) and self.source.is_absolute()
+                 and self.source.name == self.name,
+                 "approved profile source invalid")
+        _require(isinstance(self.files, Mapping)
+                 and 2 <= len(self.files) <= _MAX_FILES
+                 and {"config.yaml", ".env"} <= set(self.files),
+                 "approved profile manifest required")
+        for relative, digest in self.files.items():
+            _relative(relative)
+            _require(isinstance(digest, str) and bool(_HEX.fullmatch(digest)),
+                     "approved profile digest invalid")
+        object.__setattr__(self, "files", MappingProxyType(dict(self.files)))
+
+    @property
+    def identity(self) -> dict[str, object]:
+        from .private_profile_namespace import profile_identity
+        return profile_identity(self.name, self.files)
+
+    def freeze(self):
+        from .private_profile_namespace import PrivateProfileSnapshot
+        return PrivateProfileSnapshot.from_approved(
+            self.source, name=self.name, approved_sha256=self.files,
+        )
+
+
 _LIVE_PREPARED_LAUNCHES = {}
 
 
@@ -496,8 +576,14 @@ def _launch_key(identity):
 
 class PreparedPolicyLaunch:
     """Private host object retained until the exact owned pane closes."""
-    def __init__(self, mount, grant, private_key, key_id, parent=None):
+    def __init__(self, mount, grant, private_key, key_id, parent=None,
+                 private_profile_snapshot=None):
+        from .private_profile_namespace import PrivateProfileSnapshot
+        _require(private_profile_snapshot is None
+                 or isinstance(private_profile_snapshot, PrivateProfileSnapshot),
+                 "typed host profile snapshot required")
         self.mount, self.grant = mount, grant
+        self.private_profile_snapshot = private_profile_snapshot
         self._private_key, self._key_id, self._parent = private_key, key_id, parent
         self.sealed = None
         self._process_start_ticks = None
@@ -533,6 +619,11 @@ class PreparedPolicyLaunch:
             self.grant.require_logical_subset_of(self._parent)
 
     def seal(self, pid, attestation, *, tools, permissions):
+        approved = (self.private_profile_snapshot.identity
+                    if self.private_profile_snapshot is not None else None)
+        _require(isinstance(attestation, dict)
+                 and attestation.get("approved_profile") == approved,
+                 "approved profile must match signed sandbox attestation")
         bound, sealed = self.mount.seal(pid, self.grant, identity=self.identity, attestation=attestation,
                                        tools=tools, permissions=permissions, private_key=self._private_key,
                                        key_id=self._key_id, parent=self._parent)
@@ -584,27 +675,36 @@ class PreparedPolicyLaunch:
                 "process_start_ticks": self._process_start_ticks,
                 "identity": self.identity.to_json(),
                 "sandbox_attestation_sha256": self.grant.runtime_assurance.sandbox_attestation_sha256}
+        if self.private_profile_snapshot is not None:
+            proof["approved_profile"] = self.private_profile_snapshot.identity
         if self._bootstrap_receipt is not None:
             proof["schema_version"]="herdr-policy-launch-3"
             proof["bootstrap"]=self.mount.bootstrap.evidence(self._bootstrap_receipt)
         return proof
 
     def cleanup_after_pane_closed(self):
-        if not getattr(self, "_resources_closed", False):
-            self.mount.stage._same_inode()
-            if self.mount.bootstrap is not None:
-                self.mount.bootstrap.cleanup_after_pane_closed()
-            self.mount.stage.close()
-            self.mount.stage.path.unlink()
-            for tree in (self.mount.code, *self.mount.runtime):
-                tree.cleanup_after_pane_closed()
-            self._private_key = None
-            self._resources_closed = True
-        if self._ownership is not None:
-            self._ownership.cleanup_after_pane_closed()
-            self._ownership = None
-        if _LIVE_PREPARED_LAUNCHES.get(_launch_key(self.identity)) is self:
-            del _LIVE_PREPARED_LAUNCHES[_launch_key(self.identity)]
+        # Credential-bearing memfds must close even when the stage identity,
+        # bootstrap transport or frozen-tree cleanup fails. Keep the original
+        # error observable and never declare other resources cleaned on failure.
+        try:
+            if not getattr(self, "_resources_closed", False):
+                self.mount.stage._same_inode()
+                if self.mount.bootstrap is not None:
+                    self.mount.bootstrap.cleanup_after_pane_closed()
+                self.mount.stage.close()
+                self.mount.stage.path.unlink()
+                for tree in (self.mount.code, *self.mount.runtime):
+                    tree.cleanup_after_pane_closed()
+                self._private_key = None
+                self._resources_closed = True
+            if self._ownership is not None:
+                self._ownership.cleanup_after_pane_closed()
+                self._ownership = None
+            if _LIVE_PREPARED_LAUNCHES.get(_launch_key(self.identity)) is self:
+                del _LIVE_PREPARED_LAUNCHES[_launch_key(self.identity)]
+        finally:
+            if self.private_profile_snapshot is not None:
+                self.private_profile_snapshot.close()
 
 
 class HostPolicyLaunchFactory:
@@ -615,7 +715,11 @@ class HostPolicyLaunchFactory:
     consumer/provider policy. Missing grants deny before a pane is created.
     """
     def __init__(self, *, code: ApprovedTree, runtime: tuple[ApprovedTree, ...],
-                 storage: Path, authorize, writable_roots=(), parent_grant=None):
+                 storage: Path, authorize, writable_roots=(), parent_grant=None,
+                 approved_profile: ApprovedProfile | None = None,
+                 profile_preflight=None,
+                 parent_approved_profile: ApprovedProfile | None = None,
+                 parent_launch: PreparedPolicyLaunch | None = None):
         _require(isinstance(code, ApprovedTree) and code.target == CODE_TARGET,
                  "approved policy code required")
         _require(len(runtime) == 2 and all(isinstance(x, ApprovedTree) for x in runtime)
@@ -623,6 +727,19 @@ class HostPolicyLaunchFactory:
         _require(callable(authorize), "host policy authority required")
         _require(parent_grant is None or isinstance(parent_grant, SecurityGrant),
                  "typed parent grant required")
+        _require(approved_profile is None or isinstance(approved_profile, ApprovedProfile),
+                 "typed host approved profile required")
+        _require(profile_preflight is None or callable(profile_preflight),
+                 "typed host profile preflight required")
+        _require(parent_approved_profile is None
+                 or isinstance(parent_approved_profile, ApprovedProfile),
+                 "typed parent host profile approval required")
+        _require(parent_launch is None or isinstance(parent_launch, PreparedPolicyLaunch),
+                 "typed live parent launch required")
+        self.approved_profile = approved_profile
+        self.parent_approved_profile = parent_approved_profile
+        self.parent_launch = parent_launch
+        self.profile_preflight = profile_preflight
         self.code, self.runtime, self.storage = code, tuple(runtime), Path(storage)
         self.authorize, self.writable_roots, self.parent_grant = authorize, tuple(writable_roots), parent_grant
 
@@ -631,6 +748,19 @@ class HostPolicyLaunchFactory:
         tools = tuple(tools)
         _require("herdr_delegate_child" not in tools, "child-bound delegation transport unavailable")
         _require(isinstance(self.parent_grant, SecurityGrant), "accepted host parent grant required")
+        if self.approved_profile is not None:
+            _require(isinstance(self.parent_approved_profile, ApprovedProfile)
+                     and self.parent_approved_profile.identity == self.approved_profile.identity,
+                     "child approved profile differs from host parent approval")
+            _require(isinstance(self.parent_launch, PreparedPolicyLaunch)
+                     and self.parent_launch.sealed is not None
+                     and self.parent_launch.identity == self.parent_grant.identity
+                     and self.parent_launch.grant.hash == self.parent_grant.hash
+                     and self.parent_launch.private_profile_snapshot is not None,
+                     "child approved profile requires accepted live parent launch")
+            _require(self.parent_launch.evidence().get("approved_profile")
+                     == self.approved_profile.identity,
+                     "child approved profile differs from signed parent evidence")
         return self.prepare(identity=identity,workspace=workspace,tools=tools,permissions=permissions,
                             owned_write_roots=owned_write_roots)
 
@@ -669,14 +799,27 @@ class HostPolicyLaunchFactory:
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
         from .launch_ownership import LaunchOwnership
         ownership = LaunchOwnership.create(self.storage, identity)
-        snapshots, stage = [], None
+        snapshots, stage, profile_snapshot = [], None, None
         try:
             for definition in (self.code, *self.runtime):
                 snapshots.append(definition.freeze(ownership.directory, (*self.writable_roots, path)))
+            # A trusted host-owned manifest is the only way to enable the new
+            # profile. Bind it after the existing grant/parent admission, never
+            # to model-supplied profile hashes or task routing metadata.
+            # Credential preflight (including optional refresh) must precede
+            # sealing, otherwise a subsequent refresh updates only the live
+            # host profile and leaves the immutable child snapshot expired.
+            if self.approved_profile is not None:
+                _require(callable(self.profile_preflight),
+                         "approved profile preflight authority missing")
+                _require(self.profile_preflight(self.approved_profile.name) is True,
+                         "approved profile preflight denied")
+                profile_snapshot = self.approved_profile.freeze()
             import uuid
             stage = stage_policy_bundle(ownership.directory / ("grant-" + uuid.uuid4().hex + ".json"))
             prepared=PreparedPolicyLaunch(PolicyMount(stage, snapshots[0], snapshots[1:]),
-                                          grant, Ed25519PrivateKey.generate(), "host-launch", self.parent_grant)
+                                          grant, Ed25519PrivateKey.generate(), "host-launch", self.parent_grant,
+                                          private_profile_snapshot=profile_snapshot)
             prepared._ownership = ownership
             from .host_bootstrap import HostBootstrap
             prepared.mount.bootstrap=HostBootstrap.create(
@@ -689,6 +832,8 @@ class HostPolicyLaunchFactory:
                 stage.path.unlink(missing_ok=True)
             for snapshot in snapshots:
                 snapshot.cleanup_after_pane_closed()
+            if profile_snapshot is not None:
+                profile_snapshot.close()
             ownership.cleanup_after_pane_closed()
             raise
 

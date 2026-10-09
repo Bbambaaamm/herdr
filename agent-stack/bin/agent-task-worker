@@ -716,7 +716,8 @@ def _wait_for_task_pane_input(pane_id, pane_marker, *, timeout_seconds=10.0):
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 
-def _wait_for_task_sandbox(pane_id, pane_marker, *, policy, policy_mount, timeout_seconds=10.0):
+def _wait_for_task_sandbox(pane_id, pane_marker, *, policy, policy_mount,
+                           private_profile_snapshot=None, timeout_seconds=10.0):
     """Wait for native pane.run to become a fully verified physical sandbox."""
     deadline = time.monotonic() + timeout_seconds
     while True:
@@ -728,7 +729,9 @@ def _wait_for_task_sandbox(pane_id, pane_marker, *, policy, policy_mount, timeou
         process_info = (info.get("result") or {}).get("process_info")
         pid = inner_pid(process_info if isinstance(process_info, dict) else {}, pane_marker)
         if pid and verify_sandbox(pid, HERDR, pane_marker, policy=policy,
-                                  policy_mount=policy_mount, attempts=1):
+                                  policy_mount=policy_mount, attempts=1,
+                                  **({"private_profile_snapshot": private_profile_snapshot}
+                                     if private_profile_snapshot is not None else {})):
             if time.monotonic() <= deadline:
                 return pid
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
@@ -782,6 +785,9 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
                                   parent_agent_id=coordinator, parent_task_id="coordinator:" + coordinator,
                                   task_id=str(task["id"]), run_token=str(task["run_token"]),
                                   fencing_token=task["fencing_token"])
+    approved_profile = getattr(factory, "approved_profile", None)
+    if approved_profile is not None and approved_profile.name != _task_hermes_profile(task):
+        raise RuntimeError("task_approved_profile_identity_mismatch")
     session = {
         "agent_name": agent_name, "session_name": session_name, "pane_id": "",
         "pane_marker": pane_marker, "coordinator_agent": coordinator,
@@ -814,7 +820,14 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
                               require_slot=False)
         task_env.update(launch.environment())
         profile = _task_hermes_profile(task)
-        _preflight_root_provider(profile)
+        private_snapshot = getattr(launch, "private_profile_snapshot", None)
+        if private_snapshot is not None and private_snapshot.name != profile:
+            raise RuntimeError("task_approved_profile_identity_mismatch")
+        # Approved profile was refreshed/validated *before* it was sealed by
+        # the trusted host factory. A late refresh here would leave the sealed
+        # snapshot stale; retain legacy preflight only for legacy launches.
+        if private_snapshot is None:
+            _preflight_root_provider(profile)
         preexisting_panes = _setup_pane_ids()
         def inspect_startup_source():
             source = _herdr_json(["pane","process-info","--pane",coordinator_pane],
@@ -863,10 +876,14 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         command = sandbox_command(
             Path(workspace), HERDR, writable=(task_result,), policy=policy,
             policy_mount=launch.mount, admission_root=ROOT,
+            **({"private_profile_snapshot": private_snapshot,
+                "hermes_profile": profile} if private_snapshot is not None else {}),
         )
         _herdr_json(["pane", "run", pane_id, shell_command(command)], timeout_seconds=15.0)
         sandbox_pid = _wait_for_task_sandbox(pane_id, pane_marker,
-                                             policy=policy, policy_mount=launch.mount)
+                                             policy=policy, policy_mount=launch.mount,
+                                             **({"private_profile_snapshot": private_snapshot}
+                                                if private_snapshot is not None else {}))
         session["sandbox_pid"] = sandbox_pid
         session["sandbox_attestation"] = {
             "authority": "agent-task-worker",
@@ -881,6 +898,8 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
             "verified_at": utcnow().isoformat(),
         }
         session["sandbox_attestation"]["fencing_token"] = task["fencing_token"]
+        if private_snapshot is not None:
+            session["sandbox_attestation"]["approved_profile"] = private_snapshot.identity
         session["invocation_policy"] = launch.seal(
             sandbox_pid, session["sandbox_attestation"], tools=tuple(task.get("parent_tools") or ()),
             permissions=tuple(task.get("parent_permissions") or ()))
@@ -927,7 +946,9 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
                 hashlib.sha256(policy.read_bytes()).hexdigest()
                 == session["sandbox_attestation"]["policy_sha256"]
                 and verify_sandbox(sandbox_pid, HERDR, pane_marker, policy=policy,
-                                   policy_mount=launch.mount, attempts=1)),
+                                   policy_mount=launch.mount, attempts=1,
+                                   **({"private_profile_snapshot": private_snapshot}
+                                      if private_snapshot is not None else {}))),
             bootstrap_peer=lambda *, timeout_seconds: launch.mount.bootstrap.confirm(
                 timeout_seconds=timeout_seconds),
             timeout_seconds=60.0,
