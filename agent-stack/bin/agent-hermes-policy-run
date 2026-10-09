@@ -24,7 +24,6 @@ from typing import Any
 
 BUNDLE_PATH = Path("/run/herdr-policy/grant.bundle.json")
 BOOTSTRAP_ROOT = Path("/run/herdr-bootstrap")
-BOOTSTRAP_STAGE1 = BOOTSTRAP_ROOT / "agent-hermes-policy-stage1"
 BOOTSTRAP_PROOF = BOOTSTRAP_ROOT / "immutable-trees.json"
 STAGE1_PROOF_ENV = "HERDR_POLICY_STAGE1_PROOF_SHA256"
 STAGE2_FD_ENV = "HERDR_VERIFIED_STAGE2_FD"
@@ -32,6 +31,7 @@ BOOTSTRAP_AUTH_FD_ENV = "HERDR_BOOTSTRAP_AUTH_FD"
 MAX_AUTH_RESPONSE = 128
 MAX_BUNDLE = 2 * 1024 * 1024
 POLICY_CODE_ROOT = Path("/run/herdr/policy-code")
+BOOTSTRAP_STAGE1 = POLICY_CODE_ROOT / "agent-stack/bin/agent-hermes-policy-stage1"
 HERMES_ROOT = Path("/home/agentops/.hermes/hermes-agent")
 HERMES_HEAD = "ee5ee84a345204a3b1d6ef6ba1ab747e602867b9"
 HERMES_SOURCE_SHA256 = "525219e866137f43c8c8b068488e07d97f14529d2d67497cd52fbfd1197da4f4"
@@ -148,6 +148,8 @@ def _require_production_mount(path: Path, *, exact: bool = False) -> None:
 
 
 def _load_stage1_module() -> Any:
+    _require_production_mount(POLICY_CODE_ROOT, exact=True)
+    _require_startup_pycache_prefix()
     if BOOTSTRAP_STAGE1.is_symlink() or not BOOTSTRAP_STAGE1.is_file():
         raise SystemExit("immutable stage-one unavailable")
     loader = importlib.machinery.SourceFileLoader("herdr_policy_stage1_verified", str(BOOTSTRAP_STAGE1))
@@ -156,7 +158,7 @@ def _load_stage1_module() -> Any:
         raise SystemExit("immutable stage-one import unavailable")
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
-    _require_module_origin(module, BOOTSTRAP_ROOT, "policy stage-one")
+    _require_module_origin(module, POLICY_CODE_ROOT, "policy stage-one")
     return module
 
 
@@ -341,14 +343,14 @@ def _verified_interpreter_fd() -> int:
 
 
 def _fresh_startup_pycache_prefix() -> str:
-    prefix = BOOTSTRAP_ROOT / "no-bytecode-cache"
+    prefix = POLICY_CODE_ROOT / "no-bytecode-cache"
     if os.path.lexists(prefix):
         raise SystemExit("immutable startup cache prefix must remain absent")
     return str(prefix)
 
 
 def _require_startup_pycache_prefix() -> None:
-    prefix = str(BOOTSTRAP_ROOT / "no-bytecode-cache")
+    prefix = str(POLICY_CODE_ROOT / "no-bytecode-cache")
     if sys.pycache_prefix != prefix:
         raise SystemExit("immutable startup pycache prefix is required")
     if os.path.lexists(prefix):

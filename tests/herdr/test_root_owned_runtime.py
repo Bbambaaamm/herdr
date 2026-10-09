@@ -126,6 +126,12 @@ def test_root_owned_sdk_tree_stays_unmodified_in_actual_bwrap_child():
             (PUBLISHED / FILENAME).chmod(0o666)
         with pytest.raises(PermissionError):
             (PUBLISHED / FILENAME).write_bytes(b"attacker")
+        with pytest.raises(PermissionError):
+            (PUBLISHED / "no-bytecode-cache").mkdir()
+        with pytest.raises(OSError):
+            (inside.parent / "no-bytecode-cache").mkdir()
+        assert not (PUBLISHED / "no-bytecode-cache").exists()
+        assert not (inside.parent / "no-bytecode-cache").exists()
         assert inside.read_bytes() == raw
     finally:
         if proc is not None and proc.poll() is None:

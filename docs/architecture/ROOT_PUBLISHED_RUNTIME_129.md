@@ -98,6 +98,9 @@ The policy shim and stage-one launcher execute from the approved policy-code
 inode, rather than a same-UID-writable bootstrap copy. The bootstrap snapshot
 remains a transport for exact hash-verified metadata; it is not executable
 code authority.
+Stage two also imports its stage-one helpers from policy code. The interpreter
+cache prefix is an absent path below the same immutable code tree, so a
+host-owned bootstrap transport cannot supply forged bytecode before guards.
 
 Signed private launch evidence includes root publication paths, complete
 manifest digests, code/runtime inode identities, bootstrap executable hashes

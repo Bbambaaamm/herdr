@@ -370,13 +370,12 @@ def _connect_host_authority(proof_raw: bytes, stage2_fd: int, python_fd: int) ->
 
 
 def _fresh_pycache_prefix() -> str:
-    # No cache directory exists beneath the independently frozen RO tree.
-    # Same-UID sandbox peers cannot populate this path before interpreter
-    # startup; permissions on shared /tmp would not provide that guarantee.
-    prefix = BOOTSTRAP_ROOT / "no-bytecode-cache"
+    # The private launch's code tree is root-published; the bootstrap transport
+    # is host-UID-owned and cannot be authority for Python bytecode caches.
+    prefix = POLICY_CODE_ROOT / "no-bytecode-cache"
     if os.path.lexists(prefix):
         _fail("immutable startup cache prefix must remain absent")
-    _require_exact_ro_tree(BOOTSTRAP_ROOT, _mount_rows())
+    _require_exact_ro_tree(POLICY_CODE_ROOT, _mount_rows())
     return str(prefix)
 
 

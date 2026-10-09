@@ -386,6 +386,8 @@ def verify_retained_bootstrap(proof, *, identity, shell_pid):
              and not os.path.lexists(base/"no-bytecode-cache"),
              "retained bootstrap authority/identity mismatch")
     raw,_=_read_regular(root/str(CODE_TARGET).lstrip("/")/STAGE2_SOURCE,4_194_304)
+    _require(not os.path.lexists(root/str(CODE_TARGET).lstrip("/")/"no-bytecode-cache"),
+             "retained immutable code cache prefix changed")
     _require(hashlib.sha256(raw).hexdigest()==receipt.stage2_sha256,
              "retained stage-two source changed")
     raw,py=_read_regular(root/str(PYTHON_TARGET).lstrip("/")/PYTHON_EXECUTABLE,268_435_456)
