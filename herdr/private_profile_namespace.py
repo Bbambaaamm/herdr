@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import fcntl
 import hashlib
+import json
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -35,6 +36,25 @@ _REQUIRED_SEALS = (getattr(fcntl, "F_SEAL_SEAL", 1)
 
 class PrivateProfileError(RuntimeError):
     pass
+
+
+def profile_identity(name: str, files: Mapping[str, str]) -> dict[str, object]:
+    """Canonical host profile identity without exposing approved file bytes."""
+    _need(isinstance(name, str) and bool(_PROFILE.fullmatch(name)),
+          "profile_identity_invalid")
+    _need(isinstance(files, Mapping) and 2 <= len(files) <= _MAX_FILES
+          and {"config.yaml", ".env"} <= set(files), "profile_identity_invalid")
+    manifest = {}
+    for key, digest in files.items():
+        _relative(key)
+        _need(isinstance(digest, str) and bool(_HEX.fullmatch(digest)),
+              "profile_identity_invalid")
+        manifest[key] = digest
+    canonical = {"name": name, "files": dict(sorted(manifest.items()))}
+    source = json.dumps(canonical, sort_keys=True,
+                        separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    _need(len(source) <= 8192, "profile_identity_invalid")
+    return {**canonical, "manifest_sha256": hashlib.sha256(source).hexdigest()}
 
 
 def _need(ok: bool, reason: str) -> None:
@@ -170,6 +190,13 @@ class PrivateProfileSnapshot:
             raise
         finally:
             os.close(root_fd)
+
+    @property
+    def identity(self) -> dict[str, object]:
+        self.verify()
+        return profile_identity(self.name, {
+            item.relative: item.sha256 for item in self.files
+        })
 
     @property
     def destination(self) -> Path:

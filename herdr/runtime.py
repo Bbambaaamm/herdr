@@ -1065,6 +1065,8 @@ class HerdrChildRuntime:
                            "fencing_token": record.fencing_token, "agent_name": record.agent_id,
                            "pane_id": pane_id, "marker": marker,
                            "worktree_identity": record.worktree_identity}
+            if private_snapshot is not None:
+                attestation["approved_profile"] = private_snapshot.identity
             if record.ownership is not None:
                 if record.owned_write_mounts is None:
                     raise HerdrRuntimeError("child_owned_mount_proof_missing",task_id)
@@ -1359,7 +1361,10 @@ class HerdrChildRuntime:
             authority.preflight_work(record,launch)
             self._policy_launches[lease.task_id] = launch
             policy_env.update(launch.environment())
-            self._preflight_child_provider()
+            # Host-approved profiles completed credential preflight inside
+            # HostPolicyLaunchFactory.prepare_child() BEFORE their memfd seal.
+            if getattr(launch, "private_profile_snapshot", None) is None:
+                self._preflight_child_provider()
             def inspect_startup_source():
                 source = _json_result(self.runner.run(["pane","process-info","--current"]),
                                       "pane startup source")

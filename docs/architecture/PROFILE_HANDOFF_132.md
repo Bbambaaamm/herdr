@@ -17,16 +17,39 @@ server and blocked root task #53 have **not** changed.
 - The factory still checks the **existing** admitted `SecurityGrant`, task
   identity and parent scope before freezing profile inputs. No new grant is
   created; profile selection is an additional constraint, never authority.
-  Files are copied through no-follow reads into anonymous, write-sealed
-  Linux memfds only after grant admission.
+  A separately trusted host-only `profile_preflight(profile_name)` must
+  return `True` before snapshot creation. It may validate or refresh live
+  provider credentials; **only then** are the exact preapproved file hashes
+  checked and copied through no-follow reads into anonymous write-sealed
+  Linux memfds. Any post-refresh mismatch is a hard stop. Root/child paths
+  skip later refreshes when using an approved sealed snapshot; the unchanged
+  legacy path still performs its original provider preflight.
+  The preflight callback and reviewed hashes are NOT supplied by a task.
 - `PreparedPolicyLaunch` retains the private snapshot through sandbox
   attestation, bootstrap and the correct owned pane's lifetime, then closes
-  its file descriptors on accepted cleanup. Preparation failures close
-  snapshot descriptors without leaving a new economic attempt.
+  its file descriptors on accepted cleanup. Credential-bearing memfds are
+  closed in an independent `finally` even when an earlier stage, bootstrap
+  or frozen-code cleanup fails; the prior error still propagates and cannot
+  be misreported as a successful cleanup. Preparation failures also close
+  snapshots without creating a new economic attempt.
 - The root `agent-task-worker` and managed child `herdr/runtime.py`
   reject a mismatch between the host-approved profile name and the requested
   Hermes CLI profile. When approved and matching, they pass the exact typed
   snapshot to the existing `agent_durable_sandbox.command` FD bridge.
+  `ApprovedProfile.identity` computes a canonical, bounded profile
+  name/manifest/file-digest identity. The exact identity is included in the
+  sandbox attestation whose hash is committed by the existing signed grant,
+  as well as in retained policy evidence. The retained verifier checks the
+  evidence against its signed attestation and compares approved on-disk
+  sandbox bytes to the recorded digests.
+  A child `HostPolicyLaunchFactory` with an approved profile additionally
+  requires a host-owned `parent_approved_profile` with the same exact
+  manifest, plus the **accepted live parent `PreparedPolicyLaunch`** whose
+  signed proof contains those same approved profile hashes and whose accepted
+  grant identity/hash equals the child factory's parent grant. Passing only
+  a matching profile name or refreshing host credentials silently is denied.
+  After a restart a host must first reattach/revalidate the parent authority;
+  no synthetic, model-supplied or stale parent proof may authorize a child.
   There is **no secondary scheduler** or new persistence/cost authority.
 - The sandbox constructs a private `--tmpfs /home/agentops`, mounts approved
   profile data by sealed file descriptors, pins code/runtime/workspace from
@@ -49,7 +72,9 @@ real bwrap child namespace without running Hermes or connecting a provider,
 verifies exact approved bytes, tests post-mount same-UID host replacement, and
 attests profile HOME RO and runtime logs RW. Additional tests verify frozen
 manifest immutability, prevention of profile selection mismatch, denial before
-grant and post-pane descriptor release.
+grant, strict post-refresh hash validation, parent/child profile-identity
+consistency, signed attestation/evidence validation and independent release
+of credential-bearing file descriptors after failed cleanup.
 
 **This implementation is DRAFT and not sufficient to close P0 #129 or
 activate the autonomous #53 coordinator.** In particular:
