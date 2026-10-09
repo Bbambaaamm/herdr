@@ -80,6 +80,24 @@ class KnowledgeRequest:
             value["conversation_id"] = self.conversation_id
         return value
 
+    @classmethod
+    def from_dict(cls, raw: object) -> "KnowledgeRequest":
+        if not isinstance(raw, dict):
+            raise KnowledgeContractError("invalid_request")
+        allowed = {"request_id", "query", "sources", "conversation_id", "mode"}
+        if set(raw) - allowed or not {"request_id", "query", "sources"} <= set(raw):
+            raise KnowledgeContractError("invalid_request")
+        sources = raw["sources"]
+        if not isinstance(sources, list):
+            raise KnowledgeContractError("invalid_sources")
+        return cls(
+            request_id=raw["request_id"],
+            query=raw["query"],
+            sources=tuple(sources),
+            conversation_id=raw.get("conversation_id"),
+            mode=raw.get("mode", "search"),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class KnowledgeSourceResult:
@@ -111,6 +129,38 @@ class KnowledgeSourceResult:
                 or not 1 <= len(self.conversation_id) <= 256
                 or "\0" in self.conversation_id)):
             raise KnowledgeContractError("invalid_source_conversation")
+
+    @classmethod
+    def from_dict(cls, raw: object) -> "KnowledgeSourceResult":
+        if not isinstance(raw, dict):
+            raise KnowledgeContractError("invalid_source_result")
+        allowed = {
+            "source", "status", "duration_ms", "answer", "conversation_id",
+            "error",
+        }
+        if set(raw) - allowed or not {"source", "status", "duration_ms"} <= set(raw):
+            raise KnowledgeContractError("invalid_source_result")
+        error = raw.get("error")
+        error_code = None
+        retryable = False
+        if error is not None:
+            if (not isinstance(error, dict) or set(error) != {"code", "retryable"}
+                    or type(error["retryable"]) is not bool):
+                raise KnowledgeContractError("invalid_source_error")
+            try:
+                error_code = KnowledgeErrorCode(error["code"])
+            except (TypeError, ValueError) as exc:
+                raise KnowledgeContractError("invalid_source_error") from exc
+            retryable = error["retryable"]
+        return cls(
+            source=raw["source"],
+            status=raw["status"],
+            duration_ms=raw["duration_ms"],
+            answer=raw.get("answer"),
+            conversation_id=raw.get("conversation_id"),
+            error_code=error_code,
+            retryable=retryable,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +217,23 @@ class KnowledgeResponse:
             "sources": rows,
             "meta": {"partial": self.partial},
         }
+
+    @classmethod
+    def from_dict(cls, raw: object) -> "KnowledgeResponse":
+        if (not isinstance(raw, dict)
+                or set(raw) != {"request_id", "status", "answer", "sources", "meta"}
+                or not isinstance(raw["sources"], list)
+                or not isinstance(raw["meta"], dict)
+                or set(raw["meta"]) != {"partial"}
+                or type(raw["meta"]["partial"]) is not bool):
+            raise KnowledgeContractError("invalid_response")
+        return cls(
+            request_id=raw["request_id"],
+            status=raw["status"],
+            answer=raw["answer"],
+            sources=tuple(KnowledgeSourceResult.from_dict(item) for item in raw["sources"]),
+            partial=raw["meta"]["partial"],
+        )
 
 
 @dataclass(frozen=True, slots=True)

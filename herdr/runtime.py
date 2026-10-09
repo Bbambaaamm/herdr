@@ -61,7 +61,10 @@ def _child_toolsets(tools: Iterable[str], *, allow_delegation: bool = False) -> 
     selected = frozenset(tools)
     if "herdr_delegate_child" in selected and not allow_delegation:
         raise HerdrRuntimeError("child_nested_delegation_unavailable", "child-bound transport required")
-    if selected - (_CHILD_FILE_TOOLS | {"herdr_delegate_child", "herdr_submit_result", "herdr_verify_work"}):
+    if selected - (_CHILD_FILE_TOOLS | {
+            "herdr_delegate_child", "herdr_submit_result", "herdr_verify_work",
+            "herdr_external_knowledge",
+    }):
         raise HerdrRuntimeError("child_toolset_unmapped", ",".join(sorted(selected)))
     # Hermes has toolset-level (not per-tool) filtering. The file bundle is
     # constrained further by the OS workspace mount below. Empty legacy canary
@@ -70,6 +73,7 @@ def _child_toolsets(tools: Iterable[str], *, allow_delegation: bool = False) -> 
     if "herdr_delegate_child" in selected: groups.append("herdr_delegation")
     if "herdr_submit_result" in selected: groups.append("herdr_result")
     if "herdr_verify_work" in selected: groups.append("herdr_work")
+    if "herdr_external_knowledge" in selected: groups.append("herdr_external_knowledge")
     return ",".join(groups) if groups else "bot_room"
 
 
@@ -761,6 +765,42 @@ class HerdrChildRuntime:
                 return
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
+    def _external_knowledge_child_authority(
+        self, identity: InvocationIdentity, grant_sha256: str,
+        _provider_id: str, _request: object,
+    ) -> bool:
+        """Require the exact still-running durable child attempt."""
+        rec = self.scheduler._tasks.get(identity.task_id)
+        if rec is None or rec.state is not LifecycleState.RUNNING:
+            return False
+        lease = rec.lease
+        launch = self._policy_launches.get(identity.task_id)
+        pane = rec.execution_pane
+        proof = self._sandbox_proofs.get(pane) if pane else None
+        if (lease is None or launch is None or not isinstance(proof, dict)
+                or self.scheduler.current_time() >= lease.lease_until):
+            return False
+        if (rec.run_token != identity.run_token
+                or rec.fencing_token != identity.fencing_token
+                or rec.agent_id != identity.agent_id
+                or rec.execution_agent != identity.agent_id
+                or lease.fencing_token != identity.fencing_token
+                or lease.agent_id != identity.agent_id
+                or rec.execution_sandbox_verified is not True
+                or rec.economic_delivery_attempted is not True
+                or not rec.execution_pane or not rec.execution_marker
+                or launch.grant.hash != grant_sha256
+                or launch.grant.identity != identity):
+            return False
+        invocation = proof.get("invocation_policy")
+        if not isinstance(invocation, dict) or invocation.get("grant_sha256") != grant_sha256:
+            return False
+        try:
+            self.scheduler._require_current_ownership(rec)
+        except Exception:
+            return False
+        return True
+
     def _start_agent(self, lease: _Lease, pane_id: str) -> None:
         self._assert_prepared()
         node = self.scheduler.task_node(lease.task_id)
@@ -1380,6 +1420,11 @@ class HerdrChildRuntime:
                 )
             ):
                 raise HerdrRuntimeError("child_sandbox_attestation_denied", lease.task_id)
+            from .external_knowledge_host import bind_external_knowledge_host
+            bind_external_knowledge_host(
+                launch.mount.bootstrap, launch.grant,
+                self._external_knowledge_child_authority,
+            )
             work_port = authority.prepare_work(record, launch)
             def publish_continuation(evidence):
                 accepted = self.scheduler.attest_execution_sandbox(

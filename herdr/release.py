@@ -37,6 +37,7 @@ PAYLOAD_PATHS = (
     "configs/consumers",
     "deploy/agent_platform/production",
     "deploy/herdr/cutover",
+    "deploy/herdr/external-knowledge.example.json",
     "docs/CONSUMERS.md",
     "docs/VERSIONING_AND_DEPLOYMENT.md",
     "herdr",

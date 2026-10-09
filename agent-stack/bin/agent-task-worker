@@ -884,6 +884,10 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
             permissions=tuple(task.get("parent_permissions") or ()))
         session["sandbox_verified"] = True
         persist_execution_session(task)
+        from herdr.external_knowledge_host import bind_external_knowledge_host
+        bind_external_knowledge_host(
+            launch.mount.bootstrap, launch.grant, external_knowledge_task_authority
+        )
         if modern_work_contract(task):
             from herdr.work_contract_host import HostWorkContractFactory
             from agent_completion_evidence import spec_digest
@@ -1076,6 +1080,91 @@ def cleanup_task_session(task: dict) -> bool:
     session["cleanup_error"] = "pane close failed"
     log(str(task.get("id") or "unknown"), f"task session cleanup failed pane={pane_id}")
     return False
+
+
+def external_knowledge_task_authority(identity, grant_sha256, _provider_id, _request) -> bool:
+    """Re-read the exact canonical RUNNING root attempt before/after retrieval."""
+    from herdr.security import InvocationIdentity
+    import re
+    if (not isinstance(identity, InvocationIdentity)
+            or not isinstance(grant_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", grant_sha256) is None
+            or re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", identity.task_id) is None):
+        return False
+    try:
+        directory = os.open(
+            RUNNING, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+    except OSError:
+        return False
+    try:
+        directory_info = os.fstat(directory)
+        if (not stat.S_ISDIR(directory_info.st_mode)
+                or directory_info.st_uid != os.geteuid()
+                or directory_info.st_mode & 0o022):
+            return False
+        try:
+            fd = os.open(
+                identity.task_id + ".json",
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=directory,
+            )
+        except OSError:
+            return False
+        try:
+            before = os.fstat(fd)
+            if (not stat.S_ISREG(before.st_mode)
+                    or before.st_uid != os.geteuid()
+                    or before.st_mode & 0o022
+                    or before.st_nlink != 1
+                    or not 0 < before.st_size <= 1_048_576):
+                return False
+            raw = bytearray()
+            while len(raw) <= 1_048_576:
+                chunk = os.read(fd, min(65_536, 1_048_577 - len(raw)))
+                if not chunk:
+                    break
+                raw.extend(chunk)
+            after = os.fstat(fd)
+            named = os.stat(
+                identity.task_id + ".json", dir_fd=directory, follow_symlinks=False
+            )
+            stamp = lambda item: (
+                item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns,
+                item.st_ctime_ns, item.st_mode, item.st_uid, item.st_nlink,
+            )
+            if (len(raw) > 1_048_576 or len(raw) != before.st_size
+                    or stamp(before) != stamp(after) or stamp(before) != stamp(named)):
+                return False
+        finally:
+            os.close(fd)
+    finally:
+        os.close(directory)
+    try:
+        current = json.loads(bytes(raw).decode("utf-8"))
+        if not isinstance(current, dict):
+            return False
+        session = current.get("execution_session")
+        policy = session.get("invocation_policy") if isinstance(session, dict) else None
+        launch_identity = session.get("launch_identity") if isinstance(session, dict) else None
+        return bool(
+            current.get("id") == identity.task_id
+            and current.get("run_token") == identity.run_token
+            and current.get("fencing_token") == identity.fencing_token
+            and "github:" + str(current.get("repo") or "") == identity.consumer
+            and isinstance(session, dict)
+            and not session.get("closed_at")
+            and session.get("agent_name") == identity.agent_id
+            and session.get("sandbox_verified") is True
+            and session.get("economic_delivery_attempted") is True
+            and type(session.get("sandbox_pid")) is int
+            and session["sandbox_pid"] > 0
+            and isinstance(policy, dict)
+            and policy.get("grant_sha256") == grant_sha256
+            and InvocationIdentity.from_dict(launch_identity) == identity
+        )
+    except (UnicodeError, ValueError, TypeError, KeyError):
+        return False
 
 
 def current_task_path(task: dict) -> Path | None:
