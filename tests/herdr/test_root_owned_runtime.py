@@ -26,6 +26,8 @@ FILENAME = "external-runtime-dependency.txt"
 
 
 def approved_nonsecret_release_tree():
+    if os.geteuid() == 0:
+        pytest.skip("same-UID adversary proof must never write released files as root")
     if not PUBLISHED.is_dir() or not (PUBLISHED / FILENAME).is_file():
         pytest.skip("staging RC26 root-published nonsecret fixture is absent")
     assert [p.name for p in PUBLISHED.iterdir()] == [FILENAME]
@@ -124,6 +126,12 @@ def test_root_owned_sdk_tree_stays_unmodified_in_actual_bwrap_child():
             (PUBLISHED / FILENAME).chmod(0o666)
         with pytest.raises(PermissionError):
             (PUBLISHED / FILENAME).write_bytes(b"attacker")
+        with pytest.raises(PermissionError):
+            (PUBLISHED / "no-bytecode-cache").mkdir()
+        with pytest.raises(OSError):
+            (inside.parent / "no-bytecode-cache").mkdir()
+        assert not (PUBLISHED / "no-bytecode-cache").exists()
+        assert not (inside.parent / "no-bytecode-cache").exists()
         assert inside.read_bytes() == raw
     finally:
         if proc is not None and proc.poll() is None:

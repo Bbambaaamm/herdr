@@ -4,7 +4,9 @@ import importlib.machinery
 import importlib.util
 import hashlib
 import json
+import marshal
 import os
+import struct
 import subprocess
 import sys
 import types
@@ -56,9 +58,9 @@ def test_policy_bin_hermes_invokes_guarded_launcher():
     assert POLICY_BIN.read_text() == (
         '#!/bin/sh\n'
         'unset LD_PRELOAD LD_AUDIT LD_LIBRARY_PATH GLIBC_TUNABLES GCONV_PATH LOCPATH NLSPATH BASH_ENV ENV\n'
-        'exec /usr/bin/python3 -I -S /run/herdr-bootstrap/agent-hermes-policy-stage1 "$@"\n'
+        'exec /usr/bin/python3 -I -S /run/herdr/policy-code/agent-stack/bin/agent-hermes-policy-stage1 "$@"\n'
     )
-    assert "/run/herdr/policy-code" not in POLICY_BIN.read_text()
+    assert "/run/herdr/policy-code" in POLICY_BIN.read_text()
     assert POLICY_BIN.stat().st_mode & 0o111
     assert LAUNCHER.read_text(encoding="utf-8").splitlines()[0] == (
         "#!/usr/bin/python3 -I -S"
@@ -461,7 +463,7 @@ def test_stage1_execs_verified_stage2_source_fd(monkeypatch):
     monkeypatch.setattr(module, "_open_verified_stage2", lambda: 41)
     monkeypatch.setattr(module, "_open_verified_python", lambda: 42)
     monkeypatch.setattr(module, "_connect_host_authority", lambda *args: 43)
-    monkeypatch.setattr(module, "_fresh_pycache_prefix", lambda: "/run/herdr-bootstrap/no-bytecode-cache")
+    monkeypatch.setattr(module, "_fresh_pycache_prefix", lambda: "/run/herdr/policy-code/no-bytecode-cache")
     monkeypatch.setattr(module.os, "set_inheritable", lambda *args: None)
     seen = {}
 
@@ -475,7 +477,7 @@ def test_stage1_execs_verified_stage2_source_fd(monkeypatch):
     assert seen["executable"] == "/proc/self/fd/42"
     assert seen["argv"] == [
         "/proc/self/fd/42", "-I", "-S", "-X",
-        "pycache_prefix=/run/herdr-bootstrap/no-bytecode-cache", "/proc/self/fd/41",
+        "pycache_prefix=/run/herdr/policy-code/no-bytecode-cache", "/proc/self/fd/41",
         "chat", "--profile", "test",
     ]
     assert seen["env"][module.INTERPRETER_FD_ENV] == "42"
@@ -526,12 +528,12 @@ def test_stage1_rejects_stacked_exact_trust_root(tmp_path):
     with pytest.raises(SystemExit, match="one exact read-only trust mount"):
         module._require_exact_ro_tree(root, rows)
 
-def test_startup_cache_is_absent_under_frozen_root_not_same_uid_tmp(tmp_path,monkeypatch):
+def test_startup_cache_is_absent_under_immutable_code_root(tmp_path,monkeypatch):
     stage1, stage2 = _stage1(), _launcher()
-    root = tmp_path / "bootstrap"
+    root = tmp_path / "code"
     root.mkdir()
-    monkeypatch.setattr(stage1,"BOOTSTRAP_ROOT",root)
-    monkeypatch.setattr(stage2,"BOOTSTRAP_ROOT",root)
+    monkeypatch.setattr(stage1,"POLICY_CODE_ROOT",root)
+    monkeypatch.setattr(stage2,"POLICY_CODE_ROOT",root)
     monkeypatch.setattr(stage1,"_mount_rows",lambda:{str(root):{"ro"}})
     prefix = str(root / "no-bytecode-cache")
     assert stage1._fresh_pycache_prefix() == prefix
@@ -547,14 +549,60 @@ def test_startup_cache_is_absent_under_frozen_root_not_same_uid_tmp(tmp_path,mon
     with pytest.raises(SystemExit,match="immutable startup"):
         stage2._require_startup_pycache_prefix()
 
-def test_stage1_cache_requires_physical_readonly_bootstrap(tmp_path,monkeypatch):
+def test_stage1_cache_requires_physical_readonly_code(tmp_path,monkeypatch):
     module = _stage1()
-    root = tmp_path / "bootstrap"
+    root = tmp_path / "code"
     root.mkdir()
-    monkeypatch.setattr(module,"BOOTSTRAP_ROOT",root)
+    monkeypatch.setattr(module,"POLICY_CODE_ROOT",root)
     monkeypatch.setattr(module,"_mount_rows",lambda:{str(root):{"rw"}})
     with pytest.raises(SystemExit,match="read-only"):
         module._fresh_pycache_prefix()
+
+
+def test_stage2_helper_rejects_mutable_transport_and_forged_bytecode(tmp_path, monkeypatch):
+    module = _launcher()
+    assert module.BOOTSTRAP_STAGE1 == (
+        module.POLICY_CODE_ROOT / "agent-stack/bin/agent-hermes-policy-stage1"
+    )
+    code_root = tmp_path / "code"
+    helper = code_root / "agent-stack/bin/agent-hermes-policy-stage1"
+    helper.parent.mkdir(parents=True)
+    helper.write_text('VALUE = "approved"\n')
+    transport = tmp_path / "bootstrap"
+    transport.mkdir()
+    (transport / helper.name).write_text(
+        "raise RuntimeError('mutable transport helper executed')\n"
+    )
+    monkeypatch.setattr(module, "POLICY_CODE_ROOT", code_root)
+    monkeypatch.setattr(module, "BOOTSTRAP_STAGE1", helper)
+    monkeypatch.setattr(module, "BOOTSTRAP_ROOT", transport)
+    # Mount provenance is tested separately against the real kernel. This
+    # filesystem test exercises Python's actual cached-code import behavior.
+    seen_mounts = []
+    monkeypatch.setattr(module, "_require_production_mount",
+                        lambda path, **kwargs: seen_mounts.append((path, kwargs)))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    monkeypatch.setattr(sys, "pycache_prefix", str(transport / "no-bytecode-cache"))
+    poisoned_cache = Path(importlib.util.cache_from_source(str(helper)))
+    poisoned_cache.parent.mkdir(parents=True)
+    info = helper.stat()
+    forged = compile("raise RuntimeError('forged transport bytecode executed')",
+                     str(helper), "exec")
+    poisoned_cache.write_bytes(
+        importlib.util.MAGIC_NUMBER
+        + struct.pack("<III", 0, int(info.st_mtime), info.st_size)
+        + marshal.dumps(forged)
+    )
+    loader = importlib.machinery.SourceFileLoader("unsafe_cache_probe", str(helper))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    with pytest.raises(RuntimeError, match="forged transport bytecode executed"):
+        loader.exec_module(importlib.util.module_from_spec(spec))
+    with pytest.raises(SystemExit, match="immutable startup pycache prefix"):
+        module._load_stage1_module()
+    monkeypatch.setattr(sys, "pycache_prefix", str(code_root / "no-bytecode-cache"))
+    assert module._load_stage1_module().VALUE == "approved"
+    assert seen_mounts == [(code_root, {"exact": True})] * 2
+    assert not (code_root / "no-bytecode-cache").exists()
 
 
 def test_actual_user_namespace_keeps_stage0_verification_before_host_handshake():

@@ -923,7 +923,7 @@ class HerdrChildRuntime:
                 task_id=rec.id,run_token=rec.run_token,fencing_token=rec.fencing_token)
             original={key:proof[key] for key in ("authority","task_id","run_token","sandbox_pid",
                       "fencing_token","agent_name","pane_id","marker","worktree_identity",
-                      "ownership_sha256","owned_write_mounts")
+                      "ownership_sha256","owned_write_mounts","approved_profile","immutable_sources")
                       if key in proof}
             try:
                 verify_retained_policy_evidence(proof.get("invocation_policy"),identity=identity,

@@ -79,15 +79,122 @@ through these approved sources. An immutable policy-code bind alone
 does not prove that untrusted imports cannot enter via other mounts or
 environment paths.
 
-The existing P1 reviews of draft PR #131/#134 involving FD aliases,
-literal-bind TOCTOU, writable credential paths and alternate mount
-destinations remain separate blockers. They must be resolved before
-private-HOME activation, alongside an isolated native Hermes
-zero-provider test, exact-head CI/security review, signed rollback,
-#78 E2E and #53 durable delivery reconciliation.
+## Successor security corrections (draft, not activated)
+
+The FD bridge now requires an exact `ApprovedPrivateMountPlan` for any
+ordinary descriptor or additional bind in a private-HOME launch. The
+record lives under `/etc/herdr/launch-plans/<canonical-identity-sha256>.json`,
+with a root-owned non-writable ancestry. It binds the complete invocation
+identity (including attempt and fence), exact descriptors, writable targets
+and the digest of the complete bwrap argv. Self-declared target/inode lists
+and unrelated root-owned CLI files do not approve a launch. All authority
+mounts remain readonly; additional literal binds are rejected.
+
+The factory holds workspace/result descriptors through cleanup. Destination
+ancestors are masked with fresh tmpfs mounts before names are built, so
+host-side path replacements cannot redirect the mount into host credentials.
+Sensitive HOME directories and mount aliases below mutable roots are denied.
+The policy shim and stage-one launcher execute from the approved policy-code
+inode, rather than a same-UID-writable bootstrap copy. The bootstrap snapshot
+remains a transport for exact hash-verified metadata; it is not executable
+code authority.
+Stage two also imports its stage-one helpers from policy code. The interpreter
+cache prefix is an absent path below the same immutable code tree, so a
+host-owned bootstrap transport cannot supply forged bytecode before guards.
+
+Signed private launch evidence includes root publication paths, complete
+manifest digests, code/runtime inode identities, bootstrap executable hashes
+and the root-approved mount-plan record identity. Retained verification
+re-establishes these sources and actual mounted inodes. Private evidence
+without this provenance is refused. Child attestation and replay retain both
+profile and immutable-source evidence and reject outer/inner substitution.
+Cleanup attempts every independent release and preserves the first error
+while closing descriptors and clearing the live launch registry.
+
+## Concrete operator publication procedure
+
+`scripts/publish-herdr-runtime.py` is a release helper, never a worker or
+installer hook. It performs no network call, activation or service change.
+Its default mode validates the root-approved request and reports the intended
+new version. `--publish` requires UID 0, copies verified payload bytes into
+new inodes, fsyncs files/directories, validates root ownership and complete
+inventories, and publishes using Linux `renameat2(RENAME_NOREPLACE)`.
+Published nonsecret files use 0444 (0555 for approved executables) and
+directories use 0555, so agentops can read/execute without write authority.
+Existing versions cannot be replaced. Partial unpublished staging directories
+are retained for operator diagnosis, with no deployment symlink change.
+
+The operator must first authenticate the reviewed release commit and the
+Hermes/Python manifests through the existing release authority. Do not derive
+approval by hashing arbitrary live worker files. After independent review,
+create a root-protected version parent (for example `/opt/herdr/immutable`)
+and a root-protected publication request outside all repositories. The
+request uses this closed schema (all three `trees` are mandatory):
+
+```json
+{
+  "schema_version": "herdr-runtime-publication-1",
+  "version": "reviewed-release-version",
+  "destination": "/opt/herdr/immutable",
+  "trees": {
+    "code": {"source": "/approved/policy-payload", "target": "/run/herdr/policy-code", "files": {"relative/name": "reviewed-sha256"}, "executable_files": [], "max_bytes": 33554432, "max_file_bytes": 4194304},
+    "hermes": {"source": "/approved/hermes-payload", "target": "/home/agentops/.hermes/hermes-agent", "files": {"relative/name": "reviewed-sha256"}, "executable_files": [], "max_bytes": 2147483648, "max_file_bytes": 268435456},
+    "python": {"source": "/approved/python-payload", "target": "/home/agentops/.local/share/uv/python/cpython-3.11.16-linux-x86_64-gnu", "files": {"relative/name": "reviewed-sha256"}, "executable_files": [], "max_bytes": 2147483648, "max_file_bytes": 268435456}
+  }
+}
+```
+
+The values above are schema placeholders, not an approved runtime. Each
+`files` inventory must be complete and independently authenticated. Code must
+include `agent-stack/policy-bin/hermes`, `agent-stack/policy-bin/herdr`,
+`agent-stack/bin/agent-hermes-policy-stage1` and
+`agent-stack/bin/agent-hermes-policy-run`; mark actual executable files in
+`executable_files`. The request must mark the policy `hermes`/`herdr` shims
+and Python `bin/python3.11` executable; missing execute approval is refused.
+The reviewed Python closure must cover the interpreter,
+stdlib, shared libraries, extension modules and Hermes dependencies actually
+used by native Hermes. Credentials are never runtime publication payload.
+
+From the operator's authenticated checkout/interpreter, first run:
+
+```text
+python scripts/publish-herdr-runtime.py --configuration /etc/herdr/runtime-publication.json
+```
+
+Only after explicit privileged authorization, run the same command with
+`--publish`. Record the returned approval digest, `publication.json`, exact
+release commit and complete manifests. Keep old versions while any live or
+retained launch references them; workers never delete published sources.
+
+Tests run without root publication. They verify independent new inode copies,
+retained writable source FD attacks, source symlinks/hardlinks, changed hashes,
+ENOSPC preservation, atomic no-replace publication and actual worker-UID denial.
+Actual root publication remains unexecuted and unaccepted.
+
+## Activation gates and remaining integration
+
+The new private mode remains opt-in. The standalone host composition still
+uses its existing schema-1 configuration; it does not silently adopt a new
+profile or publisher. A reviewed integration into that same host authority
+must supply the real `ApprovedImmutableTree` inputs, `ApprovedProfile`,
+credential preflight and exact per-launch plan. The generated request is
+available as `PolicyMount.private_mount_request` after the command builder
+refuses a missing approval. A trusted operator/host authority must inspect
+source provenance and publish the matching root record; copying a worker's
+self-declaration into root storage without that validation is forbidden.
+Keep the same live held descriptors when binding the record with
+`PreparedPolicyLaunch.bind_private_mount_plan()` and rebuilding the command.
+The approval must exist before pane creation. No automatic privileged issuer
+has been installed by this change.
+
+Before activation, require exact-HEAD CI and independent security review, the
+real root-published native Hermes closure and a technically network-isolated
+zero-provider root/child/result test. Only after these gates may #78 E2E,
+rollback/recovery and #53 delivery reconciliation proceed. Publication is
+separate from acceptance and from any staging cutover.
 
 ## Status
 
-**Verified root-ownership enforcement and physical proof only.**
-Parent #129 and child #132 remain OPEN. Production RC26, the queue,
-leases/fences, credential sources and cumulative budgets are untouched.
+Implementation and isolated tests are available for review. **No acceptance
+or deployment is implied.** #129, #132, #53 and #78 remain OPEN. Production
+RC26, existing queue/leases/fences, credential sources and budgets are untouched.
