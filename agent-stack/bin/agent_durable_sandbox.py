@@ -177,6 +177,63 @@ if private_home:
         end = args.index("--")
     except ValueError:
         raise SystemExit("policy_fd_launch_invalid")
+    # All private-home launches use a closed bwrap grammar. Never accept
+    # --args: recursive option expansion bypasses ordinary mount validation.
+    # Deny capability grants, alternate PID namespaces, fail-open modes and
+    # new options unless independently audited and added to this contract.
+    flags = {"--unshare-pid", "--die-with-parent", "--unshare-net"}
+    path_options = {"--dev", "--proc", "--tmpfs", "--dir", "--chdir",
+                    "--remount-ro"}
+    one_value = path_options | {"--unsetenv"}
+    two_values = {"--ro-bind", "--bind", "--ro-bind-fd", "--bind-fd",
+                  "--ro-bind-data", "--setenv"}
+    bind_options = two_values - {"--setenv"}
+    parsed = []
+    offset = 1
+    while offset < end:
+        option = args[offset]
+        width = 0 if option in flags else 1 if option in one_value else (
+            2 if option in two_values else -1)
+        if width < 0 or offset + width >= end:
+            raise SystemExit("policy_fd_private_option_denied")
+        values = args[offset + 1:offset + 1 + width]
+        if option in path_options or option in bind_options:
+            destination = values[-1]
+            if (not destination.startswith("/")
+                or not os.path.isabs(destination)
+                or os.path.normpath(destination) != destination
+                or "//" in destination or "\\x00" in destination):
+                raise SystemExit("policy_fd_private_mount_path_invalid")
+        if option == "--setenv":
+            if values[0] not in ("HOME", "PATH", "HERDR_DURABLE_SANDBOX"):
+                raise SystemExit("policy_fd_private_home_env_invalid")
+            if values[0] == "HOME" and values[1] != str(home):
+                raise SystemExit("policy_fd_private_home_env_invalid")
+        if option == "--unsetenv" and values[0] == "HOME":
+            raise SystemExit("policy_fd_private_home_env_invalid")
+        parsed.append((option, values, offset))
+        offset += 1 + width
+    if (sum(option == "--unshare-pid" for option, _, _ in parsed) != 1
+        or sum(option == "--proc" and value == ["/proc"]
+               for option, value, _ in parsed) != 1):
+        raise SystemExit("policy_fd_private_proc_missing")
+    if (sum(option == "--setenv" and value == ["HOME", str(home)]
+            for option, value, _ in parsed) != 1):
+        raise SystemExit("policy_fd_private_home_env_invalid")
+    # SDK and XDG path overrides are host-environment inputs, not trusted
+    # profile authority. Every private-home execution clears them explicitly.
+    relocation_keys = ("HERMES_HOME", "HERMES_PROFILE", "HERMES_CONFIG_DIR",
+                       "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+                       "XDG_CACHE_HOME")
+    if any(sum(option == "--unsetenv" and value == [key]
+               for option, value, _ in parsed) != 1
+           for key in relocation_keys):
+        raise SystemExit("policy_fd_private_home_env_invalid")
+    if any(option in bind_options
+           and (Path(value[-1]) == Path("/proc")
+                or Path("/proc") in Path(value[-1]).parents)
+           for option, value, position in parsed if position > 1):
+        raise SystemExit("policy_fd_private_proc_shadowed")
     if (args[end - 2:end] != ["--remount-ro", str(home)]
         or sum(args[i] == "--remount-ro" for i in range(end)) != 1):
         raise SystemExit("policy_fd_private_home_not_readonly")

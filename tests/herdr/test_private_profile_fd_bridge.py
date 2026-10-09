@@ -222,3 +222,66 @@ def test_unsealed_regular_fd_cannot_impersonate_profile_memfd(tmp_path):
             )
             assert result.returncode != 0
             assert b"policy_fd_profile_not_sealed" in result.stderr or b"Invalid argument" in result.stderr
+
+@pytest.mark.parametrize("attack,expected", [
+    ("recursive_args", "policy_fd_private_option_denied"),
+    ("relative_bind", "policy_fd_private_mount_path_invalid"),
+    ("dotdot_bind", "policy_fd_private_mount_path_invalid"),
+    ("repeat_slash_bind", "policy_fd_private_mount_path_invalid"),
+    ("cap_sys_admin", "policy_fd_private_option_denied"),
+    ("fail_open", "policy_fd_private_option_denied"),
+    ("pidns", "policy_fd_private_option_denied"),
+    ("unset_home", "policy_fd_private_home_env_invalid"),
+    ("redirect_home", "policy_fd_private_home_env_invalid"),
+    ("untrusted_profile_env", "policy_fd_private_home_env_invalid"),
+    ("clearenv", "policy_fd_private_option_denied"),
+    ("omit_pid_unshare", "policy_fd_private_proc_missing"),
+    ("omit_proc_mount", "policy_fd_private_proc_missing"),
+    ("shadow_proc", "policy_fd_private_proc_shadowed"),
+    ("missing_explicit_home", "policy_fd_private_home_env_invalid"),
+    ("missing_hermes_unset", "policy_fd_private_home_env_invalid"),
+    ("duplicate_xdg_unset", "policy_fd_private_home_env_invalid"),
+])
+def test_private_home_rejects_bubblewrap_grammar_and_environment_bypasses(
+    tmp_path, attack, expected,
+):
+    sandbox = bridge_module()
+    source, _, snapshot = fixture_snapshot(tmp_path)
+    with snapshot:
+        opts = snapshot.mount_arguments()
+        injected = {
+            "recursive_args": ["--args", "0"],
+            "relative_bind": ["--bind", str(source), "home/agentops/.hermes/profiles/quantlab"],
+            "dotdot_bind": ["--bind", str(source),
+                            "/home/agentops/../agentops/.hermes/profiles/quantlab"],
+            "repeat_slash_bind": ["--ro-bind", str(source), "/home//agentops/.hermes"],
+            "cap_sys_admin": ["--cap-add", "CAP_SYS_ADMIN"],
+            "fail_open": ["--not-a-security-boundary"],
+            "pidns": ["--pidns", "0"],
+            "unset_home": ["--unsetenv", "HOME"],
+            "redirect_home": ["--setenv", "HOME", "/tmp/untrusted"],
+            "untrusted_profile_env": ["--setenv", "HERMES_HOME", "/tmp/untrusted"],
+            "clearenv": ["--clearenv"],
+            "shadow_proc": ["--ro-bind", str(source), "/proc"],
+        }
+        if attack in injected:
+            opts[-2:-2] = injected[attack]
+        elif attack == "missing_explicit_home":
+            index = opts.index("HOME")
+            assert opts[index - 1] == "--setenv"
+            del opts[index - 1:index + 2]
+        elif attack == "missing_hermes_unset":
+            index = opts.index("HERMES_HOME")
+            assert opts[index - 1] == "--unsetenv"
+            del opts[index - 1:index + 1]
+        elif attack == "duplicate_xdg_unset":
+            opts[-2:-2] = ["--unsetenv", "XDG_DATA_HOME"]
+        command = command_for(sandbox, snapshot, opts=opts)
+        if attack == "omit_pid_unshare":
+            command.remove("--unshare-pid")
+        elif attack == "omit_proc_mount":
+            index = command.index("--proc")
+            del command[index:index + 2]
+        result = subprocess.run(command, capture_output=True, timeout=8)
+        assert result.returncode != 0
+        assert expected.encode() in result.stderr

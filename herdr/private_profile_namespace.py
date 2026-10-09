@@ -235,6 +235,14 @@ class PrivateProfileSnapshot:
             args.extend(["--tmpfs", str(self.destination / name)])
         # bwrap's --remount-ro is NONRECURSIVE: runtime submounts stay RW.
         # The host launcher must enforce this as the last mount operation.
+        # Never inherit SDK/XDG profile relocation directives from a host
+        # shell or a previous model session. Explicit CLI --profile remains
+        # bound to the host-approved profile name.
+        for key in ("HERMES_HOME", "HERMES_PROFILE", "HERMES_CONFIG_DIR",
+                    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+                    "XDG_CACHE_HOME"):
+            args.extend(["--unsetenv", key])
+        args.extend(["--setenv", "HOME", str(self.home)])
         args.extend(["--remount-ro", str(self.home)])
         return args
 

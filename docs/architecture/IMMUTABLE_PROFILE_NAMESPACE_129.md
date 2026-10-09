@@ -45,6 +45,16 @@ connected to the live Herdr agent launcher.
 5. The host FD launcher fail-closes if the remount is absent, repeated or
    not last; if a bind/tmpfs shadows `/home`, `/`, HOME or the sealed
    profile tree; or if the exact four runtime submounts are missing.
+   In private-HOME mode the launcher additionally parses a **closed**
+   Bubblewrap option grammar: recursive `--args`, capabilities, alternative
+   PID namespaces, fail-open options and unknown switches are denied. Every
+   mount destination must be a canonical absolute path with no `..`,
+   redundant separators or relative resolution. Exactly one `--unshare-pid`
+   and a fresh `--proc /proc` are required, and proc shadowing is denied.
+   The child HOME is pinned to `/home/agentops`; Hermes and XDG profile
+   relocation variables are explicitly unset and cannot be overwritten.
+   The same policy is exercised through negative subprocess tests before
+   the pinned launcher could execute `bwrap`.
    The required initial `--ro-bind / /` is the sole permitted ancestor bind.
 6. Physical tests read from the **sandbox child namespace**, not the
    unisolated bwrap supervisor. Host source edits/renames/symlink replacement
