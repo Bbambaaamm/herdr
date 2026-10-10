@@ -799,6 +799,7 @@ class ApprovedImmutableTree:
     files: Mapping[str, str]
     max_bytes: int = 33_554_432
     max_file_bytes: int = 4_194_304
+    executable_files: tuple[str, ...] | None = None
 
     def __post_init__(self):
         from types import MappingProxyType
@@ -809,6 +810,10 @@ class ApprovedImmutableTree:
         _require(isinstance(self.files, Mapping) and len(self.files) > 0,
                  "immutable approved tree manifest required")
         object.__setattr__(self, "files", MappingProxyType(dict(self.files)))
+        if self.executable_files is not None:
+            _require(all(isinstance(name,str) for name in self.executable_files)
+                     and set(self.executable_files)<=set(self.files),"immutable executable inventory invalid")
+            object.__setattr__(self,"executable_files",tuple(self.executable_files))
 
     def freeze(self, storage, writable_roots):
         # Avoid path aliases via worker writable roots even when a temporary
@@ -819,10 +824,23 @@ class ApprovedImmutableTree:
             root = Path(raw).absolute()
             _require(not (path == root or root in path.parents),
                      "immutable source overlaps writable workspace")
-        return FrozenTree.attach_immutable(
+        tree = FrozenTree.attach_immutable(
             path, target=self.target, files=self.files,
             max_bytes=self.max_bytes, max_file_bytes=self.max_file_bytes,
         )
+        try:
+            if self.executable_files is not None:
+                for name in self.files:
+                    fd=_open_relative(tree.fd,name)
+                    try:
+                        bits=os.fstat(fd).st_mode&0o111
+                        _require(bits==(0o111 if name in self.executable_files else 0),
+                                 "immutable executable mode differs from approval")
+                    finally:os.close(fd)
+            return tree
+        except BaseException:
+            tree.close()
+            raise
 
 
 @dataclass(frozen=True)

@@ -47,6 +47,7 @@ def test_root_composition_selects_immutable_trees_and_exact_host_profile(tmp_pat
     assert isinstance(factory.code,ApprovedImmutableTree)
     assert all(isinstance(tree,ApprovedImmutableTree) for tree in factory.runtime)
     assert factory.approved_profile.identity==approved.identity
+    assert factory.code.executable_files==tuple(raw["code"]["executable_files"])
     assert factory.profile_preflight(approved.name) is True
     with pytest.raises(SecurityError,match="profile changed"):
         factory.profile_preflight("foreign")
@@ -54,6 +55,29 @@ def test_root_composition_selects_immutable_trees_and_exact_host_profile(tmp_pat
     with pytest.raises(SecurityError,match="root protected"):
         factory.prepare(identity=parent.identity,workspace=workspace,
                         tools=parent.scope.tools,permissions=parent.scope.permissions)
+
+
+@pytest.mark.parametrize("approved,mode,valid",[(True,0o555,True),(False,0o444,True),
+    (True,0o444,False),(False,0o555,False),(True,0o500,False)])
+def test_immutable_approval_enforces_real_execute_bits_and_closes_on_failure(tmp_path,monkeypatch,approved,mode,valid):
+    import os
+    from types import SimpleNamespace
+    from herdr.policy_launch import FrozenTree,CODE_TARGET
+    source=tmp_path/"source";source.mkdir();file=source/"entry.py";file.write_bytes(b"approved=True\n");file.chmod(mode)
+    closed=[]
+    def attach(*args,**kwargs):
+        fd=os.open(source,os.O_RDONLY|os.O_DIRECTORY)
+        def close():closed.append(fd);os.close(fd)
+        return SimpleNamespace(fd=fd,close=close)
+    # Only the independently tested root-protected attachment is a double.
+    # Execute bits and descriptor cleanup use actual filesystem operations.
+    monkeypatch.setattr(FrozenTree,"attach_immutable",attach)
+    tree=ApprovedImmutableTree(source,CODE_TARGET,{"entry.py":hashlib.sha256(file.read_bytes()).hexdigest()},
+        executable_files=("entry.py",) if approved else ())
+    if valid:tree.freeze(tmp_path,()).close()
+    else:
+        with pytest.raises(SecurityError,match="executable mode"):tree.freeze(tmp_path,())
+    assert len(closed)==1
 
 
 @pytest.mark.parametrize("fault",["missing-cli","unapproved-cli","missing-python","unapproved-python"])

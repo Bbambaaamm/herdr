@@ -150,6 +150,18 @@ for item in entries:
                             value.st_size,value.st_ctime_ns,value.st_mtime_ns)
         valid=valid and stamp(os.fstat(opened))==stamp(held)
         if not valid:raise SystemExit("policy_fd_result_reservation_changed")
+        parent_fd=os.open("/",os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+        try:
+            target_path=Path(item["target"])
+            if os.path.normpath(item["target"])!=item["target"]:raise ValueError("noncanonical result")
+            for part in target_path.parts[1:-1]:
+                child_fd=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=parent_fd)
+                os.close(parent_fd);parent_fd=child_fd
+            named=os.stat(target_path.name,dir_fd=parent_fd,follow_symlinks=False)
+            if not stat.S_ISREG(named.st_mode) or (named.st_dev,named.st_ino)!=(held.st_dev,held.st_ino):
+                raise ValueError("result logical inode changed")
+        except (OSError,ValueError):raise SystemExit("policy_fd_result_reservation_changed")
+        finally:os.close(parent_fd)
         if plan_envelope is None:raise SystemExit("policy_fd_private_plan_required")
     if sealed:
         required_seals = 1 | 2 | 4 | 8
@@ -455,7 +467,7 @@ if private_home:
         approved_dir_targets.update(Path(e["target"]) for e in approved_plan["descriptors"]
                                     if e["kind"] == "directory")
         approved_file_targets.update(Path(e["target"]) for e in approved_plan["descriptors"]
-                                     if e["kind"] == "file")
+                                     if e["kind"] in ("file","reserved-result"))
     approved_socket_targets = {
         Path("/run/herdr-policy/bootstrap-authority.sock"),
     }
@@ -466,6 +478,7 @@ if private_home:
         allowed = {
             "directory": approved_dir_targets,
             "file": approved_file_targets,
+            "reserved-result": approved_file_targets,
             "socket": approved_socket_targets,
         }[item["kind"]]
         if target not in allowed:

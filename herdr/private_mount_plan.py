@@ -164,9 +164,15 @@ class PinnedLaunchPath:
     def verify_reservation(self):
         from .result_submission import verify_empty_reservation_fd
         require(self.reservation is not None,"private result reservation unavailable")
+        # Resolve every logical component again without following symlinks.
+        # A held inode alone cannot authenticate where recovery will read it.
+        current=type(self)(self.logical,directory=False,expected=(self.device,self.inode))
+        current.close()
         fd=os.open(self.source,os.O_RDONLY|os.O_CLOEXEC|os.O_NONBLOCK)
         try:verify_empty_reservation_fd(fd,self.reservation)
         finally:os.close(fd)
+        current=type(self)(self.logical,directory=False,expected=(self.device,self.inode))
+        current.close()
 
     def close(self):
         if self.fd >= 0:

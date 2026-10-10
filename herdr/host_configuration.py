@@ -59,7 +59,7 @@ def _tree(raw, *, immutable=False):
             "approved executable inventory invalid")
     if immutable:
         return ApprovedImmutableTree(Path(raw["source"]),Path(raw["target"]),raw["files"],
-            raw["max_bytes"],raw["max_file_bytes"])
+            raw["max_bytes"],raw["max_file_bytes"],executable_files=tuple(raw["executable_files"]))
     return ApprovedTree(Path(raw["source"]),Path(raw["target"]),raw["files"],
         tuple(raw["executable_files"]),raw["max_bytes"],raw["max_file_bytes"])
 
