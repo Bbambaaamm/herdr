@@ -57,7 +57,7 @@ def test_reservation_does_not_follow_mutable_parent_alias(tmp_path):
     assert not list(parent.iterdir())
 
 
-@pytest.mark.parametrize("fault",[None,"bytes","intent","binding","mode","link","read-race","name","parent-alias"])
+@pytest.mark.parametrize("fault",[None,"bytes","intent","binding","mode","link","read-race","name","parent-alias","resolve-race"])
 def test_fd_launcher_rechecks_late_same_uid_result_mutation(tmp_path,fault):
     import json,subprocess,sys,importlib.util
     from herdr.result_submission import ResultSlot,reservation_binding
@@ -69,14 +69,14 @@ def test_fd_launcher_rechecks_late_same_uid_result_mutation(tmp_path,fault):
     try:
         descriptor=pin.descriptor()
         code="import os,sys;from pathlib import Path;p=Path(sys.argv[1]);action=sys.argv[2];"+{
-            None:"pass", "read-race":"pass", "bytes":"p.write_bytes(b'late-write')",
+            None:"pass", "read-race":"pass", "resolve-race":"pass", "bytes":"p.write_bytes(b'late-write')",
             "intent":"os.setxattr(p,'user.herdr.result_submission',b'late-intent')",
             "binding":"os.setxattr(p,'user.herdr.result_reservation',b'changed')",
             "mode":"p.chmod(0o644)", "link":"os.link(p,str(p)+'.link')",
             "name":"p.rename(p.with_name('moved'));p.touch(mode=0o600)",
             "parent-alias":"d=p.parent;m=d.with_name(d.name+'.moved');d.rename(m);d.symlink_to(m,target_is_directory=True)"}[fault]
         subprocess.run([sys.executable,"-I","-c",code,str(path),str(fault)],check=True)
-        if fault and fault!="read-race":
+        if fault and fault not in ("read-race","resolve-race"):
             with pytest.raises((ValueError,OSError,SecurityError)):pin.descriptor()
         root=Path(__file__).resolve().parents[2]
         spec=importlib.util.spec_from_file_location("reservation_fd_launcher",root/"agent-stack/bin/agent_durable_sandbox.py")
@@ -87,6 +87,14 @@ def test_fd_launcher_rechecks_late_same_uid_result_mutation(tmp_path,fault):
                 "def _late(fd,name):\n"
                 f" Path({str(path)!r}).write_bytes(b'write-during-check')\n"
                 " return _original(fd,name)\nos.getxattr=_late\n"+launcher)
+        if fault=="resolve-race":
+            launcher=("import ctypes\nfrom pathlib import Path\n"
+                "_libc=ctypes.CDLL(None,use_errno=True)\n_original_call=_libc.syscall\n"
+                "def _late_lookup(*args):\n result=_original_call(*args)\n"
+                f" parent=Path({str(path.parent)!r});moved=parent.with_name(parent.name+'.moved')\n"
+                " parent.rename(moved);parent.mkdir()\n return result\n"
+                "class _Proxy:syscall=staticmethod(_late_lookup)\n"
+                "ctypes.CDLL=lambda *args,**kwargs:_Proxy()\n"+launcher)
         proc=subprocess.run([sys.executable,"-I","-S","-c",launcher,
             json.dumps([descriptor]),"/usr/bin/bwrap","--bind-fd",str(pin.fd),str(path),"--","/bin/true"],
             capture_output=True,timeout=5)

@@ -109,6 +109,7 @@ class FrozenTree:
     files: tuple[tuple[str, str], ...]
     max_file_bytes: int = 4_194_304
     immutable_host_source: bool = False
+    executable_files: tuple[str, ...] | None = None
 
     @property
     def source(self):
@@ -138,6 +139,9 @@ class FrozenTree:
                 else:
                     _require(stat.S_ISREG(info.st_mode) and name in expected_files,
                              "unexpected frozen file")
+                    if self.executable_files is not None:
+                        _require(info.st_mode&0o111==(0o111 if name in self.executable_files else 0),
+                                 "immutable executable mode differs from approval")
                     found_files.add(name)
         walk(self.fd)
         _require(found_files == expected_files and found_dirs == expected_dirs,
@@ -156,6 +160,9 @@ class FrozenTree:
                 info = os.fstat(fd)
                 _require(stat.S_ISREG(info.st_mode) and info.st_size <= self.max_file_bytes,
                          "frozen source shape changed")
+                if self.executable_files is not None:
+                    _require(info.st_mode&0o111==(0o111 if name in self.executable_files else 0),
+                             "immutable executable mode differs from approval")
                 if self.immutable_host_source:
                     _verify_immutable_entry(info)
                 digest, remaining = hashlib.sha256(), info.st_size
@@ -387,7 +394,8 @@ class PolicyMount:
             "schema_version": "herdr-immutable-sources-1",
             "authority": "root-published",
             "trees": {str(tree.target): {"source": str(tree.path),
-                      "manifest_sha256": tree.source_digest}
+                      "manifest_sha256": tree.source_digest,
+                      **({"executable_files":sorted(tree.executable_files)} if tree.executable_files is not None else {})}
                       for tree in (self.code, *self.runtime)},
             "executables": {name: dict(self.code.files)[name]
                             for name in (SHIM_SOURCE, STAGE1_SOURCE, STAGE2_SOURCE)},
@@ -561,12 +569,17 @@ def validate_policy_evidence(evidence, *, identity: InvocationIdentity):
         for target, source in sources["trees"].items():
             digest = evidence["code_sha256"] if target == str(CODE_TARGET) else runtime[target]
             _require(isinstance(source, dict)
-                     and set(source) == {"source", "manifest_sha256"}
+                     and set(source) in ({"source", "manifest_sha256"},{"source","manifest_sha256","executable_files"})
                      and isinstance(source["source"], str)
                      and Path(source["source"]).is_absolute()
                      and os.path.normpath(source["source"]) == source["source"]
                      and source["manifest_sha256"] == digest,
                      "immutable source evidence binding mismatch")
+            if "executable_files" in source:
+                names=source["executable_files"]
+                _require(isinstance(names,list) and len(names)<=65536
+                         and all(isinstance(name,str) and 0<len(name)<=1024 for name in names)
+                         and names==sorted(set(names)),"immutable executable evidence malformed")
     if modern:
         from .host_bootstrap import validate_continuation
         bootstrap=evidence["bootstrap"]
@@ -594,6 +607,10 @@ def verify_retained_immutable_sources(proof):
     _require(approval.evidence() == expected, "retained private mount approval changed")
     for target, source in proof["immutable_sources"]["trees"].items():
         path = Path(source["source"])
+        approved_executable=source.get("executable_files")
+        _require(approved_executable is None or (isinstance(approved_executable,list)
+                 and len(approved_executable)<=65536 and all(isinstance(name,str) for name in approved_executable)),
+                 "retained immutable executable inventory invalid")
         _verify_root_owned_ancestry(path)
         fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         files, total, entries = {}, [0], [0]
@@ -616,6 +633,9 @@ def verify_retained_immutable_sources(proof):
                     _require(stat.S_ISREG(info.st_mode) and len(files) < 65536
                              and info.st_size <= 268435456,
                              "retained immutable source shape changed")
+                    if approved_executable is not None:
+                        _require(info.st_mode&0o111==(0o111 if relative in approved_executable else 0),
+                                 "retained immutable executable mode changed")
                     total[0] += info.st_size
                     _require(total[0] <= 2147483648, "retained immutable source exceeds bound")
                     item = _open_relative(fd, relative)
@@ -636,6 +656,8 @@ def verify_retained_immutable_sources(proof):
             _require({"device": held.st_dev, "inode": held.st_ino} == proof["tree_identities"][target],
                      "retained immutable source inode changed")
             walk(fd)
+            _require(approved_executable is None or set(approved_executable)<=set(files),
+                     "retained immutable executable inventory changed")
             _require(hashlib.sha256(canonical_json_bytes(dict(sorted(files.items())))).hexdigest()
                      == source["manifest_sha256"], "retained immutable source manifest changed")
             if target == str(CODE_TARGET):
@@ -829,14 +851,8 @@ class ApprovedImmutableTree:
             max_bytes=self.max_bytes, max_file_bytes=self.max_file_bytes,
         )
         try:
-            if self.executable_files is not None:
-                for name in self.files:
-                    fd=_open_relative(tree.fd,name)
-                    try:
-                        bits=os.fstat(fd).st_mode&0o111
-                        _require(bits==(0o111 if name in self.executable_files else 0),
-                                 "immutable executable mode differs from approval")
-                    finally:os.close(fd)
+            tree.executable_files=self.executable_files
+            tree.verify()
             return tree
         except BaseException:
             tree.close()

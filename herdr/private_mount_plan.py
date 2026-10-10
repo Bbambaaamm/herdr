@@ -15,6 +15,31 @@ from .security import SecurityError, InvocationIdentity, canonical_json_bytes
 AUTHORITY_ROOT = Path("/etc/herdr/launch-plans")
 VERSION = "herdr-private-mount-plan-1"
 
+def coherent_result_fd(path, expected):
+    """Kernel no-symlink whole-path lookup, then verify attachment and inode."""
+    import ctypes
+    path=Path(path)
+    require(path.is_absolute() and str(path)==os.path.normpath(str(path)),"private result path invalid")
+    class OpenHow(ctypes.Structure):
+        _fields_=[("flags",ctypes.c_uint64),("mode",ctypes.c_uint64),("resolve",ctypes.c_uint64)]
+    root=os.open("/",os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+    fd=-1
+    try:
+        libc=ctypes.CDLL(None,use_errno=True);libc.syscall.restype=ctypes.c_long
+        how=OpenHow(os.O_PATH|os.O_NOFOLLOW|os.O_CLOEXEC,0,0x2|0x4|0x8)
+        fd=libc.syscall(437,root,ctypes.c_char_p(os.fsencode(path.relative_to('/').as_posix())),
+                        ctypes.byref(how),ctypes.sizeof(how))
+        if fd<0:raise OSError(ctypes.get_errno(),"private result whole-path lookup denied")
+        info=os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode) and (info.st_dev,info.st_ino)==expected
+                and os.readlink(f"/proc/self/fd/{fd}")==str(path),
+                "private result logical attachment changed")
+        return fd
+    except BaseException:
+        if fd>=0:os.close(fd)
+        raise
+    finally:os.close(root)
+
 
 def require(ok, reason):
     if not ok:
@@ -164,15 +189,18 @@ class PinnedLaunchPath:
     def verify_reservation(self):
         from .result_submission import verify_empty_reservation_fd
         require(self.reservation is not None,"private result reservation unavailable")
-        # Resolve every logical component again without following symlinks.
+        # Resolve the complete logical path in one kernel lookup.
         # A held inode alone cannot authenticate where recovery will read it.
-        current=type(self)(self.logical,directory=False,expected=(self.device,self.inode))
-        current.close()
+        current=coherent_result_fd(self.logical,(self.device,self.inode))
+        from .owned_write_mounts import _mount_id
+        try:require(_mount_id(current)==_mount_id(self.fd),"private result mount attachment changed")
+        finally:os.close(current)
         fd=os.open(self.source,os.O_RDONLY|os.O_CLOEXEC|os.O_NONBLOCK)
         try:verify_empty_reservation_fd(fd,self.reservation)
         finally:os.close(fd)
-        current=type(self)(self.logical,directory=False,expected=(self.device,self.inode))
-        current.close()
+        current=coherent_result_fd(self.logical,(self.device,self.inode))
+        try:require(_mount_id(current)==_mount_id(self.fd),"private result mount attachment changed")
+        finally:os.close(current)
 
     def close(self):
         if self.fd >= 0:

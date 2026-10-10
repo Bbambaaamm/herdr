@@ -48,6 +48,7 @@ os.execv(args[0], args)
 
 _POLICY_FD_LAUNCHER = r"""
 import fcntl
+import ctypes
 import hashlib
 import json
 import os
@@ -151,17 +152,25 @@ for item in entries:
         valid=valid and stamp(os.fstat(opened))==stamp(held)
         if not valid:raise SystemExit("policy_fd_result_reservation_changed")
         parent_fd=os.open("/",os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+        named_fd=-1
         try:
             target_path=Path(item["target"])
             if os.path.normpath(item["target"])!=item["target"]:raise ValueError("noncanonical result")
-            for part in target_path.parts[1:-1]:
-                child_fd=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=parent_fd)
-                os.close(parent_fd);parent_fd=child_fd
-            named=os.stat(target_path.name,dir_fd=parent_fd,follow_symlinks=False)
-            if not stat.S_ISREG(named.st_mode) or (named.st_dev,named.st_ino)!=(held.st_dev,held.st_ino):
+            class OpenHow(ctypes.Structure):
+                _fields_=[("flags",ctypes.c_uint64),("mode",ctypes.c_uint64),("resolve",ctypes.c_uint64)]
+            libc=ctypes.CDLL(None,use_errno=True);libc.syscall.restype=ctypes.c_long
+            how=OpenHow(os.O_PATH|os.O_NOFOLLOW|os.O_CLOEXEC,0,0x2|0x4|0x8)
+            named_fd=libc.syscall(437,parent_fd,ctypes.c_char_p(os.fsencode(target_path.relative_to('/').as_posix())),
+                                  ctypes.byref(how),ctypes.sizeof(how))
+            if named_fd<0:raise OSError(ctypes.get_errno(),"result lookup denied")
+            named=os.fstat(named_fd)
+            if (not stat.S_ISREG(named.st_mode) or (named.st_dev,named.st_ino)!=(held.st_dev,held.st_ino)
+                or os.readlink(f"/proc/self/fd/{named_fd}")!=item["target"]):
                 raise ValueError("result logical inode changed")
         except (OSError,ValueError):raise SystemExit("policy_fd_result_reservation_changed")
-        finally:os.close(parent_fd)
+        finally:
+            if named_fd>=0:os.close(named_fd)
+            os.close(parent_fd)
         if plan_envelope is None:raise SystemExit("policy_fd_private_plan_required")
     if sealed:
         required_seals = 1 | 2 | 4 | 8
@@ -506,7 +515,7 @@ if private_home:
             if (root in path.parents or Path("/proc") in path.parents
                 or any(x in path.parents for x in sensitive[4:-1])):
                 raise SystemExit("policy_fd_private_fd_source_untrusted")
-            if target == workspace and path != workspace:
+            if (target == workspace or item["kind"]=="reserved-result") and path != target:
                 raise SystemExit("policy_fd_private_fd_source_untrusted")
     # Every additional source comes from the exact root-approved descriptor
     # plan. Reopening a literal caller path would reintroduce a rename race.

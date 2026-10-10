@@ -216,11 +216,16 @@ rechecks the held slot at grant seal and authenticated bootstrap confirmation.
 Advisory flock is only local reservation serialization; it is not a defense
 against hostile same-UID writes. Failure cleanup attempts all held resources
 and removes newly allocated temporary policy snapshots even before pane split.
-Late result checks also resolve every logical pathname component without
-following symlinks and compare the current directory entry to the held inode;
-recovery cannot be redirected to a replacement result. Schema-2 immutable
-trees preserve the executable inventory and verify actual execute bits for
-every approved file before accepting the tree, closing its FD on failure.
+Late result checks use Linux `openat2` with `RESOLVE_NO_SYMLINKS`,
+`RESOLVE_NO_MAGICLINKS` and `RESOLVE_BENEATH` for one coherent whole-path
+lookup. They compare its inode and actual `/proc/self/fd` attachment name
+with the approved result target; parent rename/replacement during lookup
+denies launch. Unsupported kernel resolution fails closed. The FD launcher
+also requires the held result source's actual name to equal its target.
+Schema-2 immutable trees preserve executable inventories throughout later
+verification and in signed retained source evidence. Both live verification
+and cold recovery check actual execute bits against that inventory, so a
+mode-only change cannot pass merely because file bytes still hash correctly.
 
 The generated exact mount request is
 available as `PolicyMount.private_mount_request` after the command builder

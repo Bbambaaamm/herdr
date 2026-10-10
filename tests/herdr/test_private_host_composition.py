@@ -67,8 +67,13 @@ def test_immutable_approval_enforces_real_execute_bits_and_closes_on_failure(tmp
     closed=[]
     def attach(*args,**kwargs):
         fd=os.open(source,os.O_RDONLY|os.O_DIRECTORY)
-        def close():closed.append(fd);os.close(fd)
-        return SimpleNamespace(fd=fd,close=close)
+        info=os.fstat(fd)
+        frozen=FrozenTree(source,CODE_TARGET,fd,info.st_dev,info.st_ino,"a"*64,
+            (("entry.py",hashlib.sha256(file.read_bytes()).hexdigest()),))
+        original=frozen.close
+        def close():closed.append(fd);original()
+        frozen.close=close
+        return frozen
     # Only the independently tested root-protected attachment is a double.
     # Execute bits and descriptor cleanup use actual filesystem operations.
     monkeypatch.setattr(FrozenTree,"attach_immutable",attach)
@@ -78,6 +83,55 @@ def test_immutable_approval_enforces_real_execute_bits_and_closes_on_failure(tmp
     else:
         with pytest.raises(SecurityError,match="executable mode"):tree.freeze(tmp_path,())
     assert len(closed)==1
+
+
+@pytest.mark.parametrize("approved",[True,False])
+def test_immutable_execute_inventory_survives_later_verify(tmp_path,monkeypatch,approved):
+    import os
+    from herdr.policy_launch import FrozenTree,CODE_TARGET
+    source=tmp_path/"source";source.mkdir();entry=source/"entry.py";entry.write_bytes(b"stable")
+    entry.chmod(0o555 if approved else 0o444)
+    digest=hashlib.sha256(entry.read_bytes()).hexdigest()
+    def attach(*args,**kwargs):
+        fd=os.open(source,os.O_RDONLY|os.O_DIRECTORY);info=os.fstat(fd)
+        return FrozenTree(source,CODE_TARGET,fd,info.st_dev,info.st_ino,"a"*64,(("entry.py",digest),))
+    monkeypatch.setattr(FrozenTree,"attach_immutable",attach) # Unit root-attachment double only.
+    tree=ApprovedImmutableTree(source,CODE_TARGET,{"entry.py":digest},
+        executable_files=("entry.py",) if approved else ()).freeze(tmp_path,())
+    try:
+        tree.verify()
+        entry.chmod(0o444 if approved else 0o555)
+        with pytest.raises(SecurityError,match="executable mode"):tree.verify()
+    finally:tree.close()
+
+
+@pytest.mark.parametrize("approved",[True,False])
+def test_cold_source_recovery_rejects_mode_only_change(tmp_path,monkeypatch,approved):
+    from types import SimpleNamespace
+    from herdr import policy_launch as launch
+    from herdr.private_mount_plan import ApprovedPrivateMountPlan
+    from herdr.security import canonical_json_bytes
+    _,_,parent,_=private_config(tmp_path,monkeypatch)
+    source=tmp_path/"retained";source.mkdir();entry=source/"entry.py"
+    entry.write_bytes(b"stable retained bytes");entry.chmod(0o555 if approved else 0o444)
+    files={"entry.py":hashlib.sha256(entry.read_bytes()).hexdigest()}
+    info=source.stat();target=str(launch.CODE_TARGET)
+    proof={"identity":parent.identity.to_json(),
+        "tree_identities":{target:{"device":info.st_dev,"inode":info.st_ino}},
+        "immutable_sources":{"mount_plan":{"authority":"/unit-authority"},"executables":{},
+            "trees":{target:{"source":str(source),
+                "manifest_sha256":hashlib.sha256(canonical_json_bytes(files)).hexdigest(),
+                "executable_files":["entry.py"] if approved else []}}}}
+    # Only root publication checks are unit doubles; recovery hashing and
+    # execute-bit verification read actual files, including the changed mode.
+    monkeypatch.setattr(ApprovedPrivateMountPlan,"read",classmethod(lambda cls,*args:
+        SimpleNamespace(evidence=lambda:proof["immutable_sources"]["mount_plan"])))
+    monkeypatch.setattr(launch,"_verify_root_owned_ancestry",lambda path:None)
+    monkeypatch.setattr(launch,"_verify_immutable_entry",lambda info:None)
+    launch.verify_retained_immutable_sources(proof)
+    entry.chmod(0o444 if approved else 0o555)
+    with pytest.raises(SecurityError,match="retained immutable executable mode"):
+        launch.verify_retained_immutable_sources(proof)
 
 
 @pytest.mark.parametrize("fault",["missing-cli","unapproved-cli","missing-python","unapproved-python"])
