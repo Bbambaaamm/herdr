@@ -359,6 +359,7 @@ class PolicyMount:
         self.private_workspace_pin = None
         self.private_result_pin = None
         self.private_mount_plan = None
+        self.private_mount_request = None
         self.private_identity = None
         self.private_cli_pins = {}
         targets = [str(BUNDLE_TARGET), str(code.target), *(str(x.target) for x in runtime)]
@@ -931,6 +932,27 @@ class PreparedPolicyLaunch:
         _require(self.mount.private_mount_plan is None, "private mount plan is one-shot")
         self.mount.private_mount_plan = ApprovedPrivateMountPlan.read(path, self.identity)
 
+    def prepare_private_command(self, builder):
+        """Validate the exact approved command while descriptors are still held.
+
+        The caller must do this before creating any pane. Root records remain
+        outside worker control; a missing issuer/record is an explicit denial.
+        """
+        from .private_mount_plan import AUTHORITY_ROOT
+        _require(self.private_profile_snapshot is not None and self.sealed is None,
+                 "private command must approve before pane creation")
+        if self.mount.private_mount_plan is None:
+            # Building records a bounded request without starting bwrap. Only
+            # its missing-approval denial can lead to reading a root record.
+            try:builder()
+            except RuntimeError as exc:
+                if str(exc)!="durable_private_mount_plan_unapproved":raise
+            _require(self.mount.private_mount_request is not None,
+                     "exact private mount request unavailable")
+            name=hashlib.sha256(canonical_json_bytes(self.identity.to_json())).hexdigest()+".json"
+            self.bind_private_mount_plan(AUTHORITY_ROOT/name)
+        return builder()
+
     def seal(self, pid, attestation, *, tools, permissions):
         approved = (self.private_profile_snapshot.identity
                     if self.private_profile_snapshot is not None else None)
@@ -1056,7 +1078,8 @@ class HostPolicyLaunchFactory:
                  approved_profile: ApprovedProfile | None = None,
                  profile_preflight=None,
                  parent_approved_profile: ApprovedProfile | None = None,
-                 parent_launch: PreparedPolicyLaunch | None = None):
+                 parent_launch: PreparedPolicyLaunch | None = None,
+                 retained_parent_verify=None):
         approved_types = (ApprovedTree, ApprovedImmutableTree)
         _require(isinstance(code, approved_types) and code.target == CODE_TARGET,
                  "approved policy code required")
@@ -1075,9 +1098,12 @@ class HostPolicyLaunchFactory:
                  "typed parent host profile approval required")
         _require(parent_launch is None or isinstance(parent_launch, PreparedPolicyLaunch),
                  "typed live parent launch required")
+        _require(retained_parent_verify is None or callable(retained_parent_verify),
+                 "host retained parent verifier required")
         self.approved_profile = approved_profile
         self.parent_approved_profile = parent_approved_profile
         self.parent_launch = parent_launch
+        self.retained_parent_verify = retained_parent_verify
         self.profile_preflight = profile_preflight
         self.code, self.runtime, self.storage = code, tuple(runtime), Path(storage)
         self.authorize, self.writable_roots, self.parent_grant = authorize, tuple(writable_roots), parent_grant
@@ -1091,15 +1117,22 @@ class HostPolicyLaunchFactory:
             _require(isinstance(self.parent_approved_profile, ApprovedProfile)
                      and self.parent_approved_profile.identity == self.approved_profile.identity,
                      "child approved profile differs from host parent approval")
-            _require(isinstance(self.parent_launch, PreparedPolicyLaunch)
+            if self.retained_parent_verify is not None:
+                parent,profile=self.retained_parent_verify()
+                _require(isinstance(parent,SecurityGrant)
+                         and parent==self.parent_grant
+                         and profile==self.approved_profile.identity,
+                         "child approved profile differs from verified retained parent")
+            else:
+                _require(isinstance(self.parent_launch, PreparedPolicyLaunch)
                      and self.parent_launch.sealed is not None
                      and self.parent_launch.identity == self.parent_grant.identity
                      and self.parent_launch.grant.hash == self.parent_grant.hash
                      and self.parent_launch.private_profile_snapshot is not None,
-                     "child approved profile requires accepted live parent launch")
-            _require(self.parent_launch.evidence().get("approved_profile")
+                         "child approved profile requires accepted live parent launch")
+                _require(self.parent_launch.evidence().get("approved_profile")
                      == self.approved_profile.identity,
-                     "child approved profile differs from signed parent evidence")
+                         "child approved profile differs from signed parent evidence")
         return self.prepare(identity=identity,workspace=workspace,tools=tools,permissions=permissions,
                             owned_write_roots=owned_write_roots)
 

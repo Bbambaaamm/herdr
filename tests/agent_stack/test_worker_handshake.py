@@ -1575,6 +1575,43 @@ def test_root_host_provider_preflight_precedes_pane_creation_and_failure_cleans_
     assert len(events)==1
 
 
+def test_private_root_missing_mount_approval_denies_before_pane_bridge_or_provider(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from tests.policy_launch_fakes import FakeHostPolicyLaunchFactory
+    from herdr.private_mount_plan import ApprovedPrivateMountPlan
+    from herdr.security import SecurityError
+    configure_paths(tmp_path);task=base_task();worker.prepare_attempt(task)
+    task["workspace"]=str(tmp_path)
+    calls=[];factory=FakeHostPolicyLaunchFactory()
+    original=factory.prepare
+    def prepare(**kwargs):
+        launch=original(**kwargs)
+        launch.private_profile_snapshot=SimpleNamespace(name=worker._task_hermes_profile(task))
+        launch.mount=SimpleNamespace(private_mount_plan=None,private_mount_request=None)
+        launch.sealed=None
+        return launch
+    monkeypatch.setattr(factory,"prepare",prepare)
+    def native(args,**kwargs):
+        calls.append(args)
+        assert args[:2]==["agent","get"]
+        return {"result":{"agent":{"agent":"hermes","pane_id":"coordinator","workspace_id":"workspace"}}}
+    monkeypatch.setattr(worker,"_herdr_json",native)
+    monkeypatch.setattr(worker,"_preflight_root_provider",lambda *args:pytest.fail("private profile cannot refresh mutable credentials"))
+    monkeypatch.setattr(worker,"start_bridge",lambda *args:pytest.fail("approval must precede bridge"))
+    monkeypatch.setattr(worker,"frozen_policy",lambda:_policy_file(tmp_path))
+    def command(*args,**kwargs):
+        kwargs["policy_mount"].private_mount_request={"fixture":"exact-command"}
+        raise RuntimeError("durable_private_mount_plan_unapproved")
+    monkeypatch.setattr(worker,"sandbox_command",command)
+    def deny(cls,path,identity):raise SecurityError("root mount approval missing")
+    monkeypatch.setattr(ApprovedPrivateMountPlan,"read",classmethod(deny))
+    with pytest.raises(SecurityError,match="root mount approval missing"):
+        worker.create_task_session(task,policy_launch_factory=factory)
+    assert len(calls)==1 and not task["execution_session"]["pane_split_started"]
+    launch=factory.created[0]
+    assert launch.events[-1]==("closed",) and not worker.HOST_POLICY_LAUNCHES
+
+
 @pytest.mark.parametrize("reason",["workspace outside host policy","requested tools/permissions exceed host ceiling"])
 def test_deterministic_host_prepare_denial_has_permanent_policy_prefix(tmp_path,monkeypatch,reason):
     from tests.policy_launch_fakes import FakeHostPolicyLaunchFactory

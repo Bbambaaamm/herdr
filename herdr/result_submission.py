@@ -16,6 +16,55 @@ MAX_BYTES = 131072
 def _canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
 
+def reserve_empty_result(path, identity, idempotency_key):
+    """Reserve or reopen an undelivered slot for this exact fenced attempt.
+
+    The xattr is a retry binding, not an authorization. Admission, pinned inode
+    validation and signed completion evidence remain the host's authorities.
+    Partial, unlabelled and submitted slots require explicit reconciliation.
+    """
+    path = Path(path)
+    if not path.is_absolute() or path.parent.resolve(strict=True) != path.parent:
+        raise ValueError("result reservation parent cannot use symlinks")
+    parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    fd = None
+    try:
+        flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+        try:
+            fd = os.open(path.name, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=parent)
+            created = True
+        except FileExistsError:
+            fd = os.open(path.name, flags, dir_fd=parent)
+            created = False
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_nlink != 1 or info.st_mode & 0o777 != 0o600 or info.st_size != 0):
+            raise ValueError("result reservation requires an empty private inode")
+        slot = ResultSlot(str(path), info.st_dev, info.st_ino,
+            hashlib.sha256(_canonical(identity.to_json())).hexdigest(), idempotency_key)
+        attribute = "user.herdr.result_reservation"
+        stamp = _canonical({"schema_version": "herdr-result-reservation-1", **slot.to_json()})
+        if created:
+            os.setxattr(fd, attribute, stamp, os.XATTR_CREATE)
+        elif os.getxattr(fd, attribute) != stamp:
+            raise ValueError("result reservation attempt changed")
+        # An interrupted result submission may still have zero bytes. Never
+        # reinterpret its durable submission intent as a pre-delivery retry.
+        if "user.herdr.result_submission" in os.listxattr(fd):
+            raise ValueError("result reservation has submission intent")
+        named = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        current = path.lstat()
+        if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino) or (
+                current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+            raise ValueError("result reservation inode changed")
+        os.fsync(fd)
+        os.fsync(parent)
+        return path
+    finally:
+        if fd is not None: os.close(fd)
+        os.close(parent)
+
 @dataclass(frozen=True)
 class ResultSlot:
     path: str
