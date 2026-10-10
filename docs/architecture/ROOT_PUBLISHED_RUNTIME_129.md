@@ -173,19 +173,72 @@ Actual root publication remains unexecuted and unaccepted.
 
 ## Activation gates and remaining integration
 
-The new private mode remains opt-in. The standalone host composition still
-uses its existing schema-1 configuration; it does not silently adopt a new
-profile or publisher. A reviewed integration into that same host authority
-must supply the real `ApprovedImmutableTree` inputs, `ApprovedProfile`,
-credential preflight and exact per-launch plan. The generated request is
+The new private mode remains opt-in. Schema 1 preserves the existing host
+composition. Schema 2 of the same `/etc/herdr/host-policy.json` requires all
+code/runtime trees to use `ApprovedImmutableTree`, complete bootstrap/CLI
+and Python executable approvals, and a closed `private_launch` object:
+
+```json
+{"profile":{"name":"quantlab","source":"<approved-profile>/quantlab",
+            "files":{"config.yaml":"<sha256>",".env":"<sha256>"}},
+ "credential_approval":{"schema_version":"herdr-profile-credential-approval-1",
+    "profile_sha256":"<canonical-profile-manifest-sha256>",
+    "valid_until":"<operator-validated-timezone-aware-expiry>",
+    "minimum_ttl_seconds":1860}}
+```
+
+These placeholders are a schema example, not an approved configuration.
+The release operator validates credentials before publishing the finite
+approval window. Before sealing each profile the host rereads the protected
+configuration and verifies its exact profile digest and enough remaining
+credential lifetime for the grant plus a 60-second margin. This offline check
+does not prove a native login or authorize a provider call. The private path
+never calls the legacy mutable-Hermes credential refresh.
+
+Separate child bridge processes revalidate the canonical parent session,
+current full invocation identity and signed retained physical evidence for
+each admission. The parent's signed profile digest must equal the current
+host-approved profile; changing a parent grant/profile denies before profile
+preflight. In-process factories retain their existing live-parent checks.
+
+Both root and child reserve an empty exact-attempt result inode and validate
+the entire private sandbox command before pane creation. A retry may reuse
+that empty inode only for the same full invocation identity and idempotency
+key. Existing bytes, submission intent, unlabelled partial reservation,
+changed fence/key, symlinks and hardlinks require reconciliation; no retry
+truncates or deletes a result. Reservation metadata is not an admission or
+completion authority. Signed evidence and pinned mount validation still apply.
+The descriptor carries the exact reservation binding in the root-approved
+plan. The host checks it again when building the command, and the FD launcher
+checks empty bytes, full binding, inode/owner/mode/link count, submission intent
+and a stable metadata stamp immediately before consuming the FD. The host
+rechecks the held slot at grant seal and authenticated bootstrap confirmation.
+Advisory flock is only local reservation serialization; it is not a defense
+against hostile same-UID writes. Failure cleanup attempts all held resources
+and removes newly allocated temporary policy snapshots even before pane split.
+Late result checks use Linux `openat2` with `RESOLVE_NO_SYMLINKS`,
+`RESOLVE_NO_MAGICLINKS` and `RESOLVE_BENEATH` for one coherent whole-path
+lookup. They compare its inode and actual `/proc/self/fd` attachment name
+with the approved result target; parent rename/replacement during lookup
+denies launch. Unsupported kernel resolution fails closed. The FD launcher
+also requires the held result source's actual name to equal its target.
+Schema-2 immutable trees preserve executable inventories throughout later
+verification and in signed retained source evidence. Both live verification
+and cold recovery check actual execute bits against that inventory, so a
+mode-only change cannot pass merely because file bytes still hash correctly.
+
+The generated exact mount request is
 available as `PolicyMount.private_mount_request` after the command builder
 refuses a missing approval. A trusted operator/host authority must inspect
 source provenance and publish the matching root record; copying a worker's
 self-declaration into root storage without that validation is forbidden.
 Keep the same live held descriptors when binding the record with
-`PreparedPolicyLaunch.bind_private_mount_plan()` and rebuilding the command.
+`PreparedPolicyLaunch.prepare_private_command()` and rebuilding the command.
 The approval must exist before pane creation. No automatic privileged issuer
-has been installed by this change.
+is implemented or installed by this change. A stale record from a previous
+process/descriptor set cannot be reused merely because its task identity is
+unchanged; record renewal requires trusted reconciliation. A cold restart
+cannot self-approve that renewal.
 
 Before activation, require exact-HEAD CI and independent security review, the
 real root-published native Hermes closure and a technically network-isolated

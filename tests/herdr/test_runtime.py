@@ -368,6 +368,42 @@ def test_managed_runtime_binds_owned_pane_before_prompt(tmp_path: Path, monkeypa
     assert rec.state.value == "running"
 
 
+def test_private_child_approval_failure_precedes_provider_and_pane(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from tests.policy_launch_fakes import FakeHostPolicyLaunchFactory
+    from herdr.security import SecurityError
+    scheduler=DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path/"events.jsonl"))
+    scheduler.register_external_parent_attempt(task_id="parent",run_token="root-run",
+        idempotency_key="root-key",agent_name="parent-agent",pane_id="parent-pane",marker="parent-marker",
+        repo="Bbambaaamm/herdr",issue="82",role="writer",tools=("read_file",),
+        permissions=(),policy_profile="herdr-core")
+    child=scheduler.delegate_child("parent","root-run","research",
+        ChildProposal("writer",("read_file",),"reader",("read_file",),child_task="inspect"))
+    lease=scheduler.dispatch(task_ids={child.id})[0];rec=scheduler._tasks[child.id]
+    scheduler.bind_child_prompt(child.id,"inspect now")
+    class Runner:
+        executable="/bin/true"
+        def run(self,*args,**kwargs):pytest.fail("no native process before private approval")
+    factory=FakeHostPolicyLaunchFactory();original=factory.prepare_child
+    runtime=HerdrChildRuntime(scheduler,Runner(),cwd=tmp_path,policy_launch_factory=factory)
+    def prepare(**kwargs):
+        launch=original(**kwargs)
+        launch.private_profile_snapshot=SimpleNamespace(name=runtime.env.get("HERDR_HERMES_PROFILE","quantlab"))
+        return launch
+    monkeypatch.setattr(factory,"prepare_child",prepare)
+    monkeypatch.setattr(runtime,"prepare",lambda:None)
+    monkeypatch.setattr(runtime,"_admit_child",lambda lease:None)
+    def deny(task_id,real):raise SecurityError("private mount approval missing")
+    monkeypatch.setattr(runtime,"_prepare_private_child_command",deny)
+    monkeypatch.setattr(runtime,"_preflight_child_provider",lambda:pytest.fail("no mutable private credential preflight"))
+    monkeypatch.setattr(runtime,"_create_pane",lambda *args:pytest.fail("approval must precede pane"))
+    with pytest.raises(HerdrRuntimeError,match="child_pre_delivery_failed"):
+        runtime.run_managed_child(lease,"inspect now",run_token=rec.run_token,idempotency_key=rec.idempotency_key)
+    assert not runtime._policy_launches and not runtime._private_sandbox_commands
+    assert factory.created[0].events[-1]==("closed",)
+    assert rec.execution_pane is None and not rec.economic_delivery_attempted
+
+
 def test_managed_done_without_inner_sandbox_cannot_settle(tmp_path: Path, monkeypatch) -> None:
     scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
     scheduler.register_external_parent_attempt(

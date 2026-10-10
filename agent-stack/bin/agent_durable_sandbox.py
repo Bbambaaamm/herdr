@@ -48,6 +48,7 @@ os.execv(args[0], args)
 
 _POLICY_FD_LAUNCHER = r"""
 import fcntl
+import ctypes
 import hashlib
 import json
 import os
@@ -77,13 +78,14 @@ for item in entries:
         raise SystemExit("policy_fd_launch_invalid")
     kind = item.get("kind")
     sealed = kind == "sealed-profile-data"
+    reserved = kind == "reserved-result"
     ordinary = {"source", "fd", "device", "inode", "kind", "target"}
-    expected_keys = ordinary | ({"sha256", "size"} if sealed else set())
+    expected_keys = ordinary | ({"sha256", "size"} if sealed else {"reservation"} if reserved else set())
     if set(item) != expected_keys:
         raise SystemExit("policy_fd_launch_invalid")
     if (any(type(item[k]) is not int or item[k] < 0
             for k in ("fd", "device", "inode"))
-        or kind not in ("file", "directory", "socket", "sealed-profile-data")
+        or kind not in ("file", "directory", "socket", "sealed-profile-data", "reserved-result")
         or not isinstance(item["source"], str)
         or not re.fullmatch(r"/proc/[1-9][0-9]{0,9}/fd/[0-9]{1,10}", item["source"])
         or item["source"].rsplit("/", 1)[-1] != str(item["fd"])
@@ -117,7 +119,7 @@ for item in entries:
         approved_files.add(match.group(2))
     opened = os.open(
         item["source"],
-        (os.O_RDONLY | os.O_CLOEXEC) if sealed
+        (os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK) if sealed or reserved
         else (os.O_PATH | (os.O_DIRECTORY if kind == "directory" else 0)),
     )
     held = os.fstat(opened)
@@ -128,6 +130,48 @@ for item in entries:
     )
     if not correct or (held.st_dev, held.st_ino) != (item["device"], item["inode"]):
         raise SystemExit("policy_fd_identity_mismatch")
+    if reserved:
+        binding=item["reservation"]
+        expected={"schema_version","path","device","inode","identity_sha256","idempotency_key","max_bytes"}
+        if (not isinstance(binding,dict) or set(binding)!=expected
+            or binding["schema_version"]!="herdr-result-reservation-1"
+            or binding["path"]!=item["target"] or binding["device"]!=held.st_dev or binding["inode"]!=held.st_ino
+            or any(type(binding[key]) is not int for key in ("device","inode"))
+            or held.st_uid!=os.geteuid() or held.st_nlink!=1 or held.st_mode&0o777!=0o600 or held.st_size!=0
+            or not isinstance(binding["identity_sha256"],str) or re.fullmatch("[0-9a-f]{64}",binding["identity_sha256"]) is None
+            or not isinstance(binding["idempotency_key"],str) or re.fullmatch("[A-Za-z0-9._:/+-]{1,256}",binding["idempotency_key"]) is None
+            or type(binding["max_bytes"]) is not int or not 1024<=binding["max_bytes"]<=131072):
+            raise SystemExit("policy_fd_result_reservation_changed")
+        expected_bytes=json.dumps(binding,sort_keys=True,separators=(",",":"),ensure_ascii=False,allow_nan=False).encode()
+        try:
+            valid=(os.getxattr(opened,"user.herdr.result_reservation")==expected_bytes
+                   and "user.herdr.result_submission" not in os.listxattr(opened))
+        except OSError:valid=False
+        stamp=lambda value:(value.st_dev,value.st_ino,value.st_uid,value.st_mode,value.st_nlink,
+                            value.st_size,value.st_ctime_ns,value.st_mtime_ns)
+        valid=valid and stamp(os.fstat(opened))==stamp(held)
+        if not valid:raise SystemExit("policy_fd_result_reservation_changed")
+        parent_fd=os.open("/",os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+        named_fd=-1
+        try:
+            target_path=Path(item["target"])
+            if os.path.normpath(item["target"])!=item["target"]:raise ValueError("noncanonical result")
+            class OpenHow(ctypes.Structure):
+                _fields_=[("flags",ctypes.c_uint64),("mode",ctypes.c_uint64),("resolve",ctypes.c_uint64)]
+            libc=ctypes.CDLL(None,use_errno=True);libc.syscall.restype=ctypes.c_long
+            how=OpenHow(os.O_PATH|os.O_NOFOLLOW|os.O_CLOEXEC,0,0x2|0x4|0x8)
+            named_fd=libc.syscall(437,parent_fd,ctypes.c_char_p(os.fsencode(target_path.relative_to('/').as_posix())),
+                                  ctypes.byref(how),ctypes.sizeof(how))
+            if named_fd<0:raise OSError(ctypes.get_errno(),"result lookup denied")
+            named=os.fstat(named_fd)
+            if (not stat.S_ISREG(named.st_mode) or (named.st_dev,named.st_ino)!=(held.st_dev,held.st_ino)
+                or os.readlink(f"/proc/self/fd/{named_fd}")!=item["target"]):
+                raise ValueError("result logical inode changed")
+        except (OSError,ValueError):raise SystemExit("policy_fd_result_reservation_changed")
+        finally:
+            if named_fd>=0:os.close(named_fd)
+            os.close(parent_fd)
+        if plan_envelope is None:raise SystemExit("policy_fd_private_plan_required")
     if sealed:
         required_seals = 1 | 2 | 4 | 8
         if (held.st_size != size
@@ -432,7 +476,7 @@ if private_home:
         approved_dir_targets.update(Path(e["target"]) for e in approved_plan["descriptors"]
                                     if e["kind"] == "directory")
         approved_file_targets.update(Path(e["target"]) for e in approved_plan["descriptors"]
-                                     if e["kind"] == "file")
+                                     if e["kind"] in ("file","reserved-result"))
     approved_socket_targets = {
         Path("/run/herdr-policy/bootstrap-authority.sock"),
     }
@@ -443,6 +487,7 @@ if private_home:
         allowed = {
             "directory": approved_dir_targets,
             "file": approved_file_targets,
+            "reserved-result": approved_file_targets,
             "socket": approved_socket_targets,
         }[item["kind"]]
         if target not in allowed:
@@ -470,7 +515,7 @@ if private_home:
             if (root in path.parents or Path("/proc") in path.parents
                 or any(x in path.parents for x in sensitive[4:-1])):
                 raise SystemExit("policy_fd_private_fd_source_untrusted")
-            if target == workspace and path != workspace:
+            if (target == workspace or item["kind"]=="reserved-result") and path != target:
                 raise SystemExit("policy_fd_private_fd_source_untrusted")
     # Every additional source comes from the exact root-approved descriptor
     # plan. Reopening a literal caller path would reintroduce a rename race.

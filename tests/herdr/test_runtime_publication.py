@@ -59,7 +59,7 @@ def test_publication_requires_every_directly_executed_entrypoint(tmp_path, monke
     monkeypatch.setattr(host_configuration, "_read_configuration", lambda path: raw)
     monkeypatch.setattr(runtime_publication, "_verify_root_owned_ancestry", lambda path: None)
     if fault:
-        with pytest.raises(SecurityError, match="executable entrypoint approval"):
+        with pytest.raises(SecurityError, match="executable entrypoint approval|executable inventory invalid"):
             publish_reviewed_runtime(Path("/etc/herdr/runtime-publication.json"))
     else:
         assert publish_reviewed_runtime(Path("/etc/herdr/runtime-publication.json"))["published"] is False

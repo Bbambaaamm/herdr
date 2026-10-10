@@ -828,6 +828,20 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         # snapshot stale; retain legacy preflight only for legacy launches.
         if private_snapshot is None:
             _preflight_root_provider(profile)
+        if private_snapshot is not None:
+            # Bind and approve the exact slot/command before split or bridge.
+            policy = frozen_policy()
+            task_result = result_path(str(task["id"]))
+            task_result.parent.mkdir(parents=True, exist_ok=True)
+            from herdr.result_submission import reserve_empty_result
+            reserve_empty_result(task_result,identity,str(task["idempotency_key"]))
+            launch.bind_result_slot(task_result,str(task["idempotency_key"]))
+            session["policy_file"]=str(policy)
+            persist_execution_session(task)
+            launch.prepare_private_command(lambda:sandbox_command(
+                Path(workspace),HERDR,writable=(task_result,),policy=policy,
+                policy_mount=launch.mount,admission_root=ROOT,
+                private_profile_snapshot=private_snapshot,hermes_profile=profile))
         preexisting_panes = _setup_pane_ids()
         def inspect_startup_source():
             source = _herdr_json(["pane","process-info","--pane",coordinator_pane],
@@ -862,14 +876,15 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         HOST_POLICY_LAUNCHES[(task["id"], task["run_token"])] = launch
         persist_execution_session(task)
         start_bridge(task, session)
-        policy = frozen_policy()
-        session["policy_file"] = str(policy)
-        persist_execution_session(task)
-        task_result = result_path(str(task["id"]))
-        task_result.parent.mkdir(parents=True, exist_ok=True)
-        if not task_result.exists():
-            task_result.touch(mode=0o600)
-        launch.bind_result_slot(task_result, str(task["idempotency_key"]))
+        if private_snapshot is None:
+            policy = frozen_policy()
+            session["policy_file"] = str(policy)
+            persist_execution_session(task)
+            task_result = result_path(str(task["id"]))
+            task_result.parent.mkdir(parents=True, exist_ok=True)
+            if not task_result.exists():
+                task_result.touch(mode=0o600)
+            launch.bind_result_slot(task_result, str(task["idempotency_key"]))
         _wait_for_task_pane_input(pane_id, pane_marker)
         # Resolve runtime mounts only after the terminal becomes ready; a
         # profile/path may change during the bounded pane-readiness wait.
@@ -968,7 +983,9 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         return session
     except Exception as exc:
         if not split_attempted:
-            _cleanup_prepared_root_launch(task)
+            try:_cleanup_prepared_root_launch(task)
+            finally:
+                if "policy" in locals():policy.unlink(missing_ok=True)
             raise
         if pane_id and pane_id != coordinator_pane:
             candidates = (pane_id,)

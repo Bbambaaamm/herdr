@@ -572,6 +572,7 @@ class HerdrChildRuntime:
         self.pinned_worktree = pinned_worktree
         self.policy_launch_factory = policy_launch_factory
         self._policy_launches: dict[str, PreparedPolicyLaunch] = {}
+        self._private_sandbox_commands = {}
         self._managed_launch_panes: set[str] = set()
         self._owned_write_pins = {}
         self._policy_panes: dict[str, PreparedPolicyLaunch] = {}
@@ -971,6 +972,34 @@ class HerdrChildRuntime:
             os.close(directory_fd)
         return (target,)
 
+    def _prepare_private_child_command(self, task_id, real):
+        """Approve held sources/result/argv before a native pane can exist."""
+        import importlib.machinery,importlib.util
+        source=Path(__file__).resolve().parents[1]/"agent-stack/bin/agent_durable_sandbox.py"
+        loader=importlib.machinery.SourceFileLoader("private_child_command",str(source))
+        spec=importlib.util.spec_from_loader(loader.name,loader)
+        sandbox=importlib.util.module_from_spec(spec);loader.exec_module(sandbox)
+        launch=self._policy_launches[task_id]
+        profile=launch.private_profile_snapshot
+        policy=sandbox.frozen_policy()
+        self._private_sandbox_commands[task_id]=(policy,())
+        from .result_submission import reserve_empty_result
+        result_dir=self.snapshot_path.parent/"results"
+        result_dir.mkdir(parents=True,exist_ok=True)
+        writable=(reserve_empty_result(result_dir/f"{task_id}.result.json",launch.identity,
+                      self.scheduler._tasks[task_id].idempotency_key),)
+        launch.bind_result_slot(writable[0],self.scheduler._tasks[task_id].idempotency_key)
+        launch.prepare_private_command(lambda:sandbox.command(
+            self.cwd,Path(real),writable=writable,policy=policy,
+            child_workspace_writable=self._child_workspace_writable(task_id),
+            pinned_worktree=self.pinned_worktree,policy_mount=launch.mount,
+            owned_write_pins=self._owned_write_pins.get(task_id),
+            admission_root=(self.scheduler.ownership_registry.root
+                            if self.scheduler.ownership_registry is not None else None),
+            private_profile_snapshot=profile,
+            hermes_profile=self.env.get("HERDR_HERMES_PROFILE",DEFAULT_PROFILE)))
+        self._private_sandbox_commands[task_id]=(policy,writable)
+
     def _sandbox_child_pane(self, pane_id: str, marker: str, real: str,
                             task_id: str) -> Path:
         import importlib.util
@@ -988,10 +1017,16 @@ class HerdrChildRuntime:
         if private_snapshot is not None and private_snapshot.name != approved_name:
             raise HerdrRuntimeError("child_approved_profile_identity_mismatch", task_id)
         self._policy_panes[pane_id] = launch
-        policy = sandbox.frozen_policy()
+        cached = self._private_sandbox_commands.get(task_id)
+        policy = cached[0] if cached is not None else sandbox.frozen_policy()
         try:
-            writable = self._child_result_writable(task_id)
-            launch.bind_result_slot(writable[0],self.scheduler._tasks[task_id].idempotency_key)
+            if cached is not None:
+                writable=cached[1]
+            else:
+                if private_snapshot is not None:
+                    raise HerdrRuntimeError("child_private_command_not_approved",task_id)
+                writable = self._child_result_writable(task_id)
+                launch.bind_result_slot(writable[0],self.scheduler._tasks[task_id].idempotency_key)
             deadline = time.monotonic() + 10.0
             while True:
                 remaining = deadline - time.monotonic()
@@ -1143,16 +1178,27 @@ class HerdrChildRuntime:
                 task_id=rec.id, fencing_token=rec.fencing_token)
 
     def _cleanup_policy_launch(self, task_id, pane_id=None):
+        cached=self._private_sandbox_commands.get(task_id)
         self._managed_launch_panes.discard(pane_id)
-        pins=self._owned_write_pins.pop(task_id,None)
-        if pins is not None:pins.close()
+        pins=self._owned_write_pins.get(task_id)
         record = self.scheduler._tasks.get(task_id)
         launch = self._policy_launches.get(task_id) or self._policy_panes.get(pane_id)
         if launch is not None:
-            launch.cleanup_after_pane_closed()
+            from .policy_launch import _finish_cleanup
+            actions=[]
+            if pins is not None:actions.append(pins.close)
+            actions.append(launch.cleanup_after_pane_closed)
+            if cached is not None:actions.append(lambda:cached[0].unlink(missing_ok=True))
+            _finish_cleanup(actions)
+            self._owned_write_pins.pop(task_id,None)
+            self._private_sandbox_commands.pop(task_id,None)
             self._policy_launches.pop(task_id, None)
             self._policy_panes.pop(pane_id, None)
         elif record is not None:
+            if cached is not None:cached[0].unlink(missing_ok=True)
+            self._private_sandbox_commands.pop(task_id,None)
+            if pins is not None:pins.close()
+            self._owned_write_pins.pop(task_id,None)
             factory=self.policy_launch_factory
             if factory is None:
                 from .host_configuration import build_host_policy_factory
@@ -1369,6 +1415,8 @@ class HerdrChildRuntime:
             authority.preflight_work(record,launch)
             self._policy_launches[lease.task_id] = launch
             policy_env.update(launch.environment())
+            if approved_snapshot is not None:
+                self._prepare_private_child_command(lease.task_id,real)
             # Host-approved profiles completed credential preflight inside
             # HostPolicyLaunchFactory.prepare_child() BEFORE their memfd seal.
             if getattr(launch, "private_profile_snapshot", None) is None:
