@@ -251,3 +251,56 @@ separate from acceptance and from any staging cutover.
 Implementation and isolated tests are available for review. **No acceptance
 or deployment is implied.** #129, #132, #53 and #78 remain OPEN. Production
 RC26, existing queue/leases/fences, credential sources and budgets are untouched.
+
+## One-shot operator launch-plan publication
+
+`scripts/publish-herdr-launch-plan.py` supplies the operator publication step
+for the existing private mount-plan authority. It accepts an independently
+approved root-protected ticket only from
+`/etc/herdr/launch-plan-approvals/<canonical-identity-sha256>.json`. It does not
+accept a worker proposal path, hash arbitrary worker data into approval, start
+a daemon, renew credentials, or install anything into a running deployment.
+
+The closed ticket contains `schema_version: herdr-private-mount-issuance-1`,
+the complete `plan` in the existing `herdr-private-mount-plan-1` schema, the
+exact bwrap `argv`, and timezone-aware `not_before` / `expires_at` timestamps.
+The issuance window must be active and at most one hour. The complete identity,
+including the attempt/fence, determines the filename. All descriptors must
+have unambiguous FD sources/targets and exactly one matching FD binding. The
+complete argv digest and writable targets must agree with the approved plan;
+reserved result metadata must name the same invocation and result inode.
+
+The operator must independently approve the policy, immutable sources,
+profile, command and actual held FD/result identities before creating a
+ticket. Structural validation by this helper does not grant those permissions.
+Run it only from an authenticated root-published code release with a trusted
+interpreter, never by executing a mutable worker checkout as root:
+
+```text
+python scripts/publish-herdr-launch-plan.py --configuration /etc/herdr/launch-plan-approvals/<identity-sha256>.json
+python scripts/publish-herdr-launch-plan.py --configuration /etc/herdr/launch-plan-approvals/<identity-sha256>.json --publish
+```
+
+Default mode performs read-only preflight. Explicit publication requires
+UID 0 and an already root-protected `/etc/herdr/launch-plans` directory. It
+creates a new inode, writes the canonical plan, applies 0444, fsyncs the file,
+rereads the approval and checks expiry immediately before atomic
+`renameat2(RENAME_NOREPLACE)`, then fsyncs the parent. It never overwrites an
+existing identity, including on retry. Partial hidden files are retained for
+operator reconciliation; worker evidence and old plans are never deleted.
+
+The result is consumed by the existing `ApprovedPrivateMountPlan` reader.
+Publication is not physical launch acceptance: the FD launcher, immutable
+source checks, active grant, current fence, profile, result reservation and
+bootstrap checks remain mandatory. The ticket window limits issuance; it does
+not change the lifetime/recovery semantics of the retained plan or revoke a
+previously issued record. Automatic issuance/renewal and a coordinated live
+worker/operator handoff remain separate integration work. This change does
+not activate that path or establish private native root/child acceptance.
+
+Tests use disposable ordinary-user files, with explicit root authority and
+clock doubles. They exercise the existing reader consuming the new record,
+full identity/argv/FD bindings, expiry and late withdrawal, exclusive fresh
+inodes, actual no-replace rename, retained failure files and FD cleanup.
+They also verify actual worker publication/approval refusal. These tests do
+not claim real privileged publication or a production issuer installation.
