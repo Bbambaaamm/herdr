@@ -183,3 +183,37 @@ def test_unrelated_builder_failure_never_attempts_root_approval(tmp_path,monkeyp
         lambda *args:pytest.fail("unrelated failures must not approve")))
     with pytest.raises(RuntimeError,match="unrelated"):
         launch.prepare_private_command(lambda:(_ for _ in ()).throw(RuntimeError("unrelated")))
+
+
+@pytest.mark.parametrize("cleanup_fault",[False,True])
+def test_private_child_failed_preparation_cleans_fresh_policy_even_if_pin_close_fails(tmp_path,monkeypatch,cleanup_fault):
+    from types import SimpleNamespace
+    from importlib.machinery import SourceFileLoader
+    from herdr.runtime import HerdrChildRuntime
+    from tests.policy_launch_fakes import FakePreparedPolicyLaunch
+    from tests.herdr.test_security import identity
+    runtime=HerdrChildRuntime.__new__(HerdrChildRuntime)
+    runtime.cwd=tmp_path;runtime.snapshot_path=tmp_path/"snapshot.json";runtime.env={}
+    launch=FakePreparedPolicyLaunch(identity());launch.private_profile_snapshot=SimpleNamespace(name="quantlab")
+    def deny(builder):raise SecurityError("injected missing root plan")
+    launch.prepare_private_command=deny
+    runtime._policy_launches={"task":launch};runtime._policy_panes={}
+    runtime._private_sandbox_commands={};runtime._managed_launch_panes=set()
+    runtime._owned_write_pins={}
+    runtime.scheduler=SimpleNamespace(_tasks={"task":SimpleNamespace(idempotency_key="key")})
+    policy=tmp_path/"fresh-policy"
+    def freeze():policy.write_text("allocated policy");return policy
+    original=SourceFileLoader.exec_module
+    def load(loader,module):
+        if loader.name=="private_child_command":module.frozen_policy=freeze
+        else:original(loader,module)
+    monkeypatch.setattr(SourceFileLoader,"exec_module",load)
+    with pytest.raises(SecurityError,match="missing root plan"):
+        runtime._prepare_private_child_command("task","/bin/true")
+    assert policy.exists()
+    if cleanup_fault:
+        def fail():raise OSError("injected owned pin cleanup")
+        runtime._owned_write_pins["task"]=SimpleNamespace(close=fail)
+        with pytest.raises(OSError,match="owned pin cleanup"):runtime._cleanup_policy_launch("task")
+    else:runtime._cleanup_policy_launch("task")
+    assert not policy.exists() and launch.events[-1]==("closed",)

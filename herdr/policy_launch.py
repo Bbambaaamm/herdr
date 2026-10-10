@@ -911,7 +911,7 @@ class PreparedPolicyLaunch:
 
     def bind_result_slot(self, path, idempotency_key):
         from dataclasses import replace
-        from .result_submission import ResultSlot, TOOL
+        from .result_submission import ResultSlot, TOOL, reservation_binding
         _require(self._private_key is not None, "result slot must bind before seal")
         rule = next((rule for rule in self.grant.tool_rules if rule.tool == TOOL), None)
         _require(rule is not None and rule.result_slot is None, "result submission authority required")
@@ -919,7 +919,9 @@ class PreparedPolicyLaunch:
         if self.private_profile_snapshot is not None:
             from .private_mount_plan import PinnedLaunchPath
             self.mount.private_result_pin = PinnedLaunchPath(
-                Path(slot.path), directory=False, expected=(slot.device, slot.inode))
+                Path(slot.path), directory=False, expected=(slot.device, slot.inode),
+                reservation=reservation_binding(slot))
+            self.mount.private_result_pin.verify_reservation()
         self.grant = replace(self.grant, tool_rules=tuple(
             replace(rule,result_slot=slot) if rule.tool == TOOL else rule for rule in self.grant.tool_rules))
         if self._parent is not None:
@@ -960,6 +962,8 @@ class PreparedPolicyLaunch:
                  and attestation.get("approved_profile") == approved,
                  "approved profile must match signed sandbox attestation")
         if approved is not None:
+            _require(self.mount.private_result_pin is not None,"private result reservation unavailable")
+            self.mount.private_result_pin.verify_reservation()
             # Identity-consistent profile is not sufficient if the live host
             # can rewrite imported Hermes/Python code after first attestation.
             self.mount.require_immutable_runtime()
@@ -1001,6 +1005,8 @@ class PreparedPolicyLaunch:
     def confirm_bootstrap(self):
         _require(self.mount.bootstrap is not None,"immutable host bootstrap unavailable")
         self._bootstrap_receipt=self.mount.bootstrap.confirm()
+        if self.private_profile_snapshot is not None:
+            self.mount.private_result_pin.verify_reservation()
         return self.evidence()
 
     def verify_bootstrap(self):

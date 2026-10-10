@@ -1610,6 +1610,7 @@ def test_private_root_missing_mount_approval_denies_before_pane_bridge_or_provid
     assert len(calls)==1 and not task["execution_session"]["pane_split_started"]
     launch=factory.created[0]
     assert launch.events[-1]==("closed",) and not worker.HOST_POLICY_LAUNCHES
+    assert not (tmp_path/"policy").exists()
 
 
 @pytest.mark.parametrize("reason",["workspace outside host policy","requested tools/permissions exceed host ceiling"])

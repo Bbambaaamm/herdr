@@ -983,7 +983,9 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         return session
     except Exception as exc:
         if not split_attempted:
-            _cleanup_prepared_root_launch(task)
+            try:_cleanup_prepared_root_launch(task)
+            finally:
+                if "policy" in locals():policy.unlink(missing_ok=True)
             raise
         if pane_id and pane_id != coordinator_pane:
             candidates = (pane_id,)

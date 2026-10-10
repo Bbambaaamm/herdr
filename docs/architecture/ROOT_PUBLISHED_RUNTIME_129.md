@@ -1,4 +1,4 @@
-# #129 â€” Root-published immutable Hermes / Python execution trees
+# #129 — Root-published immutable Hermes / Python execution trees
 
 ## Why the previous snapshots were not lifetime immutable
 
@@ -208,6 +208,14 @@ key. Existing bytes, submission intent, unlabelled partial reservation,
 changed fence/key, symlinks and hardlinks require reconciliation; no retry
 truncates or deletes a result. Reservation metadata is not an admission or
 completion authority. Signed evidence and pinned mount validation still apply.
+The descriptor carries the exact reservation binding in the root-approved
+plan. The host checks it again when building the command, and the FD launcher
+checks empty bytes, full binding, inode/owner/mode/link count, submission intent
+and a stable metadata stamp immediately before consuming the FD. The host
+rechecks the held slot at grant seal and authenticated bootstrap confirmation.
+Advisory flock is only local reservation serialization; it is not a defense
+against hostile same-UID writes. Failure cleanup attempts all held resources
+and removes newly allocated temporary policy snapshots even before pane split.
 
 The generated exact mount request is
 available as `PolicyMount.private_mount_request` after the command builder

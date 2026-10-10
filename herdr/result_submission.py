@@ -16,6 +16,26 @@ MAX_BYTES = 131072
 def _canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
 
+def reservation_binding(slot):
+    return {"schema_version":"herdr-result-reservation-1",**slot.to_json()}
+
+def verify_empty_reservation_fd(fd, binding):
+    """Check the held readable inode, including interrupted submission intent."""
+    if not isinstance(binding,dict) or binding.get("schema_version")!="herdr-result-reservation-1":
+        raise ValueError("result reservation binding invalid")
+    slot=ResultSlot.from_dict({k:v for k,v in binding.items() if k!="schema_version"})
+    info=os.fstat(fd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid!=os.geteuid() or info.st_nlink!=1
+            or info.st_mode&0o777!=0o600 or info.st_size!=0
+            or (info.st_dev,info.st_ino)!=(slot.device,slot.inode)
+            or os.getxattr(fd,"user.herdr.result_reservation")!=_canonical(binding)
+            or "user.herdr.result_submission" in os.listxattr(fd)):
+        raise ValueError("result reservation changed before delivery")
+    stamp=lambda value:(value.st_dev,value.st_ino,value.st_uid,value.st_mode,value.st_nlink,
+                        value.st_size,value.st_ctime_ns,value.st_mtime_ns)
+    if stamp(os.fstat(fd))!=stamp(info):
+        raise ValueError("result reservation changed during check")
+
 def reserve_empty_result(path, identity, idempotency_key):
     """Reserve or reopen an undelivered slot for this exact fenced attempt.
 
@@ -44,7 +64,7 @@ def reserve_empty_result(path, identity, idempotency_key):
         slot = ResultSlot(str(path), info.st_dev, info.st_ino,
             hashlib.sha256(_canonical(identity.to_json())).hexdigest(), idempotency_key)
         attribute = "user.herdr.result_reservation"
-        stamp = _canonical({"schema_version": "herdr-result-reservation-1", **slot.to_json()})
+        stamp = _canonical(reservation_binding(slot))
         if created:
             os.setxattr(fd, attribute, stamp, os.XATTR_CREATE)
         elif os.getxattr(fd, attribute) != stamp:
@@ -60,6 +80,7 @@ def reserve_empty_result(path, identity, idempotency_key):
             raise ValueError("result reservation inode changed")
         os.fsync(fd)
         os.fsync(parent)
+        verify_empty_reservation_fd(fd,reservation_binding(slot))
         return path
     finally:
         if fd is not None: os.close(fd)

@@ -98,11 +98,12 @@ class ApprovedPrivateMountPlan:
 
 class PinnedLaunchPath:
     """Open every component without symlinks; retain the exact admitted inode."""
-    def __init__(self, path, *, directory, expected=None):
+    def __init__(self, path, *, directory, expected=None, reservation=None):
         path = Path(path)
         require(path.is_absolute() and str(path) == os.path.normpath(str(path)),
                 "private launch path is not canonical")
         self.logical, self.root, self.directory = path, path.parent, directory
+        self.reservation=reservation
         isolated_destination_anchor(path)
         parent = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         from .owned_write_mounts import _mount_id
@@ -152,9 +153,20 @@ class PinnedLaunchPath:
 
     def descriptor(self):
         self.verify()
-        return {"source": self.source, "fd": self.fd, "device": self.device,
+        value={"source": self.source, "fd": self.fd, "device": self.device,
                 "inode": self.inode, "kind": "directory" if self.directory else "file",
                 "target": str(self.logical)}
+        if self.reservation is not None:
+            self.verify_reservation()
+            value.update(kind="reserved-result",reservation=self.reservation)
+        return value
+
+    def verify_reservation(self):
+        from .result_submission import verify_empty_reservation_fd
+        require(self.reservation is not None,"private result reservation unavailable")
+        fd=os.open(self.source,os.O_RDONLY|os.O_CLOEXEC|os.O_NONBLOCK)
+        try:verify_empty_reservation_fd(fd,self.reservation)
+        finally:os.close(fd)
 
     def close(self):
         if self.fd >= 0:
