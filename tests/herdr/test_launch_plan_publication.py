@@ -264,3 +264,21 @@ def test_post_rename_sync_failure_retains_visible_record_for_reconciliation(appr
     assert (authority / path.name).read_bytes() == canonical_json_bytes(ticket["plan"])
     assert len(calls) == 2
     assert set(os.listdir("/proc/self/fd")) == before
+
+
+def test_expiry_during_final_shape_validation_denies_before_rename(approved, monkeypatch):
+    path, _, _, authority, now = approved
+    permit_test_operator(monkeypatch)
+    original = publication._shape
+    calls = []
+    def delayed(*args):
+        original(*args)
+        calls.append(True)
+        if len(calls) == 2:
+            monkeypatch.setattr(publication, "_utc_now", lambda: now + timedelta(minutes=3))
+    monkeypatch.setattr(publication, "_shape", delayed)
+    with pytest.raises(SecurityError, match="approval window is not active"):
+        publication.publish_approved_launch_plan(path, publish=True)
+    assert len(calls) == 2
+    assert not (authority / path.name).exists()
+    assert len(list(authority.glob(".launch-plan-*"))) == 1

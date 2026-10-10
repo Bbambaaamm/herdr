@@ -173,6 +173,7 @@ def publish_approved_launch_plan(configuration_path, *, publish=False):
         # A late operator withdrawal or expiry must deny before publication.
         _, current, _ = _approval(path)
         require(current == ticket, "operator approval changed during publication")
+        _window(ticket)
         _rename_without_replacement(parent, Path(stage).name, name)
         os.fsync(parent)
         return {**record, "published": True}
