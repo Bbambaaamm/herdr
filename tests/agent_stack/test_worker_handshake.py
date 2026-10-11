@@ -2121,3 +2121,44 @@ def test_prompt_proof_requires_executed_nonce_and_same_owned_shell(monkeypatch, 
             sandbox.verify_pane_prompt(invoke, "owned", "marker", timeout_seconds=0.1)
     assert len(challenge) == 1
     assert all(args[3].startswith("builtin printf ") for args in calls if args[:2] == ["pane", "run"])
+
+
+def test_root_revalidates_handoff_after_readiness_before_native_run(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from tests.policy_launch_fakes import FakeHostPolicyLaunchFactory
+    from herdr.security import SecurityError
+    configure_paths(tmp_path); task=base_task(); worker.prepare_attempt(task)
+    task["workspace"]=str(tmp_path)
+    factory=FakeHostPolicyLaunchFactory(); original=factory.prepare
+    phase=["before-ready"]; commands=[]; builds=[]
+    def denied(launch):
+        assert phase[0]=="ready" and len(builds)==2
+        raise SecurityError("handoff expired during pane readiness")
+    def prepare(**kwargs):
+        launch=original(**kwargs)
+        launch.private_profile_snapshot=SimpleNamespace(name=worker._task_hermes_profile(task))
+        launch.private_plan_handoff=SimpleNamespace(verify_bound=denied)
+        launch.prepare_private_command=lambda builder:builder()
+        return launch
+    monkeypatch.setattr(factory,"prepare",prepare)
+    def native(args,**kwargs):
+        commands.append(args)
+        if args[:2]==["agent","get"]:
+            return {"result":{"agent":{"kind":"hermes","pane_id":"coordinator","workspace_id":"workspace"}}}
+        if args[:2]==["pane","list"]:return {"result":{"panes":[{"pane_id":"coordinator"}]}}
+        if args[:2]==["pane","split"]:return {"result":{"pane":{"pane_id":"owned"}}}
+        if args[:2]==["pane","process-info"]:return {"result":{"process_info":{"shell_pid":123}}}
+        if args[:2]==["pane","run"]:pytest.fail("expired handoff reached native pane run")
+        raise AssertionError(args)
+    monkeypatch.setattr(worker,"_herdr_json",native)
+    monkeypatch.setattr(worker,"start_bridge",lambda *args:None)
+    monkeypatch.setattr(worker,"stop_bridge",lambda *args:None)
+    monkeypatch.setattr(worker,"_preflight_root_provider",lambda *args:pytest.fail("private credentials cannot refresh"))
+    monkeypatch.setattr(worker,"frozen_policy",lambda:_policy_file(tmp_path))
+    monkeypatch.setattr(worker,"sandbox_command",lambda *args,**kwargs:builds.append("command") or ["/bin/true"])
+    monkeypatch.setattr(worker,"_wait_for_task_pane_input",lambda *args,**kwargs:phase.__setitem__(0,"ready"))
+    monkeypatch.setattr(worker,"_cleanup_setup_pane",lambda *args,**kwargs:True)
+    with pytest.raises(SecurityError,match="handoff expired during pane readiness"):
+        worker.create_task_session(task,policy_launch_factory=factory)
+    assert not any(args[:2]==["pane","run"] for args in commands)
+    assert factory.created[0].events[-1]==("closed",)

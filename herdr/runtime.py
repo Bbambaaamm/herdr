@@ -1070,7 +1070,9 @@ class HerdrChildRuntime:
                 **({"private_profile_snapshot": private_snapshot,
                     "hermes_profile": approved_name} if private_snapshot is not None else {}),
             )
-            invoke(["pane", "run", pane_id, sandbox.shell_command(sandbox_args)],
+            serialized_command = sandbox.shell_command(sandbox_args)
+            launch.verify_private_handoff()
+            invoke(["pane", "run", pane_id, serialized_command],
                    timeout_seconds=15.0)
             deadline = time.monotonic() + 10.0
             while True:

@@ -999,6 +999,10 @@ class PreparedPolicyLaunch:
             self.private_plan_handoff.verify_bound(self)
         return result
 
+    def verify_private_handoff(self):
+        if self.private_plan_handoff is not None:
+            self.private_plan_handoff.verify_bound(self)
+
     def seal(self, pid, attestation, *, tools, permissions):
         approved = (self.private_profile_snapshot.identity
                     if self.private_profile_snapshot is not None else None)

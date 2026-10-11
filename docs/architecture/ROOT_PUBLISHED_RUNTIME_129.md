@@ -336,7 +336,8 @@ pin and empty bound result slot. It rebuilds and compares the complete held
 command, verifies stable proposal bytes/inode/links/modes, and accepts only the
 existing exact root-owned plan reader. Malformed authority records deny;
 only a missing record is waited for. These checks and the deadline run again
-after the final approved builder returns. Existing durable split/fence,
+after the final approved builder returns and immediately before actual native
+pane run after pane readiness/command serialization. Existing durable split/fence,
 bootstrap, provider and economic gates still apply.
 
 This implements coordinated waiting/consumption, not automatic approval or
