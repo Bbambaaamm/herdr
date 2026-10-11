@@ -346,3 +346,22 @@ activation is included. Tests use explicit root-reader/runtime doubles and
 disposable real memfds, reservations, inodes, fsync and no-replace rename;
 one test runs the existing operator publisher concurrently with the waiting
 worker. This is not a privileged native root-child-result acceptance claim.
+
+
+### Hermes source verification without Git runtime metadata
+
+Runtime publication excludes `.git`. Stage two now verifies the same signed
+Hermes executor/source pin using `herdr/hermes_source_inventory.json` from the
+immutable policy-code tree, bound by an exact SHA-256 constant in the launcher.
+The inventory records the audited revision, version and 15,208 ordered tracked
+paths; it was produced only after matching the existing clean revision and full
+tracked-source digest. Every tracked regular file is hashed in the original Git
+index order, so the executor digest is unchanged. Missing/changed files, path
+aliases, changed inventory, unknown schema fields and untracked importable
+sources fail before native import. No runtime Git command, hook, configuration,
+index or object database is required. Site-packages, Python, immutable namespace
+and bootstrap authority checks remain prerequisites in the production path.
+
+The committed inventory is reviewed release code. Workers cannot provide one or
+refresh its pin. SDK updates require a new audited source inventory, explicit
+launcher/source/executor pins and the existing release publication workflow.

@@ -234,6 +234,7 @@ def test_preimport_executor_verifier_checks_actual_bytes(monkeypatch, tmp_path):
     expected = f'hermes:0.21.5:sha256:{digest.hexdigest()}'
     monkeypatch.setattr(module, 'HERMES_HEAD', git('rev-parse', 'HEAD'))
     monkeypatch.setattr(module, '_SOURCE_EXECUTOR', expected)
+    _source_inventory_fixture(module, monkeypatch, root, ['model_tools.py', 'pyproject.toml'])
     assert module._verify_hermes_build(root) == module.HERMES_EXECUTOR
     (root / 'model_tools.py').write_text('audited = False\n')
     with pytest.raises(SystemExit, match='cannot verify audited Hermes build|differs from signed executor'):
@@ -300,6 +301,8 @@ def test_preimport_git_ignores_repo_local_fsmonitor(monkeypatch, tmp_path):
         f"hermes:0.21.5:sha256:{digest.hexdigest()}",
     )
 
+    _source_inventory_fixture(module, monkeypatch, root, ["model_tools.py", "pyproject.toml"])
+
     marker = tmp_path / "fsmonitor-executed"
     hook = tmp_path / "malicious-fsmonitor.sh"
     hook.write_text(
@@ -309,6 +312,7 @@ def test_preimport_git_ignores_repo_local_fsmonitor(monkeypatch, tmp_path):
     hook.chmod(0o755)
     git("config", "core.fsmonitor", str(hook))
 
+    monkeypatch.setattr(module.subprocess, "run", lambda *a, **kw: pytest.fail("runtime Git executed"))
     assert module._verify_hermes_build(root) == module.HERMES_EXECUTOR
     assert not marker.exists()
 
@@ -774,3 +778,96 @@ def test_sdk_state_rejects_untrusted_modules_before_redirect(monkeypatch, tmp_pa
     assert not directory.exists()
     assert state.DEFAULT_DB_PATH == tmp_path / "host-state.db"
     assert cli._hermes_home == tmp_path / "host-home"
+
+
+def _source_inventory_fixture(module, monkeypatch, root, names):
+    names = sorted(names, key=os.fsencode)
+    digest = hashlib.sha256()
+    for name in names:
+        digest.update(os.fsencode(name) + b"\0")
+        digest.update(hashlib.sha256((root / name).read_bytes()).digest())
+    record = {"schema_version": "herdr-hermes-source-inventory-1",
+              "revision": module.HERMES_HEAD, "version": "0.21.5",
+              "source_sha256": digest.hexdigest(), "files": names}
+    raw = (json.dumps(record, sort_keys=True, indent=2) + "\n").encode()
+    inventory = root.parent / "fixture-source-inventory.json"
+    inventory.write_bytes(raw)
+    monkeypatch.setattr(module, "HERMES_INVENTORY_PATH", inventory, raising=False)
+    monkeypatch.setattr(module, "HERMES_INVENTORY_SHA256", hashlib.sha256(raw).hexdigest(), raising=False)
+    monkeypatch.setattr(module, "_SOURCE_EXECUTOR", f"hermes:0.21.5:sha256:{digest.hexdigest()}")
+    return inventory
+
+
+def _inventory_sdk(tmp_path, monkeypatch):
+    module = _launcher()
+    root = tmp_path / "sdk"
+    root.mkdir()
+    (root / "pyproject.toml").write_text('[project]\nversion = "0.21.5"\n')
+    (root / "model_tools.py").write_text("audited = True\n")
+    inventory = _source_inventory_fixture(module, monkeypatch, root, ["pyproject.toml", "model_tools.py"])
+    return module, root, inventory
+
+
+def test_published_sdk_verifies_exact_source_without_git_metadata(tmp_path, monkeypatch):
+    module, root, _ = _inventory_sdk(tmp_path, monkeypatch)
+    assert not (root / ".git").exists()
+    monkeypatch.setattr(module.subprocess, "run", lambda *a, **kw: pytest.fail("runtime Git executed"))
+    assert module._verify_hermes_build(root) == module.HERMES_EXECUTOR
+
+
+@pytest.mark.parametrize("attack", ["tracked-changed", "tracked-missing", "tracked-symlink",
+    "inventory-changed", "inventory-symlink", "inventory-unknown-field", "inventory-revision",
+    "inventory-reordered", "inventory-duplicate", "inventory-traversal", "inventory-absolute",
+    "inventory-directory", "inventory-excluded-path", "inventory-too-large", "source-version",
+    "untracked.py", "untracked.pyc", "untracked.so", "untracked.pth", "parent-symlink"])
+def test_published_sdk_rejects_source_and_inventory_attacks(tmp_path, monkeypatch, attack):
+    module, root, inventory = _inventory_sdk(tmp_path, monkeypatch)
+    data = json.loads(inventory.read_bytes())
+    if attack == "tracked-changed":
+        (root / "model_tools.py").write_text("audited = False\n")
+    elif attack == "tracked-missing":
+        (root / "model_tools.py").unlink()
+    elif attack == "tracked-symlink":
+        outside = tmp_path / "outside.py"; outside.write_text("audited = True\n")
+        (root / "model_tools.py").unlink(); (root / "model_tools.py").symlink_to(outside)
+    elif attack == "inventory-symlink":
+        outside = tmp_path / "outside.json"; outside.write_bytes(inventory.read_bytes())
+        inventory.unlink(); inventory.symlink_to(outside)
+    elif attack == "inventory-directory":
+        inventory.unlink(); inventory.mkdir()
+    elif attack == "inventory-too-large":
+        inventory.write_bytes(b" " * 1_048_577)
+    elif attack == "source-version":
+        (root / "pyproject.toml").write_text('[project]\nversion = "0.99.0"\n')
+    elif attack.startswith("untracked."):
+        (root / attack).write_bytes(b"injected")
+    elif attack == "parent-symlink":
+        package = root / "package"; package.mkdir(); (package / "module.py").write_text("approved=True\n")
+        _source_inventory_fixture(module, monkeypatch, root, ["pyproject.toml", "model_tools.py", "package/module.py"])
+        outside = tmp_path / "linked-package"; package.rename(outside); package.symlink_to(outside, target_is_directory=True)
+    else:
+        if attack == "inventory-changed": data["files"].remove("model_tools.py")
+        elif attack == "inventory-unknown-field": data["unknown"] = True
+        elif attack == "inventory-revision": data["revision"] = "f" * 40
+        elif attack == "inventory-reordered": data["files"].reverse()
+        elif attack == "inventory-duplicate": data["files"].append(data["files"][0])
+        elif attack == "inventory-traversal": data["files"].append("../outside.py")
+        elif attack == "inventory-absolute": data["files"].append("/tmp/outside.py")
+        elif attack == "inventory-excluded-path": data["files"].append("venv/unsafe.py")
+        raw = json.dumps(data, sort_keys=True).encode(); inventory.write_bytes(raw)
+        # For structural attacks explicitly substitute the test-only pin so the
+        # schema/path check must reject, rather than only the content digest.
+        if attack != "inventory-changed":
+            monkeypatch.setattr(module, "HERMES_INVENTORY_SHA256", hashlib.sha256(raw).hexdigest(), raising=False)
+    with pytest.raises(SystemExit):
+        module._verify_hermes_build(root)
+
+
+def test_committed_hermes_inventory_matches_launcher_pins(monkeypatch):
+    module = _launcher()
+    inventory = LAUNCHER.parents[2] / "herdr/hermes_source_inventory.json"
+    monkeypatch.setattr(module, "HERMES_INVENTORY_PATH", inventory)
+    data = module._hermes_source_inventory()
+    assert data["revision"] == module.HERMES_HEAD
+    assert len(data["files"]) == 15208
+    assert data["source_sha256"] == module.HERMES_SOURCE_SHA256
