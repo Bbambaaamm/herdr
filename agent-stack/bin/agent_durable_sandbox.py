@@ -835,6 +835,7 @@ def command(
         if private_profile_snapshot is not None:
             from herdr.private_mount_plan import request_for, ApprovedPrivateMountPlan
             policy_mount.private_mount_request = request_for(policy_mount.private_identity, descriptors, args)
+            policy_mount.private_mount_argv = list(args)
             plan = policy_mount.private_mount_plan
             if not isinstance(plan, ApprovedPrivateMountPlan):
                 raise RuntimeError("durable_private_mount_plan_unapproved")

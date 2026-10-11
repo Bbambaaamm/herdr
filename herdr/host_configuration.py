@@ -72,7 +72,8 @@ def _private_profile(raw):
     credentials or self-approve changed file hashes. Native/provider validation
     is a separate acceptance gate, not implied by this offline preflight.
     """
-    require(isinstance(raw,dict) and set(raw)=={"profile","credential_approval"},
+    require(isinstance(raw,dict) and set(raw) in ({"profile","credential_approval"},
+            {"profile","credential_approval","plan_handoff"}),
             "closed private host policy required")
     definition=raw["profile"]
     require(isinstance(definition,dict) and set(definition)=={"name","source","files"},
@@ -188,7 +189,15 @@ def build_host_policy_factory(*,parent_grant=None,configuration_path=HOST_POLICY
             require(expiry>=datetime.now(UTC)+timedelta(seconds=max(floor,raw["grant_ttl_seconds"]+60)),
                     "host credential approval is expired or insufficient")
             return True
-        options=dict(approved_profile=profile,profile_preflight=preflight,
+        handoff = None
+        if "plan_handoff" in raw["private_launch"]:
+            from .launch_plan_handoff import LaunchPlanHandoff
+            definition = raw["private_launch"]["plan_handoff"]
+            require(isinstance(definition,dict) and set(definition)=={"proposal_directory","timeout_seconds"}
+                    and isinstance(definition["proposal_directory"],str),
+                    "closed host launch-plan handoff configuration required")
+            handoff = LaunchPlanHandoff(definition["proposal_directory"],definition["timeout_seconds"])
+        options=dict(approved_profile=profile,profile_preflight=preflight,private_plan_handoff=handoff,
                      parent_approved_profile=profile if parent_grant is not None else None,
                      retained_parent_verify=retained_parent_verify)
     factory=HostPolicyLaunchFactory(code=code,runtime=runtime,storage=storage,authorize=authorize,
