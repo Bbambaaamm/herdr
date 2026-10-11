@@ -294,8 +294,8 @@ Publication is not physical launch acceptance: the FD launcher, immutable
 source checks, active grant, current fence, profile, result reservation and
 bootstrap checks remain mandatory. The ticket window limits issuance; it does
 not change the lifetime/recovery semantics of the retained plan or revoke a
-previously issued record. Automatic issuance/renewal and a coordinated live
-worker/operator handoff remain separate integration work. This change does
+previously issued record. Automatic issuance/renewal remain separate integration work; the opt-in live
+worker/operator handoff is described below. This change does
 not activate that path or establish private native root/child acceptance.
 
 Tests use disposable ordinary-user files, with explicit root authority and
@@ -304,3 +304,45 @@ full identity/argv/FD bindings, expiry and late withdrawal, exclusive fresh
 inodes, actual no-replace rename, retained failure files and FD cleanup.
 They also verify actual worker publication/approval refusal. These tests do
 not claim real privileged publication or a production issuer installation.
+
+## Bounded live worker/operator handoff
+
+Schema 2 may opt into `private_launch.plan_handoff` with exactly
+`proposal_directory` (an existing canonical owner-only 0700 directory outside
+all admitted writable roots) and integer `timeout_seconds` in 1..60. Only the
+root-protected host policy chooses this configuration. Without the option,
+missing approval retains the original immediate denial.
+
+The existing root and child command preparation paths retain their FDs and
+wait before any pane is created. A fresh 0400 proposal in the configured
+directory records the complete plan/argv, grant hash, approved profile digest
+inventory, process PID/start ticks and grant expiry. It contains no profile
+file bytes; command environment literals are limited to the native builder's
+public HOME/PATH/sandbox values. This directory is review evidence, not a
+task queue or an approval authority. No proposal or failed hidden stage is
+overwritten, replayed, renewed or deleted by the handoff.
+
+An independent trusted operator/issuer must verify the physical descriptors,
+current policy and approval, then use the root ticket publisher above. Never
+copy a proposal into the root approval directory as its own authorization.
+The operator must finish within the configured deadline and current grant
+and credential window. An existing proposal for the same full identity after
+crash requires reconciliation; allocate a new identity/fence only through the
+existing durable admission path, never by this helper.
+
+The waiting worker repeatedly checks the current host profile/parent policy,
+unchanged grant/profile, sealed profile inputs, immutable runtime, workspace
+pin and empty bound result slot. It rebuilds and compares the complete held
+command, verifies stable proposal bytes/inode/links/modes, and accepts only the
+existing exact root-owned plan reader. Malformed authority records deny;
+only a missing record is waited for. These checks and the deadline run again
+after the final approved builder returns and immediately before actual native
+pane run after pane readiness/command serialization. Existing durable split/fence,
+bootstrap, provider and economic gates still apply.
+
+This implements coordinated waiting/consumption, not automatic approval or
+credential/plan renewal. No daemon, timer, root installation or live worker
+activation is included. Tests use explicit root-reader/runtime doubles and
+disposable real memfds, reservations, inodes, fsync and no-replace rename;
+one test runs the existing operator publisher concurrently with the waiting
+worker. This is not a privileged native root-child-result acceptance claim.

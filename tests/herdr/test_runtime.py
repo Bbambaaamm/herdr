@@ -1741,7 +1741,7 @@ def test_missing_modern_work_profile_blocks_before_split_or_agent(tmp_path,monke
     assert not any(event["event"]=="child_pane_split_started" for event in scheduler.audit_log.replay())
 
 
-@pytest.mark.parametrize("case", ["delayed", "input-unready", "native-error", "json-ack", "text-ack", "stderr-ack", "prompt-unverified"])
+@pytest.mark.parametrize("case", ["delayed", "input-unready", "native-error", "json-ack", "text-ack", "stderr-ack", "prompt-unverified", "handoff-denied"])
 def test_managed_child_waits_before_single_native_launch_and_full_verification(tmp_path, monkeypatch, case):
     from importlib.machinery import SourceFileLoader
     from types import SimpleNamespace
@@ -1806,6 +1806,12 @@ def test_managed_child_waits_before_single_native_launch_and_full_verification(t
     runtime = HerdrChildRuntime(scheduler, runner, cwd=tmp_path, snapshot_path=tmp_path / "swarm.json")
     launch = FakePreparedPolicyLaunch(identity(task_id="task"))
     runtime._policy_launches["task"] = launch
+    from herdr.security import SecurityError
+    if case == "handoff-denied":
+        def denied(current):
+            assert current is launch and runner.input_checks == 2 and runner.prompt_checks == 1
+            raise SecurityError("handoff expired during pane readiness")
+        launch.private_plan_handoff = SimpleNamespace(verify_bound=denied)
     monkeypatch.setattr(runtime, "_child_workspace_writable", lambda task: False)
     if case == "delayed":
         assert runtime._sandbox_child_pane("owned", "marker", "/bin/true", "task") == policy
@@ -1815,9 +1821,9 @@ def test_managed_child_waits_before_single_native_launch_and_full_verification(t
         assert verification[0][2]["policy_mount"] is launch.mount
         assert runtime._sandbox_proofs["owned"]["sandbox_pid"] == 123
     else:
-        with pytest.raises(HerdrRuntimeError):
+        with pytest.raises(SecurityError if case == "handoff-denied" else HerdrRuntimeError):
             runtime._sandbox_child_pane("owned", "marker", "/bin/true", "task")
-        assert runner.launches == (0 if case in {"input-unready", "prompt-unverified"} else 1)
+        assert runner.launches == (0 if case in {"input-unready", "prompt-unverified", "handoff-denied"} else 1)
         assert runner.sandbox_checks == 0 and verification == []
         assert not policy.exists() and "owned" not in runtime._sandbox_proofs
 

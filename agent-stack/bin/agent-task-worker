@@ -894,7 +894,9 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
             **({"private_profile_snapshot": private_snapshot,
                 "hermes_profile": profile} if private_snapshot is not None else {}),
         )
-        _herdr_json(["pane", "run", pane_id, shell_command(command)], timeout_seconds=15.0)
+        serialized_command = shell_command(command)
+        launch.verify_private_handoff()
+        _herdr_json(["pane", "run", pane_id, serialized_command], timeout_seconds=15.0)
         sandbox_pid = _wait_for_task_sandbox(pane_id, pane_marker,
                                              policy=policy, policy_mount=launch.mount,
                                              **({"private_profile_snapshot": private_snapshot}

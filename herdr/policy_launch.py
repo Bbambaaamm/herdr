@@ -367,6 +367,7 @@ class PolicyMount:
         self.private_result_pin = None
         self.private_mount_plan = None
         self.private_mount_request = None
+        self.private_mount_argv = None
         self.private_identity = None
         self.private_cli_pins = {}
         targets = [str(BUNDLE_TARGET), str(code.target), *(str(x.target) for x in runtime)]
@@ -924,6 +925,9 @@ class PreparedPolicyLaunch:
         self._published_bootstrap_receipt = None
         self._continuation_sink = None
         self._ownership = None
+        self.private_plan_handoff = None
+        self._private_handoff_verify = None
+        self._private_handoff_state = None
         if private_profile_snapshot is not None and isinstance(mount, PolicyMount):
             from .private_mount_plan import PinnedLaunchPath
             mount.private_workspace_pin = PinnedLaunchPath(Path(grant.workspace_root), directory=True)
@@ -986,8 +990,18 @@ class PreparedPolicyLaunch:
             _require(self.mount.private_mount_request is not None,
                      "exact private mount request unavailable")
             name=hashlib.sha256(canonical_json_bytes(self.identity.to_json())).hexdigest()+".json"
-            self.bind_private_mount_plan(AUTHORITY_ROOT/name)
-        return builder()
+            selected = AUTHORITY_ROOT/name
+            if self.private_plan_handoff is not None:
+                selected = self.private_plan_handoff.await_approval(self, builder)
+            self.bind_private_mount_plan(selected)
+        result = builder()
+        if self.private_plan_handoff is not None:
+            self.private_plan_handoff.verify_bound(self)
+        return result
+
+    def verify_private_handoff(self):
+        if self.private_plan_handoff is not None:
+            self.private_plan_handoff.verify_bound(self)
 
     def seal(self, pid, attestation, *, tools, permissions):
         approved = (self.private_profile_snapshot.identity
@@ -1119,7 +1133,7 @@ class HostPolicyLaunchFactory:
                  profile_preflight=None,
                  parent_approved_profile: ApprovedProfile | None = None,
                  parent_launch: PreparedPolicyLaunch | None = None,
-                 retained_parent_verify=None):
+                 retained_parent_verify=None, private_plan_handoff=None):
         approved_types = (ApprovedTree, ApprovedImmutableTree)
         _require(isinstance(code, approved_types) and code.target == CODE_TARGET,
                  "approved policy code required")
@@ -1140,6 +1154,17 @@ class HostPolicyLaunchFactory:
                  "typed live parent launch required")
         _require(retained_parent_verify is None or callable(retained_parent_verify),
                  "host retained parent verifier required")
+        writable_roots = tuple(writable_roots)
+        from .launch_plan_handoff import LaunchPlanHandoff
+        _require(private_plan_handoff is None or isinstance(private_plan_handoff, LaunchPlanHandoff),
+                 "typed host launch-plan handoff required")
+        _require(private_plan_handoff is None or approved_profile is not None,
+                 "launch-plan handoff requires private host profile")
+        if private_plan_handoff is not None:
+            _require(all(Path(root) != private_plan_handoff.directory
+                         and Path(root) not in private_plan_handoff.directory.parents
+                         for root in writable_roots), "launch proposals cannot live in admitted write roots")
+        self.private_plan_handoff = private_plan_handoff
         self.approved_profile = approved_profile
         self.parent_approved_profile = parent_approved_profile
         self.parent_launch = parent_launch
@@ -1233,6 +1258,26 @@ class HostPolicyLaunchFactory:
                                           grant, Ed25519PrivateKey.generate(), "host-launch", self.parent_grant,
                                           private_profile_snapshot=profile_snapshot)
             prepared._ownership = ownership
+            prepared.private_plan_handoff = self.private_plan_handoff
+            if self.private_plan_handoff is not None:
+                def verify_handoff():
+                    _require(self.profile_preflight(self.approved_profile.name) is True,
+                             "current host profile approval unavailable")
+                    if self.parent_grant is not None:
+                        if self.retained_parent_verify is not None:
+                            parent, profile = self.retained_parent_verify()
+                            _require(parent == self.parent_grant
+                                     and profile == self.approved_profile.identity,
+                                     "retained parent changed during launch handoff")
+                        else:
+                            _require(self.parent_launch is not None,
+                                     "live parent unavailable during launch handoff")
+                            self.parent_launch.verify_bootstrap()
+                            _require(self.parent_launch.grant == self.parent_grant
+                                     and self.parent_grant.is_active(),
+                                     "live parent changed during launch handoff")
+                    return True
+                prepared._private_handoff_verify = verify_handoff
             from .host_bootstrap import HostBootstrap
             prepared.mount.bootstrap=HostBootstrap.create(
                 prepared,storage=ownership.directory,writable_roots=(*self.writable_roots,path))

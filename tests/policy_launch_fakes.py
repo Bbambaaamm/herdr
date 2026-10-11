@@ -37,6 +37,9 @@ class FakePreparedPolicyLaunch(PreparedPolicyLaunch):
         self._identity = identity
         self.mount = None
         self.events = []
+        self.private_plan_handoff = None
+        self._private_handoff_verify = None
+        self._private_handoff_state = None
     @property
     def identity(self):
         return self._identity
