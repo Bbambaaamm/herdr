@@ -13,6 +13,8 @@ from pathlib import Path
 import socket
 import stat
 import struct
+import subprocess
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -26,6 +28,46 @@ from herdr.private_mount_plan import request_for
 from herdr.security import SecurityError, ToolRule, RiskClass, canonical_json_bytes
 from tests.herdr.test_launch_plan_handoff import live
 from tests.herdr.test_private_host_composition import private_config
+
+
+@pytest.mark.parametrize("directory", ["agent-stack/bin", "scripts"])
+def test_host_wrapper_runs_approved_entrypoint_with_its_sibling_imports(tmp_path, directory):
+    # Execute the actual wrapper in an isolated child, with explicit policy and
+    # immutability doubles. This verifies imports/argv, not root admission.
+    import shutil
+    root = tmp_path / "release"
+    wrapper = root / issuer.HOST_ENTRYPOINT
+    wrapper.parent.mkdir(parents=True)
+    repository = Path(__file__).resolve().parents[2]
+    shutil.copyfile(repository / issuer.HOST_ENTRYPOINT, wrapper)
+    target = root / directory / "probe.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("import json, sys\nfrom sibling_helper import value\nprint(json.dumps([value, sys.argv]))\n")
+    (target.parent / "sibling_helper.py").write_text("value = 'approved-sibling'\n")
+    program = r"""
+import json, pathlib, runpy, sys
+from types import SimpleNamespace
+repository, root, entrypoint = sys.argv[1:]
+sys.path.insert(0, repository)
+from herdr import launch_plan_issuer, host_configuration, host_bootstrap
+from herdr.host_bootstrap import PYTHON_TARGET
+# Interpreter authority is doubled to the disposable test interpreter;
+# production continues to pin its published bin/python3.11.
+host_bootstrap.PYTHON_EXECUTABLE = "bin/" + pathlib.Path(sys.executable).name
+launch_plan_issuer._policy = lambda: (
+    {"entrypoints": [entrypoint]}, {"code": {"source": root}, "storage": root,
+    "runtime": [{"target": str(PYTHON_TARGET), "source": str(pathlib.Path(sys.executable).parent.parent)}]})
+host_configuration._tree = lambda *args, **kwargs: SimpleNamespace(
+    freeze=lambda *args: SimpleNamespace(close=lambda: None))
+wrapper = pathlib.Path(root) / launch_plan_issuer.HOST_ENTRYPOINT
+sys.argv = [str(wrapper), entrypoint, "caller-argument"]
+runpy.run_path(str(wrapper), run_name="__main__")
+"""
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", program,
+                             str(repository), str(root), f"{directory}/probe.py"],
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == ["approved-sibling", [str(target), "caller-argument"]]
 
 
 class RootOS:
@@ -454,4 +496,3 @@ def test_physical_policy_rejects_source_and_command_attacks(physical, fault):
             issuer._physical(plan, argv, p.grant, p.profile, fds, p.raw)
     finally:
         if extra is not None: os.close(extra)
-
