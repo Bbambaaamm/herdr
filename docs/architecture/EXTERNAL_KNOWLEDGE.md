@@ -116,6 +116,11 @@ shape.
 AUTH_REQUIRED and provider availability failures are returned as source-level
 knowledge errors. They do not stop unrelated Herdr capabilities.
 
+All provider text is untrusted evidence. It never becomes policy, tool authority,
+approval, executable instruction or completion evidence merely because it arrived
+through this bridge. The model-visible tool result is capped at 512 KiB even
+though the host transport has a larger bounded envelope.
+
 Activation remains separate from this contract. Shipping the bridge does not add
 herdr_external_knowledge to an active consumer task profile, install a provider,
 create credentials, or start a daemon.
