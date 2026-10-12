@@ -1420,11 +1420,12 @@ class HerdrChildRuntime:
                 )
             ):
                 raise HerdrRuntimeError("child_sandbox_attestation_denied", lease.task_id)
-            from .external_knowledge_host import bind_external_knowledge_host
-            bind_external_knowledge_host(
-                launch.mount.bootstrap, launch.grant,
-                self._external_knowledge_child_authority,
-            )
+            if "herdr_external_knowledge" in launch.grant.scope.tools:
+                from .external_knowledge_host import bind_external_knowledge_host
+                bind_external_knowledge_host(
+                    launch.mount.bootstrap, launch.grant,
+                    self._external_knowledge_child_authority,
+                )
             work_port = authority.prepare_work(record, launch)
             def publish_continuation(evidence):
                 accepted = self.scheduler.attest_execution_sandbox(

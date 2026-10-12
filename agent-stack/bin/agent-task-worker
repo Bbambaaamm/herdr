@@ -884,10 +884,11 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
             permissions=tuple(task.get("parent_permissions") or ()))
         session["sandbox_verified"] = True
         persist_execution_session(task)
-        from herdr.external_knowledge_host import bind_external_knowledge_host
-        bind_external_knowledge_host(
-            launch.mount.bootstrap, launch.grant, external_knowledge_task_authority
-        )
+        if "herdr_external_knowledge" in launch.grant.scope.tools:
+            from herdr.external_knowledge_host import bind_external_knowledge_host
+            bind_external_knowledge_host(
+                launch.mount.bootstrap, launch.grant, external_knowledge_task_authority
+            )
         if modern_work_contract(task):
             from herdr.work_contract_host import HostWorkContractFactory
             from agent_completion_evidence import spec_digest
