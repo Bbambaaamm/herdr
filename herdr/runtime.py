@@ -1420,7 +1420,7 @@ class HerdrChildRuntime:
                 )
             ):
                 raise HerdrRuntimeError("child_sandbox_attestation_denied", lease.task_id)
-            if "herdr_external_knowledge" in launch.grant.scope.tools:
+            if "herdr_external_knowledge" in node.tools:
                 from .external_knowledge_host import bind_external_knowledge_host
                 bind_external_knowledge_host(
                     launch.mount.bootstrap, launch.grant,
