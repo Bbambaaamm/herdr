@@ -63,6 +63,53 @@ class WorkAuthorityClient:
         except (EvidenceError,OSError,ValueError,TypeError) as exc:
             raise PolicyDenied("work_budget_unavailable") from exc
 
+    def external_knowledge(self, identity, grant_sha256, provider_id, request):
+        from .external_knowledge import KnowledgeContractError, KnowledgeRequest, KnowledgeResponse
+        try:
+            if (not isinstance(identity, InvocationIdentity)
+                    or not isinstance(request, KnowledgeRequest)
+                    or not isinstance(provider_id, str)):
+                raise PolicyDenied("external_knowledge_request_invalid")
+            message = {
+                "op": "external-knowledge-query",
+                "identity": identity.to_json(),
+                "grant_sha256": grant_sha256,
+                "provider_id": provider_id,
+                "request": request.to_dict(),
+            }
+            payload = json.dumps(
+                message, sort_keys=True, separators=(",", ":"),
+                ensure_ascii=False, allow_nan=False,
+            ).encode("utf-8") + b"\n"
+            if len(payload) > 8192:
+                raise PolicyDenied("external_knowledge_request_too_large")
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(905)
+                connection.connect(str(SOCKET_PATH))
+                connection.sendall(payload)
+                result = bytearray()
+                limit = 2_000_000
+                while len(result) <= limit:
+                    chunk = connection.recv(min(65_536, limit + 1 - len(result)))
+                    if not chunk:
+                        break
+                    result.extend(chunk)
+                    if b"\n" in result:
+                        break
+            if (len(result) > limit or not result.endswith(b"\n")
+                    or result.count(b"\n") != 1):
+                raise PolicyDenied("external_knowledge_response_invalid")
+            parsed = json.loads(result)
+            response = KnowledgeResponse.from_dict(parsed)
+            if (response.request_id != request.request_id
+                    or {item.source for item in response.sources} != set(request.sources)):
+                raise PolicyDenied("external_knowledge_response_mismatch")
+            return response
+        except PolicyDenied:
+            raise
+        except (KnowledgeContractError, OSError, TimeoutError, ValueError, TypeError, UnicodeError) as exc:
+            raise PolicyDenied("external_knowledge_unavailable") from exc
+
     def verify(self, identity, grant_sha256, request_id, handoff=None):
         from .evidence import EvidenceError
         try:
@@ -157,6 +204,62 @@ def _dispatch_work_connection(owner, connection):
             owner.launch.mount.verify_mounted(pid,owner.launch.sealed)
             encoded=json.dumps(result,sort_keys=True,separators=(",",":")).encode()+b"\n"
             require(len(encoded)<=8192,"budget response exceeds bound")
+            connection.sendall(encoded)
+        elif request.get("op") == "external-knowledge-query":
+            require(set(request) == {
+                        "op", "identity", "grant_sha256", "provider_id", "request"
+                    } and "herdr_external_knowledge" in owner.launch.grant.scope.tools,
+                    "external knowledge tool is not granted")
+            callback = getattr(owner, "external_knowledge_query", None)
+            durable_authority = getattr(owner, "external_knowledge_authority", None)
+            require(callable(callback) and callable(durable_authority),
+                    "external knowledge host authority unavailable")
+            from .external_knowledge import KnowledgeRequest, KnowledgeResponse
+            knowledge_request = KnowledgeRequest.from_dict(request["request"])
+            provider_id = request["provider_id"]
+            require(isinstance(provider_id, str) and 0 < len(provider_id) <= 64,
+                    "external knowledge provider invalid")
+            require(durable_authority(
+                owner.launch.identity, owner.launch.grant.hash,
+                provider_id, knowledge_request
+            ) is True, "external knowledge durable authority denied")
+            if owner.work_authority is not None:
+                require(owner.work_authority(
+                    owner.launch.identity, owner.launch.grant.hash,
+                    kind="tool", tool="herdr_external_knowledge"
+                ) is True, "external knowledge phase denied")
+            from .work_lifetime import require_grant_lifetime
+            require_grant_lifetime(owner.launch.grant, 900)
+            response = callback(
+                owner.launch.identity,
+                owner.launch.grant.hash,
+                provider_id,
+                knowledge_request,
+            )
+            require(isinstance(response, KnowledgeResponse)
+                    and response.request_id == knowledge_request.request_id
+                    and {item.source for item in response.sources} == set(knowledge_request.sources),
+                    "external knowledge response invalid")
+            require_work_time()
+            after = inspect_peer(pid)
+            require(after == peer and owner.launch.grant.is_active(),
+                    "external knowledge peer or grant changed during retrieval")
+            owner.launch.mount.verify_mounted(pid, owner.launch.sealed)
+            require(durable_authority(
+                owner.launch.identity, owner.launch.grant.hash,
+                provider_id, knowledge_request
+            ) is True, "external knowledge durable authority changed")
+            if owner.work_authority is not None:
+                require(owner.work_authority(
+                    owner.launch.identity, owner.launch.grant.hash,
+                    kind="tool", tool="herdr_external_knowledge"
+                ) is True, "external knowledge phase changed")
+            encoded = json.dumps(
+                response.to_dict(), sort_keys=True, separators=(",", ":"),
+                ensure_ascii=False, allow_nan=False,
+            ).encode("utf-8") + b"\n"
+            require(len(encoded) <= 2_000_000, "external knowledge response exceeds bound")
+            connection.settimeout(remaining_work_seconds(5))
             connection.sendall(encoded)
         elif request.get("op") == "work-verify":
             require(set(request) in ({"op", "identity", "grant_sha256", "request_id"}, {"op", "identity", "grant_sha256", "request_id", "handoff"})

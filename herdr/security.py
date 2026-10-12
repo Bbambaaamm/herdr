@@ -530,7 +530,8 @@ class SecurityGrant:
                          "terminal": RiskClass.PROCESS, "execute_code": RiskClass.PROCESS,
                          "herdr_delegate_child": RiskClass.DELEGATION,
                          "herdr_submit_result": RiskClass.RESULT_SUBMISSION,
-                         "herdr_verify_work": RiskClass.READ}
+                         "herdr_verify_work": RiskClass.READ,
+                         "herdr_external_knowledge": RiskClass.READ}
         for rule in self.tool_rules:
             if rule.tool in {"read_file", "search_files", "write_file", "patch"}:
                 required = () if rule.tool == "patch" else ("path",)
@@ -555,6 +556,11 @@ class SecurityGrant:
                     not rule.requires_sandbox or rule.requires_process or rule.path_fields
                     or rule.credential_ref_fields or set(rule.allowed_arg_keys) not in ({"request_id"}, {"request_id", "handoff"})):
                 raise SecurityError("work verification requires a closed sandboxed rule")
+            if rule.tool == "herdr_external_knowledge" and (
+                    not rule.requires_sandbox or rule.requires_process or rule.path_fields
+                    or rule.credential_ref_fields
+                    or set(rule.allowed_arg_keys) != {"provider_id", "query", "sources", "conversation_id"}):
+                raise SecurityError("external knowledge requires a closed sandboxed read rule")
             if rule.risk == RiskClass.PROCESS and (not rule.requires_process or not rule.requires_sandbox):
                 raise SecurityError("process tool requires process policy and sandbox")
             if rule.tool in built_in_risk and rule.risk != built_in_risk[rule.tool]:
