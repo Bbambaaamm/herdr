@@ -322,6 +322,7 @@ def test_host_composition_selects_automatic_client_only_by_root_policy(tmp_path,
     raw["private_launch"]["plan_handoff"] = {"proposal_directory": str(proposals), "timeout_seconds": 30,
                                              "automatic_issuer": True}
     protected = []
+    monkeypatch.setattr(issuer, "_policy", lambda: ({"request_timeout_seconds": 30}, deepcopy(raw)))
     monkeypatch.setattr(issuer, "protect_host_process", lambda: protected.append(True))
     factory = host.build_host_policy_factory()
     client = factory.private_plan_handoff.automatic_issuer
@@ -704,3 +705,36 @@ def test_accepted_long_handoff_uses_shorter_issuer_budget(live, monkeypatch):
     finally:
         listener.close()
         thread.join(4)
+
+
+@pytest.mark.parametrize("fault", [None, "policy-drift", "authority-unavailable"])
+def test_actual_host_factory_uses_protected_issuer_timeout(tmp_path, monkeypatch, fault):
+    raw, _, _, _ = private_config(tmp_path, monkeypatch)
+    proposals = tmp_path / "proposals"; proposals.mkdir(mode=0o700)
+    raw["private_launch"]["plan_handoff"] = {
+        "proposal_directory": str(proposals), "timeout_seconds": 60, "automatic_issuer": True}
+    protected = []
+    def policy():
+        if fault == "authority-unavailable":
+            raise SecurityError("protected issuer policy unavailable")
+        current = deepcopy(raw)
+        if fault == "policy-drift": current["host_uid"] += 1
+        return {"request_timeout_seconds": 30}, current
+    monkeypatch.setattr(issuer, "_policy", policy)
+    monkeypatch.setattr(issuer, "protect_host_process", lambda: protected.append(True))
+    if fault:
+        with pytest.raises(SecurityError): host.build_host_policy_factory()
+        assert protected == []
+    else:
+        factory = host.build_host_policy_factory()
+        assert factory.private_plan_handoff.timeout_seconds == 60
+        assert factory.private_plan_handoff.automatic_issuer.timeout_seconds == 30
+        assert protected == [True]
+
+
+def test_automatic_native_grammar_denies_private_network_namespace(physical):
+    argv = list(physical.argv)
+    argv.insert(argv.index("--"), "--unshare-net")
+    plan = request_for(physical.grant.identity, physical.plan["descriptors"], argv)
+    with pytest.raises(SecurityError, match="unsupported automatic mount operation"):
+        issuer._argv(plan, argv, physical.grant.workspace_root, physical.profile)

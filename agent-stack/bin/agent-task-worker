@@ -1071,9 +1071,17 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         return session
     except Exception as exc:
         if not split_attempted:
-            try:_cleanup_prepared_root_launch(task)
-            finally:
+            try:
+                _cleanup_prepared_root_launch(task)
                 if "policy" in locals():policy.unlink(missing_ok=True)
+            except Exception as cleanup_exc:
+                session["cleanup_status"] = "launch_cleanup_failed"
+                session["cleanup_error"] = str(cleanup_exc)[-1000:]
+                # Keep unresolved launch evidence and block before a new attempt.
+                # A cleanup failure must not turn the original denial into retry.
+                raise RuntimeError(
+                    "task_session_cleanup_failed:pre_split:" + type(exc).__name__
+                ) from cleanup_exc
             raise
         if pane_id and pane_id != coordinator_pane:
             candidates = (pane_id,)

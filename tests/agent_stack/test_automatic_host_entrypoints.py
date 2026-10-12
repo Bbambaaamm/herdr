@@ -377,6 +377,7 @@ def test_worker_startup_reconciles_owned_stale_closed_session(tmp_path, monkeypa
     path = worker.PENDING / "task-1.json"
     worker.write_json(path, task)
     monkeypatch.setattr(worker, "prepare_attempt", lambda *args: pytest.fail("old session was replaced"))
+    monkeypatch.setattr(worker, "_herdr_json", lambda *args, **kwargs: {"result": {"panes": []}})
     monkeypatch.setattr(worker, "stop_bridge",
                         lambda session: (_ for _ in ()).throw(RuntimeError("durable_bridge_identity_unverified")))
     assert worker.main(path) == 1
@@ -415,3 +416,87 @@ def test_worker_quarantines_automatic_plan_ambiguity_without_retry(tmp_path, mon
     assert saved["attempts"] == 0 and not list(worker.PENDING.iterdir())
     result = json.loads(worker.result_path(task["id"]).read_text())
     assert result["blocker"] == "task_launch_plan_reconciliation_required"
+
+
+
+def unresolved_private_launch_fixture(tmp_path, monkeypatch):
+    """Real create_task_session flow; authority/native transport are explicit doubles."""
+    from tests.agent_stack import test_worker_handshake as fixture
+    from herdr.launch_plan_handoff import LaunchPlanReconciliationRequired
+    fixture.configure_paths(tmp_path)
+    fixture.explicit_host_policy_for_worker_lifecycle_tests.__wrapped__(monkeypatch)
+    worker = fixture.worker
+    factory = worker.HOST_POLICY_LAUNCH_FACTORY
+    original = factory.prepare
+    def prepare(**kwargs):
+        launch = original(**kwargs)
+        launch.private_profile_snapshot = SimpleNamespace(name="quantlab")
+        def unresolved(builder):
+            raise LaunchPlanReconciliationRequired("published plan reply unavailable")
+        monkeypatch.setattr(launch, "prepare_private_command", unresolved)
+        return launch
+    monkeypatch.setattr(factory, "prepare", prepare)
+    def native(args, **kwargs):
+        assert args[:2] == ["agent", "get"], "no pane/provider action is allowed"
+        return {"result": {"agent": {"agent": "hermes", "pane_id": "coordinator",
+                                     "workspace_id": "workspace"}}}
+    monkeypatch.setattr(worker, "_herdr_json", native)
+    monkeypatch.setattr(worker, "_preflight_root_provider",
+                        lambda *args: pytest.fail("private launch refreshed provider credentials"))
+    monkeypatch.setattr(worker, "frozen_policy", lambda: fixture._policy_file(tmp_path))
+    def cleanup(task):
+        raise RuntimeError("launch storage changed before cleanup")
+    monkeypatch.setattr(worker, "_cleanup_prepared_root_launch", cleanup)
+    return worker, fixture.base_task()
+
+
+def test_actual_pre_split_cleanup_failure_is_blocking_and_retains_evidence(tmp_path, monkeypatch):
+    from herdr.launch_plan_handoff import LaunchPlanReconciliationRequired
+    worker, task = unresolved_private_launch_fixture(tmp_path, monkeypatch)
+    worker.prepare_attempt(task)
+    task.update(workspace=str(tmp_path), fencing_token=1)
+    with pytest.raises(RuntimeError, match="task_session_cleanup_failed:pre_split") as error:
+        worker.create_task_session(task)
+    assert isinstance(error.value.__cause__, RuntimeError)
+    assert "launch storage changed" in str(error.value.__cause__)
+    assert "LaunchPlanReconciliationRequired" in str(error.value)
+    session = task["execution_session"]
+    assert session["pane_split_started"] is False and "closed_at" not in session
+    assert session["cleanup_status"] == "launch_cleanup_failed"
+    assert Path(session["policy_file"]).is_file()
+    assert (task["id"], task["run_token"]) in worker.HOST_POLICY_LAUNCHES
+
+
+@pytest.mark.parametrize("child", [False, True])
+def test_actual_worker_quarantines_lost_reply_plus_cleanup_failure(tmp_path, monkeypatch, child):
+    worker, task = unresolved_private_launch_fixture(tmp_path, monkeypatch)
+    task["workspace"] = str(tmp_path)
+    if child:
+        task.update(parent_task_id="parent", run_token="child-run", idempotency_key="child-key",
+                    fencing_token=7, delegation_key="scope")
+    path = worker.RUNNING / "task-1.json"
+    worker.write_json(path, task)
+    monkeypatch.setattr(worker, "ensure_parent_scope", lambda task: None)
+    monkeypatch.setattr(worker, "freeze_plan", lambda *args: None)
+    monkeypatch.setattr(worker, "decide_model_route",
+                        lambda task: {"tier": "free", "selected_agent": "fixture"})
+    monkeypatch.setattr(worker, "record_model_route", lambda *args: None)
+    attempted = []
+    real = worker.create_task_session
+    def create(task):
+        attempted.append((task["run_token"], task["idempotency_key"], task["attempts"]))
+        return real(task)
+    monkeypatch.setattr(worker, "create_task_session", create)
+    monkeypatch.setattr(worker, "retry", lambda *args: pytest.fail("cleanup failure caused redispatch"))
+    monkeypatch.setattr(worker, "run_prompt", lambda *args: pytest.fail("unreconciled plan reached provider"))
+    assert worker.main(path) == 1
+    saved = json.loads((worker.BLOCKED / path.name).read_text())
+    assert [(saved["run_token"], saved["idempotency_key"], saved["attempts"])] == attempted
+    assert saved["attempts"] == 0 and not list(worker.PENDING.iterdir())
+    assert saved["attempt_state"] == "delivery_uncertain"
+    session = saved["execution_session"]
+    assert session["cleanup_status"] == "launch_cleanup_failed" and "closed_at" not in session
+    assert Path(session["policy_file"]).is_file()
+    assert (saved["id"], saved["run_token"]) in worker.HOST_POLICY_LAUNCHES
+    result = json.loads(worker.result_path(task["id"]).read_text())
+    assert result["blocker"] == "task_session_isolation_uncertain"

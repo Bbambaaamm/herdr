@@ -210,7 +210,7 @@ def _argv(plan, argv, workspace, profile):
     arities = {"--ro-bind": 2, "--bind-fd": 2, "--ro-bind-fd": 2, "--ro-bind-data": 2,
                "--tmpfs": 1, "--dev": 1, "--proc": 1, "--dir": 1, "--chdir": 1,
                "--remount-ro": 1, "--setenv": 2, "--unsetenv": 1,
-               "--unshare-pid": 0, "--unshare-net": 0, "--die-with-parent": 0}
+               "--unshare-pid": 0, "--die-with-parent": 0}
     public = {"HOME": "/home/agentops", "PATH": "/run/herdr/policy-code/agent-stack/policy-bin:/usr/bin:/bin",
               "HERDR_DURABLE_SANDBOX": "1"}
     operations, index = [], 1

@@ -248,9 +248,11 @@ def build_host_policy_factory(*,parent_grant=None,configuration_path=HOST_POLICY
             issuer = None
             if "automatic_issuer" in definition:
                 require(definition["automatic_issuer"] is True, "explicit automatic issuer opt-in required")
-                from .launch_plan_issuer import AutomaticLaunchPlanClient, protect_host_process, _digest
+                from .launch_plan_issuer import AutomaticLaunchPlanClient, protect_host_process, _digest, _policy
+                issuer_policy, issuer_host = _policy()
+                require(issuer_host == raw, "host automatic issuer policy changed during composition")
                 protect_host_process()
-                issuer = AutomaticLaunchPlanClient(_digest(raw), definition["timeout_seconds"])
+                issuer = AutomaticLaunchPlanClient(_digest(raw), issuer_policy["request_timeout_seconds"])
             handoff = LaunchPlanHandoff(definition["proposal_directory"],definition["timeout_seconds"],
                                       automatic_issuer=issuer)
         options=dict(approved_profile=profile,profile_preflight=preflight,private_plan_handoff=handoff,
