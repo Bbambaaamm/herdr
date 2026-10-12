@@ -412,11 +412,48 @@ def start_bridge(task: dict, session: dict) -> None:
     raise RuntimeError("durable_bridge_unavailable")
 
 
+def _bridge_exited(pidfd: int) -> bool:
+    import select
+    waiter = select.poll()
+    waiter.register(pidfd, select.POLLIN)
+    return any(fd == pidfd and events & select.POLLIN for fd, events in waiter.poll(5000))
+
+
 def stop_bridge(session: dict) -> None:
-    if bridge_alive(session):
-        os.kill(int(session["bridge_pid"]), signal.SIGTERM)
-    elif int(session.get("bridge_pid") or 0) > 0 and _bridge_process_live(int(session["bridge_pid"])):
-        raise RuntimeError("durable_bridge_identity_unverified")
+    pid = int(session.get("bridge_pid") or 0)
+    if pid <= 0:
+        return
+    try:
+        # Open before inspecting /proc so PID reuse cannot redirect the signal.
+        pidfd = os.pidfd_open(pid, 0)
+    except ProcessLookupError:
+        return
+    except (AttributeError, OSError) as exc:
+        raise RuntimeError("durable_bridge_identity_unverified") from exc
+    try:
+        if not bridge_alive(session):
+            if not _bridge_process_live(pid):
+                return
+            raise RuntimeError("durable_bridge_identity_unverified")
+        try:
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        if not _bridge_exited(pidfd):
+            raise RuntimeError("durable_bridge_cleanup_unverified")
+    finally:
+        os.close(pidfd)
+
+
+def _cleanup_bridge(session: dict) -> bool:
+    try:
+        stop_bridge(session)
+    except (OSError, RuntimeError) as exc:
+        session.pop("closed_at", None)
+        session["cleanup_status"] = "bridge_cleanup_unproven"
+        session["cleanup_error"] = str(exc)[-1000:]
+        return False
+    return True
 
 
 def ensure_parent_scope(task: dict) -> None:
@@ -1071,16 +1108,20 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
                 session["cleanup_status"] = "close_failed"
                 session["cleanup_error"] = str(exc)[-1000:]
             elif candidates:
-                session["closed_at"] = utcnow().isoformat()
-                session["cleanup_status"] = "closed"
+                session["cleanup_status"] = "pane_closed"
         if cleanup_failed:
             raise RuntimeError("task_session_cleanup_failed") from exc
         _cleanup_prepared_root_launch(task)
         if isinstance(task.get("execution_session"), dict):
-            if task["execution_session"].get("closed_at"):
-                stop_bridge(task["execution_session"])
-                if task["execution_session"].get("policy_file"):
-                    Path(task["execution_session"]["policy_file"]).unlink(missing_ok=True)
+            session = task["execution_session"]
+            if candidates:
+                if not _cleanup_bridge(session):
+                    persist_execution_session(task, startup=False)
+                    raise RuntimeError("task_session_cleanup_failed:bridge_cleanup_unproven") from exc
+                if session.get("policy_file"):
+                    Path(session["policy_file"]).unlink(missing_ok=True)
+                session["closed_at"] = utcnow().isoformat()
+                session["cleanup_status"] = "closed"
             persist_execution_session(task, startup=False)
         raise
 
@@ -1090,11 +1131,16 @@ def cleanup_task_session(task: dict) -> bool:
     if not isinstance(session, dict) or not session.get("owned_pane"):
         return True
     if session.get("closed_at"):
+        closed_at = session.pop("closed_at")
+        if not _cleanup_bridge(session):
+            return False
         try:
             _cleanup_prepared_root_launch(task)
         except Exception:
             session["cleanup_status"]="launch_cleanup_failed"
             return False
+        session["closed_at"] = closed_at
+        session["cleanup_status"] = "closed"
         return True
     pane_id = str(session.get("pane_id") or "")
     if not pane_id:
@@ -1109,6 +1155,8 @@ def cleanup_task_session(task: dict) -> bool:
                 _cleanup_prepared_root_launch(task)
             except Exception:
                 session["cleanup_status"] = "launch_cleanup_failed"
+                return False
+            if not _cleanup_bridge(session):
                 return False
             session["closed_at"] = utcnow().isoformat()
             session["cleanup_status"] = "closed_before_split"
@@ -1152,16 +1200,17 @@ def cleanup_task_session(task: dict) -> bool:
             session["cleanup_status"] = "close_unproven"
             return False
     if not present or _close_owned_pane(pane_id):
-        session["closed_at"] = utcnow().isoformat()
-        session["cleanup_status"] = "closed"
         try:
             _cleanup_prepared_root_launch(task)
         except Exception:
             session["cleanup_status"] = "launch_cleanup_failed"
             return False
-        stop_bridge(session)
+        if not _cleanup_bridge(session):
+            return False
         if session.get("policy_file"):
             Path(session["policy_file"]).unlink(missing_ok=True)
+        session["closed_at"] = utcnow().isoformat()
+        session["cleanup_status"] = "closed"
         return True
     session["cleanup_status"] = "close_failed"
     session["cleanup_error"] = "pane close failed"
@@ -1879,6 +1928,8 @@ def _main_with_epoch(task_path: Path) -> int:
                         "task_session_cleanup_failed",
                         "task_session_pane_not_isolated",
                         "task_session_split_uncertain",
+                        "durable_bridge_identity_unverified",
+                        "durable_bridge_cleanup_unverified",
                     )
                 ):
                     block_task(

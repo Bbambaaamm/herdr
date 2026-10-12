@@ -568,6 +568,7 @@ def test_client_uses_remaining_deadline_for_connect_send_and_reply(live, monkeyp
         def __exit__(self, *args): pass
         def settimeout(self, value): calls.append(("io", value))
         def sendmsg(self, blocks, rights):
+            assert json.loads(blocks[0])["deadline_monotonic_ns"] == 2_000_000_000
             clock["now"] += 0.25
             return len(blocks[0])
         def recv(self, maximum):
@@ -602,3 +603,49 @@ def test_client_exhausted_handoff_budget_cannot_send_a_request(live, monkeypatch
     with pytest.raises(SecurityError, match="deadline"):
         issuer.AutomaticLaunchPlanClient("a" * 64, 2).issue(live.launch, published, deadline=2.0)
     assert not list(live.plans.iterdir())
+
+
+@pytest.mark.parametrize("fault", ["missing", "bool", "text", "expired", "future", "queued",
+                                   "first-validation", "ticket-stage", "plan-stage", "policy-read"])
+def test_server_enforces_caller_deadline_before_each_publication(live, monkeypatch, fault):
+    _, _, approvals, listener = configure(live, monkeypatch)
+    clock = {"now": time.monotonic()}
+    monkeypatch.setattr(issuer, "time", SimpleNamespace(monotonic=lambda: clock["now"]))
+    original_receive = issuer._receive
+    def receive(connection, peer):
+        request, descriptors = original_receive(connection, peer)
+        if fault == "missing": request.pop("deadline_monotonic_ns")
+        elif fault == "bool": request["deadline_monotonic_ns"] = True
+        elif fault == "text": request["deadline_monotonic_ns"] = "late"
+        elif fault == "expired": request["deadline_monotonic_ns"] = int((clock["now"] - 1) * 1e9)
+        elif fault == "future": request["deadline_monotonic_ns"] = int((clock["now"] + 10) * 1e9)
+        elif fault == "queued": clock["now"] += 4
+        return request, descriptors
+    monkeypatch.setattr(issuer, "_receive", receive)
+    physical_calls = []
+    def physical(*args):
+        physical_calls.append(True)
+        boundary = {"first-validation": 1, "ticket-stage": 3, "plan-stage": 4}.get(fault)
+        if boundary is not None and len(physical_calls) == boundary:
+            clock["now"] += 4
+    monkeypatch.setattr(issuer, "_physical", physical)
+    original_policy = issuer._policy
+    policy_calls = []
+    def policy():
+        policy_calls.append(True)
+        if fault == "policy-read" and len(policy_calls) == 2: clock["now"] += 4
+        return original_policy()
+    monkeypatch.setattr(issuer, "_policy", policy)
+    thread, errors, results = run_server(listener)
+    try:
+        with pytest.raises(SecurityError):
+            live.launch.prepare_private_command(live.builder)
+        thread.join(4)
+        assert not thread.is_alive() and errors
+        assert not list(live.plans.glob("*.json"))
+        assert results[0].get("published") is not True
+        if fault not in {"plan-stage"}:
+            assert not list(approvals.glob("*.json"))
+    finally:
+        listener.close()
+        thread.join(4)

@@ -218,7 +218,10 @@ def test_bridge_liveness_and_stop_recognize_exact_launch_prefix(tmp_path, monkey
     monkeypatch.setattr(worker, "host_entrypoint_command", lambda *args, **kwargs: pytest.fail("current policy cannot redefine a live bridge"))
     assert worker.bridge_alive(session) is (not forged)
     killed = []
-    monkeypatch.setattr(worker.os, "kill", lambda *args: killed.append(args))
+    monkeypatch.setattr(worker.os, "pidfd_open", lambda *args: os.open("/dev/null", os.O_RDONLY))
+    monkeypatch.setattr(worker.signal, "pidfd_send_signal", lambda *args: killed.append(args))
+    monkeypatch.setattr(worker, "_bridge_exited", lambda pidfd: True)
+    monkeypatch.setattr(worker.os, "kill", lambda *args: pytest.fail("numeric PID signal is forbidden"))
     if forged:
         with pytest.raises(RuntimeError, match="identity_unverified"):
             worker.stop_bridge(session)
@@ -241,7 +244,9 @@ def test_reused_bridge_pid_requires_reconciliation_before_stop_or_restart(tmp_pa
                         if str(path) == "/proc/123/cmdline" else original_read(path))
     monkeypatch.setattr(worker, "_bridge_process_live", lambda pid: True)
     monkeypatch.setattr(worker, "process_start_ticks", lambda pid: 45)
-    monkeypatch.setattr(worker.os, "kill", lambda *args: pytest.fail("reused PID was signalled"))
+    monkeypatch.setattr(worker.os, "pidfd_open", lambda *args: os.open("/dev/null", os.O_RDONLY))
+    monkeypatch.setattr(worker.signal, "pidfd_send_signal", lambda *args: pytest.fail("reused process was signalled"))
+    monkeypatch.setattr(worker.os, "kill", lambda *args: pytest.fail("numeric PID signal is forbidden"))
     monkeypatch.setattr(worker.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("a second bridge was started"))
     assert not worker.bridge_alive(session)
     with pytest.raises(RuntimeError, match="identity_unverified"):
@@ -262,10 +267,98 @@ def test_bridge_reconciliation_distinguishes_exited_from_live_processes(monkeypa
     monkeypatch.setattr(Path, "read_text", stat_text)
     assert worker._bridge_process_live(123) is (state in {"S", "unreadable"})
     monkeypatch.setattr(worker, "bridge_alive", lambda session: False)
-    monkeypatch.setattr(worker.os, "kill", lambda *args: pytest.fail("unverified or exited process signalled"))
+    monkeypatch.setattr(worker.os, "pidfd_open", lambda *args: os.open("/dev/null", os.O_RDONLY))
+    monkeypatch.setattr(worker.signal, "pidfd_send_signal", lambda *args: pytest.fail("unverified or exited process signalled"))
     session = {"bridge_pid": 123}
     if state in {"S", "unreadable"}:
         with pytest.raises(RuntimeError, match="identity_unverified"):
             worker.stop_bridge(session)
     else:
         worker.stop_bridge(session)
+
+
+@pytest.mark.parametrize("exit_during_verification", [False, True])
+def test_bridge_stop_uses_actual_stable_pidfd(monkeypatch, exit_during_verification):
+    import subprocess
+    worker = load("automatic_bridge_actual_pidfd_test", "agent-task-worker")
+    process = subprocess.Popen([sys.executable, "-I", "-B", "-c", "import time; time.sleep(60)"])
+    def verified(session):
+        # Launch identity is an explicit double; the handle and signal are real.
+        if exit_during_verification:
+            handle = os.pidfd_open(process.pid, 0)
+            try: worker.signal.pidfd_send_signal(handle, worker.signal.SIGTERM)
+            finally: os.close(handle)
+            process.wait(timeout=5)
+        return True
+    monkeypatch.setattr(worker, "bridge_alive", verified)
+    monkeypatch.setattr(worker.os, "kill", lambda *args: pytest.fail("numeric PID signal is forbidden"))
+    try:
+        worker.stop_bridge({"bridge_pid": process.pid})
+        process.wait(timeout=5)
+        assert process.returncode is not None
+    finally:
+        if process.poll() is None:
+            handle = os.pidfd_open(process.pid, 0)
+            try: worker.signal.pidfd_send_signal(handle, worker.signal.SIGKILL)
+            finally: os.close(handle)
+            process.wait(timeout=5)
+
+
+def test_bridge_exit_timeout_keeps_cleanup_unproven(monkeypatch):
+    worker = load("automatic_bridge_exit_timeout_test", "agent-task-worker")
+    monkeypatch.setattr(worker.os, "pidfd_open", lambda *args: os.open("/dev/null", os.O_RDONLY))
+    monkeypatch.setattr(worker.signal, "pidfd_send_signal", lambda *args: None)
+    monkeypatch.setattr(worker, "bridge_alive", lambda session: True)
+    monkeypatch.setattr(worker, "_bridge_exited", lambda pidfd: False)
+    session = {"bridge_pid": 123, "closed_at": "previous-marker"}
+    assert not worker._cleanup_bridge(session)
+    assert "closed_at" not in session
+    assert session["cleanup_status"] == "bridge_cleanup_unproven"
+
+
+@pytest.mark.parametrize("closed", [False, True])
+def test_unverified_bridge_cannot_close_or_replace_session(tmp_path, monkeypatch, closed):
+    worker = load("automatic_bridge_cleanup_gate_test", "agent-task-worker")
+    session = {"owned_pane": True, "pane_id": "owned", "bridge_pid": 123}
+    if closed: session["closed_at"] = "stale-closed-marker"
+    task = {"execution_session": session}
+    monkeypatch.setattr(worker, "_cleanup_prepared_root_launch", lambda task: None)
+    monkeypatch.setattr(worker, "_herdr_json", lambda *args, **kwargs: {"result": {"panes": []}})
+    monkeypatch.setattr(worker, "stop_bridge",
+                        lambda session: (_ for _ in ()).throw(RuntimeError("durable_bridge_identity_unverified")))
+    assert worker.cleanup_task_session(task) is False
+    assert "closed_at" not in session
+    assert session["cleanup_status"] == "bridge_cleanup_unproven"
+    with pytest.raises(RuntimeError, match="previous_task_session_not_closed"):
+        worker.prepare_attempt(task)
+
+
+def test_setup_cleanup_keeps_failed_bridge_session_open(tmp_path, monkeypatch):
+    from tests.agent_stack import test_worker_handshake as fixture
+    fixture.configure_paths(tmp_path)
+    fixture.explicit_host_policy_for_worker_lifecycle_tests.__wrapped__(monkeypatch)
+    worker = fixture.worker
+    task = fixture.base_task()
+    task.update(workspace=str(tmp_path / "workspace"), run_token="setup-run",
+                routing={"selected_agent": "quantlab-hermes"})
+    def native(args, **kwargs):
+        if args[:2] == ["agent", "get"]:
+            return {"result": {"agent": {"agent": "hermes", "pane_id": "coordinator", "workspace_id": "w2"}}}
+        if args[:2] == ["pane", "split"]: return {"result": {"pane": {"pane_id": "owned-pane"}}}
+        if args[:2] == ["pane", "list"]: return {"result": {"panes": []}}
+        raise AssertionError(args)
+    def start(task, session):
+        session["bridge_pid"] = 123
+        raise RuntimeError("durable_bridge_identity_unverified")
+    monkeypatch.setattr(worker, "_herdr_json", native)
+    monkeypatch.setattr(worker, "start_bridge", start)
+    monkeypatch.setattr(worker, "_cleanup_setup_pane", lambda *args, **kwargs: True)
+    monkeypatch.setattr(worker, "_cleanup_prepared_root_launch", lambda task: None)
+    monkeypatch.setattr(worker, "frozen_policy", lambda: fixture._policy_file(tmp_path))
+    monkeypatch.setattr(worker, "sandbox_command", lambda *args, **kwargs: ["bwrap"])
+    monkeypatch.setattr(worker, "stop_bridge",
+                        lambda session: (_ for _ in ()).throw(RuntimeError("durable_bridge_identity_unverified")))
+    with pytest.raises(RuntimeError, match="task_session_cleanup_failed:bridge_cleanup_unproven"):
+        worker.create_task_session(task)
+    assert "closed_at" not in task["execution_session"]
+    assert task["execution_session"]["cleanup_status"] == "bridge_cleanup_unproven"

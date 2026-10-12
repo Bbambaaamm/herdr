@@ -109,7 +109,7 @@ def _peer(connection, issuer, raw):
     require(uid == raw["host_uid"] and pid > 0, "issuer caller is not the configured host")
     ticks = process_start_ticks(pid)
     require(Path(f"/proc/{pid}").stat().st_uid == 0, "issuer caller must be non-dumpable")
-    for name in ("mnt", "pid", "user", "cgroup", "net"):
+    for name in ("mnt", "pid", "user", "cgroup", "net", "time"):
         require(os.readlink(f"/proc/{pid}/ns/{name}") == os.readlink(f"/proc/self/ns/{name}"),
                 "sandbox callers cannot issue host plans")
     groups = _proc_bytes(pid, "cgroup", 8192).decode().splitlines()
@@ -394,7 +394,8 @@ def _physical(plan, argv, grant, profile, fds, raw):
 
 
 def _validate(request, fds, peer, raw):
-    require(set(request) == {"schema_version", "proposal", "grant", "parent_grant", "policy_sha256"}
+    require(set(request) == {"schema_version", "proposal", "grant", "parent_grant", "policy_sha256",
+                             "deadline_monotonic_ns"}
             and request["schema_version"] == VERSION and request["policy_sha256"] == _digest(raw),
             "closed issuer request with current policy required")
     proposal = request["proposal"]
@@ -423,20 +424,28 @@ def issue_request(connection):
     started = time.monotonic()
     issuer, raw = _policy()
     peer = _peer(connection, issuer, raw)
-    connection.settimeout(issuer["request_timeout_seconds"])
+    maximum_deadline = started + issuer["request_timeout_seconds"]
+    require(time.monotonic() < maximum_deadline, "issuer setup deadline expired")
+    connection.settimeout(maximum_deadline - time.monotonic())
     connection.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
     request, fds = _receive(connection, peer)
-    deadline = started + issuer["request_timeout_seconds"]
     try:
+        requested_deadline = request.get("deadline_monotonic_ns")
+        require(type(requested_deadline) is int and 0 < requested_deadline < 1 << 63,
+                "bounded caller deadline required")
+        deadline = requested_deadline / 1_000_000_000
+        require(started < deadline <= maximum_deadline and time.monotonic() < deadline,
+                "issuer caller deadline expired or exceeds its bound")
         grant, name = _validate(request, fds, peer, raw)
+        def live_authority():
+            require(_policy() == (issuer, raw) and _peer(connection, issuer, raw) == peer,
+                    "issuer authority changed during source verification")
+            # Check the caller's clock after expensive policy/peer reads.
+            require(time.monotonic() < deadline, "issuer caller deadline expired")
         def current():
-            require(time.monotonic() < deadline and _policy() == (issuer, raw)
-                    and _peer(connection, issuer, raw) == peer, "issuer authority changed or expired")
+            live_authority()
             _validate(request, fds, peer, raw)
-            # Source hashing can take time. Recheck withdrawal/peer/deadline
-            # after that work as well, immediately before atomic publication.
-            require(time.monotonic() < deadline and _policy() == (issuer, raw)
-                    and _peer(connection, issuer, raw) == peer, "issuer authority changed during source verification")
+            live_authority()
         current()
         now = datetime.now(UTC)
         ticket = {"schema_version": publication.TICKET_VERSION, "plan": request["proposal"]["plan"],
@@ -486,7 +495,8 @@ class AutomaticLaunchPlanClient:
         proposal = json.loads(published[1])
         request = {"schema_version": VERSION, "proposal": proposal, "grant": launch.grant.to_json(),
                    "parent_grant": launch._parent.to_json() if launch._parent is not None else None,
-                   "policy_sha256": self.policy_sha256}
+                   "policy_sha256": self.policy_sha256,
+                   "deadline_monotonic_ns": int(deadline * 1_000_000_000)}
         body = canonical_json_bytes(request)
         require(len(body) <= MAX_REQUEST, "issuer request exceeds bound")
         with _connect_issuer(remaining()) as connection:
