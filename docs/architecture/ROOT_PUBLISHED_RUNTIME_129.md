@@ -382,7 +382,7 @@ The root-protected `/etc/herdr/launch-plan-issuer.json` has exactly:
   "schema_version": "herdr-automatic-launch-plan-1",
   "host_policy_sha256": "<SHA-256 of canonical current host-policy JSON>",
   "host_cgroups": ["/system.slice/<existing-approved-host-service>.service"],
-  "entrypoints": ["agent-stack/bin/agent-task-worker"],
+  "entrypoints": ["agent-stack/bin/agent-task-worker", "agent-stack/bin/agent-durable-bridge"],
   "request_timeout_seconds": 30
 }
 ```
@@ -395,6 +395,8 @@ the approved immutable Python runtime and code release, with this invocation:
 ```text
 <root-published-python>/bin/python3.11 -I -B <root-published-code>/agent-stack/bin/agent-herdr-host-entrypoint agent-stack/bin/agent-task-worker <existing-worker-arguments>
 ```
+
+In opt-in automatic mode the existing dispatcher selects this pinned wrapper before claiming a pending task, and the worker starts its existing durable child bridge through the same wrapper. Both entrypoints must be approved. A missing/mismatched issuer policy, wrong UID or mutable caller release denies before the dispatcher updates the task. Schema-1 and manual configurations retain the existing invocation. Recovery recognizes the exact wrapped bridge command prefix. All processes remain children of the existing host service; no additional dispatcher or queue is installed.
 
 The wrapper protects the host process from same-UID ptrace/proc access before
 running an existing approved entrypoint. It checks the current issuer-policy

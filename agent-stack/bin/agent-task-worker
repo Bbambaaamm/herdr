@@ -35,7 +35,9 @@ LOCK = ROOT / "worker.lock"
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
 from herdr.launch_environment import sanitize_environment
-ENV = sanitize_environment(os.environ)
+from herdr.host_configuration import host_entrypoint_command
+ENV = {key: value for key, value in sanitize_environment(os.environ).items()
+       if not key.startswith("PYTHON")}
 AGENT_BIN = Path(__file__).resolve().parent
 ENV["HOME"] = str(HOME)
 ENV["PATH"] = f"{AGENT_BIN}:{HOME}/.local/node24/bin:{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin"
@@ -321,8 +323,10 @@ def bridge_alive(session: dict) -> bool:
     try:
         args = [part.decode("utf-8", errors="replace") for part in
                 Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if part]
+        expected = host_entrypoint_command("agent-stack/bin/agent-durable-bridge", [],
+                                           legacy_command=[sys.executable, str(BRIDGE)])
         return (
-            str(BRIDGE) in args
+            args[:len(expected)] == expected
             and "--task-id" in args
             and args[args.index("--task-id") + 1] == task_id
             and "--run-token" in args
@@ -338,10 +342,12 @@ def start_bridge(task: dict, session: dict) -> None:
         return
     name = bridge_socket_name(task)
     task_file = Path(str(task["task_file"])).resolve()
-    args = [sys.executable, str(BRIDGE), "--task-file", str(task_file),
+    arguments = ["--task-file", str(task_file),
             "--task-id", str(task["id"]), "--run-token", str(task["run_token"]),
             "--agent", session["agent_name"], "--pane", session["pane_id"],
             "--marker", session["pane_marker"], "--real-binary", str(HERDR)]
+    args = host_entrypoint_command("agent-stack/bin/agent-durable-bridge", arguments,
+                                  legacy_command=[sys.executable, str(BRIDGE), *arguments])
     log_path = LOGS / f"{task['id']}.bridge.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as output:
