@@ -167,3 +167,26 @@ def test_runtime_toolset_maps_only_explicit_external_knowledge():
     assert _child_toolsets(("read_file", TOOL)) == f"file,{TOOLSET}"
     with pytest.raises(HerdrRuntimeError, match="child_toolset_unmapped"):
         _child_toolsets(("external_knowledge",))
+
+
+def test_provider_result_cannot_flood_model_context(tmp_path, monkeypatch):
+    installation, registry, fake = installed(tmp_path, monkeypatch)
+
+    def oversized(identity, grant_sha256, provider_id, request):
+        fake.calls.append((identity, grant_sha256, provider_id, request))
+        chunk = "x" * 300_000
+        return KnowledgeResponse(
+            request.request_id,
+            "completed",
+            "bounded summary",
+            tuple(
+                KnowledgeSourceResult(source, "ok", 1, answer=chunk)
+                for source in request.sources
+            ),
+            False,
+        )
+
+    fake.external_knowledge = oversized
+    result = json.loads(registry.get_entry(TOOL).handler(arguments()))
+    assert result == {"error": "external_knowledge_contract_denied"}
+    assert len(fake.calls) == 1
