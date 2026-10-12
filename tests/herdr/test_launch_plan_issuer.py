@@ -23,7 +23,8 @@ import pytest
 
 from herdr import host_configuration as host, launch_plan_publication as publication
 from herdr import launch_plan_issuer as issuer, launch_plan_handoff as handoff
-from herdr.policy_launch import FrozenTree, CODE_TARGET, BUNDLE_TARGET, RUNTIME_TARGETS, process_start_ticks
+from herdr.policy_launch import FrozenTree, CODE_TARGET, BUNDLE_TARGET, RUNTIME_TARGETS, process_start_ticks, IDENTITY_ENV
+from herdr.launch_environment import STARTUP_CONTROLS
 from herdr.private_mount_plan import request_for
 from herdr.security import SecurityError, ToolRule, RiskClass, canonical_json_bytes
 from tests.herdr.test_launch_plan_handoff import live
@@ -738,3 +739,27 @@ def test_automatic_native_grammar_denies_private_network_namespace(physical):
     plan = request_for(physical.grant.identity, physical.plan["descriptors"], argv)
     with pytest.raises(SecurityError, match="unsupported automatic mount operation"):
         issuer._argv(plan, argv, physical.grant.workspace_root, physical.profile)
+
+
+@pytest.mark.parametrize("key", [
+    *IDENTITY_ENV.values(),
+    "HERDR_DURABLE_TASK_PANE", "HERDR_DURABLE_TASK_ID", "HERDR_DURABLE_RUN_TOKEN",
+    "HERDR_DURABLE_TASK_FILE", "HERDR_DURABLE_AGENT", "HERDR_DURABLE_MARKER",
+    "HERDR_DURABLE_BRIDGE_SOCKET", "HERDR_REAL_BINARY", "OTHER_INHERITED_KEY"])
+def test_automatic_native_cleanup_cannot_unset_inherited_launch_context(physical, key):
+    argv = list(physical.argv)
+    argv[argv.index("--remount-ro"):argv.index("--remount-ro")] = ["--unsetenv", key]
+    plan = request_for(physical.grant.identity, physical.plan["descriptors"], argv)
+    with pytest.raises(SecurityError, match="approved startup cleanup"):
+        issuer._argv(plan, argv, physical.grant.workspace_root, physical.profile)
+
+
+@pytest.mark.parametrize("key", [
+    *STARTUP_CONTROLS,
+    "HERMES_HOME", "HERMES_PROFILE", "HERMES_CONFIG_DIR", "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "LD_FUTURE_CONTROL"])
+def test_automatic_native_cleanup_accepts_only_builder_cleanup_inventory(physical, key):
+    argv = list(physical.argv)
+    argv[argv.index("--remount-ro"):argv.index("--remount-ro")] = ["--unsetenv", key]
+    plan = request_for(physical.grant.identity, physical.plan["descriptors"], argv)
+    issuer._argv(plan, argv, physical.grant.workspace_root, physical.profile)

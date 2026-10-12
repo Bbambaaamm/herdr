@@ -213,6 +213,10 @@ def _argv(plan, argv, workspace, profile):
                "--unshare-pid": 0, "--die-with-parent": 0}
     public = {"HOME": "/home/agentops", "PATH": "/run/herdr/policy-code/agent-stack/policy-bin:/usr/bin:/bin",
               "HERDR_DURABLE_SANDBOX": "1"}
+    from .launch_environment import STARTUP_CONTROLS
+    cleanup_keys = set(STARTUP_CONTROLS) | {
+        "HERMES_HOME", "HERMES_PROFILE", "HERMES_CONFIG_DIR", "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"}
     operations, index = [], 1
     while index < end:
         op = argv[index]
@@ -220,7 +224,10 @@ def _argv(plan, argv, workspace, profile):
         values = tuple(argv[index + 1:index + 1 + arities[op]])
         if op == "--ro-bind": require(values == ("/", "/"), "unexpected literal mount")
         if op == "--setenv": require(len(values) == 2 and public.get(values[0]) == values[1], "non-public launch environment")
-        if op == "--unsetenv": require(values[0] not in public, "required public environment cannot be unset")
+        if op == "--unsetenv":
+            require(values[0] not in public, "required public environment cannot be unset")
+            require(values[0] in cleanup_keys or re.fullmatch(r"LD_[A-Za-z0-9_]+", values[0]),
+                    "only approved startup cleanup may unset inherited environment")
         if op == "--chdir": require(values == (workspace,), "launch workspace differs")
         if op in {"--dir", "--tmpfs", "--remount-ro"}: require(publication._target(values[0]), "non-canonical mount target")
         operations.append((op, values)); index += 1 + arities[op]
