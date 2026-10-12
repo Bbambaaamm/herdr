@@ -70,11 +70,15 @@ def _build(launch, builder):
 
 class LaunchPlanHandoff:
     """Configured only by the trusted host factory, before any pane exists."""
-    def __init__(self, proposal_directory, timeout_seconds):
+    def __init__(self, proposal_directory, timeout_seconds, *, automatic_issuer=None):
         require(type(timeout_seconds) is int and 1 <= timeout_seconds <= 60,
                 "finite launch-plan handoff deadline required")
         self.directory, _ = _directory(proposal_directory)
         self.timeout_seconds = timeout_seconds
+        from .launch_plan_issuer import AutomaticLaunchPlanClient
+        require(automatic_issuer is None or isinstance(automatic_issuer, AutomaticLaunchPlanClient),
+                "typed automatic host issuer required")
+        self.automatic_issuer = automatic_issuer
 
     def _publish_proposal(self, launch, plan, argv):
         from .policy_launch import process_start_ticks
@@ -149,6 +153,10 @@ class LaunchPlanHandoff:
         self._live(launch, grant_sha256, profile)
         plan, argv = _build(launch, builder)
         published = self._publish_proposal(launch, plan, argv)
+        if self.automatic_issuer is not None:
+            self._verify_proposal(published)
+            self._live(launch, grant_sha256, profile)
+            self.automatic_issuer.issue(launch, published)
         destination = AUTHORITY_ROOT / published[0].name
         while True:
             self._verify_proposal(published)

@@ -294,7 +294,7 @@ Publication is not physical launch acceptance: the FD launcher, immutable
 source checks, active grant, current fence, profile, result reservation and
 bootstrap checks remain mandatory. The ticket window limits issuance; it does
 not change the lifetime/recovery semantics of the retained plan or revoke a
-previously issued record. Automatic issuance/renewal remain separate integration work; the opt-in live
+previously issued record. Automatic issuance is available through the opt-in root authority below; credential renewal remains separate work; the opt-in live
 worker/operator handoff is described below. This change does
 not activate that path or establish private native root/child acceptance.
 
@@ -365,3 +365,96 @@ and bootstrap authority checks remain prerequisites in the production path.
 The committed inventory is reviewed release code. Workers cannot provide one or
 refresh its pin. SDK updates require a new audited source inventory, explicit
 launcher/source/executor pins and the existing release publication workflow.
+
+## Automatic issuance through the existing root plan authority
+
+Private host composition may opt into `private_launch.plan_handoff.automatic_issuer: true`.
+The option does not install or activate an issuer. Existing configurations keep
+the operator ticket flow. The automatic client requests one exact plan, before
+seal/pane/provider work, using a bounded Unix `SOCK_SEQPACKET` operation and real
+`SCM_RIGHTS` descriptors. The existing root-owned ticket publisher and
+`ApprovedPrivateMountPlan` remain the publication and consumption authorities.
+
+The root-protected `/etc/herdr/launch-plan-issuer.json` has exactly:
+
+```json
+{
+  "schema_version": "herdr-automatic-launch-plan-1",
+  "host_policy_sha256": "<SHA-256 of canonical current host-policy JSON>",
+  "host_cgroups": ["/system.slice/<existing-approved-host-service>.service"],
+  "entrypoints": ["agent-stack/bin/agent-task-worker"],
+  "request_timeout_seconds": 30
+}
+```
+
+Only explicit non-delegated service cgroups are allowed, never a user slice or
+an entire system slice. Their ancestry and migration controls must remain root
+owned and non-writable by the service user. The existing host service must use
+the approved immutable Python runtime and code release, with this invocation:
+
+```text
+<root-published-python>/bin/python3.11 -I -B <root-published-code>/agent-stack/bin/agent-herdr-host-entrypoint agent-stack/bin/agent-task-worker <existing-worker-arguments>
+```
+
+The wrapper protects the host process from same-UID ptrace/proc access before
+running an existing approved entrypoint. It checks the current issuer-policy
+pin, interpreter flags/path, and complete root-protected code/runtime manifests.
+It does not start an agent, queue, scheduler, provider request, or alternative
+admission authority. Only the configured existing entrypoints may run. They must
+be compatible with the pinned interpreter and dependencies; verify that in the
+new release before activation. Raw credentials are never issuer-policy fields.
+
+The plan authority listens only at `/run/herdr-launch-authority/issuer.sock` in
+a root-protected directory. UID equality is insufficient: it verifies kernel
+connection and per-message credentials, PID/start ticks, non-dumpability, exact
+service cgroup, host mount/PID/user/cgroup/network namespaces, approved launcher
+argv and actual interpreter inode. Sandbox callers, mutable checkouts, unrelated
+same-UID processes and transferred connections from another PID are denied.
+The issuer and existing host service must share the host namespaces; configure
+neither service with a conflicting private mount/user/network namespace.
+
+Each request binds the current root host-policy digest, full invocation/fence,
+active grant under the existing consumer ceiling, optional active parent grant,
+unchanged profile credential window, exact proposal evidence and complete actual
+FD inventory. Real sealed profile memfds must match root-approved hashes. Code,
+SDK and Python must match the complete immutable root-published manifests and
+inodes. The bundle remains an empty pre-seal slot, bootstrap transport matches
+approved entrypoint bytes/proof, and the result must be the exact empty reserved
+inode with no previous delivery intent. Writable directories remain within the
+host grant. Native command grammar, private masks, public environment and FD
+mount roles are checked independently. Current host parent/bootstrap/fence and
+work-policy verification remain mandatory in the existing launch path.
+
+The authority creates a fresh root-owned 0400 issuance ticket, rechecks the peer,
+policy, grant and sources before its no-replace publication, then calls the
+existing 0444 plan publisher with the same live recheck immediately before the
+plan's atomic no-replace publication. Existing tickets/plans are never replaced,
+renewed, replayed or deleted. Hidden interrupted stages and proposal evidence
+remain available for explicit reconciliation. A lost response does not trigger
+an automatic retry or a new economic attempt. The waiting host still reads and
+authorizes the exact root plan, and performs its final handoff checks before the
+actual native pane starts. Error replies contain a generic reason only.
+
+Root operator preparation for a separately approved deployment:
+
+1. Publish the reviewed new code/runtime closure and updated host policy. The old
+   publication bundle is not this new source version and must not be reused.
+2. Approve the exact existing host service cgroup(s)/entrypoint(s), pin the new
+   canonical host policy, and create the root-protected issuer configuration,
+   approval/plan directories and `/run/herdr-launch-authority` directory.
+3. Start `scripts/serve-herdr-launch-plan-issuer.py` from the immutable release
+   with its approved interpreter, `-I -B`, and the necessary root authority.
+   Never execute a mutable worker checkout as root. An existing socket requires
+   explicit reconciliation; this helper never unlinks it automatically.
+4. Configure the existing host entrypoint wrapper and opt-in handoff; verify a
+   real zero-provider root/child/result flow, then the existing canary, recovery
+   and soak requirements before autonomous activation.
+
+Source implementation and disposable tests do not establish privileged native
+acceptance. Test root ownership, service admission and credential/interpreter
+authority doubles are recorded explicitly. No service installation, root write,
+provider call, budget change or deployment is performed by these tests.
+
+Linux interfaces: [Unix credentials and descriptor passing](https://www.man7.org/linux/man-pages/man7/unix.7.html),
+[non-dumpable process ownership](https://www.man7.org/linux/man-pages/man5/proc_pid.5.html),
+[cgroup v2 migration permissions](https://cdn.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html).

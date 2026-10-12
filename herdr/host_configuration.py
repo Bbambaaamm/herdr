@@ -193,10 +193,19 @@ def build_host_policy_factory(*,parent_grant=None,configuration_path=HOST_POLICY
         if "plan_handoff" in raw["private_launch"]:
             from .launch_plan_handoff import LaunchPlanHandoff
             definition = raw["private_launch"]["plan_handoff"]
-            require(isinstance(definition,dict) and set(definition)=={"proposal_directory","timeout_seconds"}
+            require(isinstance(definition,dict) and set(definition) in (
+                    {"proposal_directory","timeout_seconds"},
+                    {"proposal_directory","timeout_seconds","automatic_issuer"})
                     and isinstance(definition["proposal_directory"],str),
                     "closed host launch-plan handoff configuration required")
-            handoff = LaunchPlanHandoff(definition["proposal_directory"],definition["timeout_seconds"])
+            issuer = None
+            if "automatic_issuer" in definition:
+                require(definition["automatic_issuer"] is True, "explicit automatic issuer opt-in required")
+                from .launch_plan_issuer import AutomaticLaunchPlanClient, protect_host_process, _digest
+                protect_host_process()
+                issuer = AutomaticLaunchPlanClient(_digest(raw), definition["timeout_seconds"])
+            handoff = LaunchPlanHandoff(definition["proposal_directory"],definition["timeout_seconds"],
+                                      automatic_issuer=issuer)
         options=dict(approved_profile=profile,profile_preflight=preflight,private_plan_handoff=handoff,
                      parent_approved_profile=profile if parent_grant is not None else None,
                      retained_parent_verify=retained_parent_verify)

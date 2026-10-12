@@ -147,6 +147,13 @@ def publish_approved_launch_plan(configuration_path, *, publish=False):
     proposal is never an input to this helper. Admission and bootstrap continue
     to verify actual FDs, immutable sources, profile, grant, fence and result.
     """
+    return _publish_approved_launch_plan(configuration_path, publish=publish)
+
+
+def _publish_approved_launch_plan(configuration_path, *, publish=False, before_publish=None):
+    # The automatic root authority supplies its live peer/policy/FD recheck.
+    # This is an in-process host hook, never a worker-selected callable.
+    require(before_publish is None or callable(before_publish), "typed publication verifier required")
     if publish:
         require(os.geteuid() == 0, "launch-plan publication requires privileged operator")
     path, ticket, name = _approval(configuration_path)
@@ -174,6 +181,8 @@ def publish_approved_launch_plan(configuration_path, *, publish=False):
         _, current, _ = _approval(path)
         require(current == ticket, "operator approval changed during publication")
         _window(ticket)
+        if before_publish is not None:
+            before_publish()
         _rename_without_replacement(parent, Path(stage).name, name)
         os.fsync(parent)
         return {**record, "published": True}
