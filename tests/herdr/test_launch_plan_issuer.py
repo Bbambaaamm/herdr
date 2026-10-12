@@ -544,3 +544,61 @@ def test_physical_policy_rejects_source_and_command_attacks(physical, fault):
             issuer._physical(plan, argv, p.grant, p.profile, fds, p.raw)
     finally:
         if extra is not None: os.close(extra)
+
+
+@pytest.mark.parametrize("key", ["HOME", "PATH", "HERDR_DURABLE_SANDBOX"])
+@pytest.mark.parametrize("position", ["before", "after"])
+def test_required_public_environment_cannot_be_unset(physical, key, position):
+    argv = list(physical.argv)
+    index = argv.index("--setenv") if position == "before" else argv.index("--remount-ro")
+    argv[index:index] = ["--unsetenv", key]
+    plan = request_for(physical.grant.identity, physical.plan["descriptors"], argv)
+    with pytest.raises(SecurityError, match="required public environment"):
+        issuer._argv(plan, argv, physical.grant.workspace_root, physical.profile)
+
+
+def test_client_uses_remaining_deadline_for_connect_send_and_reply(live, monkeypatch):
+    plan, argv = handoff._build(live.launch, live.builder)
+    published = live.launch.private_plan_handoff._publish_proposal(live.launch, plan, argv)
+    clock = {"now": 0.0}
+    monkeypatch.setattr(issuer, "time", SimpleNamespace(monotonic=lambda: clock["now"]))
+    calls = []
+    class Connection:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def settimeout(self, value): calls.append(("io", value))
+        def sendmsg(self, blocks, rights):
+            clock["now"] += 0.25
+            return len(blocks[0])
+        def recv(self, maximum):
+            return canonical_json_bytes({"schema_version": issuer.VERSION,
+                "identity_sha256": issuer._digest(live.launch.identity.to_json()),
+                "plan_sha256": issuer._digest(plan), "published": True})
+    def connect(timeout):
+        calls.append(("connect", timeout))
+        clock["now"] += 0.5
+        return Connection()
+    monkeypatch.setattr(issuer, "_connect_issuer", connect)
+    issuer.AutomaticLaunchPlanClient("a" * 64, 2).issue(live.launch, published, deadline=2.0)
+    assert calls == [("connect", 2.0), ("io", 1.5), ("io", 1.25)]
+
+
+@pytest.mark.parametrize("stage", ["before-connect", "after-connect"])
+def test_client_exhausted_handoff_budget_cannot_send_a_request(live, monkeypatch, stage):
+    plan, argv = handoff._build(live.launch, live.builder)
+    published = live.launch.private_plan_handoff._publish_proposal(live.launch, plan, argv)
+    clock = {"now": 2.0 if stage == "before-connect" else 0.0}
+    monkeypatch.setattr(issuer, "time", SimpleNamespace(monotonic=lambda: clock["now"]))
+    class Connection:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def settimeout(self, value): pass
+        def sendmsg(self, *args): pytest.fail("expired budget sent descriptors")
+    def connect(timeout):
+        assert stage == "after-connect", "expired budget contacted the issuer"
+        clock["now"] = 2.0
+        return Connection()
+    monkeypatch.setattr(issuer, "_connect_issuer", connect)
+    with pytest.raises(SecurityError, match="deadline"):
+        issuer.AutomaticLaunchPlanClient("a" * 64, 2).issue(live.launch, published, deadline=2.0)
+    assert not list(live.plans.iterdir())

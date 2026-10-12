@@ -64,13 +64,16 @@ def _tree(raw, *, immutable=False):
         tuple(raw["executable_files"]),raw["max_bytes"],raw["max_file_bytes"])
 
 
-def host_entrypoint_command(entrypoint, arguments, *, legacy_command):
+def host_entrypoint_command(entrypoint, arguments, *, legacy_command, binding=None):
     """Select the immutable host wrapper only from the protected opt-in policy.
 
     Resolve admission before the dispatcher claims a task. Task fields and
     environment variables cannot select a release, interpreter or entrypoint.
     Missing/schema-1/manual configuration retains the existing command.
     """
+    if binding is not None:
+        require(isinstance(binding, dict), "host launch binding record required")
+        binding.clear()
     try:
         raw = _read_configuration(HOST_POLICY_CONFIG)
     except FileNotFoundError:
@@ -100,6 +103,9 @@ def host_entrypoint_command(entrypoint, arguments, *, legacy_command):
     require(isinstance(arguments, (list, tuple))
             and all(isinstance(value, str) and "\0" not in value for value in arguments),
             "host arguments must be literal strings")
+    if binding is not None:
+        from .launch_plan_issuer import _digest
+        binding.update(host_policy_sha256=_digest(raw), code_source=str(code))
     python = next(row for row in raw["runtime"] if row["target"] == str(PYTHON_TARGET))
     return [str(Path(python["source"]) / PYTHON_EXECUTABLE), "-I", "-B",
             str(code / HOST_ENTRYPOINT), entrypoint, *arguments]

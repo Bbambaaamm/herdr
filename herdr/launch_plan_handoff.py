@@ -156,7 +156,11 @@ class LaunchPlanHandoff:
         if self.automatic_issuer is not None:
             self._verify_proposal(published)
             self._live(launch, grant_sha256, profile)
-            self.automatic_issuer.issue(launch, published)
+            self.automatic_issuer.issue(launch, published, deadline=deadline)
+            # Publication succeeded. Give binding its own finite window rather
+            # than strand this no-replace identity on an earlier setup clock.
+            # Current grant/profile/FD authority is still rechecked throughout.
+            deadline = time.monotonic() + self.timeout_seconds
         destination = AUTHORITY_ROOT / published[0].name
         while True:
             self._verify_proposal(published)

@@ -220,6 +220,7 @@ def _argv(plan, argv, workspace, profile):
         values = tuple(argv[index + 1:index + 1 + arities[op]])
         if op == "--ro-bind": require(values == ("/", "/"), "unexpected literal mount")
         if op == "--setenv": require(len(values) == 2 and public.get(values[0]) == values[1], "non-public launch environment")
+        if op == "--unsetenv": require(values[0] not in public, "required public environment cannot be unset")
         if op == "--chdir": require(values == (workspace,), "launch workspace differs")
         if op in {"--dir", "--tmpfs", "--remount-ro"}: require(publication._target(values[0]), "non-canonical mount target")
         operations.append((op, values)); index += 1 + arities[op]
@@ -471,7 +472,16 @@ class AutomaticLaunchPlanClient:
                 and type(timeout_seconds) is int and 1 <= timeout_seconds <= 60, "bounded automatic issuer client required")
         self.policy_sha256, self.timeout_seconds = policy_sha256, timeout_seconds
 
-    def issue(self, launch, published):
+    def issue(self, launch, published, *, deadline=None):
+        now = time.monotonic()
+        if deadline is None:
+            deadline = now + self.timeout_seconds
+        require(type(deadline) in (int, float) and now < deadline <= now + self.timeout_seconds,
+                "automatic issuance deadline expired or exceeds its bound")
+        def remaining():
+            value = deadline - time.monotonic()
+            require(value > 0, "automatic issuance deadline expired")
+            return value
         launch.private_plan_handoff._verify_proposal(published)
         proposal = json.loads(published[1])
         request = {"schema_version": VERSION, "proposal": proposal, "grant": launch.grant.to_json(),
@@ -479,10 +489,12 @@ class AutomaticLaunchPlanClient:
                    "policy_sha256": self.policy_sha256}
         body = canonical_json_bytes(request)
         require(len(body) <= MAX_REQUEST, "issuer request exceeds bound")
-        with _connect_issuer(self.timeout_seconds) as connection:
+        with _connect_issuer(remaining()) as connection:
+            connection.settimeout(remaining())
             rights = array.array("i", [entry["fd"] for entry in proposal["plan"]["descriptors"]])
             require(connection.sendmsg([body], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)]) == len(body),
                     "issuer packet delivery incomplete")
+            connection.settimeout(remaining())
             answer = connection.recv(4097)
             require(0 < len(answer) <= 4096, "bounded issuer response required")
             result = json.loads(answer)

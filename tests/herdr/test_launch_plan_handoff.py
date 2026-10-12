@@ -295,3 +295,24 @@ def test_handoff_proposals_cannot_live_under_admitted_workspace(tmp_path, monkey
     raw["private_launch"]["plan_handoff"] = {"proposal_directory": str(proposals), "timeout_seconds": 30}
     with pytest.raises(SecurityError, match="admitted write roots"):
         host_configuration.build_host_policy_factory()
+
+
+def test_successful_automatic_publication_has_a_bounded_binding_window(live, monkeypatch):
+    from herdr.launch_plan_issuer import AutomaticLaunchPlanClient
+    client = AutomaticLaunchPlanClient("a" * 64, 2)
+    live.launch.private_plan_handoff.automatic_issuer = client
+    budgets = []
+    def issue(launch, published, *, deadline):
+        budgets.append(deadline)
+        # Successful publication consumes the setup/issuer budget. A fresh,
+        # finite binding phase is needed for this already committed identity.
+        live.state["time"] = deadline
+        live.approve()
+    monkeypatch.setattr(client, "issue", issue)
+    assert live.launch.prepare_private_command(live.builder)[0] == "/usr/bin/bwrap"
+    assert budgets == [2.0]
+    assert live.launch._private_handoff_state[1] == 4.0
+    live.state["time"] = 4.0
+    with pytest.raises(SecurityError, match="timed out"):
+        live.launch.private_plan_handoff.verify_bound(live.launch)
+    assert len(list(live.plans.iterdir())) == 1

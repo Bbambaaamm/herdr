@@ -51,8 +51,10 @@ def protected_policy(tmp_path, monkeypatch):
 def test_automatic_host_command_selects_only_pinned_wrapper(tmp_path, monkeypatch, entry):
     raw, authority = protected_policy(tmp_path, monkeypatch)
     args = ["literal task with spaces", "--literal"]
+    binding = {}
     result = host.host_entrypoint_command("agent-stack/bin/" + entry, args,
-                                         legacy_command=["/mutable/legacy"])
+                                         legacy_command=["/mutable/legacy"], binding=binding)
+    assert binding == {"host_policy_sha256": issuer._digest(raw), "code_source": raw["code"]["source"]}
     assert result == [str(tmp_path / "published-python/bin/python3.11"), "-I", "-B",
                       raw["code"]["source"] + "/" + issuer.HOST_ENTRYPOINT,
                       "agent-stack/bin/" + entry, *args]
@@ -173,6 +175,7 @@ def test_actual_start_bridge_uses_wrapped_command(tmp_path, monkeypatch):
     monkeypatch.setattr(worker, "host_entrypoint_command", command, raising=False)
     monkeypatch.setattr(worker, "bridge_alive", lambda session: False)
     monkeypatch.setattr(worker, "persist_execution_session", lambda task: None)
+    monkeypatch.setattr(worker, "process_start_ticks", lambda pid: 44)
     calls = []
     monkeypatch.setattr(worker.subprocess, "Popen",
                         lambda argv, **kwargs: calls.append(argv) or SimpleNamespace(pid=123, poll=lambda: None))
@@ -185,6 +188,8 @@ def test_actual_start_bridge_uses_wrapped_command(tmp_path, monkeypatch):
     worker.start_bridge(task, session)
     assert calls == [wrapped + selected[0]]
     assert session["bridge_pid"] == 123 and session["bridge_task_id"] == "task"
+    assert session["bridge_launch"]["argv"] == calls[0]
+    assert session["bridge_launch"]["process_start_ticks"] == 44
 
 
 @pytest.mark.parametrize("wrapped", [False, True])
@@ -196,15 +201,71 @@ def test_bridge_liveness_and_stop_recognize_exact_launch_prefix(tmp_path, monkey
                 [sys.executable, str(worker.BRIDGE)])
     monkeypatch.setattr(worker, "host_entrypoint_command",
                         lambda *args, **kwargs: expected, raising=False)
-    argv = [*expected, "--task-id", "task", "--run-token", "run"]
+    issued = [*expected, "--task-id", "task", "--run-token", "run"]
+    argv = list(issued)
     if forged: argv.insert(0, "/unapproved-launcher")
     original = Path.read_bytes
     monkeypatch.setattr(Path, "read_bytes", lambda path: "\0".join(argv).encode() + b"\0"
                         if str(path) == "/proc/123/cmdline" else original(path))
     session = {"bridge_pid": 123, "bridge_task_id": "task", "bridge_run_token": "run",
                "bridge_socket": worker.bridge_socket_name({"id": "task", "run_token": "run"})}
+    session["bridge_launch"] = {"schema_version": "herdr-host-bridge-launch-1",
+        "argv": issued, "process_start_ticks": 44,
+        "host_policy_sha256": "a" * 64 if wrapped else None,
+        "code_source": str(tmp_path) if wrapped else None}
+    monkeypatch.setattr(worker, "process_start_ticks", lambda pid: 44)
+    monkeypatch.setattr(worker, "_bridge_process_live", lambda pid: True)
+    monkeypatch.setattr(worker, "host_entrypoint_command", lambda *args, **kwargs: pytest.fail("current policy cannot redefine a live bridge"))
     assert worker.bridge_alive(session) is (not forged)
     killed = []
     monkeypatch.setattr(worker.os, "kill", lambda *args: killed.append(args))
-    worker.stop_bridge(session)
+    if forged:
+        with pytest.raises(RuntimeError, match="identity_unverified"):
+            worker.stop_bridge(session)
+    else:
+        worker.stop_bridge(session)
     assert bool(killed) is (not forged)
+
+
+def test_reused_bridge_pid_requires_reconciliation_before_stop_or_restart(tmp_path, monkeypatch):
+    worker = load("automatic_bridge_reuse_test", "agent-task-worker")
+    argv = ["/old/pinned/python", "-I", "-B", "/old/pinned/wrapper",
+            "agent-stack/bin/agent-durable-bridge", "--task-id", "task", "--run-token", "run"]
+    session = {"bridge_pid": 123, "bridge_task_id": "task", "bridge_run_token": "run",
+               "bridge_socket": worker.bridge_socket_name({"id": "task", "run_token": "run"}),
+               "bridge_launch": {"schema_version": "herdr-host-bridge-launch-1",
+                 "argv": argv, "process_start_ticks": 44,
+                 "host_policy_sha256": "a" * 64, "code_source": "/old/pinned"}}
+    original_read = Path.read_bytes
+    monkeypatch.setattr(Path, "read_bytes", lambda path: "\0".join(argv).encode() + b"\0"
+                        if str(path) == "/proc/123/cmdline" else original_read(path))
+    monkeypatch.setattr(worker, "_bridge_process_live", lambda pid: True)
+    monkeypatch.setattr(worker, "process_start_ticks", lambda pid: 45)
+    monkeypatch.setattr(worker.os, "kill", lambda *args: pytest.fail("reused PID was signalled"))
+    monkeypatch.setattr(worker.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("a second bridge was started"))
+    assert not worker.bridge_alive(session)
+    with pytest.raises(RuntimeError, match="identity_unverified"):
+        worker.stop_bridge(session)
+    with pytest.raises(RuntimeError, match="identity_unverified"):
+        worker.start_bridge({}, session)
+
+
+@pytest.mark.parametrize("state", ["Z", "X", "S", "unreadable"])
+def test_bridge_reconciliation_distinguishes_exited_from_live_processes(monkeypatch, state):
+    worker = load("automatic_bridge_process_state_test", "agent-task-worker")
+    original_read = Path.read_text
+    def stat_text(path, *args, **kwargs):
+        if str(path) == "/proc/123/stat":
+            if state == "unreadable": raise PermissionError("explicit proc reader double")
+            return f"123 (bridge name with ) bracket) {state} 1 2 3"
+        return original_read(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "read_text", stat_text)
+    assert worker._bridge_process_live(123) is (state in {"S", "unreadable"})
+    monkeypatch.setattr(worker, "bridge_alive", lambda session: False)
+    monkeypatch.setattr(worker.os, "kill", lambda *args: pytest.fail("unverified or exited process signalled"))
+    session = {"bridge_pid": 123}
+    if state in {"S", "unreadable"}:
+        with pytest.raises(RuntimeError, match="identity_unverified"):
+            worker.stop_bridge(session)
+    else:
+        worker.stop_bridge(session)

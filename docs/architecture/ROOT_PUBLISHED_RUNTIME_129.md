@@ -396,7 +396,7 @@ the approved immutable Python runtime and code release, with this invocation:
 <root-published-python>/bin/python3.11 -I -B <root-published-code>/agent-stack/bin/agent-herdr-host-entrypoint agent-stack/bin/agent-task-worker <existing-worker-arguments>
 ```
 
-In opt-in automatic mode the existing dispatcher selects this pinned wrapper before claiming a pending task, and the worker starts its existing durable child bridge through the same wrapper. Both entrypoints must be approved. A missing/mismatched issuer policy, wrong UID or mutable caller release denies before the dispatcher updates the task. Schema-1 and manual configurations retain the existing invocation. Recovery recognizes the exact wrapped bridge command prefix. All processes remain children of the existing host service; no additional dispatcher or queue is installed.
+In opt-in automatic mode the existing dispatcher selects this pinned wrapper before claiming a pending task, and the worker starts its existing durable child bridge through the same wrapper. Both entrypoints must be approved. A missing/mismatched issuer policy, wrong UID or mutable caller release denies before the dispatcher updates the task. Schema-1 and manual configurations retain the existing invocation. Recovery uses the exact launch-time command, protected-policy digest, release source and kernel process start ticks retained in the execution session; it does not redefine an existing bridge under a later policy/release. An unverified live PID blocks termination/restart for reconciliation; exited/zombie processes do not block cleanup. All processes remain children of the existing host service; no additional dispatcher or queue is installed.
 
 The wrapper protects the host process from same-UID ptrace/proc access before
 running an existing approved entrypoint. It checks the current issuer-policy
@@ -433,9 +433,7 @@ existing 0444 plan publisher with the same live recheck immediately before the
 plan's atomic no-replace publication. Existing tickets/plans are never replaced,
 renewed, replayed or deleted. Hidden interrupted stages and proposal evidence
 remain available for explicit reconciliation. A lost response does not trigger
-an automatic retry or a new economic attempt. The waiting host still reads and
-authorizes the exact root plan, and performs its final handoff checks before the
-actual native pane starts. Error replies contain a generic reason only.
+an automatic retry or a new economic attempt. The automatic client uses the remaining setup/handoff deadline for connection, send and response, rather than restarting its socket budget. After a successful publication response, binding receives a separate finite window of the configured handoff timeout (at most 60 seconds). Manual handoff retains its original single deadline. Grant/profile/source/current-host authority and final bound checks remain mandatory in both phases; the fresh binding window never renews an approval or retries issuance. The waiting host still reads and authorizes the exact root plan, and performs its final handoff checks before the actual native pane starts. Error replies contain a generic reason only.
 
 Root operator preparation for a separately approved deployment:
 

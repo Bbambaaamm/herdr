@@ -36,6 +36,7 @@ LOCK = ROOT / "worker.lock"
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
 from herdr.launch_environment import sanitize_environment
 from herdr.host_configuration import host_entrypoint_command
+from herdr.policy_launch import process_start_ticks
 ENV = {key: value for key, value in sanitize_environment(os.environ).items()
        if not key.startswith("PYTHON")}
 AGENT_BIN = Path(__file__).resolve().parent
@@ -323,10 +324,25 @@ def bridge_alive(session: dict) -> bool:
     try:
         args = [part.decode("utf-8", errors="replace") for part in
                 Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if part]
-        expected = host_entrypoint_command("agent-stack/bin/agent-durable-bridge", [],
-                                           legacy_command=[sys.executable, str(BRIDGE)])
+        launch = session.get("bridge_launch")
+        if launch is None:
+            # Sessions from before launch identity persistence used the direct
+            # bridge path. Do not reinterpret them under today's issuer policy.
+            command_matches = str(BRIDGE) in args
+        else:
+            if (not isinstance(launch, dict)
+                    or set(launch) != {"schema_version", "argv", "process_start_ticks",
+                                      "host_policy_sha256", "code_source"}
+                    or launch["schema_version"] != "herdr-host-bridge-launch-1"
+                    or not isinstance(launch["argv"], list)
+                    or not all(isinstance(value, str) and "\0" not in value for value in launch["argv"])
+                    or type(launch["process_start_ticks"]) is not int
+                    or launch["process_start_ticks"] <= 0):
+                return False
+            command_matches = (args == launch["argv"]
+                               and process_start_ticks(pid) == launch["process_start_ticks"])
         return (
-            args[:len(expected)] == expected
+            command_matches
             and "--task-id" in args
             and args[args.index("--task-id") + 1] == task_id
             and "--run-token" in args
@@ -337,17 +353,33 @@ def bridge_alive(session: dict) -> bool:
         return False
 
 
+def _bridge_process_live(pid: int) -> bool:
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return False
+    except (OSError, UnicodeError):
+        return True  # An unreadable live identity must be reconciled.
+    _, separator, fields = raw.rpartition(")")
+    columns = fields.split()
+    return not separator or not columns or columns[0] not in {"Z", "X", "x"}
+
+
 def start_bridge(task: dict, session: dict) -> None:
     if bridge_alive(session):
         return
+    if int(session.get("bridge_pid") or 0) > 0 and _bridge_process_live(int(session["bridge_pid"])):
+        raise RuntimeError("durable_bridge_identity_unverified")
     name = bridge_socket_name(task)
     task_file = Path(str(task["task_file"])).resolve()
     arguments = ["--task-file", str(task_file),
             "--task-id", str(task["id"]), "--run-token", str(task["run_token"]),
             "--agent", session["agent_name"], "--pane", session["pane_id"],
             "--marker", session["pane_marker"], "--real-binary", str(HERDR)]
+    binding = {}
     args = host_entrypoint_command("agent-stack/bin/agent-durable-bridge", arguments,
-                                  legacy_command=[sys.executable, str(BRIDGE), *arguments])
+                                  legacy_command=[sys.executable, str(BRIDGE), *arguments],
+                                  binding=binding)
     log_path = LOGS / f"{task['id']}.bridge.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as output:
@@ -357,7 +389,16 @@ def start_bridge(task: dict, session: dict) -> None:
     session["bridge_socket"] = name
     session["bridge_task_id"] = str(task["id"])
     session["bridge_run_token"] = str(task["run_token"])
-    persist_execution_session(task)
+    session["bridge_launch"] = {"schema_version": "herdr-host-bridge-launch-1",
+        "argv": list(args), "process_start_ticks": None,
+        "host_policy_sha256": binding.get("host_policy_sha256"),
+        "code_source": binding.get("code_source")}
+    try:
+        session["bridge_launch"]["process_start_ticks"] = process_start_ticks(process.pid)
+    finally:
+        # Keep the PID/command evidence even if startup exits before it can be
+        # attested; an unverified live PID requires reconciliation.
+        persist_execution_session(task)
     for _ in range(30):
         if process.poll() is not None:
             break
@@ -374,6 +415,8 @@ def start_bridge(task: dict, session: dict) -> None:
 def stop_bridge(session: dict) -> None:
     if bridge_alive(session):
         os.kill(int(session["bridge_pid"]), signal.SIGTERM)
+    elif int(session.get("bridge_pid") or 0) > 0 and _bridge_process_live(int(session["bridge_pid"])):
+        raise RuntimeError("durable_bridge_identity_unverified")
 
 
 def ensure_parent_scope(task: dict) -> None:
