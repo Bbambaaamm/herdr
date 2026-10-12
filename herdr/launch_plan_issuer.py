@@ -224,7 +224,8 @@ def _argv(plan, argv, workspace, profile):
         if op in {"--dir", "--tmpfs", "--remount-ro"}: require(publication._target(values[0]), "non-canonical mount target")
         operations.append((op, values)); index += 1 + arities[op]
     required = {("--ro-bind", ("/", "/")), ("--dev", ("/dev",)), ("--proc", ("/proc",)),
-                ("--unshare-pid", ()), ("--chdir", (workspace,)), ("--tmpfs", ("/tmp",)),
+                ("--unshare-pid", ()), ("--die-with-parent", ()),
+                ("--chdir", (workspace,)), ("--tmpfs", ("/tmp",)),
                 ("--tmpfs", ("/run",)), ("--tmpfs", ("/home/agentops",)),
                 ("--tmpfs", ("/home/agentops/.config/herdr",)), ("--tmpfs", ("/opt/agent-platform",))}
     require(required <= set(operations) and operations[:3] == [
@@ -259,6 +260,12 @@ def _argv(plan, argv, workspace, profile):
 def _physical(plan, argv, grant, profile, fds, raw):
     require(len(fds) == len(plan["descriptors"]), "complete held FD inventory required")
     operations = _argv(plan, argv, grant.workspace_root, profile)
+    from .owned_write_mounts import _mount_id
+    workspace_fds = [fd for entry, fd in zip(plan["descriptors"], fds)
+                     if entry["target"] == grant.workspace_root and entry["kind"] == "directory"]
+    require(len(workspace_fds) == 1, "one exact workspace source required")
+    workspace_info = os.fstat(workspace_fds[0])
+    workspace_mount = _mount_id(workspace_fds[0])
     roots = []
     try:
         for definition in (raw["code"], *raw["runtime"]):
@@ -350,16 +357,26 @@ def _physical(plan, argv, grant, profile, fds, raw):
                 finally: os.close(original)
                 special.add(target)
             else:
-                require(kind == "directory" and info.st_uid == raw["host_uid"]
+                require(kind in {"directory", "file"} and info.st_uid == raw["host_uid"]
                         and (target == grant.workspace_root or Path(grant.workspace_root) in Path(target).parents),
                         "unapproved writable source")
                 from .private_mount_plan import coherent_result_fd, isolated_destination_anchor
                 isolated_destination_anchor(target)
+                relative = Path(target).relative_to(grant.workspace_root)
+                require(all(name not in {".git", ".herdr"} and not name.startswith(".herdr-")
+                            for name in relative.parts), "owned control path denied")
+                if target != grant.workspace_root:
+                    require(not info.st_mode & 0o022 and info.st_dev == workspace_info.st_dev
+                            and _mount_id(fd) == workspace_mount, "owned write source is untrusted or crosses a mount")
+                if kind == "file":
+                    require(info.st_nlink == 1 and operations[entry["fd"]] == "--bind-fd",
+                            "exclusive owned write file required")
                 named = Path(target).stat()
                 require((named.st_dev, named.st_ino) == (info.st_dev, info.st_ino)
                         and Path(target).resolve(strict=True) == Path(target), "workspace attachment differs")
                 from .owned_write_mounts import _mount_id
-                current = os.open(target, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                current = (coherent_result_fd(target, (info.st_dev, info.st_ino)) if kind == "file" else
+                           os.open(target, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC))
                 try: require(_mount_id(current) == _mount_id(fd), "workspace mount attachment differs")
                 finally: os.close(current)
                 if target == grant.workspace_root: workspace_count += 1

@@ -381,7 +381,7 @@ def physical(live, monkeypatch):
                     result_slot=ResultSlot.from_dict({k: v for k, v in binding.items() if k != "schema_version"}))
     grant = replace(grant, scope=replace(grant.scope, tools=(*grant.scope.tools, "herdr_submit_result")),
                     tool_rules=(*grant.tool_rules, rule))
-    argv = ["/usr/bin/bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--unshare-pid",
+    argv = ["/usr/bin/bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--unshare-pid", "--die-with-parent",
             "--tmpfs", "/tmp", "--tmpfs", "/home/agentops", "--proc", "/proc", "--chdir", grant.workspace_root,
             "--tmpfs", "/home/agentops/.config/herdr", "--tmpfs", "/opt/agent-platform", "--tmpfs", "/run"]
     for value in descriptors:
@@ -409,6 +409,50 @@ ORIGINAL_PHYSICAL = issuer._physical
 def test_physical_policy_checks_real_profile_result_and_runtime_fds(physical):
     p = physical
     issuer._physical(p.plan, p.argv, p.grant, p.profile, p.fds, p.raw)
+
+
+@pytest.mark.parametrize("fault", [None, "foreign-grant", "replacement", "hardlink",
+                                   "public-write", "read-only", "mount-crossing", "control-path"])
+def test_file_scoped_owned_write_mounts_keep_exact_source_and_grant(physical, monkeypatch, fault):
+    from herdr.child_ownership import ChildOwnership, WriteScope
+    from herdr.owned_write_mounts import OwnedWritePins
+    from herdr import owned_write_mounts
+    p = physical
+    target = p.live.work.logical / "owned.py"
+    target.write_text("owned"); target.chmod(0o600)
+    contract = ChildOwnership((WriteScope("file", "owned.py"),), (), (), (), "parent", "artifact://handoff/child")
+    with OwnedWritePins(contract, p.live.work) as owned:
+        entry = owned.descriptors()[0]
+        fd = owned.mounts[0].fd
+        argv = list(p.argv)
+        at = argv.index("--setenv")
+        argv[at:at] = ["--bind-fd", str(fd), str(target)]
+        roots = (str(target),) if fault != "foreign-grant" else (str(target.with_name("foreign.py")),)
+        write = ToolRule("write_file", RiskClass.WORKSPACE_WRITE, ("path", "content"),
+                         path_fields=("path",), allowed_roots=roots)
+        grant = replace(p.grant, scope=replace(p.grant.scope, tools=(*p.grant.scope.tools, "write_file")),
+                        tool_rules=(*p.grant.tool_rules, write))
+        if fault == "replacement":
+            target.rename(target.with_name("retained.py")); target.write_text("replacement")
+        elif fault == "hardlink": os.link(target, target.with_name("alias.py"))
+        elif fault == "public-write": target.chmod(0o666)
+        elif fault == "read-only": argv[at] = "--ro-bind-fd"
+        elif fault == "mount-crossing":
+            actual = owned_write_mounts._mount_id
+            monkeypatch.setattr(owned_write_mounts, "_mount_id", lambda value: actual(value) + (value == fd))
+        elif fault == "control-path":
+            new = target.with_name(".herdr-control")
+            target.rename(new); entry["target"] = str(new); argv[at + 2] = str(new)
+            grant = replace(grant, tool_rules=(*p.grant.tool_rules,
+                replace(write, allowed_roots=(str(p.live.work.logical),))))
+        entries = [*p.plan["descriptors"], entry]
+        plan = request_for(grant.identity, entries, argv)
+        args = (plan, argv, grant, p.profile, [*p.fds, fd], p.raw)
+        if fault is None:
+            issuer._physical(*args)
+        else:
+            with pytest.raises((SecurityError, OSError, ValueError)):
+                issuer._physical(*args)
 
 
 def test_root_and_child_grants_use_the_existing_consumer_ceiling(live, monkeypatch):
@@ -451,6 +495,7 @@ def test_accepts_the_actual_native_builder_command(physical, monkeypatch):
         with pytest.raises(RuntimeError, match="durable_private_mount_plan_unapproved"):
             module.command(workspace=Path(p.grant.workspace_root), writable=(p.live.output.logical,),
                            real_binary=Path("/home/agentops/.local/bin/herdr"), policy_mount=mount,
+                           admission_root=p.live.proposals.parent,
                            pinned_worktree=p.live.work,
                            hermes_profile=p.live.profile.name, private_profile_snapshot=p.live.profile)
         plan, argv = mount.private_mount_request, mount.private_mount_argv
@@ -462,7 +507,8 @@ def test_accepts_the_actual_native_builder_command(physical, monkeypatch):
 
 @pytest.mark.parametrize("fault", ["fd-reorder", "fd-number", "profile-hash", "writable-code", "late-root-bind", "late-home",
                                    "arbitrary-command", "result-intent", "result-bytes", "bootstrap-bytes", "bundle-bytes",
-                                   "missing-runtime", "work-write", "literal-write", "namespace", "unknown-option"])
+                                   "missing-runtime", "work-write", "literal-write", "namespace", "unknown-option",
+                                   "missing-custody", "duplicate-custody"])
 def test_physical_policy_rejects_source_and_command_attacks(physical, fault):
     p = physical; argv = list(p.argv); entries = deepcopy(p.plan["descriptors"]); fds = list(p.fds)
     extra = None
@@ -489,6 +535,8 @@ def test_physical_policy_rejects_source_and_command_attacks(physical, fault):
     elif fault == "work-write": argv[argv.index(str(p.live.work.fd)) - 1] = "--bind-fd"
     elif fault == "literal-write": argv[argv.index("--"):argv.index("--")] = ["--bind", "/tmp", "/tmp"]
     elif fault == "namespace": argv.remove("--unshare-pid")
+    elif fault == "missing-custody": argv.remove("--die-with-parent")
+    elif fault == "duplicate-custody": argv.insert(argv.index("--"), "--die-with-parent")
     else: argv[argv.index("--"):argv.index("--")] = ["--share-net"]
     plan = request_for(p.grant.identity, entries, argv)
     try:
