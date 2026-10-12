@@ -227,11 +227,12 @@ def test_lost_reply_preserves_one_published_identity_without_retry_or_pane(live,
         except Exception as exc: errors.append(exc)
     thread = threading.Thread(target=server); thread.start()
     try:
-        with pytest.raises(SecurityError): live.launch.prepare_private_command(live.builder)
+        live.launch.prepare_private_command(live.builder)
         thread.join(4)
         assert errors == [] and not thread.is_alive()
         assert len(list(approvals.glob("*.json"))) == len(list(live.plans.glob("*.json"))) == 1
-        assert live.launch.mount.private_mount_plan is None and live.launch.sealed is None
+        assert live.launch.mount.private_mount_plan is not None and live.launch.sealed is None
+        live.launch.verify_private_handoff()
     finally: listener.close(); thread.join(4)
 
 
@@ -646,6 +647,60 @@ def test_server_enforces_caller_deadline_before_each_publication(live, monkeypat
         assert results[0].get("published") is not True
         if fault not in {"plan-stage"}:
             assert not list(approvals.glob("*.json"))
+    finally:
+        listener.close()
+        thread.join(4)
+
+
+@pytest.mark.parametrize("fault", ["eof", "timeout", "malformed"])
+def test_committed_plan_is_reconciled_after_lost_reply_without_reissuance(live, monkeypatch, fault):
+    _, _, _, listener = configure(live, monkeypatch)
+    original_connect = issuer._connect_issuer
+    contacts = []
+    class LostReply:
+        def __init__(self, connection): self.connection = connection
+        def __enter__(self): return self
+        def __exit__(self, *args): self.connection.close()
+        def __getattr__(self, name): return getattr(self.connection, name)
+        def recv(self, maximum):
+            answer = self.connection.recv(maximum)
+            assert json.loads(answer)["published"] is True
+            if fault == "timeout": raise TimeoutError("reply lost after commit")
+            return b"" if fault == "eof" else b"{"
+    def connect(timeout):
+        contacts.append(timeout)
+        return LostReply(original_connect(timeout))
+    monkeypatch.setattr(issuer, "_connect_issuer", connect)
+    thread, errors, results = run_server(listener)
+    try:
+        live.launch.prepare_private_command(live.builder)
+        thread.join(4)
+        assert not thread.is_alive() and errors == []
+        assert results[0]["published"] is True and len(contacts) == 1
+        assert len(list(live.plans.glob("*.json"))) == len(list(live.proposals.glob("*.json"))) == 1
+        assert json.loads(next(live.plans.glob("*.json")).read_bytes()) == live.launch.mount.private_mount_request
+        live.launch.verify_private_handoff()
+    finally:
+        listener.close()
+        thread.join(4)
+
+
+def test_accepted_long_handoff_uses_shorter_issuer_budget(live, monkeypatch):
+    _, _, _, listener = configure(live, monkeypatch)
+    live.launch.private_plan_handoff.timeout_seconds = 60
+    captured = []
+    original_receive = issuer._receive
+    def receive(connection, peer):
+        request, descriptors = original_receive(connection, peer)
+        captured.append(request["deadline_monotonic_ns"] / 1e9)
+        assert time.monotonic() < captured[-1] <= time.monotonic() + 3
+        return request, descriptors
+    monkeypatch.setattr(issuer, "_receive", receive)
+    thread, errors, results = run_server(listener)
+    try:
+        live.launch.prepare_private_command(live.builder)
+        thread.join(4)
+        assert errors == [] and results[0]["published"] is True and len(captured) == 1
     finally:
         listener.close()
         thread.join(4)

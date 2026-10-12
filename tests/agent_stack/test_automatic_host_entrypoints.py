@@ -362,3 +362,56 @@ def test_setup_cleanup_keeps_failed_bridge_session_open(tmp_path, monkeypatch):
         worker.create_task_session(task)
     assert "closed_at" not in task["execution_session"]
     assert task["execution_session"]["cleanup_status"] == "bridge_cleanup_unproven"
+
+
+def test_worker_startup_reconciles_owned_stale_closed_session(tmp_path, monkeypatch):
+    from tests.agent_stack import test_worker_handshake as fixture
+    fixture.configure_paths(tmp_path)
+    worker = fixture.worker
+    task = fixture.base_task()
+    worker.prepare_attempt(task)
+    token = task["run_token"]
+    task["attempt_state"] = "retry_scheduled"
+    task["execution_session"] = {"owned_pane": True, "pane_id": "owned",
+        "bridge_pid": 123, "closed_at": "stale-marker"}
+    path = worker.PENDING / "task-1.json"
+    worker.write_json(path, task)
+    monkeypatch.setattr(worker, "prepare_attempt", lambda *args: pytest.fail("old session was replaced"))
+    monkeypatch.setattr(worker, "stop_bridge",
+                        lambda session: (_ for _ in ()).throw(RuntimeError("durable_bridge_identity_unverified")))
+    assert worker.main(path) == 1
+    saved = json.loads((worker.BLOCKED / path.name).read_text())
+    assert saved["run_token"] == token and saved["attempts"] == 0
+    assert "closed_at" not in saved["execution_session"]
+    assert saved["execution_session"]["cleanup_status"] == "bridge_cleanup_unproven"
+
+
+@pytest.mark.parametrize("child", [False, True])
+def test_worker_quarantines_automatic_plan_ambiguity_without_retry(tmp_path, monkeypatch, child):
+    from tests.agent_stack import test_worker_handshake as fixture
+    from herdr.launch_plan_handoff import LaunchPlanReconciliationRequired
+    fixture.configure_paths(tmp_path)
+    worker = fixture.worker
+    task = fixture.base_task()
+    if child:
+        task.update(parent_task_id="parent", run_token="child-run",
+                    idempotency_key="child-key", fencing_token=7, delegation_key="scope")
+    path = worker.RUNNING / "task-1.json"
+    worker.write_json(path, task)
+    monkeypatch.setattr(worker, "ensure_parent_scope", lambda task: None)
+    monkeypatch.setattr(worker, "freeze_plan", lambda *args: None)
+    monkeypatch.setattr(worker, "decide_model_route", lambda task: {"tier": "free", "selected_agent": "fixture"})
+    monkeypatch.setattr(worker, "record_model_route", lambda *args: None)
+    attempted = []
+    def session(task):
+        attempted.append((task["run_token"], task["idempotency_key"], task["attempts"]))
+        raise LaunchPlanReconciliationRequired("ambiguous plan")
+    monkeypatch.setattr(worker, "create_task_session", session)
+    monkeypatch.setattr(worker, "retry", lambda *args: pytest.fail("ambiguous plan caused redispatch"))
+    monkeypatch.setattr(worker, "run_prompt", lambda *args: pytest.fail("provider dispatch before plan reconciliation"))
+    assert worker.main(path) == 1
+    saved = json.loads((worker.BLOCKED / path.name).read_text())
+    assert [(saved["run_token"], saved["idempotency_key"], saved["attempts"])] == attempted
+    assert saved["attempts"] == 0 and not list(worker.PENDING.iterdir())
+    result = json.loads(worker.result_path(task["id"]).read_text())
+    assert result["blocker"] == "task_launch_plan_reconciliation_required"

@@ -485,8 +485,9 @@ class AutomaticLaunchPlanClient:
         now = time.monotonic()
         if deadline is None:
             deadline = now + self.timeout_seconds
-        require(type(deadline) in (int, float) and now < deadline <= now + self.timeout_seconds,
-                "automatic issuance deadline expired or exceeds its bound")
+        require(type(deadline) in (int, float) and now < deadline < float("inf"),
+                "automatic issuance deadline expired or is not finite")
+        deadline = min(deadline, now + self.timeout_seconds)
         def remaining():
             value = deadline - time.monotonic()
             require(value > 0, "automatic issuance deadline expired")

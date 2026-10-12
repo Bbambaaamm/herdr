@@ -1854,7 +1854,6 @@ def _main_with_epoch(task_path: Path) -> int:
         if (
             isinstance(previous_session, dict)
             and previous_session.get("owned_pane")
-            and not previous_session.get("closed_at")
         ):
             if not cleanup_task_session_if_safe(task):
                 persist_current_task(task)
@@ -1923,6 +1922,11 @@ def _main_with_epoch(task_path: Path) -> int:
                 )
             except Exception as exc:
                 detail = str(exc)
+                from herdr.launch_plan_handoff import LaunchPlanReconciliationRequired
+                if isinstance(exc, LaunchPlanReconciliationRequired):
+                    block_task(task_path, task, "task_launch_plan_reconciliation_required",
+                               "Retained automatic launch evidence must be reconciled without redispatch.")
+                    return 1
                 if detail.startswith(
                     (
                         "task_session_cleanup_failed",
