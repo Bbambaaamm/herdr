@@ -458,3 +458,17 @@ provider call, budget change or deployment is performed by these tests.
 Linux interfaces: [Unix credentials and descriptor passing](https://www.man7.org/linux/man-pages/man7/unix.7.html),
 [non-dumpable process ownership](https://www.man7.org/linux/man-pages/man5/proc_pid.5.html),
 [cgroup v2 migration permissions](https://cdn.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html).
+
+
+### Isolated host dependency imports
+
+The host entrypoint runs the approved Python with `-I -B`. That interpreter does
+not automatically use Hermes venv packages; host grant creation needs
+`cryptography`, and worker policy configuration needs `yaml`. After verifying
+the exact two approved runtime targets and every immutable tree, the wrapper
+adds only the approved Hermes `venv/lib/python3.11/site-packages` directory.
+It keeps isolated interpreter, code and sibling-script imports and does not
+process `.pth` files or run `sitecustomize` hooks from the added directory.
+A missing, aliased, unapproved or withdrawn runtime denies before the entrypoint
+runs. Dependency import tests use explicit root-policy/fixture-tree doubles;
+they do not establish native issuer, bootstrap or deployment acceptance.

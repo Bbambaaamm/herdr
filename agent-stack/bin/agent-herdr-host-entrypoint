@@ -17,17 +17,28 @@ sys.path.insert(0, str(root))
 from herdr.launch_plan_issuer import _policy, HOST_ENTRYPOINT, require
 from herdr.host_configuration import _tree
 from herdr.host_bootstrap import PYTHON_TARGET, PYTHON_EXECUTABLE
+from herdr.policy_launch import RUNTIME_TARGETS
 
 issuer, policy = _policy()
 require(sys.flags.isolated and sys.dont_write_bytecode, "isolated host interpreter required")
 require(root == Path(policy["code"]["source"])
         and len(sys.argv) >= 2 and sys.argv[1] in issuer["entrypoints"], "approved host entrypoint required")
+require(len(policy["runtime"]) == 2
+        and {row["target"] for row in policy["runtime"]} == {str(path) for path in RUNTIME_TARGETS},
+        "exact approved host runtimes required")
 python = next(row for row in policy["runtime"] if row["target"] == str(PYTHON_TARGET))
 require(Path(sys.executable) == Path(python["source"]) / PYTHON_EXECUTABLE,
         "pinned host interpreter required")
 for definition in (policy["code"], *policy["runtime"]):
     snapshot = _tree(definition, immutable=True).freeze(Path(policy["storage"]), ())
     snapshot.close()
+hermes = next(row for row in policy["runtime"] if row["target"] != str(PYTHON_TARGET))
+site = Path(hermes["source"]) / "venv/lib/python3.11/site-packages"
+require(site.is_dir() and site.resolve(strict=True) == site,
+        "approved host dependency directory required")
+# The isolated Python has no Hermes venv dependencies by default. Add only
+# this fully verified immutable directory; do not execute .pth/startup hooks.
+sys.path.append(str(site))
 target = root / sys.argv[1]
 # Existing worker scripts import helpers beside their entrypoint. Restore that
 # script import directory only after its complete immutable release is verified.

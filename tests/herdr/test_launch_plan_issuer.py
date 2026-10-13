@@ -41,6 +41,7 @@ def test_host_wrapper_runs_approved_entrypoint_with_its_sibling_imports(tmp_path
     wrapper.parent.mkdir(parents=True)
     repository = Path(__file__).resolve().parents[2]
     shutil.copyfile(repository / issuer.HOST_ENTRYPOINT, wrapper)
+    (root / "hermes/venv/lib/python3.11/site-packages").mkdir(parents=True)
     target = root / directory / "probe.py"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("import json, sys\nfrom sibling_helper import value\nprint(json.dumps([value, sys.argv]))\n")
@@ -52,12 +53,15 @@ repository, root, entrypoint = sys.argv[1:]
 sys.path.insert(0, repository)
 from herdr import launch_plan_issuer, host_configuration, host_bootstrap
 from herdr.host_bootstrap import PYTHON_TARGET
+from herdr.policy_launch import RUNTIME_TARGETS
+hermes_target = next(str(x) for x in RUNTIME_TARGETS if x != PYTHON_TARGET)
 # Interpreter authority is doubled to the disposable test interpreter;
 # production continues to pin its published bin/python3.11.
 host_bootstrap.PYTHON_EXECUTABLE = "bin/" + pathlib.Path(sys.executable).name
 launch_plan_issuer._policy = lambda: (
     {"entrypoints": [entrypoint]}, {"code": {"source": root}, "storage": root,
-    "runtime": [{"target": str(PYTHON_TARGET), "source": str(pathlib.Path(sys.executable).parent.parent)}]})
+    "runtime": [{"target": str(PYTHON_TARGET), "source": str(pathlib.Path(sys.executable).parent.parent)},
+                {"target": hermes_target, "source": str(pathlib.Path(root) / "hermes")}]})
 host_configuration._tree = lambda *args, **kwargs: SimpleNamespace(
     freeze=lambda *args: SimpleNamespace(close=lambda: None))
 wrapper = pathlib.Path(root) / launch_plan_issuer.HOST_ENTRYPOINT
