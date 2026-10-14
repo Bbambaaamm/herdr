@@ -115,6 +115,10 @@ def _require_non_dumpable(pid):
 
 def _peer(connection, issuer, raw):
     pid, uid, gid = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+    return _host_peer(pid, uid, gid, issuer, raw)
+
+
+def _host_peer(pid, uid, gid, issuer, raw):
     require(uid == raw["host_uid"] and pid > 0, "issuer caller is not the configured host")
     ticks = process_start_ticks(pid)
     _require_non_dumpable(pid)
@@ -148,7 +152,7 @@ def _peer(connection, issuer, raw):
     return pid, uid, gid, ticks
 
 
-def _receive(connection, peer):
+def _receive(connection, peer, *, minimum_fds=1):
     descriptors = []
     try:
         body, ancillary, flags, _ = connection.recvmsg(
@@ -172,7 +176,7 @@ def _receive(connection, peer):
             else:
                 raise SecurityError("unexpected issuer ancillary message")
         require(not flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC) and 0 < len(body) <= MAX_REQUEST
-                and 1 <= len(descriptors) <= MAX_FDS and credentials == [peer[:3]],
+                and minimum_fds <= len(descriptors) <= MAX_FDS and credentials == [peer[:3]],
                 "bounded authenticated issuer packet required")
         value = json.loads(body)
         require(isinstance(value, dict) and canonical_json_bytes(value) == body,
@@ -434,12 +438,17 @@ def _validate(request, fds, peer, raw):
     return grant, name
 
 
-def issue_request(connection):
+def issue_request(connection, *, custody=None):
     """One bounded root operation. No admission queue, provider or retry exists."""
     require(os.geteuid() == 0, "automatic issuance requires the root plan authority")
     started = time.monotonic()
     issuer, raw = _policy()
     peer = _peer(connection, issuer, raw)
+    from .native_fd_handoff import ENTRYPOINT
+    caller_argv = _proc_bytes(peer[0], "cmdline", 32768).rstrip(b"\0").decode().split("\0")
+    require(len(caller_argv) <= 4 or caller_argv[4] != ENTRYPOINT,
+            "descriptor receiver cannot issue new plans")
+    if custody is not None: custody.require_capacity()
     maximum_deadline = started + issuer["request_timeout_seconds"]
     require(time.monotonic() < maximum_deadline, "issuer setup deadline expired")
     connection.settimeout(maximum_deadline - time.monotonic())
@@ -485,6 +494,8 @@ def issue_request(connection):
         finally: os.close(parent)
         result = publication._publish_approved_launch_plan(publication.APPROVAL_ROOT / name,
                                                           publish=True, before_publish=current)
+        if custody is not None:
+            custody.retain(request, peer, issuer, raw, fds, deadline)
         return {"schema_version": VERSION, "identity_sha256": name[:-5],
                 "plan_sha256": result["plan_sha256"], "published": True}
     finally:
@@ -560,18 +571,35 @@ def serve():
     for definition in (raw["code"], *raw["runtime"]):
         tree = host._tree(definition, immutable=True).freeze(Path(raw["storage"]), ())
         tree.close()
+    from .native_fd_handoff import DescriptorCustody, SOCKET_PATH as fd_path, ENTRYPOINT
+    import selectors
+    issuer, _ = _policy()
+    require(ENTRYPOINT in issuer["entrypoints"], "approved native descriptor entrypoint required")
     _verify_root_owned_ancestry(SOCKET_PATH.parent)
-    require(not os.path.lexists(SOCKET_PATH), "issuer socket already exists; reconcile explicitly")
-    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as listener:
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
-        listener.bind(str(SOCKET_PATH)); os.chmod(SOCKET_PATH, 0o666)
-        listener.listen(8)
-        while True:
-            connection, _ = listener.accept()
-            with connection:
-                try:
-                    result = issue_request(connection)
-                except (SecurityError, PrivateProfileError, OSError, ValueError, KeyError, TypeError, StopIteration):
-                    result = {"schema_version": VERSION, "error": "launch-plan issuance denied"}
-                try: connection.send(canonical_json_bytes(result))
-                except OSError: pass
+    require(not os.path.lexists(SOCKET_PATH) and not os.path.lexists(fd_path),
+            "issuer socket already exists; reconcile explicitly")
+    custody = DescriptorCustody()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as listener, \
+         socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as fd_listener, \
+         selectors.DefaultSelector() as selector:
+        for endpoint, path, role in ((listener, SOCKET_PATH, "plan"), (fd_listener, fd_path, "fds")):
+            endpoint.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+            endpoint.bind(str(path)); os.chmod(path, 0o666)
+            endpoint.listen(8); selector.register(endpoint, selectors.EVENT_READ, role)
+        try:
+            while True:
+                custody.prune()
+                for key, _ in selector.select(timeout=0.2):
+                    connection, _ = key.fileobj.accept()
+                    with connection:
+                        try:
+                            if key.data == "fds":
+                                custody.redeem(connection)
+                                continue
+                            result = issue_request(connection, custody=custody)
+                        except (SecurityError, PrivateProfileError, OSError, ValueError, KeyError, TypeError, StopIteration):
+                            result = {"schema_version": VERSION, "error": "launch-plan issuance denied"}
+                        try: connection.send(canonical_json_bytes(result))
+                        except OSError: pass
+        finally:
+            custody.close()

@@ -370,6 +370,7 @@ class PolicyMount:
         self.private_mount_argv = None
         self.private_identity = None
         self.private_cli_pins = {}
+        self.private_fd_handoff = False
         targets = [str(BUNDLE_TARGET), str(code.target), *(str(x.target) for x in runtime)]
         _require(len(targets) == len(set(targets)), "duplicate policy mount target")
 
@@ -994,6 +995,8 @@ class PreparedPolicyLaunch:
             if self.private_plan_handoff is not None:
                 selected = self.private_plan_handoff.await_approval(self, builder)
             self.bind_private_mount_plan(selected)
+        self.mount.private_fd_handoff = (self.private_plan_handoff is not None
+                                        and self.private_plan_handoff.automatic_issuer is not None)
         result = builder()
         if self.private_plan_handoff is not None:
             self.private_plan_handoff.verify_bound(self)

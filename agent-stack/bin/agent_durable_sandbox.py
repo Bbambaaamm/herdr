@@ -62,18 +62,24 @@ if len(sys.argv) < 3 or len(sys.argv[1]) > 65536:
 entries = json.loads(sys.argv[1])
 args = sys.argv[2:]
 plan_envelope = None
+received_fds = []
 if isinstance(entries, dict):
     plan_envelope = entries
-    if (set(entries) != {"schema_version", "authority", "authority_sha256", "entries"}
+    base_keys = {"schema_version", "authority", "authority_sha256", "entries"}
+    if (set(entries) not in (base_keys, base_keys | {"transport"})
+        or ("transport" in entries and entries["transport"] != "herdr-native-fd-handoff-1")
         or entries["schema_version"] != "herdr-private-mount-plan-1"):
         raise SystemExit("policy_fd_private_plan_invalid")
     entries = entries["entries"]
 if not isinstance(entries, list) or not 1 <= len(entries) <= 96:
     raise SystemExit("policy_fd_launch_invalid")
+if plan_envelope is not None and "transport" in plan_envelope:
+    from herdr.native_fd_handoff import receive_descriptors
+    received_fds = receive_descriptors(plan_envelope, args)
 mapping, targets, approved_files = {}, set(), set()
 profile_name = None
 total_profile_bytes = 0
-for item in entries:
+for source_index, item in enumerate(entries):
     if not isinstance(item, dict):
         raise SystemExit("policy_fd_launch_invalid")
     kind = item.get("kind")
@@ -118,7 +124,7 @@ for item in entries:
             raise SystemExit("policy_fd_profile_manifest_invalid")
         approved_files.add(match.group(2))
     opened = os.open(
-        item["source"],
+        f"/proc/self/fd/{received_fds[source_index]}" if received_fds else item["source"],
         (os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK) if sealed or reserved
         else (os.O_PATH | (os.O_DIRECTORY if kind == "directory" else 0)),
     )
@@ -182,6 +188,8 @@ for item in entries:
             raise SystemExit("policy_fd_profile_digest_mismatch")
     mapping[item["fd"]] = (opened, item["target"], kind)
     targets.add(item["target"])
+for received in received_fds:
+    os.close(received)
 
 try:
     arg_end = args.index("--")
@@ -840,8 +848,21 @@ def command(
             if not isinstance(plan, ApprovedPrivateMountPlan):
                 raise RuntimeError("durable_private_mount_plan_unapproved")
             descriptors = plan.authorize(descriptors, args)
-        result_command = ["/usr/bin/python3", "-I", "-S", "-c", _POLICY_FD_LAUNCHER,
-                          json.dumps(descriptors, separators=(",", ":")), *args]
+        if getattr(policy_mount, "private_fd_handoff", False):
+            from herdr.native_fd_handoff import VERSION, ENTRYPOINT
+            from herdr.launch_plan_issuer import HOST_ENTRYPOINT
+            from herdr.host_bootstrap import PYTHON_TARGET, PYTHON_EXECUTABLE
+            policy_mount.require_immutable_runtime()
+            if ENTRYPOINT not in dict(policy_mount.code.files):
+                raise RuntimeError("native_descriptor_entrypoint_unapproved")
+            descriptors = {**descriptors, "transport": VERSION}
+            python = next(tree for tree in policy_mount.runtime if tree.target == PYTHON_TARGET)
+            result_command = [str(python.path / PYTHON_EXECUTABLE), "-I", "-B",
+                str(policy_mount.code.path / HOST_ENTRYPOINT), ENTRYPOINT,
+                json.dumps(descriptors, separators=(",", ":")), *args]
+        else:
+            result_command = ["/usr/bin/python3", "-I", "-S", "-c", _POLICY_FD_LAUNCHER,
+                              json.dumps(descriptors, separators=(",", ":")), *args]
         if admission_root is not None:
             from herdr.ownership_epoch import custodial_command, legacy_admission_guard
             with legacy_admission_guard(admission_root) as epoch:
