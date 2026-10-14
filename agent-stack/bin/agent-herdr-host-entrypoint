@@ -38,7 +38,10 @@ require(site.is_dir() and site.resolve(strict=True) == site,
         "approved host dependency directory required")
 # The isolated Python has no Hermes venv dependencies by default. Add only
 # this fully verified immutable directory; do not execute .pth/startup hooks.
-sys.path.append(str(site))
+# Keep approved code first, then its verified dependency tree ahead of the
+# interpreter's default site-packages. The sibling script path is added first
+# below; neither -I nor runtime verification chooses between duplicate packages.
+sys.path.insert(1, str(site))
 target = root / sys.argv[1]
 # Existing worker scripts import helpers beside their entrypoint. Restore that
 # script import directory only after its complete immutable release is verified.

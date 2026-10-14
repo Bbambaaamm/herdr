@@ -467,6 +467,9 @@ not automatically use Hermes venv packages; host grant creation needs
 `cryptography`, and worker policy configuration needs `yaml`. After verifying
 the exact two approved runtime targets and every immutable tree, the wrapper
 adds only the approved Hermes `venv/lib/python3.11/site-packages` directory.
+Approved code and sibling-script imports retain precedence. The selected Hermes
+dependency directory precedes default interpreter site-packages, so duplicate
+packages in that default directory cannot replace the selected dependencies.
 It keeps isolated interpreter, code and sibling-script imports and does not
 process `.pth` files or run `sitecustomize` hooks from the added directory.
 A missing, aliased, unapproved or withdrawn runtime denies before the entrypoint

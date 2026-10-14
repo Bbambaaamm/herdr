@@ -21,6 +21,7 @@ from herdr import host_configuration, host_bootstrap, launch_plan_issuer
 from herdr.policy_launch import RUNTIME_TARGETS
 fixture = pathlib.Path(fixture)
 root = fixture / "code"
+sys.path.append(str(fixture / "default-site"))
 target = root / directory / "probe.py"
 python_target = str(host_bootstrap.PYTHON_TARGET)
 hermes_target = next(str(x) for x in RUNTIME_TARGETS if str(x) != python_target)
@@ -59,6 +60,13 @@ def fixture(tmp_path):
     site = tmp_path / "hermes/venv/lib/python3.11/site-packages"
     site.mkdir(parents=True)
     (site / "pinned_host_dependency.py").write_text("value = 'approved-dependency'\n")
+    # -I still retains interpreter-level site-packages. A duplicate there must
+    # lose to the explicitly selected immutable Hermes dependency inventory.
+    default_site = tmp_path / "default-site"; default_site.mkdir()
+    (default_site / "pinned_host_dependency.py").write_text("raise RuntimeError('unapproved default dependency')\n")
+    (site / "sibling_helper.py").write_text("raise RuntimeError('SDK shadowed approved sibling')\n")
+    (site / "root_host_helper.py").write_text("raise RuntimeError('SDK shadowed approved code')\n")
+    (root / "root_host_helper.py").write_text("value = 'approved-root'\n")
     marker = tmp_path / "startup-hook-executed"
     hook = "import pathlib; pathlib.Path(" + repr(str(marker)) + ").touch()\n"
     (site / "unsafe.pth").write_text(hook)
@@ -69,6 +77,8 @@ def fixture(tmp_path):
         entry.write_text(
             "import json, sys, pinned_host_dependency\n"
             "from sibling_helper import value\n"
+            "from root_host_helper import value as root_value\n"
+            "assert root_value == 'approved-root'\n"
             "print(json.dumps([pinned_host_dependency.value, value, sys.argv]))\n")
         (entry.parent / "sibling_helper.py").write_text("value = 'approved-sibling'\n")
     return repository, root, site, marker
