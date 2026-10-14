@@ -19,16 +19,25 @@ from tests.herdr.test_launch_plan_handoff import live
 
 
 @pytest.fixture
-def prepared(live, monkeypatch):
+def prepared(live, monkeypatch, request):
     raw, policy, approvals, listener = configure(live, monkeypatch)
     custody = transfer.DescriptorCustody()
     original = issuer.issue_request
     monkeypatch.setattr(issuer, 'issue_request', lambda connection: original(connection, custody=custody))
+    ambiguous = getattr(request, 'param', None) == 'post-rename-error'
+    if ambiguous:
+        publish = issuer.publication._publish_approved_launch_plan
+        def visible_then_failed(*args, **kwargs):
+            publish(*args, **kwargs)
+            raise OSError('fixture post-rename fsync/reply failure')
+        monkeypatch.setattr(issuer.publication, '_publish_approved_launch_plan', visible_then_failed)
     thread, errors, results = run_server(listener)
     try:
         live.launch.prepare_private_command(live.builder)
         thread.join(5)
-        assert not thread.is_alive() and not errors and results[0]['published']
+        assert not thread.is_alive()
+        if ambiguous: assert errors and 'error' in results[0]
+        else: assert not errors and results[0]['published']
     finally:
         listener.close(); thread.join(5)
     assert len(custody.pending) == 1
@@ -186,6 +195,57 @@ def test_custody_survives_original_issuance_deadline_for_reconciliation(prepared
     _, received = exchange(p)
     for fd in received: os.close(fd)
     assert not p.custody.pending
+
+
+@pytest.mark.parametrize('prepared', ['post-rename-error'], indirect=True)
+def test_ambiguous_visible_plan_keeps_redeemable_custody(prepared):
+    p = prepared
+    assert p.row['active'] and p.live.launch.mount.private_mount_plan.path.exists()
+    _, received = exchange(p)
+    for fd in received: os.close(fd)
+    assert not p.custody.pending
+
+
+def test_host_resume_after_fixed_reconciliation_window_does_not_launch(live, monkeypatch):
+    from herdr import launch_plan_handoff as handoff
+    _, _, _, listener = configure(live, monkeypatch)
+    client = live.launch.private_plan_handoff.automatic_issuer
+    original = client.issue
+    clock = [issuer.time.monotonic()]
+    def delayed(*args, **kwargs):
+        original(*args, **kwargs)
+        clock[0] = live.launch._private_issuer_reconciliation_deadline + 1
+    monkeypatch.setattr(client, 'issue', delayed)
+    monkeypatch.setattr(handoff, 'time', SimpleNamespace(monotonic=lambda:clock[0],sleep=lambda seconds:None))
+    thread, errors, _ = run_server(listener)
+    try:
+        with pytest.raises(SecurityError, match='timed out'):
+            live.launch.prepare_private_command(live.builder)
+        thread.join(5)
+        assert not thread.is_alive() and not errors
+        assert live.launch.mount.private_mount_plan is None and live.launch.sealed is None
+        assert len(list(live.plans.glob('*.json'))) == 1
+    finally: listener.close();thread.join(5)
+
+
+@pytest.mark.parametrize('boundary', [3, 4])
+def test_late_verification_failure_removes_only_unpublished_stages(live, monkeypatch, boundary):
+    _, _, approvals, listener = configure(live, monkeypatch)
+    original = issuer._validate; calls = []
+    def withdrawn(*args):
+        calls.append(1)
+        if len(calls) == boundary: raise SecurityError('fixture late withdrawal')
+        return original(*args)
+    monkeypatch.setattr(issuer, '_validate', withdrawn)
+    thread, errors, _ = run_server(listener)
+    try:
+        with pytest.raises(SecurityError): live.launch.prepare_private_command(live.builder)
+        thread.join(5)
+        assert not thread.is_alive() and errors
+        assert not list(approvals.glob('.automatic-*'))
+        assert not list(live.plans.glob('.launch-plan-*')) and not list(live.plans.glob('*.json'))
+        assert len(list(approvals.glob('*.json'))) == (0 if boundary == 3 else 1)
+    finally: listener.close();thread.join(5)
 
 
 @pytest.mark.parametrize('fail_at', [1, 2])

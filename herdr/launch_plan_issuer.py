@@ -473,6 +473,7 @@ def issue_request(connection, *, custody=None):
             live_authority()
         current()
         staged = None
+        plan_publish_attempted = False
         try:
             if custody is not None:
                 staged = custody.stage(request, peer, issuer, raw, fds, deadline)
@@ -484,18 +485,29 @@ def issue_request(connection, *, custody=None):
             _verify_root_owned_ancestry(publication.APPROVAL_ROOT)
             from .runtime_publication import _rename_without_replacement
             parent = os.open(publication.APPROVAL_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            created = None
+            renamed = False
             try:
                 import uuid
                 stage = ".automatic-" + uuid.uuid4().hex
                 fd = os.open(stage, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
                              0o600, dir_fd=parent)
+                created = os.fstat(fd)
                 with os.fdopen(fd, "wb") as stream:
                     stream.write(canonical_json_bytes(ticket)); stream.flush()
                     os.fchmod(stream.fileno(), 0o400); publication._root_owner(os.fstat(stream.fileno()))
                     os.fsync(stream.fileno())
                 current()
-                _rename_without_replacement(parent, stage, name); os.fsync(parent)
-            finally: os.close(parent)
+                _rename_without_replacement(parent, stage, name)
+                renamed = True
+                os.fsync(parent)
+            finally:
+                try:
+                    if created is not None and not renamed:
+                        publication._discard_unpublished_stage(parent, stage, created)
+                finally:
+                    os.close(parent)
+            plan_publish_attempted = True
             result = publication._publish_approved_launch_plan(publication.APPROVAL_ROOT / name,
                                                               publish=True, before_publish=current)
             if custody is not None:
@@ -505,7 +517,10 @@ def issue_request(connection, *, custody=None):
                     "plan_sha256": result["plan_sha256"], "published": True}
         finally:
             if staged is not None:
-                custody.cancel(staged)
+                if plan_publish_attempted:
+                    custody.reconcile(staged)
+                else:
+                    custody.cancel(staged)
     finally:
         for fd in fds: os.close(fd)
 
@@ -523,6 +538,10 @@ class AutomaticLaunchPlanClient:
         require(type(deadline) in (int, float) and now < deadline < float("inf"),
                 "automatic issuance deadline expired or is not finite")
         deadline = min(deadline, now + self.timeout_seconds)
+        # Both sides use the transmitted request deadline plus the configured
+        # handoff window; host scheduling cannot invent a later redemption TTL.
+        launch._private_issuer_reconciliation_deadline = (
+            deadline + launch.private_plan_handoff.timeout_seconds)
         def remaining():
             value = deadline - time.monotonic()
             require(value > 0, "automatic issuance deadline expired")

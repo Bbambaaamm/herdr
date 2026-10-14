@@ -140,6 +140,17 @@ def _root_owner(info):
     require(info.st_uid == 0, "published approval must use new root-owned inode")
 
 
+def _discard_unpublished_stage(parent, name, created):
+    try:
+        current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    require(stat.S_ISREG(current.st_mode) and current.st_uid == created.st_uid
+            and (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino),
+            "unpublished staging inode changed")
+    os.unlink(name, dir_fd=parent)
+
+
 def publish_approved_launch_plan(configuration_path, *, publish=False):
     """Default is read-only preflight; publishing never replaces an old plan.
 
@@ -165,8 +176,11 @@ def _publish_approved_launch_plan(configuration_path, *, publish=False, before_p
     if not publish:
         return record
     parent = os.open(AUTHORITY_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    stage = None
+    renamed = False
     try:
         fd, stage = tempfile.mkstemp(prefix=".launch-plan-", dir=AUTHORITY_ROOT)
+        created = os.fstat(fd)
         with os.fdopen(fd, "wb") as stream:
             stream.write(body)
             stream.flush()
@@ -184,7 +198,12 @@ def _publish_approved_launch_plan(configuration_path, *, publish=False, before_p
         if before_publish is not None:
             before_publish()
         _rename_without_replacement(parent, Path(stage).name, name)
+        renamed = True
         os.fsync(parent)
         return {**record, "published": True}
     finally:
-        os.close(parent)
+        try:
+            if stage is not None and not renamed:
+                _discard_unpublished_stage(parent, Path(stage).name, created)
+        finally:
+            os.close(parent)

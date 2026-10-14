@@ -171,7 +171,8 @@ class LaunchPlanHandoff:
                 # A lost reply does not authorize a second issuance. Reconcile
                 # only the existing root plan while retaining these exact FDs.
                 pass
-            deadline = time.monotonic() + self.timeout_seconds
+            fixed = getattr(launch, '_private_issuer_reconciliation_deadline', None)
+            deadline = deadline if fixed is None else fixed
         try:
             destination = AUTHORITY_ROOT / published[0].name
             while True:

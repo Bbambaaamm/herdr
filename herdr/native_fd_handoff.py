@@ -55,9 +55,13 @@ class DescriptorCustody:
                 duplicate = os.dup(fd)
                 copies.append(duplicate)
                 os.set_inheritable(duplicate, False)
+            handoff = raw['private_launch']['plan_handoff']['timeout_seconds']
+            grant_expiry = datetime.fromisoformat(request['grant']['expires_at'])
+            grant_deadline = time.monotonic() + (grant_expiry - datetime.now(UTC)).total_seconds()
             self.pending[key] = {'request': json.loads(canonical_json_bytes(request)),
                 'peer': peer, 'issuer': issuer, 'raw': raw, 'fds': copies,
-                'deadline': deadline, 'request_deadline': deadline, 'active': False}
+                'deadline': min(deadline + handoff, grant_deadline),
+                'request_deadline': deadline, 'active': False}
             return key
         except BaseException:
             _close(copies)
@@ -67,14 +71,27 @@ class DescriptorCustody:
         from .launch_plan_issuer import require
         row = self.pending[key]
         require(not row['active'], 'native descriptor custody already committed')
-        # The host reconciles a lost issuance reply under a fresh handoff
-        # window. Publication keeps the original deadline; descriptor custody
-        # survives that window, bounded by the same active grant and policy.
-        handoff = row['raw']['private_launch']['plan_handoff']['timeout_seconds']
-        grant_expiry = datetime.fromisoformat(row['request']['grant']['expires_at'])
-        grant_deadline = time.monotonic() + (grant_expiry - datetime.now(UTC)).total_seconds()
-        row['deadline'] = min(row['request_deadline'] + handoff, grant_deadline)
         row['active'] = True
+
+    def reconcile(self, key):
+        # A rename can succeed before fsync/reply fails. Never discard the
+        # only held descriptors of an exact visible no-replace plan.
+        from . import launch_plan_issuer as authority
+        from .private_mount_plan import ApprovedPrivateMountPlan
+        row = self.pending[key]
+        proposal = row['request']['proposal']
+        try:
+            plan = ApprovedPrivateMountPlan.read(authority.publication.AUTHORITY_ROOT / (key + '.json'),
+                InvocationIdentity.from_dict(proposal['plan']['identity']))
+            plan.authorize(proposal['plan']['descriptors'], proposal['argv'])
+        except FileNotFoundError:
+            self.cancel(key)
+        except (OSError, ValueError, authority.SecurityError):
+            # Inspection uncertainty cannot authorize transfer. Retain bounded
+            # inactive custody until exact redemption inspection or expiry.
+            pass
+        else:
+            self.activate(key)
 
     def cancel(self, key):
         row = self.pending.pop(key)
@@ -98,7 +115,6 @@ class DescriptorCustody:
         key = request['identity_sha256']
         authority.require(key in self.pending, 'native descriptors unavailable; reconcile existing plan')
         row = self.pending[key]
-        authority.require(row['active'], 'native descriptor publication incomplete')
         proposal = row['request']['proposal']
         authority.require((issuer, raw) == (row['issuer'], row['raw'])
                 and request['plan_sha256'] == authority._digest(proposal['plan']),
@@ -129,6 +145,8 @@ class DescriptorCustody:
         plan = ApprovedPrivateMountPlan.read(Path(expected['authority']),
                                              InvocationIdentity.from_dict(proposal['plan']['identity']))
         plan.authorize(proposal['plan']['descriptors'], proposal['argv'])
+        if not row['active']:
+            self.activate(key)
         authority._validate(row['request'], row['fds'], row['peer'], raw)
         authority.require(authority._policy() == (issuer, raw)
                 and authority._peer(connection, issuer, raw) == peer

@@ -304,6 +304,7 @@ def test_successful_automatic_publication_has_a_bounded_binding_window(live, mon
     budgets = []
     def issue(launch, published, *, deadline):
         budgets.append(deadline)
+        launch._private_issuer_reconciliation_deadline = deadline + live.launch.private_plan_handoff.timeout_seconds
         # Successful publication consumes the setup/issuer budget. A fresh,
         # finite binding phase is needed for this already committed identity.
         live.state["time"] = deadline
