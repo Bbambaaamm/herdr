@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Run only via the approved isolated host wrapper and pinned interpreter."""
+from importlib.machinery import SourceFileLoader
+import importlib.util
+from pathlib import Path
+import sys
+
+source = Path(__file__).with_name('agent_durable_sandbox.py')
+loader = SourceFileLoader('approved_native_fd_sandbox', str(source))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+loader.exec_module(module)
+exec(compile(module._POLICY_FD_LAUNCHER, str(source) + ':fd-launcher', 'exec'),
+     {'__name__': '__main__'})

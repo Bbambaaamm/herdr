@@ -64,6 +64,53 @@ def _tree(raw, *, immutable=False):
         tuple(raw["executable_files"]),raw["max_bytes"],raw["max_file_bytes"])
 
 
+def host_entrypoint_command(entrypoint, arguments, *, legacy_command, binding=None):
+    """Select the immutable host wrapper only from the protected opt-in policy.
+
+    Resolve admission before the dispatcher claims a task. Task fields and
+    environment variables cannot select a release, interpreter or entrypoint.
+    Missing/schema-1/manual configuration retains the existing command.
+    """
+    if binding is not None:
+        require(isinstance(binding, dict), "host launch binding record required")
+        binding.clear()
+    try:
+        raw = _read_configuration(HOST_POLICY_CONFIG)
+    except FileNotFoundError:
+        return list(legacy_command)
+    version = raw.get("schema_version")
+    require(type(version) is int and version in (1, 2),
+            "closed host composition schema required")
+    if version == 1:
+        return list(legacy_command)
+    private = raw.get("private_launch")
+    require(isinstance(private, dict), "closed private host policy required")
+    handoff = private.get("plan_handoff", {})
+    require(isinstance(handoff, dict), "closed host launch-plan handoff configuration required")
+    if "automatic_issuer" not in handoff:
+        return list(legacy_command)
+    require(handoff["automatic_issuer"] is True, "explicit automatic issuer opt-in required")
+    from .launch_plan_issuer import _policy, HOST_ENTRYPOINT
+    from .host_bootstrap import PYTHON_TARGET, PYTHON_EXECUTABLE
+    issuer, current = _policy()
+    require(current == raw, "host private policy changed before host launch")
+    require(type(raw.get("host_uid")) is int and raw["host_uid"] == os.geteuid(),
+            "host configuration UID mismatch")
+    code = Path(raw["code"]["source"])
+    require(Path(__file__).resolve(strict=True).parents[1] == code,
+            "host caller must use the approved immutable release")
+    require(entrypoint in issuer["entrypoints"], "approved host entrypoint required")
+    require(isinstance(arguments, (list, tuple))
+            and all(isinstance(value, str) and "\0" not in value for value in arguments),
+            "host arguments must be literal strings")
+    if binding is not None:
+        from .launch_plan_issuer import _digest
+        binding.update(host_policy_sha256=_digest(raw), code_source=str(code))
+    python = next(row for row in raw["runtime"] if row["target"] == str(PYTHON_TARGET))
+    return [str(Path(python["source"]) / PYTHON_EXECUTABLE), "-I", "-B",
+            str(code / HOST_ENTRYPOINT), entrypoint, *arguments]
+
+
 def _private_profile(raw):
     """The same root policy approves profile bytes and their credential window.
 
@@ -193,10 +240,21 @@ def build_host_policy_factory(*,parent_grant=None,configuration_path=HOST_POLICY
         if "plan_handoff" in raw["private_launch"]:
             from .launch_plan_handoff import LaunchPlanHandoff
             definition = raw["private_launch"]["plan_handoff"]
-            require(isinstance(definition,dict) and set(definition)=={"proposal_directory","timeout_seconds"}
+            require(isinstance(definition,dict) and set(definition) in (
+                    {"proposal_directory","timeout_seconds"},
+                    {"proposal_directory","timeout_seconds","automatic_issuer"})
                     and isinstance(definition["proposal_directory"],str),
                     "closed host launch-plan handoff configuration required")
-            handoff = LaunchPlanHandoff(definition["proposal_directory"],definition["timeout_seconds"])
+            issuer = None
+            if "automatic_issuer" in definition:
+                require(definition["automatic_issuer"] is True, "explicit automatic issuer opt-in required")
+                from .launch_plan_issuer import AutomaticLaunchPlanClient, protect_host_process, _digest, _policy
+                issuer_policy, issuer_host = _policy()
+                require(issuer_host == raw, "host automatic issuer policy changed during composition")
+                protect_host_process()
+                issuer = AutomaticLaunchPlanClient(_digest(raw), issuer_policy["request_timeout_seconds"])
+            handoff = LaunchPlanHandoff(definition["proposal_directory"],definition["timeout_seconds"],
+                                      automatic_issuer=issuer)
         options=dict(approved_profile=profile,profile_preflight=preflight,private_plan_handoff=handoff,
                      parent_approved_profile=profile if parent_grant is not None else None,
                      retained_parent_verify=retained_parent_verify)

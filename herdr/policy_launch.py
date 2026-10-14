@@ -353,6 +353,19 @@ def mount_rows(pid):
     return rows
 
 
+def _executable_inventory(names):
+    ordered = sorted(set(names))
+    return {"sha256": hashlib.sha256(canonical_json_bytes(ordered)).hexdigest(),
+            "count": len(ordered)}
+
+
+def _validate_executable_inventory(value):
+    _require(isinstance(value, dict) and set(value) == {"sha256", "count"}
+             and isinstance(value["sha256"], str) and _SHA.fullmatch(value["sha256"])
+             and type(value["count"]) is int and 0 <= value["count"] <= 65536,
+             "immutable executable inventory malformed")
+
+
 class PolicyMount:
     """Pinned grant file and independently frozen code/runtime mount objects."""
     def __init__(self, stage: PolicyBundleStage, code: FrozenTree, runtime=()):
@@ -370,6 +383,7 @@ class PolicyMount:
         self.private_mount_argv = None
         self.private_identity = None
         self.private_cli_pins = {}
+        self.private_fd_handoff = False
         targets = [str(BUNDLE_TARGET), str(code.target), *(str(x.target) for x in runtime)]
         _require(len(targets) == len(set(targets)), "duplicate policy mount target")
 
@@ -391,13 +405,19 @@ class PolicyMount:
         _require(isinstance(self.private_mount_plan, ApprovedPrivateMountPlan)
                  and ApprovedPrivateMountPlan.read(self.private_mount_plan.path, self.private_identity)
                      == self.private_mount_plan, "private mount approval unavailable or changed")
+        trees = (self.code, *self.runtime)
+        compact = all(tree.executable_files is not None for tree in trees)
+        def inventory(tree):
+            if tree.executable_files is None:
+                return {}
+            return ({"executable_inventory": _executable_inventory(tree.executable_files)}
+                    if compact else {"executable_files": sorted(set(tree.executable_files))})
         return {
-            "schema_version": "herdr-immutable-sources-1",
+            "schema_version": "herdr-immutable-sources-2" if compact else "herdr-immutable-sources-1",
             "authority": "root-published",
             "trees": {str(tree.target): {"source": str(tree.path),
-                      "manifest_sha256": tree.source_digest,
-                      **({"executable_files":sorted(tree.executable_files)} if tree.executable_files is not None else {})}
-                      for tree in (self.code, *self.runtime)},
+                      "manifest_sha256": tree.source_digest, **inventory(tree)}
+                      for tree in trees},
             "executables": {name: dict(self.code.files)[name]
                             for name in (SHIM_SOURCE, STAGE1_SOURCE, STAGE2_SOURCE)},
             "mount_plan": self.private_mount_plan.evidence(),
@@ -547,7 +567,7 @@ def validate_policy_evidence(evidence, *, identity: InvocationIdentity):
         from .host_bootstrap import SHIM_SOURCE, STAGE1_SOURCE, STAGE2_SOURCE
         _require(isinstance(sources, dict)
                  and set(sources) == {"schema_version", "authority", "trees", "executables", "mount_plan"}
-                 and sources["schema_version"] == "herdr-immutable-sources-1"
+                 and sources["schema_version"] in {"herdr-immutable-sources-1", "herdr-immutable-sources-2"}
                  and sources["authority"] == "root-published"
                  and isinstance(sources["trees"], dict)
                  and set(sources["trees"]) == set(trees)
@@ -569,8 +589,14 @@ def validate_policy_evidence(evidence, *, identity: InvocationIdentity):
                  "immutable mount plan evidence malformed")
         for target, source in sources["trees"].items():
             digest = evidence["code_sha256"] if target == str(CODE_TARGET) else runtime[target]
+            inventory_field = ("executable_files" if sources["schema_version"] == "herdr-immutable-sources-1"
+                               else "executable_inventory")
+            base_fields = {"source", "manifest_sha256"}
+            shapes = ((base_fields, base_fields | {inventory_field})
+                      if sources["schema_version"] == "herdr-immutable-sources-1"
+                      else (base_fields | {inventory_field},))
             _require(isinstance(source, dict)
-                     and set(source) in ({"source", "manifest_sha256"},{"source","manifest_sha256","executable_files"})
+                     and set(source) in shapes
                      and isinstance(source["source"], str)
                      and Path(source["source"]).is_absolute()
                      and os.path.normpath(source["source"]) == source["source"]
@@ -581,6 +607,8 @@ def validate_policy_evidence(evidence, *, identity: InvocationIdentity):
                 _require(isinstance(names,list) and len(names)<=65536
                          and all(isinstance(name,str) and 0<len(name)<=1024 for name in names)
                          and names==sorted(set(names)),"immutable executable evidence malformed")
+            if "executable_inventory" in source:
+                _validate_executable_inventory(source["executable_inventory"])
     if modern:
         from .host_bootstrap import validate_continuation
         bootstrap=evidence["bootstrap"]
@@ -609,6 +637,13 @@ def verify_retained_immutable_sources(proof):
     for target, source in proof["immutable_sources"]["trees"].items():
         path = Path(source["source"])
         approved_executable=source.get("executable_files")
+        compact_inventory = source.get("executable_inventory")
+        if proof["immutable_sources"].get("schema_version") == "herdr-immutable-sources-2":
+            _require("executable_inventory" in source, "immutable executable inventory missing")
+        if "executable_inventory" in source:
+            _validate_executable_inventory(compact_inventory)
+            _require("executable_files" not in source, "mixed immutable executable inventory")
+        discovered_executables = []
         _require(approved_executable is None or (isinstance(approved_executable,list)
                  and len(approved_executable)<=65536 and all(isinstance(name,str) for name in approved_executable)),
                  "retained immutable executable inventory invalid")
@@ -634,7 +669,12 @@ def verify_retained_immutable_sources(proof):
                     _require(stat.S_ISREG(info.st_mode) and len(files) < 65536
                              and info.st_size <= 268435456,
                              "retained immutable source shape changed")
-                    if approved_executable is not None:
+                    if compact_inventory is not None:
+                        mode = info.st_mode & 0o111
+                        _require(mode in (0, 0o111), "retained immutable executable mode changed")
+                        if mode:
+                            discovered_executables.append(relative)
+                    elif approved_executable is not None:
                         _require(info.st_mode&0o111==(0o111 if relative in approved_executable else 0),
                                  "retained immutable executable mode changed")
                     total[0] += info.st_size
@@ -657,6 +697,9 @@ def verify_retained_immutable_sources(proof):
             _require({"device": held.st_dev, "inode": held.st_ino} == proof["tree_identities"][target],
                      "retained immutable source inode changed")
             walk(fd)
+            if compact_inventory is not None:
+                _require(_executable_inventory(discovered_executables) == compact_inventory,
+                         "retained immutable executable inventory changed")
             _require(approved_executable is None or set(approved_executable)<=set(files),
                      "retained immutable executable inventory changed")
             _require(hashlib.sha256(canonical_json_bytes(dict(sorted(files.items())))).hexdigest()
@@ -994,6 +1037,8 @@ class PreparedPolicyLaunch:
             if self.private_plan_handoff is not None:
                 selected = self.private_plan_handoff.await_approval(self, builder)
             self.bind_private_mount_plan(selected)
+        self.mount.private_fd_handoff = (self.private_plan_handoff is not None
+                                        and self.private_plan_handoff.automatic_issuer is not None)
         result = builder()
         if self.private_plan_handoff is not None:
             self.private_plan_handoff.verify_bound(self)

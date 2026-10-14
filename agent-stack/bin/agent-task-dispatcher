@@ -11,6 +11,9 @@ from pathlib import Path
 HOME = Path("/home/agentops")
 BIN = Path(__file__).resolve().parent
 WORKER = BIN / "agent-task-worker"
+sys.path.insert(0, str(BIN.parents[1]))
+from herdr.host_configuration import host_entrypoint_command
+from herdr.launch_environment import sanitize_environment
 ROOT = HOME / ".local/state/agent-stack/tasks"
 PENDING = ROOT / "pending"
 RUNNING = ROOT / "running"
@@ -88,6 +91,12 @@ def launch(path: Path, dry_run: bool = False) -> int:
         log(f"refuse duplicate running task {task_id}")
         return 1
 
+    # Select the protected host launch before any queue claim or state write.
+    command = host_entrypoint_command("agent-stack/bin/agent-task-worker", [str(running)],
+                                      legacy_command=[str(WORKER), str(running)])
+    worker_env = {key: value for key, value in sanitize_environment(ENV).items()
+                  if not key.startswith("PYTHON")}
+
     # Refresh ownership time before entering running/. Old attempt timestamps
     # must never make a freshly claimed task look orphaned to the watchdog.
     task["dispatch_claimed_at"] = datetime.now(timezone.utc).isoformat()
@@ -96,10 +105,10 @@ def launch(path: Path, dry_run: bool = False) -> int:
     log(f"launch {task_id} priority={task.get('priority', 50)}")
     with (ROOT / "logs" / f"{task_id}.launcher.log").open("ab") as handle:
         proc = subprocess.Popen(
-            [str(WORKER), str(running)],
+            command,
             stdout=handle,
             stderr=subprocess.STDOUT,
-            env=ENV,
+            env=worker_env,
             start_new_session=True,
         )
 

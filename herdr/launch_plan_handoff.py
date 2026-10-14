@@ -21,6 +21,10 @@ MAX_PROPOSAL = 131072
 _MISSING = "durable_private_mount_plan_unapproved"
 
 
+class LaunchPlanReconciliationRequired(SecurityError):
+    """Retained automatic proposal must be reconciled without a new attempt."""
+
+
 def require(condition, reason):
     if not condition:
         raise SecurityError(reason)
@@ -70,11 +74,15 @@ def _build(launch, builder):
 
 class LaunchPlanHandoff:
     """Configured only by the trusted host factory, before any pane exists."""
-    def __init__(self, proposal_directory, timeout_seconds):
+    def __init__(self, proposal_directory, timeout_seconds, *, automatic_issuer=None):
         require(type(timeout_seconds) is int and 1 <= timeout_seconds <= 60,
                 "finite launch-plan handoff deadline required")
         self.directory, _ = _directory(proposal_directory)
         self.timeout_seconds = timeout_seconds
+        from .launch_plan_issuer import AutomaticLaunchPlanClient
+        require(automatic_issuer is None or isinstance(automatic_issuer, AutomaticLaunchPlanClient),
+                "typed automatic host issuer required")
+        self.automatic_issuer = automatic_issuer
 
     def _publish_proposal(self, launch, plan, argv):
         from .policy_launch import process_start_ticks
@@ -148,26 +156,48 @@ class LaunchPlanHandoff:
         profile = json.loads(canonical_json_bytes(launch.private_profile_snapshot.identity))
         self._live(launch, grant_sha256, profile)
         plan, argv = _build(launch, builder)
-        published = self._publish_proposal(launch, plan, argv)
-        destination = AUTHORITY_ROOT / published[0].name
-        while True:
-            self._verify_proposal(published)
-            self._live(launch, grant_sha256, profile)
-            current_plan, current_argv = _build(launch, builder)
-            require(current_plan == plan and current_argv == argv,
-                    "held launch command changed while waiting")
-            require(time.monotonic() < deadline, "launch-plan handoff timed out")
+        try:
+            published = self._publish_proposal(launch, plan, argv)
+        except FileExistsError as exc:
+            if self.automatic_issuer is not None:
+                raise LaunchPlanReconciliationRequired("task_launch_plan_reconciliation_required: retained proposal") from exc
+            raise
+        if self.automatic_issuer is not None:
             try:
-                approved = ApprovedPrivateMountPlan.read(destination, launch.identity)
-            except FileNotFoundError:
-                time.sleep(min(0.2, max(0, deadline - time.monotonic())))
-                continue
-            approved.authorize(plan["descriptors"], argv)
-            self._verify_proposal(published)
-            self._live(launch, grant_sha256, profile)
-            require(time.monotonic() < deadline, "launch-plan handoff timed out")
-            launch._private_handoff_state = (published, deadline, grant_sha256, profile)
-            return destination
+                self._verify_proposal(published)
+                self._live(launch, grant_sha256, profile)
+                self.automatic_issuer.issue(launch, published, deadline=deadline)
+            except (OSError, ValueError, SecurityError):
+                # A lost reply does not authorize a second issuance. Reconcile
+                # only the existing root plan while retaining these exact FDs.
+                pass
+            fixed = getattr(launch, '_private_issuer_reconciliation_deadline', None)
+            deadline = deadline if fixed is None else fixed
+        try:
+            destination = AUTHORITY_ROOT / published[0].name
+            while True:
+                self._verify_proposal(published)
+                self._live(launch, grant_sha256, profile)
+                current_plan, current_argv = _build(launch, builder)
+                require(current_plan == plan and current_argv == argv,
+                        "held launch command changed while waiting")
+                require(time.monotonic() < deadline, "launch-plan handoff timed out")
+                try:
+                    approved = ApprovedPrivateMountPlan.read(destination, launch.identity)
+                except FileNotFoundError:
+                    time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+                    continue
+                approved.authorize(plan["descriptors"], argv)
+                self._verify_proposal(published)
+                self._live(launch, grant_sha256, profile)
+                require(time.monotonic() < deadline, "launch-plan handoff timed out")
+                launch._private_handoff_state = (published, deadline, grant_sha256, profile)
+                return destination
+        except (OSError, ValueError, SecurityError) as exc:
+            if self.automatic_issuer is not None:
+                raise LaunchPlanReconciliationRequired(
+                    "task_launch_plan_reconciliation_required: " + str(exc)) from exc
+            raise
 
     def verify_bound(self, launch):
         require(isinstance(launch._private_handoff_state, tuple),

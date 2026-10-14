@@ -188,7 +188,7 @@ def test_new_inode_record_is_consumed_by_existing_plan_reader(approved, monkeypa
         plan.authorize(ticket["plan"]["descriptors"], [*ticket["argv"], "changed"])
 
 
-def test_existing_plan_never_replaced_and_failure_stage_retained(approved, monkeypatch):
+def test_existing_plan_never_replaced_and_unpublished_stage_removed(approved, monkeypatch):
     path, ticket, identity, authority, _ = approved
     permit_test_operator(monkeypatch)
     publication.publish_approved_launch_plan(path, publish=True)
@@ -199,9 +199,9 @@ def test_existing_plan_never_replaced_and_failure_stage_retained(approved, monke
     assert failure.value.errno == errno.EEXIST
     assert target.stat().st_ino == before.st_ino
     assert target.read_bytes() == canonical_json_bytes(ticket["plan"])
-    assert len(list(authority.glob(".launch-plan-*"))) == 1
+    assert not list(authority.glob(".launch-plan-*"))
     with pytest.raises(SecurityError, match="outside host authority"):
-        ApprovedPrivateMountPlan.read(next(authority.glob(".launch-plan-*")), identity)
+        ApprovedPrivateMountPlan.read(authority / ".launch-plan-unpublished", identity)
 
 
 @pytest.mark.parametrize("fault", ["expires", "withdraw", "enospc"])
@@ -221,9 +221,9 @@ def test_late_failure_denies_before_atomic_visibility_and_closes_fds(approved, m
     with pytest.raises((SecurityError, OSError)):
         publication.publish_approved_launch_plan(path, publish=True)
     assert not (authority / path.name).exists()
-    assert len(list(authority.glob(".launch-plan-*"))) == 1
+    assert not list(authority.glob(".launch-plan-*"))
     with pytest.raises(SecurityError, match="outside host authority"):
-        ApprovedPrivateMountPlan.read(next(authority.glob(".launch-plan-*")), identity)
+        ApprovedPrivateMountPlan.read(authority / ".launch-plan-unpublished", identity)
     assert set(os.listdir("/proc/self/fd")) == before
 
 
@@ -281,4 +281,4 @@ def test_expiry_during_final_shape_validation_denies_before_rename(approved, mon
         publication.publish_approved_launch_plan(path, publish=True)
     assert len(calls) == 2
     assert not (authority / path.name).exists()
-    assert len(list(authority.glob(".launch-plan-*"))) == 1
+    assert not list(authority.glob(".launch-plan-*"))
