@@ -406,8 +406,11 @@ admission authority. Only the configured existing entrypoints may run. They must
 be compatible with the pinned interpreter and dependencies; verify that in the
 new release before activation. Raw credentials are never issuer-policy fields.
 
-The plan authority listens only at `/run/herdr-launch-authority/issuer.sock` in
-a root-protected directory. UID equality is insufficient: it verifies kernel
+The plan authority listens at `/run/herdr-launch-authority/issuer.sock` and transfers
+exact approved native descriptors through `native-fds.sock` in the same root-protected
+directory. One serialized issuance worker and up to 16 independent descriptor
+receivers serve inside the existing authority process. Waiting connections use only
+the existing bounded kernel socket backlog; there is no additional queue or authority. UID equality is insufficient: it verifies kernel
 connection and per-message credentials, PID/start ticks, non-dumpability, exact
 service cgroup, host mount/PID/user/cgroup/network namespaces, approved launcher
 argv and actual interpreter inode. Sandbox callers, mutable checkouts, unrelated
@@ -431,9 +434,22 @@ The authority creates a fresh root-owned 0400 issuance ticket, rechecks the peer
 policy, grant and sources before its no-replace publication, then calls the
 existing 0444 plan publisher with the same live recheck immediately before the
 plan's atomic no-replace publication. Existing tickets/plans are never replaced,
-renewed, replayed or deleted. Hidden interrupted stages and proposal evidence
-remain available for explicit reconciliation. A lost response does not trigger
-an automatic retry or a new economic attempt. The automatic client uses the remaining setup/handoff deadline for connection, send and response, rather than restarting its socket budget. After a successful publication response, binding receives a separate finite window of the configured handoff timeout (at most 60 seconds). Manual handoff retains its original single deadline. Grant/profile/source/current-host authority and final bound checks remain mandatory in both phases; the fresh binding window never renews an approval or retries issuance. The waiting host still reads and authorizes the exact root plan, and performs its final handoff checks before the actual native pane starts. Error replies contain a generic reason only.
+renewed, replayed or deleted. A failed unpublished stage is removed only when it
+is still the exact inode created by that call. A visible approval or plan with
+ambiguous publication retains bounded custody for exact reconciliation; a lost
+response never authorizes reissuance or a new economic attempt.
+
+Client and server share the fixed transmitted request deadline. Binding ends at
+that deadline plus the configured handoff window, capped at grant expiry minus
+15 seconds. Descriptor custody survives for that fixed window plus a 15-second
+dispatch/redemption reserve, never beyond grant expiry. Descheduling cannot reset
+these windows. Manual handoff keeps its original single deadline. Root/current
+peer, grant/profile/source, signed mount plan and bound host checks remain
+mandatory. A successful descriptor send consumes custody before the syscall;
+late issuer cleanup cannot resurrect it. Per-set inspection ownership prevents
+expiry/cancellation from closing another thread's held descriptors or allowing a
+cancelled set to send. No command is executed by the root descriptor authority.
+
 
 Root operator preparation for a separately approved deployment:
 
@@ -475,3 +491,25 @@ process `.pth` files or run `sitecustomize` hooks from the added directory.
 A missing, aliased, unapproved or withdrawn runtime denies before the entrypoint
 runs. Dependency import tests use explicit root-policy/fixture-tree doubles;
 they do not establish native issuer, bootstrap or deployment acceptance.
+
+### Compact retained executable inventory
+
+Private launch proofs keep their 16 KiB frame limit. Complete runtime executable
+path lists can exceed that limit before profile and bootstrap metadata is added.
+New `herdr-immutable-sources-2` evidence binds an `executable_inventory` for each
+code/SDK/Python source: exactly `sha256` and integer `count` (0 through 65,536).
+The digest is SHA-256 of canonical JSON for the sorted executable relative names.
+These commitments remain part of the signed sandbox attestation and grant.
+
+Cold replay still checks root-owned ancestry, directory inode, complete content
+manifest, approved bootstrap bytes and exact mounts. While walking every file,
+it requires execute bits to be either all set (0111) or absent, collects the
+actual executable names, and compares both their digest and count with the
+retained signed commitment. A same-count mode swap, rename, addition, removal or
+partial execute permission is denied. A compact source cannot omit its inventory,
+contain a raw path list, or mix both representations.
+
+Readers continue to accept bounded `herdr-immutable-sources-1` evidence and its
+exact path-list mode checks. An old source with unknown executable metadata keeps
+the legacy format; it cannot claim compact mode without an inventory commitment.
+No frame, file-count, source-size, signature, authority or grant limit is enlarged.
