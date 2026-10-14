@@ -472,32 +472,40 @@ def issue_request(connection, *, custody=None):
             _validate(request, fds, peer, raw)
             live_authority()
         current()
-        now = datetime.now(UTC)
-        ticket = {"schema_version": publication.TICKET_VERSION, "plan": request["proposal"]["plan"],
-                  "argv": request["proposal"]["argv"], "not_before": now.isoformat(),
-                  "expires_at": min(now + timedelta(seconds=issuer["request_timeout_seconds"]),
-                                    datetime.fromisoformat(grant.expires_at)).isoformat()}
-        _verify_root_owned_ancestry(publication.APPROVAL_ROOT)
-        from .runtime_publication import _rename_without_replacement
-        parent = os.open(publication.APPROVAL_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        staged = None
         try:
-            import uuid
-            stage = ".automatic-" + uuid.uuid4().hex
-            fd = os.open(stage, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                         0o600, dir_fd=parent)
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(canonical_json_bytes(ticket)); stream.flush()
-                os.fchmod(stream.fileno(), 0o400); publication._root_owner(os.fstat(stream.fileno()))
-                os.fsync(stream.fileno())
-            current()
-            _rename_without_replacement(parent, stage, name); os.fsync(parent)
-        finally: os.close(parent)
-        result = publication._publish_approved_launch_plan(publication.APPROVAL_ROOT / name,
-                                                          publish=True, before_publish=current)
-        if custody is not None:
-            custody.retain(request, peer, issuer, raw, fds, deadline)
-        return {"schema_version": VERSION, "identity_sha256": name[:-5],
-                "plan_sha256": result["plan_sha256"], "published": True}
+            if custody is not None:
+                staged = custody.stage(request, peer, issuer, raw, fds, deadline)
+            now = datetime.now(UTC)
+            ticket = {"schema_version": publication.TICKET_VERSION, "plan": request["proposal"]["plan"],
+                      "argv": request["proposal"]["argv"], "not_before": now.isoformat(),
+                      "expires_at": min(now + timedelta(seconds=issuer["request_timeout_seconds"]),
+                                        datetime.fromisoformat(grant.expires_at)).isoformat()}
+            _verify_root_owned_ancestry(publication.APPROVAL_ROOT)
+            from .runtime_publication import _rename_without_replacement
+            parent = os.open(publication.APPROVAL_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                import uuid
+                stage = ".automatic-" + uuid.uuid4().hex
+                fd = os.open(stage, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                             0o600, dir_fd=parent)
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(canonical_json_bytes(ticket)); stream.flush()
+                    os.fchmod(stream.fileno(), 0o400); publication._root_owner(os.fstat(stream.fileno()))
+                    os.fsync(stream.fileno())
+                current()
+                _rename_without_replacement(parent, stage, name); os.fsync(parent)
+            finally: os.close(parent)
+            result = publication._publish_approved_launch_plan(publication.APPROVAL_ROOT / name,
+                                                              publish=True, before_publish=current)
+            if custody is not None:
+                custody.activate(staged)
+                staged = None
+            return {"schema_version": VERSION, "identity_sha256": name[:-5],
+                    "plan_sha256": result["plan_sha256"], "published": True}
+        finally:
+            if staged is not None:
+                custody.cancel(staged)
     finally:
         for fd in fds: os.close(fd)
 

@@ -8,6 +8,7 @@ import ctypes
 from pathlib import Path
 import subprocess
 import sys
+import errno
 from types import SimpleNamespace
 
 import pytest
@@ -172,6 +173,65 @@ def test_actual_client_checks_plan_and_received_fd_inventory(prepared, monkeypat
     finally:
         for fd in received: os.close(fd)
         sender.close(); thread.join(5)
+
+
+def test_custody_survives_original_issuance_deadline_for_reconciliation(prepared, monkeypatch):
+    p = prepared
+    original = p.row['request_deadline']
+    handoff = p.raw['private_launch']['plan_handoff']['timeout_seconds']
+    assert p.row['deadline'] == pytest.approx(original + handoff)
+    monkeypatch.setattr(transfer, 'time', SimpleNamespace(monotonic=lambda: original + 0.1))
+    p.custody.prune()
+    assert p.key in p.custody.pending
+    _, received = exchange(p)
+    for fd in received: os.close(fd)
+    assert not p.custody.pending
+
+
+@pytest.mark.parametrize('fail_at', [1, 2])
+def test_fd_duplication_failure_precedes_irreversible_publication(live, monkeypatch, fail_at):
+    _, _, approvals, listener = configure(live, monkeypatch)
+    custody = transfer.DescriptorCustody()
+    original = issuer.issue_request
+    monkeypatch.setattr(issuer, 'issue_request', lambda connection: original(connection, custody=custody))
+    copies = []
+    class ExhaustedOS(RootOS):
+        def dup(self, fd):
+            if len(copies) + 1 == fail_at: raise OSError(errno.EMFILE, 'fixture FD pressure')
+            duplicate = os.dup(fd); copies.append(duplicate); return duplicate
+    monkeypatch.setattr(transfer, 'os', ExhaustedOS())
+    thread, errors, _ = run_server(listener)
+    try:
+        with pytest.raises(SecurityError): live.launch.prepare_private_command(live.builder)
+        thread.join(5)
+        assert not thread.is_alive() and errors
+        assert not list(approvals.glob('*.json')) and not list(live.plans.glob('*.json'))
+        assert not custody.pending
+        for fd in copies:
+            with pytest.raises(OSError): os.fstat(fd)
+    finally: listener.close();thread.join(5);custody.close()
+
+
+def test_plan_publication_failure_cancels_staged_custody(live, monkeypatch):
+    _, _, _, listener = configure(live, monkeypatch)
+    custody = transfer.DescriptorCustody(); copies = []
+    original = issuer.issue_request
+    stage = custody.stage
+    def observed_stage(*args):
+        key = stage(*args); copies.extend(custody.pending[key]['fds']); return key
+    monkeypatch.setattr(custody, 'stage', observed_stage)
+    monkeypatch.setattr(issuer, 'issue_request', lambda connection: original(connection, custody=custody))
+    def denied(*args, **kwargs): raise OSError('fixture plan publication failure')
+    monkeypatch.setattr(issuer.publication, '_publish_approved_launch_plan', denied)
+    thread, errors, _ = run_server(listener)
+    try:
+        with pytest.raises(SecurityError): live.launch.prepare_private_command(live.builder)
+        thread.join(5)
+        assert not thread.is_alive() and errors and copies and not custody.pending
+        assert not list(live.plans.glob('*.json'))
+        for fd in copies:
+            with pytest.raises(OSError): os.fstat(fd)
+    finally: listener.close();thread.join(5);custody.close()
 
 
 @pytest.mark.skipif(sys.platform != 'linux' or os.geteuid() == 0,

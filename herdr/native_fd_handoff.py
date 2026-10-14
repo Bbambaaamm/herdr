@@ -13,6 +13,7 @@ import re
 import socket
 import struct
 import time
+from datetime import UTC, datetime
 
 from .security import InvocationIdentity, canonical_json_bytes
 
@@ -42,7 +43,7 @@ class DescriptorCustody:
         self.prune()
         require(len(self.pending) < MAX_PENDING, 'native descriptor custody is full')
 
-    def retain(self, request, peer, issuer, raw, fds, deadline):
+    def stage(self, request, peer, issuer, raw, fds, deadline):
         from .launch_plan_issuer import _digest, require
         self.require_capacity()
         key = _digest(request['proposal']['plan']['identity'])
@@ -55,10 +56,29 @@ class DescriptorCustody:
                 copies.append(duplicate)
                 os.set_inheritable(duplicate, False)
             self.pending[key] = {'request': json.loads(canonical_json_bytes(request)),
-                'peer': peer, 'issuer': issuer, 'raw': raw, 'fds': copies, 'deadline': deadline}
+                'peer': peer, 'issuer': issuer, 'raw': raw, 'fds': copies,
+                'deadline': deadline, 'request_deadline': deadline, 'active': False}
+            return key
         except BaseException:
             _close(copies)
             raise
+
+    def activate(self, key):
+        from .launch_plan_issuer import require
+        row = self.pending[key]
+        require(not row['active'], 'native descriptor custody already committed')
+        # The host reconciles a lost issuance reply under a fresh handoff
+        # window. Publication keeps the original deadline; descriptor custody
+        # survives that window, bounded by the same active grant and policy.
+        handoff = row['raw']['private_launch']['plan_handoff']['timeout_seconds']
+        grant_expiry = datetime.fromisoformat(row['request']['grant']['expires_at'])
+        grant_deadline = time.monotonic() + (grant_expiry - datetime.now(UTC)).total_seconds()
+        row['deadline'] = min(row['request_deadline'] + handoff, grant_deadline)
+        row['active'] = True
+
+    def cancel(self, key):
+        row = self.pending.pop(key)
+        _close(row['fds'])
 
     def redeem(self, connection):
         from . import launch_plan_issuer as authority
@@ -78,6 +98,7 @@ class DescriptorCustody:
         key = request['identity_sha256']
         authority.require(key in self.pending, 'native descriptors unavailable; reconcile existing plan')
         row = self.pending[key]
+        authority.require(row['active'], 'native descriptor publication incomplete')
         proposal = row['request']['proposal']
         authority.require((issuer, raw) == (row['issuer'], row['raw'])
                 and request['plan_sha256'] == authority._digest(proposal['plan']),
