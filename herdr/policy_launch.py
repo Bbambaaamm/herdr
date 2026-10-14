@@ -354,7 +354,7 @@ def mount_rows(pid):
 
 
 def _executable_inventory(names):
-    ordered = sorted(names)
+    ordered = sorted(set(names))
     return {"sha256": hashlib.sha256(canonical_json_bytes(ordered)).hexdigest(),
             "count": len(ordered)}
 
@@ -411,7 +411,7 @@ class PolicyMount:
             if tree.executable_files is None:
                 return {}
             return ({"executable_inventory": _executable_inventory(tree.executable_files)}
-                    if compact else {"executable_files": sorted(tree.executable_files)})
+                    if compact else {"executable_files": sorted(set(tree.executable_files))})
         return {
             "schema_version": "herdr-immutable-sources-2" if compact else "herdr-immutable-sources-1",
             "authority": "root-published",

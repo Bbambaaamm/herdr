@@ -158,3 +158,18 @@ def test_unknown_legacy_modes_keep_legacy_format_and_cannot_claim_compact(emitte
     proof['immutable_sources']['schema_version'] = 'herdr-immutable-sources-2'
     with pytest.raises(SecurityError):
         launch.validate_policy_evidence(proof, identity=emitted.identity)
+
+
+def test_duplicate_configuration_names_commit_the_unique_filesystem_inventory(emitted):
+    for tree in (emitted.mount.code, *emitted.mount.runtime):
+        tree.executable_files = (*tree.executable_files, *tree.executable_files)
+    sources = launch.PolicyMount.immutable_source_evidence(emitted.mount)
+    assert sources == emitted.proof['immutable_sources']
+    proof = deepcopy(emitted.proof); proof['immutable_sources'] = sources
+    assert launch.validate_policy_evidence(proof, identity=emitted.identity) == proof
+    emitted.mount.runtime[0].executable_files = None
+    legacy = launch.PolicyMount.immutable_source_evidence(emitted.mount)
+    assert legacy['schema_version'] == 'herdr-immutable-sources-1'
+    for source in legacy['trees'].values():
+        if 'executable_files' in source:
+            assert source['executable_files'] == sorted(set(emitted.names))

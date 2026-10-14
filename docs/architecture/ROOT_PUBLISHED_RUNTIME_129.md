@@ -498,7 +498,7 @@ Private launch proofs keep their 16 KiB frame limit. Complete runtime executable
 path lists can exceed that limit before profile and bootstrap metadata is added.
 New `herdr-immutable-sources-2` evidence binds an `executable_inventory` for each
 code/SDK/Python source: exactly `sha256` and integer `count` (0 through 65,536).
-The digest is SHA-256 of canonical JSON for the sorted executable relative names.
+The digest is SHA-256 of canonical JSON for the sorted unique executable relative names.
 These commitments remain part of the signed sandbox attestation and grant.
 
 Cold replay still checks root-owned ancestry, directory inode, complete content
