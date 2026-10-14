@@ -258,7 +258,8 @@ def test_host_peer_requires_every_independent_authority_binding(tmp_path, monkey
         def getsockopt(self, *args): return struct.pack("3i", pid, uid + (fault == "uid"), os.getgid())
     class ObservedPath(type(Path())):
         def stat(self, *args, **kwargs):
-            if str(self) == f"/proc/{pid}": return SimpleNamespace(st_uid=uid if fault == "dumpable" else 0)
+            if str(self) == f"/proc/{pid}/status":
+                return SimpleNamespace(st_mode=stat.S_IFREG | 0o444, st_uid=uid + 1 if fault == "dumpable" else 0, st_gid=0)
             if str(self) == f"/proc/{pid}/exe":
                 return SimpleNamespace(st_dev=actual.st_dev, st_ino=actual.st_ino + (fault == "interpreter"))
             return super().stat(*args, **kwargs)
@@ -767,3 +768,68 @@ def test_automatic_native_cleanup_accepts_only_builder_cleanup_inventory(physica
     argv[argv.index("--remount-ro"):argv.index("--remount-ro")] = ["--unsetenv", key]
     plan = request_for(physical.grant.identity, physical.plan["descriptors"], argv)
     issuer._argv(plan, argv, physical.grant.workspace_root, physical.profile)
+
+
+@pytest.mark.skipif(sys.platform != "linux" or os.geteuid() == 0,
+                    reason="real non-root Linux proc ownership and protection required")
+@pytest.mark.parametrize("dumpable", [0, 1])
+def test_real_non_dumpable_peer_uses_proc_entry_not_process_directory(dumpable):
+    # No proc/ownership/ptrace doubles. Test the production check against a
+    # separate ordinary-user process and observe same-UID kernel protection.
+    program = r"""
+import ctypes,json,os,sys
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from herdr import launch_plan_issuer as issuer
+libc=ctypes.CDLL(None,use_errno=True)
+mode=int(sys.argv[2])
+assert libc.prctl(4,mode,0,0,0)==0 and libc.prctl(3,0,0,0,0)==mode
+base=Path('/proc')/str(os.getpid())
+status=(base/'status').stat()
+print(json.dumps({'pid':os.getpid(),'directory_uid':base.stat().st_uid,
+                  'status_uid':status.st_uid,'status_gid':status.st_gid}),flush=True)
+sys.stdin.read(1)
+"""
+    repository = Path(__file__).resolve().parents[2]
+    child = subprocess.Popen([sys.executable, "-I", "-B", "-c", program,
+                              str(repository), str(dumpable)],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True)
+    try:
+        import select
+        assert select.select([child.stdout], [], [], 10)[0], "native proc probe did not start"
+        line = child.stdout.readline()
+        assert line, child.stderr.read()
+        observation = json.loads(line)
+        assert observation["pid"] == child.pid
+        assert observation["directory_uid"] == os.getuid()
+        if dumpable == 0:
+            assert observation["status_uid"] == observation["status_gid"] == 0
+            issuer._require_non_dumpable(child.pid)
+            with pytest.raises(PermissionError):
+                fd = os.open(f"/proc/{child.pid}/environ", os.O_RDONLY)
+                os.close(fd)
+        else:
+            assert observation["status_uid"] == os.getuid()
+            with pytest.raises(SecurityError, match="must be non-dumpable"):
+                issuer._require_non_dumpable(child.pid)
+            # Do not read or print inherited environment bytes.
+            fd = os.open(f"/proc/{child.pid}/environ", os.O_RDONLY)
+            os.close(fd)
+        child.communicate("x", timeout=10)
+        assert child.returncode == 0
+    finally:
+        if child.poll() is None:
+            child.kill(); child.communicate(timeout=5)
+
+
+@pytest.mark.parametrize("fault", ["not-regular", "owner", "group"])
+def test_non_dumpable_proc_marker_denies_wrong_type_owner_or_group(monkeypatch, fault):
+    class ObservedPath(type(Path())):
+        def stat(self):
+            return SimpleNamespace(st_mode=(stat.S_IFDIR if fault == "not-regular" else stat.S_IFREG) | 0o444,
+                                   st_uid=1 if fault == "owner" else 0,
+                                   st_gid=1 if fault == "group" else 0)
+    monkeypatch.setattr(issuer, "Path", ObservedPath)
+    with pytest.raises(SecurityError, match="must be non-dumpable"):
+        issuer._require_non_dumpable(1234)

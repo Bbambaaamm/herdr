@@ -104,11 +104,20 @@ def _proc_bytes(pid, name, limit=262144):
     return raw
 
 
+def _require_non_dumpable(pid):
+    # Linux changes ownership of the entries inside /proc/<pid> when the
+    # process is protected; the process directory itself keeps its UID.
+    # Use a kernel-created regular entry, with both root owner and group.
+    info = Path(f"/proc/{pid}/status").stat()
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_gid == 0,
+            "issuer caller must be non-dumpable")
+
+
 def _peer(connection, issuer, raw):
     pid, uid, gid = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
     require(uid == raw["host_uid"] and pid > 0, "issuer caller is not the configured host")
     ticks = process_start_ticks(pid)
-    require(Path(f"/proc/{pid}").stat().st_uid == 0, "issuer caller must be non-dumpable")
+    _require_non_dumpable(pid)
     for name in ("mnt", "pid", "user", "cgroup", "net", "time"):
         require(os.readlink(f"/proc/{pid}/ns/{name}") == os.readlink(f"/proc/self/ns/{name}"),
                 "sandbox callers cannot issue host plans")
