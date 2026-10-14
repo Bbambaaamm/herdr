@@ -10,6 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from agent_platform_dashboard.production_sources import command as github_command
+from herdr.coding_guidance import CODING_DISCIPLINE
 from herdr.evidence import (EvidenceError, EvidenceMissing, EvidenceUnavailable,
                             EvidenceStore, accept_artifact, binding, digest, validate_criteria, EVIDENCE_VERSION)
 
@@ -318,12 +319,15 @@ def verification_applies(task: dict) -> bool:
 
 def completion_instructions(task: dict) -> str:
     if not verification_applies(task):
-        return "\nHost policy: this consumer currently retains legacy unverified completion; do not claim verified worker result, integration or deployment.\n"
+        legacy = "\nHost policy: this consumer currently retains legacy unverified completion; do not claim verified worker result, integration or deployment.\n"
+        return legacy + (CODING_DISCIPLINE if completion_kind(task) == "coding" else "")
     kind = completion_kind(task)
     plan = task.get("completion_plan") or {}
     common = ("\nHOST COMPLETION VERIFICATION:\n"
               "- The host accepts results against a plan frozen before dispatch. Model prose and producer labels cannot waive it.\n"
               "- Completed worker result, integration, deployment, and control cycle are distinct levels.\n")
+    if kind == "coding":
+        common += CODING_DISCIPLINE
     if kind == "control":
         return common + ("- This is a control cycle. Submit nonempty summary and evidence=[{herdr_control:{version:1,next_action:<nonempty text>}}] through herdr_submit_result. Its completion does not satisfy an implementation or its dependencies.\n")
     if kind == "coding" and task.get("work_contract_version") == 1:

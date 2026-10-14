@@ -12,6 +12,25 @@ from herdr.evidence import EvidenceError, EvidenceMissing, EvidenceUnavailable
 from herdr.workspace import ArtifactRef
 
 
+def test_coding_discipline_is_shared_once_and_not_added_to_control_or_review():
+    from herdr.coding_guidance import CODING_DISCIPLINE
+
+    prompt = collector.completion_instructions({"repo": collector.POLICY["repo"],
+                                                "completion_kind": "coding"})
+    assert prompt.count("CODING DISCIPLINE") == 1
+    assert CODING_DISCIPLINE in prompt
+    for key in ("Think before editing", "Simplicity first", "Surgical changes",
+                "Goal-driven verification"):
+        assert key in prompt
+
+    legacy = collector.completion_instructions({"repo": "another/repo",
+                                                 "completion_kind": "coding"})
+    assert "legacy unverified" in legacy and legacy.count("CODING DISCIPLINE") == 1
+    for kind in ("control", "review", "research"):
+        assert "CODING DISCIPLINE" not in collector.completion_instructions({
+            "repo": collector.POLICY["repo"], "completion_kind": kind})
+
+
 def proof_fixture():
     head, base = "a" * 40, "b" * 40
     artifact = ArtifactRef("task", 1, base, head, "c" * 64, ("result.py",), "result")

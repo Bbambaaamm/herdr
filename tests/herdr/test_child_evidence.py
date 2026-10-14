@@ -36,6 +36,19 @@ def artifact_fixture(tmp_path,monkeypatch):
     proof["review"]["specification_binding"]={**spec_binding,"binding_sha256":digest(spec_binding)}
     return rec,result,plan,store,path,proof
 
+def test_child_coding_prompt_uses_single_shared_discipline(tmp_path, monkeypatch):
+    from herdr.coding_guidance import CODING_DISCIPLINE
+
+    rec, _, plan, store, _, proof = artifact_fixture(tmp_path, monkeypatch)
+    authority = ChildCompletionAuthority(store=store, approve=lambda **kw: plan,
+                                          collector=lambda *args: proof)
+    authority.prepare(rec)
+    instructions = authority.instructions(rec)
+    assert instructions.count("CODING DISCIPLINE") == 1
+    assert CODING_DISCIPLINE in instructions
+    assert "Frozen plan: " in instructions
+
+
 def test_child_semantic_gate_uses_exact_real_artifact_and_replays_after_cleanup(tmp_path,monkeypatch):
     rec,result,plan,store,path,proof=artifact_fixture(tmp_path,monkeypatch)
     calls=[]
