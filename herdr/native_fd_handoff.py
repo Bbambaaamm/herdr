@@ -21,6 +21,8 @@ VERSION = 'herdr-native-fd-handoff-1'
 ENTRYPOINT = 'agent-stack/bin/agent-herdr-fd-launch'
 SOCKET_PATH = Path('/run/herdr-launch-authority/native-fds.sock')
 MAX_PENDING = 16
+# Bounded pane dispatch plus descriptor redemption after the host binds a plan.
+REDEMPTION_SECONDS = 15
 
 
 def _close(fds):
@@ -58,9 +60,13 @@ class DescriptorCustody:
             handoff = raw['private_launch']['plan_handoff']['timeout_seconds']
             grant_expiry = datetime.fromisoformat(request['grant']['expires_at'])
             grant_deadline = time.monotonic() + (grant_expiry - datetime.now(UTC)).total_seconds()
+            binding_deadline = min(deadline + handoff, grant_deadline - REDEMPTION_SECONDS)
+            require(time.monotonic() < binding_deadline,
+                    'native descriptor grant leaves no dispatch interval')
             self.pending[key] = {'request': json.loads(canonical_json_bytes(request)),
                 'peer': peer, 'issuer': issuer, 'raw': raw, 'fds': copies,
-                'deadline': min(deadline + handoff, grant_deadline),
+                'deadline': min(deadline + handoff + REDEMPTION_SECONDS, grant_deadline),
+                'binding_deadline': binding_deadline,
                 'request_deadline': deadline, 'active': False}
             return key
         except BaseException:

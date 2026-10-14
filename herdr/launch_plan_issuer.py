@@ -538,10 +538,14 @@ class AutomaticLaunchPlanClient:
         require(type(deadline) in (int, float) and now < deadline < float("inf"),
                 "automatic issuance deadline expired or is not finite")
         deadline = min(deadline, now + self.timeout_seconds)
-        # Both sides use the transmitted request deadline plus the configured
-        # handoff window; host scheduling cannot invent a later redemption TTL.
-        launch._private_issuer_reconciliation_deadline = (
-            deadline + launch.private_plan_handoff.timeout_seconds)
+        # Binding ends before custody expiry, reserving bounded time for pane
+        # dispatch/redemption without extending either the window or the grant.
+        from .native_fd_handoff import REDEMPTION_SECONDS
+        grant_deadline = now + (datetime.fromisoformat(launch.grant.expires_at)
+                                - datetime.now(UTC)).total_seconds()
+        launch._private_issuer_reconciliation_deadline = min(
+            deadline + launch.private_plan_handoff.timeout_seconds,
+            grant_deadline - REDEMPTION_SECONDS)
         def remaining():
             value = deadline - time.monotonic()
             require(value > 0, "automatic issuance deadline expired")

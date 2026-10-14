@@ -188,7 +188,8 @@ def test_custody_survives_original_issuance_deadline_for_reconciliation(prepared
     p = prepared
     original = p.row['request_deadline']
     handoff = p.raw['private_launch']['plan_handoff']['timeout_seconds']
-    assert p.row['deadline'] == pytest.approx(original + handoff)
+    assert p.row['binding_deadline'] == pytest.approx(original + handoff)
+    assert p.row['deadline'] == pytest.approx(original + handoff + transfer.REDEMPTION_SECONDS)
     monkeypatch.setattr(transfer, 'time', SimpleNamespace(monotonic=lambda: original + 0.1))
     p.custody.prune()
     assert p.key in p.custody.pending
@@ -340,3 +341,44 @@ with socket.socket(fileno=int(sys.argv[1])) as channel:
         if child is not None and child.poll() is None: child.kill();child.communicate(timeout=5)
         assert libc.prctl(4, previous, 0, 0, 0) == 0
         sender.close();receiver.close();os.close(fd)
+
+
+def test_last_moment_binding_still_allows_delayed_pane_fd_redemption(prepared, monkeypatch):
+    p = prepared
+    binding = p.live.launch._private_handoff_state[1]
+    assert p.row['deadline'] >= binding + transfer.REDEMPTION_SECONDS - 0.001
+    clock = [binding - 0.01]
+    from herdr import launch_plan_handoff as handoff
+    monkeypatch.setattr(handoff, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(transfer, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    p.live.launch.verify_private_handoff()
+    clock[0] += 5  # pane dispatch starts after the binding window has ended
+    p.custody.prune()
+    assert p.key in p.custody.pending
+    _, received = exchange(p)
+    for fd in received: os.close(fd)
+    assert not p.custody.pending
+
+
+def test_dispatch_reserve_never_extends_grant_or_stages_expiring_grant(prepared, monkeypatch):
+    from datetime import UTC, datetime, timedelta
+    from copy import deepcopy
+    p = prepared
+    request = deepcopy(p.row['request'])
+    p.custody.cancel(p.key)
+    now = transfer.time.monotonic()
+    expiry = datetime.now(UTC) + timedelta(seconds=transfer.REDEMPTION_SECONDS + 5)
+    request['grant']['expires_at'] = expiry.isoformat()
+    key = p.custody.stage(request, p.row['peer'], p.row['issuer'], p.raw,
+                         [entry['fd'] for entry in p.proposal['plan']['descriptors']], now + 60)
+    row = p.custody.pending[key]
+    assert row['binding_deadline'] == pytest.approx(now + 5, abs=0.05)
+    assert row['deadline'] == pytest.approx(now + transfer.REDEMPTION_SECONDS + 5, abs=0.05)
+    assert row['deadline'] - row['binding_deadline'] == pytest.approx(transfer.REDEMPTION_SECONDS)
+    p.custody.cancel(key)
+    request['grant']['expires_at'] = (datetime.now(UTC) + timedelta(seconds=1)).isoformat()
+    before = len(os.listdir('/proc/self/fd'))
+    with pytest.raises(SecurityError, match='no dispatch interval'):
+        p.custody.stage(request, p.row['peer'], p.row['issuer'], p.raw,
+                       [entry['fd'] for entry in p.proposal['plan']['descriptors']], now + 60)
+    assert not p.custody.pending and len(os.listdir('/proc/self/fd')) == before
