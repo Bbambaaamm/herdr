@@ -8,6 +8,7 @@ import errno
 from .evidence import (EvidenceError,EvidenceMissing,EvidenceUnavailable,EvidenceStore,accept_artifact,binding,
                        canonical,digest,validate_plan)
 from .security import InvocationIdentity
+from .coding_guidance import CODING_DISCIPLINE
 
 HOST_CHILD_COMPLETION_AUTHORITY = None
 
@@ -246,15 +247,18 @@ class ChildCompletionAuthority:
         task=child_task(rec)
         plan=self.store.read("plan",digest(binding(task)))
         validate_plan(plan)
+        coding_guidance = CODING_DISCIPLINE if plan["kind"] == "coding" else ""
         if self.modern_work(rec):
             return ("\nHOST CHILD WORK CONTRACT: Use herdr_verify_work with a stable request_id and a handoff declaration. "
                 "The host runs the frozen oracle, preserves hooks, seals the exact tested local artifact and submits the original result. "
                 "PASS ends implementation; pending independent CI/review never starts another economic attempt.\n"
+                + coding_guidance +
                 "Frozen completion plan: " + canonical(plan).decode() + "\n")
         artifact={"task_id":rec.node.id,"attempt":rec.attempts,"base_sha":plan["base_sha"],
             "commit_sha":"<exact result commit>","result_sha":"<sealed ArtifactRef SHA256>",
             "changed_files":["<exact changed files>"],"branch":"<isolated task branch>"}
         return ("\nHOST CHILD COMPLETION CONTRACT:\n"
+            + coding_guidance +
             "- Lifecycle settlement is not verified completion. Preserve this attempt while CI/review is pending.\n"
             "- Submit through herdr_submit_result with exactly one evidence item {herdr_completion:{version:1,artifact:<ArtifactRef>,pr_number:<integer>,scope_self_check:<only when required>}}; the host derives the admitted workspace.\n"
             "- The reviewed commit must include this exact immutable footer: "+__import__("herdr.verification_binding",fromlist=["commit_footer"]).commit_footer(plan)+"\n"
