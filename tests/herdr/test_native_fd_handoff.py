@@ -23,8 +23,28 @@ def prepared(live, monkeypatch, request):
     raw, policy, approvals, listener = configure(live, monkeypatch)
     custody = transfer.DescriptorCustody()
     original = issuer.issue_request
-    monkeypatch.setattr(issuer, 'issue_request', lambda connection: original(connection, custody=custody))
-    ambiguous = getattr(request, 'param', None) == 'post-rename-error'
+    variant = getattr(request, 'param', None)
+    ticket_ambiguous = variant == 'ticket-rename-error'
+    def observed_issue(connection):
+        try:
+            return original(connection, custody=custody)
+        except OSError:
+            if ticket_ambiguous:
+                # Explicit independent operator publication, while the exact
+                # visible approval is still live; no issuance retry.
+                ticket = next(approvals.glob('*.json'))
+                issuer.publication._publish_approved_launch_plan(ticket, publish=True)
+            raise
+    monkeypatch.setattr(issuer, 'issue_request', observed_issue)
+    ambiguous = variant == 'post-rename-error'
+    if ticket_ambiguous:
+        parent_inode = approvals.stat().st_ino
+        class AmbiguousTicketOS(RootOS):
+            def fsync(self, fd):
+                if os.fstat(fd).st_ino == parent_inode:
+                    raise OSError('fixture ticket post-rename directory fsync failure')
+                return os.fsync(fd)
+        monkeypatch.setattr(issuer, 'os', AmbiguousTicketOS())
     if ambiguous:
         publish = issuer.publication._publish_approved_launch_plan
         def visible_then_failed(*args, **kwargs):
@@ -36,7 +56,7 @@ def prepared(live, monkeypatch, request):
         live.launch.prepare_private_command(live.builder)
         thread.join(5)
         assert not thread.is_alive()
-        if ambiguous: assert errors and 'error' in results[0]
+        if ambiguous or ticket_ambiguous: assert errors and 'error' in results[0]
         else: assert not errors and results[0]['published']
     finally:
         listener.close(); thread.join(5)
@@ -273,7 +293,7 @@ def test_fd_duplication_failure_precedes_irreversible_publication(live, monkeypa
     finally: listener.close();thread.join(5);custody.close()
 
 
-def test_plan_publication_failure_cancels_staged_custody(live, monkeypatch):
+def test_visible_approval_retains_inactive_custody_after_plan_publication_failure(live, monkeypatch):
     _, _, _, listener = configure(live, monkeypatch)
     custody = transfer.DescriptorCustody(); copies = []
     original = issuer.issue_request
@@ -288,8 +308,12 @@ def test_plan_publication_failure_cancels_staged_custody(live, monkeypatch):
     try:
         with pytest.raises(SecurityError): live.launch.prepare_private_command(live.builder)
         thread.join(5)
-        assert not thread.is_alive() and errors and copies and not custody.pending
-        assert not list(live.plans.glob('*.json'))
+        assert not thread.is_alive() and errors and copies and len(custody.pending) == 1
+        row = next(iter(custody.pending.values()))
+        assert not row['active'] and not list(live.plans.glob('*.json'))
+        for fd in copies: os.fstat(fd)
+        row['deadline'] = 0; custody.prune()
+        assert not custody.pending
         for fd in copies:
             with pytest.raises(OSError): os.fstat(fd)
     finally: listener.close();thread.join(5);custody.close()
@@ -382,3 +406,140 @@ def test_dispatch_reserve_never_extends_grant_or_stages_expiring_grant(prepared,
         p.custody.stage(request, p.row['peer'], p.row['issuer'], p.raw,
                        [entry['fd'] for entry in p.proposal['plan']['descriptors']], now + 60)
     assert not p.custody.pending and len(os.listdir('/proc/self/fd')) == before
+
+
+@pytest.mark.parametrize('prepared', ['ticket-rename-error'], indirect=True)
+def test_visible_ticket_retains_custody_for_independent_exact_plan(prepared):
+    p = prepared
+    assert not p.row['active'] and p.live.launch.mount.private_mount_plan.path.exists()
+    _, received = exchange(p)
+    for fd in received: os.close(fd)
+    assert not p.custody.pending
+    # A delayed issuer cleanup cannot resurrect or send an already consumed set.
+    p.custody.activate(p.key); p.custody.reconcile(p.key); p.custody.cancel(p.key)
+    assert not p.custody.pending
+
+
+def test_cancel_during_redemption_inspection_defers_close_and_prevents_send(prepared, monkeypatch):
+    p = prepared
+    entered, release = threading.Event(), threading.Event()
+    validate = issuer._validate
+    def delayed_validate(*args):
+        entered.set(); assert release.wait(3)
+        return validate(*args)
+    monkeypatch.setattr(issuer, '_validate', delayed_validate)
+    failures = []
+    def attempt():
+        try: exchange(p)
+        except BaseException as error: failures.append(error)
+    copies = list(p.row['fds'])
+    worker = threading.Thread(target=attempt); worker.start()
+    try:
+        assert entered.wait(3)
+        p.custody.cancel(p.key)
+        assert not p.custody.pending
+        for fd in copies: os.fstat(fd)  # The inspector still owns these FDs.
+        release.set(); worker.join(5)
+        assert not worker.is_alive() and len(failures) == 1
+        assert isinstance(failures[0], SecurityError) and 'withdrawn' in str(failures[0])
+        for fd in copies:
+            with pytest.raises(OSError): os.fstat(fd)
+    finally:
+        release.set(); worker.join(5)
+
+
+@pytest.mark.parametrize('blocked_role', ['plan', 'fds'])
+def test_real_service_redemption_is_independent_of_slow_authority_request(prepared, monkeypatch, tmp_path, blocked_role):
+    p = prepared
+    stop, entered, release = threading.Event(), threading.Event(), threading.Event()
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    fd_listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    paths = {'plan': tmp_path / 'ip', 'fds': tmp_path / 'if'}
+    for endpoint, role in ((listener, 'plan'), (fd_listener, 'fds')):
+        endpoint.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+        endpoint.bind(str(paths[role])); endpoint.listen(16)
+    issue_calls = []
+    if blocked_role == 'plan':
+        def slow_issue(connection, *args, **kwargs):
+            assert connection.recv(131072)
+            issue_calls.append(1)
+            entered.set(); assert release.wait(5)
+            return {'schema_version': issuer.VERSION, 'error': 'fixture blocked issue'}
+        monkeypatch.setattr(issuer, 'issue_request', slow_issue)  # Authority workload is an explicit double.
+    else:
+        redeem = p.custody.redeem
+        calls, lock = [], threading.Lock()
+        def slow_first(connection):
+            with lock:
+                calls.append(1); first = len(calls) == 1
+            if first:
+                entered.set(); assert release.wait(5)
+            return redeem(connection)
+        monkeypatch.setattr(p.custody, 'redeem', slow_first)
+    errors = []
+    def serve():
+        try: issuer._serve_connections(listener, fd_listener, p.custody, stop=stop)
+        except BaseException as error: errors.append(error)
+    service = threading.Thread(target=serve); service.start()
+    blocked = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    receiver = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    received = []
+    queued = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) if blocked_role == 'plan' else None
+    try:
+        blocked.connect(str(paths[blocked_role])); blocked.send(canonical_json_bytes(packet(p)))
+        assert entered.wait(3)
+        if queued is not None:
+            queued.settimeout(3); queued.connect(str(paths['plan']))
+            queued.send(canonical_json_bytes(packet(p)))
+        receiver.settimeout(3); receiver.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+        receiver.connect(str(paths['fds'])); receiver.send(canonical_json_bytes(packet(p)))
+        answer, received = issuer._receive(receiver, p.row['peer'])
+        assert not release.is_set() and answer == {**packet(p), 'descriptor_count': len(received)}
+        assert len(received) == len(p.proposal['plan']['descriptors']) and not p.custody.pending
+        if queued is not None:
+            assert issue_calls == [1]
+            release.set()
+            assert json.loads(queued.recv(4096))['error'] == 'fixture blocked issue'
+            assert issue_calls == [1, 1]
+    finally:
+        for fd in received: os.close(fd)
+        release.set(); stop.set(); service.join(6)
+        receiver.close(); blocked.close(); listener.close(); fd_listener.close()
+        if queued is not None: queued.close()
+    assert not service.is_alive() and not errors
+
+
+def test_redemption_waits_for_same_plan_inspection_without_blocking_other_sets(prepared):
+    p = prepared
+    waiting = threading.Event()
+    original_lock = p.row['lock']
+    class ObservedLock:
+        def acquire(self, *args, **kwargs):
+            if kwargs.get('timeout', 0) > 0:
+                assert original_lock.locked()
+                waiting.set()
+            return original_lock.acquire(*args, **kwargs)
+        def release(self):
+            return original_lock.release()
+    p.row['lock'] = ObservedLock()
+    inspected = p.custody._claim(p.key)
+    assert inspected is p.row
+    received, failures = [], []
+    def attempt():
+        try:
+            _, descriptors = exchange(p)
+            received.extend(descriptors)
+        except BaseException as error: failures.append(error)
+    worker = threading.Thread(target=attempt); worker.start()
+    released = False
+    try:
+        assert waiting.wait(3)
+        p.custody._release(p.key, inspected); released = True
+        worker.join(5)
+        assert not worker.is_alive() and not failures
+        assert len(received) == len(p.proposal['plan']['descriptors'])
+        assert not p.custody.pending
+    finally:
+        if not released: p.custody._release(p.key, inspected)
+        worker.join(5)
+        for fd in received: os.close(fd)

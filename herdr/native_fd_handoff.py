@@ -13,6 +13,7 @@ import re
 import socket
 import struct
 import time
+import threading
 from datetime import UTC, datetime
 
 from .security import InvocationIdentity, canonical_json_bytes
@@ -33,75 +34,124 @@ def _close(fds):
 class DescriptorCustody:
     def __init__(self):
         self.pending = {}
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _close_row(row):
+        fds, row['fds'] = row['fds'], []
+        _close(fds)
+
+    def _claim(self, key, *, wait=False):
+        with self._lock:
+            row = self.pending.get(key)
+        if row is None:
+            return None
+        timeout = max(0, row['deadline'] - time.monotonic()) if wait else 0
+        if not row['lock'].acquire(timeout=timeout):
+            return None
+        with self._lock:
+            if self.pending.get(key) is not row or row['cancelled']:
+                row['lock'].release()
+                return None
+            return row
+
+    def _release(self, key, row):
+        with self._lock:
+            if row['cancelled'] or time.monotonic() >= row['deadline']:
+                if self.pending.get(key) is row:
+                    self.pending.pop(key)
+                self._close_row(row)
+            row['lock'].release()
 
     def prune(self):
-        for key, row in list(self.pending.items()):
-            if time.monotonic() >= row['deadline']:
-                self.pending.pop(key)
-                _close(row['fds'])
+        with self._lock:
+            for key, row in list(self.pending.items()):
+                if time.monotonic() >= row['deadline'] and row['lock'].acquire(blocking=False):
+                    try:
+                        self.pending.pop(key)
+                        self._close_row(row)
+                    finally:
+                        row['lock'].release()
 
     def require_capacity(self):
         from .launch_plan_issuer import require
-        self.prune()
-        require(len(self.pending) < MAX_PENDING, 'native descriptor custody is full')
+        with self._lock:
+            self.prune()
+            require(len(self.pending) < MAX_PENDING, 'native descriptor custody is full')
 
     def stage(self, request, peer, issuer, raw, fds, deadline):
         from .launch_plan_issuer import _digest, require
-        self.require_capacity()
-        key = _digest(request['proposal']['plan']['identity'])
-        require(key not in self.pending and time.monotonic() < deadline,
-                'native descriptor custody identity or deadline changed')
-        copies = []
-        try:
-            for fd in fds:
-                duplicate = os.dup(fd)
-                copies.append(duplicate)
-                os.set_inheritable(duplicate, False)
-            handoff = raw['private_launch']['plan_handoff']['timeout_seconds']
-            grant_expiry = datetime.fromisoformat(request['grant']['expires_at'])
-            grant_deadline = time.monotonic() + (grant_expiry - datetime.now(UTC)).total_seconds()
-            binding_deadline = min(deadline + handoff, grant_deadline - REDEMPTION_SECONDS)
-            require(time.monotonic() < binding_deadline,
-                    'native descriptor grant leaves no dispatch interval')
-            self.pending[key] = {'request': json.loads(canonical_json_bytes(request)),
-                'peer': peer, 'issuer': issuer, 'raw': raw, 'fds': copies,
-                'deadline': min(deadline + handoff + REDEMPTION_SECONDS, grant_deadline),
-                'binding_deadline': binding_deadline,
-                'request_deadline': deadline, 'active': False}
-            return key
-        except BaseException:
-            _close(copies)
-            raise
+        with self._lock:
+            self.require_capacity()
+            key = _digest(request['proposal']['plan']['identity'])
+            require(key not in self.pending and time.monotonic() < deadline,
+                    'native descriptor custody identity or deadline changed')
+            copies = []
+            try:
+                for fd in fds:
+                    duplicate = os.dup(fd)
+                    copies.append(duplicate)
+                    os.set_inheritable(duplicate, False)
+                handoff = raw['private_launch']['plan_handoff']['timeout_seconds']
+                grant_expiry = datetime.fromisoformat(request['grant']['expires_at'])
+                grant_deadline = time.monotonic() + (grant_expiry - datetime.now(UTC)).total_seconds()
+                binding_deadline = min(deadline + handoff, grant_deadline - REDEMPTION_SECONDS)
+                require(time.monotonic() < binding_deadline,
+                        'native descriptor grant leaves no dispatch interval')
+                self.pending[key] = {'request': json.loads(canonical_json_bytes(request)),
+                    'peer': peer, 'issuer': issuer, 'raw': raw, 'fds': copies,
+                    'deadline': min(deadline + handoff + REDEMPTION_SECONDS, grant_deadline),
+                    'binding_deadline': binding_deadline,
+                    'request_deadline': deadline, 'active': False,
+                    'lock': threading.Lock(), 'cancelled': False}
+                return key
+            except BaseException:
+                _close(copies)
+                raise
 
     def activate(self, key):
-        from .launch_plan_issuer import require
-        row = self.pending[key]
-        require(not row['active'], 'native descriptor custody already committed')
-        row['active'] = True
+        # A concurrent exact receiver can already have consumed the row after
+        # the root plan became visible. Activation never recreates custody.
+        with self._lock:
+            row = self.pending.get(key)
+            if row is not None:
+                row['active'] = True
 
-    def reconcile(self, key):
-        # A rename can succeed before fsync/reply fails. Never discard the
-        # only held descriptors of an exact visible no-replace plan.
+    def reconcile(self, key, *, keep_if_missing=False):
         from . import launch_plan_issuer as authority
         from .private_mount_plan import ApprovedPrivateMountPlan
-        row = self.pending[key]
-        proposal = row['request']['proposal']
+        row = self._claim(key)
+        if row is None:
+            return
         try:
-            plan = ApprovedPrivateMountPlan.read(authority.publication.AUTHORITY_ROOT / (key + '.json'),
-                InvocationIdentity.from_dict(proposal['plan']['identity']))
-            plan.authorize(proposal['plan']['descriptors'], proposal['argv'])
-        except FileNotFoundError:
-            self.cancel(key)
-        except (OSError, ValueError, authority.SecurityError):
-            # Inspection uncertainty cannot authorize transfer. Retain bounded
-            # inactive custody until exact redemption inspection or expiry.
-            pass
-        else:
-            self.activate(key)
+            proposal = row['request']['proposal']
+            try:
+                plan = ApprovedPrivateMountPlan.read(authority.publication.AUTHORITY_ROOT / (key + '.json'),
+                    InvocationIdentity.from_dict(proposal['plan']['identity']))
+                plan.authorize(proposal['plan']['descriptors'], proposal['argv'])
+            except FileNotFoundError:
+                if not keep_if_missing:
+                    self.cancel(key)
+            except (OSError, ValueError, authority.SecurityError):
+                pass  # Bounded inactive custody; exact redemption must recheck.
+            else:
+                self.activate(key)
+        finally:
+            self._release(key, row)
 
     def cancel(self, key):
-        row = self.pending.pop(key)
-        _close(row['fds'])
+        with self._lock:
+            row = self.pending.pop(key, None)
+            if row is None:
+                return
+            row['cancelled'] = True
+            if row['lock'].acquire(blocking=False):
+                try:
+                    self._close_row(row)
+                finally:
+                    row['lock'].release()
+            # An in-flight inspector owns the FDs until _release; it cannot
+            # commit transfer after cancellation removed the exact row.
 
     def redeem(self, connection):
         from . import launch_plan_issuer as authority
@@ -119,60 +169,66 @@ class DescriptorCustody:
         finally:
             _close(incoming)
         key = request['identity_sha256']
-        authority.require(key in self.pending, 'native descriptors unavailable; reconcile existing plan')
-        row = self.pending[key]
-        proposal = row['request']['proposal']
-        authority.require((issuer, raw) == (row['issuer'], row['raw'])
-                and request['plan_sha256'] == authority._digest(proposal['plan']),
-                'native descriptor authority changed')
-        argv = authority._proc_bytes(peer[0], 'cmdline', 32768).rstrip(b'\0').decode().split('\0')
-        expected = {'schema_version': 'herdr-private-mount-plan-1',
-            'authority': str(authority.publication.AUTHORITY_ROOT / (key + '.json')),
-            'authority_sha256': request['plan_sha256'], 'entries': proposal['plan']['descriptors'],
-            'transport': VERSION}
-        def unique(pairs):
-            result = {}
-            for name, value in pairs:
-                authority.require(name not in result, 'duplicate native launcher field')
-                result[name] = value
-            return result
-        authority.require(len(argv) >= 7 and argv[4] == ENTRYPOINT
-                and json.loads(argv[5], object_pairs_hook=unique) == expected and argv[6:] == proposal['argv'],
-                'exact approved native descriptor launcher required')
-        from .launch_environment import process_environment
-        from .policy_launch import IDENTITY_ENV
-        environment = process_environment(peer[0])
-        authority.require(all(environment.get(name) == str(proposal['plan']['identity'][field])
-                              for field, name in IDENTITY_ENV.items()),
-                          'native descriptor launcher identity differs')
-        authority.require(authority._host_peer(*row['peer'][:3], issuer, raw) == row['peer'],
-                          'native descriptor owner changed')
-        from .private_mount_plan import ApprovedPrivateMountPlan
-        plan = ApprovedPrivateMountPlan.read(Path(expected['authority']),
-                                             InvocationIdentity.from_dict(proposal['plan']['identity']))
-        plan.authorize(proposal['plan']['descriptors'], proposal['argv'])
-        if not row['active']:
-            self.activate(key)
-        authority._validate(row['request'], row['fds'], row['peer'], raw)
-        authority.require(authority._policy() == (issuer, raw)
-                and authority._peer(connection, issuer, raw) == peer
-                and authority._host_peer(*row['peer'][:3], issuer, raw) == row['peer']
-                and time.monotonic() < row['deadline'], 'native descriptor admission expired or changed')
-        # Consume before the syscall: a lost reply never permits another send.
-        self.pending.pop(key)
+        row = self._claim(key, wait=True)
+        authority.require(row is not None, 'native descriptors unavailable; reconcile existing plan')
         try:
-            answer = canonical_json_bytes({'schema_version': VERSION, 'identity_sha256': key,
-                'plan_sha256': request['plan_sha256'], 'descriptor_count': len(row['fds'])})
-            connection.settimeout(max(0.001, row['deadline'] - time.monotonic()))
-            authority.require(connection.sendmsg([answer], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
-                        array.array('i', row['fds']))]) == len(answer), 'native descriptor reply lost; reconcile')
+            proposal = row['request']['proposal']
+            authority.require((issuer, raw) == (row['issuer'], row['raw'])
+                    and request['plan_sha256'] == authority._digest(proposal['plan']),
+                    'native descriptor authority changed')
+            argv = authority._proc_bytes(peer[0], 'cmdline', 32768).rstrip(b'\0').decode().split('\0')
+            expected = {'schema_version': 'herdr-private-mount-plan-1',
+                'authority': str(authority.publication.AUTHORITY_ROOT / (key + '.json')),
+                'authority_sha256': request['plan_sha256'], 'entries': proposal['plan']['descriptors'],
+                'transport': VERSION}
+            def unique(pairs):
+                result = {}
+                for name, value in pairs:
+                    authority.require(name not in result, 'duplicate native launcher field')
+                    result[name] = value
+                return result
+            authority.require(len(argv) >= 7 and argv[4] == ENTRYPOINT
+                    and json.loads(argv[5], object_pairs_hook=unique) == expected and argv[6:] == proposal['argv'],
+                    'exact approved native descriptor launcher required')
+            from .launch_environment import process_environment
+            from .policy_launch import IDENTITY_ENV
+            environment = process_environment(peer[0])
+            authority.require(all(environment.get(name) == str(proposal['plan']['identity'][field])
+                                  for field, name in IDENTITY_ENV.items()),
+                              'native descriptor launcher identity differs')
+            authority.require(authority._host_peer(*row['peer'][:3], issuer, raw) == row['peer'],
+                              'native descriptor owner changed')
+            from .private_mount_plan import ApprovedPrivateMountPlan
+            plan = ApprovedPrivateMountPlan.read(Path(expected['authority']),
+                                                 InvocationIdentity.from_dict(proposal['plan']['identity']))
+            plan.authorize(proposal['plan']['descriptors'], proposal['argv'])
+            if not row['active']:
+                self.activate(key)
+            authority._validate(row['request'], row['fds'], row['peer'], raw)
+            authority.require(authority._policy() == (issuer, raw)
+                    and authority._peer(connection, issuer, raw) == peer
+                    and authority._host_peer(*row['peer'][:3], issuer, raw) == row['peer']
+                    and time.monotonic() < row['deadline'], 'native descriptor admission expired or changed')
+            # Consume before the syscall: a lost reply never permits another send.
+            with self._lock:
+                authority.require(self.pending.get(key) is row and not row['cancelled'],
+                                  'native descriptor custody withdrawn')
+                self.pending.pop(key)
+            try:
+                answer = canonical_json_bytes({'schema_version': VERSION, 'identity_sha256': key,
+                    'plan_sha256': request['plan_sha256'], 'descriptor_count': len(row['fds'])})
+                connection.settimeout(max(0.001, row['deadline'] - time.monotonic()))
+                authority.require(connection.sendmsg([answer], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                            array.array('i', row['fds']))]) == len(answer), 'native descriptor reply lost; reconcile')
+            finally:
+                self._close_row(row)
         finally:
-            _close(row['fds'])
+            self._release(key, row)
 
     def close(self):
-        for row in self.pending.values():
-            _close(row['fds'])
-        self.pending.clear()
+        with self._lock:
+            for key in list(self.pending):
+                self.cancel(key)
 
 
 def _connect(timeout):

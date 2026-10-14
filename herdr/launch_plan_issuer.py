@@ -474,6 +474,7 @@ def issue_request(connection, *, custody=None):
         current()
         staged = None
         plan_publish_attempted = False
+        renamed = False
         try:
             if custody is not None:
                 staged = custody.stage(request, peer, issuer, raw, fds, deadline)
@@ -518,9 +519,12 @@ def issue_request(connection, *, custody=None):
         finally:
             if staged is not None:
                 if plan_publish_attempted:
-                    custody.reconcile(staged)
-                else:
+                    custody.reconcile(staged, keep_if_missing=renamed)
+                elif not renamed:
                     custody.cancel(staged)
+                # A visible no-replace ticket with ambiguous directory fsync
+                # retains inactive custody. Only an exact independently
+                # published root plan can later release it, within its TTL.
     finally:
         for fd in fds: os.close(fd)
 
@@ -603,7 +607,6 @@ def serve():
         tree = host._tree(definition, immutable=True).freeze(Path(raw["storage"]), ())
         tree.close()
     from .native_fd_handoff import DescriptorCustody, SOCKET_PATH as fd_path, ENTRYPOINT
-    import selectors
     issuer, _ = _policy()
     require(ENTRYPOINT in issuer["entrypoints"], "approved native descriptor entrypoint required")
     _verify_root_owned_ancestry(SOCKET_PATH.parent)
@@ -611,26 +614,84 @@ def serve():
             "issuer socket already exists; reconcile explicitly")
     custody = DescriptorCustody()
     with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as listener, \
-         socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as fd_listener, \
-         selectors.DefaultSelector() as selector:
-        for endpoint, path, role in ((listener, SOCKET_PATH, "plan"), (fd_listener, fd_path, "fds")):
+         socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as fd_listener:
+        for endpoint, path in ((listener, SOCKET_PATH), (fd_listener, fd_path)):
             endpoint.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
             endpoint.bind(str(path)); os.chmod(path, 0o666)
-            endpoint.listen(8); selector.register(endpoint, selectors.EVENT_READ, role)
+            endpoint.listen(16)
+        _serve_connections(listener, fd_listener, custody)
+
+
+def _serve_connections(listener, fd_listener, custody, *, stop=None):
+    """Bounded independent servicing in the existing authority process.
+
+    One issuance slot preserves publication serialization. Each cached FD set
+    can redeem independently; expensive issuance or another receiver cannot
+    hold the descriptor listener. No queue or second authority is introduced.
+    """
+    import selectors
+    import threading
+    from .native_fd_handoff import MAX_PENDING
+    stop = threading.Event() if stop is None else stop
+    slots = {'plan': threading.BoundedSemaphore(1),
+             'fds': threading.BoundedSemaphore(MAX_PENDING)}
+    jobs, lock = set(), threading.Lock()
+
+    def handle(connection, role):
         try:
-            while True:
-                custody.prune()
-                for key, _ in selector.select(timeout=0.2):
-                    connection, _ = key.fileobj.accept()
-                    with connection:
-                        try:
-                            if key.data == "fds":
-                                custody.redeem(connection)
-                                continue
-                            result = issue_request(connection, custody=custody)
-                        except (SecurityError, PrivateProfileError, OSError, ValueError, KeyError, TypeError, StopIteration):
-                            result = {"schema_version": VERSION, "error": "launch-plan issuance denied"}
-                        try: connection.send(canonical_json_bytes(result))
-                        except OSError: pass
+            with connection:
+                try:
+                    if role == 'fds':
+                        custody.redeem(connection)
+                        return
+                    result = issue_request(connection, custody=custody)
+                except (SecurityError, PrivateProfileError, OSError, ValueError, KeyError, TypeError, StopIteration):
+                    result = {'schema_version': VERSION, 'error': 'launch-plan issuance denied'}
+                try:
+                    connection.send(canonical_json_bytes(result))
+                except OSError:
+                    pass
         finally:
+            slots[role].release()
+            with lock:
+                jobs.discard(threading.current_thread())
+
+    with selectors.DefaultSelector() as selector:
+        endpoints = {'plan': listener, 'fds': fd_listener}
+        registered = set()
+        try:
+            while not stop.is_set():
+                custody.prune()
+                for role, endpoint in endpoints.items():
+                    if role not in registered and slots[role].acquire(blocking=False):
+                        slots[role].release()
+                        selector.register(endpoint, selectors.EVENT_READ, role)
+                        registered.add(role)
+                for key, _ in selector.select(timeout=0.2):
+                    role = key.data
+                    if not slots[role].acquire(blocking=False):
+                        # Leave bounded pending connections in the existing
+                        # kernel backlog; do not accept/drop another plan.
+                        selector.unregister(key.fileobj); registered.remove(role)
+                        continue
+                    try:
+                        connection, _ = key.fileobj.accept()
+                    except BaseException:
+                        slots[role].release()
+                        raise
+                    thread = threading.Thread(target=handle, args=(connection, role))
+                    with lock:
+                        jobs.add(thread)
+                    try:
+                        thread.start()
+                    except BaseException:
+                        with lock:
+                            jobs.discard(thread)
+                        connection.close(); slots[role].release()
+                        raise
+        finally:
+            with lock:
+                remaining = list(jobs)
+            for thread in remaining:
+                thread.join()
             custody.close()
