@@ -236,12 +236,17 @@ def test_actual_child_accepts_guard_held_through_handoff_without_inherited_fd(di
     assert admitted['fencing_token'] == 1
 
 
-def test_metadata_change_after_claim_quarantines_exact_unstarted_task(dispatcher, monkeypatch):
+@pytest.mark.parametrize("change", ["chmod", "hardlink"])
+def test_metadata_change_after_claim_quarantines_exact_unstarted_task(dispatcher, monkeypatch, change):
     pending = pending_task(dispatcher)
     child_command(dispatcher, monkeypatch)
     actual_popen = subprocess.Popen
     def change_then_spawn(*a, **kw):
-        (dispatcher.ROOT / 'worker.lock').chmod(0o644)
+        lock = dispatcher.ROOT / 'worker.lock'
+        if change == 'chmod':
+            lock.chmod(0o644)
+        else:
+            os.link(lock, dispatcher.ROOT / 'after-claim-alias')
         return actual_popen(*a, **kw)
     monkeypatch.setattr(dispatcher.subprocess, 'Popen', change_then_spawn)
     assert dispatcher.launch(pending) == 1
@@ -271,3 +276,14 @@ def test_spawn_failure_retains_unstarted_claim_without_retry(dispatcher, monkeyp
     blocked = json.loads((dispatcher.ROOT / 'blocked' / pending.name).read_text())
     assert blocked['automatic_retry_allowed'] is False
     assert blocked['fencing_token'] == 0 and 'run_token' not in blocked
+
+
+def test_zero_exit_without_admission_is_blocked_instead_of_stranded(dispatcher, monkeypatch):
+    pending = pending_task(dispatcher)
+    monkeypatch.setattr(dispatcher, 'host_entrypoint_command',
+        lambda *a, **kw: [sys.executable, '-I', '-c', 'raise SystemExit(0)'])
+    assert dispatcher.launch(pending) == 1
+    assert not list(dispatcher.RUNNING.iterdir())
+    blocked = json.loads((dispatcher.ROOT / 'blocked' / pending.name).read_text())
+    assert blocked['fencing_token'] == 0 and blocked['automatic_retry_allowed'] is False
+    assert 'run_token' not in blocked
