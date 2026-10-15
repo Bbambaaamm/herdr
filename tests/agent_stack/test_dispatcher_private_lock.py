@@ -146,3 +146,25 @@ with legacy_admission_guard(sys.argv[1]) as binding:
         cwd=SOURCE, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)['inode'] == (dispatcher.ROOT / 'worker.lock').stat().st_ino
+
+
+@pytest.mark.parametrize('change', ['chmod', 'hardlink'])
+def test_metadata_changed_during_acquisition_denied_before_claim(dispatcher, monkeypatch, change):
+    dispatcher.PENDING.mkdir()
+    dispatcher.RUNNING.mkdir()
+    task = dispatcher.PENDING / 'one.json'
+    original = b'{"id":"one","attempts":1,"fencing_token":0}\n'
+    task.write_bytes(original)
+    actual_flock = fcntl.flock
+    def acquire_then_change(fd, operation):
+        actual_flock(fd, operation)
+        lock = dispatcher.ROOT / 'worker.lock'
+        if change == 'chmod':
+            lock.chmod(0o644)
+        else:
+            os.link(lock, dispatcher.ROOT / 'another-name')
+    monkeypatch.setattr(dispatcher.fcntl, 'flock', acquire_then_change)
+    with pytest.raises(RuntimeError, match='worker_lock_metadata'):
+        dispatcher.launch(task)
+    assert task.read_bytes() == original
+    assert not list(dispatcher.RUNNING.iterdir())
