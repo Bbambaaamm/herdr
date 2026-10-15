@@ -134,8 +134,13 @@ def test_real_dispatcher_passes_the_host_wrapper_to_popen(tmp_path, monkeypatch)
     calls = []
     def popen(argv, **kwargs):
         calls.append((argv, kwargs))
-        monkeypatch.setattr(dispatcher, "worker_running", lambda: True)
-        return SimpleNamespace(poll=lambda: None)
+        running = dispatcher.RUNNING / task.name
+        state = json.loads(running.read_text())
+        state["dispatch_admission"] = {"nonce": state["dispatch_admission_nonce"],
+            "pid": os.getpid(), "start_ticks": dispatcher.process_start_ticks(os.getpid()),
+            "parent_pid": os.getpid()}
+        running.write_text(json.dumps(state))
+        return SimpleNamespace(pid=os.getpid(), poll=lambda: None)
     monkeypatch.setattr(dispatcher.subprocess, "Popen", popen)
     dispatcher.ENV = {**dispatcher.ENV, "PYTHONPATH": "/attacker", "LD_PRELOAD": "/attacker.so"}
     assert dispatcher.launch(task) == 0

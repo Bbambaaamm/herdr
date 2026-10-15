@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
+import ctypes
 import fcntl
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,11 +18,15 @@ WORKER = BIN / "agent-task-worker"
 sys.path.insert(0, str(BIN.parents[1]))
 from herdr.host_configuration import host_entrypoint_command
 from herdr.launch_environment import sanitize_environment
+from herdr.policy_launch import process_start_ticks
 ROOT = HOME / ".local/state/agent-stack/tasks"
 PENDING = ROOT / "pending"
 RUNNING = ROOT / "running"
 LOG = HOME / ".local/state/agent-stack/task-dispatch.log"
 DISPATCH_LOCK = ROOT / "dispatcher.lock"
+
+ADMISSION_TIMEOUT = 15.0
+LIBC = ctypes.CDLL(None, use_errno=True)
 
 ENV = os.environ.copy()
 ENV["HOME"] = str(HOME)
@@ -127,7 +134,11 @@ def quarantine_unstarted_claim(running: Path, claimed: bytes, reason: str) -> bo
     # Only the exact, untouched top-level claim can be classified as unstarted.
     # A worker-written identity/session, existing result or concurrent change
     # requires reconciliation; never erase it or schedule another attempt.
-    if not running.exists() or running.read_bytes() != claimed:
+    try:
+        current = running.read_bytes()
+    except FileNotFoundError:
+        return False
+    if current != claimed:
         return False
     task = json.loads(claimed)
     if (any(key in task for key in ("run_token", "execution_session", "parent_task_id"))
@@ -145,6 +156,66 @@ def quarantine_unstarted_claim(running: Path, claimed: bytes, reason: str) -> bo
 
     return True
 
+
+def pin_dispatch_parent(parent_pid: int) -> None:
+    # Until its own epoch is acquired, an unadmitted child must die with this
+    # dispatcher even if the dispatcher is SIGKILLed between fork and exec.
+    if LIBC.prctl(1, signal.SIGKILL, 0, 0, 0) != 0 or os.getppid() != parent_pid:
+        os._exit(125)
+
+
+def stop_unadmitted_child(proc) -> None:
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def current_dispatch_state(running: Path):
+    try:
+        return json.loads(running.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        # A safely retained pending/blocked/done transition can race polling.
+        return None
+
+
+def fresh_dispatch_ack(task, nonce, pid, start_ticks, parent_pid) -> bool:
+    return (start_ticks is not None and isinstance(task, dict)
+            and task.get("dispatch_admission") == {"nonce": nonce, "pid": pid,
+                "start_ticks": start_ticks, "parent_pid": parent_pid})
+
+
+def await_dispatch_admission(proc, running, claimed, nonce, parent_pid) -> int:
+    try:
+        start_ticks = process_start_ticks(proc.pid)
+    except (OSError, ValueError):
+        start_ticks = None
+    deadline = time.monotonic() + ADMISSION_TIMEOUT
+    while True:
+        status = proc.poll()
+        current = current_dispatch_state(running)
+        acknowledged = fresh_dispatch_ack(current, nonce, proc.pid, start_ticks, parent_pid)
+        if status is not None:
+            unstarted = quarantine_unstarted_claim(
+                running, claimed, f"worker exited without admitted task state rc={status}")
+            log(f"worker for {running.stem} settled during admission rc={status}")
+            return 0 if status == 0 and not unstarted and (current is None or acknowledged) else 1
+        if acknowledged:
+            return 0
+        if time.monotonic() >= deadline:
+            # Reap this exact child BEFORE releasing the epoch. A race with a
+            # newly written acknowledgement never permits rollback: the exact
+            # original claim comparison preserves all worker-written state.
+            stop_unadmitted_child(proc)
+            quarantine_unstarted_claim(running, claimed, "worker admission timed out; owned child reaped")
+            log(f"worker admission for {running.stem} timed out; reconcile without retry")
+            return 1
+        time.sleep(0.05)
+
+
 def _launch_with_epoch(path: Path) -> int:
     task = json.loads(path.read_text(encoding="utf-8"))
     task_id = str(task["id"])
@@ -161,6 +232,10 @@ def _launch_with_epoch(path: Path) -> int:
 
     # Refresh ownership time before entering running/. Old attempt timestamps
     # must never make a freshly claimed task look orphaned to the watchdog.
+    nonce, parent_pid = uuid.uuid4().hex, os.getpid()
+    task["dispatch_admission_nonce"] = nonce
+    task["dispatch_admission_parent_pid"] = parent_pid
+    task.pop("dispatch_admission", None)
     task["dispatch_claimed_at"] = datetime.now(timezone.utc).isoformat()
     write_json(path, task)
     os.replace(path, running)
@@ -171,27 +246,17 @@ def _launch_with_epoch(path: Path) -> int:
             proc = subprocess.Popen(
                 command, stdout=handle, stderr=subprocess.STDOUT,
                 env=worker_env, start_new_session=True, close_fds=True,
+                preexec_fn=lambda: pin_dispatch_parent(parent_pid),
             )
     except OSError as exc:
         quarantine_unstarted_claim(running, claimed, f"worker spawn failed: {exc}")
         raise
 
-    # A process name is not an acknowledgement of worker admission. Keep the
-    # epoch until the worker persists its existing attempt identity or settles.
-    for _ in range(150):
-        status = proc.poll()
-        if status is not None:
-            unstarted = quarantine_unstarted_claim(
-                running, claimed, f"worker exited without admitted task state rc={status}")
-            log(f"worker for {task_id} settled during admission rc={status}")
-            return 0 if status == 0 and not unstarted else 1
-        if running.exists():
-            current = json.loads(running.read_text(encoding="utf-8"))
-            if current.get("run_token") and current.get("ownership_epoch"):
-                return 0
-        time.sleep(0.1)
-    log(f"worker admission for {task_id} unconfirmed; reconcile retained task without retry")
-    return 1
+    try:
+        return await_dispatch_admission(proc, running, claimed, nonce, parent_pid)
+    except BaseException:
+        stop_unadmitted_child(proc)
+        raise
 
 def main() -> int:
     dry_run = "--dry-run" in sys.argv

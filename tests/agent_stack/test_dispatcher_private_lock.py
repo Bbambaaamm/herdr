@@ -200,7 +200,12 @@ try:
 finally:os.close(fd)
 with legacy_admission_guard(root):
     data=json.loads(task.read_text())
+    from herdr.policy_launch import process_start_ticks
+    import ctypes
+    assert ctypes.CDLL(None).prctl(1,0,0,0,0)==0
     data.update(run_token='real-child-admitted',fencing_token=1,ownership_epoch={'version':1})
+    data['dispatch_admission']={'nonce':data['dispatch_admission_nonce'],'pid':os.getpid(),
+        'start_ticks':process_start_ticks(os.getpid()),'parent_pid':os.getppid()}
     task.write_text(json.dumps(data))
 """
     monkeypatch.setattr(dispatcher, 'host_entrypoint_command',

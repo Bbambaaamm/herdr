@@ -183,3 +183,12 @@ process exit. A failed spawn or dead child may quarantine only an exact unchange
 claim with no attempt identity, session, parent or existing result. That task is
 blocked for reconciliation without retry; worker-written or uncertain state is
 never reset or requeued. Flock is advisory and does not prevent an owner chmod.
+
+Startup acknowledgement is a fresh per-launch nonce bound to the actual child
+PID/start ticks and dispatcher PID in the canonical task. Retained run tokens
+are never startup acknowledgement. The worker publishes this record only with
+its own shared epoch and loop lock, clears the temporary parent-death fence,
+and consumes the nonce before normal work/reconciliation. Unadmitted children
+are fenced by PR_SET_PDEATHSIG(SIGKILL); a bounded startup timeout terminates
+and reaps the exact child while the dispatcher still holds its epoch. Queue
+file disappearance during polling is observed as a transition.

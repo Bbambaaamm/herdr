@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import sys
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -38,6 +39,7 @@ def test_launch_stamps_fresh_dispatch_claim_before_running(tmp_path, monkeypatch
         return active["value"]
 
     class FakeProcess:
+        pid = os.getpid()
         returncode = None
         def poll(self):
             return None
@@ -46,7 +48,9 @@ def test_launch_stamps_fresh_dispatch_claim_before_running(tmp_path, monkeypatch
         active["value"] = True
         running = dispatcher.RUNNING / "task-1.json"
         task = json.loads(running.read_text())
-        task.update(run_token="fixture-admitted", ownership_epoch={"version": 1})
+        task["dispatch_admission"] = {"nonce": task["dispatch_admission_nonce"],
+            "pid": os.getpid(), "start_ticks": dispatcher.process_start_ticks(os.getpid()),
+            "parent_pid": os.getpid()}
         running.write_text(json.dumps(task))
         return FakeProcess()
 

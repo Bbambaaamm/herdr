@@ -1806,6 +1806,30 @@ def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool)
     else:
         _retry_locked(task_path, task, blocker or "agent reported failed", all_terminal)
 
+
+def acknowledge_dispatch_admission(task_path: Path, task: dict) -> None:
+    nonce = task.get("dispatch_admission_nonce")
+    if nonce is None:
+        return  # Direct/legacy callers have no dispatcher startup handshake.
+    parent_pid = task.get("dispatch_admission_parent_pid")
+    if (not isinstance(nonce, str) or len(nonce) != 32
+            or any(c not in "0123456789abcdef" for c in nonce)
+            or type(parent_pid) is not int or parent_pid != os.getppid()):
+        raise RuntimeError("dispatch_admission_identity_invalid")
+    # Called only with this worker's own SH epoch and coordinator loop lock.
+    # Its own epoch now replaces the dispatcher's temporary parent-death fence.
+    import ctypes
+    if ctypes.CDLL(None, use_errno=True).prctl(1, 0, 0, 0, 0) != 0:
+        raise RuntimeError("dispatch_admission_parent_fence_clear_failed")
+    task["dispatch_admission"] = {"nonce": nonce, "pid": os.getpid(),
+        "start_ticks": process_start_ticks(os.getpid()), "parent_pid": parent_pid}
+    # Consume the startup challenge. Cold/direct reconciliation must not be
+    # mistaken for a child of a dispatcher that no longer exists.
+    task.pop("dispatch_admission_nonce")
+    task.pop("dispatch_admission_parent_pid")
+    write_json(task_path, task)
+
+
 def main(task_path: Path) -> int:
     from herdr.ownership_epoch import legacy_admission_guard
     try:
@@ -1830,6 +1854,7 @@ def _main_with_epoch(task_path: Path) -> int:
             return 0
 
         task = json.loads(task_path.read_text(encoding="utf-8"))
+        acknowledge_dispatch_admission(task_path, task)
         task_id = str(task["id"])
 
         if task.get("verification_resolution") == "needs_replan":
