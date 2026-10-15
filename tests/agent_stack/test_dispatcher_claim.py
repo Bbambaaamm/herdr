@@ -44,6 +44,10 @@ def test_launch_stamps_fresh_dispatch_claim_before_running(tmp_path, monkeypatch
 
     def fake_popen(*args, **kwargs):
         active["value"] = True
+        running = dispatcher.RUNNING / "task-1.json"
+        task = json.loads(running.read_text())
+        task.update(run_token="fixture-admitted", ownership_epoch={"version": 1})
+        running.write_text(json.dumps(task))
         return FakeProcess()
 
     monkeypatch.setattr(dispatcher, "worker_running", worker_running)

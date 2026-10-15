@@ -168,3 +168,106 @@ def test_metadata_changed_during_acquisition_denied_before_claim(dispatcher, mon
         dispatcher.launch(task)
     assert task.read_bytes() == original
     assert not list(dispatcher.RUNNING.iterdir())
+
+
+
+def pending_task(dispatcher):
+    for name in ('pending', 'running', 'blocked', 'results', 'logs'):
+        (dispatcher.ROOT / name).mkdir()
+    task = dispatcher.PENDING / 'one.json'
+    task.write_text('{"id":"one","attempts":1,"fencing_token":0}\n')
+    return task
+
+
+def child_command(dispatcher, monkeypatch, *, allocated=False):
+    program = """import fcntl,json,os,sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from herdr.ownership_epoch import legacy_admission_guard
+root=Path(sys.argv[2]); task=root/'running/one.json'
+if sys.argv[3]=='allocated':
+    data=json.loads(task.read_text());data.update(run_token='retain-me',fencing_token=1)
+    task.write_text(json.dumps(data));raise SystemExit(3)
+# The dispatcher must still own the existing epoch, without inheriting its FD.
+inherited=[os.readlink('/proc/self/fd/'+fd) for fd in os.listdir('/proc/self/fd')
+    if fd not in {'0','1','2'} and os.path.exists('/proc/self/fd/'+fd)]
+assert not any('worker.lock' in name for name in inherited)
+fd=os.open(root/'worker.lock',os.O_RDWR)
+try:
+    try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except BlockingIOError:pass
+    else:raise RuntimeError('dispatcher released epoch before handoff')
+finally:os.close(fd)
+with legacy_admission_guard(root):
+    data=json.loads(task.read_text())
+    data.update(run_token='real-child-admitted',fencing_token=1,ownership_epoch={'version':1})
+    task.write_text(json.dumps(data))
+"""
+    monkeypatch.setattr(dispatcher, 'host_entrypoint_command',
+        lambda *a, **kw: [sys.executable, '-I', '-B', '-c', program, str(SOURCE),
+                         str(dispatcher.ROOT), 'allocated' if allocated else 'fresh'])
+
+
+def test_metadata_change_after_last_probe_stat_denied_before_claim(dispatcher, monkeypatch):
+    from herdr.child_ownership import OwnershipError
+    pending = pending_task(dispatcher)
+    original = pending.read_bytes()
+    actual_stat = os.stat
+    changed = []
+    def stat_then_change(path, *args, **kwargs):
+        info = actual_stat(path, *args, **kwargs)
+        if path == 'worker.lock' and kwargs.get('dir_fd') is not None and not changed:
+            changed.append(True)
+            (dispatcher.ROOT / 'worker.lock').chmod(0o644)
+        return info
+    monkeypatch.setattr(dispatcher.os, 'stat', stat_then_change)
+    with pytest.raises(OwnershipError, match='ownership_epoch_lock'):
+        dispatcher.launch(pending)
+    assert pending.read_bytes() == original
+    assert not list(dispatcher.RUNNING.iterdir())
+
+
+def test_actual_child_accepts_guard_held_through_handoff_without_inherited_fd(dispatcher, monkeypatch):
+    pending = pending_task(dispatcher)
+    child_command(dispatcher, monkeypatch)
+    assert dispatcher.launch(pending) == 0
+    admitted = json.loads((dispatcher.RUNNING / pending.name).read_text())
+    assert admitted['run_token'] == 'real-child-admitted'
+    assert admitted['fencing_token'] == 1
+
+
+def test_metadata_change_after_claim_quarantines_exact_unstarted_task(dispatcher, monkeypatch):
+    pending = pending_task(dispatcher)
+    child_command(dispatcher, monkeypatch)
+    actual_popen = subprocess.Popen
+    def change_then_spawn(*a, **kw):
+        (dispatcher.ROOT / 'worker.lock').chmod(0o644)
+        return actual_popen(*a, **kw)
+    monkeypatch.setattr(dispatcher.subprocess, 'Popen', change_then_spawn)
+    assert dispatcher.launch(pending) == 1
+    assert not list(dispatcher.RUNNING.iterdir())
+    blocked = json.loads((dispatcher.ROOT / 'blocked' / pending.name).read_text())
+    assert blocked['blocker'] == 'worker_startup_denied'
+    assert blocked['automatic_retry_allowed'] is False
+    assert blocked['attempts'] == 1 and blocked['fencing_token'] == 0
+    assert 'run_token' not in blocked
+
+
+def test_allocated_child_identity_is_never_rolled_back_or_requeued(dispatcher, monkeypatch):
+    pending = pending_task(dispatcher)
+    child_command(dispatcher, monkeypatch, allocated=True)
+    assert dispatcher.launch(pending) == 1
+    retained = json.loads((dispatcher.RUNNING / pending.name).read_text())
+    assert retained['run_token'] == 'retain-me' and retained['fencing_token'] == 1
+    assert not list((dispatcher.ROOT / 'blocked').iterdir())
+    assert not list(dispatcher.PENDING.iterdir())
+
+
+def test_spawn_failure_retains_unstarted_claim_without_retry(dispatcher, monkeypatch):
+    pending = pending_task(dispatcher)
+    monkeypatch.setattr(dispatcher, 'host_entrypoint_command', lambda *a, **kw: ['/nonexistent/worker'])
+    with pytest.raises(FileNotFoundError):
+        dispatcher.launch(pending)
+    blocked = json.loads((dispatcher.ROOT / 'blocked' / pending.name).read_text())
+    assert blocked['automatic_retry_allowed'] is False
+    assert blocked['fencing_token'] == 0 and 'run_token' not in blocked

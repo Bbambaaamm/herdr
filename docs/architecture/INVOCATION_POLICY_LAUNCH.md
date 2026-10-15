@@ -175,3 +175,11 @@ An existing shared or exclusive holder prevents another dispatch. Unsafe file
 metadata, process-probe errors and inode replacement stop admission before the
 pending task is claimed; the dispatcher never repairs existing lock permissions.
 The process check remains necessary during the spawn-before-lock interval.
+
+The liveness probe does not authorize a claim. The dispatcher holds the existing
+shared ownership epoch across queue claim and process handoff, with no lock FD
+inherited by the child. It waits for the worker's durable attempt identity or
+process exit. A failed spawn or dead child may quarantine only an exact unchanged
+claim with no attempt identity, session, parent or existing result. That task is
+blocked for reconciliation without retry; worker-written or uncertain state is
+never reset or requeued. Flock is advisory and does not prevent an owner chmod.

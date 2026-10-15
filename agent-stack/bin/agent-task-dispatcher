@@ -115,6 +115,36 @@ def launch(path: Path, dry_run: bool = False) -> int:
         log("worker already active")
         return 0
 
+    from herdr.ownership_epoch import legacy_admission_guard
+    # The liveness probe is not an admission capability. Keep the existing
+    # epoch's shared descriptor alive through claim and worker acknowledgement.
+    # The new worker takes its own SH lock; legacy EX workers stay excluded.
+    with legacy_admission_guard(ROOT):
+        return _launch_with_epoch(path)
+
+
+def quarantine_unstarted_claim(running: Path, claimed: bytes, reason: str) -> None:
+    # Only the exact, untouched top-level claim can be classified as unstarted.
+    # A worker-written identity/session, existing result or concurrent change
+    # requires reconciliation; never erase it or schedule another attempt.
+    if not running.exists() or running.read_bytes() != claimed:
+        return
+    task = json.loads(claimed)
+    if (any(key in task for key in ("run_token", "execution_session", "parent_task_id"))
+            or (ROOT / "results" / running.name).exists()):
+        return
+    target = ROOT / "blocked" / running.name
+    if target.exists():
+        raise RuntimeError("dispatch_startup_blocked_destination_exists")
+    task.update(attempt_state="blocked", blocker="worker_startup_denied",
+                last_error=reason, dispatch_reconciliation_required=True,
+                automatic_retry_allowed=False)
+    write_json(running, task)
+    os.replace(running, target)
+    log(f"worker startup denied for {task['id']}; retained in blocked without retry")
+
+
+def _launch_with_epoch(path: Path) -> int:
     task = json.loads(path.read_text(encoding="utf-8"))
     task_id = str(task["id"])
     running = RUNNING / f"{task_id}.json"
@@ -134,27 +164,33 @@ def launch(path: Path, dry_run: bool = False) -> int:
     write_json(path, task)
     os.replace(path, running)
     log(f"launch {task_id} priority={task.get('priority', 50)}")
-    with (ROOT / "logs" / f"{task_id}.launcher.log").open("ab") as handle:
-        proc = subprocess.Popen(
-            command,
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            env=worker_env,
-            start_new_session=True,
-        )
+    claimed = running.read_bytes()
+    try:
+        with (ROOT / "logs" / f"{task_id}.launcher.log").open("ab") as handle:
+            proc = subprocess.Popen(
+                command, stdout=handle, stderr=subprocess.STDOUT,
+                env=worker_env, start_new_session=True, close_fds=True,
+            )
+    except OSError as exc:
+        quarantine_unstarted_claim(running, claimed, f"worker spawn failed: {exc}")
+        raise
 
-    # Do not release the dispatcher serialization window until the child is
-    # observable or has already settled. This prevents a second task from
-    # being launched during worker.lock acquisition.
-    for _ in range(50):
-        if worker_running():
-            return 0
-        if proc.poll() is not None:
-            log(f"worker for {task_id} settled before lock observation rc={proc.returncode}")
-            return 0
+    # A process name is not an acknowledgement of worker admission. Keep the
+    # epoch until the worker persists its existing attempt identity or settles.
+    for _ in range(150):
+        status = proc.poll()
+        if status is not None:
+            if status != 0:
+                quarantine_unstarted_claim(running, claimed, f"worker exited before admission rc={status}")
+            log(f"worker for {task_id} settled during admission rc={status}")
+            return 0 if status == 0 else 1
+        if running.exists():
+            current = json.loads(running.read_text(encoding="utf-8"))
+            if current.get("run_token") and current.get("ownership_epoch"):
+                return 0
         time.sleep(0.1)
-    log(f"worker process for {task_id} alive; lock acquisition not observed after 5s")
-    return 0
+    log(f"worker admission for {task_id} unconfirmed; reconcile retained task without retry")
+    return 1
 
 def main() -> int:
     dry_run = "--dry-run" in sys.argv
