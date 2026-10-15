@@ -164,3 +164,14 @@ Managed root and child results use the granted herdr_submit_result Hermes tool. 
 A child's versioned pre-split ownership intent is durable before admission/policy resource preparation. Native split intent precedes the call; an invoked/legacy unknown split remains quarantined. A root session retains its full launch identity before policy proof publication and a one-use prompt intent. Typed native agent absence permits pre-prompt cleanup only with the same marker, current sandbox PID and physically retained grant/attestation. Result replay uses fsynced scheduler evidence even when the mutable source result is corrupted; cleanup failure preserves candidate evidence while withholding the parent gate.
 
 Nested child delegation is rejected before provisioning until a child-bound transport is available through #95. Root delegation retains its authenticated bridge.
+
+## Dispatcher cold-queue lock admission
+
+The ordinary dispatcher creates and probes `worker.lock` as a private 0600,
+single-link regular file owned by the host UID, using a pinned queue directory
+and non-following descriptors. The probe takes an exclusive nonblocking lock
+on the same inode used by the worker admission guard and namespace custodian.
+An existing shared or exclusive holder prevents another dispatch. Unsafe file
+metadata, process-probe errors and inode replacement stop admission before the
+pending task is claimed; the dispatcher never repairs existing lock permissions.
+The process check remains necessary during the spawn-before-lock interval.
