@@ -21,8 +21,14 @@ def boundary_workspace():
     try: yield target
     finally: shutil.rmtree(target)
 
-def fixture(root, hook=None, *, grant_transform=None, defer_verify=False, repository_config=None, environment_transform=None):
+def fixture(root, hook=None, *, grant_transform=None, defer_verify=False, repository_config=None, environment_transform=None, baseline_files=None):
     factory, work, plan, grant, log = factory_fixture(root)
+    if baseline_files:
+        for name, content in baseline_files.items():
+            (work / name).write_text(content)
+        git(work, "add", ".")
+        git(work, "commit", "-qm", "Large unchanged baseline inventory")
+        plan = replace(plan, base_sha=git(work, "rev-parse", "HEAD"))
     branch = WorkspaceManager(work).branch_name(86, plan.identity.task_id, 1, plan.base_sha)
     git(work, "branch", "-m", branch)
     for key,value in (repository_config or {}).items():
@@ -145,3 +151,19 @@ def test_foreign_staged_content_is_preserved_and_prevents_hygiene(boundary_works
     with pytest.raises(WorkContractError,match="foreign staged|approved work scope"):committer(cycle)
     assert git(work,"diff","--cached")==before
     assert not list(committer.storage.iterdir())
+
+
+def test_real_large_index_export_uses_default_bounded_profile(boundary_workspace):
+    # Long tracked paths make the real exported Git index exceed 64 KiB.
+    padding = {"padding-%04d-" % n + "x" * 64 + ".txt": "unchanged\n" for n in range(400)}
+    committer, cycle, work, log = fixture(boundary_workspace, baseline_files=padding)
+    artifact = committer(cycle)
+    assert cycle.phase is WorkPhase.HANDOFF
+    assert artifact.changed_files == ("result.py",)
+    assert (work / ".git" / "index").stat().st_size * 4 // 3 > 65536
+    assert git(work, "status", "--porcelain") == ""
+    assert int(git(work, "rev-list", "--count", artifact.base_sha + "..HEAD")) == 1
+    restored = WorkCycle(cycle.plan, work, log)
+    before = log._path.read_bytes()
+    assert committer(restored) == artifact
+    assert log._path.read_bytes() == before

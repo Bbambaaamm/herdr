@@ -109,7 +109,7 @@ class LocalCommitPolicy:
     hooks_root: str
     hooks: tuple[tuple[str, str], ...]
     timeout_seconds: int = 60
-    output_bytes: int = 65536
+    output_bytes: int = 1048576
     max_processes: int = 8
 
     def __post_init__(self):
