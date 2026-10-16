@@ -292,7 +292,7 @@ def _physical(plan, argv, grant, profile, fds, raw):
         for definition in (raw["code"], *raw["runtime"]):
             roots.append(host._tree(definition, immutable=True).freeze(Path(raw["storage"]), ()))
         known = {str(tree.target): tree for tree in roots}
-        seen = set(); result_count = 0; workspace_count = 0; special = set()
+        seen = set(); result_count = 0; workspace_count = 0; resolver_count = 0; special = set()
         profile_root = f"/home/agentops/.hermes/profiles/{profile['name']}/"
         profiles = set()
         for entry, fd in zip(plan["descriptors"], fds):
@@ -316,6 +316,11 @@ def _physical(plan, argv, grant, profile, fds, raw):
                         and operations[entry["fd"]] == "--ro-bind-data", "unapproved profile input")
                 SealedProfileInput(name, fd, entry["size"], entry["sha256"]).verify()
                 profiles.add(name)
+            elif kind == "sealed-resolver-data":
+                from .resolver_namespace import verify_host_descriptor
+                require(operations[entry["fd"]] == "--ro-bind-data", "resolver must use read-only sealed data")
+                verify_host_descriptor(entry, fd, host_uid=raw["host_uid"])
+                resolver_count += 1
             elif kind == "reserved-result":
                 require(operations[entry["fd"]] == "--bind-fd" and info.st_uid == raw["host_uid"]
                         and info.st_nlink == 1 and stat.S_IMODE(info.st_mode) == 0o600 and info.st_size == 0,
@@ -406,7 +411,7 @@ def _physical(plan, argv, grant, profile, fds, raw):
                         Path(target) == Path(root) or Path(root) in Path(target).parents for root in rule.allowed_roots)
                         for rule in grant.tool_rules), "write mount exceeds host grant")
         require(seen == set(known) and profiles == set(profile["files"]) and result_count == 1
-                and workspace_count == 1 and special == {str(BUNDLE_TARGET), "/run/herdr-bootstrap",
+                and workspace_count == 1 and resolver_count == 1 and special == {str(BUNDLE_TARGET), "/run/herdr-bootstrap",
                     "/run/herdr-policy/bootstrap-authority.sock", "/home/agentops/.local/bin/herdr"},
                 "incomplete approved launch sources")
     finally:

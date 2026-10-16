@@ -376,7 +376,10 @@ def physical(live, monkeypatch):
         info = os.fstat(fd)
         return {"source": f"/proc/{os.getpid()}/fd/{fd}", "fd": fd, "device": info.st_dev,
                 "inode": info.st_ino, "kind": kind, "target": str(target)}
+    from herdr.resolver_namespace import ResolverSnapshot
+    resolver = ResolverSnapshot.create()
     descriptors = [live.work.descriptor(), live.output.descriptor(), *live.profile.fd_descriptors(),
+                   resolver.descriptor(),
                    *[entry(t.fd, t.target, "directory") for t in trees],
                    entry(bootstrap.fd, bootstrap.target, "directory"),
                    entry(sockfd, "/run/herdr-policy/bootstrap-authority.sock", "socket"),
@@ -392,8 +395,9 @@ def physical(live, monkeypatch):
     argv = ["/usr/bin/bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--unshare-pid", "--die-with-parent",
             "--tmpfs", "/tmp", "--tmpfs", "/home/agentops", "--proc", "/proc", "--chdir", grant.workspace_root,
             "--tmpfs", "/home/agentops/.config/herdr", "--tmpfs", "/opt/agent-platform", "--tmpfs", "/run"]
+    argv += resolver.parent_args()
     for value in descriptors:
-        op = "--ro-bind-data" if value["kind"] == "sealed-profile-data" else (
+        op = "--ro-bind-data" if value["kind"] in {"sealed-profile-data", "sealed-resolver-data"} else (
              "--bind-fd" if value["kind"] == "reserved-result" else "--ro-bind-fd")
         argv += [op, str(value["fd"]), value["target"]]
     argv += ["--setenv", "HOME", "/home/agentops", "--setenv", "PATH",
@@ -404,14 +408,47 @@ def physical(live, monkeypatch):
     try:
         yield SimpleNamespace(plan=request_for(grant.identity, descriptors, argv), argv=argv, grant=grant,
                               profile=live.profile.identity, fds=[x["fd"] for x in descriptors], raw=raw,
-                              live=live, bundle=bundle, bootstrap=bootstrap, trees=trees)
+                              live=live, bundle=bundle, bootstrap=bootstrap, trees=trees, resolver=resolver)
     finally:
         for fd in (sockfd, bundlefd, clifd): os.close(fd)
-        sock.close(); bootstrap.close()
+        sock.close(); bootstrap.close(); resolver.close()
         for tree in trees: tree.close()
 
 
 ORIGINAL_PHYSICAL = issuer._physical
+
+
+@pytest.mark.parametrize('fault', ['missing', 'target', 'bytes', 'writable', 'unsealed'])
+def test_root_issuer_denies_unapproved_resolver_data(physical, fault):
+    p = physical
+    entries, argv, fds = deepcopy(p.plan['descriptors']), list(p.argv), list(p.fds)
+    index = next(i for i, entry in enumerate(entries) if entry['kind'] == 'sealed-resolver-data')
+    entry = entries[index]
+    at = argv.index(str(entry['fd'])) - 1
+    extra = None
+    try:
+        if fault == 'missing':
+            entries.pop(index); fds.pop(index); del argv[at:at+3]
+        elif fault == 'target':
+            target = '/etc/resolv.conf' if entry['target'] != '/etc/resolv.conf' else '/run/systemd/resolve/resolv.conf'
+            entry['target'] = target; argv[at+2] = target
+        elif fault == 'writable': argv[at] = '--bind-fd'
+        else:
+            import fcntl
+            from herdr.private_profile_namespace import _F_ADD_SEALS, _REQUIRED_SEALS
+            extra = os.memfd_create('forged-resolver', os.MFD_ALLOW_SEALING)
+            body = b'nameserver 192.0.2.1\n' if fault == 'bytes' else os.pread(fds[index], 16385, 0)
+            os.write(extra, body)
+            if fault == 'bytes': fcntl.fcntl(extra, _F_ADD_SEALS, _REQUIRED_SEALS)
+            info = os.fstat(extra)
+            entry.update(fd=extra, source=f'/proc/{os.getpid()}/fd/{extra}', device=info.st_dev,
+                         inode=info.st_ino, sha256=hashlib.sha256(body).hexdigest(), size=len(body))
+            fds[index] = extra; argv[at+1] = str(extra)
+        plan = request_for(p.grant.identity, entries, argv)
+        with pytest.raises((SecurityError, OSError)):
+            issuer._physical(plan, argv, p.grant, p.profile, fds, p.raw)
+    finally:
+        if extra is not None: os.close(extra)
 
 
 def test_physical_policy_checks_real_profile_result_and_runtime_fds(physical):
@@ -523,6 +560,7 @@ def test_accepts_the_actual_native_builder_command(physical, monkeypatch, grant_
                 issuer._physical(*args)
     finally:
         for fd in mount.private_cli_pins.values(): os.close(fd)
+        if mount.resolver_snapshot is not None: mount.resolver_snapshot.close()
         stage.close()
 
 

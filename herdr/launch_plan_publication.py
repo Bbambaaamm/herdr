@@ -71,9 +71,9 @@ def _shape(plan, argv, identity):
     for entry in entries:
         require(isinstance(entry, dict), "descriptor object required")
         kind = entry.get("kind")
-        extra = ({"sha256", "size"} if kind == "sealed-profile-data"
+        extra = ({"sha256", "size"} if kind in ("sealed-profile-data", "sealed-resolver-data")
                  else {"reservation"} if kind == "reserved-result" else set())
-        require(isinstance(kind, str) and kind in {"file", "directory", "socket", "sealed-profile-data", "reserved-result"}
+        require(isinstance(kind, str) and kind in {"file", "directory", "socket", "sealed-profile-data", "sealed-resolver-data", "reserved-result"}
                 and set(entry) == ordinary | extra
                 and all(type(entry[key]) is int and entry[key] >= 0 for key in ("fd", "device", "inode"))
                 and isinstance(entry["source"], str)
@@ -81,10 +81,14 @@ def _shape(plan, argv, identity):
                 and entry["source"].rsplit("/", 1)[-1] == str(entry["fd"])
                 and _target(entry["target"]) and entry["fd"] not in mapping
                 and entry["target"] not in targets, "descriptor shape or alias invalid")
-        if kind == "sealed-profile-data":
+        if kind in {"sealed-profile-data", "sealed-resolver-data"}:
             require(type(entry["size"]) is int and 0 <= entry["size"] <= 131072
                     and isinstance(entry["sha256"], str)
                     and re.fullmatch(r"[a-f0-9]{64}", entry["sha256"]), "sealed descriptor digest invalid")
+        if kind == "sealed-resolver-data":
+            from .resolver_namespace import TARGETS, MAX_BYTES
+            require(entry["target"] in TARGETS and 0 < entry["size"] <= MAX_BYTES,
+                    "resolver descriptor target or bound invalid")
         if kind == "reserved-result":
             binding = entry["reservation"]
             require(isinstance(binding, dict) and set(binding) == {
@@ -108,7 +112,7 @@ def _shape(plan, argv, identity):
         require(number in mapping and number not in used, "FD binding is missing or duplicated")
         entry = mapping[number]
         require(argv[index + 2] == entry["target"]
-                and (arg == "--ro-bind-data") == (entry["kind"] == "sealed-profile-data")
+                and (arg == "--ro-bind-data") == (entry["kind"] in {"sealed-profile-data", "sealed-resolver-data"})
                 and not (arg == "--bind-fd" and entry["kind"] == "socket"), "FD binding role differs")
         used.add(number)
     require(used == set(mapping) and plan == request_for(identity, entries, argv),

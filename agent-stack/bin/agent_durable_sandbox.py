@@ -83,7 +83,9 @@ for source_index, item in enumerate(entries):
     if not isinstance(item, dict):
         raise SystemExit("policy_fd_launch_invalid")
     kind = item.get("kind")
-    sealed = kind == "sealed-profile-data"
+    sealed_profile = kind == "sealed-profile-data"
+    sealed_resolver = kind == "sealed-resolver-data"
+    sealed = sealed_profile or sealed_resolver
     reserved = kind == "reserved-result"
     ordinary = {"source", "fd", "device", "inode", "kind", "target"}
     expected_keys = ordinary | ({"sha256", "size"} if sealed else {"reservation"} if reserved else set())
@@ -91,7 +93,7 @@ for source_index, item in enumerate(entries):
         raise SystemExit("policy_fd_launch_invalid")
     if (any(type(item[k]) is not int or item[k] < 0
             for k in ("fd", "device", "inode"))
-        or kind not in ("file", "directory", "socket", "sealed-profile-data", "reserved-result")
+        or kind not in ("file", "directory", "socket", "sealed-profile-data", "sealed-resolver-data", "reserved-result")
         or not isinstance(item["source"], str)
         or not re.fullmatch(r"/proc/[1-9][0-9]{0,9}/fd/[0-9]{1,10}", item["source"])
         or item["source"].rsplit("/", 1)[-1] != str(item["fd"])
@@ -99,7 +101,7 @@ for source_index, item in enumerate(entries):
         or not item["target"].startswith("/")
         or item["fd"] in mapping or item["target"] in targets):
         raise SystemExit("policy_fd_launch_invalid")
-    if sealed:
+    if sealed_profile:
         match = re.fullmatch(
             r"/home/agentops/\.hermes/profiles/"
             r"([a-z0-9][a-z0-9_-]{0,31})/([a-zA-Z0-9_.\-/]{1,256})",
@@ -123,6 +125,13 @@ for source_index, item in enumerate(entries):
         if total_profile_bytes > 524288:
             raise SystemExit("policy_fd_profile_manifest_invalid")
         approved_files.add(match.group(2))
+    if sealed_resolver:
+        size, digest = item["size"], item["sha256"]
+        if (plan_envelope is None or item["target"] not in {"/etc/resolv.conf",
+            "/run/systemd/resolve/stub-resolv.conf", "/run/systemd/resolve/resolv.conf"}
+            or type(size) is not int or not 0 < size <= 16384
+            or not isinstance(digest, str) or re.fullmatch(r"[a-f0-9]{64}", digest) is None):
+            raise SystemExit("policy_fd_resolver_manifest_invalid")
     opened = os.open(
         f"/proc/self/fd/{received_fds[source_index]}" if received_fds else item["source"],
         (os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK) if sealed or reserved
@@ -207,9 +216,9 @@ for index, arg in enumerate(args[:arg_end]):
             raise SystemExit("policy_fd_launch_invalid")
         opened, target, kind = mapping[original]
         if (args[index + 2] != target
-            or (arg == "--ro-bind-data") != (kind == "sealed-profile-data")):
+            or (arg == "--ro-bind-data") != (kind in ("sealed-profile-data", "sealed-resolver-data"))):
             raise SystemExit("policy_fd_launch_invalid")
-        if kind == "sealed-profile-data":
+        if kind in ("sealed-profile-data", "sealed-resolver-data"):
             os.lseek(opened, 0, os.SEEK_SET)
         args[index + 1] = str(opened)
         os.set_inheritable(opened, True)
@@ -458,7 +467,7 @@ if private_home:
     # The *opened* FD path (not a caller-supplied "source" string) is checked.
     workspace_dirs = [v[0] for op, v, _ in parsed if op == "--chdir"]
     ordinary_entries = [item for item in entries
-                        if item["kind"] != "sealed-profile-data"]
+                        if item["kind"] not in ("sealed-profile-data", "sealed-resolver-data")]
     # Disposable no-agent kernel tests may carry only sealed file data.
     # Any launch with ordinary code/workspace FDs requires an exact cwd.
     if len(workspace_dirs) > 1 or (ordinary_entries and len(workspace_dirs) != 1):
@@ -489,7 +498,7 @@ if private_home:
         Path("/run/herdr-policy/bootstrap-authority.sock"),
     }
     for item in entries:
-        if item["kind"] == "sealed-profile-data":
+        if item["kind"] in ("sealed-profile-data", "sealed-resolver-data"):
             continue
         target = Path(item["target"])
         allowed = {
@@ -536,6 +545,8 @@ if private_home:
     # The pinned FD is the only source Bubblewrap may mount; pathname
     # swaps performed after this check cannot alter that inode's identity.
 else:
+    if any(item["kind"] == "sealed-resolver-data" for item in entries):
+        raise SystemExit("policy_fd_resolver_without_private_home")
     if approved_files:
         raise SystemExit("policy_fd_profile_data_without_private_home")
     # Legacy mask inventory must remain strict until the production caller
@@ -816,6 +827,10 @@ def command(
         else:
             args += ["--ro-bind", str(policy), str(path)]
     if policy_mount is not None:
+        # Public DNS must survive the private /run mask without exposing host runtime data.
+        if private_profile_snapshot is not None and policy_mount.resolver_snapshot is None:
+            from herdr.resolver_namespace import ResolverSnapshot
+            policy_mount.resolver_snapshot = ResolverSnapshot.create()
         # Host-only immutable copies override mutable checkout/runtime aliases.
         descriptors = policy_mount.descriptors()
         if owned_write_pins is not None:descriptors.extend(owned_write_pins.descriptors())
@@ -829,8 +844,11 @@ def command(
                                     "kind": "file", "target": target})
             descriptors.extend(private_profile_snapshot.fd_descriptors())
         args += ["--tmpfs", "/run", "--dir", "/run/herdr", "--dir", "/run/herdr-policy"]
+        if policy_mount.resolver_snapshot is not None:
+            args += policy_mount.resolver_snapshot.parent_args()
         for entry in policy_mount.descriptors():
-            args += ["--ro-bind-fd", str(entry["fd"]), entry["target"]]
+            option = "--ro-bind-data" if entry["kind"] == "sealed-resolver-data" else "--ro-bind-fd"
+            args += [option, str(entry["fd"]), entry["target"]]
         from herdr.launch_environment import STARTUP_CONTROLS
         for name in sorted(set(STARTUP_CONTROLS)|{key for key in os.environ if key.startswith("LD_")}):
             args += ["--unsetenv",name]
