@@ -473,7 +473,9 @@ def test_root_and_child_grants_use_the_existing_consumer_ceiling(live, monkeypat
     with pytest.raises(SecurityError): issuer._grant({**request, "parent_grant": foreign.to_json()}, raw, live.profile.identity)
 
 
-def test_accepts_the_actual_native_builder_command(physical, monkeypatch):
+@pytest.mark.parametrize("grant_write,mount_write,accepted", [(True,True,True), (False,False,True),
+    (False,True,False), (True,False,True)])
+def test_accepts_the_actual_native_builder_command(physical, monkeypatch, grant_write, mount_write, accepted):
     from tests.herdr.test_policy_launch import sandbox_module
     from herdr.policy_launch import PolicyMount, PreparedPolicyLaunch
     from herdr.security import stage_policy_bundle
@@ -483,6 +485,8 @@ def test_accepts_the_actual_native_builder_command(physical, monkeypatch):
                      path_fields=("path",), allowed_roots=(p.grant.workspace_root,))
     root_grant = replace(p.grant, scope=replace(p.grant.scope, tools=(*p.grant.scope.tools, "write_file")),
                          tool_rules=(*p.grant.tool_rules, write))
+    if not grant_write:
+        root_grant = p.grant
     stage = stage_policy_bundle(p.bundle.parent / "builder-grant")
     mount = PolicyMount(stage, p.trees[0], p.trees[1:])
     mount.require_immutable_runtime = lambda: None  # Disposable roots cannot claim privileged immutability.
@@ -505,9 +509,18 @@ def test_accepts_the_actual_native_builder_command(physical, monkeypatch):
                            real_binary=Path("/home/agentops/.local/bin/herdr"), policy_mount=mount,
                            admission_root=p.live.proposals.parent,
                            pinned_worktree=p.live.work,
-                           hermes_profile=p.live.profile.name, private_profile_snapshot=p.live.profile)
+                           hermes_profile=p.live.profile.name, private_profile_snapshot=p.live.profile,
+                           root_workspace_writable=mount_write)
         plan, argv = mount.private_mount_request, mount.private_mount_argv
-        issuer._physical(plan, argv, root_grant, p.profile, [entry["fd"] for entry in plan["descriptors"]], p.raw)
+        operation = argv[argv.index(str(p.live.work.fd)) - 1]
+        assert operation == ("--bind-fd" if mount_write else "--ro-bind-fd")
+        assert p.live.output.logical.name == "result.json"  # Ordinary root slot, not a child result filename.
+        args = (plan, argv, root_grant, p.profile, [entry["fd"] for entry in plan["descriptors"]], p.raw)
+        if accepted:
+            issuer._physical(*args)
+        else:
+            with pytest.raises(SecurityError, match="write mount exceeds host grant"):
+                issuer._physical(*args)
     finally:
         for fd in mount.private_cli_pins.values(): os.close(fd)
         stage.close()
@@ -833,3 +846,15 @@ def test_non_dumpable_proc_marker_denies_wrong_type_owner_or_group(monkeypatch, 
     monkeypatch.setattr(issuer, "Path", ObservedPath)
     with pytest.raises(SecurityError, match="must be non-dumpable"):
         issuer._require_non_dumpable(1234)
+
+
+@pytest.mark.parametrize("options", [
+    {"root_workspace_writable": "yes", "private_profile_snapshot": object(), "policy_mount": object()},
+    {"root_workspace_writable": True},
+    {"root_workspace_writable": False, "child_workspace_writable": False,
+     "private_profile_snapshot": object(), "policy_mount": object()},
+])
+def test_root_workspace_mode_cannot_bypass_private_or_child_admission(tmp_path, options):
+    from tests.herdr.test_policy_launch import sandbox_module
+    with pytest.raises(RuntimeError, match="private_root_workspace_mode_required"):
+        sandbox_module().command(tmp_path, tmp_path / "absent", **options)

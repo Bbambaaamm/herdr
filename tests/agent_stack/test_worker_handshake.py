@@ -1587,6 +1587,8 @@ def test_private_root_missing_mount_approval_denies_before_pane_bridge_or_provid
     def prepare(**kwargs):
         launch=original(**kwargs)
         launch.private_profile_snapshot=SimpleNamespace(name=worker._task_hermes_profile(task))
+        from tests.herdr.test_security import grant as fixture_grant
+        launch.grant=fixture_grant(Path(task["workspace"]))
         launch.mount=SimpleNamespace(private_mount_plan=None,private_mount_request=None)
         launch.sealed=None
         return launch
@@ -2137,6 +2139,8 @@ def test_root_revalidates_handoff_after_readiness_before_native_run(tmp_path, mo
     def prepare(**kwargs):
         launch=original(**kwargs)
         launch.private_profile_snapshot=SimpleNamespace(name=worker._task_hermes_profile(task))
+        from tests.herdr.test_security import grant as fixture_grant
+        launch.grant=fixture_grant(Path(task["workspace"]))
         launch.private_plan_handoff=SimpleNamespace(verify_bound=denied)
         launch.prepare_private_command=lambda builder:builder()
         return launch
@@ -2155,10 +2159,49 @@ def test_root_revalidates_handoff_after_readiness_before_native_run(tmp_path, mo
     monkeypatch.setattr(worker,"stop_bridge",lambda *args:None)
     monkeypatch.setattr(worker,"_preflight_root_provider",lambda *args:pytest.fail("private credentials cannot refresh"))
     monkeypatch.setattr(worker,"frozen_policy",lambda:_policy_file(tmp_path))
-    monkeypatch.setattr(worker,"sandbox_command",lambda *args,**kwargs:builds.append("command") or ["/bin/true"])
+    def build(*args, **kwargs):
+        assert kwargs["root_workspace_writable"] is False
+        builds.append("command")
+        return ["/bin/true"]
+    monkeypatch.setattr(worker,"sandbox_command",build)
     monkeypatch.setattr(worker,"_wait_for_task_pane_input",lambda *args,**kwargs:phase.__setitem__(0,"ready"))
     monkeypatch.setattr(worker,"_cleanup_setup_pane",lambda *args,**kwargs:True)
     with pytest.raises(SecurityError,match="handoff expired during pane readiness"):
         worker.create_task_session(task,policy_launch_factory=factory)
     assert not any(args[:2]==["pane","run"] for args in commands)
     assert factory.created[0].events[-1]==("closed",)
+
+
+@pytest.mark.parametrize("tool,root_kind,scoped,expected", [
+    ("read_file", "workspace", True, False),
+    ("write_file", "workspace", True, True),
+    ("patch", "workspace", True, True),
+    ("patch", "parent", True, None),
+    ("write_file", "nested", True, False),
+    ("write_file", "sibling", True, None),
+    ("write_file", "workspace", False, None),
+])
+def test_private_root_workspace_mount_uses_effective_grant(tmp_path, tool, root_kind, scoped, expected):
+    from dataclasses import replace
+    from tests.herdr.test_security import grant
+    from herdr.security import ToolRule, RiskClass
+    workspace = tmp_path / "workspace"
+    roots = {"workspace": workspace, "parent": tmp_path,
+             "nested": workspace / "nested", "sibling": tmp_path / "workspace-other"}
+    planned = grant(workspace)
+    rule = ToolRule(tool, RiskClass.READ if tool == "read_file" else RiskClass.WORKSPACE_WRITE,
+                    ("path",), path_fields=("path",), allowed_roots=(str(roots[root_kind]),))
+    if expected is None:
+        from herdr.security import SecurityError
+        with pytest.raises(SecurityError):
+            replace(planned, tool_rules=(rule,),
+                    scope=replace(planned.scope, tools=(tool,) if scoped else ("read_file",)))
+        return
+    planned = replace(planned, tool_rules=(rule,),
+                      scope=replace(planned.scope, tools=(tool,) if scoped else ("read_file",)))
+    assert worker._root_workspace_writable(planned, workspace) is expected
+
+
+def test_private_root_workspace_denies_an_untyped_grant(tmp_path):
+    with pytest.raises(RuntimeError, match="typed root workspace grant"):
+        worker._root_workspace_writable({}, tmp_path)
