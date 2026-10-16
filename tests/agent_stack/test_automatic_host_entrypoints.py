@@ -134,8 +134,13 @@ def test_real_dispatcher_passes_the_host_wrapper_to_popen(tmp_path, monkeypatch)
     calls = []
     def popen(argv, **kwargs):
         calls.append((argv, kwargs))
-        monkeypatch.setattr(dispatcher, "worker_running", lambda: True)
-        return SimpleNamespace(poll=lambda: None)
+        running = dispatcher.RUNNING / task.name
+        state = json.loads(running.read_text())
+        state["dispatch_admission"] = {"nonce": state["dispatch_admission_nonce"],
+            "pid": os.getpid(), "start_ticks": dispatcher.process_start_ticks(os.getpid()),
+            "parent_pid": os.getpid()}
+        running.write_text(json.dumps(state))
+        return SimpleNamespace(pid=os.getpid(), poll=lambda: None)
     monkeypatch.setattr(dispatcher.subprocess, "Popen", popen)
     dispatcher.ENV = {**dispatcher.ENV, "PYTHONPATH": "/attacker", "LD_PRELOAD": "/attacker.so"}
     assert dispatcher.launch(task) == 0
@@ -184,6 +189,8 @@ def test_actual_start_bridge_uses_wrapped_command(tmp_path, monkeypatch):
         def __exit__(self, *args): pass
         def settimeout(self, value): pass
         def connect(self, address): pass
+        def getsockopt(self, *args):
+            return __import__("struct").pack("3i", 123, os.getuid(), os.getgid())
     monkeypatch.setattr(worker.socket, "socket", lambda *args: Socket())
     worker.start_bridge(task, session)
     assert calls == [wrapped + selected[0]]
@@ -431,6 +438,8 @@ def unresolved_private_launch_fixture(tmp_path, monkeypatch):
     def prepare(**kwargs):
         launch = original(**kwargs)
         launch.private_profile_snapshot = SimpleNamespace(name="quantlab")
+        from tests.herdr.test_security import grant
+        launch.grant = grant(Path(kwargs["workspace"]))
         def unresolved(builder):
             raise LaunchPlanReconciliationRequired("published plan reply unavailable")
         monkeypatch.setattr(launch, "prepare_private_command", unresolved)

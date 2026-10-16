@@ -647,6 +647,7 @@ def command(
     writable: tuple[Path, ...] = (),
     policy: Path | None = None,
     child_workspace_writable: bool | None = None,
+    root_workspace_writable: bool | None = None,
     pinned_worktree: PinnedWorktree | None = None,
     policy_mount=None,
     owned_write_pins=None,
@@ -654,6 +655,12 @@ def command(
     private_profile_snapshot=None,
     hermes_profile: str | None = None,
 ) -> list[str]:
+    if root_workspace_writable is not None and (
+        type(root_workspace_writable) is not bool or child_workspace_writable is not None
+        or private_profile_snapshot is None or policy_mount is None):
+        raise RuntimeError("private_root_workspace_mode_required")
+    workspace_writable = (child_workspace_writable is not False
+        if root_workspace_writable is None else root_workspace_writable)
     if private_profile_snapshot is not None:
         from herdr.private_profile_namespace import PrivateProfileSnapshot
         if (policy_mount is None
@@ -732,8 +739,8 @@ def command(
                                      pinned_worktree.root in result.parents):
             raise RuntimeError("managed_child_result_inside_worktree_root")
 
-    # Keep the host root read-only. Root tasks retain their workspace bind;
-    # managed children receive it writable only with admitted write scope.
+    # Keep the host root read-only. Private roots use their admitted grant;
+    # managed children retain their separate admitted workspace mode.
     # Mask control paths after writable binds and over-mount the local CLI.
     args = [
         str(BWRAP),
@@ -746,9 +753,9 @@ def command(
         *(private_destination_setup if private_profile_mounts else []),
         *([] if pinned_worktree is None or private_profile_mounts else
           ["--tmpfs", str(workspace.parent), "--dir", str(workspace)]),
-        (("--bind-fd" if child_workspace_writable is not False else "--ro-bind-fd")
+        (("--bind-fd" if workspace_writable else "--ro-bind-fd")
          if pinned_worktree else
-         ("--bind" if child_workspace_writable is not False else "--ro-bind")),
+         ("--bind" if workspace_writable else "--ro-bind")),
         str(pinned_worktree.fd) if pinned_worktree else str(workspace), str(workspace),
         "--proc", "/proc",
         "--chdir", str(workspace),
