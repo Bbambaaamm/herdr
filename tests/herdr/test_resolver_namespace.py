@@ -33,9 +33,9 @@ def test_real_host_source_is_independently_verified_and_kernel_sealed():
 
 
 def test_resolver_service_must_not_share_worker_uid(monkeypatch):
-    monkeypatch.setattr(resolver.pwd, 'getpwnam', lambda name: SimpleNamespace(pw_uid=1001))
+    monkeypatch.setattr(resolver, '_resolver_service_uid', lambda: os.geteuid())
     with pytest.raises(SecurityError, match='worker identity'):
-        resolver._owners(1001)
+        resolver._owners(os.geteuid())
 
 
 @pytest.mark.parametrize('fault', ['target', 'digest', 'size', 'zero', 'oversize', 'unsealed', 'host-drift'])

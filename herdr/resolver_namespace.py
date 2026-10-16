@@ -28,11 +28,17 @@ def require(condition, reason):
         raise SecurityError(reason)
 
 
+def _resolver_service_uid():
+    try:
+        return pwd.getpwnam("systemd-resolve").pw_uid
+    except KeyError:
+        return None
+
+
 def _owners(host_uid):
     owners = {0}
-    try:
-        uid = pwd.getpwnam("systemd-resolve").pw_uid
-    except KeyError:
+    uid = _resolver_service_uid()
+    if uid is None:
         return owners
     require(uid != host_uid or uid == 0, "resolver service shares the worker identity")
     owners.add(uid)
