@@ -5,6 +5,7 @@ import os
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -305,6 +306,7 @@ TASK_PANE_ENV = "HERDR_DURABLE_TASK_PANE"
 POLICY_BIN = Path(__file__).resolve().parents[1] / "policy-bin"
 CHILD_HELPER = Path(__file__).resolve().parent / "agent-durable-child"
 BRIDGE = Path(__file__).resolve().parent / "agent-durable-bridge"
+BRIDGE_STARTUP_TIMEOUT_SECONDS = 60.0
 
 
 def bridge_socket_name(task: dict) -> str:
@@ -382,6 +384,7 @@ def start_bridge(task: dict, session: dict) -> None:
                                   binding=binding)
     log_path = LOGS / f"{task['id']}.bridge.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + BRIDGE_STARTUP_TIMEOUT_SECONDS
     with log_path.open("a", encoding="utf-8") as output:
         process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=output,
                                    stderr=output, env=ENV, start_new_session=True)
@@ -399,17 +402,33 @@ def start_bridge(task: dict, session: dict) -> None:
         # Keep the PID/command evidence even if startup exits before it can be
         # attested; an unverified live PID requires reconciliation.
         persist_execution_session(task)
-    for _ in range(30):
-        if process.poll() is not None:
-            break
+    # The pinned host wrapper verifies the complete code/Python/SDK inventory
+    # before binding. Its measured startup alone exceeds the former 3s loop.
+    while True:
+        status = process.poll()
+        if status is not None:
+            raise RuntimeError(f"durable_bridge_unavailable:process_exited:{status}")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("durable_bridge_unavailable:startup_timeout")
         try:
             with socket.socket(socket.AF_UNIX) as connection:
-                connection.settimeout(0.1)
+                connection.settimeout(min(0.1, remaining))
                 connection.connect("\0" + name[1:])
-            return
+                credentials = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
         except OSError:
-            time.sleep(0.1)
-    raise RuntimeError("durable_bridge_unavailable")
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+            continue
+        try:
+            peer_pid, peer_uid, _ = struct.unpack("3i", credentials)
+        except (struct.error, TypeError) as error:
+            raise RuntimeError("durable_bridge_identity_unverified") from error
+        if (peer_pid != process.pid or peer_uid != os.getuid()
+                or process_start_ticks(process.pid) != session["bridge_launch"]["process_start_ticks"]):
+            raise RuntimeError("durable_bridge_identity_unverified")
+        if process.poll() is not None:
+            raise RuntimeError("durable_bridge_unavailable:exited_during_readiness")
+        return
 
 
 def _bridge_exited(pidfd: int) -> bool:

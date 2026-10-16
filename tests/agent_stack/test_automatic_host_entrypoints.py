@@ -189,6 +189,8 @@ def test_actual_start_bridge_uses_wrapped_command(tmp_path, monkeypatch):
         def __exit__(self, *args): pass
         def settimeout(self, value): pass
         def connect(self, address): pass
+        def getsockopt(self, *args):
+            return __import__("struct").pack("3i", 123, os.getuid(), os.getgid())
     monkeypatch.setattr(worker.socket, "socket", lambda *args: Socket())
     worker.start_bridge(task, session)
     assert calls == [wrapped + selected[0]]
