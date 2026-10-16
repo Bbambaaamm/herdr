@@ -436,6 +436,8 @@ def unresolved_private_launch_fixture(tmp_path, monkeypatch):
     def prepare(**kwargs):
         launch = original(**kwargs)
         launch.private_profile_snapshot = SimpleNamespace(name="quantlab")
+        from tests.herdr.test_security import grant
+        launch.grant = grant(Path(kwargs["workspace"]))
         def unresolved(builder):
             raise LaunchPlanReconciliationRequired("published plan reply unavailable")
         monkeypatch.setattr(launch, "prepare_private_command", unresolved)
