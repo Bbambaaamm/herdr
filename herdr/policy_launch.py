@@ -384,6 +384,7 @@ class PolicyMount:
         self.private_identity = None
         self.private_cli_pins = {}
         self.private_fd_handoff = False
+        self.resolver_snapshot = None
         targets = [str(BUNDLE_TARGET), str(code.target), *(str(x.target) for x in runtime)]
         _require(len(targets) == len(set(targets)), "duplicate policy mount target")
 
@@ -437,6 +438,10 @@ class PolicyMount:
             from .host_bootstrap import HostBootstrap
             _require(isinstance(self.bootstrap,HostBootstrap),"typed host bootstrap required")
             result.extend(self.bootstrap.descriptors())
+        if self.resolver_snapshot is not None:
+            from .resolver_namespace import ResolverSnapshot
+            _require(isinstance(self.resolver_snapshot, ResolverSnapshot), "typed resolver snapshot required")
+            result.append(self.resolver_snapshot.descriptor())
         return result
 
     def verify_mounted(self, pid, sealed: SealedPolicyBundle | None = None):
@@ -448,6 +453,10 @@ class PolicyMount:
             self.private_mount_plan.verify_mounted(pid, rows)
         root = Path(f"/proc/{pid}/root")
         for entry in self.descriptors():
+            if entry["kind"] == "sealed-resolver-data":
+                from .resolver_namespace import verify_mounted
+                verify_mounted(entry, pid, rows)
+                continue
             if entry["kind"] == "directory":
                 target = Path(entry["target"])
                 _require(not any(target in Path(path).parents for path in rows),
@@ -1137,6 +1146,9 @@ class PreparedPolicyLaunch:
                            for fd in getattr(self.mount, "private_cli_pins", {}).values())
             if hasattr(self.mount, "private_cli_pins"):
                 self.mount.private_cli_pins = {}
+            resolver = getattr(self.mount, "resolver_snapshot", None)
+            if resolver is not None:
+                actions.append(resolver.close)
             def release_stage():
                 try:
                     self.mount.stage._same_inode()
