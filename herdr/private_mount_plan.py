@@ -110,6 +110,10 @@ class ApprovedPrivateMountPlan:
                      "/run/herdr-bootstrap", "/run/herdr-policy/bootstrap-authority.sock",
                      "/home/agentops/.local/bin/herdr", "/home/agentops/.local/bin/hermes"}
         for entry in raw["descriptors"]:
+            if entry["kind"] == "sealed-resolver-data":
+                from .resolver_namespace import verify_mounted
+                verify_mounted(entry, pid, rows)
+                continue
             if entry["kind"] == "sealed-profile-data":
                 continue
             target = entry["target"]

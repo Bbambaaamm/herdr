@@ -139,3 +139,40 @@ host policy launcher and the bwrap child, not just a direct bwrap invocation.
 This scope is deliberately isolated from PR #125, PR #127, PR #128, disk
 issue #126 and active RC26 runtime. It can be reviewed on the PR branch
 without touching queue, credentials, deployment or model budget.
+
+## Private /run DNS admission (source integration, 2026-10-16)
+
+A private launch masks host `/run`. On systemd hosts, `/etc/resolv.conf`
+often points into that masked tree, so the native SDK loses DNS even when
+the host can reach its provider. Preserve only the public resolver input,
+using the existing root launch-plan authority and descriptor transport.
+
+- `ResolverSnapshot` reads a root-owned regular `/etc/resolv.conf` or its
+  supported symlink to `/run/systemd/resolve/{stub-resolv.conf,resolv.conf}`.
+  Source ancestry is opened without following links, must be non-writable
+  by group/other, and belongs to root or the named systemd resolver service.
+  That service must not share the worker UID. Unknown layouts fail closed.
+- Bound the source to 16 KiB and freeze it into a fully sealed memfd.
+  The new closed descriptor role `sealed-resolver-data` uses only
+  `--ro-bind-data` at the selected fixed target. No general host /run mount
+  or caller-selected configuration path is admitted.
+- The root issuer independently reads the trusted host configuration and
+  compares target, exact bytes, descriptor identity and kernel seals. Each
+  native private launch requires exactly one resolver descriptor. A profile
+  digest supplied by the worker cannot approve resolver data.
+- The FD launcher requires the exact protected launch plan for this role;
+  the profile-only disposable-test exception does not apply. Mounted
+  verification checks the copied data's bounded bytes and read-only mount,
+  rather than comparing its new bwrap inode with the memfd inode. Normal
+  launch cleanup closes the retained snapshot.
+- Tests exercise the real native command builder and issuer FD validation,
+  reject forged/missing/writable/unsealed data, and reproduce the masked
+  symlink before restoring the exact sealed bytes in a real bwrap process
+  with networking disabled. These tests use no provider or credentials.
+
+The launcher and issuer must be published from the same reviewed source
+closure before private worker activation. This source change does not
+authorize a model call, change network policy, activate workers, or resolve
+any earlier uncertain economic operation. Ordinary-worker model inference,
+release cutover/recovery and full autonomous dispatch still need their
+separate acceptance evidence.
