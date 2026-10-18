@@ -53,8 +53,27 @@ def wait_file(path, process=None, timeout=10):
 def dead(pid):
     try:
         return Path(f'/proc/{pid}/stat').read_text().split(') ', 1)[1].split()[0] == 'Z'
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
+        # A reaped /proc entry may report either ENOENT or ESRCH.
         return True
+
+
+@pytest.mark.parametrize('error', [FileNotFoundError, ProcessLookupError])
+def test_dead_proc_disappearance_is_observed_as_dead(monkeypatch, error):
+    def reaped(path, *args, **kwargs):
+        assert path == Path('/proc/12345/stat')
+        raise error('owned fixture process was reaped')
+    monkeypatch.setattr(Path, 'read_text', reaped)
+    assert dead(12345) is True
+
+
+def test_dead_proc_permission_error_remains_uninspectable(monkeypatch):
+    def denied(path, *args, **kwargs):
+        assert path == Path('/proc/12345/stat')
+        raise PermissionError('owned fixture process cannot be inspected')
+    monkeypatch.setattr(Path, 'read_text', denied)
+    with pytest.raises(PermissionError, match='cannot be inspected'):
+        dead(12345)
 
 
 def wait_dead(pid):
