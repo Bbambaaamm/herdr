@@ -25,6 +25,10 @@ _MAX_FILE_BYTES = 131_072
 _MAX_TOTAL_BYTES = 524_288
 _HOME = Path("/home/agentops")
 _RUNTIME = ("sessions", "cache", "logs", "pastes")
+# The pinned SDK initializes this skeleton while reading configuration.
+# These directories are empty private-home entries, not new writable mounts.
+_INITIALIZATION = ("cron", "memories", "pairing", "hooks",
+                   "image_cache", "audio_cache", "skills")
 # Linux memfd seal constants (some Python builds omit exported names).
 _F_GET_SEALS = getattr(fcntl, "F_GET_SEALS", 1034)
 _F_ADD_SEALS = getattr(fcntl, "F_ADD_SEALS", 1033)
@@ -241,7 +245,7 @@ class PrivateProfileSnapshot:
             self.home / ".hermes/profiles",
             self.destination,
         ]
-        dirs = [*roots]
+        dirs = [*roots, *(self.destination / name for name in _INITIALIZATION)]
         for file in self.files:
             parts = _relative(file.relative)
             for index in range(1, len(parts)):
