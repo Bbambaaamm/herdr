@@ -157,6 +157,23 @@ def _pr_binding(pr: dict) -> tuple:
             pr.get("base", {}).get("ref"))
 
 
+def _clean_review_body(body):
+    """Recognize only the plain clean receipt or one exact v1 envelope.
+
+    This view is used for format recognition only. The original comment is
+    retained for digesting and final immutable-observation checks.
+    """
+    if not isinstance(body, str):
+        return None
+    envelope = "<!-- codex-review-receipt:v1 -->\n\n"
+    if body.startswith(envelope):
+        body = body[len(envelope):]
+    if ("codex-review-receipt" in body.casefold()
+            or not body.startswith("Codex Review: Didn't find any major issues.")):
+        return None
+    return body
+
+
 def _collect_github(plan: dict, artifact, number):
     if type(number) is not int or number <= 0:
         raise EvidenceError("immutable pull request reference is required")
@@ -186,9 +203,11 @@ def _collect_github(plan: dict, artifact, number):
     for row in comments:
         if row.get("user", {}).get("login") != BOT or row.get("user", {}).get("type") != "Bot":
             continue
-        body = row.get("body", "")
+        body = _clean_review_body(row.get("body", ""))
+        if body is None:
+            continue
         match = re.search(r"\*\*Reviewed commit:\*\*\s*\x60([0-9a-f]{10,40})\x60", body)
-        if not body.startswith("Codex Review: Didn't find any major issues.") or not match:
+        if not match:
             continue
         if not artifact.commit_sha.startswith(match.group(1)):
             continue
