@@ -252,3 +252,78 @@ def test_growing_gzip_optional_header_stops_at_snapshot_byte_limit(tmp_path, mon
     # The one-byte overflow probe is the only permitted read past the snapshot.
     assert observed["raw_bytes"] <= initial_bytes + 1
     assert not target.exists()
+
+
+@pytest.mark.parametrize("headers,handler", [
+    ({"GNU.sparse.major": "1", "GNU.sparse.minor": "0"}, "_proc_gnusparse_10"),
+    ({"GNU.sparse.map": "0,1"}, "_proc_gnusparse_01"),
+    ({"GNU.sparse.size": "1"}, "_proc_gnusparse_00"),
+])
+def test_sparse_pax_is_denied_before_stdlib_sparse_parser(tmp_path, monkeypatch, headers, handler):
+    def sparse_parser(*args, **kwargs):
+        pytest.fail("stdlib sparse parser reached before denial")
+    monkeypatch.setattr(tarfile.TarInfo, handler, sparse_parser)
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        member = tarfile.TarInfo("tiny")
+        member.pax_headers = headers
+        archive.addfile(member)
+    path = tmp_path / "sparse-pax.tar.gz"
+    path.write_bytes(gzip.compress(raw.getvalue()))
+    with pytest.raises(release.ReleaseError, match="unsupported_archive_member"):
+        release.extract_archive(path, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_tar_member_cache_does_not_accumulate_global_pax_copies(tmp_path, monkeypatch):
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT,
+                      pax_headers={"comment": "bounded metadata"}) as archive:
+        for index in range(5):
+            archive.addfile(tarfile.TarInfo(f"file-{index}"))
+    path = tmp_path / "global.tar.gz"
+    path.write_bytes(gzip.compress(raw.getvalue()))
+    observed = []
+    original = tarfile.TarFile.next
+    def observed_next(archive):
+        member = original(archive)
+        observed.append(len(archive.members))
+        return member
+    monkeypatch.setattr(tarfile.TarFile, "next", observed_next)
+    release.extract_archive(path, tmp_path / "out")
+    assert len(list((tmp_path / "out").iterdir())) == 5
+    assert max(observed) <= 1
+
+
+def test_cumulative_global_pax_metadata_is_bounded(tmp_path):
+    records = []
+    for index in range(3):
+        metadata = tarfile.TarInfo.create_pax_global_header({f"key-{index}": "v" * 24})
+        records.append(metadata)
+        records.append(tarfile.TarInfo(f"file-{index}").tobuf(format=tarfile.USTAR_FORMAT))
+    path = tmp_path / "globals.tar.gz"
+    path.write_bytes(gzip.compress(b"".join(records) + b"\0" * 1024))
+    with pytest.raises(release.ReleaseError, match="global_metadata_limit"):
+        release.extract_archive(path, tmp_path / "out", limits=limits(max_metadata_bytes=90))
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("preload", [0, 1, 2, "all"])
+def test_safe_extract_preserves_bounded_preloaded_members(tmp_path, preload):
+    path = bundle(tmp_path, [(f"file-{i}", str(i).encode(), tarfile.REGTYPE) for i in range(3)])
+    with tarfile.open(path, mode="r:gz") as archive:
+        if preload == "all":
+            archive.getmembers()
+        else:
+            for _ in range(preload):
+                archive.next()
+        release.safe_extract(archive, tmp_path / "out")
+    assert {p.name: p.read_bytes() for p in (tmp_path / "out").iterdir()} == {
+        f"file-{i}": str(i).encode() for i in range(3)}
+
+
+def test_valid_pax_path_still_extracts(tmp_path):
+    name = "dir/" + "a" * 110
+    path = bundle(tmp_path, [(name, b"payload", tarfile.REGTYPE)])
+    release.extract_archive(path, tmp_path / "out")
+    assert (tmp_path / "out" / name).read_bytes() == b"payload"

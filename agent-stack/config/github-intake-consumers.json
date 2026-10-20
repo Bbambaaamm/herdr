@@ -25,7 +25,11 @@
       "hermes_profile": "quantlab",
       "priority_default": 60,
       "priority_architecture": 50,
-      "worktree_root": "/home/agentops/workspaces/quantlab/worktrees"
+      "worktree_root": "/home/agentops/workspaces/quantlab/worktrees",
+      "admission": {
+        "signal": "maintainer-comment-v1",
+        "max_age_seconds": 86400
+      }
     },
     {
       "consumer": "majak",
@@ -52,7 +56,11 @@
       "hermes_profile": "majak",
       "priority_default": 60,
       "priority_architecture": 60,
-      "worktree_root": "/home/agentops/workspaces/dotacni-majak/worktrees"
+      "worktree_root": "/home/agentops/workspaces/dotacni-majak/worktrees",
+      "admission": {
+        "signal": "maintainer-comment-v1",
+        "max_age_seconds": 86400
+      }
     },
     {
       "consumer": "herdr",
@@ -79,7 +87,11 @@
       "hermes_profile": "quantlab",
       "priority_default": 60,
       "priority_architecture": 60,
-      "worktree_root": "/home/agentops/workspaces/herdr/worktrees"
+      "worktree_root": "/home/agentops/workspaces/herdr/worktrees",
+      "admission": {
+        "signal": "maintainer-comment-v1",
+        "max_age_seconds": 86400
+      }
     },
     {
       "consumer": "heating",

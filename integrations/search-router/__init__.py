@@ -9,13 +9,21 @@ import sqlite3
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote_plus
 
 from hermes_constants import get_hermes_home
 
 FAST = "fast"
 DEEP = "deep"
 BROWSER = "browser"
+
+# The installed browser/extraction connectors do not expose a trusted
+# connection-address and redirect-policy boundary. Never pass URLs to them:
+# a separate DNS lookup cannot prevent rebinding between check and connect.
+_URL_ROUTE_ERROR = (
+    "URL navigation and extraction are unavailable: connectors must enforce "
+    "destination and redirect policy at the connection boundary."
+)
+_URL_ROUTE_ERROR_CODE = "unsafe_url_route_disabled"
 _URL_RE = re.compile(r"https?://[^\s<>()\[\]{}\"']+", re.I)
 
 _BROWSER_TERMS = (
@@ -24,6 +32,8 @@ _BROWSER_TERMS = (
     "klik", "přihl", "formulář", "dashboard", "interaktiv", "screenshot",
     "otevři strán", "na stránce", "web app", "webová aplikace",
 )
+_BROWSER_STEMS = frozenset({"klik", "přihl", "formulář", "interaktiv", "otevři strán"})
+
 _DEEP_TERMS = (
     "research", "deep", "compare", "comparison", "verify", "cross-check",
     "multiple sources", "official sources", "evidence", "investigate", "report",
@@ -105,7 +115,10 @@ def _urls(query: str) -> list[str]:
 
 def _classify(query: str, limit: int) -> tuple[str, str]:
     text = (query or "").lower()
-    browser_hits = [term for term in _BROWSER_TERMS if term in text]
+    # Keep intentional Czech stems; English words/phrases need token boundaries.
+    browser_hits = [term for term in _BROWSER_TERMS
+                    if (term in text if term in _BROWSER_STEMS
+                        else re.search(r"\b" + re.escape(term) + r"\b", text))]
     deep_hits = [term for term in _DEEP_TERMS if term in text]
     urls = _urls(query)
     if browser_hits:
@@ -253,7 +266,7 @@ def _external_cost(provider: str) -> float | None:
         elif part in ("perplexity-web", "perplexity"):
             total += _perplexity_cost(False)
             paid_seen = True
-        elif part.endswith("-keyless") or part in ("local-browser", "keyless-rescue"):
+        elif part.endswith("-keyless") or part in ("local-browser", "keyless-rescue", "none"):
             continue
         else:
             unknown_seen = True
@@ -300,12 +313,8 @@ async def _keyless_search(query: str, limit: int) -> tuple[dict[str, Any], str]:
     return data, _safe_provider(str(served) + "-keyless")
 
 async def _browser_navigate(url: str, task_id: str = "") -> tuple[bool, str]:
-    from tools.browser_tool import browser_navigate
-    raw = await asyncio.to_thread(browser_navigate, url, task_id or None)
-    text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
-    parsed = _parse(text)
-    failed = bool(parsed.get("error")) if text.lstrip().startswith("{") else not bool(text.strip())
-    return (not failed), text[:24000]
+    """Fail closed until a connector can enforce destination/redirect policy."""
+    return False, ""
 
 async def _search_with_fallback(
     query: str, limit: int, task_id: str = "", *, prefer_quality: bool = False
@@ -322,45 +331,38 @@ async def _search_with_fallback(
         fallback, fallback_provider = await _keyless_search(query, limit)
         if _is_ok(fallback) and _hits(fallback):
             return fallback, fallback_provider, True, fallback_provider
-        url = "https://duckduckgo.com/?q=" + quote_plus(query)
-        ok, snapshot = await _browser_navigate(url, task_id)
-        if ok:
-            return {
-                "success": True,
-                "data": {"web": [], "browser_snapshot": snapshot},
-            }, "local-browser", True, "local-browser"
         if fallback.get("error"):
             primary.setdefault("fallback_error", str(fallback.get("error"))[:500])
         return primary, provider, True, fallback_provider
 
+    attempted: list[str] = []
     if prefer_quality:
         cost = _perplexity_cost(False)
         reservation = _reserve_paid(cost, "perplexity-web", query)
         if reservation is not None:
             paid, paid_provider = await _perplexity_search(query, limit, fast=False)
+            attempted.append(paid_provider)
             if _is_ok(paid) and _hits(paid):
                 return paid, paid_provider, False, None
 
     free, free_provider = await _keyless_search(query, limit)
+    attempted.append(free_provider)
     if _is_ok(free) and _hits(free):
-        return free, free_provider, bool(prefer_quality), (free_provider if prefer_quality else None)
+        return free, _join_provider(*attempted), len(attempted) > 1, (
+            free_provider if len(attempted) > 1 else None)
 
     if not prefer_quality:
         cost = _perplexity_cost(True)
         reservation = _reserve_paid(cost, "perplexity-fast", query)
         if reservation is not None:
             paid, paid_provider = await _perplexity_search(query, limit, fast=True)
+            attempted.append(paid_provider)
             if _is_ok(paid) and _hits(paid):
-                return paid, paid_provider, True, paid_provider
+                return paid, _join_provider(*attempted), True, paid_provider
 
-    url = "https://duckduckgo.com/?q=" + quote_plus(query)
-    ok, snapshot = await _browser_navigate(url, task_id)
-    if ok:
-        return {
-            "success": True,
-            "data": {"web": [], "browser_snapshot": snapshot},
-        }, "local-browser", True, "local-browser"
-    return free, free_provider, True, "local-browser"
+    # A denied reservation is not an attempted request; a failed one still is.
+    return free, _join_provider(*attempted), len(attempted) > 1, (
+        attempted[-1] if len(attempted) > 1 else None)
 
 def _unique_urls(query: str, data: dict[str, Any], maximum: int = 3) -> list[str]:
     values = _urls(query)
@@ -372,30 +374,12 @@ def _unique_urls(query: str, data: dict[str, Any], maximum: int = 3) -> list[str
     return [u for u in values if not (u in seen or seen.add(u))][:maximum]
 
 async def _extract(urls: list[str]) -> tuple[list[dict[str, Any]], str, bool]:
-    if not urls:
-        return [], "", False
-    if _perplexity_available():
-        from plugins.web.keyless_mcp import extract_with_failover
-        fallback = await asyncio.to_thread(extract_with_failover, "parallel", urls)
-        useful = [r for r in fallback if isinstance(r, dict) and r.get("content") and not r.get("error")]
-        return fallback, "parallel-keyless", bool(useful)
-
-    from tools.web_tools import web_extract_tool
-    raw = await web_extract_tool(urls, "markdown", char_limit=6000)
-    parsed = _parse(raw)
-    rows = parsed.get("results") if isinstance(parsed.get("results"), list) else []
-    useful = [r for r in rows if isinstance(r, dict) and r.get("content") and not r.get("error")]
-    rescued = any(
-        isinstance(r, dict) and isinstance(r.get("metadata"), dict)
-        and r["metadata"].get("rescued_from")
-        for r in rows
-    )
-    if useful:
-        return rows, ("keyless-rescue" if rescued else _requested_provider()), rescued
-    from plugins.web.keyless_mcp import extract_with_failover
-    fallback = await asyncio.to_thread(extract_with_failover, "parallel", urls)
-    useful = [r for r in fallback if isinstance(r, dict) and r.get("content") and not r.get("error")]
-    return fallback, "parallel-keyless", bool(useful)
+    # Even public-looking URLs can redirect or rebind to a private destination.
+    # Preserve search results, but do not invoke an unguarded extraction sink.
+    return [
+        {"url": url, "error": _URL_ROUTE_ERROR, "error_code": _URL_ROUTE_ERROR_CODE}
+        for url in urls
+    ], "", False
 
 def _decorate(
     data: dict[str, Any], mode: str, reason: str, provider: str,
@@ -461,27 +445,11 @@ async def _handle(
     extract_count = 0
     try:
         if mode == BROWSER:
-            urls = _urls(query)
-            search_data: dict[str, Any] | None = None
-            if urls:
-                target = urls[0]
-            else:
-                search_data, search_provider, sf, sfp = await _search_with_fallback(
-                    query, max(limit, 5), task_id
-                )
-                provider, fallback_used, fallback_provider = search_provider, sf, sfp
-                found = _unique_urls(query, search_data, 1)
-                target = found[0] if found else "https://duckduckgo.com/?q=" + quote_plus(query)
-            ok, snapshot = await _browser_navigate(target, task_id)
-            provider = _join_provider(provider if not urls else "", "local-browser")
-            result = {
-                "success": ok,
-                "data": {"web": _hits(search_data or {}), "browser_snapshot": snapshot, "url": target},
-            }
-            if not ok:
-                result["error"] = "browser navigation failed"
+            provider = "none"
             result = _decorate(
-                result, mode, reason, provider, fallback_used, fallback_provider
+                {"success": False, "error": _URL_ROUTE_ERROR,
+                 "error_code": _URL_ROUTE_ERROR_CODE},
+                mode, reason, provider, False, None,
             )
         elif mode == DEEP:
             result, provider, fallback_used, fallback_provider = await _search_with_fallback(
@@ -521,7 +489,7 @@ async def _handle(
             fallback_provider=fallback_provider, fallback_used=fallback_used, started=started,
             success=success, result_count=result_count, extract_count=extract_count,
             tool_call_id=tool_call_id, session_id=session_id, task_id=task_id,
-            error_type=None if success else "route_failed",
+            error_type=None if success else result.get("error_code", "route_failed"),
         )
         return json.dumps(result, ensure_ascii=False)
     except Exception as exc:
@@ -544,9 +512,9 @@ def _status_text() -> str:
     return "\n".join([
         f"Search router [{_profile()}]",
         f"requested provider: {_requested_provider()}",
-        "routes: fast -> free ring; deep -> quality-gated Perplexity + full-page extract; browser -> local browser",
+        "routes: fast/deep -> search providers; URL navigation/extraction -> disabled (no trusted transport policy)",
         f"perplexity: {'enabled as escalation' if _perplexity_available() else 'disabled (no API key)'}; daily cap=USD {_perplexity_daily_cap():.2f}",
-        "fallback: free keyless ring -> paid fast escalation (when enabled) -> local browser",
+        "fallback: free keyless ring -> paid fast escalation (when enabled); no browser fallback",
         "telemetry: query text is not stored; only hash + length",
     ])
 
@@ -603,8 +571,9 @@ def register(ctx) -> None:
         "name": "web_search",
         "description": (
             "Search through the local Search Router. It automatically uses fast search for "
-            "ordinary lookups, search+extract for deep multi-source research, and the local "
-            "browser for dynamic/interactive pages. Query text is not persisted in telemetry."
+            "ordinary lookups and search results for deep multi-source research. "
+            "URL navigation and page extraction are disabled until their connectors enforce "
+            "destination and redirect policy. Query text is not persisted in telemetry."
         ),
         "parameters": {
             "type": "object",

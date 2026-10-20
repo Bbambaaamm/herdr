@@ -27,6 +27,7 @@ PAYLOAD_PATHS = (
     "requirements-mcp.txt",
     "docs/architecture/MCP_GATEWAY.md",
     "docs/architecture/EXTERNAL_KNOWLEDGE.md",
+    "docs/architecture/GITHUB_INTAKE_ADMISSION.md",
     "agent-stack",
     "agent_platform_dashboard/__init__.py",
     "agent_platform_dashboard/production_auth.py",
@@ -302,6 +303,32 @@ def _bounded_tar_info(limits: ArchiveLimits):
                 return super()._proc_member(archive)
             finally:
                 archive._bounded_header_depth = depth - 1
+        def _proc_pax(self, archive):
+            # Reject sparse extensions before stdlib reads a sparse map from a
+            # subsequent file body. A post-parse member.sparse check is too late.
+            if self.type == tarfile.XGLTYPE:
+                total = getattr(archive, "_bounded_global_metadata", 0) + self.size
+                _need(total <= limits.max_metadata_bytes, "archive_global_metadata_limit")
+                archive._bounded_global_metadata = total
+            position = archive.fileobj.tell()
+            raw = archive.fileobj.read(self._block(self.size))
+            _need(len(raw) == self._block(self.size), "truncated_archive_metadata")
+            payload = raw[:self.size]
+            offset = 0
+            while offset < len(payload):
+                space = payload.find(b" ", offset)
+                digits = payload[offset:space] if space >= 0 else b""
+                _need(1 <= len(digits) <= 10 and digits.isdigit(), "invalid_archive_metadata")
+                length = int(digits)
+                end = offset + length
+                _need(length >= 5 and space + 1 < end <= len(payload)
+                      and payload[end - 1:end] == b"\n", "invalid_archive_metadata")
+                key, equals, _ = payload[space + 1:end - 1].partition(b"=")
+                _need(bool(key) and equals == b"=", "invalid_archive_metadata")
+                _need(not key.startswith(b"GNU.sparse."), "unsupported_archive_member")
+                offset = end
+            archive.fileobj.seek(position)
+            return super()._proc_pax(archive)
     return BoundedTarInfo
 
 
@@ -330,12 +357,40 @@ def _extraction_destination(destination: Path):
         raise
 
 
+def _uncached_members(archive: tarfile.TarFile, limits: ArchiveLimits):
+    if not isinstance(archive, tarfile.TarFile):
+        yield from archive
+        return
+    # safe_extract also accepts a caller-owned TarFile that was already partly
+    # read. Preserve that bounded prefix; external releases start with one item.
+    _need(len(archive.members) <= limits.max_members, "archive_member_limit")
+    prefix = tuple(archive.members)
+    archive.members.clear()
+    if archive.firstmember is not None:
+        first = archive.next()
+        if not prefix:
+            prefix = (first,)
+        else:
+            _need(first is prefix[0], "invalid_archive_member_cache")
+    yield from prefix
+    if archive._loaded:
+        return
+    while True:
+        member = archive.next()
+        # TarFile.__iter__ retains every TarInfo (and its global PAX dict copy).
+        # Links are disallowed, so later lookup never needs this cache.
+        archive.members.clear()
+        if member is None:
+            return
+        yield member
+
+
 def _extract_members(archive: tarfile.TarFile, destination: Path,
                      limits: ArchiveLimits, created: list[tuple[Path, bool]]) -> None:
     count = total = 0
     seen: set[str] = set()
-    # Iteration is bounded; getmembers() would materialize the entire archive.
-    for member in archive:
+    # Do not retain every TarInfo/global metadata dictionary while iterating.
+    for member in _uncached_members(archive, limits):
         count += 1
         _need(count <= limits.max_members, "archive_member_limit")
         path = _safe_name(member.name)
