@@ -36,6 +36,7 @@ SAFE_REPO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}$")
 APPROVAL_MARKER = "HERDR-ADMISSION-V1\n"
 MAX_APPROVAL_AGE = 86400
 MAX_COMMENTS = 1000
+MAX_CONSUMERS = 64
 SCAN_SECONDS = 24.0
 GH_TIMEOUT_SECONDS = 5.0
 _SCAN_DEADLINE = None
@@ -151,6 +152,8 @@ def load_consumers() -> list[dict]:
             if not str(entry.get(field) or "").strip():
                 raise RuntimeError(f"missing {field} for enabled consumer {consumer}")
         enabled.append(entry)
+        if len(enabled) > MAX_CONSUMERS:
+            raise RuntimeError("enabled consumer registry limit exceeded")
     return enabled
 
 
@@ -424,10 +427,12 @@ def _scan_cursor(consumers):
     if (not isinstance(value, dict) or set(value) != {"version", "next_repository", "after_issue"}
             or value["version"] != 1 or not isinstance(value["next_repository"], str)
             or not SAFE_REPO.fullmatch(value["next_repository"])
-            or not isinstance(value["after_issue"], dict) or len(value["after_issue"]) > 64
+            or not isinstance(value["after_issue"], dict)
             or any(not SAFE_REPO.fullmatch(k) or type(v) is not int or v <= 0
                    for k, v in value["after_issue"].items())):
         raise AdmissionDenied("intake-cursor-invalid")
+    selected = {c["repository"] for c in consumers}
+    value["after_issue"] = {repo: issue for repo, issue in value["after_issue"].items() if repo in selected}
     return path, value
 
 def _scan_issue(consumer, issue, indexed, previous):
@@ -478,6 +483,8 @@ def _scan_intake_locked(consumers):
     previous_deadline, previous_user = _SCAN_DEADLINE, _SCAN_USER
     _SCAN_DEADLINE, _SCAN_USER = time.monotonic() + SCAN_SECONDS, None
     try:
+        if len(consumers) > MAX_CONSUMERS:
+            raise AdmissionDenied("intake-consumer-limit")
         previous = load_state()  # No history may be silently dropped before auth/work.
         previous, retired = _retire_unselected_consumers(previous, {c['repository'] for c in consumers})
         if retired:
@@ -935,7 +942,7 @@ def _queue_issue_locked(consumer: dict, issue: dict, records: list[dict]) -> str
     path = PENDING / f"{task_id}.json"
     scan_remaining()
     _consume_admission(consumer, issue, task_id, admission)
-    scan_remaining()
+    # Once consumed, finish local durability; the scan deadline bounds admission/network work.
     publish_task(path, task, admission)
     _mark_admission_published(consumer, issue, task_id, admission)
     log(
