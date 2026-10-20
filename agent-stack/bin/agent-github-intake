@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
+import hashlib
 import json
+import subprocess
 import os
 import re
 import sys
 import time
-import urllib.error
-import urllib.request
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HOME = Path("/home/agentops")
@@ -27,6 +27,16 @@ LEGACY_REPO = "Bbambaaamm/Autonomous-Quant-Lab"
 ACTIVE_DIRS = ("pending", "running", "blocked")
 TERMINAL_DIRS = ("done", "failed")
 COOLDOWN_SECONDS = 300
+SAFE_REPO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}$")
+APPROVAL_MARKER = "HERDR-ADMISSION-V1\n"
+MAX_APPROVAL_AGE = 86400
+MAX_COMMENTS = 1000
+
+
+class AdmissionDenied(RuntimeError):
+    """Redacted denial; issue content never supplies execution authority."""
+
+
 SAFE_CONSUMER = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 
 
@@ -55,10 +65,10 @@ def load_state() -> dict:
         return {}
     try:
         raw = json.loads(STATE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    except Exception as exc:
+        raise AdmissionDenied("intake-state-unavailable") from exc
     if not isinstance(raw, dict):
-        return {}
+        raise AdmissionDenied("intake-state-invalid")
 
     normalized: dict[str, dict] = {}
     for key, value in raw.items():
@@ -98,7 +108,7 @@ def load_consumers() -> list[dict]:
         mode = str(entry.get("mode") or "")
         if not SAFE_CONSUMER.fullmatch(consumer):
             raise RuntimeError(f"invalid consumer id: {consumer!r}")
-        if repo.count("/") != 1:
+        if not SAFE_REPO.fullmatch(repo):
             raise RuntimeError(f"invalid repository for {consumer}")
         if repo in seen_repos:
             raise RuntimeError(f"duplicate repository in intake registry: {repo}")
@@ -111,6 +121,8 @@ def load_consumers() -> list[dict]:
                 raise RuntimeError(f"invalid root issue for {consumer}")
         if entry.get("enabled") is not True:
             continue
+        if entry.get("admission") != {"signal": "maintainer-comment-v1", "max_age_seconds": MAX_APPROVAL_AGE}:
+            raise RuntimeError(f"trusted admission policy required for {consumer}")
         for field in (
             "coordinator_agent",
             "workspace",
@@ -125,22 +137,159 @@ def load_consumers() -> list[dict]:
     return enabled
 
 
-def request_headers() -> dict[str, str]:
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "herdr-github-intake/3",
-    }
-    token = os.environ.get("GITHUB_TOKEN")
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-        headers["X-GitHub-Api-Version"] = "2022-11-28"
-    return headers
+def _json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise AdmissionDenied("duplicate-json-field")
+        result[key] = value
+    return result
 
 
 def fetch_json(url: str):
-    request = urllib.request.Request(url, headers=request_headers())
-    with urllib.request.urlopen(request, timeout=15) as response:
-        return json.load(response)
+    # Resolve through the installed gh guard. No direct HTTP/token fallback.
+    prefix = "https://api.github.com/"
+    if not isinstance(url, str) or not url.startswith(prefix) or any(c in url for c in "\r\n#"):
+        raise AdmissionDenied("github-endpoint-invalid")
+    endpoint = url[len(prefix):]
+    if not endpoint or endpoint.startswith("-"):
+        raise AdmissionDenied("github-endpoint-invalid")
+    result = subprocess.run(
+        ["gh", "api", "--hostname", "github.com", "--method", "GET", endpoint],
+        stdin=subprocess.DEVNULL, capture_output=True, timeout=20, check=False,
+    )
+    if result.returncode != 0 or not result.stdout or len(result.stdout) > 8388608:
+        raise AdmissionDenied("github-auth-or-response-unavailable")
+    try:
+        return json.loads(result.stdout, object_pairs_hook=_json_object)
+    except (ValueError, TypeError) as exc:
+        raise AdmissionDenied("github-response-invalid") from exc
+
+
+def _user(value):
+    if (not isinstance(value, dict) or type(value.get("id")) is not int or value["id"] <= 0
+            or value.get("type") != "User" or not isinstance(value.get("login"), str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", value["login"])):
+        raise AdmissionDenied("github-user-unverifiable")
+    return value["id"], value["login"]
+
+
+def authenticated_user():
+    return _user(fetch_json("https://api.github.com/user"))
+
+
+def _date(value):
+    try:
+        result = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if result.tzinfo is None:
+            raise ValueError("timezone missing")
+        return result.astimezone(timezone.utc)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise AdmissionDenied("github-time-unverifiable") from exc
+
+
+def issue_revision(repo, repository, issue):
+    if (not isinstance(repository, dict) or not isinstance(repository.get("full_name"), str)
+            or repository["full_name"].lower() != repo.lower()
+            or type(repository.get("id")) is not int or repository["id"] <= 0
+            or not isinstance(issue, dict) or type(issue.get("number")) is not int
+            or issue["number"] <= 0 or type(issue.get("id")) is not int or issue["id"] <= 0
+            or issue.get("state") != "open" or "pull_request" in issue
+            or not isinstance(issue.get("title"), str) or not 0 < len(issue["title"]) <= 256
+            or "body" not in issue or (issue["body"] is not None and not isinstance(issue["body"], str))
+            or len(issue["body"] or "") > 12000 or type(issue.get("comments")) is not int
+            or not 0 <= issue["comments"] <= MAX_COMMENTS):
+        raise AdmissionDenied("github-issue-incomplete-or-ineligible")
+    api = f"https://api.github.com/repos/{repo}"
+    number = issue["number"]
+    if (issue.get("repository_url") != api or issue.get("url") != f"{api}/issues/{number}"
+            or issue.get("html_url") != f"https://github.com/{repo}/issues/{number}"):
+        raise AdmissionDenied("github-issue-repository-mismatch")
+    if _date(issue.get("created_at")) > _date(issue.get("updated_at")):
+        raise AdmissionDenied("github-issue-revision-invalid")
+    content = {"version": 1, "repository": repo, "repository_id": repository["id"],
+               "issue_id": issue["id"], "number": number, "state": issue["state"],
+               "title": issue["title"], "body": issue["body"]}
+    digest = hashlib.sha256(json.dumps(content, sort_keys=True, ensure_ascii=False,
+                                       separators=(",", ":")).encode()).hexdigest()
+    return digest
+
+
+def approved_revision(consumer, issue):
+    if consumer.get("admission") != {"signal": "maintainer-comment-v1", "max_age_seconds": MAX_APPROVAL_AGE}:
+        raise AdmissionDenied("trusted-admission-policy-required")
+    authenticated_user()
+    repo = consumer["repository"]
+    number = issue.get("number")
+    if type(number) is not int or number <= 0 or (consumer["mode"] == "root_only" and number != consumer["root_issue"]):
+        raise AdmissionDenied("github-issue-selection-mismatch")
+    api = f"https://api.github.com/repos/{repo}"
+    repository = fetch_json(api)
+    current = fetch_json(f"{api}/issues/{number}")
+    digest = issue_revision(repo, repository, current)
+    if current["number"] != number:
+        raise AdmissionDenied("github-issue-selection-mismatch")
+    comments = []
+    for page in range(1, (current["comments"] + 99) // 100 + 1):
+        rows = fetch_json(f"{api}/issues/{number}/comments?per_page=100&page={page}")
+        expected = min(100, current["comments"] - len(comments))
+        if not isinstance(rows, list) or len(rows) != expected:
+            raise AdmissionDenied("github-comments-incomplete")
+        comments.extend(rows)
+    ids = set()
+    for comment in comments:
+        if (not isinstance(comment, dict) or type(comment.get("id")) is not int or comment["id"] <= 0
+                or comment["id"] in ids or not isinstance(comment.get("body"), str)
+                or comment.get("issue_url") != f"{api}/issues/{number}"):
+            raise AdmissionDenied("github-comment-incomplete")
+        ids.add(comment["id"])
+    for comment in sorted(comments, key=lambda row: row["id"], reverse=True):
+        if not comment["body"].startswith(APPROVAL_MARKER):
+            continue
+        user_id, login = _user(comment.get("user"))
+        permission = fetch_json(f"{api}/collaborators/{login}/permission")
+        if not isinstance(permission, dict) or _user(permission.get("user")) != (user_id, login):
+            raise AdmissionDenied("github-approver-unverifiable")
+        if (permission.get("role_name"), permission.get("permission")) not in {("admin", "admin"), ("maintain", "write")}:
+            continue
+        created = _date(comment.get("created_at"))
+        if created != _date(comment.get("updated_at")) or not _date(current["updated_at"]) <= created <= now():
+            raise AdmissionDenied("github-approval-stale-or-edited")
+        try:
+            approval = json.loads(comment["body"][len(APPROVAL_MARKER):], object_pairs_hook=_json_object)
+        except (ValueError, TypeError) as exc:
+            raise AdmissionDenied("github-approval-invalid") from exc
+        if (not isinstance(approval, dict) or set(approval) != {"action", "repository", "issue_number", "issue_id", "content_sha256", "expires_at"}
+                or approval.get("action") != "approve" or approval.get("repository") != repo
+                or type(approval.get("issue_number")) is not int or approval["issue_number"] != number
+                or type(approval.get("issue_id")) is not int or approval["issue_id"] != current["id"]
+                or approval.get("content_sha256") != digest):
+            raise AdmissionDenied("github-approval-scope-mismatch")
+        expires = _date(approval["expires_at"])
+        if not now() < expires <= created + timedelta(seconds=MAX_APPROVAL_AGE):
+            raise AdmissionDenied("github-approval-expired-or-unbounded")
+        # A second complete read prevents pagination/permission checks from
+        # silently consuming an issue revision that changed during admission.
+        fresh = fetch_json(f"{api}/issues/{number}")
+        if (issue_revision(repo, repository, fresh) != digest or fresh["updated_at"] != current["updated_at"]
+                or fresh["comments"] != current["comments"]):
+            raise AdmissionDenied("github-issue-changed-during-admission")
+        return fresh, {"version": 1, "approval_id": comment["id"], "content_sha256": digest,
+                       "repository_id": repository["id"], "issue_id": fresh["id"],
+                       "approver_user_id": user_id, "approver_login": login,
+                       "approved_at": comment["created_at"], "expires_at": approval["expires_at"],
+                       "issue_updated_at": fresh["updated_at"]}
+    raise AdmissionDenied("github-maintainer-approval-missing")
+
+
+def used_approvals(value):
+    history = value.get("used_approvals", {})
+    if (not isinstance(history, dict) or len(history) > 1024
+            or any(not isinstance(key, str) or not key.isdigit() or not isinstance(item, str)
+                   or not re.fullmatch(r"github-[a-z0-9-]+-issue-[0-9]+-approval-[0-9]+", item)
+                   for key, item in history.items())):
+        raise AdmissionDenied("intake-approval-history-invalid")
+    return dict(history)
 
 
 def fetch_issues(consumer: dict) -> list[dict]:
@@ -360,12 +509,22 @@ Operating rules:
 
 
 def queue_issue(consumer: dict, issue: dict, records: list[dict]) -> str:
-    number = int(issue["number"])
-    episode = now().strftime("%Y%m%dT%H%M%SZ")
-    task_id = f"github-{consumer['consumer']}-issue-{number}-{episode}"
+    issue, admission = approved_revision(consumer, issue)
+    number = issue["number"]
+    task_id = f"github-{consumer['consumer']}-issue-{number}-approval-{admission['approval_id']}"
+    previous = load_state().get(state_key(consumer["repository"], number), {})
+    history = used_approvals(previous)
+    if str(admission["approval_id"]) in history:
+        return history[str(admission["approval_id"])]
+    if any((record["task"].get("github_admission") or {}).get("approval_id") == admission["approval_id"]
+           for record in records):
+        return task_id
+    if len(history) >= 1024:
+        raise AdmissionDenied("intake-approval-history-full")
     prior = prior_evidence(records)
     task = {
         "id": task_id,
+        "github_admission": admission,
         "kind": (
             "github_root_orchestration"
             if consumer.get("mode") == "root_only"
@@ -397,8 +556,17 @@ def queue_issue(consumer: dict, issue: dict, records: list[dict]) -> str:
         for field in scope_fields:
             task[field] = consumer[field]
     path = PENDING / f"{task_id}.json"
-    path.write_text(json.dumps(task, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.chmod(path, 0o600)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        retained = json.loads(path.read_text(encoding="utf-8"))
+        if retained.get("id") != task_id or retained.get("github_admission") != admission:
+            raise AdmissionDenied("intake-admission-collision")
+        return task_id
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(task, ensure_ascii=False, indent=2) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
     log(
         f"queued {consumer['repository']}#{number} as {task_id} "
         f"priority={task['priority']} coordinator={task['agent']}"
@@ -432,11 +600,36 @@ def intervention_blocker(
 
 
 def main() -> int:
+    if sys.argv[1:2] == ["--approval-digest"]:
+        if len(sys.argv) != 4 or not sys.argv[3].isdigit() or int(sys.argv[3]) <= 0:
+            raise AdmissionDenied("approval-digest-arguments-invalid")
+        repo, number = sys.argv[2], int(sys.argv[3])
+        consumers = load_consumers()
+        selected = [row for row in consumers if row["repository"] == repo
+                    and (row["mode"] != "root_only" or row["root_issue"] == number)]
+        if len(selected) != 1:
+            raise AdmissionDenied("approval-digest-consumer-mismatch")
+        authenticated_user()
+        api = f"https://api.github.com/repos/{repo}"
+        repository = fetch_json(api)
+        issue = fetch_json(f"{api}/issues/{number}")
+        digest = issue_revision(repo, repository, issue)
+        if issue["number"] != number:
+            raise AdmissionDenied("github-issue-selection-mismatch")
+        proposed = {"action": "approve", "repository": repo, "issue_number": number,
+                    "issue_id": issue["id"], "content_sha256": digest,
+                    "expires_at": (now() + timedelta(minutes=30)).isoformat()}
+        print(json.dumps({"read_only": True, "task_created": False,
+                          "approval_body": APPROVAL_MARKER + json.dumps(proposed, sort_keys=True)}))
+        return 0
+    if sys.argv[1:] not in ([], ["--force"]):
+        raise AdmissionDenied("intake-arguments-invalid")
     force = "--force" in sys.argv
     if not force and STAMP.exists() and time.time() - STAMP.stat().st_mtime < 300:
         return 0
 
     consumers = load_consumers()
+    authenticated_user()
     previous_state = load_state()
     indexed = task_index()
     new_state: dict[str, dict] = {}
@@ -459,6 +652,7 @@ def main() -> int:
                 "title": str(issue.get("title") or "")[:160],
                 "remote_updated_at": str(issue.get("updated_at") or ""),
                 "seen_at": now().isoformat(),
+                "used_approvals": used_approvals(previous_state.get(key, {})),
             }
 
             if active:
@@ -494,8 +688,17 @@ def main() -> int:
                 new_state[key] = current
                 continue
 
-            task_id = queue_issue(consumer, issue, records)
-            current["scheduler_state"] = "queued"
+            try:
+                task_id = queue_issue(consumer, issue, records)
+            except AdmissionDenied as exc:
+                current["scheduler_state"] = "unauthorized"
+                current["blocker"] = str(exc)
+                new_state[key] = current
+                continue
+            approval_id = task_id.rsplit("-approval-", 1)[1]
+            replayed = approval_id in current["used_approvals"]
+            current["used_approvals"][approval_id] = task_id
+            current["scheduler_state"] = "admission_replayed" if replayed else "queued"
             current["task_id"] = task_id
             new_state[key] = current
 
