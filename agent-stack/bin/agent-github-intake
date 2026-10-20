@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+import contextlib
 import ctypes
+import fcntl
 import hashlib
 import stat
 import tempfile
@@ -38,6 +40,7 @@ SCAN_SECONDS = 24.0
 GH_TIMEOUT_SECONDS = 5.0
 _SCAN_DEADLINE = None
 _SCAN_USER = None
+_INTAKE_LOCK_OWNER = None
 
 
 class AdmissionDenied(RuntimeError):
@@ -97,7 +100,8 @@ def load_state() -> dict:
         row = dict(value)
         if ("repo" in row and row["repo"] != repo) or ("issue" in row and str(row["issue"]) != str(number)):
             raise AdmissionDenied("intake-state-identity-invalid")
-        used_approvals(row)  # Validate every row, including closed/unselected ones.
+        history = used_approvals(row)  # Validate closed/unselected rows too.
+        _validate_admission_intent(row, history)
         row.setdefault("repo", repo)
         row.setdefault("issue", number)
         normalized[canonical] = row
@@ -147,8 +151,6 @@ def load_consumers() -> list[dict]:
             if not str(entry.get(field) or "").strip():
                 raise RuntimeError(f"missing {field} for enabled consumer {consumer}")
         enabled.append(entry)
-    if not enabled:
-        raise RuntimeError("no enabled GitHub intake consumers")
     return enabled
 
 
@@ -438,6 +440,11 @@ def _scan_issue(consumer, issue, indexed, previous):
                "title": str(issue.get("title") or "")[:160],
                "remote_updated_at": str(issue.get("updated_at") or ""),
                "seen_at": now().isoformat(), "used_approvals": used_approvals(previous)}
+    if 'admission_intent' in previous:
+        current['admission_intent'] = previous['admission_intent']
+    if _requires_admission_reconciliation(previous):
+        current.update(scheduler_state='blocked', blocker='intake-admission-reconciliation-required')
+        return key, current
     if active:
         current.update(scheduler_state="active", task_ids=[str(r["task"].get("id") or "") for r in active])
         return key, current
@@ -458,16 +465,25 @@ def _scan_issue(consumer, issue, indexed, previous):
         return key, current
     approval_id = task_id.rsplit("-approval-", 1)[1]
     replayed = approval_id in current["used_approvals"]
+    durable = load_state().get(key, {})
+    current["used_approvals"].update(used_approvals(durable))
+    if 'admission_intent' in durable:
+        current['admission_intent'] = durable['admission_intent']
     current["used_approvals"][approval_id] = task_id
     current.update(scheduler_state="admission_replayed" if replayed else "queued", task_id=task_id)
     return key, current
 
-def scan_intake(consumers):
+def _scan_intake_locked(consumers):
     global _SCAN_DEADLINE, _SCAN_USER
     previous_deadline, previous_user = _SCAN_DEADLINE, _SCAN_USER
     _SCAN_DEADLINE, _SCAN_USER = time.monotonic() + SCAN_SECONDS, None
     try:
         previous = load_state()  # No history may be silently dropped before auth/work.
+        previous, retired = _retire_unselected_consumers(previous, {c['repository'] for c in consumers})
+        if retired:
+            save_state(previous)
+        if not consumers:
+            return 0
         cursor_path, cursor = _scan_cursor(consumers)
         indexed = task_index()
         authenticated_user()
@@ -512,13 +528,143 @@ def scan_intake(consumers):
         except ScanExpired:
             complete = False
             log("intake scan deferred at bounded deadline")
-        save_state(new_state)
+        save_state(_merge_durable_admissions(new_state))
         if complete:
             STAMP.touch()
             os.chmod(STAMP, 0o600)
         return 0
     finally:
         _SCAN_DEADLINE, _SCAN_USER = previous_deadline, previous_user
+
+
+@contextlib.contextmanager
+def intake_lock():
+    global _INTAKE_LOCK_OWNER
+    owner = os.getpid()
+    if _INTAKE_LOCK_OWNER == owner:
+        yield
+        return
+    fd = os.open(STATE.with_suffix('.lock'), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            raise AdmissionDenied('intake-lock-invalid')
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise AdmissionDenied('intake-already-running') from exc
+        _INTAKE_LOCK_OWNER = owner
+        try:
+            yield
+        finally:
+            _INTAKE_LOCK_OWNER = None
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _validate_admission_intent(row, history):
+    intent = row.get('admission_intent')
+    if intent is None and 'admission_intent' not in row:
+        return
+    if (not isinstance(intent, dict) or set(intent) != {'version', 'approval_id', 'task_id', 'content_sha256', 'state'}
+            or type(intent['version']) is not int or intent['version'] != 1
+            or type(intent['approval_id']) is not int or intent['approval_id'] <= 0
+            or not isinstance(intent['task_id'], str)
+            or history.get(str(intent['approval_id'])) != intent['task_id']
+            or not intent['task_id'].endswith('-approval-' + str(intent['approval_id']))
+            or not isinstance(intent['content_sha256'], str) or not re.fullmatch('[0-9a-f]{64}', intent['content_sha256'])
+            or intent['state'] not in {'publication_pending', 'published'}):
+        raise AdmissionDenied('intake-admission-intent-invalid')
+
+
+def _requires_admission_reconciliation(row):
+    intent = row.get('admission_intent')
+    return isinstance(intent, dict) and intent['state'] == 'publication_pending'
+
+
+def _consume_admission(consumer, issue, task_id, admission):
+    if _INTAKE_LOCK_OWNER != os.getpid():
+        raise AdmissionDenied('intake-lock-required')
+    state = load_state()
+    key = state_key(consumer['repository'], issue['number'])
+    row = dict(state.get(key, {}))
+    if _requires_admission_reconciliation(row):
+        raise AdmissionDenied('intake-admission-reconciliation-required')
+    history = used_approvals(row)
+    approval_id = str(admission['approval_id'])
+    if approval_id in history or len(history) >= 1024:
+        raise AdmissionDenied('intake-admission-already-consumed')
+    history[approval_id] = task_id
+    row.update(repo=consumer['repository'], issue=issue['number'], consumer=consumer['consumer'],
+               open=True, seen_at=now().isoformat(), used_approvals=history,
+               task_id=task_id, scheduler_state='blocked', blocker='intake-admission-reconciliation-required',
+               admission_intent={'version': 1, 'approval_id': admission['approval_id'], 'task_id': task_id,
+                                 'content_sha256': admission['content_sha256'], 'state': 'publication_pending'})
+    state[key] = row
+    # Complete STATE file AND its directory must be durable before queue exposure.
+    save_state(state)
+
+
+def _mark_admission_published(consumer, issue, task_id, admission):
+    if _INTAKE_LOCK_OWNER != os.getpid():
+        raise AdmissionDenied('intake-lock-required')
+    state = load_state()
+    key = state_key(consumer['repository'], issue['number'])
+    row = dict(state[key])
+    intent = row['admission_intent']
+    if intent != {'version': 1, 'approval_id': admission['approval_id'], 'task_id': task_id,
+                  'content_sha256': admission['content_sha256'], 'state': 'publication_pending'}:
+        raise AdmissionDenied('intake-admission-intent-changed')
+    row['admission_intent'] = {**intent, 'state': 'published'}
+    row['scheduler_state'] = 'queued'
+    row.pop('blocker', None)
+    state[key] = row
+    save_state(state)
+
+
+def _retire_unselected_consumers(state, selected):
+    result = dict(state)
+    changed = False
+    for key, old in state.items():
+        if old['repo'] not in selected:
+            row = dict(old)
+            row.update(open=False, closed_or_missing=True, retired_consumer=True, scheduler_state='closed')
+            if 'task_id' in row:
+                row['previous_task_id'] = row.pop('task_id')
+            if 'task_ids' in row:
+                row['previous_task_ids'] = row.pop('task_ids')
+            result[key] = row
+            changed |= row != old
+    return result, changed
+
+
+def _merge_durable_admissions(state):
+    # queue_issue persists intents during this same locked scan. A final scan
+    # snapshot must not erase them with its earlier in-memory history copy.
+    for key, durable in load_state().items():
+        row = dict(state.get(key, durable))
+        history = used_approvals(row)
+        for approval, task_id in used_approvals(durable).items():
+            if approval in history and history[approval] != task_id:
+                raise AdmissionDenied('intake-admission-history-conflict')
+            history[approval] = task_id
+        row['used_approvals'] = history
+        if 'admission_intent' in durable:
+            row['admission_intent'] = durable['admission_intent']
+        state[key] = row
+    return state
+
+
+def queue_issue(consumer, issue, records):
+    with intake_lock():
+        return _queue_issue_locked(consumer, issue, records)
+
+
+def scan_intake(consumers):
+    with intake_lock():
+        return _scan_intake_locked(consumers)
+
 
 
 def fetch_issues(consumer: dict) -> list[dict]:
@@ -737,12 +883,14 @@ Operating rules:
     raise RuntimeError(f"enabled consumer has no safe prompt contract: {name}")
 
 
-def queue_issue(consumer: dict, issue: dict, records: list[dict]) -> str:
+def _queue_issue_locked(consumer: dict, issue: dict, records: list[dict]) -> str:
     issue, admission = approved_revision(consumer, issue)
     number = issue["number"]
     task_id = f"github-{consumer['consumer']}-issue-{number}-approval-{admission['approval_id']}"
     previous = load_state().get(state_key(consumer["repository"], number), {})
     history = used_approvals(previous)
+    if _requires_admission_reconciliation(previous):
+        raise AdmissionDenied("intake-admission-reconciliation-required")
     if str(admission["approval_id"]) in history:
         return history[str(admission["approval_id"])]
     if any((record["task"].get("github_admission") or {}).get("approval_id") == admission["approval_id"]
@@ -786,7 +934,10 @@ def queue_issue(consumer: dict, issue: dict, records: list[dict]) -> str:
             task[field] = consumer[field]
     path = PENDING / f"{task_id}.json"
     scan_remaining()
+    _consume_admission(consumer, issue, task_id, admission)
+    scan_remaining()
     publish_task(path, task, admission)
+    _mark_admission_published(consumer, issue, task_id, admission)
     log(
         f"queued {consumer['repository']}#{number} as {task_id} "
         f"priority={task['priority']} coordinator={task['agent']}"
