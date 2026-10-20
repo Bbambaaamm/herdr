@@ -393,6 +393,71 @@ class IntakeFollowupTests(_base.GitHubIntakeTests):
         self.assertEqual(len(row['used_approvals']), 1)
 
 
+    def test_rotating_65_retired_repositories_never_poison_next_scan_cursor(self):
+        consumer = self.herdr_consumer()
+        with patch.object(self.intake, 'authenticated_user'), patch.object(self.intake, 'task_index', return_value={}), patch.object(self.intake, 'fetch_issues', return_value=[{'number': 1}]), patch.object(self.intake, '_scan_issue', side_effect=lambda c, i, *_: (self.intake.state_key(c['repository'], i['number']), {'repo': c['repository'], 'issue': i['number'], 'open': True})):
+            for index in range(66):
+                current = dict(consumer, repository=f'rotation/repo-{index}')
+                self.assertEqual(self.intake.scan_intake([current]), 0)
+        cursor = json.loads(self.intake.STAMP.with_suffix('.cursor.json').read_bytes())
+        self.assertEqual(cursor['after_issue'], {'rotation/repo-65': 1})
+        self.assertEqual(cursor['next_repository'], 'rotation/repo-65')
+        self.assertEqual(list(self.intake.PENDING.glob('*.json')), [])
+
+    def test_legacy_oversized_cursor_prunes_valid_retired_entries_before_persist(self):
+        consumer = self.herdr_consumer()
+        path = self.intake.STAMP.with_suffix('.cursor.json')
+        after = {f'retired/repo-{i}': i + 1 for i in range(65)}
+        after[consumer['repository']] = 53
+        path.write_text(json.dumps({'version': 1, 'next_repository': 'retired/repo-0', 'after_issue': after}))
+        with patch.object(self.intake, 'authenticated_user'), patch.object(self.intake, 'task_index', return_value={}), patch.object(self.intake, 'fetch_issues', return_value=[]):
+            self.assertEqual(self.intake.scan_intake([consumer]), 0)
+        cursor = json.loads(path.read_bytes())
+        self.assertEqual(cursor['after_issue'], {consumer['repository']: 53})
+        self.assertEqual(cursor['next_repository'], consumer['repository'])
+
+    def test_consumer_limit_matches_cursor_bound_before_authentication_or_state_effects(self):
+        consumers = [dict(self.herdr_consumer(), consumer=f'consumer-{i}', repository=f'active/repo-{i}') for i in range(65)]
+        self.write_config(consumers[:64])
+        self.assertEqual(len(self.intake.load_consumers()), 64)
+        with patch.object(self.intake, 'authenticated_user'), patch.object(self.intake, 'task_index', return_value={}), patch.object(self.intake, 'fetch_issues', return_value=[]):
+            self.assertEqual(self.intake.scan_intake(self.intake.load_consumers()), 0)
+        cursor_path = self.intake.STAMP.with_suffix('.cursor.json')
+        before = (self.intake.STATE.read_bytes(), cursor_path.read_bytes())
+        self.write_config(consumers)
+        with self.assertRaisesRegex(RuntimeError, 'consumer.*limit'):
+            self.intake.load_consumers()
+        with patch.object(self.intake, 'authenticated_user', side_effect=AssertionError('no over-limit authentication')), patch.object(self.intake, 'load_state', side_effect=AssertionError('no over-limit state access')):
+            with self.assertRaisesRegex(self.intake.AdmissionDenied, 'consumer-limit'):
+                self.intake.scan_intake(consumers)
+        self.assertEqual((self.intake.STATE.read_bytes(), cursor_path.read_bytes()), before)
+        self.assertEqual(list(self.intake.PENDING.glob('*.json')), [])
+
+    def test_deadline_crossed_by_durable_consume_finishes_local_publication_exactly_once(self):
+        consumer = self.herdr_consumer()
+        clock = [1.0]
+        self.intake._SCAN_DEADLINE = 10.0
+        consume = self.intake._consume_admission
+        api_after_consume = []
+        def slow_consume(*args):
+            consume(*args)
+            api_after_consume.append(len(self.api_calls))
+            clock[0] = 11.0
+        with patch.object(self.intake.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(self.intake, '_consume_admission', side_effect=slow_consume) as consumed:
+            task_id = self.intake.queue_issue(consumer, {'number': 53}, [])
+            self.assertEqual(len(self.api_calls), api_after_consume[0])
+            path = self.intake.PENDING / (task_id + '.json')
+            before = (path.stat().st_ino, path.read_bytes())
+            row = self.intake.load_state()['Bbambaaamm/herdr#53']
+            self.assertEqual(row['admission_intent']['state'], 'published')
+            self.assertEqual(row['used_approvals']['42'], task_id)
+            self.intake._SCAN_DEADLINE = 20.0
+            self.assertEqual(self.intake.queue_issue(consumer, {'number': 53}, []), task_id)
+            self.assertEqual(consumed.call_count, 1)
+            self.assertEqual((path.stat().st_ino, path.read_bytes()), before)
+        self.assertEqual(len(list(self.intake.PENDING.glob('*.json'))), 1)
+
+
 def load_tests(loader, tests, pattern):
     return unittest.TestSuite(IntakeFollowupTests(name) for name in vars(IntakeFollowupTests) if name.startswith('test_'))
 
