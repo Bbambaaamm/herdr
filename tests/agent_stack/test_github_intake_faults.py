@@ -214,7 +214,7 @@ class IntakeFollowupTests(_base.GitHubIntakeTests):
 
     def test_partial_deadline_preserves_unvisited_history_and_rotates_issue(self):
         consumer = self.herdr_consumer();consumer['mode'] = 'all_open'
-        key = 'old/repository#99';retained = {'used_approvals': {'42': 'github-herdr-issue-99-approval-42'}, 'open': True}
+        key = 'Bbambaaamm/herdr#99';retained = {'used_approvals': {'42': 'github-herdr-issue-99-approval-42'}, 'open': True}
         self.intake.STATE.write_text(json.dumps({key: retained}))
         issues = [{'number': 53}, {'number': 54}];seen = [];clock = [1.0]
         def attempt(c, issue, *args):
@@ -255,6 +255,142 @@ class IntakeFollowupTests(_base.GitHubIntakeTests):
             value = [n.value for n in ast.walk(assignment) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
             self.assertIn(name, value)
         self.assertTrue((root / name).is_file())
+
+
+    def test_removed_consumer_closes_row_without_losing_approval_history(self):
+        retired = 'retired/repository#99'
+        history = {'42': 'github-retired-issue-99-approval-42'}
+        self.intake.STATE.write_text(json.dumps({retired: {'repo': 'retired/repository', 'issue': 99,
+            'open': True, 'used_approvals': history, 'task_id': 'old-retained-task'}}))
+        self._run_main_with_majak()
+        row = json.loads(self.intake.STATE.read_bytes())[retired]
+        self.assertFalse(row['open'])
+        self.assertEqual(row['scheduler_state'], 'closed')
+        self.assertEqual(row['used_approvals'], history)
+        self.assertEqual(row['previous_task_id'], 'old-retained-task')
+
+    def test_all_disabled_registry_is_close_only_without_authentication(self):
+        key = 'Bbambaaamm/herdr#53'
+        self.intake.STATE.write_text(json.dumps({key: {'open': True, 'used_approvals': {'42': 'github-herdr-issue-53-approval-42'}}}))
+        self.write_config([])
+        self.assertEqual(self.intake.load_consumers(), [])
+        with patch.object(self.intake, 'authenticated_user', side_effect=AssertionError('no authentication for close-only')):
+            self.assertEqual(self.intake.scan_intake([]), 0)
+        row = json.loads(self.intake.STATE.read_bytes())[key]
+        self.assertFalse(row['open'])
+        self.assertTrue(row['retired_consumer'])
+        self.assertEqual(row['used_approvals']['42'], 'github-herdr-issue-53-approval-42')
+
+    def test_postrename_sync_failure_dispatcher_move_and_cooldown_cannot_reissue(self):
+        consumer = self.herdr_consumer()
+        fsync = self.intake.os.fsync
+        def fail_pending_directory(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode) and os.fstat(fd).st_ino == self.intake.PENDING.stat().st_ino:
+                raise OSError('pending publication directory sync failed')
+            return fsync(fd)
+        with patch.object(self.intake.os, 'fsync', side_effect=fail_pending_directory), self.assertRaises(OSError):
+            self.intake.queue_issue(consumer, {'number': 53}, [])
+        pending = next(self.intake.PENDING.glob('*.json'))
+        done = self.intake.ROOT / 'done' / pending.name
+        pending.rename(done)  # Disposable dispatcher can claim immediately after rename.
+        old = time.time() - self.intake.COOLDOWN_SECONDS - 10
+        os.utime(done, (old, old))
+        done.unlink()  # Completed disposable materialization pruned; durable admission must suffice.
+        try:
+            self.intake.queue_issue(consumer, {'number': 53}, [])
+        except self.intake.AdmissionDenied:
+            pass
+        self.assertEqual(list(self.intake.PENDING.glob('*.json')), [])
+        row = self.intake.load_state()['Bbambaaamm/herdr#53']
+        self.assertEqual(row['used_approvals']['42'], 'github-herdr-issue-53-approval-42')
+        self.assertEqual(row['admission_intent']['state'], 'publication_pending')
+
+    def test_intent_is_durable_before_publish_and_prepublish_failure_requires_reconciliation(self):
+        consumer = self.herdr_consumer()
+        def stop_before_exposure(path, task, admission):
+            row = self.intake.load_state()['Bbambaaamm/herdr#53']
+            self.assertEqual(row['used_approvals']['42'], task['id'])
+            self.assertEqual(row['admission_intent']['state'], 'publication_pending')
+            raise OSError('publication not attempted')
+        with patch.object(self.intake, 'publish_task', side_effect=stop_before_exposure), self.assertRaises(OSError):
+            self.intake.queue_issue(consumer, {'number': 53}, [])
+        self.assertEqual(list(self.intake.PENDING.glob('*.json')), [])
+        for approval in (42, 43):
+            self.comment_rows[consumer['repository']][0]['id'] = approval
+            with self.assertRaisesRegex(self.intake.AdmissionDenied, 'reconciliation-required'):
+                self.intake.queue_issue(consumer, {'number': 53}, [])
+        self.assertEqual(list(self.intake.PENDING.glob('*.json')), [])
+
+    def test_state_directory_sync_failure_prevents_pending_exposure(self):
+        fsync = self.intake.os.fsync
+        parent_inode = self.intake.STATE.parent.stat().st_ino
+        def deny(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode) and os.fstat(fd).st_ino == parent_inode:
+                raise OSError('intent directory sync failure')
+            return fsync(fd)
+        with patch.object(self.intake.os, 'fsync', side_effect=deny), patch.object(self.intake, 'publish_task') as publish:
+            with self.assertRaises(OSError):self.intake.queue_issue(self.herdr_consumer(), {'number': 53}, [])
+        publish.assert_not_called()
+        self.assertEqual(list(self.intake.PENDING.glob('*.json')), [])
+
+    def test_final_scan_snapshot_preserves_newly_persisted_published_intent(self):
+        self.assertEqual(self._run_main_with_majak(), 0)
+        row = self.intake.load_state()['Bbambaaamm/dotacni-majak#662']
+        self.assertEqual(row['admission_intent']['state'], 'published')
+        self.assertEqual(row['used_approvals']['42'], row['admission_intent']['task_id'])
+
+    def test_pending_intent_survives_retirement_and_blocks_new_approval_when_reenabled(self):
+        consumer = self.herdr_consumer()
+        with patch.object(self.intake, 'publish_task', side_effect=OSError('before exposure')):
+            with self.assertRaises(OSError):self.intake.queue_issue(consumer, {'number': 53}, [])
+        self.intake.scan_intake([])
+        row = self.intake.load_state()['Bbambaaamm/herdr#53']
+        self.assertFalse(row['open'])
+        self.assertEqual(row['admission_intent']['state'], 'publication_pending')
+        self.comment_rows[consumer['repository']][0]['id'] = 43
+        with self.assertRaisesRegex(self.intake.AdmissionDenied, 'reconciliation-required'):
+            self.intake.queue_issue(consumer, {'number': 53}, [])
+
+    def test_all_intent_rows_are_validated_including_retired_consumers(self):
+        task_id = 'github-retired-issue-99-approval-42'
+        valid = {'version': 1, 'approval_id': 42, 'task_id': task_id, 'content_sha256': 'a'*64, 'state': 'publication_pending'}
+        for field, value in [('version', True), ('approval_id', 43), ('task_id', 'wrong'),
+                             ('content_sha256', 'wrong'), ('state', 'unknown')]:
+            with self.subTest(field=field):
+                intent = dict(valid);intent[field] = value
+                self.intake.STATE.write_text(json.dumps({'retired/repository#99': {'open': False,
+                    'used_approvals': {'42': task_id}, 'admission_intent': intent}}))
+                with self.assertRaises(self.intake.AdmissionDenied):self.intake.load_state()
+
+    @unittest.skipUnless(hasattr(os, 'fork'), 'actual cross-process intake flock')
+    def test_inherited_process_cannot_reuse_parent_lock_ownership(self):
+        consumer = self.herdr_consumer()
+        with self.intake.intake_lock():
+            pid = os.fork()
+            if pid == 0:
+                try:self.intake.queue_issue(consumer, {'number': 53}, [])
+                except self.intake.AdmissionDenied as exc:os._exit(0 if str(exc) == 'intake-already-running' else 2)
+                except Exception:os._exit(3)
+                os._exit(1)
+            self.assertEqual(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]), 0)
+        self.assertEqual(list(self.intake.PENDING.glob('*.json')), [])
+
+    @unittest.skipUnless(hasattr(os, 'fork'), 'actual concurrent admission producers')
+    def test_concurrent_producers_cannot_overwrite_consumed_admission(self):
+        children = []
+        for _ in range(2):
+            pid = os.fork()
+            if pid == 0:
+                try:self.intake.queue_issue(self.herdr_consumer(), {'number': 53}, [])
+                except self.intake.AdmissionDenied as exc:os._exit(0 if str(exc) == 'intake-already-running' else 2)
+                except Exception:os._exit(3)
+                os._exit(0)
+            children.append(pid)
+        for pid in children:self.assertEqual(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]), 0)
+        self.assertEqual(len(list(self.intake.PENDING.glob('*.json'))), 1)
+        row = self.intake.load_state()['Bbambaaamm/herdr#53']
+        self.assertEqual(row['admission_intent']['state'], 'published')
+        self.assertEqual(len(row['used_approvals']), 1)
 
 
 def load_tests(loader, tests, pattern):

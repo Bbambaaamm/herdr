@@ -26,13 +26,36 @@ _URL_ROUTE_ERROR = (
 _URL_ROUTE_ERROR_CODE = "unsafe_url_route_disabled"
 _URL_RE = re.compile(r"https?://[^\s<>()\[\]{}\"']+", re.I)
 
-_BROWSER_TERMS = (
-    "click", "login", "sign in", "form", "dashboard", "javascript", "js-heavy",
-    "interactive", "interact", "screenshot", "open page", "current page",
-    "klik", "přihl", "formulář", "dashboard", "interaktiv", "screenshot",
-    "otevři strán", "na stránce", "web app", "webová aplikace",
+# Classify actions, not subjects: a search about JavaScript/login/forms must
+# remain a search. Ambiguous queries do not justify the unavailable route.
+_BROWSER_ACTIONS = (
+    r"(?:click|press|select)\s+(?:(?:the|this|that|a|an)\s+)?(?:button|link|checkbox|tab|menu|element)\b",
+    r"(?:log\s*in|sign\s+in)\s+(?:to|on|at|into)\b",
+    r"(?:fill(?:\s+in|\s+out)?|submit)\s+(?:(?:the|this|that|a)\s+)?form\b",
+    r"(?:open|visit|navigate\s+to)\s+(?:(?:the|this|that|a)\s+(?:page|website|site|dashboard|web\s+app)\b|https?://|(?:page|website|site|dashboard|web\s+app)(?:\s*$|\s+https?://))",
+    r"(?:take|capture)\s+(?:(?:a|the)\s+)?screenshot\b",
+    r"(?:run|execute)\s+(?:javascript|js)\s+(?:on|in)\s+(?:(?:the|this|current)\s+)*(?:page|browser|website)\b",
+    r"(?:interact\s+with|use)\s+(?:(?:the|this|that|an?)\s+)?(?:web\s+app|current\s+page|interactive\s+(?:page|website|site))\b",
+    r"klik(?:ni|něte)\s+na\b",
+    r"(?:přihlas|přihlaste)\s+se\s+(?:k|do|na)\b",
+    r"(?:vyplň(?:te)?|odešli|odešlete)\s+(?:(?:ten|tento)\s+)?formulář\w*\b",
+    r"(?:otevři|otevřete)\s+(?:(?:tu|tuto|ten|tento)\s+)?(?:stránk\w*|web\b|dashboard\b|https?://)",
+    r"(?:použij(?:te)?|ovládej(?:te)?)\s+(?:(?:tu|tuto|ten|tento)\s+)?(?:interaktivní\s+(?:web|stránk\w*)|webovou\s+aplikaci)\b",
+    r"(?:pořiď(?:te)?|udělej(?:te)?)\s+(?:snímek\s+(?:stránky|obrazovky)|screenshot)\b",
 )
-_BROWSER_STEMS = frozenset({"klik", "přihl", "formulář", "interaktiv", "otevři strán"})
+
+
+def _browser_intent(text: str) -> bool:
+    command = re.sub(r"\s+", " ", text).strip()
+    command = re.sub(
+        r"^(?:(?:please|can you|could you|would you|prosím(?: tě| vás)?)\s*[,;:]?\s+)+",
+        "", command,
+    )
+    command = re.sub(
+        r"^(?:on (?:the |this |that )?current page|na (?:této|aktuální) stránce)\s*[,;:]?\s+",
+        "", command,
+    )
+    return any(re.match(pattern, command) for pattern in _BROWSER_ACTIONS)
 
 _DEEP_TERMS = (
     "research", "deep", "compare", "comparison", "verify", "cross-check",
@@ -115,14 +138,10 @@ def _urls(query: str) -> list[str]:
 
 def _classify(query: str, limit: int) -> tuple[str, str]:
     text = (query or "").lower()
-    # Keep intentional Czech stems; English words/phrases need token boundaries.
-    browser_hits = [term for term in _BROWSER_TERMS
-                    if (term in text if term in _BROWSER_STEMS
-                        else re.search(r"\b" + re.escape(term) + r"\b", text))]
     deep_hits = [term for term in _DEEP_TERMS if term in text]
     urls = _urls(query)
-    if browser_hits:
-        return BROWSER, "dynamic/interactive intent: " + ", ".join(browser_hits[:3])
+    if _browser_intent(text):
+        return BROWSER, "explicit browser interaction requested"
     if urls:
         return DEEP, "explicit URL requires page retrieval"
     if len(deep_hits) >= 1 or int(limit or 5) >= 8:

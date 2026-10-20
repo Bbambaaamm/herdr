@@ -269,7 +269,7 @@ def test_incidental_english_substrings_remain_search(router, url_sinks, monkeypa
     "klikni na tlačítko",
     "vyplň formuláře",
     "přihlas se k účtu",
-    "interaktivní web",
+    "použij interaktivní web",
     "otevři stránku",
 ])
 def test_explicit_browser_intent_and_czech_stems_stay_disabled(
@@ -320,4 +320,66 @@ def test_paid_attempt_telemetry_matrix(
     assert data["success"] is free_ok
     expected_cost = router._perplexity_cost(False) if reservation is not None else 0.0
     assert router._external_cost(actual_provider) == expected_cost
+    assert url_sinks == []
+
+
+@pytest.mark.parametrize("query", [
+    "What is JavaScript?",
+    "click chemistry Nobel Prize",
+    "login security best practices",
+    "form 10-K meaning",
+    "JavaScript tutorial",
+    "interactive web accessibility",
+    "dashboard design principles",
+    "screenshot software comparison",
+    "open page meaning",
+    "How do I click a button in JavaScript?",
+    "Co je JavaScript?",
+    "přihlášení bezpečnost doporučení",
+    "formuláře daňového přiznání",
+    "interaktivní web přístupnost",
+    "klik chemie Nobelova cena",
+    "'otevři stránku' překlad do angličtiny",
+])
+def test_browser_topics_remain_search(router, url_sinks, monkeypatch, query):
+    calls = []
+    async def search(value, limit, task_id="", **kwargs):
+        calls.append(value)
+        return {"success": True, "data": {"web": [{"url": URLS[0]}]}}, "test-search", False, None
+
+    monkeypatch.setattr(router, "_search_with_fallback", search)
+    result = json.loads(asyncio.run(router._handle({"query": query})))
+    assert result["success"] is True
+    assert result["data"]["_search_router"]["mode"] in (router.FAST, router.DEEP)
+    assert calls == [query]
+    assert url_sinks == []
+
+
+@pytest.mark.parametrize("query", [
+    "Please click the button",
+    "Can you sign in to my account?",
+    "fill out this form",
+    "submit the form",
+    "open the dashboard",
+    "take a screenshot of the current page",
+    "run JavaScript on the current page",
+    "interact with the web app",
+    "on the current page, click the link",
+    "Prosím klikni na tlačítko",
+    "přihlaste se do účtu",
+    "vyplňte tento formulář",
+    "otevřete tuto stránku",
+    "použij interaktivní web",
+    "pořiď snímek obrazovky",
+    "na aktuální stránce klikni na odkaz",
+])
+def test_explicit_browser_actions_stay_disabled(router, url_sinks, monkeypatch, query):
+    async def forbidden(*args, **kwargs):
+        pytest.fail("explicit interactive request must not reach a provider")
+
+    monkeypatch.setattr(router, "_search_with_fallback", forbidden)
+    result = json.loads(asyncio.run(router._handle({"query": query})))
+    assert result["success"] is False
+    assert result["error_code"] == "unsafe_url_route_disabled"
+    assert result["data"]["_search_router"]["provider"] == "none"
     assert url_sinks == []
