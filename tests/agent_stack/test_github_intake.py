@@ -1,6 +1,12 @@
 import importlib.machinery
 import importlib.util
+import copy
+import io
 import json
+import subprocess
+from contextlib import redirect_stdout
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 import sys
 import tempfile
 import time
@@ -31,6 +37,61 @@ class GitHubIntakeTests(unittest.TestCase):
         self.intake.STATE = root / "github-intake-state.json"
         self.intake.STAMP = root / "github-intake.stamp"
         self.intake.LOG = root / "github-intake.log"
+        self.clock = datetime(2026, 10, 20, 12, 0, tzinfo=timezone.utc)
+        self.intake.now = lambda: self.clock
+        self.api_calls = []
+        self.real_fetch_json = self.intake.fetch_json
+        self.repository_rows = {}
+        self.issue_rows = {}
+        self.comment_rows = {}
+        self.permission_role = ("maintain", "write")
+        self.authenticated = {"id": 900, "login": "intake-reader", "type": "User"}
+        for repo, number, title, body in [
+            ("Bbambaaamm/herdr", 53, "HERDR CONTROL: autonomous backlog drain", "Drain Herdr safely"),
+            ("Bbambaaamm/dotacni-majak", 662, "HERDR CONTROL", "Finish Majak"),
+            ("Bbambaaamm/Autonomous-Quant-Lab", 45, "Synthetic authorized issue", "Bounded work"),
+        ]:
+            api = f"https://api.github.com/repos/{repo}"
+            repository = {"id": number + 1000, "full_name": repo}
+            issue = {"id": number + 10000, "number": number, "state": "open", "title": title,
+                     "body": body, "repository_url": api, "url": f"{api}/issues/{number}",
+                     "html_url": f"https://github.com/{repo}/issues/{number}", "comments": 1,
+                     "created_at": (self.clock - timedelta(days=1)).isoformat(),
+                     "updated_at": (self.clock - timedelta(minutes=1)).isoformat()}
+            approval = {"action": "approve", "repository": repo, "issue_number": number,
+                        "issue_id": issue["id"], "content_sha256": self.intake.issue_revision(repo, repository, issue),
+                        "expires_at": (self.clock + timedelta(minutes=30)).isoformat()}
+            comment = {"id": 42, "body": self.intake.APPROVAL_MARKER + json.dumps(approval),
+                       "issue_url": issue["url"], "user": {"id": 500, "login": "maintainer", "type": "User"},
+                       "created_at": (self.clock - timedelta(seconds=30)).isoformat(),
+                       "updated_at": (self.clock - timedelta(seconds=30)).isoformat()}
+            self.repository_rows[repo] = repository
+            self.issue_rows[repo] = issue
+            self.comment_rows[repo] = [comment]
+        self.intake.fetch_json = self.fake_api
+
+    def fake_api(self, url):
+        self.api_calls.append(url)
+        if url == "https://api.github.com/user":
+            return copy.deepcopy(self.authenticated)
+        for repo, issue in self.issue_rows.items():
+            api = f"https://api.github.com/repos/{repo}"
+            number = {"Bbambaaamm/herdr": 53, "Bbambaaamm/dotacni-majak": 662,
+                      "Bbambaaamm/Autonomous-Quant-Lab": 45}[repo]
+            issue_url = f"{api}/issues/{number}"
+            if url == api:
+                return copy.deepcopy(self.repository_rows[repo])
+            if url == issue_url:
+                return copy.deepcopy(issue)
+            if url.startswith(issue_url + "/comments?per_page=100&page="):
+                page = int(url.rsplit("=", 1)[1])
+                return copy.deepcopy(self.comment_rows[repo][(page - 1) * 100:page * 100])
+            if url == api + "/collaborators/maintainer/permission":
+                role, permission = self.permission_role
+                return {"role_name": role, "permission": permission,
+                        "user": {"id": 500, "login": "maintainer", "type": "User"}}
+        raise AssertionError("unregistered synthetic API path: " + url)
+
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -49,6 +110,7 @@ class GitHubIntakeTests(unittest.TestCase):
         return {
             "consumer": "quantlab",
             "enabled": True,
+            "admission": {"signal": "maintainer-comment-v1", "max_age_seconds": 86400},
             "repository": "Bbambaaamm/Autonomous-Quant-Lab",
             "mode": "all_open",
             "coordinator_agent": "quantlab-hermes",
@@ -64,6 +126,7 @@ class GitHubIntakeTests(unittest.TestCase):
         return {
             "consumer": "majak",
             "enabled": True,
+            "admission": {"signal": "maintainer-comment-v1", "max_age_seconds": 86400},
             "repository": "Bbambaaamm/dotacni-majak",
             "mode": "root_only",
             "root_issue": 662,
@@ -80,6 +143,7 @@ class GitHubIntakeTests(unittest.TestCase):
         return {
             "consumer": "herdr",
             "enabled": True,
+            "admission": {"signal": "maintainer-comment-v1", "max_age_seconds": 86400},
             "repository": "Bbambaaamm/herdr",
             "mode": "root_only",
             "root_issue": 53,
@@ -454,6 +518,215 @@ class GitHubIntakeTests(unittest.TestCase):
                          ("verification-pending", "evidence_unavailable"))
 
 
+
+    def assert_no_authorized_queue(self, consumer=None):
+        consumer = consumer or self.herdr_consumer()
+        issue = self.issue_rows[consumer["repository"]]
+        with self.assertRaises(self.intake.AdmissionDenied):
+            self.intake.queue_issue(consumer, issue, [])
+        self.assertEqual(list(self.intake.PENDING.glob("*.json")), [])
+
+    def test_explicit_maintainer_approval_binds_the_complete_current_revision(self):
+        consumer = self.herdr_consumer()
+        task_id = self.intake.queue_issue(consumer, {"number": 53}, [])
+        task = json.loads((self.intake.PENDING / (task_id + ".json")).read_bytes())
+        self.assertEqual(task_id, "github-herdr-issue-53-approval-42")
+        self.assertEqual(task["github_admission"]["approver_user_id"], 500)
+        self.assertEqual(task["github_admission"]["content_sha256"], self.intake.issue_revision(
+            consumer["repository"], self.repository_rows[consumer["repository"]], self.issue_rows[consumer["repository"]]))
+        self.assertEqual(self.api_calls[0], "https://api.github.com/user")
+        self.assertEqual(sum(path == self.issue_rows[consumer["repository"]]["url"] for path in self.api_calls), 2)
+
+    def test_author_identity_and_forged_label_alone_are_never_admission(self):
+        issue = self.issue_rows["Bbambaaamm/herdr"]
+        issue["user"] = {"id": 500, "login": "maintainer", "type": "User"}
+        issue["labels"] = [{"name": "approved"}, {"name": "herdr-approved"}]
+        issue["comments"] = 0
+        self.comment_rows["Bbambaaamm/herdr"] = []
+        self.assert_no_authorized_queue()
+
+    def test_forged_author_association_and_write_permission_are_not_maintainer_control(self):
+        self.comment_rows["Bbambaaamm/herdr"][0]["author_association"] = "OWNER"
+        for role in [("write", "write"), ("triage", "read"), ("admin", "read"), ("unknown", "admin")]:
+            with self.subTest(role=role):
+                self.permission_role = role
+                self.assert_no_authorized_queue()
+
+    def test_issue_content_edit_after_approval_is_denied(self):
+        self.issue_rows["Bbambaaamm/herdr"]["body"] += "\nChanged after approval"
+        self.assert_no_authorized_queue()
+
+    def test_changed_revision_time_even_for_unchanged_content_is_denied(self):
+        self.issue_rows["Bbambaaamm/herdr"]["updated_at"] = self.clock.isoformat()
+        self.assert_no_authorized_queue()
+
+    def test_changed_during_permission_check_is_denied_before_queue(self):
+        original = self.intake.fetch_json
+        reads = 0
+        def changed(url):
+            nonlocal reads
+            value = original(url)
+            if url == self.issue_rows["Bbambaaamm/herdr"]["url"]:
+                reads += 1
+                if reads == 2:
+                    value["title"] += " changed"
+            return value
+        self.intake.fetch_json = changed
+        self.assert_no_authorized_queue()
+
+    def test_edited_or_expired_or_unbounded_approval_is_denied(self):
+        original = copy.deepcopy(self.comment_rows["Bbambaaamm/herdr"][0])
+        for variation in ("edited", "expired", "unbounded"):
+            with self.subTest(variation=variation):
+                comment = copy.deepcopy(original)
+                if variation == "edited":
+                    comment["updated_at"] = self.clock.isoformat()
+                else:
+                    body = json.loads(comment["body"][len(self.intake.APPROVAL_MARKER):])
+                    body["expires_at"] = (self.clock + timedelta(days=2) if variation == "unbounded"
+                                          else self.clock - timedelta(seconds=1)).isoformat()
+                    comment["body"] = self.intake.APPROVAL_MARKER + json.dumps(body)
+                self.comment_rows["Bbambaaamm/herdr"] = [comment]
+                self.assert_no_authorized_queue()
+
+    def test_latest_trusted_rejection_does_not_fall_back_to_old_approval(self):
+        revoke = copy.deepcopy(self.comment_rows["Bbambaaamm/herdr"][0]);revoke["id"] = 43
+        payload = json.loads(revoke["body"][len(self.intake.APPROVAL_MARKER):]);payload["action"] = "revoke"
+        revoke["body"] = self.intake.APPROVAL_MARKER + json.dumps(payload)
+        self.comment_rows["Bbambaaamm/herdr"].append(revoke)
+        self.issue_rows["Bbambaaamm/herdr"]["comments"] = 2
+        self.assert_no_authorized_queue()
+
+    def test_approval_wrong_repo_issue_id_number_or_digest_is_denied(self):
+        original = copy.deepcopy(self.comment_rows["Bbambaaamm/herdr"][0])
+        for field, value in [("repository", "attacker/other"), ("issue_number", 54), ("issue_id", 999),
+                             ("content_sha256", "0" * 64), ("action", "anything")]:
+            with self.subTest(field=field):
+                comment = copy.deepcopy(original);payload = json.loads(comment["body"][len(self.intake.APPROVAL_MARKER):])
+                payload[field] = value;comment["body"] = self.intake.APPROVAL_MARKER + json.dumps(payload)
+                self.comment_rows["Bbambaaamm/herdr"] = [comment]
+                self.assert_no_authorized_queue()
+
+    def test_replayed_admission_after_terminal_state_does_not_schedule_again(self):
+        self.assertEqual(self._run_main_with_majak(), 0)
+        pending = next(self.intake.PENDING.glob("*.json"))
+        done = self.intake.ROOT / "done" / pending.name;pending.rename(done)
+        old = time.time() - self.intake.COOLDOWN_SECONDS - 10
+        import os
+        os.utime(done, (old, old))
+        before = done.read_bytes()
+        self.assertEqual(self._run_main_with_majak(), 0)
+        self.assertEqual(list(self.intake.PENDING.glob("*.json")), [])
+        self.assertEqual(done.read_bytes(), before)
+        self.assertEqual(json.loads(self.intake.STATE.read_bytes())["Bbambaaamm/dotacni-majak#662"]["scheduler_state"], "admission_replayed")
+
+    def test_existing_state_keeps_consumed_approval_even_when_task_materialization_is_absent(self):
+        self.assertEqual(self._run_main_with_majak(), 0)
+        for path in self.intake.PENDING.glob("*.json"):
+            path.unlink()  # Only this disposable test's private queue.
+        self.assertEqual(self._run_main_with_majak(), 0)
+        self.assertEqual(list(self.intake.PENDING.glob("*.json")), [])
+
+    def test_same_approval_direct_replay_is_exclusive_and_unchanged(self):
+        consumer = self.herdr_consumer();issue = self.issue_rows[consumer["repository"]]
+        first = self.intake.queue_issue(consumer, issue, []);path = self.intake.PENDING / (first + ".json")
+        before = path.read_bytes();self.assertEqual(self.intake.queue_issue(consumer, issue, []), first)
+        self.assertEqual(path.read_bytes(), before);self.assertEqual(len(list(self.intake.PENDING.glob("*.json"))), 1)
+
+    def test_incomplete_issue_and_unknown_closed_state_are_denied(self):
+        original = copy.deepcopy(self.issue_rows["Bbambaaamm/herdr"])
+        for field in ("id", "number", "title", "body", "comments", "created_at", "updated_at", "url", "repository_url", "html_url"):
+            with self.subTest(field=field):
+                value = copy.deepcopy(original);value.pop(field);self.issue_rows["Bbambaaamm/herdr"] = value
+                self.assert_no_authorized_queue()
+        for state in ("closed", "unknown", None):
+            value = copy.deepcopy(original);value["state"] = state;self.issue_rows["Bbambaaamm/herdr"] = value
+            self.assert_no_authorized_queue()
+
+    def test_missing_authentication_or_incomplete_authenticated_user_fails_closed(self):
+        for value in ({}, {"id": 1}, {"id": True, "login": "user", "type": "User"}):
+            with self.subTest(value=value):
+                self.authenticated = value;self.assert_no_authorized_queue()
+
+    def test_incomplete_or_malformed_pagination_never_uses_partial_approval(self):
+        self.issue_rows["Bbambaaamm/herdr"]["comments"] = 101
+        self.assert_no_authorized_queue()
+        self.issue_rows["Bbambaaamm/herdr"]["comments"] = 1
+        self.comment_rows["Bbambaaamm/herdr"][0].pop("issue_url")
+        self.assert_no_authorized_queue()
+
+    def test_complete_pagination_can_find_trusted_approval_on_second_page(self):
+        approval = copy.deepcopy(self.comment_rows["Bbambaaamm/herdr"][0]);approval["id"] = 101
+        rows = []
+        for number in range(1, 101):
+            comment = copy.deepcopy(approval);comment["id"] = number;comment["body"] = "Ordinary untrusted discussion"
+            rows.append(comment)
+        self.comment_rows["Bbambaaamm/herdr"] = rows + [approval]
+        self.issue_rows["Bbambaaamm/herdr"]["comments"] = 101
+        self.intake.queue_issue(self.herdr_consumer(), {"number": 53}, [])
+        self.assertTrue(any(url.endswith("page=2") for url in self.api_calls))
+
+    def test_gh_guard_transport_has_no_anonymous_or_direct_http_fallback(self):
+        with patch.object(self.intake.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, b"", b"authentication unavailable")) as run:
+            self.intake.fetch_json = self.real_fetch_json
+            self.assert_no_authorized_queue()
+            self.assertEqual(run.call_args.args[0], ["gh", "api", "--hostname", "github.com", "--method", "GET", "user"])
+            self.assertIs(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        with patch.object(self.intake.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b'{"id":1,"id":2}', b"")):
+            with self.assertRaises(self.intake.AdmissionDenied):self.real_fetch_json("https://api.github.com/user")
+
+    def test_malformed_http_json_and_empty_eof_fail_closed(self):
+        for body in (b"", b"{", b"null", b"[]"):
+            with self.subTest(body=body),patch.object(self.intake.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, body, b"")):
+                self.intake.fetch_json = self.real_fetch_json
+                self.assert_no_authorized_queue()
+
+    def test_registry_missing_admission_policy_is_denied(self):
+        consumer = self.herdr_consumer();consumer.pop("admission")
+        self.write_config([consumer]);payload = json.loads(self.intake.CONFIG.read_bytes())
+        payload["consumers"][0].pop("admission", None);self.intake.CONFIG.write_text(json.dumps(payload))
+        with self.assertRaisesRegex(RuntimeError, "trusted admission policy"):
+            self.intake.load_consumers()
+
+    def test_corrupt_consumed_state_does_not_reset_admission_history(self):
+        self.intake.STATE.write_text("{broken")
+        self.assert_no_authorized_queue()
+
+
+
+    def test_readonly_digest_helper_never_creates_state_stamp_or_task(self):
+        self.write_config([self.herdr_consumer()])
+        original = list(self.intake.sys.argv)
+        output = io.StringIO()
+        try:
+            self.intake.sys.argv = ["agent-github-intake", "--approval-digest", "Bbambaaamm/herdr", "53"]
+            with redirect_stdout(output):
+                self.assertEqual(self.intake.main(), 0)
+        finally:
+            self.intake.sys.argv = original
+        report = json.loads(output.getvalue())
+        self.assertTrue(report["read_only"]);self.assertFalse(report["task_created"])
+        self.assertNotIn("Drain Herdr safely", output.getvalue())
+        payload = json.loads(report["approval_body"][len(self.intake.APPROVAL_MARKER):])
+        self.assertEqual(payload["content_sha256"], self.intake.issue_revision("Bbambaaamm/herdr", self.repository_rows["Bbambaaamm/herdr"], self.issue_rows["Bbambaaamm/herdr"]))
+        self.assertEqual(list(self.intake.PENDING.glob("*.json")), [])
+        self.assertFalse(self.intake.STATE.exists());self.assertFalse(self.intake.STAMP.exists())
+
+    def test_permission_identity_mismatch_cannot_use_maintainer_role(self):
+        original = self.intake.fetch_json
+        def mismatch(url):
+            value = original(url)
+            if url.endswith("/permission"):
+                value["user"]["id"] = 501
+            return value
+        self.intake.fetch_json = mismatch
+        self.assert_no_authorized_queue()
+
+    def test_duplicate_approval_fields_are_rejected(self):
+        comment = self.comment_rows["Bbambaaamm/herdr"][0]
+        payload = comment["body"][len(self.intake.APPROVAL_MARKER):]
+        comment["body"] = self.intake.APPROVAL_MARKER + payload[:-1] + ', "action": "approve"}'
+        self.assert_no_authorized_queue()
 
 if __name__ == "__main__":
     unittest.main()
