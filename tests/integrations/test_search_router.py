@@ -188,3 +188,136 @@ def test_public_search_fallback_still_works(router, url_sinks, monkeypatch):
     assert provider == fallback_provider == "keyless"
     assert used is True
     assert url_sinks == []
+
+
+@pytest.mark.parametrize("query", [
+    "information about weather",
+    "performance optimization",
+    "reformation history",
+])
+def test_form_substrings_remain_ordinary_search(router, url_sinks, monkeypatch, query):
+    calls = []
+    async def search(value, limit):
+        calls.append(value)
+        return {"success": True, "data": {"web": [{"url": URLS[0]}]}}, "test-search"
+
+    monkeypatch.setattr(router, "_primary_search", search)
+    result = json.loads(asyncio.run(router._handle({"query": query})))
+    assert result["success"] is True
+    assert result["data"]["_search_router"]["mode"] == router.FAST
+    assert calls == [query]
+    assert url_sinks == []
+
+
+def test_browser_denial_records_no_actual_provider_or_cost(router, url_sinks, monkeypatch):
+    recorded = []
+    monkeypatch.setattr(router, "_requested_provider", lambda: "perplexity")
+    monkeypatch.setattr(router, "_record", lambda **kwargs: recorded.append(kwargs))
+    result = json.loads(asyncio.run(router._handle({"query": "open page https://example.org"})))
+    assert result["success"] is False
+    assert result["error_code"] == "unsafe_url_route_disabled"
+    assert result["data"]["_search_router"]["provider"] == "none"
+    assert recorded[0]["requested"] == "perplexity"
+    assert recorded[0]["provider"] == "none"
+    assert router._external_cost(recorded[0]["provider"]) == 0.0
+    assert url_sinks == []
+
+
+def test_failed_paid_escalation_is_retained_in_telemetry(router, url_sinks, monkeypatch):
+    calls = []
+    async def free(query, limit):
+        return {"success": False, "error": "synthetic free failure"}, "parallel-keyless"
+
+    async def paid(query, limit, *, fast):
+        calls.append(fast)
+        return {"success": False, "error": "synthetic paid failure"}, "perplexity-fast"
+
+    monkeypatch.setattr(router, "_perplexity_available", lambda: True)
+    monkeypatch.setattr(router, "_keyless_search", free)
+    monkeypatch.setattr(router, "_reserve_paid", lambda *args: 1)
+    monkeypatch.setattr(router, "_perplexity_search", paid)
+    data, provider, used, fallback = asyncio.run(router._search_with_fallback("ordinary lookup", 3))
+    assert data["success"] is False
+    assert calls == [True]
+    assert used is True
+    assert fallback == "perplexity-fast"
+    assert provider == "parallel-keyless_perplexity-fast"
+    assert router._external_cost(provider) == router._perplexity_cost(True)
+    assert url_sinks == []
+
+
+@pytest.mark.parametrize("query", [
+    "misclick statistics",
+    "social interactions",
+    "loginless configuration",
+])
+def test_incidental_english_substrings_remain_search(router, url_sinks, monkeypatch, query):
+    async def search(value, limit):
+        return {"success": True, "data": {"web": [{"url": URLS[0]}]}}, "test-search"
+
+    monkeypatch.setattr(router, "_primary_search", search)
+    result = json.loads(asyncio.run(router._handle({"query": query})))
+    assert result["success"] is True
+    assert result["data"]["_search_router"]["mode"] == router.FAST
+    assert url_sinks == []
+
+
+@pytest.mark.parametrize("query", [
+    "click the button",
+    "sign in to account",
+    "fill form",
+    "klikni na tlačítko",
+    "vyplň formuláře",
+    "přihlas se k účtu",
+    "interaktivní web",
+    "otevři stránku",
+])
+def test_explicit_browser_intent_and_czech_stems_stay_disabled(
+    router, url_sinks, monkeypatch, query
+):
+    async def forbidden(*args, **kwargs):
+        pytest.fail("intentional browser request must not reach search")
+
+    monkeypatch.setattr(router, "_search_with_fallback", forbidden)
+    result = json.loads(asyncio.run(router._handle({"query": query})))
+    assert result["success"] is False
+    assert result["error_code"] == "unsafe_url_route_disabled"
+    assert result["data"]["_search_router"]["provider"] == "none"
+    assert url_sinks == []
+
+
+@pytest.mark.parametrize("quality,reservation,free_ok,providers,fallback", [
+    (True, 1, True, ["perplexity-web", "parallel-keyless"], "parallel-keyless"),
+    (True, 1, False, ["perplexity-web", "parallel-keyless"], "parallel-keyless"),
+    (True, None, True, ["parallel-keyless"], None),
+    (True, None, False, ["parallel-keyless"], None),
+    (False, None, False, ["parallel-keyless"], None),
+])
+def test_paid_attempt_telemetry_matrix(
+    router, url_sinks, monkeypatch, quality, reservation, free_ok, providers, fallback
+):
+    calls = []
+    async def free(query, limit):
+        calls.append("parallel-keyless")
+        return {"success": free_ok, "data": {"web": [{"url": URLS[0]}] if free_ok else []}}, "parallel-keyless"
+
+    async def paid(query, limit, *, fast):
+        provider = "perplexity-fast" if fast else "perplexity-web"
+        calls.append(provider)
+        return {"success": False, "error": "synthetic paid failure"}, provider
+
+    monkeypatch.setattr(router, "_perplexity_available", lambda: True)
+    monkeypatch.setattr(router, "_keyless_search", free)
+    monkeypatch.setattr(router, "_reserve_paid", lambda *args: reservation)
+    monkeypatch.setattr(router, "_perplexity_search", paid)
+    data, actual_provider, used, actual_fallback = asyncio.run(
+        router._search_with_fallback("ordinary lookup", 3, prefer_quality=quality)
+    )
+    assert calls == providers
+    assert actual_provider == "_".join(providers)
+    assert used is (len(providers) > 1)
+    assert actual_fallback == fallback
+    assert data["success"] is free_ok
+    expected_cost = router._perplexity_cost(False) if reservation is not None else 0.0
+    assert router._external_cost(actual_provider) == expected_cost
+    assert url_sinks == []

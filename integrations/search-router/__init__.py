@@ -32,6 +32,8 @@ _BROWSER_TERMS = (
     "klik", "přihl", "formulář", "dashboard", "interaktiv", "screenshot",
     "otevři strán", "na stránce", "web app", "webová aplikace",
 )
+_BROWSER_STEMS = frozenset({"klik", "přihl", "formulář", "interaktiv", "otevři strán"})
+
 _DEEP_TERMS = (
     "research", "deep", "compare", "comparison", "verify", "cross-check",
     "multiple sources", "official sources", "evidence", "investigate", "report",
@@ -113,7 +115,10 @@ def _urls(query: str) -> list[str]:
 
 def _classify(query: str, limit: int) -> tuple[str, str]:
     text = (query or "").lower()
-    browser_hits = [term for term in _BROWSER_TERMS if term in text]
+    # Keep intentional Czech stems; English words/phrases need token boundaries.
+    browser_hits = [term for term in _BROWSER_TERMS
+                    if (term in text if term in _BROWSER_STEMS
+                        else re.search(r"\b" + re.escape(term) + r"\b", text))]
     deep_hits = [term for term in _DEEP_TERMS if term in text]
     urls = _urls(query)
     if browser_hits:
@@ -261,7 +266,7 @@ def _external_cost(provider: str) -> float | None:
         elif part in ("perplexity-web", "perplexity"):
             total += _perplexity_cost(False)
             paid_seen = True
-        elif part.endswith("-keyless") or part in ("local-browser", "keyless-rescue"):
+        elif part.endswith("-keyless") or part in ("local-browser", "keyless-rescue", "none"):
             continue
         else:
             unknown_seen = True
@@ -330,27 +335,34 @@ async def _search_with_fallback(
             primary.setdefault("fallback_error", str(fallback.get("error"))[:500])
         return primary, provider, True, fallback_provider
 
+    attempted: list[str] = []
     if prefer_quality:
         cost = _perplexity_cost(False)
         reservation = _reserve_paid(cost, "perplexity-web", query)
         if reservation is not None:
             paid, paid_provider = await _perplexity_search(query, limit, fast=False)
+            attempted.append(paid_provider)
             if _is_ok(paid) and _hits(paid):
                 return paid, paid_provider, False, None
 
     free, free_provider = await _keyless_search(query, limit)
+    attempted.append(free_provider)
     if _is_ok(free) and _hits(free):
-        return free, free_provider, bool(prefer_quality), (free_provider if prefer_quality else None)
+        return free, _join_provider(*attempted), len(attempted) > 1, (
+            free_provider if len(attempted) > 1 else None)
 
     if not prefer_quality:
         cost = _perplexity_cost(True)
         reservation = _reserve_paid(cost, "perplexity-fast", query)
         if reservation is not None:
             paid, paid_provider = await _perplexity_search(query, limit, fast=True)
+            attempted.append(paid_provider)
             if _is_ok(paid) and _hits(paid):
-                return paid, paid_provider, True, paid_provider
+                return paid, _join_provider(*attempted), True, paid_provider
 
-    return free, free_provider, bool(prefer_quality), None
+    # A denied reservation is not an attempted request; a failed one still is.
+    return free, _join_provider(*attempted), len(attempted) > 1, (
+        attempted[-1] if len(attempted) > 1 else None)
 
 def _unique_urls(query: str, data: dict[str, Any], maximum: int = 3) -> list[str]:
     values = _urls(query)
@@ -433,6 +445,7 @@ async def _handle(
     extract_count = 0
     try:
         if mode == BROWSER:
+            provider = "none"
             result = _decorate(
                 {"success": False, "error": _URL_ROUTE_ERROR,
                  "error_code": _URL_ROUTE_ERROR_CODE},
