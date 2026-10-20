@@ -23,6 +23,7 @@ PAYLOAD_PATHS = (
     "requirements-mcp.txt",
     "docs/architecture/MCP_GATEWAY.md",
     "docs/architecture/EXTERNAL_KNOWLEDGE.md",
+    "docs/architecture/GITHUB_INTAKE_ADMISSION.md",
     "agent-stack",
     "agent_platform_dashboard/__init__.py",
     "agent_platform_dashboard/production_auth.py",

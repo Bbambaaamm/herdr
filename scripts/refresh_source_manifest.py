@@ -31,6 +31,7 @@ FILES = (
     Path("requirements-mcp.txt"),
     Path("docs/architecture/MCP_GATEWAY.md"),
     Path("docs/architecture/EXTERNAL_KNOWLEDGE.md"),
+         Path("docs/architecture/GITHUB_INTAKE_ADMISSION.md"),
 )
 OUTPUT = Path("provenance/CANONICAL_SOURCE_MANIFEST.sha256")
 TEXT_SUFFIXES = {
