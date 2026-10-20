@@ -108,10 +108,52 @@ host-only. The external provider receives only provider_id plus the bounded
 generic KnowledgeRequest; Herdr invocation identity and grant hashes are not
 forwarded to it.
 
-The fixed host allowlist is /etc/herdr/external-knowledge.json. It contains only
-consumer/provider/source identifiers, never credentials. The repository example
-at deploy/herdr/external-knowledge.example.json documents its closed version-1
-shape.
+The fixed host policy is /etc/herdr/external-knowledge.json. The repository
+example at deploy/herdr/external-knowledge.example.json documents its closed
+version-2 shape. It contains consumer/provider/source identifiers and trusted
+provider capability facts, never credentials.
+
+### Version-2 policy and trusted capability facts
+
+The example is a dummy configuration: its .invalid endpoint is not a deployed
+provider, its credential_refs list is empty, and its retention, training and
+region values do not attest to any real service. Shipping or parsing it activates
+nothing. Before installation, a trusted operator must independently establish
+the actual endpoint/API mode, processing region, egress, data classes, retention
+and training behavior from reviewed provider contracts and deployment settings,
+including relevant subprocessors. Unknown facts must deny use; do not copy the
+example's limits to make an unverified provider pass.
+
+The top-level version-2 keys are version, consumers and provider_capabilities.
+Each consumer still has exactly one providers mapping from provider id to logical
+source ids. Each provider_capabilities row has the exact ProviderRoute fields:
+
+- provider and HTTPS base_url (no embedded credentials);
+- api_mode fixed to external_knowledge;
+- exactly one regions entry and an explicit data_classes array;
+- max_egress, max_retention and training;
+- credential_refs, either empty or one approved credential identifier.
+
+Credential references are opaque identifiers, never keys, tokens or token-file
+contents. The destination, API mode and credential reference must exactly match
+the provider route in the actual signed launch SecurityGrant. Both that grant's
+global scope and its route limits must admit the configured region, egress,
+retention and training behavior. A child cannot broaden its parent's grant.
+The host treats all model-controlled query and conversation text as SENSITIVE;
+a model argument or provider response cannot classify it as public or supply
+capability facts.
+
+Install only a reviewed root-owned regular policy file under root-owned
+ancestors, with no group/other write access. The allowlist and capability facts
+are necessary but do not create a SecurityGrant, grant a tool, install a daemon,
+or authorize a new consumer. The host reloads the protected policy and checks
+it again after connecting, immediately before the first request bytes are sent.
+
+Version-1 allowlists may still parse for migration, but they contain no trusted
+capability facts and therefore cannot authorize delivery. Missing, malformed or
+unknown version-2 capability metadata also denies use; there is no fallback to
+the old allowlist-only behavior. Neither a model self-attestation nor a provider
+success response can override that denial.
 
 AUTH_REQUIRED and provider availability failures are returned as source-level
 knowledge errors. They do not stop unrelated Herdr capabilities.

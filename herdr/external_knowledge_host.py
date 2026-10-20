@@ -7,6 +7,7 @@ only after the exact peer, grant, mount and work phase have been rechecked.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import socket
 import stat
@@ -20,13 +21,16 @@ from .external_knowledge import (
     KnowledgeResponse,
     KnowledgeSourceResult,
 )
-from .security import InvocationIdentity
+from .capability import DataClass, Egress
+from .security import (InvocationGuard, InvocationIdentity, PolicyDenied, ProviderRequest,
+                       ProviderRoute, SECURITY_GRANT_VERSION, SecurityError, SecurityGrant)
 
 POLICY_PATH = Path("/etc/herdr/external-knowledge.json")
 PROVIDER_SOCKET_PATH = Path("/run/herdr-external-knowledge/provider.sock")
 MAX_POLICY_BYTES = 65_536
 MAX_PROVIDER_REQUEST_BYTES = 32_768
 MAX_PROVIDER_RESPONSE_BYTES = 2_097_152
+_LOG = logging.getLogger(__name__)
 
 
 class ExternalKnowledgeHostError(ValueError):
@@ -131,7 +135,10 @@ def _trusted_socket(path: Path) -> os.stat_result:
 class HostExternalKnowledgePolicy:
     """Root-owned allowlist. It contains identifiers only, never credentials."""
 
-    def __init__(self, consumers: Mapping[str, Mapping[str, tuple[str, ...]]]):
+    def __init__(
+        self, consumers: Mapping[str, Mapping[str, tuple[str, ...]]],
+        *, provider_capabilities: tuple[ProviderRoute, ...] = (),
+    ):
         checked: dict[str, dict[str, tuple[str, ...]]] = {}
         for consumer, providers in consumers.items():
             consumer_id = _consumer_token(consumer)
@@ -148,12 +155,37 @@ class HostExternalKnowledgePolicy:
                 rows[provider_id] = tuple(sorted(parsed))
             checked[consumer_id] = rows
         self._consumers = checked
+        # These facts come only from root-owned host configuration, never from
+        # model arguments or provider response claims. Missing facts deny use.
+        self._capabilities: dict[str, ProviderRoute] = {}
+        for route in provider_capabilities:
+            if (not isinstance(route, ProviderRoute)
+                    or route.provider in self._capabilities
+                    or route.api_mode != "external_knowledge"
+                    or len(route.regions) != 1
+                    or len(route.credential_refs) > 1
+                    or route.max_egress is Egress.NONE):
+                raise ExternalKnowledgeHostError("policy_invalid")
+            self._capabilities[route.provider] = route
 
     @classmethod
     def from_file(cls, path: Path = POLICY_PATH) -> "HostExternalKnowledgePolicy":
         raw = _read_regular_root_policy(path)
-        if set(raw) != {"version", "consumers"} or raw["version"] != 1:
+        version = raw.get("version")
+        expected = {"version", "consumers"}
+        if version == 2:
+            expected.add("provider_capabilities")
+        if type(version) is not int or version not in {1, 2} or set(raw) != expected:
             raise ExternalKnowledgeHostError("policy_invalid")
+        capabilities = ()
+        if version == 2:
+            rows = raw["provider_capabilities"]
+            if not isinstance(rows, list) or not 1 <= len(rows) <= 16:
+                raise ExternalKnowledgeHostError("policy_invalid")
+            try:
+                capabilities = tuple(ProviderRoute.from_dict(row) for row in rows)
+            except (SecurityError, TypeError, ValueError) as exc:
+                raise ExternalKnowledgeHostError("policy_invalid") from exc
         consumers = raw["consumers"]
         if not isinstance(consumers, dict) or not consumers:
             raise ExternalKnowledgeHostError("policy_invalid")
@@ -168,7 +200,7 @@ class HostExternalKnowledgePolicy:
                 provider: tuple(sources) if isinstance(sources, list) else sources
                 for provider, sources in providers.items()
             }
-        return cls(normalized)
+        return cls(normalized, provider_capabilities=capabilities)
 
     def allows(self, consumer: str, provider_id: str, sources: tuple[str, ...]) -> bool:
         providers = self._consumers.get(consumer)
@@ -176,6 +208,38 @@ class HostExternalKnowledgePolicy:
             return False
         allowed = providers.get(provider_id)
         return allowed is not None and set(sources) <= set(allowed)
+
+    def authorize(
+        self, grant: SecurityGrant, provider_id: str, request: KnowledgeRequest,
+    ) -> None:
+        if not self.allows(grant.identity.consumer, provider_id, request.sources):
+            raise PolicyDenied("external_knowledge_source_denied")
+        capabilities = self._capabilities.get(provider_id)
+        if capabilities is None:
+            raise PolicyDenied("external_knowledge_capabilities_unverified")
+        matching = [route for route in grant.provider_routes if route.provider == provider_id]
+        if len(matching) != 1:
+            raise PolicyDenied("provider_route_missing")
+        route = matching[0]
+        if (route.base_url != capabilities.base_url
+                or route.api_mode != capabilities.api_mode
+                or route.credential_refs != capabilities.credential_refs):
+            raise PolicyDenied("external_knowledge_destination_denied")
+        # No declassification proof exists for arbitrary model-controlled text.
+        # Conservatively classify the entire query/conversation as SENSITIVE.
+        # Neither the model nor the remote provider can select a lower class.
+        if DataClass.SENSITIVE not in capabilities.data_classes:
+            raise PolicyDenied("data_class_denied")
+        InvocationGuard(grant).authorize_provider(ProviderRequest(
+            provider=provider_id,
+            region=capabilities.regions[0],
+            data_class=DataClass.SENSITIVE,
+            egress=capabilities.max_egress,
+            retention=capabilities.max_retention,
+            training=capabilities.training,
+            credential_ref=(capabilities.credential_refs[0]
+                            if capabilities.credential_refs else None),
+        ))
 
 
 def _error_response(
@@ -227,6 +291,7 @@ class HostExternalKnowledgeClient:
         policy_path: Path = POLICY_PATH,
         socket_path: Path = PROVIDER_SOCKET_PATH,
         timeout_seconds: float = 900.0,
+        grant: SecurityGrant | None = None,
     ):
         if (not isinstance(timeout_seconds, (int, float))
                 or not 1 <= float(timeout_seconds) <= 900):
@@ -234,6 +299,7 @@ class HostExternalKnowledgeClient:
         self.policy_path = Path(policy_path)
         self.socket_path = Path(socket_path)
         self.timeout_seconds = float(timeout_seconds)
+        self._grant = grant
 
     def query(
         self,
@@ -249,9 +315,16 @@ class HostExternalKnowledgeClient:
                 or not isinstance(request, KnowledgeRequest)):
             return _error_response(request, KnowledgeErrorCode.INVALID_REQUEST)
         try:
+            grant = self._grant
+            if (not isinstance(grant, SecurityGrant)
+                    or grant.schema_version != SECURITY_GRANT_VERSION
+                    or grant.identity != identity or grant.hash != grant_sha256
+                    or not grant.is_active()
+                    or "herdr_external_knowledge" not in grant.scope.tools):
+                raise PolicyDenied("external_knowledge_grant_mismatch")
+            provider_id = _token(provider_id)
             policy = HostExternalKnowledgePolicy.from_file(self.policy_path)
-            if not policy.allows(identity.consumer, provider_id, request.sources):
-                return _error_response(request, KnowledgeErrorCode.AUTH_FORBIDDEN)
+            policy.authorize(grant, provider_id, request)
             _trusted_socket(self.socket_path)
             payload = json.dumps(
                 {
@@ -269,6 +342,10 @@ class HostExternalKnowledgeClient:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                 connection.settimeout(self.timeout_seconds)
                 connection.connect(str(self.socket_path))
+                # Reopen protected host policy at the delivery boundary: a
+                # source revocation or capability change during connect denies.
+                policy = HostExternalKnowledgePolicy.from_file(self.policy_path)
+                policy.authorize(grant, provider_id, request)
                 connection.sendall(payload)
                 raw = _read_line(connection, MAX_PROVIDER_RESPONSE_BYTES)
             parsed = json.loads(raw.decode("utf-8"))
@@ -279,11 +356,20 @@ class HostExternalKnowledgeClient:
                     or {item.source for item in response.sources} != set(request.sources)):
                 raise ExternalKnowledgeHostError("provider_response_mismatch")
             return response
+        except (PolicyDenied, SecurityError) as exc:
+            reason = exc.reason if isinstance(exc, PolicyDenied) else "external_knowledge_grant_invalid"
+            # Closed reason codes only: never log query, conversation, response,
+            # endpoint, credentials, or arbitrary exception text.
+            _LOG.warning("external_knowledge_denied reason=%s", reason)
+            return _error_response(request, KnowledgeErrorCode.AUTH_FORBIDDEN)
         except (OSError, TimeoutError):
             return _error_response(
                 request, KnowledgeErrorCode.PROVIDER_UNAVAILABLE, retryable=True
             )
         except ExternalKnowledgeHostError as exc:
+            if exc.reason.startswith("policy_"):
+                _LOG.warning("external_knowledge_denied reason=%s", exc.reason)
+                return _error_response(request, KnowledgeErrorCode.AUTH_FORBIDDEN)
             return _error_response(
                 request,
                 KnowledgeErrorCode.PROVIDER_UNAVAILABLE,
@@ -303,4 +389,4 @@ def bind_external_knowledge_host(bootstrap, grant, authority) -> None:
     if not callable(authority):
         raise ExternalKnowledgeHostError("durable_authority_required")
     bootstrap.external_knowledge_authority = authority
-    bootstrap.external_knowledge_query = HostExternalKnowledgeClient().query
+    bootstrap.external_knowledge_query = HostExternalKnowledgeClient(grant=grant).query
