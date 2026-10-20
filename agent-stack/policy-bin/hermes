@@ -1,3 +1,3 @@
 #!/bin/sh
 unset LD_PRELOAD LD_AUDIT LD_LIBRARY_PATH GLIBC_TUNABLES GCONV_PATH LOCPATH NLSPATH BASH_ENV ENV
-exec /usr/bin/python3 -I -S /run/herdr-bootstrap/agent-hermes-policy-stage1 "$@"
+exec /usr/bin/python3 -I -S /run/herdr/policy-code/agent-stack/bin/agent-hermes-policy-stage1 "$@"

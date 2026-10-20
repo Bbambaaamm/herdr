@@ -22,6 +22,9 @@ FILES = (
     Path("docs/architecture/AGENT_SKILLS.md"),
     Path("docs/architecture/CONTEXT_MEMORY.md"),
     Path("docs/architecture/INVOCATION_POLICY_LAUNCH.md"),
+    Path("docs/architecture/IMMUTABLE_PROFILE_NAMESPACE_129.md"),
+    Path("docs/architecture/PROFILE_HANDOFF_132.md"),
+    Path("docs/architecture/ROOT_PUBLISHED_RUNTIME_129.md"),
     Path("docs/architecture/COMPLETION_EVIDENCE.md"),
     Path("docs/architecture/PROMPT_RUNTIME.md"),
 

@@ -1552,6 +1552,9 @@ class DynamicChildScheduler:
                     task_id=rec.id, run_token=rec.run_token, fencing_token=rec.fencing_token)
                 attestation["invocation_policy"] = validate_policy_evidence(
                     invocation_policy, identity=policy_identity)
+                for field in ("approved_profile", "immutable_sources"):
+                    if field in attestation["invocation_policy"]:
+                        attestation[field] = json.loads(json.dumps(attestation["invocation_policy"][field]))
             except (SecurityError, TypeError, ValueError):
                 return False
         if not rec.execution_sandbox_verified and (
@@ -2423,6 +2426,9 @@ class DynamicChildScheduler:
                             consumer="github:" + rec.repo, agent_id=rec.agent_id,
                             parent_agent_id=rec.parent_agent_id, parent_task_id=rec.parent_task_id,
                             task_id=rec.id, run_token=rec.run_token, fencing_token=rec.fencing_token))
+                        for field in ("approved_profile", "immutable_sources"):
+                            if attestation.get(field) != attestation["invocation_policy"].get(field):
+                                raise SecurityError("retained source attestation differs from policy")
                     except (SecurityError, TypeError, ValueError) as exc:
                         raise SchedulerError("invalid child invocation policy evidence") from exc
                 if event_type=="execution_sandbox_attested" and (
