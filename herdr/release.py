@@ -1,10 +1,14 @@
 """Deterministic, fail-closed Herdr release bundle primitives."""
 from __future__ import annotations
 
+from contextlib import contextmanager
+from dataclasses import dataclass
 import gzip
 import hashlib
 import io
 import json
+import os
+import stat
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
@@ -181,26 +185,243 @@ def consumer_digest(files: dict[str, bytes]) -> str:
 
 def _safe_name(name: str) -> PurePosixPath:
     path = PurePosixPath(name)
+    _need(not any(c in name for c in ("\\", "\0", ":")), "unsafe_archive_path")
     _need(name == str(path) and not path.is_absolute() and ".." not in path.parts and path.parts,
           "unsafe_archive_path")
     return path
 
 
-def safe_extract(archive: tarfile.TarFile, destination: Path) -> None:
-    for member in archive.getmembers():
+@dataclass(frozen=True)
+class ArchiveLimits:
+    """Host-selected ceilings; none are read from the archive or its manifest."""
+
+    max_members: int = 8192
+    max_file_bytes: int = 64 * 1024 * 1024
+    max_total_bytes: int = 256 * 1024 * 1024
+    max_stream_bytes: int = 320 * 1024 * 1024
+    max_compressed_bytes: int = 64 * 1024 * 1024
+    max_path_bytes: int = 4096
+    max_path_depth: int = 32
+    max_expansion_ratio: int = 200
+    max_metadata_bytes: int = 64 * 1024
+    max_header_depth: int = 16
+
+    def __post_init__(self) -> None:
+        _need(all(type(value) is int and value > 0 for value in vars(self).values()),
+              "invalid_archive_limits")
+
+
+DEFAULT_ARCHIVE_LIMITS = ArchiveLimits()
+_ARCHIVE_CHUNK_BYTES = 64 * 1024
+_MAX_TAR_READ_BYTES = 1024 * 1024
+
+
+class _BoundedCompressedReader:
+    """Bound raw reads too: gzip header strings need not inflate any tar bytes."""
+
+    def __init__(self, source: BinaryIO, limit: int):
+        self.source = source
+        self.limit = limit
+        self.consumed = 0
+
+    def read(self, size: int) -> bytes:
+        _need(type(size) is int and 0 <= size <= _MAX_TAR_READ_BYTES,
+              "archive_compressed_read_limit")
+        requested = min(size, self.limit - self.consumed + 1)
+        chunk = self.source.read(requested)
+        _need(len(chunk) <= requested, "archive_compressed_read_overflow")
+        self.consumed += len(chunk)
+        _need(self.consumed <= self.limit, "archive_compressed_size_limit")
+        return chunk
+
+    def tell(self) -> int:
+        return self.consumed
+
+
+class _BoundedArchiveReader:
+    """Bound inflation before tarfile can allocate extended-header payloads."""
+
+    def __init__(self, source: BinaryIO, limit: int):
+        self.source = source
+        self.limit = limit
+        self.consumed = 0
+
+    def tell(self) -> int:
+        return getattr(self, "position", 0)
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        # TarFile reads one byte behind the next header after extracting a file.
+        # A small lookback avoids rewinding gzip and repeatedly inflating input.
+        target = offset + self.tell() if whence == 1 else offset
+        _need(whence in (0, 1) and type(target) is int and target >= 0,
+              "archive_seek_limit")
+        cache = getattr(self, "cache", b"")
+        _need(target >= self.consumed - len(cache), "archive_backward_seek_limit")
+        while self.consumed < target:
+            self.position = self.consumed
+            _need(bool(self.read(min(_ARCHIVE_CHUNK_BYTES, target - self.consumed))),
+                  "truncated_archive_file")
+        self.position = target
+        return target
+
+    def read(self, size: int) -> bytes:
+        _need(type(size) is int and 0 <= size <= _MAX_TAR_READ_BYTES,
+              "archive_metadata_read_limit")
+        position = self.tell()
+        cache = getattr(self, "cache", b"")
+        replay = min(size, self.consumed - position)
+        prefix = cache[position - (self.consumed - len(cache)):][:replay]
+        requested = min(size - replay, self.limit - self.consumed + 1)
+        chunk = self.source.read(requested)
+        _need(len(chunk) <= requested, "archive_stream_read_overflow")
+        self.consumed += len(chunk)
+        _need(self.consumed <= self.limit, "archive_expansion_limit")
+        self.cache = (cache + chunk)[-_MAX_TAR_READ_BYTES:]
+        self.position = position + len(prefix) + len(chunk)
+        return prefix + chunk
+
+
+def _bounded_tar_info(limits: ArchiveLimits):
+    class BoundedTarInfo(tarfile.TarInfo):
+        def _proc_member(self, archive):
+            # tarfile resolves PAX/GNU metadata recursively before yielding a
+            # member. Count those hidden headers and limit recursion as well.
+            count = getattr(archive, "_bounded_headers", 0) + 1
+            depth = getattr(archive, "_bounded_header_depth", 0) + 1
+            archive._bounded_headers = count
+            _need(count <= limits.max_members, "archive_member_limit")
+            _need(depth <= limits.max_header_depth, "archive_metadata_depth_limit")
+            metadata = self.type in (tarfile.XHDTYPE, tarfile.XGLTYPE,
+                                    tarfile.SOLARIS_XHDTYPE, tarfile.GNUTYPE_LONGNAME,
+                                    tarfile.GNUTYPE_LONGLINK)
+            _need(not metadata or 0 <= self.size <= limits.max_metadata_bytes,
+                  "archive_metadata_size_limit")
+            _need(self.type != tarfile.GNUTYPE_SPARSE, "unsupported_archive_member")
+            archive._bounded_header_depth = depth
+            try:
+                return super()._proc_member(archive)
+            finally:
+                archive._bounded_header_depth = depth - 1
+    return BoundedTarInfo
+
+
+@contextmanager
+def _extraction_destination(destination: Path):
+    """Only remove objects created in a new/empty private extraction directory."""
+    destination = Path(destination)
+    created: list[tuple[Path, bool]] = []
+    try:
+        _need(not destination.is_symlink(), "unsafe_extraction_destination")
+        if not destination.exists():
+            destination.mkdir(mode=0o700)
+            created.append((destination, True))
+        _need(destination.is_dir() and not any(destination.iterdir()),
+              "extraction_destination_not_empty")
+        yield destination, created
+    except BaseException:
+        for path, directory in reversed(created):
+            try:
+                if directory:
+                    path.rmdir()
+                else:
+                    path.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+
+
+def _extract_members(archive: tarfile.TarFile, destination: Path,
+                     limits: ArchiveLimits, created: list[tuple[Path, bool]]) -> None:
+    count = total = 0
+    seen: set[str] = set()
+    # Iteration is bounded; getmembers() would materialize the entire archive.
+    for member in archive:
+        count += 1
+        _need(count <= limits.max_members, "archive_member_limit")
         path = _safe_name(member.name)
-        _need(member.isfile() or member.isdir(), "unsupported_archive_member")
+        _need(len(member.name.encode("utf-8")) <= limits.max_path_bytes
+              and len(path.parts) <= limits.max_path_depth, "archive_path_limit")
+        _need(member.name not in seen, "duplicate_archive_member")
+        seen.add(member.name)
+        _need(member.type in (tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE)
+              and member.sparse is None, "unsupported_archive_member")
+        _need(type(member.size) is int and 0 <= member.size <= limits.max_file_bytes,
+              "archive_file_size_limit")
+        _need(not member.isdir() or member.size == 0, "invalid_archive_directory_size")
+        current = destination
+        for component in path.parts[:-1]:
+            current = current / component
+            if current.exists():
+                _need(current.is_dir() and not current.is_symlink(), "unsafe_archive_parent")
+            else:
+                _need(len(created) < limits.max_members + 1, "archive_object_limit")
+                current.mkdir()
+                created.append((current, True))
         target = destination.joinpath(*path.parts)
-        target.parent.mkdir(parents=True, exist_ok=True)
         if member.isdir():
-            target.mkdir(exist_ok=True)
+            if not target.exists():
+                _need(len(created) < limits.max_members + 1, "archive_object_limit")
+                target.mkdir()
+                created.append((target, True))
+            _need(target.is_dir() and not target.is_symlink(), "unsafe_archive_directory")
             continue
+        _need(total + member.size <= limits.max_total_bytes, "archive_total_size_limit")
         stream = archive.extractfile(member)
         _need(stream is not None, "missing_archive_file")
-        with target.open("xb") as output:
-            while chunk := stream.read(1024 * 1024):
+        _need(len(created) < limits.max_members + 1, "archive_object_limit")
+        copied = 0
+        with stream, target.open("xb") as output:
+            created.append((target, False))
+            while chunk := stream.read(_ARCHIVE_CHUNK_BYTES):
+                copied += len(chunk)
+                _need(len(chunk) <= _ARCHIVE_CHUNK_BYTES and copied <= member.size
+                      and copied <= limits.max_file_bytes, "archive_actual_file_size_limit")
+                _need(total + len(chunk) <= limits.max_total_bytes, "archive_actual_total_size_limit")
                 output.write(chunk)
+                total += len(chunk)
+        _need(copied == member.size, "truncated_archive_file")
         target.chmod(member.mode & 0o755)
+
+
+def safe_extract(archive: tarfile.TarFile, destination: Path, *,
+                 limits: ArchiveLimits = DEFAULT_ARCHIVE_LIMITS) -> None:
+    """Bound members and actual extracted bytes; input parsing must also be bounded.
+
+    Release/cutover entrypoints use extract_archive(), which bounds gzip inflation
+    and metadata reads before tarfile parses even the first member.
+    """
+    with _extraction_destination(destination) as (folder, created):
+        _extract_members(archive, folder, limits, created)
+
+
+def extract_archive(path: Path, destination: Path, *,
+                    limits: ArchiveLimits = DEFAULT_ARCHIVE_LIMITS) -> None:
+    """Stream a gzip release with resource bounds and transactional cleanup."""
+    with _extraction_destination(destination) as (folder, created):
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb", buffering=0) as source:
+            before = os.fstat(source.fileno())
+            _need(stat.S_ISREG(before.st_mode) and 0 < before.st_size <= limits.max_compressed_bytes,
+                  "archive_compressed_size_limit")
+            inflation_limit = min(limits.max_stream_bytes,
+                                  max(_MAX_TAR_READ_BYTES, before.st_size * limits.max_expansion_ratio))
+            try:
+                compressed = _BoundedCompressedReader(source, before.st_size)
+                with gzip.GzipFile(fileobj=compressed, mode="rb") as inflated:
+                    reader = _BoundedArchiveReader(inflated, inflation_limit)
+                    with tarfile.open(fileobj=reader, mode="r:",
+                                      tarinfo=_bounded_tar_info(limits)) as archive:
+                        _extract_members(archive, folder, limits, created)
+                        # Validate gzip trailers/concatenated streams, including
+                        # bytes after tar's end marker, within the same budget.
+                        while reader.read(_ARCHIVE_CHUNK_BYTES):
+                            pass
+            except (OSError, EOFError, tarfile.TarError) as exc:
+                raise ReleaseError("invalid_or_truncated_release_archive") from exc
+            after = os.fstat(source.fileno())
+            _need((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                  == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns),
+                  "release_archive_changed")
 
 
 def file_manifest(root: Path, *, exclude: Iterable[str] = ()) -> bytes:
@@ -269,8 +490,7 @@ def verify_archive(path: Path) -> dict[str, object]:
     _need(path.is_file() and not path.is_symlink(), "release_archive_invalid")
     with tempfile.TemporaryDirectory(prefix="herdr-verify-") as folder:
         destination = Path(folder)
-        with tarfile.open(path, "r:gz") as archive:
-            safe_extract(archive, destination)
+        extract_archive(path, destination)
         roots = list(destination.iterdir())
         _need(len(roots) == 1 and roots[0].is_dir(), "release_archive_root_invalid")
         return verify_tree(roots[0])
