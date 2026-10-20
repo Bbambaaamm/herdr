@@ -71,3 +71,13 @@ digest. Issue-derived instructions remain subordinate to the host's existing
 TaskGraph, grant, child-permission, budget, review, merge and deployment gates.
 An acknowledgement does not replace any of them. Apply/deploy, model activation
 and autonomous backlog activation remain separate approvals.
+
+## Failure and scan bounds
+
+Every retained state row and repository/issue key is validated, including closed or currently unselected consumers. Invalid rows, duplicate/migrating keys, identity mismatch or malformed consumed-approval history stop intake; they are never discarded as a fresh state.
+
+A pending task is serialized and fsynced under a hidden temporary name, then published by Linux renameat2(RENAME_NOREPLACE) and directory fsync. No hard-link or partial final JSON is exposed. A crash before publication leaves only an ignored temporary; a crash after publication leaves a complete task whose deterministic approval ID retains at-most-once behavior. A durability error is a stopped transaction, not permission to reset or replace retained work.
+
+The normal maintenance caller allows 30 seconds. Intake reserves six seconds for local persistence by limiting the GitHub scan to 24 seconds, with each guarded GET bounded by the smaller of five seconds and the remaining scan time. This is an HTTP/scan deadline, not a real-time filesystem guarantee. Only the authenticated user identity is cached within that single scan; maintainer permissions, issue revisions and approval evidence are checked afresh.
+
+The fsynced github-intake.cursor.json (beside the existing stamp) records only the next consumer and last attempted issue for fair resumption. It is not authority and cannot admit work. Interrupted scans preserve unvisited issue state and all approval history, avoid a completed-scan stamp, and resume other consumers/issues on the next maintenance invocation. An issue requiring more fresh GitHub verification than the bounded window remains deferred; partial response pages or cached permissions never authorize it. The existing all-open fetch remains bounded to its first 100 API rows.
