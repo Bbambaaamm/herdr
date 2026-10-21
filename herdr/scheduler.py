@@ -1237,7 +1237,9 @@ class DynamicChildScheduler:
                             or existing.node.objective != proposal.child_task
                             or existing.node.role != proposal.child_role
                             or existing.node.tools != tuple(proposal.child_tools)
-                            or existing.node.permissions != tuple(proposal.child_permissions)):
+                            or existing.node.permissions != tuple(proposal.child_permissions)
+                            or existing.node.model_policy.get("model") != proposal.child_model
+                            or existing.node.model_policy.get("fallback_model") != proposal.child_fallback_model):
                         raise SchedulerError("delegation key reused with different identity or work")
                     if (existing.worktree_identity != proposal.worktree_identity
                             or existing.ownership != proposal.ownership):
