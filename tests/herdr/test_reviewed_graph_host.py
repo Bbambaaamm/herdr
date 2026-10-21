@@ -399,8 +399,19 @@ def test_final_continuation_never_recreates_missing_canonical_ledger(tmp_path,mo
     work=build(raw,task,git);launch,proof=sealed_task(task,grant);config.bind_reviewed_parent(work,task,launch)
     directory=attempt_directory(Path(raw["task_store_root"]),task["id"],task["run_token"])
     ledger=directory/"scheduler.jsonl";ledger.unlink();calls=[]
-    with pytest.raises(RuntimeError):callback(task,work,launch,lambda task:calls.append(True))(proof)
-    assert not ledger.exists() and calls==[]
+    model_projection=ScopeOnlyModelProjection(work,object(),("--model","unit/missing-ledger"))
+    send=callback(task,work,launch,lambda task:calls.append(True),model_projection=model_projection)
+    with pytest.raises(RuntimeError,match="^canonical parent scheduler unavailable$"):send(proof)
+    assert not ledger.exists() and calls==[] and model_projection.calls==0
+
+
+def test_all_callback_callers_bind_explicit_model_projection():
+    import ast
+    tree=ast.parse(Path(__file__).read_text())
+    callers=[n for n in ast.walk(tree) if isinstance(n,ast.Call)
+        and isinstance(n.func,ast.Name) and n.func.id=="callback"]
+    assert len(callers)==3
+    assert all(any(k.arg=="model_projection" for k in call.keywords) for call in callers)
 
 
 def test_structural_fixture_never_probes_bwrap_or_calls_physical_factory(tmp_path,monkeypatch):
