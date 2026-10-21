@@ -1,4 +1,4 @@
-"""Fixed host configuration to actual worker work authority; no model selector."""
+"""Fixed host work authority and original protected graph projection."""
 from __future__ import annotations
 
 import copy
@@ -200,6 +200,54 @@ def _reviewed_graph(definition, task):
             and set(node.permissions) == set(planning["permissions"]),
             "reviewed graph differs from approved work planning scope")
     return graph
+
+
+def reviewed_root_model_arguments(factory, private_snapshot):
+    """Project only the original host admission; task routing data is never authority.
+
+    This is a metadata/closure check, not a grant or an allocation operation.
+    Non-null fallback policies need a separate, reviewed implementation.
+    """
+    if factory is None:
+        return []
+    from .work_contract_host import HostWorkContractFactory
+    from .private_profile_namespace import PrivateProfileSnapshot
+    from .taskgraph import TaskGraph
+    require(isinstance(factory, HostWorkContractFactory), "original host work factory required")
+    admitted = factory.host_admission
+    require(isinstance(admitted, dict) and isinstance(admitted.get("definition"), dict),
+            "original host work admission required")
+    definition = admitted["definition"]
+    if "reviewed_graph" not in definition:
+        return []
+    reviewed = closed(definition["reviewed_graph"], ("version", "graph_sha256", "graph"), "reviewed graph")
+    require(type(reviewed["version"]) is int and reviewed["version"] == 1,
+            "reviewed graph version unsupported")
+    graph = TaskGraph.parse_planner_output(reviewed["graph"])
+    require(graph.graph_hash() == reviewed["graph_sha256"] and len(graph.nodes) == 1,
+            "original root model graph changed")
+    policy = graph.nodes[0].model_policy
+    model = policy["model"]
+    require("fallback_model" in policy and policy["fallback_model"] is None,
+            "reviewed root fallback policy unsupported")
+    require(isinstance(private_snapshot, PrivateProfileSnapshot)
+            and private_snapshot.sdk_policy() is not None,
+            "reviewed root requires sealed empty SDK fallback policy")
+    budget = definition.get("budget")
+    quotes = budget.get("model_quotes") if isinstance(budget, dict) else None
+    require(isinstance(quotes, list) and len(quotes) == 1 and isinstance(quotes[0], dict),
+            "reviewed root requires singleton exact model quote")
+    quote = quotes[0]
+    require(all(isinstance(quote.get(key), str) and quote[key] and "\x00" not in quote[key]
+                for key in ("provider", "model", "api_mode", "base_url"))
+            and quote["model"] == model
+            and ("provider" not in policy or quote["provider"] == policy["provider"]),
+            "reviewed root model differs from exact quote")
+    current = getattr(factory, "budget_quotes", None)
+    require(isinstance(current, dict) and len(current) == 1
+            and canonical(list(current.values())) == canonical(quotes),
+            "original root model quote binding changed")
+    return ["--model", model]
 
 
 def _graph_admission(storage, graph, *, create=False):

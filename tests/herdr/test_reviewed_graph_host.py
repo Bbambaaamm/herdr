@@ -1,6 +1,6 @@
 """Protected graph host composition with real disposable evidence and journals only."""
 from copy import deepcopy
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 import json
@@ -300,13 +300,35 @@ def test_actual_bridge_never_late_initializes_or_falls_back_from_canonical(tmp_p
         json.loads(line).get("event")=="spawn_child" for line in ledger.read_text().splitlines())
 
 
-def callback(task,work,launch,persist):
-    # Execute the actual nested worker callback, with the actual graph guard.
+@dataclass
+class ScopeOnlyModelProjection:
+    """Bound unit-only seam; real model/profile validation is tested separately."""
+    expected_factory: object
+    expected_snapshot: object
+    arguments: tuple[str, ...]
+    calls: int = 0
+
+    def __call__(self, factory, snapshot):
+        from herdr.work_contract_host import HostWorkContractFactory
+        assert isinstance(factory, HostWorkContractFactory) and factory is self.expected_factory
+        assert snapshot is self.expected_snapshot
+        assert len(self.arguments) == 2 and self.arguments[0] == "--model"
+        self.calls += 1
+        return list(self.arguments)
+
+
+def callback(task,work,launch,persist,*,model_projection):
+    # Actual graph guard; the explicit model seam is scoped to these callback tests.
+    assert isinstance(model_projection, ScopeOnlyModelProjection)
+    assert model_projection.expected_factory is work
     import ast
     source=Path(__file__).resolve().parents[2]/"agent-stack/bin/agent-task-worker"
     node=next(n for n in ast.walk(ast.parse(source.read_text())) if isinstance(n,ast.FunctionDef) and n.name=="publish_continuation")
     namespace=dict(task=task,work_factory=work,launch=launch,session=task["execution_session"],
-        bind_reviewed_parent=config.bind_reviewed_parent,persist_execution_session=persist)
+        bind_reviewed_parent=config.bind_reviewed_parent,persist_execution_session=persist,
+        reviewed_root_model_arguments=model_projection,
+        private_snapshot=model_projection.expected_snapshot,
+        root_model_args=list(model_projection.arguments))
     exec(compile(ast.fix_missing_locations(ast.Module(body=[node],type_ignores=[])),str(source),"exec"),namespace)
     return namespace["publish_continuation"]
 
@@ -315,12 +337,27 @@ def test_final_worker_continuation_denial_cannot_persist_or_ack_changed_scope(tm
     raw,task,d,g,grant,git=configured(tmp_path,monkeypatch)
     work=build(raw,task,git);launch,proof=sealed_task(task,grant);config.bind_reviewed_parent(work,task,launch)
     saved=deepcopy(task["execution_session"]["invocation_policy"]);calls=[]
-    send=callback(task,work,launch,lambda task:calls.append(True))
+    model_projection=ScopeOnlyModelProjection(work,object(),("--model","unit/scope-only"))
+    send=callback(task,work,launch,lambda task:calls.append(True),model_projection=model_projection)
     changed=deepcopy(proof);changed["identity"]["parent_agent_id"]="foreign"
     from herdr.security import SecurityError
     with pytest.raises(SecurityError):send(changed)
     assert calls==[] and task["execution_session"]["invocation_policy"]==saved
-    assert send(proof) is True and calls==[True]
+    assert model_projection.calls==0  # Changed scope is denied before the model seam.
+    assert send(proof) is True and calls==[True] and model_projection.calls==1
+
+
+def test_final_worker_model_projection_drift_cannot_persist_or_ack(tmp_path,monkeypatch):
+    raw,task,d,g,grant,git=configured(tmp_path,monkeypatch)
+    work=build(raw,task,git);launch,proof=sealed_task(task,grant);config.bind_reviewed_parent(work,task,launch)
+    saved=deepcopy(task["execution_session"]["invocation_policy"]);calls=[]
+    model_projection=ScopeOnlyModelProjection(work,object(),("--model","unit/original"))
+    send=callback(task,work,launch,lambda task:calls.append(True),model_projection=model_projection)
+    model_projection.arguments=("--model","unit/drift")
+    with pytest.raises(RuntimeError,match="^task_original_root_model_changed$"):
+        send(proof)
+    assert model_projection.calls==1 and calls==[]
+    assert task["execution_session"]["invocation_policy"]==saved
 
 
 def test_worker_seal_graph_bind_prepare_and_ack_order():
@@ -362,8 +399,19 @@ def test_final_continuation_never_recreates_missing_canonical_ledger(tmp_path,mo
     work=build(raw,task,git);launch,proof=sealed_task(task,grant);config.bind_reviewed_parent(work,task,launch)
     directory=attempt_directory(Path(raw["task_store_root"]),task["id"],task["run_token"])
     ledger=directory/"scheduler.jsonl";ledger.unlink();calls=[]
-    with pytest.raises(RuntimeError):callback(task,work,launch,lambda task:calls.append(True))(proof)
-    assert not ledger.exists() and calls==[]
+    model_projection=ScopeOnlyModelProjection(work,object(),("--model","unit/missing-ledger"))
+    send=callback(task,work,launch,lambda task:calls.append(True),model_projection=model_projection)
+    with pytest.raises(RuntimeError,match="^canonical parent scheduler unavailable$"):send(proof)
+    assert not ledger.exists() and calls==[] and model_projection.calls==0
+
+
+def test_all_callback_callers_bind_explicit_model_projection():
+    import ast
+    tree=ast.parse(Path(__file__).read_text())
+    callers=[n for n in ast.walk(tree) if isinstance(n,ast.Call)
+        and isinstance(n.func,ast.Name) and n.func.id=="callback"]
+    assert len(callers)==3
+    assert all(any(k.arg=="model_projection" for k in call.keywords) for call in callers)
 
 
 def test_structural_fixture_never_probes_bwrap_or_calls_physical_factory(tmp_path,monkeypatch):

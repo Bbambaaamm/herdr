@@ -121,6 +121,101 @@ class SealedProfileInput:
             self.fd = -1
 
 
+SDK_POLICY_MEMBER = "herdr-sdk-policy.json"
+MANAGED_SENTINEL = Path("/run/herdr/policy-code/no-managed-scope")
+
+
+def _closed_json(raw: bytes, reason: str) -> dict:
+    def pairs(entries):
+        result = {}
+        for key, value in entries:
+            _need(key not in result, reason)
+            result[key] = value
+        return result
+    def constant(value):
+        raise PrivateProfileError(reason)
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs, parse_constant=constant)
+    except (UnicodeError, ValueError, TypeError):
+        raise PrivateProfileError(reason) from None
+    _need(type(value) is dict, reason)
+    return value
+
+
+def verified_profile_identity(value) -> dict:
+    _need(isinstance(value, dict) and set(value) == {"name", "files", "manifest_sha256"},
+          "private_sdk_manifest_invalid")
+    expected = profile_identity(value["name"], value["files"])
+    _need(value == expected, "private_sdk_manifest_invalid")
+    return expected
+
+
+@dataclass(frozen=True)
+class PrivateSDKPolicy:
+    """Nonsecret data from an authenticated, mounted ApprovedProfile manifest.
+
+    Constructing this value is not approval. Only the verified bootstrap consumer
+    installs it; host callers derive it from their actual sealed snapshot.
+    """
+    profile_name: str
+    profile_sha256: str
+    config_sha256: str
+
+    def __post_init__(self):
+        _need(isinstance(self.profile_name, str) and bool(_PROFILE.fullmatch(self.profile_name))
+              and all(isinstance(x, str) and bool(_HEX.fullmatch(x))
+                      for x in (self.profile_sha256, self.config_sha256)), "private_sdk_policy_invalid")
+
+    @property
+    def profile_home(self):
+        return _HOME / ".hermes/profiles" / self.profile_name
+
+    def reassert(self):
+        try:
+            os.lstat(MANAGED_SENTINEL)
+        except FileNotFoundError:
+            pass
+        else:
+            raise PrivateProfileError("private_sdk_managed_sentinel_present")
+        os.environ["HERMES_HOME"] = str(self.profile_home)
+        os.environ["HERMES_MANAGED_DIR"] = str(MANAGED_SENTINEL)
+
+    def verify_config_path(self, path):
+        _need(Path(path) == self.profile_home / "config.yaml", "private_sdk_config_path_changed")
+        fd = os.open(_HOME, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            member = _open_beneath(fd, ".hermes/profiles/" + self.profile_name + "/config.yaml")
+            try:
+                info = os.fstat(member)
+                _need(stat.S_ISREG(info.st_mode) and 0 < info.st_size <= _MAX_FILE_BYTES,
+                      "private_sdk_config_invalid")
+                raw = os.pread(member, info.st_size + 1, 0)
+                _need(len(raw) == info.st_size and hashlib.sha256(raw).hexdigest() == self.config_sha256,
+                      "private_sdk_config_changed")
+            finally:
+                os.close(member)
+        finally:
+            os.close(fd)
+
+
+def private_sdk_policy(approved_profile, policy_raw: bytes, config_raw: bytes) -> PrivateSDKPolicy:
+    approved = verified_profile_identity(approved_profile)
+    files = approved["files"]
+    _need(SDK_POLICY_MEMBER in files and "config.yaml" in files
+          and 0 < len(policy_raw) <= 4096 and 0 < len(config_raw) <= _MAX_FILE_BYTES
+          and hashlib.sha256(policy_raw).hexdigest() == files[SDK_POLICY_MEMBER]
+          and hashlib.sha256(config_raw).hexdigest() == files["config.yaml"], "private_sdk_input_changed")
+    policy = _closed_json(policy_raw, "private_sdk_policy_invalid")
+    _need(set(policy) == {"schema_version", "managed_scope", "fallback_chain"}
+          and type(policy["schema_version"]) is int and policy["schema_version"] == 1
+          and policy["managed_scope"] == "none" and policy["fallback_chain"] == "empty",
+          "private_sdk_policy_invalid")
+    config = _closed_json(config_raw, "private_sdk_config_json_required")
+    _need(all(key in config and type(config[key]) is list and not config[key]
+              for key in ("fallback_providers", "fallback_model")), "private_sdk_fallback_not_empty")
+    return PrivateSDKPolicy(approved["name"], approved["manifest_sha256"], files["config.yaml"])
+
+
 @dataclass
 class PrivateProfileSnapshot:
     name: str
@@ -187,13 +282,24 @@ class PrivateProfileSnapshot:
                         raw[:] = bytes(len(raw))
                 finally:
                     os.close(source)
-            return cls(name, tuple(copies), home)
+            snapshot = cls(name, tuple(copies), home)
+            snapshot.sdk_policy()  # A present invalid policy member never becomes legacy.
+            return snapshot
         except BaseException:
             for item in copies:
                 item.close()
             raise
         finally:
             os.close(root_fd)
+
+    def sdk_policy(self):
+        self.verify()
+        files = {item.relative: item for item in self.files}
+        if SDK_POLICY_MEMBER not in files:
+            return None
+        policy, config = files[SDK_POLICY_MEMBER], files["config.yaml"]
+        return private_sdk_policy(self.identity, os.pread(policy.fd, policy.size + 1, 0),
+                                  os.pread(config.fd, config.size + 1, 0))
 
     @property
     def identity(self) -> dict[str, object]:

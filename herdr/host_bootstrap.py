@@ -93,6 +93,16 @@ class _DurableBootstrapAuthority(BootstrapAuthority):
             raise BootstrapAuthorityError("durable bootstrap publication failed") from exc
 
 
+def bootstrap_proof(identity, trees, *, approved_profile=None):
+    value = {"schema_version": "herdr-policy-bootstrap-1", "authority": "herdr-host-frozen-tree",
+             "identity": identity.to_json(), "trees": trees}
+    if approved_profile is not None:
+        from .private_profile_namespace import verified_profile_identity
+        value["schema_version"] = "herdr-policy-bootstrap-2"
+        value["approved_profile"] = verified_profile_identity(approved_profile)
+    return json.loads(canonical_json_bytes(value))
+
+
 class HostBootstrap:
     def __init__(self, launch, tree, proof, listener, socket_path, socket_fd):
         self.launch, self.tree, self.proof = launch, tree, proof
@@ -128,11 +138,15 @@ class HostBootstrap:
         shim, _, _ = read_frozen_file(code, SHIM_SOURCE)
         stage1, _, _ = read_frozen_file(code, STAGE1_SOURCE)
         read_frozen_file(code, STAGE2_SOURCE)
-        proof = {"schema_version": "herdr-policy-bootstrap-1",
-                 "authority": "herdr-host-frozen-tree", "identity": launch.identity.to_json(),
-                 "trees": {str(tree.target): {"device": tree.device, "inode": tree.inode,
-                           "source_digest": tree.source_digest, "snapshot_kind": "host-frozen-copy"}
-                           for tree in (code, *runtime)}}
+        profile = getattr(launch, "private_profile_snapshot", None)
+        if profile is not None:
+            profile.verify()
+            profile.sdk_policy()
+        proof = bootstrap_proof(launch.identity,
+            {str(tree.target): {"device": tree.device, "inode": tree.inode,
+             "source_digest": tree.source_digest, "snapshot_kind": "host-frozen-copy"}
+             for tree in (code, *runtime)},
+            approved_profile=profile.identity if profile is not None else None)
         source = Path(tempfile.mkdtemp(prefix="bootstrap-source-", dir=storage))
         tree = listener = socket_fd = socket_dir = None
         try:
@@ -201,6 +215,11 @@ class HostBootstrap:
         self.launch.mount.verify_mounted(shell_pid, self.launch.sealed)
         self._shell_pid, self._shell_ticks = shell_pid, process_start_ticks(shell_pid)
         self._attestation = json.loads(canonical_json_bytes(attestation))
+        profile = getattr(self.launch, "private_profile_snapshot", None)
+        approved = profile.identity if profile is not None else None
+        _require(self.proof.get("approved_profile") == approved
+                 and attestation.get("approved_profile") == approved,
+                 "bootstrap approved profile differs from sealed launch")
         python = next(tree for tree in self.launch.mount.runtime if tree.target == PYTHON_TARGET)
         pyraw, pydev, pyino = read_frozen_file(python, PYTHON_EXECUTABLE, 268_435_456)
         # Execute the approved code-tree inode, never the mutable transport copy.
@@ -344,6 +363,25 @@ def _read_regular(path, limit):
     finally: os.close(fd)
 
 
+def retained_bootstrap_proof(evidence, identity, raw):
+    """Reconstruct the closed proof from retained host evidence, not caller fields."""
+    from .policy_launch import CODE_TARGET
+    actual=json.loads(raw)
+    version=actual.get("schema_version") if isinstance(actual,dict) else None
+    _require(version in {"herdr-policy-bootstrap-1","herdr-policy-bootstrap-2"},
+             "retained bootstrap version unsupported")
+    approved=evidence.get("approved_profile") if version=="herdr-policy-bootstrap-2" else None
+    _require(version!="herdr-policy-bootstrap-2" or approved is not None,
+             "retained bootstrap profile unavailable")
+    # Historical private v1 remains readable, but cannot authorize the new SDK policy.
+    expected_proof=bootstrap_proof(identity,{
+        path:{**node,"source_digest":evidence["code_sha256"] if path==str(CODE_TARGET)
+              else evidence["runtime_sha256"][path],"snapshot_kind":"host-frozen-copy"}
+        for path,node in evidence["tree_identities"].items()},approved_profile=approved)
+    _require(raw==canonical_json_bytes(expected_proof), "retained bootstrap profile/identity mismatch")
+    return expected_proof
+
+
 def verify_retained_bootstrap(proof, *, identity, shell_pid):
     """Reopen the actual authenticated agent, fixed bootstrap and source bytes."""
     from .policy_launch import mount_rows,process_start_ticks,CODE_TARGET,IDENTITY_ENV
@@ -376,12 +414,8 @@ def verify_retained_bootstrap(proof, *, identity, shell_pid):
     _require(set(inventory)=={"hermes","agent-hermes-policy-stage1","immutable-trees.json"}
              and hashlib.sha256(canonical_json_bytes(dict(sorted(inventory.items())))).hexdigest()==tree["source_digest"],
              "retained bootstrap bytes changed")
-    expected_proof={"schema_version":"herdr-policy-bootstrap-1","authority":"herdr-host-frozen-tree",
-        "identity":identity.to_json(),"trees":{
-            path:{**node,"source_digest":proof["code_sha256"] if path==str(CODE_TARGET)
-                  else proof["runtime_sha256"][path],"snapshot_kind":"host-frozen-copy"}
-            for path,node in proof["tree_identities"].items()}}
     raw,_=_read_regular(base/"immutable-trees.json",65536)
+    expected_proof=retained_bootstrap_proof(proof,identity,raw)
     _require(raw==canonical_json_bytes(expected_proof)
              and inventory["immutable-trees.json"]==receipt.proof_sha256
              and inventory["agent-hermes-policy-stage1"]==receipt.stage1_sha256
