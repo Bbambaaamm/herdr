@@ -249,10 +249,12 @@ _POLICY_ENV = {
 }
 
 
-def _reassert_policy_environment() -> None:
+def _reassert_policy_environment(private_sdk_policy=None) -> None:
     import os
     for key, value in _POLICY_ENV.items():
         os.environ[key] = value
+    if private_sdk_policy is not None:
+        private_sdk_policy.reassert()
 
 
 def _require_local_backend(env_type: Any, env: Any | None = None) -> None:
@@ -570,14 +572,93 @@ class GuardInstallation:
         self.installed = False
 
 
-def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
+def _install_dotenv_environment(installation, private_sdk_policy=None):
+    from hermes_cli import env_loader
+    # Policy suppression is authority, not user config. Hermes reloads profile
+    # dotenv files with override=True after profile selection, so reassert the
+    # protected values after every dotenv layer and disable plugin discovery at
+    # the manager method itself. A .env cannot turn policy mode back off.
+    _reassert_policy_environment(private_sdk_policy)
+    original_dotenv_layer = env_loader._load_dotenv_with_fallback
+    @functools.wraps(original_dotenv_layer)
+    def guarded_dotenv_layer(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return original_dotenv_layer(*args, **kwargs)
+        finally:
+            _reassert_policy_environment(private_sdk_policy)
+    installation._remember(env_loader, "_load_dotenv_with_fallback", guarded_dotenv_layer)
+
+    original_dotenv_load = env_loader.load_hermes_dotenv
+    @functools.wraps(original_dotenv_load)
+    def guarded_dotenv_load(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return original_dotenv_load(*args, **kwargs)
+        finally:
+            _reassert_policy_environment(private_sdk_policy)
+    installation._remember(env_loader, "load_hermes_dotenv", guarded_dotenv_load)
+
+
+
+def _install_private_sdk_configuration(installation, policy):
+    from hermes_cli import config, managed_scope
+    original_managed = managed_scope.get_managed_dir
+    original_path = config.get_config_path
+
+    @functools.wraps(original_managed)
+    def private_managed_dir():
+        policy.reassert()
+        if original_managed() is not None:
+            raise PolicyDenied("private_sdk_managed_scope_changed")
+        return None
+
+    @functools.wraps(original_path)
+    def private_config_path():
+        policy.reassert()
+        path = original_path()
+        policy.verify_config_path(path)
+        return path
+
+    installation._remember(managed_scope, "get_managed_dir", private_managed_dir)
+    installation._remember(config, "get_config_path", private_config_path)
+
+
+def _check_private_sdk_agent(policy, agent):
+    from hermes_cli import config
+    policy.reassert()
+    policy.verify_config_path(config.get_config_path())
+    chain = getattr(agent, "_fallback_chain", None)
+    if type(chain) is not list or chain:
+        raise PolicyDenied("private_sdk_fallback_not_empty")
+
+
+def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None) -> GuardInstallation:
     """Install #76 authority at all audited Hermes v0.21.5 execution seams.
 
     This must run before the model is allowed to issue tool calls.  Plugin
     pre_tool_call is intentionally *not* relied on: callers may set skip flags
     and middleware failures are fail-open in the audited Hermes version.
     """
-    surface = inspect_hermes_security_surface()
+    installation = None
+    if private_sdk_policy is not None:
+        from .private_profile_namespace import PrivateSDKPolicy
+        if not isinstance(private_sdk_policy, PrivateSDKPolicy):
+            raise PolicyDenied("private_sdk_policy_unverified")
+        private_sdk_policy.reassert()
+        installation = GuardInstallation(guard=guard)
+        try:
+            # Protect import-time dotenv/config reads before model_tools or tools
+            # can import/cache configuration. env_loader is the definition-only seam.
+            _install_dotenv_environment(installation, private_sdk_policy)
+            _install_private_sdk_configuration(installation, private_sdk_policy)
+        except BaseException:
+            installation.uninstall()
+            raise
+    try:
+        surface = inspect_hermes_security_surface()
+    except BaseException:
+        if installation is not None:
+            installation.uninstall()
+        raise
 
     import model_tools
     from agent import auxiliary_client, conversation_loop, turn_api_call, tool_executor
@@ -593,7 +674,10 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
     guard.path_resolver = lambda value, task_id: _resolve_path_for_task(
         value, task_id
     )
-    installation = GuardInstallation(guard=guard, surface=surface)
+    if installation is None:
+        installation = GuardInstallation(guard=guard, surface=surface)
+    else:
+        installation.surface = surface
 
     # Pin local file authority to the granted directory inodes. Hermes may keep
     # its higher-level formatting/search helpers, but physical read/write/patch
@@ -660,31 +744,11 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
         installation._remember(file_tools, "_special_file_kind", lambda path: None)
         installation.finalizers.append(file_workspace.close)
 
-    # Policy suppression is authority, not user config. Hermes reloads profile
-    # dotenv files with override=True after profile selection, so reassert the
-    # protected values after every dotenv layer and disable plugin discovery at
-    # the manager method itself. A .env cannot turn policy mode back off.
-    _reassert_policy_environment()
-    original_dotenv_layer = env_loader._load_dotenv_with_fallback
-    @functools.wraps(original_dotenv_layer)
-    def guarded_dotenv_layer(*args: Any, **kwargs: Any) -> Any:
-        try:
-            return original_dotenv_layer(*args, **kwargs)
-        finally:
-            _reassert_policy_environment()
-    installation._remember(env_loader, "_load_dotenv_with_fallback", guarded_dotenv_layer)
-
-    original_dotenv_load = env_loader.load_hermes_dotenv
-    @functools.wraps(original_dotenv_load)
-    def guarded_dotenv_load(*args: Any, **kwargs: Any) -> Any:
-        try:
-            return original_dotenv_load(*args, **kwargs)
-        finally:
-            _reassert_policy_environment()
-    installation._remember(env_loader, "load_hermes_dotenv", guarded_dotenv_load)
+    if private_sdk_policy is None:
+        _install_dotenv_environment(installation)
 
     def disabled_plugin_discovery(self: Any, force: bool = False) -> None:
-        _reassert_policy_environment()
+        _reassert_policy_environment(private_sdk_policy)
         self._discovered = True
         return None
     installation._remember(plugins.PluginManager, "discover_and_load", disabled_plugin_discovery)
@@ -885,6 +949,8 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
 
     @functools.wraps(original_perform)
     def guarded_perform(agent: Any, *args: Any, **kwargs: Any) -> Any:
+        if private_sdk_policy is not None:
+            _check_private_sdk_agent(private_sdk_policy, agent)
         authorize_agent_provider(agent)
         token = _ACTIVE_AGENT.set(agent)
         budgeted=False

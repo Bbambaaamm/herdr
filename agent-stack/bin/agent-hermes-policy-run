@@ -200,6 +200,7 @@ def _require_stage1_continuity() -> None:
     rows = stage1._mount_rows()
     stage1._require_exact_ro_tree(BOOTSTRAP_ROOT, rows)
     stage1._verify_trees(proof, rows)
+    return proof
 
 
 def _raw_identity_from_env() -> dict[str, object]:
@@ -628,11 +629,70 @@ def _native_hermes_process_label():
             checked(15, old)
 
 
+def _verified_private_sdk_policy(proof, hermes_args):
+    """Only a host-authenticated v2 manifest may enable private SDK configuration."""
+    if not isinstance(proof, dict):
+        raise SystemExit("verified bootstrap proof unavailable")
+    if proof.get("schema_version") == "herdr-policy-bootstrap-1":
+        return None  # Historical private/legacy proof cannot opt in by file presence.
+    if proof.get("schema_version") != "herdr-policy-bootstrap-2":
+        raise SystemExit("verified bootstrap proof version unsupported")
+    from herdr.private_profile_namespace import (
+        _HOME, _MAX_FILE_BYTES, _open_beneath, SDK_POLICY_MEMBER,
+        PrivateProfileError, verified_profile_identity, private_sdk_policy,
+    )
+    _require_module_origin(sys.modules["herdr.private_profile_namespace"], POLICY_CODE_ROOT,
+                           "herdr.private_profile_namespace")
+    try:
+        approved = verified_profile_identity(proof["approved_profile"])
+        if SDK_POLICY_MEMBER not in approved["files"]:
+            return None
+        selected = []
+        for index, arg in enumerate(hermes_args):
+            if arg in ("-p", "--profile"):
+                if index + 1 >= len(hermes_args):
+                    raise PrivateProfileError("private_sdk_profile_argument_invalid")
+                selected.append(hermes_args[index + 1])
+            elif arg.startswith("--profile="):
+                selected.append(arg.split("=", 1)[1])
+        if selected != [approved["name"]]:
+            raise PrivateProfileError("private_sdk_profile_argument_changed")
+        mount, modes = _covering_mount(_HOME)
+        if mount != _HOME or "ro" not in modes or _mountpoint_count(_HOME) != 1:
+            raise PrivateProfileError("private_sdk_home_not_private_readonly")
+        base = _HOME / ".hermes/profiles" / approved["name"]
+        values = {}
+        fd = os.open(_HOME, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            for name in (SDK_POLICY_MEMBER, "config.yaml"):
+                path = base / name
+                _require_production_mount(path, exact=True)
+                member = _open_beneath(fd, ".hermes/profiles/" + approved["name"] + "/" + name)
+                try:
+                    info = os.fstat(member)
+                    limit = 4096 if name == SDK_POLICY_MEMBER else _MAX_FILE_BYTES
+                    if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= limit:
+                        raise PrivateProfileError("private_sdk_member_invalid")
+                    values[name] = os.pread(member, info.st_size + 1, 0)
+                    if len(values[name]) != info.st_size:
+                        raise PrivateProfileError("private_sdk_member_changed")
+                finally:
+                    os.close(member)
+        finally:
+            os.close(fd)
+        policy = private_sdk_policy(approved, values[SDK_POLICY_MEMBER], values["config.yaml"])
+        _require_production_mount(POLICY_CODE_ROOT, exact=True)
+        policy.reassert()  # Sentinel is absent below the verified, nonshadowable RO code tree.
+        return policy
+    except (PrivateProfileError, KeyError, OSError, TypeError, ValueError):
+        raise SystemExit("authenticated private SDK configuration rejected") from None
+
+
 def bootstrap(hermes_args: list[str]) -> int:
     """Every entry uses the fixed authenticated production path."""
     bundle_path,policy_code_root,hermes_root=BUNDLE_PATH,POLICY_CODE_ROOT,HERMES_ROOT
     _require_host_bootstrap_authority()
-    _require_stage1_continuity()
+    bootstrap_proof = _require_stage1_continuity()
     _require_production_mount(bundle_path, exact=True)
     _require_production_mount(policy_code_root, exact=True)
     _require_production_mount(hermes_root, exact=True)
@@ -643,6 +703,7 @@ def bootstrap(hermes_args: list[str]) -> int:
     executor = _verify_hermes_build(hermes_root)
 
     _reset_import_path(policy_code_root, hermes_root)
+    private_sdk_policy = _verified_private_sdk_policy(bootstrap_proof, hermes_args)
 
     # Policy mode executes only the hashed Hermes core/import surface. Disable
     # directory, project and entry-point plugin discovery before importing any
@@ -673,7 +734,10 @@ def bootstrap(hermes_args: list[str]) -> int:
     except (security_module.SecurityError, KeyError, TypeError, ValueError) as exc:
         raise SystemExit(f"signed Herdr grant rejected: {exc}") from exc
 
-    guard_module.install_hermes_guard(guard)
+    if private_sdk_policy is None:
+        guard_module.install_hermes_guard(guard)
+    else:
+        guard_module.install_hermes_guard(guard, private_sdk_policy=private_sdk_policy)
 
     # Hermes consumes profile flags while its CLI module is imported.
     # Set the approved argv first and retain the module's consumed argv.

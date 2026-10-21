@@ -358,11 +358,13 @@ def _physical(plan, argv, grant, profile, fds, raw):
                 try:
                     require(os.fstat(child).st_size <= 65536, "bootstrap proof exceeds bound")
                     proof = json.loads(os.pread(child, 65537, 0))
-                    require(proof == {"schema_version": "herdr-policy-bootstrap-1",
-                            "authority": "herdr-host-frozen-tree", "identity": grant.identity.to_json(),
-                            "trees": {target: {"device": tree.device, "inode": tree.inode,
+                    from .host_bootstrap import bootstrap_proof
+                    approved = host._private_profile(raw["private_launch"])[0].identity
+                    require(proof == bootstrap_proof(grant.identity,
+                            {target: {"device": tree.device, "inode": tree.inode,
                                 "source_digest": tree.source_digest, "snapshot_kind": "host-frozen-copy"}
-                                for target, tree in known.items()}}, "bootstrap transport proof differs")
+                                for target, tree in known.items()}, approved_profile=approved),
+                            "bootstrap transport proof differs")
                 finally: os.close(child)
                 special.add(target)
             elif kind == "socket" and target == "/run/herdr-policy/bootstrap-authority.sock":

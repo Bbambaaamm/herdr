@@ -194,6 +194,28 @@ def _canonical(value: object) -> bytes:
         _fail("bootstrap proof is not canonical JSON")
 
 
+def _validate_profile_identity(value):
+    # Independent system-stdlib validation before importing the verified code tree.
+    if not isinstance(value, dict) or set(value) != {"name", "files", "manifest_sha256"}:
+        _fail("bootstrap approved profile malformed")
+    name, files = value["name"], value["files"]
+    if (not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", name)
+            or not isinstance(files, dict) or not 2 <= len(files) <= 16
+            or not {"config.yaml", ".env"} <= set(files)):
+        _fail("bootstrap approved profile malformed")
+    for path, digest in files.items():
+        if (not isinstance(path, str) or not 0 < len(path) <= 256
+                or path.startswith("/") or "\\" in path or len(path.split("/")) > 8
+                or any(part in ("", ".", "..") or len(part) > 80 for part in path.split("/"))
+                or path.split("/")[0] in {"sessions", "logs", "cache", "pastes", "state.db",
+                                           ".hermes_history", "state.db-wal", "state.db-shm"}
+                or not isinstance(digest, str) or not _SHA.fullmatch(digest)):
+            _fail("bootstrap approved profile malformed")
+    raw = _canonical({"name": name, "files": dict(sorted(files.items()))})
+    if len(raw) > 8192 or value["manifest_sha256"] != hashlib.sha256(raw).hexdigest():
+        _fail("bootstrap approved profile digest mismatch")
+
+
 def _read_proof(path: Path = PROOF_PATH) -> tuple[dict, bytes]:
     raw = _read_regular(path, MAX_PROOF)
     try:
@@ -201,10 +223,15 @@ def _read_proof(path: Path = PROOF_PATH) -> tuple[dict, bytes]:
     except (UnicodeDecodeError, json.JSONDecodeError):
         _fail("bootstrap proof malformed")
     expected_keys = {"schema_version", "authority", "identity", "trees"}
+    version = proof.get("schema_version") if isinstance(proof, dict) else None
+    if version == "herdr-policy-bootstrap-2":
+        expected_keys.add("approved_profile")
     if not isinstance(proof, dict) or set(proof) != expected_keys:
         _fail("bootstrap proof fields differ")
-    if proof["schema_version"] != PROOF_VERSION or proof["authority"] != PROOF_AUTHORITY:
+    if version not in (PROOF_VERSION, "herdr-policy-bootstrap-2") or proof["authority"] != PROOF_AUTHORITY:
         _fail("bootstrap proof authority/version mismatch")
+    if version == "herdr-policy-bootstrap-2":
+        _validate_profile_identity(proof["approved_profile"])
     identity = proof["identity"]
     if identity != _identity_from_env():
         _fail("bootstrap proof identity mismatch")

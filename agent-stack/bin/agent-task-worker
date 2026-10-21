@@ -938,6 +938,8 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         private_snapshot = getattr(launch, "private_profile_snapshot", None)
         if private_snapshot is not None and private_snapshot.name != profile:
             raise RuntimeError("task_approved_profile_identity_mismatch")
+        from herdr.work_configuration import reviewed_root_model_arguments
+        root_model_args = reviewed_root_model_arguments(work_factory, private_snapshot)
         # Approved profile was refreshed/validated *before* it was sealed by
         # the trusted host factory. A late refresh here would leave the sealed
         # snapshot stale; retain legacy preflight only for legacy launches.
@@ -1072,6 +1074,8 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         def publish_continuation(evidence):
             if work_factory is not None:
                 bind_reviewed_parent(work_factory, task, launch, evidence=evidence, recheck=True)
+                if reviewed_root_model_arguments(work_factory, private_snapshot) != root_model_args:
+                    raise RuntimeError("task_original_root_model_changed")
             session["invocation_policy"]=evidence
             persist_execution_session(task)
             return True
@@ -1082,7 +1086,7 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         persist_execution_session(task)
         started = start_sandbox_agent(
             _herdr_json, pane_id, pane_marker, sandbox_pid, agent_name,
-            ["-p", profile, "chat", "--continue", session_name, "--create-if-missing",
+            ["-p", profile, "chat", *root_model_args, "--continue", session_name, "--create-if-missing",
              "--in", workspace, "--toolsets",
              __import__("herdr.runtime", fromlist=["_child_toolsets"])._child_toolsets(
                  tuple(task.get("parent_tools") or ()), allow_delegation=True)],

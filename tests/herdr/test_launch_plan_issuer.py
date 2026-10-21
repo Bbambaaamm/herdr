@@ -361,9 +361,10 @@ def physical(live, monkeypatch):
             return replace(tree, fd=os.dup(tree.fd))
         return SimpleNamespace(freeze=freeze)
     monkeypatch.setattr(host, "_tree", definition)  # Root protection only is doubled; byte/FD verification remains real.
-    proof = {"schema_version": "herdr-policy-bootstrap-1", "authority": "herdr-host-frozen-tree",
-             "identity": live.launch.identity.to_json(), "trees": {str(t.target): {"device": t.device,
-             "inode": t.inode, "source_digest": t.source_digest, "snapshot_kind": "host-frozen-copy"} for t in trees}}
+    from herdr.host_bootstrap import bootstrap_proof
+    proof = bootstrap_proof(live.launch.identity, {str(t.target): {"device": t.device,
+             "inode": t.inode, "source_digest": t.source_digest, "snapshot_kind": "host-frozen-copy"} for t in trees},
+             approved_profile=host._private_profile(raw["private_launch"])[0].identity)
     source = live.proposals.parent / "bootstrap-fixture"; source.mkdir()
     _, bootstrap = frozen(source, target=Path("/run/herdr-bootstrap"), files={"hermes": b"shim",
                          "agent-hermes-policy-stage1": b"stage1", "immutable-trees.json": canonical_json_bytes(proof)})
@@ -896,3 +897,25 @@ def test_root_workspace_mode_cannot_bypass_private_or_child_admission(tmp_path, 
     from tests.herdr.test_policy_launch import sandbox_module
     with pytest.raises(RuntimeError, match="private_root_workspace_mode_required"):
         sandbox_module().command(tmp_path, tmp_path / "absent", **options)
+
+
+@pytest.mark.parametrize("fault", ["legacy-v1", "different-profile", "manifest-sha", "unknown-field"])
+def test_new_private_issuer_binds_profile_from_root_policy_not_transport(physical, fault):
+    p = physical
+    path = p.bootstrap.path / "immutable-trees.json"
+    proof = json.loads(path.read_bytes())
+    assert proof["schema_version"] == "herdr-policy-bootstrap-2"
+    if fault == "legacy-v1":
+        proof["schema_version"] = "herdr-policy-bootstrap-1"
+        proof.pop("approved_profile")
+    elif fault == "different-profile":
+        from herdr.private_profile_namespace import profile_identity
+        proof["approved_profile"] = profile_identity("other", proof["approved_profile"]["files"])
+    elif fault == "manifest-sha":
+        proof["approved_profile"]["manifest_sha256"] = "f" * 64
+    else:
+        proof["approved_profile"]["unapproved"] = True
+    path.chmod(0o600)
+    path.write_bytes(canonical_json_bytes(proof))
+    with pytest.raises(SecurityError, match="bootstrap transport proof differs"):
+        issuer._physical(p.plan, p.argv, p.grant, p.profile, p.fds, p.raw)
