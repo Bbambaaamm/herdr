@@ -24,7 +24,6 @@ from typing import Any
 
 BUNDLE_PATH = Path("/run/herdr-policy/grant.bundle.json")
 BOOTSTRAP_ROOT = Path("/run/herdr-bootstrap")
-BOOTSTRAP_STAGE1 = BOOTSTRAP_ROOT / "agent-hermes-policy-stage1"
 BOOTSTRAP_PROOF = BOOTSTRAP_ROOT / "immutable-trees.json"
 STAGE1_PROOF_ENV = "HERDR_POLICY_STAGE1_PROOF_SHA256"
 STAGE2_FD_ENV = "HERDR_VERIFIED_STAGE2_FD"
@@ -32,9 +31,13 @@ BOOTSTRAP_AUTH_FD_ENV = "HERDR_BOOTSTRAP_AUTH_FD"
 MAX_AUTH_RESPONSE = 128
 MAX_BUNDLE = 2 * 1024 * 1024
 POLICY_CODE_ROOT = Path("/run/herdr/policy-code")
+BOOTSTRAP_STAGE1 = POLICY_CODE_ROOT / "agent-stack/bin/agent-hermes-policy-stage1"
 HERMES_ROOT = Path("/home/agentops/.hermes/hermes-agent")
 HERMES_HEAD = "ee5ee84a345204a3b1d6ef6ba1ab747e602867b9"
 HERMES_SOURCE_SHA256 = "525219e866137f43c8c8b068488e07d97f14529d2d67497cd52fbfd1197da4f4"
+HERMES_INVENTORY_PATH = POLICY_CODE_ROOT / "herdr/hermes_source_inventory.json"
+HERMES_INVENTORY_SHA256 = "8ff6ff1a3ef0160b7930da71a503f6401b0b8dcb26117756fc8db0c9cabc5803"
+MAX_HERMES_INVENTORY = 1_048_576
 PYTHON_PATH = Path("/home/agentops/.local/share/uv/python/cpython-3.11.16-linux-x86_64-gnu/bin/python3.11")
 PYTHON_ROOT = PYTHON_PATH.parents[1]
 PYTHON_SHA256 = "1e761eb19d6f2594ab8dc64bd99ad4e1753589f3bf1ec199e4eef3aaa21e3930"
@@ -148,6 +151,8 @@ def _require_production_mount(path: Path, *, exact: bool = False) -> None:
 
 
 def _load_stage1_module() -> Any:
+    _require_production_mount(POLICY_CODE_ROOT, exact=True)
+    _require_startup_pycache_prefix()
     if BOOTSTRAP_STAGE1.is_symlink() or not BOOTSTRAP_STAGE1.is_file():
         raise SystemExit("immutable stage-one unavailable")
     loader = importlib.machinery.SourceFileLoader("herdr_policy_stage1_verified", str(BOOTSTRAP_STAGE1))
@@ -156,7 +161,7 @@ def _load_stage1_module() -> Any:
         raise SystemExit("immutable stage-one import unavailable")
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
-    _require_module_origin(module, BOOTSTRAP_ROOT, "policy stage-one")
+    _require_module_origin(module, POLICY_CODE_ROOT, "policy stage-one")
     return module
 
 
@@ -341,14 +346,14 @@ def _verified_interpreter_fd() -> int:
 
 
 def _fresh_startup_pycache_prefix() -> str:
-    prefix = BOOTSTRAP_ROOT / "no-bytecode-cache"
+    prefix = POLICY_CODE_ROOT / "no-bytecode-cache"
     if os.path.lexists(prefix):
         raise SystemExit("immutable startup cache prefix must remain absent")
     return str(prefix)
 
 
 def _require_startup_pycache_prefix() -> None:
-    prefix = str(BOOTSTRAP_ROOT / "no-bytecode-cache")
+    prefix = str(POLICY_CODE_ROOT / "no-bytecode-cache")
     if sys.pycache_prefix != prefix:
         raise SystemExit("immutable startup pycache prefix is required")
     if os.path.lexists(prefix):
@@ -419,43 +424,79 @@ def _require_module_origin(module: Any, root: Path, label: str) -> None:
         raise SystemExit(f"{label} import escaped trusted root")
 
 
-def _verify_hermes_build(root: Path) -> str:
-    """Verify actual tracked source against the pinned clean Git build before import."""
+def _hermes_source_inventory() -> dict[str, Any]:
+    """Read only the exact reviewed inventory from the immutable policy code."""
+    fd = os.open(HERMES_INVENTORY_PATH, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     try:
-        project = (root / "pyproject.toml").read_text(encoding="utf-8")
-        version = re.search(r'(?m)^version = "([^"]+)"$', project).group(1)
-        env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent",
-               "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
-               "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_OPTIONAL_LOCKS": "0",
-               "GIT_NO_REPLACE_OBJECTS": "1", "GIT_ATTR_NOSYSTEM": "1"}
-        command = ["/usr/bin/git", "-c", "core.fsmonitor=false",
-                   "-c", "core.untrackedCache=false", "-c", "core.hooksPath=/dev/null",
-                   "-C", str(root)]
-        def git(*args: str) -> str:
-            return subprocess.run([*command, *args],
-                                  env=env, capture_output=True, text=True,
-                                  check=True, timeout=30).stdout.strip()
-        head = git("rev-parse", "HEAD")
-        if head != HERMES_HEAD:
-            raise ValueError("Hermes revision changed")
-        names = subprocess.run([*command, "ls-files", "-z"],
-                               env=env, capture_output=True, check=True, timeout=30).stdout
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= MAX_HERMES_INVENTORY:
+            raise ValueError("Hermes source inventory file invalid")
+        raw = bytearray()
+        while len(raw) <= MAX_HERMES_INVENTORY:
+            chunk = os.read(fd, min(65536, MAX_HERMES_INVENTORY + 1 - len(raw)))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        if len(raw) > MAX_HERMES_INVENTORY or hashlib.sha256(raw).hexdigest() != HERMES_INVENTORY_SHA256:
+            raise ValueError("Hermes source inventory differs from reviewed pin")
+    finally:
+        os.close(fd)
+    data = json.loads(raw)
+    if (not isinstance(data, dict)
+            or set(data) != {"schema_version", "revision", "version", "source_sha256", "files"}
+            or data["schema_version"] != "herdr-hermes-source-inventory-1"
+            or data["revision"] != HERMES_HEAD
+            or f"hermes:{data['version']}:sha256:{data['source_sha256']}" != _SOURCE_EXECUTOR):
+        raise ValueError("Hermes source inventory identity invalid")
+    names = data["files"]
+    if not isinstance(names, list) or not 2 <= len(names) <= 20000:
+        raise ValueError("Hermes source inventory count invalid")
+    excluded = {"venv", ".git", "__pycache__", "node_modules"}
+    for name in names:
+        if (not isinstance(name, str) or not 0 < len(name) <= 1024
+                or name.startswith("/") or "\\" in name
+                or any(ord(char) < 32 or ord(char) == 127 for char in name)
+                or len(name.split("/")) > 32
+                or any(part in {"", ".", ".."} | excluded for part in name.split("/"))):
+            raise ValueError("Hermes source inventory path invalid")
+    if names != sorted(set(names), key=os.fsencode) or "pyproject.toml" not in names:
+        raise ValueError("Hermes source inventory order or uniqueness invalid")
+    return data
+
+
+def _verify_hermes_build(root: Path) -> str:
+    """Verify pinned source bytes without executable Git metadata in the runtime."""
+    try:
+        inventory = _hermes_source_inventory()
+        if root.resolve(strict=True) != root or not root.is_dir():
+            raise ValueError("Hermes source root alias denied")
         digest = hashlib.sha256()
-        tracked = set()
-        for name in names.split(b"\0"):
-            if name:
-                tracked.add(os.fsdecode(name))
-                digest.update(name + b"\0")
-                digest.update(hashlib.sha256((root / os.fsdecode(name)).read_bytes()).digest())
-        if git("status", "--porcelain", "--untracked-files=all"):
-            raise ValueError("Hermes source tree is not clean")
-        for path in root.rglob("*"):
-            relative = path.relative_to(root)
-            if any(part in {"venv", ".git", "__pycache__", "node_modules"} for part in relative.parts):
-                continue
-            if path.suffix in {".py", ".pyc", ".so", ".pth"} and relative.as_posix() not in tracked:
-                raise ValueError("untracked importable Hermes file")
-    except (OSError, AttributeError, ValueError, subprocess.SubprocessError) as exc:
+        tracked = set(inventory["files"])
+        for name in inventory["files"]:
+            path = root / name
+            if path.parent.resolve(strict=True) != path.parent:
+                raise ValueError("Hermes tracked source parent alias denied")
+            digest.update(os.fsencode(name) + b"\0")
+            digest.update(bytes.fromhex(_sha256_regular_path(path, 128 * 1024 * 1024)))
+        project = (root / "pyproject.toml").read_text(encoding="utf-8")
+        version = re.search(r'(?m)^version = "([^\"]+)"$', project).group(1)
+        if version != inventory["version"]:
+            raise ValueError("Hermes source version changed")
+        # The separately pinned site-packages/stdlib and private pycache policy
+        # retain their existing checks. No repository hooks/config are executed.
+        excluded = {"venv", ".git", "__pycache__", "node_modules"}
+        for directory, dirs, files in os.walk(root, followlinks=False):
+            parent = Path(directory)
+            dirs[:] = [name for name in dirs if name not in excluded]
+            for name in dirs:
+                if (parent / name).is_symlink():
+                    raise ValueError("untracked Hermes directory alias denied")
+            for name in files:
+                path = parent / name
+                relative = path.relative_to(root)
+                if path.suffix in {".py", ".pyc", ".so", ".pth"} and relative.as_posix() not in tracked:
+                    raise ValueError("untracked importable Hermes file")
+    except (OSError, AttributeError, TypeError, ValueError, UnicodeError) as exc:
         raise SystemExit("cannot verify audited Hermes build") from exc
     actual = f"hermes:{version}:sha256:{digest.hexdigest()}"
     if actual != _SOURCE_EXECUTOR:
@@ -516,6 +557,28 @@ def _configure_ephemeral_sdk_state(hermes_root: Path) -> None:
         raise SystemExit("SDK state must be inside the private temporary mount")
     state = importlib.import_module("hermes_state")
     _require_module_origin(state, hermes_root, "hermes_state")
+    # Import after profile consumption so configuration and credentials are still
+    # loaded from the approved read-only home. The pinned CLI uses _hermes_home
+    # for paste files and interactive history, independently of SessionDB.
+    cli = importlib.import_module("cli")
+    _require_module_origin(cli, hermes_root, "cli")
+    # Native paste/history writes need a private home, but the SDK resolves
+    # prefill files later, after constructing HermesCLI. Anchor those reads to
+    # the already consumed approved profile before relocating the UI home.
+    approved_home = cli._hermes_home
+    original_prefill_resolver = cli._resolve_prefill_messages_file
+    if not isinstance(approved_home, Path) or not callable(original_prefill_resolver):
+        raise SystemExit("approved Hermes prefill root unavailable")
+
+    def approved_prefill_resolver(config):
+        raw = original_prefill_resolver(config)
+        if not raw:
+            return raw
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = approved_home / path
+        return str(path)
+
     try:
         directory.mkdir(mode=0o700)
         actual = directory.lstat()
@@ -528,6 +591,8 @@ def _configure_ephemeral_sdk_state(hermes_root: Path) -> None:
     # The pinned SDK resolves this override at each SessionDB acquisition.
     # Configuration, credentials and the host's session database stay read-only.
     state.DEFAULT_DB_PATH = directory / "state.db"
+    cli._resolve_prefill_messages_file = approved_prefill_resolver
+    cli._hermes_home = directory
 
 
 @contextmanager

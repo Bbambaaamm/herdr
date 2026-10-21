@@ -244,6 +244,22 @@ class SchedulerError(RuntimeError):
     pass
 
 
+def _replay_model_policy(event: Mapping[str, Any]) -> dict[str, Any]:
+    """New complete policy is authoritative; legacy absence keeps old defaults."""
+    if "model_policy" in event:
+        policy = event["model_policy"]
+        if not isinstance(policy, dict):
+            raise SchedulerError("invalid durable model policy")
+        for field in ("model", "fallback_model"):
+            if field in event and (type(event[field]) is not type(policy.get(field))
+                                   or event[field] != policy.get(field)):
+                raise SchedulerError("durable model policy projection mismatch")
+        return policy
+    fallback = event.get("fallback_model", "longcat")
+    return {"model": str(event["model"]) if event.get("model") else "laguna",
+            "fallback_model": None if fallback is None else str(fallback)}
+
+
 # ---------------------------------------------------------------------------
 # Audit log
 # ---------------------------------------------------------------------------
@@ -541,6 +557,7 @@ class DynamicChildScheduler:
             )
             self.audit_log.append(
                 {
+                    **node.to_json(),
                     "event": "submit",
                     "task_id": node.id,
                     "repo": repo,
@@ -577,6 +594,9 @@ class DynamicChildScheduler:
                 "issue": issue,
                 "node_count": len(graph.nodes),
                 "graph_hash": graph.graph_hash(),
+                "max_nodes": self._plan_max_nodes,
+                "max_depth": self._plan_max_depth,
+                "max_fanout": self._plan_max_fanout,
                 "ts": now,
             }
         )
@@ -1357,6 +1377,7 @@ class DynamicChildScheduler:
         )
         self.audit_log.append(
             {
+                **child_node.to_json(),
                 "event": "spawn_child",
                 "child_id": child_id,
                 "parent_id": parent_id,
@@ -1552,6 +1573,9 @@ class DynamicChildScheduler:
                     task_id=rec.id, run_token=rec.run_token, fencing_token=rec.fencing_token)
                 attestation["invocation_policy"] = validate_policy_evidence(
                     invocation_policy, identity=policy_identity)
+                for field in ("approved_profile", "immutable_sources"):
+                    if field in attestation["invocation_policy"]:
+                        attestation[field] = json.loads(json.dumps(attestation["invocation_policy"][field]))
             except (SecurityError, TypeError, ValueError):
                 return False
         if not rec.execution_sandbox_verified and (
@@ -2060,6 +2084,7 @@ class DynamicChildScheduler:
             event_type = e.get("event")
             if event_type == "submit":
                 task_id = str(e.get("task_id", ""))
+                model_policy = _replay_model_policy(e)
                 rec = self._tasks.get(task_id)
                 if rec is None:
                     node = TaskNode(
@@ -2073,12 +2098,7 @@ class DynamicChildScheduler:
                         dependencies=tuple(e.get("dependencies", [])),
                         priority=int(e.get("priority", 0)),
                         resource_class=str(e.get("resource_class", "standard")),
-                        model_policy={
-                            "model": str(e["model"]) if e.get("model") else "laguna",
-                            "fallback_model": str(e["fallback_model"])
-                            if e.get("fallback_model")
-                            else "longcat",
-                        },
+                        model_policy=model_policy,
                         tools=tuple(e.get("tools", [])),
                         permissions=tuple(e.get("permissions", [])),
                         timeout_seconds=int(e.get("timeout_seconds", 1800)),
@@ -2104,11 +2124,11 @@ class DynamicChildScheduler:
                 rec.state = LifecycleState.PENDING
                 rec.telemetry = list(e.get("telemetry", []))
                 rec.model_used = str(e["model"]) if e.get("model") else rec.model_used
-                rec.fallback_used = (
-                    str(e["fallback_model"])
-                    if e.get("fallback_model")
-                    else rec.fallback_used
-                )
+                if "model_policy" in e:
+                    rec.model_used = model_policy.get("model")
+                    rec.fallback_used = model_policy.get("fallback_model")
+                elif "fallback_model" in e:
+                    rec.fallback_used = model_policy["fallback_model"]
                 if e.get("agent_id"):
                     rec.agent_id = str(e["agent_id"])
                 if e.get("fencing_token") is not None:
@@ -2119,6 +2139,22 @@ class DynamicChildScheduler:
                     rec.parent_task_id = str(e["parent_id"])
                 if e.get("parent_task_id"):
                     rec.parent_task_id = str(e["parent_task_id"])
+            elif event_type == "graph_submit":
+                fields = {"max_nodes", "max_depth", "max_fanout"}
+                present = fields.intersection(e)
+                if present:
+                    if present != fields or any(type(e[key]) is not int or e[key] < 1 for key in fields):
+                        raise SchedulerError("invalid durable graph limits")
+                    self._plan_max_nodes = min(self._plan_max_nodes, e["max_nodes"])
+                    self._plan_max_depth = min(self._plan_max_depth, e["max_depth"])
+                    self._plan_max_fanout = min(self._plan_max_fanout, e["max_fanout"])
+                else:
+                    # Historical limits are unknown: read existing attempts but
+                    # never authorize an additional child from a wider budget.
+                    count = e.get("node_count", len(self._tasks))
+                    if type(count) is not int or not 1 <= count <= len(self._tasks):
+                        raise SchedulerError("invalid legacy graph node limit")
+                    self._plan_max_nodes = min(self._plan_max_nodes, count)
             elif event_type == "claim":
                 task_id = str(e.get("task_id", ""))
                 rec = self._tasks.get(task_id)
@@ -2292,6 +2328,7 @@ class DynamicChildScheduler:
                     self._claims[task_id] = rec.lease
             elif event_type == "spawn_child":
                 child_id = str(e.get("child_id", ""))
+                model_policy = _replay_model_policy(e)
                 rec = self._tasks.get(child_id)
                 if rec is None:
                     node = TaskNode(
@@ -2307,10 +2344,7 @@ class DynamicChildScheduler:
                         expected_outputs=e.get("expected_outputs", ()),
                         priority=int(e.get("priority", 0)),
                         resource_class=str(e.get("resource_class", "standard")),
-                        model_policy={
-                            "model": str(e.get("model", "laguna")),
-                            "fallback_model": str(e.get("fallback_model", "longcat")),
-                        },
+                        model_policy=model_policy,
                         tools=tuple(e.get("child_tools", [])),
                         permissions=tuple(e.get("child_permissions", [])),
                         timeout_seconds=int(e.get("timeout_seconds", 1800)),
@@ -2327,11 +2361,11 @@ class DynamicChildScheduler:
                         repo=str(e.get("repo", "default")),
                         issue=str(e.get("issue", "")),
                         policy_profile=str(e.get("policy_profile", "default")),
-                        model_used=str(e.get("model", "laguna")),
-                        fallback_used=str(e.get("fallback_model", "longcat")),
+                        model_used=model_policy.get("model"),
+                        fallback_used=model_policy.get("fallback_model"),
                     )
                     self._tasks[child_id] = rec
-                rec.model_used = str(e.get("model", rec.model_used or "laguna"))
+                rec.model_used = model_policy.get("model")
                 rec.delegation_key = str(e["delegation_key"]) if e.get("delegation_key") else None
                 rec.parent_run_token = str(e["parent_run_token"]) if e.get("parent_run_token") else None
                 identity = e.get("worktree_identity", "")
@@ -2350,9 +2384,7 @@ class DynamicChildScheduler:
                         or tuple(ownership.hard_dependencies)!=tuple(rec.node.dependencies)):
                     raise SchedulerError("durable ownership graph mismatch")
                 rec.ownership=ownership
-                rec.fallback_used = str(
-                    e.get("fallback_model", rec.fallback_used or "longcat")
-                )
+                rec.fallback_used = model_policy.get("fallback_model")
                 if e.get("parent_id"):
                     rec.parent_task_id = str(e["parent_id"])
                 if e.get("parent_agent_id"):
@@ -2423,6 +2455,9 @@ class DynamicChildScheduler:
                             consumer="github:" + rec.repo, agent_id=rec.agent_id,
                             parent_agent_id=rec.parent_agent_id, parent_task_id=rec.parent_task_id,
                             task_id=rec.id, run_token=rec.run_token, fencing_token=rec.fencing_token))
+                        for field in ("approved_profile", "immutable_sources"):
+                            if attestation.get(field) != attestation["invocation_policy"].get(field):
+                                raise SecurityError("retained source attestation differs from policy")
                     except (SecurityError, TypeError, ValueError) as exc:
                         raise SchedulerError("invalid child invocation policy evidence") from exc
                 if event_type=="execution_sandbox_attested" and (
@@ -2668,6 +2703,8 @@ class DynamicChildScheduler:
                         max_attempts=1)
         rec = TaskRecord(node=node, state=LifecycleState.RUNNING,
                          repo=repo, issue=issue, policy_profile=policy_profile,
+                          model_used=node.model_policy.get("model"),
+                          fallback_used=node.model_policy.get("fallback_model"),
                          agent_id=agent_name, run_token=run_token,
                          idempotency_key=idempotency_key, attempt_state="accepted",
                          execution_agent=agent_name, execution_pane=pane_id,
@@ -2677,11 +2714,12 @@ class DynamicChildScheduler:
         rec.fencing_token = rec.lease.fencing_token
         self._tasks[task_id] = rec
         self._claims[task_id] = rec.lease
-        self.audit_log.append({"event": "submit", "task_id": task_id,
+        self.audit_log.append({**node.to_json(), "event": "submit", "task_id": task_id,
                                "repo": repo, "issue": issue, "role": role,
                                "tools": list(tools), "permissions": list(permissions),
                                "policy_profile": policy_profile,
                                "objective": node.objective, "agent_id": agent_name,
+                                "model": rec.model_used, "fallback_model": rec.fallback_used,
                                "fencing_token": rec.fencing_token})
         self.audit_log.append({"event": "claim", "task_id": task_id,
                                "agent_id": agent_name, "holder": "external",

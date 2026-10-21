@@ -4,7 +4,9 @@ import importlib.machinery
 import importlib.util
 import hashlib
 import json
+import marshal
 import os
+import struct
 import subprocess
 import sys
 import types
@@ -56,9 +58,9 @@ def test_policy_bin_hermes_invokes_guarded_launcher():
     assert POLICY_BIN.read_text() == (
         '#!/bin/sh\n'
         'unset LD_PRELOAD LD_AUDIT LD_LIBRARY_PATH GLIBC_TUNABLES GCONV_PATH LOCPATH NLSPATH BASH_ENV ENV\n'
-        'exec /usr/bin/python3 -I -S /run/herdr-bootstrap/agent-hermes-policy-stage1 "$@"\n'
+        'exec /usr/bin/python3 -I -S /run/herdr/policy-code/agent-stack/bin/agent-hermes-policy-stage1 "$@"\n'
     )
-    assert "/run/herdr/policy-code" not in POLICY_BIN.read_text()
+    assert "/run/herdr/policy-code" in POLICY_BIN.read_text()
     assert POLICY_BIN.stat().st_mode & 0o111
     assert LAUNCHER.read_text(encoding="utf-8").splitlines()[0] == (
         "#!/usr/bin/python3 -I -S"
@@ -105,6 +107,20 @@ def test_same_process_guard_precedes_hermes_main(monkeypatch, tmp_path, profile_
     (hermes / 'hermes_state.py').write_text('')
     fake_state.__file__ = str(hermes / 'hermes_state.py')
     fake_state.DEFAULT_DB_PATH = hermes / 'state.db'
+    fake_cli = types.ModuleType("cli")
+    (hermes / "cli.py").write_text("")
+    fake_cli.__file__ = str(hermes / "cli.py")
+    approved_home = hermes / "approved-profile"
+    fake_cli._hermes_home = approved_home
+    config = {"model": "approved-model", "agent": {"prefill_messages_file": "prompts/approved.json"}}
+    fake_cli.CLI_CONFIG = config
+    fake_cli._resolve_prefill_messages_file = lambda cfg: (
+        os.getenv("HERMES_PREFILL_MESSAGES_FILE", "")
+        or cfg.get("prefill_messages_file", "")
+        or cfg.get("agent", {}).get("prefill_messages_file", "")
+    )
+    fake_cli.get_hermes_home = lambda: approved_home
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
     private_state = Path('/tmp') / ('herdr-sdk-state-test-' + uuid.uuid4().hex)
     monkeypatch.setattr(module, '_EPHEMERAL_SDK_STATE_ROOT', private_state)
     monkeypatch.setattr(module, '_require_private_sdk_tmp', lambda: 123)
@@ -113,6 +129,17 @@ def test_same_process_guard_precedes_hermes_main(monkeypatch, tmp_path, profile_
     def main():
         assert events == ['verified', 'installed']
         assert fake_state.DEFAULT_DB_PATH == private_state / 'state.db'
+        assert fake_cli._hermes_home == private_state
+        assert fake_cli.get_hermes_home() == approved_home
+        assert fake_cli.CLI_CONFIG is config
+        # Prefill is loaded after CLI initialization: relative paths must still
+        # resolve against the approved profile, never the writable SDK home.
+        assert fake_cli._resolve_prefill_messages_file(config) == str(
+            approved_home / "prompts/approved.json"
+        )
+        assert fake_cli._resolve_prefill_messages_file(
+            {"prefill_messages_file": "/approved/external.json"}
+        ) == "/approved/external.json"
         assert private_state.stat().st_mode & 0o777 == 0o700
         assert Path('/proc/self/comm').read_text().strip() == 'hermes'
         assert os.environ["HERMES_SAFE_MODE"] == "1"
@@ -207,6 +234,7 @@ def test_preimport_executor_verifier_checks_actual_bytes(monkeypatch, tmp_path):
     expected = f'hermes:0.21.5:sha256:{digest.hexdigest()}'
     monkeypatch.setattr(module, 'HERMES_HEAD', git('rev-parse', 'HEAD'))
     monkeypatch.setattr(module, '_SOURCE_EXECUTOR', expected)
+    _source_inventory_fixture(module, monkeypatch, root, ['model_tools.py', 'pyproject.toml'])
     assert module._verify_hermes_build(root) == module.HERMES_EXECUTOR
     (root / 'model_tools.py').write_text('audited = False\n')
     with pytest.raises(SystemExit, match='cannot verify audited Hermes build|differs from signed executor'):
@@ -273,6 +301,8 @@ def test_preimport_git_ignores_repo_local_fsmonitor(monkeypatch, tmp_path):
         f"hermes:0.21.5:sha256:{digest.hexdigest()}",
     )
 
+    _source_inventory_fixture(module, monkeypatch, root, ["model_tools.py", "pyproject.toml"])
+
     marker = tmp_path / "fsmonitor-executed"
     hook = tmp_path / "malicious-fsmonitor.sh"
     hook.write_text(
@@ -282,6 +312,7 @@ def test_preimport_git_ignores_repo_local_fsmonitor(monkeypatch, tmp_path):
     hook.chmod(0o755)
     git("config", "core.fsmonitor", str(hook))
 
+    monkeypatch.setattr(module.subprocess, "run", lambda *a, **kw: pytest.fail("runtime Git executed"))
     assert module._verify_hermes_build(root) == module.HERMES_EXECUTOR
     assert not marker.exists()
 
@@ -436,7 +467,7 @@ def test_stage1_execs_verified_stage2_source_fd(monkeypatch):
     monkeypatch.setattr(module, "_open_verified_stage2", lambda: 41)
     monkeypatch.setattr(module, "_open_verified_python", lambda: 42)
     monkeypatch.setattr(module, "_connect_host_authority", lambda *args: 43)
-    monkeypatch.setattr(module, "_fresh_pycache_prefix", lambda: "/run/herdr-bootstrap/no-bytecode-cache")
+    monkeypatch.setattr(module, "_fresh_pycache_prefix", lambda: "/run/herdr/policy-code/no-bytecode-cache")
     monkeypatch.setattr(module.os, "set_inheritable", lambda *args: None)
     seen = {}
 
@@ -450,7 +481,7 @@ def test_stage1_execs_verified_stage2_source_fd(monkeypatch):
     assert seen["executable"] == "/proc/self/fd/42"
     assert seen["argv"] == [
         "/proc/self/fd/42", "-I", "-S", "-X",
-        "pycache_prefix=/run/herdr-bootstrap/no-bytecode-cache", "/proc/self/fd/41",
+        "pycache_prefix=/run/herdr/policy-code/no-bytecode-cache", "/proc/self/fd/41",
         "chat", "--profile", "test",
     ]
     assert seen["env"][module.INTERPRETER_FD_ENV] == "42"
@@ -501,12 +532,12 @@ def test_stage1_rejects_stacked_exact_trust_root(tmp_path):
     with pytest.raises(SystemExit, match="one exact read-only trust mount"):
         module._require_exact_ro_tree(root, rows)
 
-def test_startup_cache_is_absent_under_frozen_root_not_same_uid_tmp(tmp_path,monkeypatch):
+def test_startup_cache_is_absent_under_immutable_code_root(tmp_path,monkeypatch):
     stage1, stage2 = _stage1(), _launcher()
-    root = tmp_path / "bootstrap"
+    root = tmp_path / "code"
     root.mkdir()
-    monkeypatch.setattr(stage1,"BOOTSTRAP_ROOT",root)
-    monkeypatch.setattr(stage2,"BOOTSTRAP_ROOT",root)
+    monkeypatch.setattr(stage1,"POLICY_CODE_ROOT",root)
+    monkeypatch.setattr(stage2,"POLICY_CODE_ROOT",root)
     monkeypatch.setattr(stage1,"_mount_rows",lambda:{str(root):{"ro"}})
     prefix = str(root / "no-bytecode-cache")
     assert stage1._fresh_pycache_prefix() == prefix
@@ -522,14 +553,60 @@ def test_startup_cache_is_absent_under_frozen_root_not_same_uid_tmp(tmp_path,mon
     with pytest.raises(SystemExit,match="immutable startup"):
         stage2._require_startup_pycache_prefix()
 
-def test_stage1_cache_requires_physical_readonly_bootstrap(tmp_path,monkeypatch):
+def test_stage1_cache_requires_physical_readonly_code(tmp_path,monkeypatch):
     module = _stage1()
-    root = tmp_path / "bootstrap"
+    root = tmp_path / "code"
     root.mkdir()
-    monkeypatch.setattr(module,"BOOTSTRAP_ROOT",root)
+    monkeypatch.setattr(module,"POLICY_CODE_ROOT",root)
     monkeypatch.setattr(module,"_mount_rows",lambda:{str(root):{"rw"}})
     with pytest.raises(SystemExit,match="read-only"):
         module._fresh_pycache_prefix()
+
+
+def test_stage2_helper_rejects_mutable_transport_and_forged_bytecode(tmp_path, monkeypatch):
+    module = _launcher()
+    assert module.BOOTSTRAP_STAGE1 == (
+        module.POLICY_CODE_ROOT / "agent-stack/bin/agent-hermes-policy-stage1"
+    )
+    code_root = tmp_path / "code"
+    helper = code_root / "agent-stack/bin/agent-hermes-policy-stage1"
+    helper.parent.mkdir(parents=True)
+    helper.write_text('VALUE = "approved"\n')
+    transport = tmp_path / "bootstrap"
+    transport.mkdir()
+    (transport / helper.name).write_text(
+        "raise RuntimeError('mutable transport helper executed')\n"
+    )
+    monkeypatch.setattr(module, "POLICY_CODE_ROOT", code_root)
+    monkeypatch.setattr(module, "BOOTSTRAP_STAGE1", helper)
+    monkeypatch.setattr(module, "BOOTSTRAP_ROOT", transport)
+    # Mount provenance is tested separately against the real kernel. This
+    # filesystem test exercises Python's actual cached-code import behavior.
+    seen_mounts = []
+    monkeypatch.setattr(module, "_require_production_mount",
+                        lambda path, **kwargs: seen_mounts.append((path, kwargs)))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    monkeypatch.setattr(sys, "pycache_prefix", str(transport / "no-bytecode-cache"))
+    poisoned_cache = Path(importlib.util.cache_from_source(str(helper)))
+    poisoned_cache.parent.mkdir(parents=True)
+    info = helper.stat()
+    forged = compile("raise RuntimeError('forged transport bytecode executed')",
+                     str(helper), "exec")
+    poisoned_cache.write_bytes(
+        importlib.util.MAGIC_NUMBER
+        + struct.pack("<III", 0, int(info.st_mtime), info.st_size)
+        + marshal.dumps(forged)
+    )
+    loader = importlib.machinery.SourceFileLoader("unsafe_cache_probe", str(helper))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    with pytest.raises(RuntimeError, match="forged transport bytecode executed"):
+        loader.exec_module(importlib.util.module_from_spec(spec))
+    with pytest.raises(SystemExit, match="immutable startup pycache prefix"):
+        module._load_stage1_module()
+    monkeypatch.setattr(sys, "pycache_prefix", str(code_root / "no-bytecode-cache"))
+    assert module._load_stage1_module().VALUE == "approved"
+    assert seen_mounts == [(code_root, {"exact": True})] * 2
+    assert not (code_root / "no-bytecode-cache").exists()
 
 
 def test_actual_user_namespace_keeps_stage0_verification_before_host_handshake():
@@ -656,6 +733,12 @@ def test_sdk_state_rejects_existing_directory(monkeypatch, tmp_path):
     fake_state.__file__ = str(tmp_path / "hermes_state.py")
     (tmp_path / "hermes_state.py").write_text("")
     fake_state.DEFAULT_DB_PATH = tmp_path / "host-state.db"
+    fake_cli = types.ModuleType("cli")
+    (tmp_path / "cli.py").write_text("")
+    fake_cli.__file__ = str(tmp_path / "cli.py")
+    fake_cli._hermes_home = tmp_path / "host-home"
+    fake_cli._resolve_prefill_messages_file = lambda cfg: cfg.get("prefill_messages_file", "")
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
     directory = Path("/tmp") / ("herdr-sdk-state-existing-" + uuid.uuid4().hex)
     directory.mkdir(mode=0o700)
     monkeypatch.setattr(module, "_EPHEMERAL_SDK_STATE_ROOT", directory)
@@ -666,5 +749,125 @@ def test_sdk_state_rejects_existing_directory(monkeypatch, tmp_path):
         with pytest.raises(SystemExit, match="fresh private SDK state unavailable"):
             module._configure_ephemeral_sdk_state(tmp_path)
         assert fake_state.DEFAULT_DB_PATH == tmp_path / "host-state.db"
+        assert fake_cli._hermes_home == tmp_path / "host-home"
     finally:
         directory.rmdir()
+
+
+@pytest.mark.parametrize("untrusted", ["hermes_state", "cli"])
+def test_sdk_state_rejects_untrusted_modules_before_redirect(monkeypatch, tmp_path, untrusted):
+    module = _launcher()
+    monkeypatch.setattr(module, "_require_private_sdk_tmp", lambda: 123)
+    monkeypatch.setattr(module, "_sdk_state_mount_id", lambda path: 123)
+    state = types.ModuleType("hermes_state")
+    cli = types.ModuleType("cli")
+    (tmp_path / "hermes_state.py").write_text("")
+    (tmp_path / "cli.py").write_text("")
+    state.__file__ = str(tmp_path / "hermes_state.py")
+    cli.__file__ = str(tmp_path / "cli.py")
+    state.DEFAULT_DB_PATH = tmp_path / "host-state.db"
+    cli._hermes_home = tmp_path / "host-home"
+    modules = {"hermes_state": state, "cli": cli}
+    modules[untrusted].__file__ = str(tmp_path.parent / "untrusted.py")
+    for name, value in modules.items():
+        monkeypatch.setitem(sys.modules, name, value)
+    directory = Path("/tmp") / ("herdr-sdk-state-untrusted-" + uuid.uuid4().hex)
+    monkeypatch.setattr(module, "_EPHEMERAL_SDK_STATE_ROOT", directory)
+    with pytest.raises(SystemExit):
+        module._configure_ephemeral_sdk_state(tmp_path)
+    assert not directory.exists()
+    assert state.DEFAULT_DB_PATH == tmp_path / "host-state.db"
+    assert cli._hermes_home == tmp_path / "host-home"
+
+
+def _source_inventory_fixture(module, monkeypatch, root, names):
+    names = sorted(names, key=os.fsencode)
+    digest = hashlib.sha256()
+    for name in names:
+        digest.update(os.fsencode(name) + b"\0")
+        digest.update(hashlib.sha256((root / name).read_bytes()).digest())
+    record = {"schema_version": "herdr-hermes-source-inventory-1",
+              "revision": module.HERMES_HEAD, "version": "0.21.5",
+              "source_sha256": digest.hexdigest(), "files": names}
+    raw = (json.dumps(record, sort_keys=True, indent=2) + "\n").encode()
+    inventory = root.parent / "fixture-source-inventory.json"
+    inventory.write_bytes(raw)
+    monkeypatch.setattr(module, "HERMES_INVENTORY_PATH", inventory, raising=False)
+    monkeypatch.setattr(module, "HERMES_INVENTORY_SHA256", hashlib.sha256(raw).hexdigest(), raising=False)
+    monkeypatch.setattr(module, "_SOURCE_EXECUTOR", f"hermes:0.21.5:sha256:{digest.hexdigest()}")
+    return inventory
+
+
+def _inventory_sdk(tmp_path, monkeypatch):
+    module = _launcher()
+    root = tmp_path / "sdk"
+    root.mkdir()
+    (root / "pyproject.toml").write_text('[project]\nversion = "0.21.5"\n')
+    (root / "model_tools.py").write_text("audited = True\n")
+    inventory = _source_inventory_fixture(module, monkeypatch, root, ["pyproject.toml", "model_tools.py"])
+    return module, root, inventory
+
+
+def test_published_sdk_verifies_exact_source_without_git_metadata(tmp_path, monkeypatch):
+    module, root, _ = _inventory_sdk(tmp_path, monkeypatch)
+    assert not (root / ".git").exists()
+    monkeypatch.setattr(module.subprocess, "run", lambda *a, **kw: pytest.fail("runtime Git executed"))
+    assert module._verify_hermes_build(root) == module.HERMES_EXECUTOR
+
+
+@pytest.mark.parametrize("attack", ["tracked-changed", "tracked-missing", "tracked-symlink",
+    "inventory-changed", "inventory-symlink", "inventory-unknown-field", "inventory-revision",
+    "inventory-reordered", "inventory-duplicate", "inventory-traversal", "inventory-absolute",
+    "inventory-directory", "inventory-excluded-path", "inventory-too-large", "source-version",
+    "untracked.py", "untracked.pyc", "untracked.so", "untracked.pth", "parent-symlink"])
+def test_published_sdk_rejects_source_and_inventory_attacks(tmp_path, monkeypatch, attack):
+    module, root, inventory = _inventory_sdk(tmp_path, monkeypatch)
+    data = json.loads(inventory.read_bytes())
+    if attack == "tracked-changed":
+        (root / "model_tools.py").write_text("audited = False\n")
+    elif attack == "tracked-missing":
+        (root / "model_tools.py").unlink()
+    elif attack == "tracked-symlink":
+        outside = tmp_path / "outside.py"; outside.write_text("audited = True\n")
+        (root / "model_tools.py").unlink(); (root / "model_tools.py").symlink_to(outside)
+    elif attack == "inventory-symlink":
+        outside = tmp_path / "outside.json"; outside.write_bytes(inventory.read_bytes())
+        inventory.unlink(); inventory.symlink_to(outside)
+    elif attack == "inventory-directory":
+        inventory.unlink(); inventory.mkdir()
+    elif attack == "inventory-too-large":
+        inventory.write_bytes(b" " * 1_048_577)
+    elif attack == "source-version":
+        (root / "pyproject.toml").write_text('[project]\nversion = "0.99.0"\n')
+    elif attack.startswith("untracked."):
+        (root / attack).write_bytes(b"injected")
+    elif attack == "parent-symlink":
+        package = root / "package"; package.mkdir(); (package / "module.py").write_text("approved=True\n")
+        _source_inventory_fixture(module, monkeypatch, root, ["pyproject.toml", "model_tools.py", "package/module.py"])
+        outside = tmp_path / "linked-package"; package.rename(outside); package.symlink_to(outside, target_is_directory=True)
+    else:
+        if attack == "inventory-changed": data["files"].remove("model_tools.py")
+        elif attack == "inventory-unknown-field": data["unknown"] = True
+        elif attack == "inventory-revision": data["revision"] = "f" * 40
+        elif attack == "inventory-reordered": data["files"].reverse()
+        elif attack == "inventory-duplicate": data["files"].append(data["files"][0])
+        elif attack == "inventory-traversal": data["files"].append("../outside.py")
+        elif attack == "inventory-absolute": data["files"].append("/tmp/outside.py")
+        elif attack == "inventory-excluded-path": data["files"].append("venv/unsafe.py")
+        raw = json.dumps(data, sort_keys=True).encode(); inventory.write_bytes(raw)
+        # For structural attacks explicitly substitute the test-only pin so the
+        # schema/path check must reject, rather than only the content digest.
+        if attack != "inventory-changed":
+            monkeypatch.setattr(module, "HERMES_INVENTORY_SHA256", hashlib.sha256(raw).hexdigest(), raising=False)
+    with pytest.raises(SystemExit):
+        module._verify_hermes_build(root)
+
+
+def test_committed_hermes_inventory_matches_launcher_pins(monkeypatch):
+    module = _launcher()
+    inventory = LAUNCHER.parents[2] / "herdr/hermes_source_inventory.json"
+    monkeypatch.setattr(module, "HERMES_INVENTORY_PATH", inventory)
+    data = module._hermes_source_inventory()
+    assert data["revision"] == module.HERMES_HEAD
+    assert len(data["files"]) == 15208
+    assert data["source_sha256"] == module.HERMES_SOURCE_SHA256

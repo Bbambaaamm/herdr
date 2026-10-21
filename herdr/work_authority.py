@@ -3,11 +3,44 @@ import json
 import os
 import socket
 import struct
+import time
 
 from .bootstrap_authority import SOCKET_PATH, _recv_line, inspect_peer
 from .security import InvocationIdentity, PolicyDenied
 from .work_cycle import require, WorkContractError
 from .evidence import canonical
+
+
+# Physical peer/mount verification runs before authorization and again after
+# budget callbacks. Allow that work while bounding the *whole* exchange, not
+# each received chunk. A transport failure never authorizes an economic retry:
+# the host may already have retained the original operation reservation.
+_WORK_REQUEST_TIMEOUT_SECONDS = 60
+
+
+def _work_response(payload, *, max_bytes):
+    deadline = time.monotonic() + _WORK_REQUEST_TIMEOUT_SECONDS
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        def bounded(operation, *args):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("work authority exchange timed out")
+            connection.settimeout(remaining)
+            result = operation(*args)
+            if time.monotonic() > deadline:
+                raise TimeoutError("work authority exchange timed out")
+            return result
+        bounded(connection.connect, str(SOCKET_PATH))
+        bounded(connection.sendall, payload)
+        result = bytearray()
+        while len(result) <= max_bytes:
+            chunk = bounded(connection.recv, min(1024, max_bytes + 1 - len(result)))
+            if not chunk:
+                break
+            result.extend(chunk)
+            if b"\n" in result:
+                break
+    return bytes(result)
 
 
 class WorkAuthorityClient:
@@ -20,20 +53,9 @@ class WorkAuthorityClient:
         payload = canonical(request) + b"\n"
         require(len(payload) <= 8192, "work authority request exceeds bound")
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                connection.settimeout(5)
-                connection.connect(str(SOCKET_PATH))
-                connection.sendall(payload)
-                result = bytearray()
-                while len(result) < 128:
-                    chunk = connection.recv(128 - len(result))
-                    if not chunk:
-                        break
-                    result.extend(chunk)
-                    if b"\n" in result:
-                        break
-                if bytes(result) != b"work-ok\n":
-                    raise PolicyDenied("work_phase_forbids_invocation")
+            result = _work_response(payload, max_bytes=128)
+            if result != b"work-ok\n":
+                raise PolicyDenied("work_phase_forbids_invocation")
         except PolicyDenied:
             raise
         except (OSError, TimeoutError) as exc:
@@ -47,14 +69,7 @@ class WorkAuthorityClient:
                      "action":action,"payload":payload}
             encoded=json.dumps(request,sort_keys=True,separators=(",",":")).encode()+b"\n"
             require(len(encoded)<=8192,"bounded model budget transport required")
-            with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as connection:
-                connection.settimeout(5);connection.connect(str(SOCKET_PATH));connection.sendall(encoded)
-                result=bytearray()
-                while len(result)<=8192:
-                    chunk=connection.recv(min(1024,8193-len(result)))
-                    if not chunk:break
-                    result.extend(chunk)
-                    if b"\n" in result:break
+            result=_work_response(encoded,max_bytes=8192)
             require(len(result)<=8192 and result.endswith(b"\n"),"bounded budget response required")
             parsed=json.loads(result)
             require(isinstance(parsed,dict),"closed host budget response required")
