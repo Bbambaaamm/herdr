@@ -25,6 +25,7 @@ from agent_durable_children import (attempt_directory, ledger_required,
                                     parent_attempt_guard,
                                     publish_exact_child_result)
 from agent_durable_sandbox import PinnedWorktree
+from herdr.delegation_tool import model_arguments
 
 
 def _delivery_prompt(prompt, result_path, child_id, run_token, fencing_token,
@@ -218,6 +219,7 @@ def _parent_context(runner):
 
 
 def delegate(args, *, runner=None, policy_launch_factory=None, completion_authority=None):
+    model_arguments(vars(args))
     real = _required_env("HERDR_REAL_BINARY")
     if not Path(real).is_absolute() or not Path(real).is_file():
         raise ValueError("real Herdr binary unavailable")
@@ -340,7 +342,8 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
                                       ({"herdr_submit_result"} if "herdr_submit_result" in task["parent_tools"] else set()))),
                                  child_permissions=tuple(args.permission),
                                  child_task=args.objective,
-                                 worktree_identity=pinned.identity, ownership=ownership)
+                                 worktree_identity=pinned.identity, ownership=ownership,
+                                  **{"child_"+name: value for name, value in model_arguments(vars(args)).items()})
         from herdr.child_evidence import ChildCompletionAuthority
         if isinstance(completion_authority, ChildCompletionAuthority):
             proposal=completion_authority.prepare_delegation(proposal,
@@ -470,6 +473,7 @@ def client_delegate(args):
         "cwd": str(getattr(args, "cwd", "") or ""),
         "ownership": getattr(args, "ownership", None),
     }
+    request.update(model_arguments(vars(args)))
     payload = json.dumps(request, ensure_ascii=False, allow_nan=False).encode("utf-8")
     if len(payload) > MAX_REQUEST:
         raise ValueError("delegation request too large")
@@ -508,6 +512,11 @@ def main():
     parser.add_argument("--permission", action="append", default=[])
     parser.add_argument("--cwd", default="")
     parser.add_argument("--ownership", type=json.loads, default=None)
+    parser.add_argument("--model", default=argparse.SUPPRESS)
+    fallback = parser.add_mutually_exclusive_group()
+    fallback.add_argument("--fallback-model", dest="fallback_model", default=argparse.SUPPRESS)
+    fallback.add_argument("--no-fallback", dest="fallback_model", action="store_const",
+                          const=None, default=argparse.SUPPRESS)
     args = parser.parse_args()
     try:
         if os.environ.get("HERDR_DURABLE_BRIDGE_SOCKET"):

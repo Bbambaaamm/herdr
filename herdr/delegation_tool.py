@@ -15,7 +15,7 @@ from herdr.child_ownership import ChildOwnership, ownership_schema
 
 TOOL = "herdr_delegate_child"
 TOOLSET = "herdr_delegation"
-ARGUMENTS = ("key", "role", "objective", "prompt", "tool", "permission", "cwd", "ownership")
+ARGUMENTS = ("key", "role", "objective", "prompt", "tool", "permission", "cwd", "ownership", "model", "fallback_model")
 SCHEMA = {
     "name": TOOL,
     "description": "Delegate bounded work through the current Herdr task. Reuse the same key to reconcile the same child. Returned evidence is submitted work, subject to shared acceptance.",
@@ -33,15 +33,39 @@ SCHEMA = {
                      "items": {"type": "string", "minLength": 1, "maxLength": 128}},
             "cwd": {"type": "string", "maxLength": 4096},
             "ownership": ownership_schema(),
+            "model": {"type": "string", "minLength": 1, "maxLength": 256},
+            "fallback_model": {"type": ["string", "null"], "minLength": 1, "maxLength": 256},
         },
     },
 }
+
+
+def model_arguments(value):
+    """Preserve optional routing intent; this never authorizes a model route.
+
+    Absence retains ChildProposal defaults. Explicit fallback null disables it.
+    Concrete host tool rules, child grants and economic admission still apply.
+    """
+    result = {}
+    for name in ("model", "fallback_model"):
+        if name not in value:
+            continue
+        item = value[name]
+        if item is None and name == "fallback_model":
+            result[name] = None
+            continue
+        if (not isinstance(item, str) or not 0 < len(item) <= 256
+                or any(ord(char) <= 32 or ord(char) == 127 for char in item)):
+            raise ValueError("bounded delegation model identifier required")
+        result[name] = item
+    return result
 
 
 def _arguments(value):
     if not isinstance(value, dict) or set(value) - set(ARGUMENTS):
         raise SecurityError("closed delegation arguments required")
     checked = dict(value)
+    model_arguments(checked)
     for name, limit in (("key", 128), ("role", 32), ("objective", 8192), ("prompt", 32768)):
         item = checked.get(name)
         if not isinstance(item, str) or not 0 < len(item) <= limit or "\0" in item:

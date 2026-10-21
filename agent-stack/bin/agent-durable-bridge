@@ -21,6 +21,7 @@ FIELDS = {
     "operation", "task_id", "run_token", "agent", "pane", "marker",
     "key", "role", "objective", "prompt", "tool", "permission", "cwd", "ownership",
 }
+MODEL_FIELDS = {"model", "fallback_model"}
 ACTIVE_STATES = {"running", "blocked"}
 TERMINAL_STATES = {"done", "failed"}
 MAX_CONNECTIONS = 1024
@@ -36,7 +37,7 @@ def socket_name(task_id: str, run_token: str) -> str:
 def validate_request(request: object, identity: dict) -> argparse.Namespace:
     if (
         not isinstance(request, dict)
-        or set(request) not in (FIELDS, FIELDS-{"ownership"})
+        or set(request) - MODEL_FIELDS not in (FIELDS, FIELDS-{"ownership"})
         or request.get("operation") != "delegate"
     ):
         raise ValueError("invalid delegation request schema")
@@ -68,6 +69,7 @@ def validate_request(request: object, identity: dict) -> argparse.Namespace:
     return argparse.Namespace(
         **{key: request[key] for key in ("key", "role", "objective", "prompt", "tool", "permission", "cwd")},
         ownership=ownership,
+        **child.model_arguments(request),
     )
 
 
