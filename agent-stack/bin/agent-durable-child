@@ -328,6 +328,18 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
             issue=str(task.get("issue") or ""), role=task["parent_role"],
             tools=task["parent_tools"], permissions=task["parent_permissions"],
             policy_profile=task["safety_profile"])
+        from herdr.work_configuration import reviewed_parent_admission
+        canonical_record = scheduler._tasks.get(parent_id)
+        canonical_required = canonical_record is not None and canonical_record.canonical_parent is not None
+        canonical = (reviewed_parent_admission(state_root, current,
+            grant=getattr(policy_launch_factory, "parent_grant", None))
+            if current.get("work_contract_version") == 1 or canonical_required else None)
+        if canonical is not None:
+            if not ledger_preexisting:
+                raise SchedulerError("canonical parent must be bound before work starts")
+            parent_binding["canonical_parent"] = canonical
+        elif canonical_record is not None and canonical_record.canonical_parent is not None:
+            raise SchedulerError("canonical parent requires original protected admission")
         if ledger_preexisting:
             scheduler.register_external_parent_attempt(**parent_binding)
         else:

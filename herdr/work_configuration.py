@@ -171,6 +171,185 @@ def inspect_discovery(workspace, paths, snapshot):
         os.close(directory)
 
 
+def _reviewed_graph(definition, task):
+    """Protected catalogue data only; the graph is not its own approval."""
+    if "reviewed_graph" not in definition:
+        return None
+    from .taskgraph import TaskGraph
+    value = closed(definition["reviewed_graph"], ("version", "graph_sha256", "graph"), "reviewed graph")
+    require(type(value["version"]) is int and value["version"] == 1, "reviewed graph version unsupported")
+    sha(value["graph_sha256"], "reviewed graph")
+    graph = TaskGraph.parse_planner_output(value["graph"])
+    require(graph.graph_hash() == value["graph_sha256"] and len(graph.nodes) == 1,
+            "reviewed graph hash or root-only scope changed")
+    node = graph.nodes[0]
+    business_spec = task.get("spec_hash")
+    require(isinstance(business_spec, str), "reviewed graph business specification missing")
+    sha(business_spec.removeprefix("sha256:"), "reviewed business specification")
+    require(graph.envelope.spec_hash.removeprefix("sha256:") == business_spec.removeprefix("sha256:"),
+            "reviewed graph business specification changed")
+    require(node.id == task.get("id") and node.parent_id is None and not node.dependencies
+            and graph.envelope.issue == str(task.get("repo")) + "#" + str(task.get("issue"))
+            and graph.envelope.policy_profile == task.get("safety_profile")
+            and node.role == task.get("parent_role")
+            and set(node.tools) == set(task.get("parent_tools") or ())
+            and set(node.permissions) == set(task.get("parent_permissions") or ()),
+            "reviewed graph ordinary task scope changed")
+    planning = definition["planning"]
+    require(set(node.tools) == set(planning["tools"])
+            and set(node.permissions) == set(planning["permissions"]),
+            "reviewed graph differs from approved work planning scope")
+    return graph
+
+
+def _graph_admission(storage, graph, *, create=False):
+    from .taskgraph import PersistentTaskGraph, LifecycleState
+    path = storage / "taskgraph.jsonl"
+    if not os.path.lexists(path):
+        require(create, "original reviewed graph admission unavailable")
+        _audit(path)  # Private no-follow file and durable directory before append.
+        PersistentTaskGraph(path).persist_graph(graph)
+        directory = os.open(storage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
+                and info.st_nlink == 1 and not info.st_mode & 0o077
+                and 0 < info.st_size <= 1048576, "reviewed graph journal is not private and bounded")
+        with os.fdopen(os.dup(fd), "rb") as stream:
+            raw = stream.read(1048577)
+        # The generic replay permits incomplete tails. This dedicated admission
+        # log has exactly one complete immutable PENDING event.
+        require(len(raw) == info.st_size and raw.endswith(b"\n") and len(raw.splitlines()) == 1,
+                "reviewed graph admission journal changed")
+        actual, states = PersistentTaskGraph(path).replay()
+        stamp = lambda value: (value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+            value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+        require(stamp(info) == stamp(os.fstat(fd)) == stamp(path.lstat()),
+                "reviewed graph admission changed during replay")
+        require(actual.to_planner_json() == graph.to_planner_json()
+                and all(state.lifecycle is LifecycleState.PENDING and state.attempt == 0
+                        and state.lease_id is None and state.lease_expires_at is None for state in states.values()),
+                "reviewed graph admission changed")
+    finally:
+        os.close(fd)
+
+
+def _original_work_admission(root, task, configuration_path):
+    """Read an existing protected work admission without opening budget ports."""
+    from agent_completion_evidence import spec_digest
+    raw = _read_configuration(configuration_path)
+    root = Path(root)
+    require(root.is_absolute() and root.resolve(strict=True) == root
+            and root == Path(raw["task_store_root"]), "work task store differs from host configuration")
+    storage = Path(raw["storage"]) / "work-contracts" / digest(binding(task))
+    if not os.path.lexists(storage):
+        require(task.get("work_contract_version") != 1, "original work admission unavailable")
+        return None, None
+    for directory in (Path(raw["storage"]), storage.parent, storage, storage / "admission"):
+        require(directory.resolve(strict=True) == directory and directory.is_dir(), "original work admission unavailable")
+        info = directory.lstat()
+        require(info.st_uid == os.geteuid() and not info.st_mode & 0o077,
+                "original work admission is not private")
+    workspace = Path(task["workspace"]).resolve()
+    require(not storage.is_relative_to(workspace), "work authority is worker writable")
+    store = EvidenceStore(storage / "admission"); store.protect_from((workspace,))
+    admitted = store.read("plan", digest(binding(task)))
+    closed(admitted, ("version", "identity", "spec_sha256", "definition", "environment"), "work admission")
+    require(type(admitted["version"]) is int and admitted["version"] == 1
+            and admitted["identity"] == binding(task) and admitted["spec_sha256"] == spec_digest(task),
+            "original work admission binding changed")
+    require(raw == _read_configuration(configuration_path), "host configuration changed during graph read")
+    return storage, admitted
+
+
+def reviewed_parent_admission(root, task, *, grant, evidence=None, configuration_path=HOST_POLICY_CONFIG):
+    """Bind original protected graph to an already authenticated sealed attempt.
+
+    The worker/bridge supplies the actual verified grant. Neither task JSON nor
+    the returned structural descriptor authenticates or approves a caller.
+    """
+    from .scheduler import CanonicalParentAdmission
+    from .security import InvocationIdentity, SecurityGrant
+    from .policy_launch import validate_policy_evidence
+    storage, admitted = _original_work_admission(root, task, configuration_path)
+    if admitted is None:
+        return None
+    graph = _reviewed_graph(admitted["definition"], task)
+    if graph is None:
+        return None
+    _graph_admission(storage, graph)
+    session = task.get("execution_session")
+    require(isinstance(session, dict) and session.get("owned_pane") is True
+            and not session.get("closed_at") and session.get("sandbox_verified") is True,
+            "reviewed parent session is not sealed and owned")
+    identity = InvocationIdentity.from_dict(session.get("launch_identity"))
+    require(isinstance(grant, SecurityGrant) and grant.identity == identity
+            and identity.task_id == task["id"] and identity.run_token == task["run_token"]
+            and identity.fencing_token == task["fencing_token"]
+            and identity.consumer == "github:" + task["repo"]
+            and identity.agent_id == session.get("agent_name")
+            and set(grant.scope.tools) == set(graph.nodes[0].tools)
+            and set(grant.scope.permissions) <= set(graph.nodes[0].permissions),
+            "reviewed parent differs from authenticated grant")
+    policy = validate_policy_evidence(session.get("invocation_policy") if evidence is None else evidence,
+                                      identity=identity)
+    attestation = session.get("sandbox_attestation")
+    require(policy["grant_sha256"] == grant.hash
+            and isinstance(attestation, dict)
+            and digest(attestation) == policy["sandbox_attestation_sha256"]
+            and attestation.get("task_id") == identity.task_id
+            and attestation.get("run_token") == identity.run_token
+            and attestation.get("fencing_token") == identity.fencing_token
+            and attestation.get("pane_id") == session.get("pane_id")
+            and attestation.get("marker") == session.get("pane_marker"),
+            "reviewed parent sealed attestation changed")
+    parent = CanonicalParentAdmission(graph=graph, graph_sha256=graph.graph_hash(), identity=identity,
+        idempotency_key=task["idempotency_key"], repo=task["repo"], issue=str(task["issue"]),
+        pane_id=session.get("pane_id"), marker=session.get("pane_marker"))
+    parent.to_json()
+    return parent
+
+
+def bind_reviewed_parent(factory, task, launch, *, evidence=None, recheck=False):
+    """Use the existing private attempt journal, without dispatch or a new claim."""
+    from agent_durable_children import (parent_attempt_guard, attempt_directory,
+        initialize_parent_scheduler, ledger_required)
+    from .scheduler import DynamicChildScheduler, SchedulerError
+    root = factory.task_store_root
+    configuration_path = factory.host_configuration_path
+    with parent_attempt_guard(root, task["id"], task["run_token"]):
+        parent = reviewed_parent_admission(root, task, grant=launch.grant, evidence=evidence,
+                                           configuration_path=configuration_path)
+        directory = attempt_directory(root, task["id"], task["run_token"])
+        ledger = directory / "scheduler.jsonl"
+        if parent is None:
+            if ledger.is_file():
+                existing = DynamicChildScheduler(audit_log=AuditLog(ledger)); existing.replay()
+                require(all(rec.canonical_parent is None for rec in existing._tasks.values()),
+                        "canonical parent requires original protected admission")
+            return None
+        _, admitted = _original_work_admission(root, task, configuration_path)
+        require(canonical(admitted) == canonical(factory.host_admission), "original reviewed admission differs from work factory")
+        args = dict(task_id=parent.identity.task_id, run_token=parent.identity.run_token,
+            idempotency_key=parent.idempotency_key, agent_name=parent.identity.agent_id,
+            pane_id=parent.pane_id, marker=parent.marker, repo=parent.repo, issue=parent.issue,
+            role=task["parent_role"], tools=task["parent_tools"], permissions=task["parent_permissions"],
+            policy_profile=task["safety_profile"], canonical_parent=parent)
+        if ledger.is_file():
+            require(ledger_required(directory), "canonical parent scheduler sentinel missing")
+            scheduler = DynamicChildScheduler(audit_log=AuditLog(ledger)); scheduler.replay()
+            scheduler.register_external_parent_attempt(**args)
+        else:
+            require(not recheck and not ledger_required(directory), "canonical parent scheduler unavailable")
+            initialize_parent_scheduler(directory, **args)
+        return parent
+
+
 def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG, git=None, recovery=False, spec_sha256=None):
     """Only standalone host code selects the protected configuration path."""
     from agent_completion_evidence import spec_digest
@@ -227,7 +406,7 @@ def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG
     names = {"spec_version", "policy_version", "base_sha", "files", "criteria", "checks",
              "budget_reference", "mode", "baseline_omission_reason", "phases", "prerequisite_commits",
              "purpose", "baseline_policy", "discovery_files", "planning"}
-    closed(definition, names | ({"hygiene"} if "hygiene" in definition else set()) | ({"budget"} if "budget" in definition else set()), "approved work definition")
+    closed(definition, names | ({"hygiene"} if "hygiene" in definition else set()) | ({"budget"} if "budget" in definition else set()) | ({"reviewed_graph"} if "reviewed_graph" in definition else set()), "approved work definition")
     hygiene = None
     if "hygiene" in definition:
         from .work_hygiene import LocalCommitPolicy
@@ -236,8 +415,11 @@ def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG
     require(definition["mode"] == "repair", "experiment authority is not configured")
     base = (task.get("completion_plan") or {}).get("base_sha")
     require(base == definition["base_sha"], "work base differs from frozen completion plan")
+    graph = _reviewed_graph(definition, task)
     if not recovery:
         store.publish("plan", digest(binding(task)), admitted)
+    if graph is not None:
+        _graph_admission(storage, graph, create=not recovery)
 
     def approve(*, identity, workspace, grant, spec_sha256):
         require(not recovery, "recovered work evidence cannot authorize new implementation")
@@ -263,7 +445,7 @@ def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG
                 "host fills actual planning identity and discovery")
         planning.update(version=1, identity=identity.to_json(), spec_sha256=spec_sha256,
                         base_sha=definition["base_sha"], discovery=discovery.to_json())
-        data = {key: value for key, value in definition.items() if key not in {"discovery_files", "planning", "hygiene", "budget"}}
+        data = {key: value for key, value in definition.items() if key not in {"discovery_files", "planning", "hygiene", "budget", "reviewed_graph"}}
         data["mode"] = WorkMode(data["mode"])
         data["files"] = tuple(FileScope(**item) for item in data["files"])
         data["checks"] = tuple(ValidationCheck(**item) for item in data["checks"])
@@ -290,6 +472,7 @@ def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG
     require(factory.request_wall_seconds<=900,"full host verification request exceeds bound")
     factory.request_wall_seconds=900  # Includes transport and protected callback.
     factory.task_store_root = root
+    factory.host_configuration_path = configuration_path
     _private_directory(storage / "results", base=Path(raw["storage"]))
     from .work_result_receipt import WorkResultAuthority
     factory.result_authority = WorkResultAuthority(EvidenceStore(storage / "results"))

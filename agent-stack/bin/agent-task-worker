@@ -855,8 +855,7 @@ def _wait_for_task_sandbox(pane_id, pane_marker, *, policy, policy_mount,
 
 def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
     """Create one fresh Hermes pane/session for exactly one durable attempt."""
-    if modern_work_contract(task):
-        work_factory = _root_work_factory(task)
+    work_factory = _root_work_factory(task) if modern_work_contract(task) else None
     routing = task.get("routing") if isinstance(task.get("routing"), dict) else {}
     coordinator = str(
         routing.get("selected_agent") or task.get("agent") or "quantlab-hermes"
@@ -1056,6 +1055,8 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
             from agent_completion_evidence import store_for
             from herdr.evidence import binding, digest
             preflight_handoff(work_factory, launch, store_for(ROOT,task).read("plan",digest(binding(task))))
+            from herdr.work_configuration import bind_reviewed_parent
+            bind_reviewed_parent(work_factory, task, launch)
             cycle = work_factory.prepare(identity=identity, workspace=Path(workspace),
                                          grant=launch.grant, spec_sha256=spec_digest(task))
             task["work_contract"] = {"version":1,"plan_sha256":cycle.plan.hash,
@@ -1069,6 +1070,8 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
             launch.mount.bootstrap.work_budget = work_factory.budget_effect
             persist_execution_session(task)
         def publish_continuation(evidence):
+            if work_factory is not None:
+                bind_reviewed_parent(work_factory, task, launch, evidence=evidence, recheck=True)
             session["invocation_policy"]=evidence
             persist_execution_session(task)
             return True
