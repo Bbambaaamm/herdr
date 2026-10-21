@@ -265,6 +265,165 @@ def _replay_model_policy(event: Mapping[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+_LEGACY_PARENT = object()
+
+
+@dataclass(frozen=True)
+class CanonicalParentAdmission:
+    """Root-only host data, never a grant or evidence of graph approval.
+
+    Only a trusted caller may supply the reviewed graph and already allocated
+    ordinary identity/session. This value neither authenticates that caller nor
+    authorizes a model, budget, native launch or queue admission.
+    """
+    graph: TaskGraph
+    graph_sha256: str
+    identity: "InvocationIdentity"
+    idempotency_key: str
+    repo: str
+    issue: str
+    pane_id: str
+    marker: str
+
+    def to_json(self) -> dict:
+        from .security import InvocationIdentity
+        if not isinstance(self.graph, TaskGraph) or not isinstance(self.identity, InvocationIdentity):
+            raise SchedulerError("typed canonical graph and ordinary identity required")
+        graph = TaskGraph.parse_planner_output({"envelope": asdict(self.graph.envelope),
+            "nodes": [node.to_json() for node in self.graph.nodes]})
+        if (len(graph.nodes) != 1 or graph.nodes[0].parent_id is not None
+                or graph.nodes[0].dependencies or graph.nodes[0].id != self.identity.task_id):
+            raise SchedulerError("canonical parent mode requires exactly one root")
+        if (not isinstance(self.graph_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", self.graph_sha256)
+                or graph.graph_hash() != self.graph_sha256):
+            raise SchedulerError("canonical graph digest mismatch")
+        if (not all(isinstance(value, str) and 0 < len(value) <= 1024
+                    and not any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value)
+                    for value in (self.idempotency_key, self.repo, self.issue, self.pane_id, self.marker))
+                or self.identity.consumer != "github:" + self.repo
+                or graph.envelope.issue != self.repo + "#" + self.issue):
+            raise SchedulerError("canonical parent scope mismatch")
+        # Revalidate even a supplied instance; a type annotation is not authority.
+        identity = InvocationIdentity.from_dict(self.identity.to_json())
+        return {"version": 1, "graph": {"envelope": asdict(graph.envelope),
+                    "nodes": [node.to_json() for node in graph.nodes]},
+                "graph_sha256": self.graph_sha256, "identity": identity.to_json(),
+                "idempotency_key": self.idempotency_key, "repo": self.repo,
+                "issue": self.issue, "pane_id": self.pane_id, "marker": self.marker}
+
+    @classmethod
+    def from_json(cls, raw):
+        from .security import InvocationIdentity, SecurityError
+        fields = {"version", "graph", "graph_sha256", "identity", "idempotency_key",
+                  "repo", "issue", "pane_id", "marker"}
+        try:
+            if (not isinstance(raw, dict) or set(raw) != fields
+                    or type(raw["version"]) is not int or raw["version"] != 1):
+                raise SchedulerError("invalid canonical parent data")
+            parent = cls(graph=TaskGraph.parse_planner_output(raw["graph"]),
+                graph_sha256=raw["graph_sha256"], identity=InvocationIdentity.from_dict(raw["identity"]),
+                idempotency_key=raw["idempotency_key"], repo=raw["repo"], issue=raw["issue"],
+                pane_id=raw["pane_id"], marker=raw["marker"])
+            if parent.to_json() != raw:
+                raise SchedulerError("noncanonical parent data")
+            return parent
+        except (ValueError, TypeError, KeyError, SecurityError) as exc:
+            raise SchedulerError("invalid canonical parent data") from exc
+
+
+def _canonical_payload_parent(payload):
+    if not isinstance(payload, dict) or set(payload) != {"admission", "limits"}:
+        raise SchedulerError("invalid canonical parent claim")
+    parent = CanonicalParentAdmission.from_json(payload["admission"])
+    limits = payload["limits"]
+    if (not isinstance(limits, dict) or set(limits) != {"max_nodes", "max_depth", "max_fanout"}
+            or any(type(value) is not int or value < 1 for value in limits.values())
+            or any(limits[key] > getattr(parent.graph.envelope, key) for key in limits)):
+        raise SchedulerError("invalid canonical parent limits")
+    return parent
+
+
+def _canonical_parent_payload(parent, events):
+    if not isinstance(parent, CanonicalParentAdmission):
+        raise SchedulerError("typed canonical parent data required")
+    data = parent.to_json()
+    submits = [event for event in events if event.get("event") == "submit"]
+    graphs = [event for event in events if event.get("event") == "graph_submit"]
+    node = data["graph"]["nodes"][0]
+    if len(submits) != 1 or len(graphs) != 1:
+        raise SchedulerError("canonical root journal mismatch")
+    submit, graph = submits[0], graphs[0]
+    if (any(submit.get(key) != value for key, value in node.items())
+            or submit.get("task_id") != parent.identity.task_id
+            or submit.get("repo") != parent.repo or submit.get("issue") != parent.issue
+            or submit.get("policy_profile") != parent.graph.envelope.policy_profile
+            or submit.get("state") != LifecycleState.PENDING.value
+            or submit.get("model") != node["model_policy"].get("model")
+            or submit.get("fallback_model") != node["model_policy"].get("fallback_model")
+            or graph.get("graph_hash") != parent.graph_sha256
+            or type(graph.get("node_count")) is not int or graph["node_count"] != 1
+            or graph.get("repo") != parent.repo or graph.get("issue") != parent.issue):
+        raise SchedulerError("canonical root journal mismatch")
+    payload = {"admission": data,
+               "limits": {key: graph.get(key) for key in ("max_nodes", "max_depth", "max_fanout")}}
+    _canonical_payload_parent(payload)
+    return payload
+
+
+def _validate_canonical_claim(event, parent, payload):
+    identity = parent.identity
+    if (event.get("task_id") != identity.task_id or event.get("run_token") != identity.run_token
+            or event.get("idempotency_key") != parent.idempotency_key
+            or event.get("agent_id") != identity.agent_id or event.get("holder") != "external"
+            or type(event.get("fencing_token")) is not int or event["fencing_token"] != identity.fencing_token
+            or event.get("attempt_state") != "accepted" or event.get("canonical_parent") != payload
+            or type(event.get("lease_until")) not in (float, int)
+            or not 0 < event["lease_until"] < float("inf")):
+        raise SchedulerError("canonical ordinary claim mismatch")
+
+
+def _validate_canonical_session(event, parent):
+    if (event.get("task_id"), event.get("run_token"), event.get("agent_name"),
+            event.get("pane_id"), event.get("marker")) != (parent.identity.task_id,
+            parent.identity.run_token, parent.identity.agent_id, parent.pane_id, parent.marker):
+        raise SchedulerError("canonical ordinary session mismatch")
+
+
+def validate_canonical_parent_initialization(payload, events):
+    """Validate only structural host data; this does not approve a graph."""
+    parent = _canonical_payload_parent(payload)
+    if (len(events) != 4 or [event.get("event") for event in events] !=
+            ["submit", "graph_submit", "claim", "execution_session_bound"]
+            or payload != _canonical_parent_payload(parent, events)):
+        raise SchedulerError("invalid canonical parent initialization events")
+    _validate_canonical_claim(events[2], parent, payload)
+    _validate_canonical_session(events[3], parent)
+    return parent
+
+
+def _validate_canonical_record(rec, parent, *, pending=False, bound=False):
+    node = parent.graph.nodes[0]
+    if (rec.node.to_json() != node.to_json() or rec.repo != parent.repo or rec.issue != parent.issue
+            or rec.policy_profile != parent.graph.envelope.policy_profile
+            or rec.parent_task_id is not None or rec.parent_agent_id is not None
+            or rec.model_used != node.model_policy.get("model")
+            or rec.fallback_used != node.model_policy.get("fallback_model")):
+        raise SchedulerError("canonical parent record mismatch")
+    if pending and (rec.state is not LifecycleState.PENDING or rec.attempt_state != "dispatching"
+            or rec.attempts != 0 or rec.started_at is not None
+            or any(value is not None for value in (rec.run_token, rec.idempotency_key,
+                rec.execution_agent, rec.execution_pane, rec.execution_marker, rec.canonical_parent,
+                rec.delegation_key, rec.execution_sandbox_attestation, rec.namespace_lifetime,
+                rec.result_status, rec.pre_delivery_failure))
+            or rec.execution_sandbox_verified or rec.cleanup_complete):
+        raise SchedulerError("canonical root is not unbound pending")
+    if bound and ((rec.run_token, rec.idempotency_key, rec.fencing_token, rec.agent_id,
+            rec.execution_agent, rec.execution_pane, rec.execution_marker) != (
+            parent.identity.run_token, parent.idempotency_key, parent.identity.fencing_token,
+            parent.identity.agent_id, parent.identity.agent_id, parent.pane_id, parent.marker)):
+        raise SchedulerError("canonical parent binding mismatch")
+
+
 class AuditLog:
     """Append-only JSONL audit log for replay/recovery."""
 
@@ -358,6 +517,7 @@ class TaskRecord:
     delivery_prompt_sha256: str | None = None
     result_status: str | None = None
     result_artifact_sha256: str | None = None
+    canonical_parent: dict[str, object] | None = None
     completion_contract_version: int = 2
     completion_receipt: dict[str,object] | None = None
     completion_failure: dict[str,object] | None = None
@@ -2084,6 +2244,8 @@ class DynamicChildScheduler:
         )
         for e in events:
             event_type = e.get("event")
+            if "canonical_parent" in e and event_type != "claim":
+                raise SchedulerError("canonical parent field outside claim")
             if event_type == "submit":
                 task_id = str(e.get("task_id", ""))
                 model_policy = _replay_model_policy(e)
@@ -2161,7 +2323,19 @@ class DynamicChildScheduler:
                 task_id = str(e.get("task_id", ""))
                 rec = self._tasks.get(task_id)
                 if rec is None:
+                    if "canonical_parent" in e:
+                        raise SchedulerError("canonical claim without root")
                     continue
+                if "canonical_parent" in e:
+                    payload = e["canonical_parent"]
+                    parent = _canonical_payload_parent(payload)
+                    if payload != _canonical_parent_payload(parent, events):
+                        raise SchedulerError("canonical claim journal mismatch")
+                    _validate_canonical_record(rec, parent, pending=True)
+                    _validate_canonical_claim(e, parent, payload)
+                    rec.canonical_parent = payload
+                elif rec.canonical_parent is not None:
+                    raise SchedulerError("canonical parent cannot be reclaimed")
                 rec.lease = Lease(
                         task_id=task_id,
                         agent_id=str(e.get("agent_id", "")),
@@ -2415,6 +2589,8 @@ class DynamicChildScheduler:
                     rec.delivery_prompt_sha256 = str(e.get("sha256", ""))
             elif event_type == "execution_session_bound":
                 rec = self._tasks.get(str(e.get("task_id", "")))
+                if rec is not None and rec.canonical_parent is not None:
+                    _validate_canonical_session(e, _canonical_payload_parent(rec.canonical_parent))
                 if rec is not None and rec.run_token == str(e.get("run_token", "")):
                     rec.execution_agent = str(e.get("agent_name", ""))
                     rec.execution_pane = str(e.get("pane_id", ""))
@@ -2594,6 +2770,9 @@ class DynamicChildScheduler:
                     rec.agent_id = rec.lease.agent_id
                     rec.fencing_token = rec.lease.fencing_token
                     self._claims[rec.node.id] = rec.lease
+        for rec in self._tasks.values():
+            if rec.canonical_parent is not None:
+                _validate_canonical_record(rec, _canonical_payload_parent(rec.canonical_parent), bound=True)
         max_fence = max((int(e.get("fencing_token") or 0) for e in events), default=0)
         max_fence = max(max_fence, max((rec.fencing_token or 0 for rec in self._tasks.values()), default=0))
         self._next_fencing_token_value = max(self._next_fencing_token_value, max_fence + 1)
@@ -2677,13 +2856,64 @@ class DynamicChildScheduler:
         )
         return lease
 
+    def _register_canonical_parent(self, *, canonical_parent, task_id, run_token,
+            idempotency_key, agent_name, pane_id, marker, repo, issue, role, tools,
+            permissions, policy_profile):
+        parent = canonical_parent
+        payload = _canonical_parent_payload(parent, self.audit_log.replay())
+        node, identity = parent.graph.nodes[0], parent.identity
+        if (task_id, run_token, idempotency_key, agent_name, pane_id, marker,
+                repo, issue, role, tuple(tools), tuple(permissions), policy_profile) != (
+                identity.task_id, identity.run_token, parent.idempotency_key, identity.agent_id,
+                parent.pane_id, parent.marker, parent.repo, parent.issue, node.role,
+                node.tools, node.permissions, parent.graph.envelope.policy_profile):
+            raise SchedulerError("canonical parent request mismatch")
+        rec = self._tasks.get(task_id)
+        if rec is None:
+            raise SchedulerError("existing canonical root required")
+        if rec.canonical_parent is not None:
+            _validate_canonical_record(rec, parent, bound=True)
+            if (rec.canonical_parent != payload or rec.state is not LifecycleState.RUNNING
+                    or rec.attempt_state != "accepted" or rec.lease is None
+                    or (rec.lease.task_id, rec.lease.agent_id, rec.lease.holder, rec.lease.fencing_token) !=
+                    (task_id, agent_name, "external", identity.fencing_token)):
+                raise SchedulerError("canonical parent repeat mismatch")
+            return rec
+        _validate_canonical_record(rec, parent, pending=True)
+        if any(getattr(self, "_plan_" + key) > value for key, value in payload["limits"].items()):
+            raise SchedulerError("canonical graph limits changed")
+        lease = Lease(task_id, agent_name, "external", identity.fencing_token,
+                      self.clock() + self.budget.claim_ttl_seconds)
+        rec.lease, rec.fencing_token, rec.agent_id = lease, identity.fencing_token, agent_name
+        rec.state, rec.attempt_state = LifecycleState.RUNNING, "accepted"
+        rec.run_token, rec.idempotency_key = run_token, idempotency_key
+        rec.execution_agent, rec.execution_pane, rec.execution_marker = agent_name, pane_id, marker
+        rec.canonical_parent = payload
+        self._claims[task_id] = lease
+        with self._next_fencing_token_lock:
+            self._next_fencing_token_value = max(self._next_fencing_token_value, identity.fencing_token + 1)
+        self.audit_log.append({"event": "claim", "task_id": task_id, "agent_id": agent_name,
+            "holder": "external", "fencing_token": identity.fencing_token,
+            "lease_until": lease.lease_until, "run_token": run_token,
+            "idempotency_key": idempotency_key, "attempt_state": "accepted",
+            "canonical_parent": payload})
+        self.audit_log.append({"event": "execution_session_bound", "task_id": task_id,
+            "run_token": run_token, "agent_name": agent_name, "pane_id": pane_id, "marker": marker})
+        self.audit_log.flush()
+        return rec
+
     def register_external_parent_attempt(
         self, *, task_id: str, run_token: str, idempotency_key: str,
         agent_name: str, pane_id: str, marker: str, repo: str, issue: str,
         role: str, tools: Sequence[str], permissions: Sequence[str],
-        policy_profile: str,
+        policy_profile: str, canonical_parent=_LEGACY_PARENT,
     ) -> TaskRecord:
-        """Durably bind an already running Agent Stack attempt to this scheduler."""
+        """Bind host-observed ordinary data; canonical mode never grants approval."""
+        if canonical_parent is not _LEGACY_PARENT:
+            return self._register_canonical_parent(canonical_parent=canonical_parent,
+                task_id=task_id, run_token=run_token, idempotency_key=idempotency_key,
+                agent_name=agent_name, pane_id=pane_id, marker=marker, repo=repo, issue=issue,
+                role=role, tools=tools, permissions=permissions, policy_profile=policy_profile)
         if not all((task_id, run_token, idempotency_key, agent_name, pane_id,
                     marker, repo, role, policy_profile)):
             raise SchedulerError("external parent identity incomplete")
