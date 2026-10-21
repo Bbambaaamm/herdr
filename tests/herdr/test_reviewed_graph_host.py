@@ -4,6 +4,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 import json
+import hashlib
 import sys
 import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]/"agent-stack/bin"))
@@ -17,9 +18,30 @@ from tests.herdr.test_work_contract_host import factory_fixture
 from tests.herdr.test_work_planning import artifact
 
 
-def configured(tmp_path, monkeypatch, *, graph=True, budget=False):
+def structural_factory(tmp_path, monkeypatch):
+    """Real typed host data/journals; this fixture cannot execute a check."""
+    from herdr.check_runner import CheckEnvironment, HostCheckRunner
+    from herdr.work_contract_host import HostWorkContractFactory
+    from tests.herdr.test_work_cycle import setup, trusted_git
+    from tests.herdr.test_security import grant as make_grant
+    def no_physical_check(*args, **kwargs):
+        pytest.fail("structural graph fixture attempted a physical check runner")
+    monkeypatch.setattr(HostCheckRunner, "__init__", no_physical_check)
+    _, workspace, template, audit = setup(tmp_path)
+    grant = replace(make_grant(workspace), identity=template.identity)
+    executable = Path(sys.executable).resolve(strict=True)
+    environment = CheckEnvironment("non-executing-graph-contract-1",
+        ((str(executable), hashlib.sha256(executable.read_bytes()).hexdigest()),), (str(executable),))
+    template = replace(template, grant_sha256=grant.hash, environment_sha256=environment.hash)
+    factory = HostWorkContractFactory(approve=lambda **kwargs:template, environment=environment,
+        storage=tmp_path/"host"/"checks", audit_log=audit, git=trusted_git(workspace))
+    return factory, workspace, template, grant, audit
+
+
+def configured(tmp_path, monkeypatch, *, graph=True, budget=False, physical=False):
     raw, _, _ = approved_config(tmp_path, monkeypatch)
-    old, workspace, template, grant, _ = factory_fixture(tmp_path/"actual")
+    old, workspace, template, grant, _ = (factory_fixture(tmp_path/"actual") if physical
+        else structural_factory(tmp_path/"actual", monkeypatch))
     task = dict(id=grant.identity.task_id, run_token=grant.identity.run_token,
         fencing_token=grant.identity.fencing_token, idempotency_key="ordinary-key", attempt_id=1,
         repo="org/repo", issue=9, kind="coding", prompt="Synthetic unit contract only",
@@ -117,7 +139,9 @@ def test_unapproved_graph_rejected_before_any_budget_port(tmp_path,monkeypatch,f
 
 
 def test_host_graph_metadata_is_not_a_workplan_keyword(tmp_path,monkeypatch):
-    raw,task,d,g,grant,git=configured(tmp_path,monkeypatch)
+    # This sole actual baseline execution keeps the original physical fixture
+    # and its honest unavailable-runtime skip. No synthetic namespace is used.
+    raw,task,d,g,grant,git=configured(tmp_path,monkeypatch,physical=True)
     work=build(raw,task,git)
     cycle=work.prepare(identity=grant.identity,workspace=Path(task["workspace"]),grant=grant,spec_sha256=spec_digest(task))
     assert "reviewed_graph" not in cycle.plan.to_json()
@@ -340,3 +364,28 @@ def test_final_continuation_never_recreates_missing_canonical_ledger(tmp_path,mo
     ledger=directory/"scheduler.jsonl";ledger.unlink();calls=[]
     with pytest.raises(RuntimeError):callback(task,work,launch,lambda task:calls.append(True))(proof)
     assert not ledger.exists() and calls==[]
+
+
+def test_structural_fixture_never_probes_bwrap_or_calls_physical_factory(tmp_path,monkeypatch):
+    def forbidden(*args,**kwargs):pytest.fail("structural graph used the physical fixture")
+    monkeypatch.setattr(sys.modules[__name__],"factory_fixture",forbidden)
+    original=Path.is_file
+    def no_bwrap_probe(path):
+        if path==Path("/usr/bin/bwrap"):
+            pytest.fail("structural graph probed optional bubblewrap")
+        return original(path)
+    monkeypatch.setattr(Path,"is_file",no_bwrap_probe)
+    raw,task,d,g,grant,git=configured(tmp_path,monkeypatch)
+    build(raw,task,git)
+    saved,states=PersistentTaskGraph(graph_path(raw,task)).replay()
+    assert saved.graph_hash()==g.graph_hash() and states[task["id"]].lifecycle is LifecycleState.PENDING
+    from herdr.check_runner import HostCheckRunner
+    with pytest.raises(pytest.fail.Exception,match="attempted a physical check runner"):
+        HostCheckRunner(None,None)
+
+
+def test_physical_fixture_keeps_real_absent_bwrap_skip(tmp_path,monkeypatch):
+    original=Path.is_file
+    monkeypatch.setattr(Path,"is_file",lambda path:False if path==Path("/usr/bin/bwrap") else original(path))
+    with pytest.raises(pytest.skip.Exception,match="physical namespace runtime unavailable"):
+        configured(tmp_path,monkeypatch,physical=True)
