@@ -683,3 +683,237 @@ def test_v4a_update_denies_before_earlier_add_can_mutate(tmp_path):
         assert "conditional replacement unavailable" in result.error
         assert applied==[] and target.read_text()=="original" and not (root/"new").exists()
     finally:authority.close()
+
+
+
+def _read_hash_ops(root, gate):
+    """Small result double; the pinned SDK JSON contract is tested separately."""
+    from dataclasses import dataclass
+    from herdr.file_authority import RootFDWorkspace
+
+    @dataclass
+    class ReadResult:
+        content: str = ""
+        total_lines: int = 0
+        file_size: int = 0
+        truncated: bool = False
+        error: str | None = None
+        base64_content: str | None = None
+        is_binary: bool = False
+
+        def to_dict(self):
+            return {key: value for key, value in vars(self).items()
+                    if not key.startswith("_") and value is not None}
+
+    authority = RootFDWorkspace((str(root),))
+    delegate = types.SimpleNamespace(_add_line_numbers=lambda value, offset:
+        "\n".join(f"{offset+i}|{line}" for i, line in enumerate(value.splitlines())))
+    return authority, hermes_guard._PolicyFileOps(authority, delegate,
+        types.SimpleNamespace(ReadResult=ReadResult), types.SimpleNamespace(),
+        redaction_gate=gate)
+
+
+@pytest.mark.parametrize("raw", [
+    b"alpha\nbeta\n", b"alpha\r\nbeta\r\n", b"\xef\xbb\xbfalpha\r\n",
+    b"alpha\rbeta\r", "Příliš žluťoučký \u212b A\u030a\n".encode(),
+    b"alpha", b"alpha\n\n", b"",
+], ids=["lf", "crlf", "bom", "lone-cr", "unicode", "no-final-newline", "trailing-blank", "empty"])
+def test_policy_read_public_hashes_bind_exact_utf8_buffer(tmp_path, raw):
+    import hashlib
+    target = tmp_path / "source.py"; target.write_bytes(raw)
+    seen = []
+    def gate(path, text):
+        seen.append((path, text))
+        return text
+    authority, ops = _read_hash_ops(tmp_path, gate)
+    try:
+        result = ops.read_file(str(target), offset=1, limit=1).to_dict()
+        assert result["raw_sha256"] == hashlib.sha256(raw).hexdigest()
+        assert result["sha256_crlf_to_lf"] == hashlib.sha256(raw.replace(b"\r\n", b"\n")).hexdigest()
+        assert result["hash_scope"] == "entire-read-buffer"
+        assert seen == [(str(target), raw.decode("utf-8"))]
+        assert result["file_size"] == len(raw)
+    finally:
+        authority.close()
+
+
+def test_policy_read_hashes_do_not_reread_or_hash_only_the_visible_page(tmp_path, monkeypatch):
+    import hashlib
+    target = tmp_path / "large.py"
+    raw = b"visible\n" + b"hidden-but-public\n" * 3000
+    target.write_bytes(raw)
+    authority, ops = _read_hash_ops(tmp_path, lambda path, text: text)
+    original = authority.read_bytes
+    reads = []
+    def counted(path, **kwargs):
+        reads.append(path)
+        value = original(path, **kwargs)
+        # A later replacement must not make metadata describe different bytes
+        # from those used to produce this page.
+        target.write_bytes(b"replacement-after-the-read\n")
+        return value
+    monkeypatch.setattr(authority, "read_bytes", counted)
+    try:
+        result = ops.read_file(str(target), limit=1).to_dict()
+        assert reads == [str(target)]
+        assert result["content"] == "1|visible" and result["truncated"] is True
+        assert result["raw_sha256"] == hashlib.sha256(raw).hexdigest()
+        assert result["raw_sha256"] != hashlib.sha256(target.read_bytes()).hexdigest()
+    finally:
+        authority.close()
+
+
+@pytest.mark.parametrize("failure", ["absent", "not-callable", "raises", "none", "number", "changed"])
+def test_policy_read_optional_hash_gate_fails_closed_without_breaking_content(tmp_path, failure):
+    target = tmp_path / "source.py"; target.write_text("visible\n")
+    def raises(path, text):
+        raise RuntimeError("unit-only unavailable redactor")
+    gates = {"absent": None, "not-callable": 1, "raises": raises,
+             "none": lambda path, text: None, "number": lambda path, text: 1,
+             "changed": lambda path, text: "redacted"}
+    authority, ops = _read_hash_ops(tmp_path, gates[failure])
+    try:
+        result = ops.read_file(str(target), limit=1).to_dict()
+        assert result["content"] == "1|visible" and not result.get("error")
+        assert not {"raw_sha256", "sha256_crlf_to_lf", "hash_scope"} & result.keys()
+    finally:
+        authority.close()
+
+
+def test_policy_read_hidden_redacted_text_never_discloses_a_whole_file_hash(tmp_path):
+    target = tmp_path / "source.py"; target.write_text("visible\nunit-secret-on-hidden-line\n")
+    seen = []
+    def gate(path, text):
+        seen.append(text)
+        return text.replace("unit-secret-on-hidden-line", "<redacted>")
+    authority, ops = _read_hash_ops(tmp_path, gate)
+    try:
+        result = ops.read_file(str(target), limit=1).to_dict()
+        assert seen == ["visible\nunit-secret-on-hidden-line\n"]
+        assert result["content"] == "1|visible"
+        assert not {"raw_sha256", "sha256_crlf_to_lf", "hash_scope"} & result.keys()
+    finally:
+        authority.close()
+
+
+@pytest.mark.parametrize("failure", ["outside", "symlink", "non-utf8", "pagination"])
+def test_policy_read_errors_never_return_public_hashes(tmp_path, failure):
+    root = tmp_path / "root"; root.mkdir()
+    target = root / "source.py"; target.write_bytes(b"public\n")
+    outside = tmp_path / "outside.py"; outside.write_bytes(b"outside\n")
+    selected = str(target)
+    if failure == "outside": selected = str(outside)
+    elif failure == "symlink": target.unlink(); target.symlink_to(outside)
+    elif failure == "non-utf8": target.write_bytes(b"\xff\xfe")
+    authority, ops = _read_hash_ops(root, lambda path, text: text)
+    try:
+        result = ops.read_file(selected, offset=0 if failure == "pagination" else 1).to_dict()
+        assert result["error"]
+        assert not {"raw_sha256", "sha256_crlf_to_lf", "hash_scope"} & result.keys()
+    finally:
+        authority.close()
+
+
+def test_policy_binary_read_and_nul_text_never_return_public_hashes(tmp_path):
+    target = tmp_path / "data.bin"; target.write_bytes(b"binary\x00payload")
+    authority, ops = _read_hash_ops(tmp_path, lambda path, text: text)
+    try:
+        for result in (ops.read_file_bytes(str(target)).to_dict(),
+                       ops.read_file(str(target)).to_dict()):
+            assert not {"raw_sha256", "sha256_crlf_to_lf", "hash_scope"} & result.keys()
+    finally:
+        authority.close()
+
+
+def test_pinned_sdk_formatter_preserves_safe_whole_read_hashes(tmp_path):
+    """Actual guard, file formatter and redactor; no CLI/agent/auth/provider call."""
+    import os
+    from pathlib import Path
+    import subprocess
+
+    sdk = Path("/opt/herdr/releases/p0-5035d92-test/hermes")
+    python = Path("/opt/herdr/releases/p0-5035d92-test/python/bin/python3.11")
+    if not sdk.is_dir() or not python.is_file():
+        pytest.skip("pinned SDK formatter component unavailable")
+    repo = Path(__file__).resolve().parents[2]
+    script = r'''
+import hashlib,json,os,socket,subprocess,sys,types
+from pathlib import Path
+repo,sdk,scratch=map(Path,sys.argv[1:4])
+sys.path[:0]=[str(repo),str(sdk),str(sdk/"venv/lib/python3.11/site-packages")]
+def denied(*args,**kwargs):raise AssertionError("component attempted external effect")
+socket.socket.connect=denied;socket.socket.connect_ex=denied;socket.getaddrinfo=denied
+subprocess.Popen=denied;os.system=denied
+pins={
+"tools/file_tools.py":"e1c5dec811b68b59d0926b1d9fa5aab3e89aef4d47a492b22aa03bc162acc095",
+"tools/file_operations_common.py":"dc0a3d7c46376694eaa918a2c9239dbbc0d77234ffe6010582c8c112e835cae8",
+"tools/file_operations.py":"f0089dae05fd7695aaafbea55e5ce17eb8f4b07e3d8d83a17989a005e682f804",
+"agent/redact.py":"85f6bcf8577697713dbf12992a75ec4f269f90e52523475a8d84a9d287b81c5b"}
+for name,digest in pins.items():assert hashlib.sha256((sdk/name).read_bytes()).hexdigest()==digest
+home=scratch/"home";home.mkdir()
+profile=home/".hermes";profile.mkdir();(profile/"config.yaml").write_text("{}\n")
+os.environ.update(HOME=str(home),HERMES_HOME=str(profile),HERMES_SAFE_MODE="1",
+                  HERMES_ENABLE_PROJECT_PLUGINS="0",HERMES_REDACT_SECRETS="true")
+from tools import file_tools,terminal_tool
+from tools.file_operations import ShellFileOperations
+from herdr.hermes_guard import install_hermes_guard
+from herdr.security import InvocationGuard,SecurityGrant
+unit_grant=SecurityGrant.from_dict(json.loads(sys.argv[4]))
+work=scratch/"work";work.mkdir()
+delegate=ShellFileOperations(None,cwd=str(work))
+# This is the lower environment acquisition seam only: formatting, redaction,
+# authority reads/writes, guard installation and to_dict below remain actual.
+file_tools._get_file_ops=lambda task_id="default":delegate
+terminal_tool._get_env_config=lambda:{"env_type":"local"}
+installation=install_hermes_guard(InvocationGuard(unit_grant))
+try:
+ original=file_tools.redact_sensitive_text
+ seen=[]
+ def observe(text,**kwargs):
+  seen.append(text)
+  return original(text,**kwargs)
+ file_tools.redact_sensitive_text=observe
+ target=work/"source.py";raw=b"visible\r\n"+b"public hidden line\r\n"*3000;target.write_bytes(raw)
+ first=json.loads(file_tools.read_file_tool(str(target),offset=1,limit=1,task_id="child-task"))
+ assert first.get("raw_sha256")==hashlib.sha256(raw).hexdigest(),first
+ assert first["sha256_crlf_to_lf"]==hashlib.sha256(raw.replace(b"\r\n",b"\n")).hexdigest()
+ assert first["hash_scope"]=="entire-read-buffer" and first["truncated"] is True
+ assert raw.decode() in seen and len(first["content"])<100
+ proxy=file_tools._get_file_ops("child-task")
+ patched=proxy.patch_replace(str(target),"visible","edited")
+ assert not patched.success and "conditional replacement unavailable" in patched.error
+ assert target.read_bytes()==raw  # Preserve the existing shared-writer barrier.
+ written=proxy.write_file(str(target),"edited\npublic replacement\n")
+ assert written.verified is True and not written.error
+ changed=target.read_bytes()
+ second=json.loads(file_tools.read_file_tool(str(target),offset=1,limit=1,task_id="child-task"))
+ assert second["raw_sha256"]==hashlib.sha256(changed).hexdigest()!=first["raw_sha256"]
+ created=work/"created.py"
+ added=proxy.patch_v4a("*** Begin Patch\n*** Add File: "+str(created)+"\n+public addition\n*** End Patch\n")
+ assert added.success and not added.error, added.error
+ created_read=json.loads(file_tools.read_file_tool(str(created),limit=1,task_id="child-task"))
+ assert created_read["raw_sha256"]==hashlib.sha256(created.read_bytes()).hexdigest()
+ secret=work/"hidden.py";secret.write_text("visible\n"+"sk-"+"A"*40+"\n")
+ secret_result=json.loads(file_tools.read_file_tool(str(secret),limit=1,task_id="child-task"))
+ assert "error" not in secret_result and secret_result["content"].startswith("1|visible")
+ assert not {"raw_sha256","sha256_crlf_to_lf","hash_scope"}&secret_result.keys()
+ # A replaced/unavailable current display redactor cannot reuse an older gate.
+ file_tools.redact_sensitive_text=None
+ unavailable=proxy.read_file(str(target),limit=1).to_dict()
+ assert not {"raw_sha256","sha256_crlf_to_lf","hash_scope"}&unavailable.keys()
+ print(json.dumps({"actual_sdk_formatter_json":True,"actual_install_gate":True,
+  "public_hashes_before_pagination":True,"patch_update_denied":True,
+  "v4a_add_then_read_hash":True,"write_then_new_hash":True,
+  "hidden_secret_digest_suppressed":True,"current_redactor_lookup":True,
+  "cli_model_auth_or_provider_calls":0}))
+finally:
+ installation.uninstall()
+'''
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path / "launch-home"),
+           "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": str(tmp_path)}
+    from tests.herdr.test_security import grant as unit_grant
+    grant_json = json.dumps(unit_grant(tmp_path / "work", tools=("read_file", "write_file", "patch")).to_json())
+    result = subprocess.run([str(python), "-I", "-B", "-c", script, str(repo), str(sdk), str(tmp_path), grant_json],
+                            env=env, capture_output=True, text=True, timeout=45)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout.strip().splitlines()[-1])["actual_sdk_formatter_json"] is True
