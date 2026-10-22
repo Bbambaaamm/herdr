@@ -247,7 +247,7 @@ class WorkInvocationGuard(InvocationGuard):
         answer=self.work_authority.effect(self.grant.identity,self.grant.hash,"ceiling",payload)
         if (not isinstance(answer,dict) or set(answer)!={"output_token_field","max_output_tokens"}
                 or answer["output_token_field"] not in ("max_tokens","max_completion_tokens")
-                or type(answer["max_output_tokens"]) is not int or not 1<=answer["max_output_tokens"]<=4096):
+                or type(answer["max_output_tokens"]) is not int or not 1<=answer["max_output_tokens"]<=32768):
             raise PolicyDenied("model_quote_ceiling_invalid")
         return answer
 
