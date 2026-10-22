@@ -38,26 +38,49 @@ from herdr.security import InvocationGuard, PolicyDenied, SecurityError, Provide
 class _PolicyFileOps:
     """Hermes FileOperations facade backed by pinned nofollow root FDs."""
 
-    def __init__(self, workspace: RootFDWorkspace, delegate: Any, common: Any, patch_parser: Any) -> None:
+    def __init__(self, workspace: RootFDWorkspace, delegate: Any, common: Any, patch_parser: Any,
+                 *, redaction_gate: Callable[[str, str], Any] | None = None) -> None:
         self._workspace = workspace
         self._delegate = delegate
         self._common = common
         self._patch_parser = patch_parser
+        self._redaction_gate = redaction_gate
 
     def __getattr__(self, name: str) -> Any:
         if name not in {"env","_add_line_numbers"}:
             raise PolicyDenied("file_operation_unattested",name[:64])
         return getattr(self._delegate, name)
 
+    def _read_hashes(self, path: str, content: str) -> dict[str, str]:
+        """Optional public digests of this exact read, never of redacted bytes."""
+        if not callable(self._redaction_gate) or "\x00" in content:
+            return {}
+        try:
+            redacted = self._redaction_gate(path, content)
+            if type(redacted) is not str or redacted != content:
+                return {}
+            # RootFDWorkspace uses strict UTF-8 decode without newline/BOM
+            # normalization. Re-encoding therefore recovers the same read bytes.
+            raw = content.encode("utf-8")
+            return {"raw_sha256": hashlib.sha256(raw).hexdigest(),
+                    "sha256_crlf_to_lf": hashlib.sha256(raw.replace(b"\r\n", b"\n")).hexdigest(),
+                    "hash_scope": "entire-read-buffer"}
+        except Exception:
+            # Missing/broken SDK redaction only disables optional metadata.
+            return {}
+
     def read_file_raw(self, path: str) -> Any:
         try:
             content = self._workspace.read_text(path)
         except (OSError, FileAuthorityError) as exc:
             return self._common.ReadResult(error=str(exc))
-        return self._common.ReadResult(
+        result = self._common.ReadResult(
             content=content, total_lines=len(content.splitlines()),
             file_size=len(content.encode("utf-8")),
         )
+        for key, value in self._read_hashes(path, content).items():
+            setattr(result, key, value)
+        return result
 
     def read_file_bytes(self, path: str, max_bytes: int | None = None) -> Any:
         limit = self._workspace_max_file_bytes() if max_bytes is None else max_bytes
@@ -88,10 +111,14 @@ class _PolicyFileOps:
         lines = result.content.splitlines(keepends=True)
         page = "".join(lines[offset - 1:offset - 1 + limit])
         numbered = self._delegate._add_line_numbers(page, offset)
-        return self._common.ReadResult(
+        page_result = self._common.ReadResult(
             content=numbered, total_lines=len(lines), file_size=result.file_size,
             truncated=(offset - 1 + limit) < len(lines),
         )
+        for key in ("raw_sha256", "sha256_crlf_to_lf", "hash_scope"):
+            if hasattr(result, key):
+                setattr(page_result, key, getattr(result, key))
+        return page_result
 
     def search(self,pattern,path=".",target="content",file_glob=None,limit=50,offset=0,
                output_mode="content",context=0,order="discovery"):
@@ -695,6 +722,13 @@ def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None) -> 
         original_get_file_ops = file_tools._get_file_ops
         proxies: dict[int, _PolicyFileOps] = {}
 
+        def read_redaction_gate(path: str, content: str) -> Any:
+            # Use the SDK's current display redactor and secret-path context,
+            # not a cached replacement or a separate policy-mode heuristic.
+            return file_tools.redact_sensitive_text(
+                content, file_read=True, secret_file=file_tools._is_secret_file_arg(path)
+            )
+
         @functools.wraps(original_get_file_ops)
         def guarded_get_file_ops(task_id: str = "default") -> Any:
             # Check the configured backend BEFORE original_get_file_ops can
@@ -708,7 +742,8 @@ def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None) -> 
             proxy = proxies.get(key)
             if proxy is None:
                 proxy = proxies[key] = _PolicyFileOps(
-                    file_workspace, delegate, file_operations_common, patch_parser
+                    file_workspace, delegate, file_operations_common, patch_parser,
+                    redaction_gate=read_redaction_gate,
                 )
             return proxy
 
