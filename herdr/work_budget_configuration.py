@@ -18,7 +18,7 @@ def model_request_ceiling(quote):
             and (not o_series or field=="max_completion_tokens"),"unsupported quoted token field")
     limit=quote["max_output_tokens"]
     require(type(limit) is int and 1<=limit<=1000000,"finite quoted output ceiling required")
-    return {"output_token_field":field,"max_output_tokens":min(4096,limit)}
+    return {"output_token_field":field,"max_output_tokens":min(32768,limit)}
 
 def parse_allocation(raw):
     closed(raw, ("allocation_id","consumer","work_key","lineage_key","authorization_reference","limits",

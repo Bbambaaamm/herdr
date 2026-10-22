@@ -428,15 +428,17 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
         agent.model = "quoted-text-model"
         agent.client = types.SimpleNamespace(max_retries=0)
         original = {"model": agent.model, "messages": [{"role": "user", "content": "bounded text"}]}
-        for cap, quoted_field in (({}, "max_tokens"), ({"max_tokens": 17}, "max_tokens"),
-                                  ({"max_completion_tokens": 18}, "max_completion_tokens")):
-            policy.model_request_ceiling = lambda route, field=quoted_field: {
-                "output_token_field": field, "max_output_tokens": 100}
+        from herdr.work_budget_configuration import model_request_ceiling
+        for cap, quoted_field, quoted_limit in (({}, "max_tokens", 100), ({"max_tokens": 17}, "max_tokens", 100),
+                                                ({"max_completion_tokens": 18}, "max_completion_tokens", 100),
+                                                ({}, "max_tokens", 32768)):
+            policy.model_request_ceiling = lambda route, field=quoted_field, limit=quoted_limit: model_request_ceiling({
+                **route, "output_token_field": field, "max_output_tokens": limit})
             request = {**original, **cap}
             agent._test_model_request = request
             loop.perform_api_call(agent)
             sent = network_requests[-1]
-            expected = next(iter(cap.values()), 100)
+            expected = next(iter(cap.values()), quoted_limit)
             assert next(sent[key] for key in ("max_tokens", "max_completion_tokens") if key in sent) == expected
             assert request == {**original, **cap}  # The middleware's request was not mutated.
             start, returned = effects[-2:]
