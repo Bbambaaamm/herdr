@@ -253,6 +253,134 @@ def test_search_projection_exposes_operational_metrics_not_query_metadata(tmp_pa
     assert path.read_bytes() == before
 
 
+
+def search_pair_db(path):
+    search_db(path)
+    db = sqlite3.connect(path)
+    db.execute(
+        "INSERT INTO searches VALUES(2,20,21,'fast','exa-keyless','exa-keyless',1,200,8,3,0,0.0,'PRIVATEHASH2',88)"
+    )
+    db.commit(); db.close()
+
+
+@pytest.mark.parametrize('field', ['duration_ms', 'result_count', 'extract_count'])
+@pytest.mark.parametrize('missing_id', [1, 2])
+def test_search_rejects_partially_missing_required_measurements(tmp_path, field, missing_id):
+    path = tmp_path / 'search.db'; search_pair_db(path)
+    db = sqlite3.connect(path)
+    db.execute('UPDATE searches SET ' + field + '=NULL WHERE id=?', (missing_id,))
+    db.commit(); db.close()
+    before = path.read_bytes()
+
+    with pytest.raises(ValueError):
+        sources.search(str(path), 'majak')
+
+    assert path.read_bytes() == before
+    assert not Path(str(path) + '-wal').exists() and not Path(str(path) + '-shm').exists()
+
+
+@pytest.mark.parametrize('field', ['duration_ms', 'result_count', 'extract_count'])
+def test_search_all_missing_required_measurements_still_fail_closed(tmp_path, field):
+    path = tmp_path / 'search.db'; search_pair_db(path)
+    db = sqlite3.connect(path)
+    db.execute('UPDATE searches SET ' + field + '=NULL')
+    db.commit(); db.close()
+    before = path.read_bytes()
+
+    with pytest.raises(ValueError):
+        sources.search(str(path), 'majak')
+
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize('unknown_cost', [False, True])
+def test_search_complete_measurements_preserve_totals_and_nullable_cost(tmp_path, unknown_cost):
+    path = tmp_path / 'search.db'; search_pair_db(path)
+    db = sqlite3.connect(path)
+    db.execute('UPDATE searches SET fallback_provider=NULL,fallback_used=0')
+    if unknown_cost:
+        db.execute('UPDATE searches SET cost_usd=NULL WHERE id=2')
+    db.commit(); db.close()
+    before = path.read_bytes()
+
+    rows, stamp = sources.search(str(path), 'majak')
+
+    assert rows == [dict(
+        route_mode='fast', provider='exa-keyless', fallback_provider=None,
+        searches=2, successful_searches=1, duration_ms=325, max_duration_ms=200,
+        fallback_count=0, cost_microusd=None if unknown_cost else 0,
+        result_count=13, extract_count=3, last_used_at=21,
+    )]
+    assert stamp == 21 and 'PRIVATEHASH' not in json.dumps(rows)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize('field', ['duration_ms', 'result_count', 'extract_count'])
+def test_search_incomplete_group_is_exported_as_source_failed(tmp_path, monkeypatch, field):
+    path = tmp_path / 'search.db'; search_pair_db(path)
+    db = sqlite3.connect(path)
+    db.execute('UPDATE searches SET ' + field + '=NULL WHERE id=2')
+    db.commit(); db.close()
+    before = path.read_bytes()
+    cfg = config(tmp_path)
+    cfg['profiles']['majak']['search'] = str(path)
+    # This regression exercises only the synthetic Search source.
+    for name in ('QUEUE_PATH', 'CODEX_USAGE_PATH', 'ADMISSION_PATH', 'RELEASE_PATH', 'SWARM_PATH'):
+        monkeypatch.setattr(sources, name, None)
+
+    value = collect(cfg, 100)
+
+    result = next(s for s in value['sources'] if s['profile'] == 'majak' and s['kind'] == 'search')
+    assert result['status'] == 'unavailable' and result['reason'] == 'source_failed'
+    assert result['rows'] == [] and result['data_at'] is None
+    assert path.read_bytes() == before
+    assert 'PRIVATEHASH' not in json.dumps(value)
+
+
+@pytest.mark.parametrize('groups', [50, 51])
+def test_search_group_cap_preserves_overflow_rejection(tmp_path, groups):
+    path = tmp_path / 'search.db'; search_db(path)
+    db = sqlite3.connect(path)
+    db.execute('DELETE FROM searches')
+    db.executemany(
+        'INSERT INTO searches VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        [(i, 100 + i, None, 'fast', f'provider-{i}', None, 0, 1, 0, 0, 1, None,
+          'PRIVATEHASH', 99) for i in range(1, groups + 1)],
+    )
+    db.commit(); db.close()
+    before = path.read_bytes()
+
+    if groups == 51:
+        with pytest.raises(ValueError):
+            sources.search(str(path), 'majak')
+    else:
+        rows, stamp = sources.search(str(path), 'majak')
+        assert len(rows) == 50 and stamp == 150
+        assert {row['provider'] for row in rows} == {f'provider-{i}' for i in range(1, 51)}
+
+    assert path.read_bytes() == before
+
+
+def test_search_required_completeness_is_limited_to_newest_1000_records(tmp_path):
+    path = tmp_path / 'search.db'; search_db(path)
+    db = sqlite3.connect(path)
+    db.execute('UPDATE searches SET duration_ms=NULL')
+    db.executemany(
+        'INSERT INTO searches VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        [(i, i, None, 'fast', 'exa-keyless', None, 0, 1, 0, 0, 1, None,
+          'PRIVATEHASH', 99) for i in range(2, 1002)],
+    )
+    db.commit(); db.close()
+    before = path.read_bytes()
+
+    rows, stamp = sources.search(str(path), 'majak')
+
+    assert len(rows) == 1 and rows[0]['searches'] == 1000
+    assert rows[0]['duration_ms'] == 1000 and rows[0]['max_duration_ms'] == 1
+    assert rows[0]['result_count'] == rows[0]['extract_count'] == 0
+    assert rows[0]['cost_microusd'] is None and stamp == 1001
+    assert path.read_bytes() == before
+
 def test_search_projection_accepts_no_fallback_and_tracks_provider_recency(tmp_path):
     path = tmp_path / 'search.db'; search_db(path)
     db = sqlite3.connect(path)

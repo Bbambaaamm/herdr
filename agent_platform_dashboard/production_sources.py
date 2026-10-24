@@ -206,9 +206,13 @@ SEARCH_COLUMNS = {
 }
 SEARCH_SQL = '''SELECT route_mode,actual_provider,fallback_provider,count(*),
 sum(CASE WHEN success=1 THEN 1 ELSE 0 END),
-sum(duration_ms),max(duration_ms),sum(coalesce(fallback_used,0)),
+CASE WHEN count(duration_ms)=count(*) THEN sum(duration_ms) END,
+CASE WHEN count(duration_ms)=count(*) THEN max(duration_ms) END,
+sum(coalesce(fallback_used,0)),
 CASE WHEN count(cost_usd)=count(*) THEN sum(cost_usd) END,
-sum(result_count),sum(extract_count),max(coalesce(ended_at,started_at)) FROM
+CASE WHEN count(result_count)=count(*) THEN sum(result_count) END,
+CASE WHEN count(extract_count)=count(*) THEN sum(extract_count) END,
+max(coalesce(ended_at,started_at)) FROM
 (SELECT id,started_at,ended_at,route_mode,actual_provider,fallback_provider,
         fallback_used,duration_ms,result_count,extract_count,success,cost_usd
  FROM searches ORDER BY id DESC LIMIT 1000)
