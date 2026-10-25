@@ -103,7 +103,7 @@ def freeze_policy(store, task, *, parent_spec_hash, contracts, environment, base
     store.publish("plan", policy_key(task["repo"], task["id"], task["run_token"]), value)
     return value
 
-def build_authority(store, policy, *, collector):
+def build_authority(store, policy, *, collector, admitted_children=None):
     require(isinstance(store, EvidenceStore) and callable(collector), "host child authority ports missing")
     validate_policy(policy)
     policy = copy.deepcopy(policy)
@@ -132,17 +132,28 @@ def build_authority(store, policy, *, collector):
         return plan
     authority = ChildCompletionAuthority(store=store, approve=approve, collector=collector)
     authority.work_contracts = copy.deepcopy(policy["contracts"])
+    authority.admitted_children = copy.deepcopy(admitted_children)
     return authority
 
-def authority_for_parent(store, task, *, parent_spec_hash, collector, parent_identity=None):
+def authority_for_parent(store, task, *, parent_spec_hash, collector, parent_identity=None, admitted_children=None):
     policy = store.read("plan", policy_key(task["repo"], task["id"], task["run_token"]))
     validate_policy(policy)
+    expected=task.get("child_completion_contracts")
+    if admitted_children is not None:
+        from .claimed_child_contracts import contracts, _claim
+        from .security import InvocationIdentity
+        require(expected is None and admitted_children["parent"]==binding(task)
+                and admitted_children["spec_sha256"]==parent_spec_hash, "derived child policy parent changed")
+        original=InvocationIdentity.from_dict(admitted_children["identity"])
+        require(parent_identity is None or original==parent_identity, "derived child policy grant changed")
+        _claim(task,original)
+        expected=contracts(admitted_children,policy["contracts"]["base_sha"])
     require(policy["parent"] == binding(task) and policy["parent_spec_hash"] == parent_spec_hash
-        and policy["contracts"] == task.get("child_completion_contracts"),
+        and policy["contracts"] == expected,
         "frozen parent child contracts changed")
     if parent_identity is not None:
         require(parent_identity.consumer == "github:"+policy["repo"]
             and parent_identity.task_id == task["id"] and parent_identity.run_token == task["run_token"]
             and parent_identity.fencing_token == task["fencing_token"],
             "child completion differs from authenticated parent")
-    return build_authority(store, policy, collector=collector)
+    return build_authority(store, policy, collector=collector, admitted_children=admitted_children)

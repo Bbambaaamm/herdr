@@ -19,7 +19,7 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 BUNDLE_PATH = Path("/run/herdr-policy/grant.bundle.json")
@@ -734,7 +734,16 @@ def bootstrap(hermes_args: list[str]) -> int:
     except (security_module.SecurityError, KeyError, TypeError, ValueError) as exc:
         raise SystemExit(f"signed Herdr grant rejected: {exc}") from exc
 
-    if private_sdk_policy is None:
+    cli_binding = None
+    use_cli_identity = (private_sdk_policy is not None and len(hermes_args) >= 3
+                        and hermes_args[0] in ("-p", "--profile") and hermes_args[2] == "chat")
+    if use_cli_identity:
+        binding_module = importlib.import_module("herdr.hermes_cli_identity")
+        _require_module_origin(binding_module, policy_code_root, "herdr.hermes_cli_identity")
+        cli_binding = binding_module.CLIInvocationBinding(guard)
+        guard_module.install_hermes_guard(
+            guard, private_sdk_policy=private_sdk_policy, cli_invocation_binding=cli_binding)
+    elif private_sdk_policy is None:
         guard_module.install_hermes_guard(guard)
     else:
         guard_module.install_hermes_guard(guard, private_sdk_policy=private_sdk_policy)
@@ -744,8 +753,21 @@ def bootstrap(hermes_args: list[str]) -> int:
     sys.argv = [str(hermes_root / "hermes"), *hermes_args]
     hermes_main_module = importlib.import_module("hermes_cli.main")
     _require_module_origin(hermes_main_module, hermes_root, "hermes_cli.main")
+    native_transport = nullcontext()
+    if private_sdk_policy is not None:
+        transport_module = importlib.import_module("herdr.hermes_terminal_transport")
+        _require_module_origin(transport_module, policy_code_root, "herdr.hermes_terminal_transport")
+        cli_module = importlib.import_module("cli")
+        _require_module_origin(cli_module, hermes_root, "cli")
+        native_transport = transport_module.native_cli_transport_factory(
+            cli_module.HermesCLI, guard, private_sdk_policy=private_sdk_policy)
+    identity_transport = nullcontext()
+    if cli_binding is not None:
+        agent_module = importlib.import_module("run_agent")
+        _require_module_origin(agent_module, hermes_root, "run_agent")
+        identity_transport = cli_binding.factory(cli_module.HermesCLI, agent_module.AIAgent)
     _configure_ephemeral_sdk_state(hermes_root)
-    with _native_hermes_process_label():
+    with _native_hermes_process_label(), native_transport, identity_transport:
         result = hermes_main_module.main()
     return 0 if result is None else int(result)
 

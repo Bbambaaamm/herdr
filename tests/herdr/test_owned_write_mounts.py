@@ -1,5 +1,6 @@
 """Physical owned-write boundaries; no provider or semantic acceptance claims."""
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -71,6 +72,54 @@ def test_new_declared_file_is_host_created_and_fsynced_only_on_explicit_policy(t
             assert (tmp_path/"lib/new.py").stat().st_mode&0o777==0o600
             assert (tmp_path/"lib/new.py").read_bytes()==b""
 
+class OwnedWriteKernelMount:
+    # Test-only legacy descriptor adapter, not an authenticated PolicyMount.
+    # Match the actual non-private command() surface and PolicyMount defaults;
+    # typed private-profile/native-transport fields are deliberately not faked.
+    resolver_snapshot = None
+    private_fd_handoff = False
+
+    def descriptors(self):
+        return []
+
+
+@pytest.mark.parametrize("kind",["file","directory"])
+def test_owned_write_kernel_mount_fixture_constructs_actual_fd_command(tmp_path,monkeypatch,kind):
+    # Component coverage remains meaningful on CI without bwrap: construct the
+    # real command and pinned descriptors, but never pretend to execute it.
+    workspace=tmp_path/"worktrees/child";workspace.mkdir(parents=True)
+    (workspace/"lib").mkdir();target=workspace/"lib/own.py";target.write_text("old")
+    foreign=workspace/"foreign.py";foreign.write_text("foreign")
+    result=tmp_path/"results/child.result.json";result.parent.mkdir();result.write_bytes(b"")
+    binary=tmp_path/"native";binary.write_text("component-only")
+    policy=tmp_path/"policy";policy.write_text("component-only")
+    bwrap=tmp_path/"bwrap-placeholder";bwrap.write_text("never executed")
+    config=tmp_path/"config";config.mkdir();releases=tmp_path/"releases";releases.mkdir()
+    monkeypatch.setattr(sandbox,"BWRAP",bwrap)
+    monkeypatch.setattr(sandbox,"HERDR_CONFIG",config)
+    monkeypatch.setattr(sandbox,"HERDR_RELEASES",releases)
+    def no_launch(*args,**kwargs):
+        pytest.fail("component test must not launch a native process")
+    monkeypatch.setattr(subprocess,"run",no_launch)
+    monkeypatch.setattr(subprocess,"Popen",no_launch)
+    scope=(kind,"lib/own.py" if kind=="file" else "lib")
+    mount=OwnedWriteKernelMount()
+    with pin(workspace) as root,OwnedWritePins(contract(scope),root) as owned:
+        args=sandbox.command(workspace,binary,writable=(result,),policy=policy,
+            child_workspace_writable=False,pinned_worktree=root,policy_mount=mount,owned_write_pins=owned)
+        descriptors=json.loads(args[args.index(sandbox._POLICY_FD_LAUNCHER)+1])
+        argv=args[args.index(str(bwrap)):]
+        own_target=str(target if kind=="file" else target.parent)
+        assert {row["target"] for row in descriptors}=={str(workspace),own_target}
+        assert str(foreign) not in {row["target"] for row in descriptors}
+        ro=argv.index("--ro-bind-fd")
+        assert argv[ro+1:ro+3]==[str(root.fd),str(workspace)]
+        writes=[argv[i+1:i+3] for i,part in enumerate(argv) if part=="--bind-fd"]
+        assert writes==[[str(owned.descriptors()[0]["fd"]),own_target]]
+        assert mount.resolver_snapshot is None and mount.private_fd_handoff is False
+    assert target.read_text()=="old" and foreign.read_text()=="foreign" and result.read_bytes()==b""
+
+
 @pytest.mark.parametrize("kind",["file","directory"])
 def test_actual_kernel_allows_owned_write_and_denies_foreign_sibling(kind,monkeypatch):
     if not sandbox.BWRAP.is_file():
@@ -85,14 +134,10 @@ def test_actual_kernel_allows_owned_write_and_denies_foreign_sibling(kind,monkey
         native=base/"native";native.write_text("approved");policy=base/"policy";policy.write_text("approved")
         config=base/"config";config.mkdir();releases=base/"releases";releases.mkdir()
         monkeypatch.setattr(sandbox,"HERDR_CONFIG",config);monkeypatch.setattr(sandbox,"HERDR_RELEASES",releases)
-        class TestMount:
-            # Test-only descriptor adapter: this test establishes kernel file
-            # scope, and does not claim authenticated policy/bootstrap evidence.
-            def descriptors(self):return []
         scope=(kind,"lib/own.py" if kind=="file" else "lib")
         with pin(workspace) as root,OwnedWritePins(contract(scope),root) as owned:
             args=sandbox.command(workspace,native,writable=(result,),policy=policy,
-                child_workspace_writable=False,pinned_worktree=root,policy_mount=TestMount(),owned_write_pins=owned)
+                child_workspace_writable=False,pinned_worktree=root,policy_mount=OwnedWriteKernelMount(),owned_write_pins=owned)
             args=args[:args.index("--")+1]+["/usr/bin/python3","-I","-c",
                 "from pathlib import Path;import errno;"
                 "p=Path("+repr(str(target))+");p.write_text('changed');"

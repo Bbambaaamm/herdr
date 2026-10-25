@@ -212,6 +212,23 @@ def _trusted_hermes_profile_preflight(profile: str, *, executable: str, env: Map
 MAX_PROMPT_CHARS = 1200
 
 
+def _managed_prompt_transport(prompt: str, *, modern: bool) -> str:
+    """Keep legacy prompts unchanged; frame modern host-composed delivery once.
+
+    The untrusted business prompt remains capped separately by the delegation
+    client. Frozen host instructions use the existing ordinary-worker UTF-8
+    channel bound, including bracketed-paste overhead and control validation.
+    """
+    if type(modern) is not bool:
+        raise HerdrRuntimeError("invalid_child_prompt", "typed transport mode required")
+    if modern:
+        from .hermes_terminal_transport import encode_native_prompt
+        return encode_native_prompt(prompt)
+    if not isinstance(prompt, str) or not prompt or len(prompt) > MAX_PROMPT_CHARS:
+        raise HerdrRuntimeError("invalid_child_prompt", "legacy prompt exceeds bound")
+    return prompt
+
+
 @dataclass(frozen=True)
 class CommandResult:
     returncode: int
@@ -1403,6 +1420,11 @@ class HerdrChildRuntime:
         pane_id = None
         try:
             record = self.scheduler._tasks.get(lease.task_id)
+            from .child_evidence import ChildCompletionAuthority
+            authority = self.scheduler.completion_authority
+            modern = (record is not None and isinstance(authority, ChildCompletionAuthority)
+                      and authority.modern_work(record))
+            transport_prompt = _managed_prompt_transport(prompt, modern=modern)
             if (record is not None and record.worktree_identity and
                     (self.pinned_worktree is None or
                      self.pinned_worktree.identity != record.worktree_identity)):
@@ -1530,14 +1552,12 @@ class HerdrChildRuntime:
             self.scheduler.execution_verifier = (
                 lambda agent, pane, bound_marker: self._verify_live_child(
                     agent, pane, bound_marker, require_sandbox=True))
-            if not prompt or len(prompt) > MAX_PROMPT_CHARS:
-                raise HerdrRuntimeError("invalid_child_prompt", lease.task_id)
             timeout = int(min(3600.0, max(1.0, self.scheduler.budget.claim_ttl_seconds - 30.0)))
             if not self.scheduler.mark_child_delivery_started(
                     lease.task_id,run_token,lease.agent_id,lease.fencing_token,idempotency_key):
                 raise HerdrRuntimeError("child_delivery_already_started",lease.task_id)
             delivery_started = True
-            result = self.runner.run(["agent", "prompt", lease.agent_id, prompt,
+            result = self.runner.run(["agent", "prompt", lease.agent_id, transport_prompt,
                                       "--wait", "--timeout", str(timeout * 1000)],
                                      timeout_seconds=timeout + 5.0)
             _json_result(result, "agent prompt")

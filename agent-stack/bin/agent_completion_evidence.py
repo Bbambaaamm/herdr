@@ -305,7 +305,7 @@ def spec_digest(task: dict) -> str:
     keys=("repo", "issue", "kind", "prompt", "completion_kind", "spec_hash", "completion_contract", "completion_evidence", "child_completion_contracts")
     if "work_contract_version" in task:
         keys+=("work_contract_version",)
-    for marker in ("work_budget_version","child_work_budget_version"):
+    for marker in ("work_budget_version","child_work_budget_version","completion_base_version"):
         if marker in task: keys+=(marker,)
     if "child_work_contract_version" in task:
         keys+=("child_work_contract_version",)
@@ -407,13 +407,22 @@ def freeze_plan(root: Path, task: dict) -> None:
                             "completion_level": "control_cycle"}
     else:
         workspace = Path(task.get("workspace", "")).resolve()
+        base_revision = ["rev-parse", "origin/main"]
+        expected_base = None
+        if "completion_base_version" in task:
+            from herdr.work_configuration import approved_completion_base
+            try:
+                base_ref, expected_base = approved_completion_base(root, task)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                raise EvidenceError("reviewed_completion_base_unavailable") from exc
+            base_revision = ["rev-parse", "--verify", base_ref + "^{commit}"]
         try:
             proc = subprocess.run(["/usr/bin/git", "--no-optional-locks", "-c", "core.fsmonitor=false",
                                    "-c", "core.hooksPath=/dev/null", "-C", str(workspace),
-                                   "rev-parse", "origin/main"],
+                                   *base_revision],
                                   text=True, capture_output=True, check=True, timeout=15)
             base = proc.stdout.strip()
-            if not re.fullmatch(r"[0-9a-f]{40}", base):
+            if not re.fullmatch(r"[0-9a-f]{40}", base) or (expected_base is not None and base != expected_base):
                 raise EvidenceError("baseline is invalid")
         except (OSError, subprocess.SubprocessError) as exc:
             raise EvidenceUnavailable("trusted baseline is unavailable") from exc
@@ -546,6 +555,25 @@ def freeze_child_completion_contracts(root, task, parent_plan):
     freeze_policy(store_for(root,task),task,parent_spec_hash=spec_digest(task),
         contracts=contracts,environment=environment,baseline=baseline)
 
+def freeze_derived_child_contracts(root, task, admitted):
+    """Freeze only previously approved derived data in the existing evidence store."""
+    from herdr.claimed_child_contracts import retained,contracts
+    from herdr.child_completion_policy import freeze_policy
+    from herdr.evidence import validate_plan
+    derived=retained(admitted,task)
+    if derived is None:return
+    store=store_for(root,task)
+    plan=store.read("plan",digest(binding(task)))
+    validate_plan(plan)
+    if (plan["identity"]!=binding(task) or plan["spec_hash"]!=spec_digest(task)
+            or plan.get("base_sha")!=admitted["definition"]["base_sha"] or plan["kind"]!="coding"):
+        raise EvidenceError("derived child policy original parent plan changed")
+    environment={key:plan["environment"][key] for key in
+        ("collector","ci_workflow_blob_sha","ci_workflow_id","github_actions_app_id")}
+    freeze_policy(store,task,parent_spec_hash=spec_digest(task),
+        contracts=contracts(derived,plan["base_sha"]),environment=environment,baseline=plan["baseline"])
+
+
 def child_completion_for_root(task_file, identity, *, factory):
     from herdr.child_completion_policy import authority_for_parent
     from herdr.policy_launch import HostPolicyLaunchFactory
@@ -557,24 +585,60 @@ def child_completion_for_root(task_file, identity, *, factory):
             or path.parent.parent!=factory.task_store_root or task.get("id")!=identity["task_id"]
             or task.get("run_token")!=identity["run_token"]):
         raise EvidenceError("canonical authenticated parent completion binding required")
+    admitted_children=None
     if task.get("child_completion_contracts") is None:
-        # Keep authenticated delegation available; absence of an acceptance
-        # policy never authorizes an unverified completed implementation.
-        return None
+        from herdr.work_configuration import original_derived_children
+        admitted_children=original_derived_children(factory.task_store_root,task,identity=factory.parent_grant.identity)
+        if admitted_children is None:return None
     return authority_for_parent(store_for(factory.task_store_root,task),task,
         parent_spec_hash=spec_digest(task),collector=collect_github,
-        parent_identity=factory.parent_grant.identity)
+        parent_identity=factory.parent_grant.identity,admitted_children=admitted_children)
 
 def child_completion_for_replay(root, scheduler):
     """Restore the same frozen source ports; do not grant, dispatch or call a model."""
-    from herdr.child_completion_policy import authority_for_parent
+    from herdr.child_completion_policy import authority_for_parent, policy_key
     from herdr.host_configuration import read_canonical_parent
     parents=[rec for rec in scheduler._tasks.values() if rec.parent_task_id is None]
     if len(parents)!=1:
         return None
     parent=parents[0]
     task=read_canonical_parent(root,parent.id,parent.run_token)
-    if task is None or task.get("child_completion_contracts") is None:
+    if task is None:
+        from herdr.child_completion_policy import policy_key
+        existing=Path(root)/"verification"
+        if existing.exists():
+            try:EvidenceStore(existing).read("plan",policy_key(parent.repo,parent.id,parent.run_token))
+            except EvidenceMissing:return None
+            raise EvidenceError("frozen child policy has no original canonical parent")
+        if parent.canonical_parent is not None:
+            raise EvidenceError('canonical child replay has no original parent task')
         return None
+    admitted_children=None
+    if task.get("child_completion_contracts") is None:
+        from herdr.work_configuration import original_derived_children
+        modern_fields = ('child_completion_contracts', 'work_contract_version', 'work_budget_version',
+                         'child_work_contract_version', 'child_work_budget_version')
+        if parent.canonical_parent is None and not any(key in task for key in modern_fields):
+            # Only a retained legacy scheduler attempt can keep its original port.
+            # An existing modern policy or changed frozen spec cannot downgrade.
+            existing = Path(root) / 'verification'
+            if existing.exists():
+                store = EvidenceStore(existing)
+                try:
+                    store.read('plan', policy_key(parent.repo, parent.id, parent.run_token))
+                except EvidenceMissing:
+                    pass
+                else:
+                    raise EvidenceError('frozen child policy cannot replay as legacy')
+                try:
+                    plan = store.read('plan', digest(binding(task)))
+                except EvidenceMissing:
+                    pass
+                else:
+                    if plan['identity'] != binding(task) or plan['spec_hash'] != spec_digest(task):
+                        raise EvidenceError('frozen parent plan changed during legacy replay')
+            return None
+        admitted_children=original_derived_children(root,task,identity=scheduler.ownership_parent)
+        if admitted_children is None:return None
     return authority_for_parent(store_for(root,task),task,parent_spec_hash=spec_digest(task),
-        collector=collect_github,parent_identity=scheduler.ownership_parent)
+        collector=collect_github,parent_identity=scheduler.ownership_parent,admitted_children=admitted_children)
