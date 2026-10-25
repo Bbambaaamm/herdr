@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 from .child_evidence import ChildCompletionAuthority
 from .evidence import (EvidenceError, EvidenceStore, binding, canonical, digest,
-                       validate_criteria, validate_plan)
+                       validate_criteria, validate_plan, valid_completion_base_branch)
 from .scope_evidence import validate_scope_policy
 
 SHA = re.compile(r"^[0-9a-f]{64}$")
@@ -56,6 +56,9 @@ def policy_key(repo, task_id, run_token):
 def validate_policy(value):
     names = {"version", "repo", "parent", "parent_spec_hash", "contracts",
              "workspace_root", "environment", "baseline", "policy_hash"}
+    if isinstance(value, dict) and "base_branch" in value:
+        require(valid_completion_base_branch(value["base_branch"]), "invalid frozen child base branch")
+        names.add("base_branch")
     require(isinstance(value, dict) and set(value) == names
         and type(value["version"]) is int and value["version"] == 1
         and value["repo"] == REPO
@@ -90,7 +93,7 @@ def validate_policy(value):
     require(value["policy_hash"] == digest({k:v for k,v in value.items() if k != "policy_hash"}),
         "host child policy changed")
 
-def freeze_policy(store, task, *, parent_spec_hash, contracts, environment, baseline):
+def freeze_policy(store, task, *, parent_spec_hash, contracts, environment, baseline, base_branch=None):
     require(isinstance(store, EvidenceStore) and task.get("repo") == REPO,
         "host child completion consumer unavailable")
     validate_contracts(contracts)
@@ -98,12 +101,14 @@ def freeze_policy(store, task, *, parent_spec_hash, contracts, environment, base
         "parent_spec_hash":parent_spec_hash, "contracts":copy.deepcopy(contracts),
         "workspace_root":task.get("worktree_root") or "/home/agentops/worktrees",
         "environment":copy.deepcopy(environment), "baseline":copy.deepcopy(baseline)}
+    if base_branch is not None:
+        value["base_branch"] = base_branch
     value["policy_hash"] = digest(value)
     validate_policy(value)
     store.publish("plan", policy_key(task["repo"], task["id"], task["run_token"]), value)
     return value
 
-def build_authority(store, policy, *, collector):
+def build_authority(store, policy, *, collector, admitted_children=None):
     require(isinstance(store, EvidenceStore) and callable(collector), "host child authority ports missing")
     validate_policy(policy)
     policy = copy.deepcopy(policy)
@@ -121,6 +126,8 @@ def build_authority(store, policy, *, collector):
             "base_sha":policy["contracts"]["base_sha"], "workspace_root":policy["workspace_root"],
             "required_checks":list(CHECKS) if kind == "coding" else ["GitGuardian Security Checks"],
             "reviewer":REVIEWER, "environment":copy.deepcopy(policy["environment"])}
+        if "base_branch" in policy:
+            plan["base_branch"] = policy["base_branch"]
         if kind != "coding":
             plan["criteria"] = copy.deepcopy(entry["criteria"])
         elif "criteria" in entry:
@@ -132,17 +139,28 @@ def build_authority(store, policy, *, collector):
         return plan
     authority = ChildCompletionAuthority(store=store, approve=approve, collector=collector)
     authority.work_contracts = copy.deepcopy(policy["contracts"])
+    authority.admitted_children = copy.deepcopy(admitted_children)
     return authority
 
-def authority_for_parent(store, task, *, parent_spec_hash, collector, parent_identity=None):
+def authority_for_parent(store, task, *, parent_spec_hash, collector, parent_identity=None, admitted_children=None):
     policy = store.read("plan", policy_key(task["repo"], task["id"], task["run_token"]))
     validate_policy(policy)
+    expected=task.get("child_completion_contracts")
+    if admitted_children is not None:
+        from .claimed_child_contracts import contracts, _claim
+        from .security import InvocationIdentity
+        require(expected is None and admitted_children["parent"]==binding(task)
+                and admitted_children["spec_sha256"]==parent_spec_hash, "derived child policy parent changed")
+        original=InvocationIdentity.from_dict(admitted_children["identity"])
+        require(parent_identity is None or original==parent_identity, "derived child policy grant changed")
+        _claim(task,original)
+        expected=contracts(admitted_children,policy["contracts"]["base_sha"])
     require(policy["parent"] == binding(task) and policy["parent_spec_hash"] == parent_spec_hash
-        and policy["contracts"] == task.get("child_completion_contracts"),
+        and policy["contracts"] == expected,
         "frozen parent child contracts changed")
     if parent_identity is not None:
         require(parent_identity.consumer == "github:"+policy["repo"]
             and parent_identity.task_id == task["id"] and parent_identity.run_token == task["run_token"]
             and parent_identity.fencing_token == task["fencing_token"],
             "child completion differs from authenticated parent")
-    return build_authority(store, policy, collector=collector)
+    return build_authority(store, policy, collector=collector, admitted_children=admitted_children)

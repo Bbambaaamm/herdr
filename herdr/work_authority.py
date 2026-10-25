@@ -18,8 +18,12 @@ from .evidence import canonical
 _WORK_REQUEST_TIMEOUT_SECONDS = 60
 
 
-def _work_response(payload, *, max_bytes):
-    deadline = time.monotonic() + _WORK_REQUEST_TIMEOUT_SECONDS
+_SDK_OBSERVATION_TIMEOUT_SECONDS = 0.5
+
+
+def _work_response(payload, *, max_bytes, timeout_seconds=None):
+    seconds = _WORK_REQUEST_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+    deadline = time.monotonic() + seconds
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         def bounded(operation, *args):
             remaining = deadline - time.monotonic()
@@ -77,6 +81,22 @@ class WorkAuthorityClient:
         except PolicyDenied:raise
         except (EvidenceError,OSError,ValueError,TypeError) as exc:
             raise PolicyDenied("work_budget_unavailable") from exc
+
+    def observe(self, identity, grant_sha256, observation):
+        # No retry: a lost ACK may follow a durable observation. This transport
+        # does not authorize any effect and cannot change budget delivery state.
+        from .sdk_observation import validate_observation
+        try:
+            require(isinstance(identity, InvocationIdentity), "SDK observation identity required")
+            request = {"op": "work-sdk-observation", "identity": identity.to_json(),
+                       "grant_sha256": grant_sha256,
+                       "observation": validate_observation(observation)}
+            payload = canonical(request) + b"\n"
+            require(len(payload) <= 8192, "bounded SDK observation required")
+            return _work_response(payload, max_bytes=128,
+                timeout_seconds=_SDK_OBSERVATION_TIMEOUT_SECONDS) == b"observation-ok\n"
+        except Exception:
+            return False
 
     def external_knowledge(self, identity, grant_sha256, provider_id, request):
         from .external_knowledge import KnowledgeContractError, KnowledgeRequest, KnowledgeResponse
@@ -175,6 +195,29 @@ def dispatch_work_connection(owner, connection):
         # Context-exit expiry must never kill the authority listener.
         return True
 
+def _observe_authenticated_denial(owner, peer, binding, operation, error):
+    """Host-only best effort; historical ports keep their original denial."""
+    try:
+        from types import MethodType
+        from .work_contract_host import HostWorkContractFactory
+        from .host_work_denial import describe_denial
+        from .work_lifetime import require_work_time
+        callback = getattr(owner, "work_authority", None)
+        if (type(callback) is not MethodType
+                or type(callback.__self__) is not HostWorkContractFactory
+                or callback.__func__ is not HostWorkContractFactory.authorize_invocation):
+            return False
+        identity, grant_sha256 = binding
+        require_work_time()
+        # This reports the request's earlier verified binding, not live authority
+        # now: an exiting peer/expired grant must not erase its host failure.
+        return callback.__self__.observe_host_denial(
+            identity, grant_sha256, describe_denial(operation, error, peer)) is True
+    except BaseException:
+        # No observer failure, including failed fsync, may replace the denial.
+        return False
+
+
 def _dispatch_work_connection(owner, connection):
     """Only the exact observed stage-two process can ask about its phase.
 
@@ -185,6 +228,7 @@ def _dispatch_work_connection(owner, connection):
     if receipt is None:
         return False
     accepted_peer = False
+    authenticated_binding, operation = None, None
     try:
         pid, uid, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
         if pid != receipt.peer_pid or uid != os.geteuid():
@@ -204,10 +248,29 @@ def _dispatch_work_connection(owner, connection):
         require_work_time()
         require(request.get("identity") == owner.launch.identity.to_json()
                 and request.get("grant_sha256") == owner.launch.grant.hash, "work authority binding invalid")
-        if request.get("op") == "work-budget":
+        authenticated_binding = (owner.launch.identity, owner.launch.grant.hash)
+        if request.get("op") == "work-sdk-observation":
+            from .sdk_observation import validate_observation
+            require(set(request) == {"op", "identity", "grant_sha256", "observation"},
+                    "closed SDK observation request required")
+            observation = validate_observation(request["observation"])
+            operation = "work-sdk-observation"
+            callback = getattr(owner, "work_observe", None)
+            require(callable(callback), "host SDK observation unavailable")
+            require(callback(owner.launch.identity, owner.launch.grant.hash, observation) is True,
+                    "host SDK observation denied")
+            require_work_time()
+            after = inspect_peer(pid)
+            require(after == peer and owner.launch.grant.is_active(),
+                    "SDK observation peer or grant changed")
+            owner.launch.mount.verify_mounted(pid, owner.launch.sealed)
+            require_work_time()
+            connection.sendall(b"observation-ok\n")
+        elif request.get("op") == "work-budget":
             require(set(request)=={"op","identity","grant_sha256","action","payload"}
                     and request["action"] in {"status","ceiling","start","returned"} and isinstance(request["payload"],dict),
                     "closed budget request required")
+            operation = "work-budget"
             callback=getattr(owner,"work_budget",None)
             if callback is None:
                 require(request["action"]=="status" and request["payload"]=={},"budget authority missing")
@@ -225,6 +288,7 @@ def _dispatch_work_connection(owner, connection):
                         "op", "identity", "grant_sha256", "provider_id", "request"
                     } and "herdr_external_knowledge" in owner.launch.grant.scope.tools,
                     "external knowledge tool is not granted")
+            operation = "external-knowledge-query"
             callback = getattr(owner, "external_knowledge_query", None)
             durable_authority = getattr(owner, "external_knowledge_authority", None)
             require(callable(callback) and callable(durable_authority),
@@ -280,6 +344,7 @@ def _dispatch_work_connection(owner, connection):
             require(set(request) in ({"op", "identity", "grant_sha256", "request_id"}, {"op", "identity", "grant_sha256", "request_id", "handoff"})
                     and "herdr_verify_work" in owner.launch.grant.scope.tools,
                     "verification tool is not granted")
+            operation = "work-verify"
             callback = getattr(owner, "work_verify", None)
             require(callable(callback), "host verification authority unavailable")
             from .work_lifetime import check_wall_seconds, require_grant_lifetime
@@ -312,13 +377,16 @@ def _dispatch_work_connection(owner, connection):
                     and ((request["kind"] == "provider" and request["tool"] is None)
                          or (request["kind"] == "tool" and isinstance(request["tool"], str)
                              and 0 < len(request["tool"]) <= 128)), "work authority binding invalid")
+            operation = "work-authorize"
             callback = owner.work_authority
             if callback is not None:
                 require(callback(owner.launch.identity, owner.launch.grant.hash,
                                  kind=request["kind"], tool=request["tool"]) is True,
                         "work authority denied")
             connection.sendall(b"work-ok\n")
-    except Exception:
+    except Exception as error:
+        if authenticated_binding is not None and operation is not None:
+            _observe_authenticated_denial(owner, peer, authenticated_binding, operation, error)
         try:
             connection.sendall(b"denied\n")
         except OSError:

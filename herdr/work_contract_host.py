@@ -1,6 +1,8 @@
 """Host composition ports for the existing worker/runtime; never model config."""
 from pathlib import Path
 import threading
+import os
+import stat
 import re
 import contextvars
 from contextlib import contextmanager
@@ -12,16 +14,31 @@ from .work_cycle import WorkCycle, WorkPhase, WorkPlan, require
 from .check_runner import CheckEnvironment, HostCheckRunner
 
 class HostWorkContractFactory:
-    def __init__(self, *, approve, environment, storage, audit_log, git=None, budget_authority=None, budget_binding=None):
+    def __init__(self, *, approve, environment, storage, audit_log, git=None, budget_authority=None, budget_binding=None,
+                 check_storage=None, commit_runtime_storage=None):
         require(callable(approve) and isinstance(environment,CheckEnvironment)
                 and isinstance(audit_log,AuditLog),"host work authority required")
         self.approve,self.environment,self.storage,self.audit_log=approve,environment,Path(storage),audit_log
+        self.check_storage = self.storage if check_storage is None else Path(check_storage)
+        self.commit_runtime_storage = None if commit_runtime_storage is None else Path(commit_runtime_storage)
+        self._runtime_scratch = tuple(Path(path) for path in (check_storage, commit_runtime_storage) if path is not None)
+        for path in self._runtime_scratch:
+            info = path.stat()
+            require(path.is_absolute() and path.resolve(strict=True) == path
+                    and stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o077,
+                    "host work runtime storage must be private")
         self.git=git
         self.budget_authority,self.budget_binding=budget_authority,budget_binding
         self.allocations={}
         self.cycles={}
         self.handoffs={}
         self._lock=threading.RLock()
+
+    def _require_scratch_binding(self, workspace, writable_roots=()):
+        for path in self._runtime_scratch:
+            require(not path.is_relative_to(workspace) and not any(
+                path.is_relative_to(Path(root).resolve()) for root in writable_roots),
+                "work runtime scratch is worker writable")
 
     def _refresh(self,identity):
         found=self.cycles.get(digest(identity.to_json()))
@@ -44,6 +61,7 @@ class HostWorkContractFactory:
             require(grant.is_active(),"work authority expired")
             root=Path(workspace).resolve(strict=True)
             require(root==Path(grant.workspace_root).resolve(strict=True),"exact granted worktree required")
+            self._require_scratch_binding(root, grant.runtime_assurance.writable_roots)
             log_path=self.audit_log._path.resolve()
             for path in grant.runtime_assurance.writable_roots:
                 require(not log_path.is_relative_to(Path(path).resolve()),"work audit is worker writable")
@@ -62,8 +80,15 @@ class HostWorkContractFactory:
             from .work_lifetime import check_wall_seconds, require_grant_lifetime
             request=check_wall_seconds(plan,getattr(self,"local_commit_policy",None))
             require(request<=900,"complete host request exceeds bound")
+            hygiene=getattr(self,"local_commit_policy",None)
+            if hygiene is not None:
+                require(plan.hygiene_sha256==hygiene.hash,"approved local commit policy binding mismatch")
+                from .work_hygiene import preflight_local_commit
+                consumer=identity.consumer
+                repo=consumer.removeprefix("github:") if consumer.startswith("github:") else None
+                preflight_local_commit(hygiene,root,repo=repo)
             require_grant_lifetime(grant,check_wall_seconds(plan)+900)
-            runner=HostCheckRunner(self.environment,self.storage,git=self.git)
+            runner=HostCheckRunner(self.environment,self.check_storage,git=self.git)
             from .work_lifetime import bounded_host_request
             cycle=WorkCycle(plan,root,self.audit_log,git=self.git,budget_authority=self.budget_authority)
             allocation=None
@@ -108,8 +133,9 @@ class HostWorkContractFactory:
                     and plan.grant_sha256==grant_sha256 and plan.environment_sha256==self.environment.hash,
                     "recovered work authority mismatch")
             cycle=WorkCycle(plan,Path(workspace),self.audit_log,git=self.git,budget_authority=self.budget_authority)
+            self._require_scratch_binding(Path(workspace).resolve())
             runner=None if cycle.phase in {WorkPhase.HANDOFF,WorkPhase.FINISHED} else HostCheckRunner(
-                self.environment,self.storage,git=self.git)
+                self.environment,self.check_storage,git=self.git)
             if self.budget_authority is not None:
                 from .work_budget import BudgetedCheckRunner
                 allocation=self.budget_authority.find_allocation(plan.budget_reference)
@@ -200,6 +226,61 @@ class HostWorkContractFactory:
         from .work_budget_configuration import model_effect
         return model_effect(self,identity,grant_sha256,action,payload)
 
+    def observe_sdk(self, identity, grant_sha256, observation):
+        """Append descriptive metadata to the existing host audit, without effects."""
+        from .sdk_observation import validate_observation, validate_observation_events, MAX_OBSERVATIONS
+        observation = validate_observation(observation)
+        with self._lock:
+            # Do not call _refresh: its hygiene reconciliation may affect budget.
+            found = self.cycles.get(digest(identity.to_json()))
+            require(found is not None, "SDK observation work contract unavailable")
+            cycle, _ = found
+            require(cycle.plan.identity == identity and cycle.plan.grant_sha256 == grant_sha256,
+                    "SDK observation work binding changed")
+            events = [row for row in self.audit_log.replay()
+                      if row.get("event") == "work_sdk_observation"
+                      and row.get("work_cycle") == identity.to_json()]
+            validate_observation_events(events, identity, cycle.plan.hash, grant_sha256)
+            if not any(row["observation"] == observation for row in events):
+                require(len(events) < MAX_OBSERVATIONS, "SDK observation limit reached")
+                self.audit_log.append({"event": "work_sdk_observation", "work_cycle": identity.to_json(),
+                    "plan_sha256": cycle.plan.hash, "grant_sha256": grant_sha256,
+                    "provenance": "sdk_observed", "observation_index": len(events) + 1,
+                    "observation": observation})
+            # Also synchronize an existing entry after a lost ACK / failed sync.
+            self.audit_log.flush(sync_existing=True)
+            return True
+
+    def observe_host_denial(self, identity, grant_sha256, denial):
+        """No refresh/effects/retry, and no waiting for another factory request."""
+        from .host_work_denial import validate_denial, validate_denial_events, MAX_DENIALS
+        from .work_lifetime import require_work_time
+        denial = validate_denial(denial)
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            require_work_time()
+            found = self.cycles.get(digest(identity.to_json()))
+            require(found is not None, "host denial work contract unavailable")
+            cycle, _ = found
+            require(cycle.plan.identity == identity and cycle.plan.grant_sha256 == grant_sha256,
+                    "host denial work binding changed")
+            events = [row for row in self.audit_log.replay()
+                      if row.get("event") == "work_host_denial"
+                      and row.get("work_cycle") == identity.to_json()]
+            validate_denial_events(events, identity, cycle.plan.hash, grant_sha256)
+            require_work_time()
+            if not any(row["denial"] == denial for row in events):
+                require(len(events) < MAX_DENIALS, "host denial limit reached")
+                self.audit_log.append({"event": "work_host_denial", "work_cycle": identity.to_json(),
+                    "plan_sha256": cycle.plan.hash, "grant_sha256": grant_sha256,
+                    "provenance": "host_authenticated_request", "denial_index": len(events) + 1,
+                    "denial": denial})
+            self.audit_log.flush(sync_existing=True)
+            return True
+        finally:
+            self._lock.release()
+
     def bind_handoff(self, identity, port):
         from .work_handoff import HostWorkHandoff
         require(isinstance(port, HostWorkHandoff) and port.identity == identity, "host handoff binding required")
@@ -234,6 +315,12 @@ class WorkInvocationGuard(InvocationGuard):
             return super().authorize_tool_call(tool,args,**kwargs)
         self.work_authority(self.grant.identity,self.grant.hash,kind="tool",tool=self.canonical_tool(tool))
         return super().authorize_tool_call(tool,args,**kwargs)
+
+    def observe_sdk(self, observation):
+        observer = getattr(self.work_authority, "observe", None)
+        if callable(observer):
+            return observer(self.grant.identity, self.grant.hash, observation)
+        return False
 
     def budget_required(self):
         transport=getattr(self.work_authority,"effect",None)

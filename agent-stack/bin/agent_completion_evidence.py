@@ -157,13 +157,156 @@ def _pr_binding(pr: dict) -> tuple:
             pr.get("base", {}).get("ref"))
 
 
+_CODEX_SUMMARY_HEADER = "<!-- codex-pull-request-review-summary -->"
+_CODEX_SUMMARY_PREFIX = _CODEX_SUMMARY_HEADER + "\n<!-- codex-review-state:v1 "
+
+
+def _codex_summary_state(body):
+    """Parse the authenticated app's versioned state, never its display prose."""
+    if not isinstance(body, str) or not body.startswith(_CODEX_SUMMARY_HEADER):
+        return None
+    if not body.startswith(_CODEX_SUMMARY_PREFIX) or len(body) > 65536:
+        raise EvidenceUnavailable("unsupported Codex summary protocol")
+    encoded, separator, _ = body[len(_CODEX_SUMMARY_PREFIX):].partition(" -->\n")
+    if (not separator or "\n" in encoded or "\r" in encoded
+            or body.count("codex-review-state:") != 1
+            or body.count(_CODEX_SUMMARY_HEADER) != 1):
+        raise EvidenceUnavailable("ambiguous Codex summary protocol")
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate summary field")
+            result[key] = value
+        return result
+    try:
+        state = json.loads(encoded, object_pairs_hook=unique)
+    except (TypeError, ValueError) as exc:
+        raise EvidenceUnavailable("invalid Codex summary state") from exc
+    fields = {"commit_sha", "has_any_findings", "has_unresolved_findings", "status"}
+    if not isinstance(state, dict) or set(state) != {"code_review", "security_review"}:
+        raise EvidenceUnavailable("closed Codex summary state required")
+    for review in state.values():
+        if not isinstance(review, dict) or set(review) != fields:
+            raise EvidenceUnavailable("closed Codex review state required")
+        sha = review["commit_sha"]
+        if sha is not None and (not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha)):
+            raise EvidenceUnavailable("exact Codex summary commit required")
+        if any(review[name] is not None and type(review[name]) is not bool
+               for name in ("has_any_findings", "has_unresolved_findings")):
+            raise EvidenceUnavailable("typed Codex finding flags required")
+        if (review["status"] is not None and not isinstance(review["status"], str)
+                or review["status"] not in {None, "pending", "queued", "in_progress", "completed", "failed", "cancelled", "canceled"}):
+            raise EvidenceUnavailable("unsupported Codex review status")
+    return state
+
+
+def _summary_is_clean(state):
+    code = state["code_review"]
+    def clean(review):
+        return (review["status"] == "completed" and review["commit_sha"] is not None
+                and review["has_any_findings"] is False
+                and review["has_unresolved_findings"] is False)
+    security = state["security_review"]
+    return (clean(code) and (all(value is None for value in security.values())
+            or clean(security) and security["commit_sha"] == code["commit_sha"]))
+
+
+def _parse_review_timestamp(value):
+    from datetime import datetime
+    if not isinstance(value, str):
+        raise EvidenceUnavailable("review observation time unavailable")
+    try:
+        observed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise EvidenceUnavailable("review observation time invalid") from exc
+    if observed.tzinfo is None:
+        raise EvidenceUnavailable("timezone-aware review time required")
+    return observed
+
+
+def _comment_edit_timestamp(row):
+    created = _parse_review_timestamp(row.get("created_at"))
+    updated = _parse_review_timestamp(row["updated_at"]) if "updated_at" in row else created
+    if updated < created:
+        raise EvidenceUnavailable("review edit predates its creation")
+    return updated
+
+
+def _review_timestamp(row):
+    """Unrelated summary edits cannot refresh the code review's completion."""
+    from datetime import timedelta
+    created = _parse_review_timestamp(row.get("created_at"))
+    updated = _comment_edit_timestamp(row)
+    state = _codex_summary_state(row.get("body"))
+    if state is None or state["code_review"]["status"] != "completed":
+        # Preserve the original freshness rule for legacy immutable receipts.
+        return created
+    candidates = []
+    for line in row["body"].splitlines():
+        cells = line.split("|")
+        if len(cells) != 6 or not re.fullmatch(r"\s*[^A-Za-z0-9|]*\*\*Code Review\*\*\s*", cells[1]):
+            continue
+        times = re.findall(r'<relative-time\b[^>]*\bdatetime="([^"]+)"', cells[2])
+        commit = re.fullmatch(r"\s*"+chr(96)+r"([0-9a-f]{7,40})"+chr(96)+r"\s*", cells[3])
+        if (len(times) == 1 and commit and state["code_review"]["commit_sha"] is not None
+                and state["code_review"]["commit_sha"].startswith(commit.group(1))):
+            candidates.append(_parse_review_timestamp(times[0]))
+    if len(candidates) != 1:
+        # A machine state can prove its SHA/flags without display markup, but
+        # cannot supersede a later same-commit review without its own time.
+        return created
+    if candidates[0] >= updated + timedelta(seconds=1):
+        raise EvidenceUnavailable("code review completion postdates its comment")
+    return candidates[0]
+
+
+
+
+def _review_comment_key(row):
+    if type(row.get("id")) is not int or row["id"] <= 0:
+        raise EvidenceUnavailable("review comment identity unavailable")
+    return _review_timestamp(row), row["id"]
+
+
+def _current_codex_summaries(comments, commit_sha):
+    rows = []
+    states = {}
+    for row in comments:
+        if row.get("user", {}).get("login") != BOT or row.get("user", {}).get("type") != "Bot":
+            continue
+        state = _codex_summary_state(row.get("body"))
+        if state is not None:
+            if row.get("id") in states:
+                raise EvidenceUnavailable("duplicate Codex summary identity")
+            rows.append(row)
+            states[row["id"]] = state
+    if rows:
+        latest = max(rows, key=lambda row: (_comment_edit_timestamp(row), _review_comment_key(row)[1]))
+        state = states[latest["id"]]
+        if state["code_review"]["commit_sha"] != commit_sha or not _summary_is_clean(state):
+            raise EvidenceMissing("current independent Codex summary has not passed")
+    return rows
+
+
 def _clean_review_body(body):
-    """Recognize only the plain clean receipt or one exact v1 envelope.
+    """Recognize legacy clean receipts and the strictly typed v1 app summary.
 
     This view is used for format recognition only. The original comment is
     retained for digesting and final immutable-observation checks.
     """
     if not isinstance(body, str):
+        return None
+    try:
+        state = _codex_summary_state(body)
+    except EvidenceError:
+        return None
+    if state is not None:
+        if not _summary_is_clean(state):
+            return None
+        return ("Codex Review: Didn't find any major issues.\n"
+                "**Reviewed commit:** "+chr(96)+state["code_review"]["commit_sha"]+chr(96))
+    if "codex-review-state:" in body.casefold() or "codex-pull-request-review-summary" in body.casefold():
         return None
     envelope = "<!-- codex-review-receipt:v1 -->\n\n"
     if body.startswith(envelope):
@@ -178,12 +321,16 @@ def _collect_github(plan: dict, artifact, number):
     if type(number) is not int or number <= 0:
         raise EvidenceError("immutable pull request reference is required")
     repo = plan["repo"]
+    from herdr.evidence import valid_completion_base_branch
+    expected_branch = plan.get("base_branch", "main")
+    if not valid_completion_base_branch(expected_branch):
+        raise EvidenceError("invalid approved pull request base branch")
     pr = github(f"repos/{repo}/pulls/{number}")
     if (pr.get("head", {}).get("repo", {}).get("full_name") != repo
             or pr.get("base", {}).get("repo", {}).get("full_name") != repo
             or pr.get("head", {}).get("sha") != artifact.commit_sha
             or pr.get("base", {}).get("sha") != artifact.base_sha
-            or pr.get("base", {}).get("ref") != "main"):
+            or pr.get("base", {}).get("ref") != expected_branch):
         raise EvidenceError("pull request repository, commit or baseline mismatch")
     initial_binding = _pr_binding(pr)
     from herdr.verification_binding import verify_commit_binding
@@ -197,6 +344,7 @@ def _collect_github(plan: dict, artifact, number):
     reviews = github(f"repos/{repo}/pulls/{number}/reviews?per_page=100")
     _check_effective_reviews(reviews)
     comments = github(f"repos/{repo}/issues/{number}/comments?per_page=100")
+    summary_rows = _current_codex_summaries(comments, artifact.commit_sha)
     # Codex publishes its clean review as a bot-authored conversation comment.
     # Resolve the reported abbreviated commit through GitHub to bind the full SHA.
     candidates = []
@@ -216,31 +364,34 @@ def _collect_github(plan: dict, artifact, number):
             candidates.append(row)
     if not candidates:
         raise EvidenceMissing("independent exact-commit review has not passed")
-    clean = max(candidates, key=lambda r: r["id"])
+    clean = max(candidates, key=_review_comment_key)
     latest_reviews = github(f"repos/{repo}/pulls/{number}/reviews?per_page=100")
     _check_effective_reviews(latest_reviews)
     if _unresolved_threads(repo, number):
         raise EvidenceMissing("pull request acquired unresolved review findings during collection")
-    if any(r.get("commit_id") == artifact.commit_sha
-           and r.get("user", {}).get("login") == BOT
-           and r.get("submitted_at", "") > clean["created_at"]
-           and r.get("state") in {"COMMENTED", "CHANGES_REQUESTED"}
-           for r in latest_reviews):
-        raise EvidenceMissing("newer exact-commit review must be reconciled")
+    for row in latest_reviews:
+        if (row.get("commit_id") == artifact.commit_sha
+                and row.get("user", {}).get("login") == BOT
+                and row.get("state") in {"COMMENTED", "CHANGES_REQUESTED"}
+                and _review_timestamp({"created_at": row.get("submitted_at")}) > _review_timestamp(clean)):
+            raise EvidenceMissing("newer exact-commit review must be reconciled")
     # A rerun can supersede a previously green check during review collection.
     checks = collect_checks(repo, artifact.commit_sha, plan["required_checks"],
                             require_success=True)
     verify_workflow(plan, artifact, checks)
     latest_comments = github(f"repos/{repo}/issues/{number}/comments?per_page=100")
+    if _current_codex_summaries(latest_comments, artifact.commit_sha) != summary_rows:
+        raise EvidenceMissing("independent Codex summary changed during collection")
     retained = [row for row in latest_comments if row.get("id") == clean["id"]]
     if len(retained) != 1 or retained[0] != clean:
         raise EvidenceMissing("selected independent review changed or disappeared")
     for row in latest_comments:
-        if row.get("id", 0) <= clean["id"] or row.get("user", {}).get("login") != BOT:
+        if row.get("user", {}).get("login") != BOT or row.get("user", {}).get("type") != "Bot":
             continue
         body = row.get("body", "")
         match = re.search(r"\*\*Reviewed commit:\*\*\s*\x60([0-9a-f]{10,40})\x60", body)
-        if match and artifact.commit_sha.startswith(match.group(1)):
+        if (match and artifact.commit_sha.startswith(match.group(1))
+                and _review_comment_key(row) > _review_comment_key(clean)):
             raise EvidenceMissing("newer conversation review must be reconciled")
     latest = github(f"repos/{repo}/pulls/{number}")
     if _pr_binding(latest) != initial_binding:
@@ -270,7 +421,7 @@ def collect_local_handoff(plan, artifact, number):
             raise EvidenceUnavailable("associated PR window exceeds local handoff bound")
         matching = [row for row in rows if isinstance(row, dict)
                     and _pr_binding(row) == (artifact.commit_sha, artifact.base_sha,
-                         plan["repo"], plan["repo"], "main")]
+                         plan["repo"], plan["repo"], plan.get("base_branch", "main"))]
         if not matching:
             raise EvidenceMissing("exact local artifact awaits its parent-published pull request")
         if len(matching) != 1 or type(matching[0].get("number")) is not int:
@@ -305,7 +456,7 @@ def spec_digest(task: dict) -> str:
     keys=("repo", "issue", "kind", "prompt", "completion_kind", "spec_hash", "completion_contract", "completion_evidence", "child_completion_contracts")
     if "work_contract_version" in task:
         keys+=("work_contract_version",)
-    for marker in ("work_budget_version","child_work_budget_version"):
+    for marker in ("work_budget_version","child_work_budget_version","completion_base_version"):
         if marker in task: keys+=(marker,)
     if "child_work_contract_version" in task:
         keys+=("child_work_contract_version",)
@@ -407,19 +558,30 @@ def freeze_plan(root: Path, task: dict) -> None:
                             "completion_level": "control_cycle"}
     else:
         workspace = Path(task.get("workspace", "")).resolve()
+        base_revision = ["rev-parse", "origin/main"]
+        expected_base = None
+        if "completion_base_version" in task:
+            from herdr.work_configuration import approved_completion_base
+            try:
+                base_ref, expected_base = approved_completion_base(root, task)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                raise EvidenceError("reviewed_completion_base_unavailable") from exc
+            base_revision = ["rev-parse", "--verify", base_ref + "^{commit}"]
         try:
             proc = subprocess.run(["/usr/bin/git", "--no-optional-locks", "-c", "core.fsmonitor=false",
                                    "-c", "core.hooksPath=/dev/null", "-C", str(workspace),
-                                   "rev-parse", "origin/main"],
+                                   *base_revision],
                                   text=True, capture_output=True, check=True, timeout=15)
             base = proc.stdout.strip()
-            if not re.fullmatch(r"[0-9a-f]{40}", base):
+            if not re.fullmatch(r"[0-9a-f]{40}", base) or (expected_base is not None and base != expected_base):
                 raise EvidenceError("baseline is invalid")
         except (OSError, subprocess.SubprocessError) as exc:
             raise EvidenceUnavailable("trusted baseline is unavailable") from exc
         required = list(CHECK_APPS) if kind == "coding" else ["GitGuardian Security Checks"]
         plan.update(base_sha=base, workspace_root="/home/agentops/worktrees",
                     required_checks=required, reviewer=BOT)
+        if expected_base is not None:
+            plan["base_branch"] = base_ref.removeprefix("refs/remotes/origin/")
         if kind == "coding":
             if criteria is not None:
                 from herdr.scope_evidence import validate_scope_policy
@@ -537,14 +699,36 @@ def freeze_child_completion_contracts(root, task, parent_plan):
     if old is not None:
         validate_policy(old)
         if (old["parent"]!=binding(task) or old["parent_spec_hash"]!=spec_digest(task)
-                or old["contracts"]!=contracts):
+                or old["contracts"]!=contracts
+                or old.get("base_branch","main")!=parent_plan.get("base_branch","main")):
             raise EvidenceError("immutable child completion policy changed")
         return
     environment={"collector":"github-api-v1","ci_workflow_blob_sha":workflow_blob(task["repo"],base),
         "ci_workflow_id":POLICY["workflow_id"],"github_actions_app_id":15368}
     baseline=list(collect_checks(task["repo"],base,list(CHECK_APPS),require_success=False).values())
     freeze_policy(store_for(root,task),task,parent_spec_hash=spec_digest(task),
-        contracts=contracts,environment=environment,baseline=baseline)
+        contracts=contracts,environment=environment,baseline=baseline,
+        base_branch=parent_plan.get("base_branch"))
+
+def freeze_derived_child_contracts(root, task, admitted):
+    """Freeze only previously approved derived data in the existing evidence store."""
+    from herdr.claimed_child_contracts import retained,contracts
+    from herdr.child_completion_policy import freeze_policy
+    from herdr.evidence import validate_plan
+    derived=retained(admitted,task)
+    if derived is None:return
+    store=store_for(root,task)
+    plan=store.read("plan",digest(binding(task)))
+    validate_plan(plan)
+    if (plan["identity"]!=binding(task) or plan["spec_hash"]!=spec_digest(task)
+            or plan.get("base_sha")!=admitted["definition"]["base_sha"] or plan["kind"]!="coding"):
+        raise EvidenceError("derived child policy original parent plan changed")
+    environment={key:plan["environment"][key] for key in
+        ("collector","ci_workflow_blob_sha","ci_workflow_id","github_actions_app_id")}
+    freeze_policy(store,task,parent_spec_hash=spec_digest(task),
+        contracts=contracts(derived,plan["base_sha"]),environment=environment,baseline=plan["baseline"],
+        base_branch=plan.get("base_branch"))
+
 
 def child_completion_for_root(task_file, identity, *, factory):
     from herdr.child_completion_policy import authority_for_parent
@@ -557,24 +741,60 @@ def child_completion_for_root(task_file, identity, *, factory):
             or path.parent.parent!=factory.task_store_root or task.get("id")!=identity["task_id"]
             or task.get("run_token")!=identity["run_token"]):
         raise EvidenceError("canonical authenticated parent completion binding required")
+    admitted_children=None
     if task.get("child_completion_contracts") is None:
-        # Keep authenticated delegation available; absence of an acceptance
-        # policy never authorizes an unverified completed implementation.
-        return None
+        from herdr.work_configuration import original_derived_children
+        admitted_children=original_derived_children(factory.task_store_root,task,identity=factory.parent_grant.identity)
+        if admitted_children is None:return None
     return authority_for_parent(store_for(factory.task_store_root,task),task,
         parent_spec_hash=spec_digest(task),collector=collect_github,
-        parent_identity=factory.parent_grant.identity)
+        parent_identity=factory.parent_grant.identity,admitted_children=admitted_children)
 
 def child_completion_for_replay(root, scheduler):
     """Restore the same frozen source ports; do not grant, dispatch or call a model."""
-    from herdr.child_completion_policy import authority_for_parent
+    from herdr.child_completion_policy import authority_for_parent, policy_key
     from herdr.host_configuration import read_canonical_parent
     parents=[rec for rec in scheduler._tasks.values() if rec.parent_task_id is None]
     if len(parents)!=1:
         return None
     parent=parents[0]
     task=read_canonical_parent(root,parent.id,parent.run_token)
-    if task is None or task.get("child_completion_contracts") is None:
+    if task is None:
+        from herdr.child_completion_policy import policy_key
+        existing=Path(root)/"verification"
+        if existing.exists():
+            try:EvidenceStore(existing).read("plan",policy_key(parent.repo,parent.id,parent.run_token))
+            except EvidenceMissing:return None
+            raise EvidenceError("frozen child policy has no original canonical parent")
+        if parent.canonical_parent is not None:
+            raise EvidenceError('canonical child replay has no original parent task')
         return None
+    admitted_children=None
+    if task.get("child_completion_contracts") is None:
+        from herdr.work_configuration import original_derived_children
+        modern_fields = ('child_completion_contracts', 'work_contract_version', 'work_budget_version',
+                         'child_work_contract_version', 'child_work_budget_version')
+        if parent.canonical_parent is None and not any(key in task for key in modern_fields):
+            # Only a retained legacy scheduler attempt can keep its original port.
+            # An existing modern policy or changed frozen spec cannot downgrade.
+            existing = Path(root) / 'verification'
+            if existing.exists():
+                store = EvidenceStore(existing)
+                try:
+                    store.read('plan', policy_key(parent.repo, parent.id, parent.run_token))
+                except EvidenceMissing:
+                    pass
+                else:
+                    raise EvidenceError('frozen child policy cannot replay as legacy')
+                try:
+                    plan = store.read('plan', digest(binding(task)))
+                except EvidenceMissing:
+                    pass
+                else:
+                    if plan['identity'] != binding(task) or plan['spec_hash'] != spec_digest(task):
+                        raise EvidenceError('frozen parent plan changed during legacy replay')
+            return None
+        admitted_children=original_derived_children(root,task,identity=scheduler.ownership_parent)
+        if admitted_children is None:return None
     return authority_for_parent(store_for(root,task),task,parent_spec_hash=spec_digest(task),
-        collector=collect_github,parent_identity=scheduler.ownership_parent)
+        collector=collect_github,parent_identity=scheduler.ownership_parent,admitted_children=admitted_children)

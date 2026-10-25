@@ -272,6 +272,10 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
     class Guard:
         aliases = {}
         checks = []
+        sdk_observations = []
+        def observe_sdk(self, row):
+            self.sdk_observations.append(row)
+            return True
         approval_required = False
         approval_used = False
         grant = types.SimpleNamespace(hash="a"*64, identity=types.SimpleNamespace(task_id="task"), scope=types.SimpleNamespace(tools=(), data_classes=(DataClass.INTERNAL,)), provider_routes=(types.SimpleNamespace(provider="provider-a", base_url="https://provider-a.example.invalid/v1", api_mode="openai", regions=("eu-central",), data_classes=("internal",), max_egress="region_bound", max_retention="limited", training="excluded", credential_refs=()),))
@@ -406,6 +410,8 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
         with pytest.raises(PolicyDenied, match="provider_not_granted"):
             loop.perform_api_call(agent)
         assert callbacks == []
+        assert {row["phase"] for row in policy.sdk_observations} == {"sdk_provider_check", "sdk_api_call"}
+        assert all(row["error_type"] == "PolicyDenied" for row in policy.sdk_observations)
         agent.provider = "provider-a"
         agent.base_url = "https://unexpected.example.invalid/v1"
         with pytest.raises(PolicyDenied, match="provider_endpoint_denied"):
@@ -455,6 +461,7 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
             with pytest.raises(WorkContractError):
                 loop.perform_api_call(agent)
             assert (len(effects), len(network_requests)) == before
+        assert any(row["phase"] == "sdk_middleware" for row in policy.sdk_observations)
         # A preexisting incompatible cap must stop before either reservation or transport.
         from herdr.work_budget_configuration import model_request_ceiling
         policy.model_request_ceiling = lambda route: model_request_ceiling({**route, "max_output_tokens": 100})

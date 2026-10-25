@@ -75,6 +75,7 @@ def test_work_registry_consumes_one_shot_approval_once(tmp_path,monkeypatch):
     from herdr.security import ApprovalEvidence, RiskClass, ToolRule, canonical_digest
     from herdr.work_contract_host import WorkInvocationGuard
     from herdr.work_tool import register_work_tool,TOOL
+    from herdr.hermes_guard import GuardInstallation
     from herdr.policy_launch import IDENTITY_ENV
     from tests.herdr.test_security import grant,assurance
     raw={"request_id":"one"}
@@ -93,7 +94,7 @@ def test_work_registry_consumes_one_shot_approval_once(tmp_path,monkeypatch):
         def get_entry(self,name):return entries.get(name)
         def register(self,**kw):entries[kw["name"]]=SimpleNamespace(**kw)
         def restore_registration(self,*args):pass
-    install=SimpleNamespace(guard=guard,installed=True,finalizers=[])
+    install=GuardInstallation(guard,surface={})
     authorization=contextvars.ContextVar("test-work-authorization",default=None)
     register_work_tool(install,Registry(),authorization,lambda t,a:canonical_digest({"tool":t,"args":a}))
     monkeypatch.setenv("HERDR_DURABLE_SANDBOX","1")

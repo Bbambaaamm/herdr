@@ -647,11 +647,16 @@ def _root_work_factory(task, *, recovery=False):
     if factory is None:
         from herdr.work_configuration import build_root_work_factory
         try:
-            factory = build_root_work_factory(ROOT, task, recovery=recovery)
+            factory = build_root_work_factory(ROOT, task, recovery=recovery,
+                claimed_identity=None if recovery else _claimed_root_identity(task))
         except (OSError, ValueError, KeyError, TypeError, EvidenceError) as exc:
             raise EvidenceError("task_work_contract_authority_missing") from exc
     if not isinstance(factory, HostWorkContractFactory):
         raise EvidenceError("task_work_contract_authority_missing")
+    admission = getattr(factory, "host_admission", None)
+    if isinstance(admission, dict) and "managed_children" in admission:
+        from herdr.claimed_child_contracts import retained
+        retained(admission, task, identity=None if recovery else _claimed_root_identity(task))
     HOST_WORK_FACTORIES[cache_key] = factory
     return factory
 
@@ -740,15 +745,24 @@ def _preflight_root_provider(profile):
         executable=ENV.get("HERDR_HERMES_BINARY","/home/agentops/.local/bin/hermes"),env=ENV)
 
 
-def _root_launch_identity(task):
+def _claimed_root_identity(task):
     from herdr.security import InvocationIdentity
-    session = task.get("execution_session") or {}
     routing = task.get("routing") if isinstance(task.get("routing"), dict) else {}
     coordinator = str(routing.get("selected_agent") or task.get("agent") or "quantlab-hermes")
     agent, marker = _task_session_identity(task)
     identity = InvocationIdentity(consumer="github:"+str(task["repo"]), agent_id=agent,
         parent_agent_id=coordinator, parent_task_id="coordinator:"+coordinator,
         task_id=str(task["id"]), run_token=str(task["run_token"]), fencing_token=task["fencing_token"])
+    return identity
+
+
+def _root_launch_identity(task):
+    from herdr.security import InvocationIdentity
+    session = task.get("execution_session") or {}
+    identity = _claimed_root_identity(task)
+    routing = task.get("routing") if isinstance(task.get("routing"), dict) else {}
+    coordinator = str(routing.get("selected_agent") or task.get("agent") or "quantlab-hermes")
+    agent, marker = _task_session_identity(task)
     if (session.get("agent_name") != agent or session.get("session_name") != marker
             or session.get("coordinator_agent") != coordinator or session.get("pane_marker") != marker):
         raise RuntimeError("task_launch_cleanup_identity_mismatch")
@@ -1070,6 +1084,7 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
             launch.mount.bootstrap.work_authority = work_factory.authorize_invocation
             launch.mount.bootstrap.work_verify = work_factory.verify_request
             launch.mount.bootstrap.work_budget = work_factory.budget_effect
+            launch.mount.bootstrap.work_observe = work_factory.observe_sdk
             persist_execution_session(task)
         def publish_continuation(evidence):
             if work_factory is not None:
@@ -1513,6 +1528,11 @@ def run_prompt(task: dict) -> tuple[int, str]:
     agent = str(session["agent_name"])
     timeout_seconds = int(task.get("timeout_seconds") or 1800)
     prompt = prompt_text(task)
+    if modern_work_contract(task):
+        # One native delivery. Framing is validated before recording intent;
+        # the authenticated CLI transport preserves the SDK paste guard.
+        from herdr.hermes_terminal_transport import encode_native_prompt
+        prompt = encode_native_prompt(prompt)
     cmd = [
         str(HERDR), "agent", "prompt", agent, prompt,
         "--wait", "--timeout", str(timeout_seconds * 1000),
@@ -1792,8 +1812,17 @@ def defer_for_active_children(task_path: Path, task: dict, *, reason: str = "",
     return True
 
 def finish(task_path: Path, task: dict, output: str) -> None:
+    pending_cleanup = False
     with parent_transition_guard(task) as all_terminal:
         _finish_locked(task_path, task, output, all_terminal)
+        if modern_work_contract(task) and task.get("attempt_state") == "verification_pending":
+            pending_cleanup = not defer_for_active_children(
+                current_task_path(task) or task_path, task, all_terminal=all_terminal)
+    if pending_cleanup:
+        # The durable pending state rejects new delegation under the same lock.
+        # Failure recording takes that lock itself, so cleanup runs after release.
+        cleanup_task_session_if_safe(task)
+        persist_current_task(task)
 
 
 def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool) -> None:

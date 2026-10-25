@@ -123,6 +123,7 @@ class HostBootstrap:
         self.work_authority = None
         self.work_verify = None
         self.work_budget = None
+        self.work_observe = None
         self.external_knowledge_authority = None
         self.external_knowledge_query = None
 

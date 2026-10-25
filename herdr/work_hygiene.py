@@ -209,8 +209,92 @@ def publish_file(parent, name, raw, *, expected=None):
         except FileNotFoundError: pass
 
 
+def _local_repository_inputs(policy, root, *, repo=None, branch=None):
+    require(root.is_absolute() and root.resolve(strict=True) == root and root.is_dir(),
+            "canonical local commit workspace required")
+    git = read_only_git(root)
+    current = git(["symbolic-ref", "--short", "HEAD"]).strip()
+    require(current.startswith("herdr/") and (branch is None or current == branch),
+            "local commit requires the exact owned branch")
+    git(["check-ref-format", "refs/heads/" + current])
+    metadata = Path(git(["rev-parse", "--absolute-git-dir"]).strip())
+    common = Path(git(["rev-parse", "--path-format=absolute", "--git-common-dir"]).strip())
+    for path in (metadata, common): directory_fd_close(path)
+    values = verified_config_values(common, git, policy.config_sha256)
+    selected, seen, tracking, remote = {}, set(), {}, {}
+    allowed = {"user.name", "user.email", "core.filemode", "core.autocrlf", "core.commentchar", "commit.cleanup"}
+    structural = {"core.repositoryformatversion":"0", "core.bare":"false", "core.logallrefupdates":"true"}
+    for row in filter(None, values):
+        key, separator, value = row.partition("\n")
+        require(separator and key not in seen, "duplicate or malformed repository policy key")
+        seen.add(key)
+        if key in allowed:
+            selected[key] = value
+        elif key in structural:
+            require(value == structural[key], "repository structural policy differs")
+        elif key == "core.hookspath":
+            actual = Path(value) if Path(value).is_absolute() else root/value
+            require(actual.resolve(strict=True) == Path(policy.hooks_root), "configured hook root differs")
+        elif key in {"remote.origin.url", "remote.origin.fetch"}:
+            remote[key] = value
+        elif key.startswith("branch.") and key.endswith((".remote", ".merge")):
+            name, _, field = key[len("branch."):].rpartition(".")
+            require(name and (len(tracking) < 32 or name in tracking), "bounded branch tracking policy required")
+            tracking.setdefault(name, {})[field] = value
+        else:
+            require(False, "repository commit policy needs an approved richer profile")
+    require(selected.get("user.name") and selected.get("user.email"), "repository commit author policy missing")
+    if "core.hookspath" not in seen:
+        require(Path(policy.hooks_root) == common/"hooks", "default repository hook root differs")
+    if remote or tracking:
+        require(isinstance(repo, str) and re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*/[A-Za-z0-9_-][A-Za-z0-9_.-]*", repo)
+                and remote == {"remote.origin.url":"https://github.com/"+repo+".git",
+                               "remote.origin.fetch":"+refs/heads/*:refs/remotes/origin/*"},
+                "repository origin differs from the approved GitHub repository")
+        for name, fields in tracking.items():
+            require(set(fields) == {"remote", "merge"} and fields["remote"] == "origin"
+                    and fields["merge"].startswith("refs/heads/"), "repository tracking policy differs")
+            git(["check-ref-format", "refs/heads/" + name])
+            git(["check-ref-format", fields["merge"]])
+    # Remotes and tracking are frozen provenance metadata, never hook inputs.
+    return git, metadata, common, selected
+
+def _approved_local_hooks(policy):
+    fd = directory_fd(policy.hooks_root)
+    result = {}
+    try:
+        for name in os.listdir(fd):
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if name.endswith(".sample") or not info.st_mode & 0o111: continue
+            require(name in dict(policy.hooks), "unfrozen executable hook")
+            handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+            try:
+                st = os.fstat(handle)
+                require(stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and st.st_size <= 1048576,
+                        "hook is not a bounded regular input")
+                raw = os.read(handle, 1048577)
+                after = os.fstat(handle)
+                stamp = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+                require(stamp(st) == stamp(after), "repository hook changed while reading")
+                require(len(raw) == st.st_size and hashlib.sha256(raw).hexdigest() == dict(policy.hooks)[name],
+                        "repository hook changed")
+                result[name] = raw
+            finally: os.close(handle)
+        require(set(result) == set(dict(policy.hooks)), "approved repository hook missing")
+        return result
+    finally: os.close(fd)
+
+
+def preflight_local_commit(policy, workspace, *, repo=None, branch=None):
+    """Read the same frozen Git/hook contract before fresh work has effects."""
+    require(isinstance(policy, LocalCommitPolicy), "host local commit policy required")
+    from .work_lifetime import bounded_host_request
+    with bounded_host_request(30):
+        _local_repository_inputs(policy, Path(workspace), repo=repo, branch=branch)
+        _approved_local_hooks(policy)
+
 class HostLocalCommitter:
-    def __init__(self, policy, storage, draft, *, completion_plan, workspace_identity):
+    def __init__(self, policy, storage, draft, *, completion_plan, workspace_identity, runtime_storage=None):
         require(isinstance(policy, LocalCommitPolicy) and isinstance(draft, ArtifactRef)
                 and not draft.result_sha and draft.commit_sha == draft.base_sha, "host local commit draft required")
         require(isinstance(completion_plan, dict) and completion_plan["identity"]["id"] == draft.task_id
@@ -221,63 +305,23 @@ class HostLocalCommitter:
         self.storage.mkdir(mode=0o700, parents=True, exist_ok=True)
         require(self.storage.resolve(strict=True) == self.storage and self.storage.stat().st_mode & 0o077 == 0,
                 "host commit storage must be private")
+        self.runtime_storage = self.storage if runtime_storage is None else Path(runtime_storage)
+        if runtime_storage is not None:
+            info = self.runtime_storage.stat()
+            require(self.runtime_storage.is_absolute() and self.runtime_storage.resolve(strict=True) == self.runtime_storage
+                    and stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o077,
+                    "host commit runtime storage must be private")
 
     def _repository(self, cycle):
         info = cycle.root.lstat()
         require(f"{info.st_dev}:{info.st_ino}" == self.workspace_identity
-                and not self.storage.is_relative_to(cycle.root), "local commit workspace ownership changed")
-        git = read_only_git(cycle.root)
-        require(git(["symbolic-ref", "--short", "HEAD"]).strip() == self.draft.branch
-                and self.draft.branch.startswith("herdr/"), "local commit requires the exact owned branch")
-        metadata = Path(git(["rev-parse", "--absolute-git-dir"]).strip())
-        common = Path(git(["rev-parse", "--path-format=absolute", "--git-common-dir"]).strip())
-        for path in (metadata, common): directory_fd_close(path)
-        values = verified_config_values(common,git,self.policy.config_sha256)
-        selected = {}
-        allowed = {"user.name", "user.email", "core.filemode", "core.autocrlf", "core.commentchar", "commit.cleanup"}
-        for row in filter(None, values):
-            key, separator, value = row.partition("\n")
-            require(separator and not key.startswith(("include.", "includeif.", "filter."))
-                    and key not in {"core.fsmonitor", "commit.gpgsign", "commit.template"},
-                    "repository commit policy needs an approved richer profile")
-            structural={"core.repositoryformatversion":"0","core.bare":"false","core.logallrefupdates":"true"}
-            require(key in allowed or key=="core.hookspath" or key in structural and value==structural[key],
-                    "repository commit policy needs an approved richer profile")
-            if key in allowed:
-                require(key not in selected, "duplicate commit policy key")
-                selected[key] = value
-            if key == "core.hookspath":
-                actual = Path(value) if Path(value).is_absolute() else cycle.root/value
-                require(actual.resolve(strict=True) == Path(self.policy.hooks_root), "configured hook root differs")
-        require(selected.get("user.name") and selected.get("user.email"), "repository commit author policy missing")
-        if not any(row.startswith("core.hookspath\n") for row in values):
-            require(Path(self.policy.hooks_root) == common/"hooks", "default repository hook root differs")
-        return git, metadata, common, selected
+                and not self.storage.is_relative_to(cycle.root)
+                and not self.runtime_storage.is_relative_to(cycle.root), "local commit workspace ownership changed")
+        return _local_repository_inputs(self.policy, cycle.root, repo=self.completion_plan.get("repo"),
+                                        branch=self.draft.branch)
 
     def _hooks(self):
-        fd = directory_fd(self.policy.hooks_root)
-        result = {}
-        try:
-            for name in os.listdir(fd):
-                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
-                if name.endswith(".sample") or not info.st_mode & 0o111: continue
-                require(name in dict(self.policy.hooks), "unfrozen executable hook")
-                handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
-                try:
-                    st = os.fstat(handle)
-                    require(stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and st.st_size <= 1048576,
-                            "hook is not a bounded regular input")
-                    raw = os.read(handle, 1048577)
-                    after = os.fstat(handle)
-                    stamp = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
-                    require(stamp(st) == stamp(after), "repository hook changed while reading")
-                    require(len(raw) == st.st_size and hashlib.sha256(raw).hexdigest() == dict(self.policy.hooks)[name],
-                            "repository hook changed")
-                    result[name] = raw
-                finally: os.close(handle)
-            require(set(result) == set(dict(self.policy.hooks)), "approved repository hook missing")
-            return result
-        finally: os.close(fd)
+        return _approved_local_hooks(self.policy)
 
     def __call__(self, cycle):
         require(cycle.plan.identity.task_id == self.draft.task_id and cycle.plan.base_sha == self.draft.base_sha
@@ -388,7 +432,7 @@ class HostLocalCommitter:
             runtime = None
             try:
                 from .check_runtime import FrozenCheckRuntime
-                runtime = FrozenCheckRuntime(self.policy.environment,self.storage,writable_roots=(cycle.root,))
+                runtime = FrozenCheckRuntime(self.policy.environment,self.runtime_storage,writable_roots=(cycle.root,))
                 argv = ["/usr/bin/bwrap", "--die-with-parent", "--unshare-user", "--uid", "65534", "--gid", "65534",
                         "--disable-userns", "--unshare-pid", "--unshare-net", "--unshare-ipc",
                         "--unshare-uts", "--cap-drop", "ALL", "--tmpfs", "/", *runtime.arguments(),

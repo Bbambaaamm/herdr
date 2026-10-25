@@ -580,6 +580,12 @@ class GuardInstallation:
     surface: dict[str, Any] = field(default_factory=dict)
     finalizers: list[Callable[[], Any]] = field(default_factory=list)
     installed: bool = True
+    cli_invocation_binding: Any = None
+
+    def resolve_caller_task_id(self, task_id: str | None) -> str | None:
+        """Resolve only a live host-bound tool context; SDK arguments stay raw."""
+        return (self.cli_invocation_binding.caller_task_id(task_id)
+                if self.cli_invocation_binding is not None else task_id)
 
     def _remember(self, owner: Any, name: str, replacement: Any) -> None:
         original = getattr(owner, name)
@@ -589,6 +595,8 @@ class GuardInstallation:
     def uninstall(self) -> None:
         if not self.installed:
             return
+        if self.cli_invocation_binding is not None:
+            self.cli_invocation_binding.close()
         for owner, name, original in reversed(self.originals):
             setattr(owner, name, original)
         for finalizer in reversed(self.finalizers):
@@ -658,13 +666,41 @@ def _check_private_sdk_agent(policy, agent):
         raise PolicyDenied("private_sdk_fallback_not_empty")
 
 
-def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None) -> GuardInstallation:
+def _install_sdk_observation_formatter(installation, guard):
+    # The pinned CLI calls this formatter with the *actual* caught constructor
+    # exception before returning False. Observe enums, preserve all UI text.
+    authority = getattr(guard, "work_authority", None)
+    if not callable(getattr(authority, "observe", None)):
+        return
+    try:
+        from hermes_cli import cli_chat_error_copy
+        original = cli_chat_error_copy.agent_init_failure_message
+    except (ImportError, AttributeError):
+        return  # Optional diagnostics must not break a legacy SDK startup.
+    if not callable(original):
+        return
+    @functools.wraps(original)
+    def observed(error):
+        from .sdk_observation import report_failure
+        report_failure(guard, "sdk_agent_init", error)
+        return original(error)
+    installation._remember(cli_chat_error_copy, "agent_init_failure_message", observed)
+
+
+def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None,
+                         cli_invocation_binding=None) -> GuardInstallation:
     """Install #76 authority at all audited Hermes v0.21.5 execution seams.
 
     This must run before the model is allowed to issue tool calls.  Plugin
     pre_tool_call is intentionally *not* relied on: callers may set skip flags
     and middleware failures are fail-open in the audited Hermes version.
     """
+    if cli_invocation_binding is not None:
+        from .hermes_cli_identity import CLIInvocationBinding
+        if type(cli_invocation_binding) is not CLIInvocationBinding or cli_invocation_binding.guard is not guard:
+            raise PolicyDenied("cli_binding_guard_required")
+    def caller_task_id(value):
+        return installation.resolve_caller_task_id(value)
     installation = None
     if private_sdk_policy is not None:
         from .private_profile_namespace import PrivateSDKPolicy
@@ -699,12 +735,16 @@ def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None) -> 
     aliases = dict(surface["legacy_aliases"])
     guard.aliases = aliases
     guard.path_resolver = lambda value, task_id: _resolve_path_for_task(
-        value, task_id
+        value, (cli_invocation_binding.path_task_id(task_id)
+                if cli_invocation_binding is not None else task_id)
     )
     if installation is None:
         installation = GuardInstallation(guard=guard, surface=surface)
     else:
         installation.surface = surface
+
+    installation.cli_invocation_binding = cli_invocation_binding
+    _install_sdk_observation_formatter(installation, guard)
 
     # Pin local file authority to the granted directory inodes. Hermes may keep
     # its higher-level formatting/search helpers, but physical read/write/patch
@@ -960,6 +1000,9 @@ def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None) -> 
 
     installation._remember(codex_adapter, "create", guarded_codex_create)
 
+    from .sdk_observation import observe_failures
+
+    @observe_failures(guard, "sdk_provider_check")
     def authorize_agent_provider(agent: Any) -> None:
         provider = getattr(agent, "provider", None)
         routes = getattr(getattr(guard, "grant", None), "provider_routes", ())
@@ -983,6 +1026,7 @@ def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None) -> 
     original_perform = turn_api_call.perform_api_call
 
     @functools.wraps(original_perform)
+    @observe_failures(guard, "sdk_api_call")
     def guarded_perform(agent: Any, *args: Any, **kwargs: Any) -> Any:
         if private_sdk_policy is not None:
             _check_private_sdk_agent(private_sdk_policy, agent)
@@ -1007,6 +1051,7 @@ def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None) -> 
     original_middleware = middleware.run_llm_execution_middleware
 
     @functools.wraps(original_middleware)
+    @observe_failures(guard, "sdk_middleware")
     def guarded_llm_execution(request: Any, next_call: Any, **context: Any) -> Any:
         agent = _ACTIVE_AGENT.get()
         if agent is None:
@@ -1057,14 +1102,26 @@ def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None) -> 
                                 tool_call_id: str, execute: Callable[..., Any],
                                 **kwargs: Any) -> Any:
         def authorized_execute(final_args: dict[str, Any]) -> Any:
+            try:
+                token = (cli_invocation_binding.begin_tool(agent, effective_task_id)
+                         if cli_invocation_binding is not None else None)
+            except PolicyDenied as exc:
+                return _denied_result(exc.reason, exc.detail)
+            try:
+                return bound_execute(final_args)
+            finally:
+                if token is not None:
+                    cli_invocation_binding.end_tool(token)
+
+        def bound_execute(final_args: dict[str, Any]) -> Any:
             if function_name in _META_READ_TOOLS:
                 return execute(final_args)
             if function_name == _BRIDGE_TOOL:
-                denied = _precheck_bridge(guard, final_args, effective_task_id)
+                denied = _precheck_bridge(guard, final_args, caller_task_id(effective_task_id))
                 return denied if denied is not None else execute(final_args)
             try:
                 canonical, checked = guard.authorize_tool_call(
-                    function_name, final_args, caller_task_id=effective_task_id,
+                    function_name, final_args, caller_task_id=caller_task_id(effective_task_id),
                     consume_approval=True,
                 )
                 digest = _call_digest(canonical, checked)
@@ -1103,7 +1160,7 @@ def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None) -> 
             return original_handle(function_name, function_args, task_id, *args, **kwargs)
 
         if function_name == _BRIDGE_TOOL:
-            denied = _precheck_bridge(guard, function_args, task_id)
+            denied = _precheck_bridge(guard, function_args, caller_task_id(task_id))
             if denied is not None:
                 return denied
             return original_handle(function_name, function_args, task_id, *args, **kwargs)
@@ -1112,7 +1169,7 @@ def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None) -> 
             _, checked = guard.authorize_tool_call(
                 function_name,
                 function_args,
-                caller_task_id=task_id,
+                caller_task_id=caller_task_id(task_id),
                 consume_approval=False,
             )
         except PolicyDenied as exc:
@@ -1145,7 +1202,7 @@ def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None) -> 
             _, checked = guard.authorize_tool_call(
                 canonical,
                 args,
-                caller_task_id=kwargs.get("task_id"),
+                caller_task_id=caller_task_id(kwargs.get("task_id")),
                 consume_approval=(already != (guard.grant.hash, canonical, digest)),
             )
         except PolicyDenied as exc:
@@ -1178,7 +1235,8 @@ def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None) -> 
             _, checked = guard.authorize_tool_call(
                 canonical,
                 arguments,
-                caller_task_id=guard.grant.identity.task_id,
+                caller_task_id=(caller_task_id(None) if cli_invocation_binding is not None
+                                else guard.grant.identity.task_id),
                 consume_approval=(already != (guard.grant.hash, canonical, digest)),
             )
         except PolicyDenied as exc:

@@ -21,10 +21,12 @@ def boundary_workspace():
     try: yield target
     finally: shutil.rmtree(target)
 
-def fixture(root, hook=None, *, grant_transform=None, defer_verify=False, repository_config=None, environment_transform=None):
+def fixture(root, hook=None, *, grant_transform=None, defer_verify=False, repository_config=None, environment_transform=None, repository_setup=None):
     factory, work, plan, grant, log = factory_fixture(root)
     branch = WorkspaceManager(work).branch_name(86, plan.identity.task_id, 1, plan.base_sha)
     git(work, "branch", "-m", branch)
+    if repository_setup is not None:
+        repository_setup(work, branch)
     for key,value in (repository_config or {}).items():
         git(work,"config","--local",key,value)
     hooks = work/".git"/"hooks"
@@ -43,6 +45,7 @@ def fixture(root, hook=None, *, grant_transform=None, defer_verify=False, reposi
         grant = grant_transform(grant)
     plan = replace(plan, grant_sha256=grant.hash, environment_sha256=environment.hash, hygiene_sha256=policy.hash)
     factory.environment = environment; factory.approve = lambda **kwargs: plan
+    factory.local_commit_policy = policy
     cycle = factory.prepare(identity=plan.identity, workspace=work, grant=grant, spec_sha256=plan.spec_sha256)
     (work/"result.py").write_text("def approved():\n    return 3\n\ndef foreign():\n    return 2\n")
     if not defer_verify:

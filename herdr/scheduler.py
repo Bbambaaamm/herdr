@@ -436,9 +436,17 @@ class AuditLog:
         with self._lock:
             self._buffer.append(event)
 
-    def flush(self) -> None:
+    def flush(self, *, sync_existing: bool = False) -> None:
         with self._lock:
             if not self._buffer:
+                if sync_existing:
+                    with open(self._path, "rb") as fh:
+                        os.fsync(fh.fileno())
+                    directory = os.open(self._path.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(directory)
+                    finally:
+                        os.close(directory)
                 return
             events = self._buffer
             self._buffer = []

@@ -335,11 +335,31 @@ class WorkCycle:
         self.audit_log.flush()
 
     def _restore(self):
+        sdk_observations = []
+        host_denials = []
         for event in self._events():
             require(event.get("plan_sha256") == self.plan.hash, "work plan changed during restart")
             kind = event["event"]
             if kind == "work_plan":
                 require(event.get("plan") == json.loads(canonical(self.plan.to_json())), "persisted work plan changed")
+            elif kind == "work_sdk_observation":
+                from .sdk_observation import validate_observation_events
+                sdk_observations.append(event)
+                try:
+                    validate_observation_events(sdk_observations, self.plan.identity,
+                                                self.plan.hash, self.plan.grant_sha256)
+                except ValueError as exc:
+                    raise WorkContractError("invalid SDK observation replay") from exc
+                # Metadata only: no work phase, verification or budget transition.
+            elif kind == "work_host_denial":
+                from .host_work_denial import validate_denial_events
+                host_denials.append(event)
+                try:
+                    validate_denial_events(host_denials, self.plan.identity,
+                                           self.plan.hash, self.plan.grant_sha256)
+                except ValueError as exc:
+                    raise WorkContractError("invalid host denial replay") from exc
+                # Metadata only: no phase, retry, result or budget transition.
             elif kind == "work_discovery":
                 require(self.plan.planning is not None and self.phase is WorkPhase.PREPARE
                         and event.get("discovery") == self.plan.planning.to_json()["discovery"],

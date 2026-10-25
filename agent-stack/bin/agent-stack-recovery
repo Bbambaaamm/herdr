@@ -505,6 +505,12 @@ def terminalize_from_result(
 ) -> None:
     with parent_transition_guard(task) as all_terminal:
         _terminalize_from_result_locked(path, task, result, age_seconds, all_terminal)
+    if all_terminal and task.get("attempt_state") == "verification_pending":
+        worker = _worker_bridge()
+        if worker.modern_work_contract(task):
+            worker.ROOT = ROOT
+            worker.cleanup_task_session_if_safe(task)
+            write_json(BLOCKED / path.name, task)
 
 
 def _terminalize_from_result_locked(

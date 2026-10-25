@@ -172,6 +172,8 @@ def test_cold_host_recovers_commit_before_slot_delivery_after_sdk_loss(boundary_
 
 def test_modern_child_port_runs_baseline_and_recovers_original_local_candidate(boundary_workspace, monkeypatch):
     """Actual child authority and host effects; launch transport is a fixture."""
+    from herdr.scheduler import TaskRecord
+    from herdr.taskgraph import TaskNode
     from types import SimpleNamespace
     from herdr.child_evidence import ChildCompletionAuthority, child_identity, child_spec, child_task
     from herdr.work_contract_host import HostWorkContractFactory
@@ -182,15 +184,7 @@ def test_modern_child_port_runs_baseline_and_recovers_original_local_candidate(b
     identity = old_cycle.plan.identity
     workspace = old_cycle.root
     info = workspace.stat()
-    rec = SimpleNamespace(node=SimpleNamespace(id=identity.task_id, objective="Repair approved behavior",
-        role="writer", tools=guard.grant.scope.tools, permissions=("workspace-write",)),
-        run_token=identity.run_token, idempotency_key="original", attempts=1,
-        fencing_token=identity.fencing_token, repo=task["repo"], issue="86",
-        parent_task_id=identity.parent_task_id, parent_agent_id=identity.parent_agent_id,
-        agent_id=identity.agent_id, execution_agent=identity.agent_id, execution_pane="child-pane",
-        execution_marker="child-marker", execution_sandbox_verified=True,
-        execution_sandbox_attestation={"invocation_policy":task["execution_session"]["invocation_policy"]},
-        worktree_identity=f"{workspace}|{info.st_dev}:{info.st_ino}", ownership=None, owned_write_mounts=None)
+    rec = TaskRecord(id=identity.task_id, delegation_key='child-original', node=TaskNode(id=identity.task_id, parent_id=identity.parent_task_id, type='task', objective='Repair approved behavior', role='writer', tools=guard.grant.scope.tools, permissions=('workspace-write',), inputs=(), expected_outputs=({'kind': 'result'},), dependencies=(), priority=0, resource_class='standard', model_policy={'model': 'fixture-only'}), run_token=identity.run_token, idempotency_key='original', attempts=1, fencing_token=identity.fencing_token, repo=task['repo'], issue='86', parent_task_id=identity.parent_task_id, parent_agent_id=identity.parent_agent_id, agent_id=identity.agent_id, execution_agent=identity.agent_id, execution_pane='child-pane', execution_marker='child-marker', execution_sandbox_verified=True, execution_sandbox_attestation={'invocation_policy': task['execution_session']['invocation_policy']}, worktree_identity=f'{workspace}|{info.st_dev}:{info.st_ino}', ownership=None, owned_write_mounts=None)
     assert child_identity(rec) == identity
     spec = child_spec(rec)
     approved = replace(old_cycle.plan, spec_sha256=spec)
@@ -225,6 +219,40 @@ def test_modern_child_port_runs_baseline_and_recovers_original_local_candidate(b
     assert len(baseline)==1 and baseline[0]["checks"][0]["exit_code"]==1
     assert bootstrap.work_authority==factory.authorize_invocation
     assert bootstrap.work_verify==factory.verify_request
+    assert bootstrap.work_budget==factory.budget_effect
+    assert bootstrap.work_observe==factory.observe_sdk
+    # The actual managed-child prepare_work binding must reach the child's
+    # existing audit through the same authenticated port as the root worker.
+    # Only the mount verifier is an explicit fixture; Unix peer credentials,
+    # child factory/plan, audit fsync/replay and result handoff are real.
+    import socket
+    from herdr.work_authority import dispatch_work_connection
+    from tests.herdr.test_work_authority import owner_for
+    from herdr.work_cycle import WorkContractError
+    metadata={"phase":"sdk_agent_init","outcome":"failed","error_type":"TypeError"}
+    owner,checked_mounts=owner_for(factory,guard.grant)
+    owner.work_observe=bootstrap.work_observe
+    parent_before=old_log._path.read_bytes()
+    child_before=log.replay()
+    left,right=socket.socketpair()
+    try:
+        right.sendall(json.dumps({"op":"work-sdk-observation","identity":identity.to_json(),
+            "grant_sha256":guard.grant.hash,"observation":metadata}).encode()+b"\n")
+        assert dispatch_work_connection(owner,left)
+        assert right.recv(128)==b"observation-ok\n"
+    finally:
+        left.close();right.close()
+    records=log.replay()
+    assert records[:-1]==child_before
+    assert records[-1]=={"event":"work_sdk_observation","work_cycle":child_identity(rec).to_json(),
+        "plan_sha256":approved.hash,"grant_sha256":guard.grant.hash,"provenance":"sdk_observed",
+        "observation_index":1,"observation":metadata}
+    assert len(checked_mounts)==2 and old_log._path.read_bytes()==parent_before
+    assert factory.budget_authority is None and factory.cycle(identity).phase is WorkPhase.WORK
+    child_bytes=log._path.read_bytes()
+    with pytest.raises(WorkContractError):
+        bootstrap.work_observe(replace(identity,run_token="foreign-attempt"),guard.grant.hash,metadata)
+    assert log._path.read_bytes()==child_bytes
     (workspace/"result.py").write_text("def approved():\n    return 3\n\ndef foreign():\n    return 2\n")
     response=bootstrap.work_verify(identity,guard.grant.hash,"child-original",{"pr_number":None})
     cycle=factory.cycle(identity)
