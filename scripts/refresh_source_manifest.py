@@ -29,6 +29,7 @@ FILES = (
     Path("docs/architecture/PROMPT_RUNTIME.md"),
 
     Path("docs/architecture/WORK_NODE_CONTRACT.md"),
+    Path("docs/architecture/PARENT_RESULT_PUBLICATION.md"),
     Path("package.json"),
     Path("package-lock.json"),
     Path("requirements-mcp.txt"),
