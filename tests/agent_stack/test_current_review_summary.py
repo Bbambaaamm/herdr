@@ -182,3 +182,26 @@ def test_current_summary_legacy_edits_do_not_refresh_review_freshness(monkeypatc
         "submitted_at":"2026-10-03T21:00:00Z","state":"COMMENTED"}]
     install_snapshots(monkeypatch,artifact,plan,pr,checks,[legacy],reviews=reviews)
     with pytest.raises(EvidenceError):collector.collect_github(plan,artifact,4)
+
+@pytest.mark.parametrize("selected,actual,duplicate,accepted", [
+    (None,"main",False,True),
+    ("review/approved","review/approved",False,True),
+    ("review/approved","main",False,False),
+    (None,"review/approved",False,False),
+    ("review/approved","review/approved",True,False),
+])
+def test_local_host_handoff_discovers_only_the_approved_base(monkeypatch,selected,actual,duplicate,accepted):
+    artifact,plan,pr,checks,comment=proof_fixture()
+    if selected is not None:plan["base_branch"]=selected
+    pr["base"]["ref"]=actual;pr["number"]=4
+    install_transport(monkeypatch,artifact,plan,pr,checks,comment)
+    original=collector.github
+    def api(path):
+        if path==f"repos/{plan['repo']}/commits/{artifact.commit_sha}/pulls?per_page=100":
+            return [deepcopy(pr),deepcopy(pr)] if duplicate else [deepcopy(pr)]
+        return deepcopy(original(path))
+    monkeypatch.setattr(collector,"github",api)
+    if accepted:
+        assert collector.collect_local_handoff(plan,artifact,None)["review"]["commit_sha"]==artifact.commit_sha
+    else:
+        with pytest.raises(EvidenceError):collector.collect_local_handoff(plan,artifact,None)

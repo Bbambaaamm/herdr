@@ -421,7 +421,7 @@ def collect_local_handoff(plan, artifact, number):
             raise EvidenceUnavailable("associated PR window exceeds local handoff bound")
         matching = [row for row in rows if isinstance(row, dict)
                     and _pr_binding(row) == (artifact.commit_sha, artifact.base_sha,
-                         plan["repo"], plan["repo"], "main")]
+                         plan["repo"], plan["repo"], plan.get("base_branch", "main"))]
         if not matching:
             raise EvidenceMissing("exact local artifact awaits its parent-published pull request")
         if len(matching) != 1 or type(matching[0].get("number")) is not int:
