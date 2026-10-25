@@ -82,7 +82,8 @@ def publication(boundary_workspace, monkeypatch):
         plan_sha256=cycle.plan.hash)
     artifact = parse_artifact(completion_candidate(payload, workspace=task["workspace"])["artifact"])
     permit = ParentPublicationPermit(plan["identity"], plan["repo"], plan["spec_hash"],
-        plan["plan_hash"], plan["base_sha"], "main", artifact.branch, 2000)
+        plan["plan_hash"], plan["base_sha"], "main", artifact.branch, 2000,
+        "Implement this component's approved bounded repair and regression coverage.")
     remote = Remote(artifact.base_sha)
     store = EvidenceStore(boundary_workspace/"host"/"parent-publication")
     publisher = ParentArtifactPublisher(permit=permit, receipt_store=store, transport=remote, clock=lambda: 1000)
@@ -105,6 +106,9 @@ def test_parent_publishes_one_exact_result_and_replay_has_no_effects(publication
     receipt = publish(p)
     assert receipt["pull_request"] == 42
     assert p.remote.pushes == p.remote.creates == 1
+    intent = p.publisher._read("pr-intent")
+    assert p.permit.public_summary in intent["request"]["body"]
+    assert "run_token" not in intent["request"]["body"]
     assert p.remote.bundle.startswith(b"# v2 git bundle\n")
     assert p.log._path.read_bytes() == p.audit_before
     assert p.factory.cycle(p.factory.cycles[next(iter(p.factory.cycles))][0].plan.identity).phase is WorkPhase.HANDOFF

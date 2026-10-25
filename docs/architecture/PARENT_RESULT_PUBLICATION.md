@@ -34,6 +34,12 @@ cold work-cycle recovery. --inspect checks configuration only and performs no
 remote or model operation. No configuration file or service is installed by
 adding this code.
 
+The permit also carries an explicit bounded public_summary for independent PR
+review. Host composition writes this public task description deliberately;
+the command never exports the private prompt, credential data or the permit
+itself into the PR body. A specification hash alone is not useful task context
+for an independent reviewer.
+
 The parent invokes this command after local handoff. It leaves the original
 null PR reference untouched. The ordinary worker/watchdog then discovers the
 exact same-repository/head/base/approved-branch PR and reconciles CI/review on

@@ -43,6 +43,7 @@ class ParentPublicationPermit:
     base_branch: str
     head_branch: str
     expires_at_epoch: int
+    public_summary: str
 
     def __post_init__(self):
         object.__setattr__(self, "identity", copy.deepcopy(self.identity))
@@ -69,6 +70,10 @@ class ParentPublicationPermit:
             "distinct approved result branch required")
         require(type(self.expires_at_epoch) is int and self.expires_at_epoch > 0,
             "finite parent publication authorization required")
+        require(isinstance(self.public_summary, str) and self.public_summary.strip()
+            and len(self.public_summary.encode("utf-8")) <= 8192
+            and all(ord(char) >= 32 or char in "\n\t" for char in self.public_summary),
+            "bounded host-approved public review context required")
 
     @property
     def hash(self):
@@ -242,7 +247,8 @@ class ParentArtifactPublisher:
                 require(self._read("pr-intent") is None,
                     "original PR creation outcome is unknown; reconcile without another creation")
                 request = {"title": "Herdr verified local result: " + task["id"],
-                    "body": "Host-verified local coding result. Independent CI and review remain required.\n\n"
+                    "body": "Approved bounded task:\n\n" + self.permit.public_summary + "\n\n"
+                        + "Host-verified local coding result. Independent CI and review remain required.\n\n"
                         + "Base commit: " + artifact.base_sha + "\n"
                         + "Result commit: " + artifact.commit_sha + "\n",
                     "base": self.permit.base_branch, "head": self.permit.head_branch}

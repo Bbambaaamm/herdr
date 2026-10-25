@@ -31,7 +31,7 @@ os.execv(sys.argv[1], sys.argv[1:])
 
 
 def _bounded_process(argv, *, env, cwd, data=None, timeout=30, output_limit=2_000_000):
-    require(data is None or isinstance(data, bytes) and len(data) <= 4096,
+    require(data is None or isinstance(data, bytes) and len(data) <= 65536,
         "bounded parent request input required")
     require(isinstance(argv, list) and argv and Path(argv[0]).is_absolute()
         and all(isinstance(x, str) and "\0" not in x for x in argv),
@@ -128,7 +128,7 @@ class GitHubParentTransport:
             timeout=min(timeout, remaining))
 
     def _api(self, permit, method, path, *, request=None, missing=False):
-        data = None if request is None else json.dumps(request, separators=(",", ":")).encode()
+        data = None if request is None else json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
         argv = [str(self.gh), "api", "--hostname", "github.com", "--method", method, "--include", path]
         if data is not None:
             argv.extend(["--input", "-"])

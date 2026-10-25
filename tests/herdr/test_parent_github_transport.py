@@ -22,7 +22,8 @@ ROOT = Path(__file__).resolve().parents[2]
 def permit():
     return ParentPublicationPermit({"id":"test", "run_token":"original",
         "idempotency_key":"original-key","attempt":1,"fencing_token":1},
-        "org/repo","a"*64,"b"*64,"c"*40,"review/base","herdr/result",int(time.time())+300)
+        "org/repo","a"*64,"b"*64,"c"*40,"review/base","herdr/result",int(time.time())+300,
+        "Public bounded task context; no private prompts or credentials.")
 
 
 def transport(tmp_path):
@@ -72,6 +73,24 @@ def test_create_pr_sends_one_closed_json_request_on_stdin(tmp_path,monkeypatch):
     assert len(calls)==1
     assert json.loads(calls[0][1]["data"])==request
     assert calls[0][0][-2:]==["--input","-"]
+
+
+@pytest.mark.parametrize("value",["", "x"*8193, "unsafe\0text", "unsafe\x1btext"])
+def test_public_review_context_must_be_bounded_explicit_text(value):
+    with pytest.raises(EvidenceError):replace(permit(), public_summary=value)
+
+
+def test_public_review_context_uses_exact_utf8_without_including_authority_fields(tmp_path,monkeypatch):
+    client=transport(tmp_path);seen=[]
+    def run(p,argv,**kwargs):
+        seen.append(kwargs["data"])
+        return 0,b"HTTP/2.0 201 Created\n\n{}"
+    monkeypatch.setattr(client,"_run",run)
+    text="Schválená omezená oprava. "*200
+    request={"title":"Oprava", "body":text, "base":"review/base", "head":"herdr/result"}
+    client.create_pull_request(permit(),None,request)
+    assert json.loads(seen[0])["body"]==text
+    assert "Schválená".encode() in seen[0] and b"run_token" not in seen[0]
 
 
 def test_git_push_uses_only_a_new_bare_repo_fixed_url_and_empty_remote_lease(tmp_path,monkeypatch):
