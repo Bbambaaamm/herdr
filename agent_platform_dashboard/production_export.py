@@ -29,9 +29,19 @@ def configuration(raw):
         names = set(settings)
         legacy = {'router', 'kanban', 'git', 'tests'}
         extended = legacy | {'search'}
-        c.need(names in (legacy, extended))
+        full = extended | {'metrics', 'route', 'lifecycle'}
+        c.need(names in (legacy, extended, full))
         if names == legacy:
             settings['search'] = None
+        if profile == 'majak':
+            # Metrics/route/lifecycle are quantlab-only fabrics (#77).
+            settings.pop('metrics', None)
+            settings.pop('route', None)
+            settings.pop('lifecycle', None)
+        else:
+            for kind in ('metrics', 'route', 'lifecycle'):
+                if kind not in names:
+                    settings[kind] = None
         for kind, value in settings.items():
             if value is None:
                 continue
@@ -54,7 +64,9 @@ def collect(config, now):
                 'kanban': sources.kanban, 'git': sources.git,
                 'tests': sources.tests,
                 'codex': sources.codex, 'admission': sources.admission,
-                'release': sources.release, 'swarm': sources.swarm}
+                'release': sources.release, 'swarm': sources.swarm,
+                'metrics': sources.metrics, 'route': sources.route,
+                'lifecycle': sources.lifecycle}
     queue_payload = None
     queue_loaded = False
     queue_load_failed = False
@@ -72,6 +84,10 @@ def collect(config, now):
             setting = sources.RELEASE_PATH
         elif kind == 'swarm':
             setting = sources.SWARM_PATH
+        elif kind in ('metrics', 'route', 'lifecycle'):
+            # Explicitly configured durable input, or an explicit disabled None.
+            # A configured path is never silently replaced by a default path.
+            setting = config['profiles'][profile].get(kind)
         else:
             setting = config['profiles'][profile][kind]
         if setting is None:
@@ -101,6 +117,12 @@ def collect(config, now):
             if kind in ('herdr', 'queue', 'codex', 'admission', 'swarm'):
                 c.need(data_at is not None)
                 source['observed_at'] = data_at
+            if kind == 'route':
+                # Route decisions are durable decision records: data_at is the
+                # producer snapshot stamp, not the decision timestamp.
+                c.need(data_at is None or 0 <= now - data_at <= 86400)
+            elif kind == 'lifecycle':
+                c.need(data_at is None or 0 <= now - data_at <= 86400)
             if kind == 'tests':
                 c.need(data_at is not None and 0 <= now - data_at <= 86400)
             if kind == 'kanban':

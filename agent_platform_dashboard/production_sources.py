@@ -25,6 +25,12 @@ ADMISSION_PATH = '/var/lib/agent-platform-herdr/admission.jsonl'
 RELEASE_PATH = '/var/lib/agent-platform-herdr/deployed-release.json'
 SWARM_PATH = '/var/lib/agent-platform-herdr/swarm.json'
 SWARM_FALLBACK_PATH = '/var/lib/agent-platform-herdr/agent-stack-swarm.json'
+METRICS_PATH = '/var/lib/agent-platform-herdr/metrics.json'
+METRICS_FALLBACK_PATH = '/var/lib/agent-platform-herdr/machine-city-metrics.json'
+ROUTE_PATH = '/var/lib/agent-platform-herdr/route-decisions.json'
+LIFECYCLE_PATH = '/var/lib/agent-platform-herdr/work-lifecycle.json'
+ROUTE_FALLBACK_PATH = '/var/lib/agent-platform-herdr/model-routing-decisions.json'
+LIFECYCLE_FALLBACK_PATH = '/var/lib/agent-platform-herdr/work-cycle-lifecycle.json'
 SWARM_FRESH_SECONDS = 90
 
 
@@ -206,9 +212,17 @@ SEARCH_COLUMNS = {
 }
 SEARCH_SQL = '''SELECT route_mode,actual_provider,fallback_provider,count(*),
 sum(CASE WHEN success=1 THEN 1 ELSE 0 END),
-sum(duration_ms),max(duration_ms),sum(coalesce(fallback_used,0)),
+CASE WHEN count(duration_ms)=count(*) THEN sum(duration_ms) END,
+CASE WHEN count(duration_ms)=count(*) THEN max(duration_ms) END,
+sum(coalesce(fallback_used,0)),
 CASE WHEN count(cost_usd)=count(*) THEN sum(cost_usd) END,
-sum(result_count),sum(extract_count),max(coalesce(ended_at,started_at)) FROM
+CASE WHEN count(result_count)=count(*) THEN sum(result_count) END,
+CASE WHEN count(extract_count)=count(*) THEN sum(extract_count) END,
+sum(CASE WHEN cost_usd IS NOT NULL
+          AND (typeof(cost_usd) NOT IN ('real','integer')
+               OR NOT (cost_usd >= 0 AND cost_usd < 100000000))
+         THEN 1 ELSE 0 END) AS invalid_cost,
+max(coalesce(ended_at,started_at)) FROM
 (SELECT id,started_at,ended_at,route_mode,actual_provider,fallback_provider,
         fallback_used,duration_ms,result_count,extract_count,success,cost_usd
  FROM searches ORDER BY id DESC LIMIT 1000)
@@ -220,9 +234,10 @@ def search(path, profile):
         records = db.execute(SEARCH_SQL).fetchall()
     c.need(len(records) <= 50)
     rows, timestamps = [], []
-    for mode, provider, fallback_provider, count, successes, duration, maximum, fallbacks, cost, results, extracts, stamp in records:
+    for mode, provider, fallback_provider, count, successes, duration, maximum, fallbacks, cost, results, extracts, invalid_cost, stamp in records:
         c.need(type(duration) in (int, float) and 0 <= duration < 10**12)
         c.need(type(maximum) in (int, float) and 0 <= maximum <= duration)
+        c.need(invalid_cost == 0)
         c.need(cost is None or type(cost) in (int, float) and 0 <= cost < 10**8)
         c.need(type(stamp) in (int, float) and 0 <= stamp < 2**53)
         last_used_at = stamp
@@ -238,6 +253,89 @@ def search(path, profile):
         rows.append(item)
         timestamps.append(int(last_used_at))
     return rows, max(timestamps, default=None)
+
+
+METRICS_FABRICS = ('work', 'cost', 'context', 'execution', 'verification', 'search',
+                   'prompt', 'approval', 'evidence', 'experiments', 'teamwork', 'memory')
+
+
+def _metric(identifier, category, label, unit, window, denominator, value,
+            coverage, freshness, note, source='producer'):
+    return dict(id=identifier, category=category, label=label, unit=unit, window=window,
+                denominator=denominator, source=source, value=value, coverage=coverage,
+                freshness=freshness, note=note)
+
+
+def metrics(path, profile):
+    """#77 read contract for the new fabrics.
+
+    A durable fabric snapshot is either a measured replay (fresh producer
+    measurements, published unchanged) or an explicit unavailable state with a
+    reason. The dashboard never derives a value the producer did not measure.
+    """
+    c.need(profile == 'quantlab' and path in (METRICS_PATH, METRICS_FALLBACK_PATH))
+    raw = c.parse(read(path, c.MAX_BYTES), c.MAX_BYTES)
+    c.need(type(raw) is dict and raw['version'] == 1
+           and type(raw['fabrics']) is list and len(raw['fabrics']) <= 16)
+    measured, unavailable = [], []
+    for fabric in raw['fabrics']:
+        c.sub_keys(fabric, 'category freshness|measurements')
+        category = fabric['category']
+        c.need(type(category) is str and category in METRICS_FABRICS)
+        c.need(type(fabric['freshness']) is str
+               and fabric['freshness'] in ('fresh', 'stale', 'unknown'))
+        if fabric['freshness'] == 'fresh' and type(fabric['measurements']) is list:
+            seen_ids = set()
+            for item in fabric['measurements']:
+                c.metrics_row(item)
+                # The same durable identity twice would double-count a metric.
+                c.need(item['id'] not in seen_ids)
+                seen_ids.add(item['id'])
+                measured.append(item)
+        else:
+            unavailable.append(_metric(
+                identifier='metrics.' + category, category=category,
+                label='Metriky ' + category, unit='count', window=86400,
+                denominator='none', value=None, coverage=0,
+                freshness=fabric['freshness'],
+                note='Producent není integrován nebo jeho snapshot je neaktuální.',
+            ))
+    c.need(len(measured) + len(unavailable) <= 64)
+    rows = [{'measured': measured, 'unavailable': unavailable, 'denominator': None}]
+    for row_value in rows:
+        c.row('metrics', row_value)
+    return rows, None
+
+
+def route(path, profile):
+    """Explainable route decisions from the durable routing producer."""
+    c.need(profile == 'quantlab' and path in (ROUTE_PATH, ROUTE_FALLBACK_PATH))
+    raw = c.parse(read(path, c.MAX_BYTES), c.MAX_BYTES)
+    c.need(type(raw) is dict and raw['version'] == 1
+           and type(raw['routes']) is list and len(raw['routes']) <= 50)
+    rows, stamps = [], []
+    for item in raw['routes']:
+        c.row('route', item)
+        c.need(item['reason'] != 'unknown' or item['policy_freshness'] == 'unknown')
+        rows.append(item)
+        stamps.append(item['observed_at'])
+    return rows, max(stamps, default=None)
+
+
+def lifecycle(path, profile):
+    """Durable control-cycle phase/lifecycle state, separate from runtime health."""
+    c.need(profile == 'quantlab' and path in (LIFECYCLE_PATH, LIFECYCLE_FALLBACK_PATH))
+    raw = c.parse(read(path, c.MAX_BYTES), c.MAX_BYTES)
+    c.need(type(raw) is dict and raw['version'] == 1
+           and type(raw['work']) is list and len(raw['work']) <= 50)
+    rows, stamps = [], []
+    for item in raw['work']:
+        c.row('lifecycle', item)
+        # A phase can only be explained together with the gate it passed.
+        c.need(item['phase'] != 'PLAN_GATE' or item['plan_gate'] != 'unknown')
+        rows.append(item)
+        stamps.append(item['observed_at'])
+    return rows, max(stamps, default=None)
 
 
 def kanban(source, profile):
