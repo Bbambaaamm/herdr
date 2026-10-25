@@ -226,3 +226,30 @@ def test_reviewed_catalogue_unknown_field_still_denied(tmp_path, monkeypatch, en
             config.approved_completion_base(root, task)
         else:
             config.build_root_work_factory(root, task, git=git)
+
+def branch_validation_plan(branch):
+    from herdr.evidence import digest
+    result={"version":1,"identity":{},"repo":"org/repo","kind":"coding",
+        "spec_hash":"a"*64,"policy_hash":"b"*64,"base_sha":"c"*40,"baseline":[],
+        "workspace_root":"/home/agentops/worktrees","required_checks":["Herdr contract"],
+        "reviewer":"chatgpt-codex-connector[bot]","environment":{},"base_branch":branch}
+    result["plan_hash"]=digest({key:value for key,value in result.items() if key!="baseline"})
+    return result
+
+def test_approved_branch_completion_plan_is_valid_and_hash_bound():
+    from herdr.evidence import validate_plan,EvidenceError
+    plan=branch_validation_plan("review/approved")
+    validate_plan(plan)
+    plan["base_branch"]="review/other"
+    with pytest.raises(EvidenceError):validate_plan(plan)
+
+@pytest.mark.parametrize("branch",["","../bad","review//bad","review/.bad","review/bad.lock","review/bad.","review bad","-bad",True])
+def test_approved_branch_invalid_plan_name_denied(branch):
+    from herdr.evidence import validate_plan,EvidenceError
+    with pytest.raises(EvidenceError):validate_plan(branch_validation_plan(branch))
+
+def test_approved_branch_freeze_retains_protected_ref(reviewed,monkeypatch):
+    root,_,task,definition,_=reviewed
+    _,published=freeze_ports(monkeypatch,definition["base_sha"])
+    completion.freeze_plan(root,task)
+    assert published[0]["base_branch"]==definition["completion_base"]["remote_ref"].removeprefix("refs/remotes/origin/")

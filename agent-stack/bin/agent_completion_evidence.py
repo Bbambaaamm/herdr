@@ -157,13 +157,156 @@ def _pr_binding(pr: dict) -> tuple:
             pr.get("base", {}).get("ref"))
 
 
+_CODEX_SUMMARY_HEADER = "<!-- codex-pull-request-review-summary -->"
+_CODEX_SUMMARY_PREFIX = _CODEX_SUMMARY_HEADER + "\n<!-- codex-review-state:v1 "
+
+
+def _codex_summary_state(body):
+    """Parse the authenticated app's versioned state, never its display prose."""
+    if not isinstance(body, str) or not body.startswith(_CODEX_SUMMARY_HEADER):
+        return None
+    if not body.startswith(_CODEX_SUMMARY_PREFIX) or len(body) > 65536:
+        raise EvidenceUnavailable("unsupported Codex summary protocol")
+    encoded, separator, _ = body[len(_CODEX_SUMMARY_PREFIX):].partition(" -->\n")
+    if (not separator or "\n" in encoded or "\r" in encoded
+            or body.count("codex-review-state:") != 1
+            or body.count(_CODEX_SUMMARY_HEADER) != 1):
+        raise EvidenceUnavailable("ambiguous Codex summary protocol")
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate summary field")
+            result[key] = value
+        return result
+    try:
+        state = json.loads(encoded, object_pairs_hook=unique)
+    except (TypeError, ValueError) as exc:
+        raise EvidenceUnavailable("invalid Codex summary state") from exc
+    fields = {"commit_sha", "has_any_findings", "has_unresolved_findings", "status"}
+    if not isinstance(state, dict) or set(state) != {"code_review", "security_review"}:
+        raise EvidenceUnavailable("closed Codex summary state required")
+    for review in state.values():
+        if not isinstance(review, dict) or set(review) != fields:
+            raise EvidenceUnavailable("closed Codex review state required")
+        sha = review["commit_sha"]
+        if sha is not None and (not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha)):
+            raise EvidenceUnavailable("exact Codex summary commit required")
+        if any(review[name] is not None and type(review[name]) is not bool
+               for name in ("has_any_findings", "has_unresolved_findings")):
+            raise EvidenceUnavailable("typed Codex finding flags required")
+        if (review["status"] is not None and not isinstance(review["status"], str)
+                or review["status"] not in {None, "pending", "queued", "in_progress", "completed", "failed", "cancelled", "canceled"}):
+            raise EvidenceUnavailable("unsupported Codex review status")
+    return state
+
+
+def _summary_is_clean(state):
+    code = state["code_review"]
+    def clean(review):
+        return (review["status"] == "completed" and review["commit_sha"] is not None
+                and review["has_any_findings"] is False
+                and review["has_unresolved_findings"] is False)
+    security = state["security_review"]
+    return (clean(code) and (all(value is None for value in security.values())
+            or clean(security) and security["commit_sha"] == code["commit_sha"]))
+
+
+def _parse_review_timestamp(value):
+    from datetime import datetime
+    if not isinstance(value, str):
+        raise EvidenceUnavailable("review observation time unavailable")
+    try:
+        observed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise EvidenceUnavailable("review observation time invalid") from exc
+    if observed.tzinfo is None:
+        raise EvidenceUnavailable("timezone-aware review time required")
+    return observed
+
+
+def _comment_edit_timestamp(row):
+    created = _parse_review_timestamp(row.get("created_at"))
+    updated = _parse_review_timestamp(row["updated_at"]) if "updated_at" in row else created
+    if updated < created:
+        raise EvidenceUnavailable("review edit predates its creation")
+    return updated
+
+
+def _review_timestamp(row):
+    """Unrelated summary edits cannot refresh the code review's completion."""
+    from datetime import timedelta
+    created = _parse_review_timestamp(row.get("created_at"))
+    updated = _comment_edit_timestamp(row)
+    state = _codex_summary_state(row.get("body"))
+    if state is None or state["code_review"]["status"] != "completed":
+        # Preserve the original freshness rule for legacy immutable receipts.
+        return created
+    candidates = []
+    for line in row["body"].splitlines():
+        cells = line.split("|")
+        if len(cells) != 6 or not re.fullmatch(r"\s*[^A-Za-z0-9|]*\*\*Code Review\*\*\s*", cells[1]):
+            continue
+        times = re.findall(r'<relative-time\b[^>]*\bdatetime="([^"]+)"', cells[2])
+        commit = re.fullmatch(r"\s*"+chr(96)+r"([0-9a-f]{7,40})"+chr(96)+r"\s*", cells[3])
+        if (len(times) == 1 and commit and state["code_review"]["commit_sha"] is not None
+                and state["code_review"]["commit_sha"].startswith(commit.group(1))):
+            candidates.append(_parse_review_timestamp(times[0]))
+    if len(candidates) != 1:
+        # A machine state can prove its SHA/flags without display markup, but
+        # cannot supersede a later same-commit review without its own time.
+        return created
+    if candidates[0] >= updated + timedelta(seconds=1):
+        raise EvidenceUnavailable("code review completion postdates its comment")
+    return candidates[0]
+
+
+
+
+def _review_comment_key(row):
+    if type(row.get("id")) is not int or row["id"] <= 0:
+        raise EvidenceUnavailable("review comment identity unavailable")
+    return _review_timestamp(row), row["id"]
+
+
+def _current_codex_summaries(comments, commit_sha):
+    rows = []
+    states = {}
+    for row in comments:
+        if row.get("user", {}).get("login") != BOT or row.get("user", {}).get("type") != "Bot":
+            continue
+        state = _codex_summary_state(row.get("body"))
+        if state is not None:
+            if row.get("id") in states:
+                raise EvidenceUnavailable("duplicate Codex summary identity")
+            rows.append(row)
+            states[row["id"]] = state
+    if rows:
+        latest = max(rows, key=lambda row: (_comment_edit_timestamp(row), _review_comment_key(row)[1]))
+        state = states[latest["id"]]
+        if state["code_review"]["commit_sha"] != commit_sha or not _summary_is_clean(state):
+            raise EvidenceMissing("current independent Codex summary has not passed")
+    return rows
+
+
 def _clean_review_body(body):
-    """Recognize only the plain clean receipt or one exact v1 envelope.
+    """Recognize legacy clean receipts and the strictly typed v1 app summary.
 
     This view is used for format recognition only. The original comment is
     retained for digesting and final immutable-observation checks.
     """
     if not isinstance(body, str):
+        return None
+    try:
+        state = _codex_summary_state(body)
+    except EvidenceError:
+        return None
+    if state is not None:
+        if not _summary_is_clean(state):
+            return None
+        return ("Codex Review: Didn't find any major issues.\n"
+                "**Reviewed commit:** "+chr(96)+state["code_review"]["commit_sha"]+chr(96))
+    if "codex-review-state:" in body.casefold() or "codex-pull-request-review-summary" in body.casefold():
         return None
     envelope = "<!-- codex-review-receipt:v1 -->\n\n"
     if body.startswith(envelope):
@@ -178,12 +321,16 @@ def _collect_github(plan: dict, artifact, number):
     if type(number) is not int or number <= 0:
         raise EvidenceError("immutable pull request reference is required")
     repo = plan["repo"]
+    from herdr.evidence import valid_completion_base_branch
+    expected_branch = plan.get("base_branch", "main")
+    if not valid_completion_base_branch(expected_branch):
+        raise EvidenceError("invalid approved pull request base branch")
     pr = github(f"repos/{repo}/pulls/{number}")
     if (pr.get("head", {}).get("repo", {}).get("full_name") != repo
             or pr.get("base", {}).get("repo", {}).get("full_name") != repo
             or pr.get("head", {}).get("sha") != artifact.commit_sha
             or pr.get("base", {}).get("sha") != artifact.base_sha
-            or pr.get("base", {}).get("ref") != "main"):
+            or pr.get("base", {}).get("ref") != expected_branch):
         raise EvidenceError("pull request repository, commit or baseline mismatch")
     initial_binding = _pr_binding(pr)
     from herdr.verification_binding import verify_commit_binding
@@ -197,6 +344,7 @@ def _collect_github(plan: dict, artifact, number):
     reviews = github(f"repos/{repo}/pulls/{number}/reviews?per_page=100")
     _check_effective_reviews(reviews)
     comments = github(f"repos/{repo}/issues/{number}/comments?per_page=100")
+    summary_rows = _current_codex_summaries(comments, artifact.commit_sha)
     # Codex publishes its clean review as a bot-authored conversation comment.
     # Resolve the reported abbreviated commit through GitHub to bind the full SHA.
     candidates = []
@@ -216,31 +364,34 @@ def _collect_github(plan: dict, artifact, number):
             candidates.append(row)
     if not candidates:
         raise EvidenceMissing("independent exact-commit review has not passed")
-    clean = max(candidates, key=lambda r: r["id"])
+    clean = max(candidates, key=_review_comment_key)
     latest_reviews = github(f"repos/{repo}/pulls/{number}/reviews?per_page=100")
     _check_effective_reviews(latest_reviews)
     if _unresolved_threads(repo, number):
         raise EvidenceMissing("pull request acquired unresolved review findings during collection")
-    if any(r.get("commit_id") == artifact.commit_sha
-           and r.get("user", {}).get("login") == BOT
-           and r.get("submitted_at", "") > clean["created_at"]
-           and r.get("state") in {"COMMENTED", "CHANGES_REQUESTED"}
-           for r in latest_reviews):
-        raise EvidenceMissing("newer exact-commit review must be reconciled")
+    for row in latest_reviews:
+        if (row.get("commit_id") == artifact.commit_sha
+                and row.get("user", {}).get("login") == BOT
+                and row.get("state") in {"COMMENTED", "CHANGES_REQUESTED"}
+                and _review_timestamp({"created_at": row.get("submitted_at")}) > _review_timestamp(clean)):
+            raise EvidenceMissing("newer exact-commit review must be reconciled")
     # A rerun can supersede a previously green check during review collection.
     checks = collect_checks(repo, artifact.commit_sha, plan["required_checks"],
                             require_success=True)
     verify_workflow(plan, artifact, checks)
     latest_comments = github(f"repos/{repo}/issues/{number}/comments?per_page=100")
+    if _current_codex_summaries(latest_comments, artifact.commit_sha) != summary_rows:
+        raise EvidenceMissing("independent Codex summary changed during collection")
     retained = [row for row in latest_comments if row.get("id") == clean["id"]]
     if len(retained) != 1 or retained[0] != clean:
         raise EvidenceMissing("selected independent review changed or disappeared")
     for row in latest_comments:
-        if row.get("id", 0) <= clean["id"] or row.get("user", {}).get("login") != BOT:
+        if row.get("user", {}).get("login") != BOT or row.get("user", {}).get("type") != "Bot":
             continue
         body = row.get("body", "")
         match = re.search(r"\*\*Reviewed commit:\*\*\s*\x60([0-9a-f]{10,40})\x60", body)
-        if match and artifact.commit_sha.startswith(match.group(1)):
+        if (match and artifact.commit_sha.startswith(match.group(1))
+                and _review_comment_key(row) > _review_comment_key(clean)):
             raise EvidenceMissing("newer conversation review must be reconciled")
     latest = github(f"repos/{repo}/pulls/{number}")
     if _pr_binding(latest) != initial_binding:
@@ -429,6 +580,8 @@ def freeze_plan(root: Path, task: dict) -> None:
         required = list(CHECK_APPS) if kind == "coding" else ["GitGuardian Security Checks"]
         plan.update(base_sha=base, workspace_root="/home/agentops/worktrees",
                     required_checks=required, reviewer=BOT)
+        if expected_base is not None:
+            plan["base_branch"] = base_ref.removeprefix("refs/remotes/origin/")
         if kind == "coding":
             if criteria is not None:
                 from herdr.scope_evidence import validate_scope_policy

@@ -234,11 +234,8 @@ def _completion_base_selection(root, task, raw, definition):
     require(isinstance(ref, str) and ref.startswith(prefix) and len(ref) <= 512,
             "canonical reviewed origin ref required")
     branch = ref[len(prefix):]
-    require(bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch))
-            and ".." not in branch and "//" not in branch
-            and all(part and not part.startswith(".") and not part.endswith(".")
-                    and not part.lower().endswith(".lock") for part in branch.split("/")),
-            "canonical reviewed origin ref required")
+    from .evidence import valid_completion_base_branch
+    require(valid_completion_base_branch(branch), "canonical reviewed origin ref required")
     base = definition.get("base_sha")
     require(isinstance(base, str) and re.fullmatch(r"[0-9a-f]{40}", base) is not None,
             "exact reviewed completion commit required")
