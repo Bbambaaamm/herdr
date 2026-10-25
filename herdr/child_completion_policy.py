@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 from .child_evidence import ChildCompletionAuthority
 from .evidence import (EvidenceError, EvidenceStore, binding, canonical, digest,
-                       validate_criteria, validate_plan)
+                       validate_criteria, validate_plan, valid_completion_base_branch)
 from .scope_evidence import validate_scope_policy
 
 SHA = re.compile(r"^[0-9a-f]{64}$")
@@ -56,6 +56,9 @@ def policy_key(repo, task_id, run_token):
 def validate_policy(value):
     names = {"version", "repo", "parent", "parent_spec_hash", "contracts",
              "workspace_root", "environment", "baseline", "policy_hash"}
+    if isinstance(value, dict) and "base_branch" in value:
+        require(valid_completion_base_branch(value["base_branch"]), "invalid frozen child base branch")
+        names.add("base_branch")
     require(isinstance(value, dict) and set(value) == names
         and type(value["version"]) is int and value["version"] == 1
         and value["repo"] == REPO
@@ -90,7 +93,7 @@ def validate_policy(value):
     require(value["policy_hash"] == digest({k:v for k,v in value.items() if k != "policy_hash"}),
         "host child policy changed")
 
-def freeze_policy(store, task, *, parent_spec_hash, contracts, environment, baseline):
+def freeze_policy(store, task, *, parent_spec_hash, contracts, environment, baseline, base_branch=None):
     require(isinstance(store, EvidenceStore) and task.get("repo") == REPO,
         "host child completion consumer unavailable")
     validate_contracts(contracts)
@@ -98,6 +101,8 @@ def freeze_policy(store, task, *, parent_spec_hash, contracts, environment, base
         "parent_spec_hash":parent_spec_hash, "contracts":copy.deepcopy(contracts),
         "workspace_root":task.get("worktree_root") or "/home/agentops/worktrees",
         "environment":copy.deepcopy(environment), "baseline":copy.deepcopy(baseline)}
+    if base_branch is not None:
+        value["base_branch"] = base_branch
     value["policy_hash"] = digest(value)
     validate_policy(value)
     store.publish("plan", policy_key(task["repo"], task["id"], task["run_token"]), value)
@@ -121,6 +126,8 @@ def build_authority(store, policy, *, collector, admitted_children=None):
             "base_sha":policy["contracts"]["base_sha"], "workspace_root":policy["workspace_root"],
             "required_checks":list(CHECKS) if kind == "coding" else ["GitGuardian Security Checks"],
             "reviewer":REVIEWER, "environment":copy.deepcopy(policy["environment"])}
+        if "base_branch" in policy:
+            plan["base_branch"] = policy["base_branch"]
         if kind != "coding":
             plan["criteria"] = copy.deepcopy(entry["criteria"])
         elif "criteria" in entry:

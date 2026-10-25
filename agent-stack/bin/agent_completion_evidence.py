@@ -699,14 +699,16 @@ def freeze_child_completion_contracts(root, task, parent_plan):
     if old is not None:
         validate_policy(old)
         if (old["parent"]!=binding(task) or old["parent_spec_hash"]!=spec_digest(task)
-                or old["contracts"]!=contracts):
+                or old["contracts"]!=contracts
+                or old.get("base_branch","main")!=parent_plan.get("base_branch","main")):
             raise EvidenceError("immutable child completion policy changed")
         return
     environment={"collector":"github-api-v1","ci_workflow_blob_sha":workflow_blob(task["repo"],base),
         "ci_workflow_id":POLICY["workflow_id"],"github_actions_app_id":15368}
     baseline=list(collect_checks(task["repo"],base,list(CHECK_APPS),require_success=False).values())
     freeze_policy(store_for(root,task),task,parent_spec_hash=spec_digest(task),
-        contracts=contracts,environment=environment,baseline=baseline)
+        contracts=contracts,environment=environment,baseline=baseline,
+        base_branch=parent_plan.get("base_branch"))
 
 def freeze_derived_child_contracts(root, task, admitted):
     """Freeze only previously approved derived data in the existing evidence store."""
@@ -724,7 +726,8 @@ def freeze_derived_child_contracts(root, task, admitted):
     environment={key:plan["environment"][key] for key in
         ("collector","ci_workflow_blob_sha","ci_workflow_id","github_actions_app_id")}
     freeze_policy(store,task,parent_spec_hash=spec_digest(task),
-        contracts=contracts(derived,plan["base_sha"]),environment=environment,baseline=plan["baseline"])
+        contracts=contracts(derived,plan["base_sha"]),environment=environment,baseline=plan["baseline"],
+        base_branch=plan.get("base_branch"))
 
 
 def child_completion_for_root(task_file, identity, *, factory):

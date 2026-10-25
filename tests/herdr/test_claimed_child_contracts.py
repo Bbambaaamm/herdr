@@ -195,7 +195,8 @@ def parent_plan(p):
     "record-null","old-wrong-child-admission","cold-marker-missing","cold-marker-null","cold-marker-changed",
     "cold-parent-missing","cold-marker-and-parent-missing","cold-admission-marker-missing",
     "cold-admission-marker-null","cold-definition-drift","cold-environment-drift"])
-def test_producer_persist_original_authority_child_factory_and_cold_replay(prepared,monkeypatch,consumer_fault):
+@pytest.mark.parametrize("base_branch",[None,"review/approved"])
+def test_producer_persist_original_authority_child_factory_and_cold_replay(prepared,monkeypatch,consumer_fault,base_branch):
     p=prepared;task_root=p.tmp/"task-state";task_root.mkdir(mode=0o700);storage=p.tmp/"storage";storage.mkdir(mode=0o700)
     original_bytes=json.dumps(p.task,sort_keys=True);original_spec=spec_digest(p.task)
     raw={"task_store_root":str(task_root),"storage":str(storage),"work_contracts":{"version":1,
@@ -211,7 +212,12 @@ def test_producer_persist_original_authority_child_factory_and_cold_replay(prepa
         factory.budget_definition=deepcopy(definition)
         return budgets.parse_allocation(definition["allocation"])
     monkeypatch.setattr(budgets,"bind_budget",bind_budget)
-    store=store_for(task_root,p.task);store.publish("plan",digest(binding(p.task)),parent_plan(p))
+    store=store_for(task_root,p.task)
+    frozen=parent_plan(p)
+    if base_branch is not None:
+        frozen["base_branch"]=base_branch
+        frozen["plan_hash"]=digest({k:v for k,v in frozen.items() if k not in {"plan_hash","baseline"}})
+    store.publish("plan",digest(binding(p.task)),frozen)
     import agent_completion_evidence as completion
     original_freeze=completion.freeze_derived_child_contracts
     def frozen(*args,**kw):events.append("freeze-derived-policy");return original_freeze(*args,**kw)
@@ -256,6 +262,11 @@ def test_producer_persist_original_authority_child_factory_and_cold_replay(prepa
     monkeypatch.setattr("herdr.host_configuration.read_canonical_parent",lambda *args:deepcopy(p.task))
     approved=authority.store.read("plan",digest(binding(child_task(rec))))
     child_task_data=authority._work_task(rec,approved)
+    assert approved.get("base_branch")==base_branch
+    assert child_task_data["completion_plan"].get("base_branch")==base_branch
+    cold_authority=authority_for_parent(store,p.task,parent_spec_hash=original_spec,parent_identity=p.identity,
+        collector=lambda *a:pytest.fail("cold preparation cannot collect GitHub"),admitted_children=persisted)
+    assert cold_authority.approve(task=child_task(rec),spec_sha256=child_spec(rec))==approved
     assert child_task_data["derived_parent_admission_sha256"]==digest(persisted)
     without_marker=dict(child_task_data);without_marker.pop("derived_parent_admission_sha256")
     assert spec_digest(child_task_data)==spec_digest(without_marker)

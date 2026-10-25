@@ -184,6 +184,8 @@ class ChildCompletionAuthority:
         task.update(workspace=str(child_workspace(rec)[0]), work_contract_version=1,
                     completion_plan={"base_sha":plan["base_sha"]},
                     work_workspace_identity=f"{child_workspace(rec)[1]}:{child_workspace(rec)[2]}")
+        if "base_branch" in plan:
+            task["completion_plan"]["base_branch"] = plan["base_branch"]
         return task
 
     def preflight_work(self,rec,launch):
