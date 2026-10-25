@@ -101,7 +101,9 @@ def routing_payload(observed_at):
 
 class ObservabilityContractTests(unittest.TestCase):
     def test_source_matrix_is_closed_and_asymmetric(self):
-        self.assertEqual(len(c.SOURCE_PAIRS), 18)
+        # The #77 fabric kinds (metrics/route/lifecycle) are quantlab-only, so
+        # the matrix grew from 18 to 21 entries while staying closed/asymmetric.
+        self.assertEqual(len(c.SOURCE_PAIRS), 21)
         self.assertIn(("quantlab", "queue"), c.SOURCE_PAIRS)
         self.assertIn(("majak", "queue"), c.SOURCE_PAIRS)
         self.assertIn(("majak", "codex"), c.SOURCE_PAIRS)
@@ -371,7 +373,7 @@ class ObservabilityContractTests(unittest.TestCase):
                     },
                 }
                 snapshot = collect(config, 100)
-                self.assertEqual(len(snapshot["sources"]), 18)
+                self.assertEqual(len(snapshot["sources"]), 21)
                 q = next(
                     s for s in snapshot["sources"]
                     if s["kind"] == "queue" and s["profile"] == "quantlab"

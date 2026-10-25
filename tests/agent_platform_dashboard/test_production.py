@@ -15,7 +15,7 @@ def test_closed_snapshot_rejects_sensitive_fields():
 
 def test_unavailable_is_not_zero():
     value = decode(json.dumps(unavailable(100)).encode())
-    assert len(value['sources']) == 18
+    assert len(value['sources']) == len(SOURCE_PAIRS) == 21
     assert all(s['status'] == 'unavailable' and s['rows'] == [] for s in value['sources'])
 
 import base64
@@ -251,6 +251,212 @@ def test_search_projection_exposes_operational_metrics_not_query_metadata(tmp_pa
         with pytest.raises(sqlite3.DatabaseError):
             db.execute('SELECT query_hash FROM searches')
     assert path.read_bytes() == before
+
+
+
+def search_pair_db(path):
+    search_db(path)
+    db = sqlite3.connect(path)
+    db.execute(
+        "INSERT INTO searches VALUES(2,20,21,'fast','exa-keyless','exa-keyless',1,200,8,3,0,0.0,'PRIVATEHASH2',88)"
+    )
+    db.commit(); db.close()
+
+
+@pytest.mark.parametrize('field', ['duration_ms', 'result_count', 'extract_count'])
+@pytest.mark.parametrize('missing_id', [1, 2])
+def test_search_rejects_partially_missing_required_measurements(tmp_path, field, missing_id):
+    path = tmp_path / 'search.db'; search_pair_db(path)
+    db = sqlite3.connect(path)
+    db.execute('UPDATE searches SET ' + field + '=NULL WHERE id=?', (missing_id,))
+    db.commit(); db.close()
+    before = path.read_bytes()
+
+    with pytest.raises(ValueError):
+        sources.search(str(path), 'majak')
+
+    assert path.read_bytes() == before
+    assert not Path(str(path) + '-wal').exists() and not Path(str(path) + '-shm').exists()
+
+
+@pytest.mark.parametrize('field', ['duration_ms', 'result_count', 'extract_count'])
+def test_search_all_missing_required_measurements_still_fail_closed(tmp_path, field):
+    path = tmp_path / 'search.db'; search_pair_db(path)
+    db = sqlite3.connect(path)
+    db.execute('UPDATE searches SET ' + field + '=NULL')
+    db.commit(); db.close()
+    before = path.read_bytes()
+
+    with pytest.raises(ValueError):
+        sources.search(str(path), 'majak')
+
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize('unknown_cost', [False, True])
+def test_search_complete_measurements_preserve_totals_and_nullable_cost(tmp_path, unknown_cost):
+    path = tmp_path / 'search.db'; search_pair_db(path)
+    db = sqlite3.connect(path)
+    db.execute('UPDATE searches SET fallback_provider=NULL,fallback_used=0')
+    if unknown_cost:
+        db.execute('UPDATE searches SET cost_usd=NULL WHERE id=2')
+    db.commit(); db.close()
+    before = path.read_bytes()
+
+    rows, stamp = sources.search(str(path), 'majak')
+
+    assert rows == [dict(
+        route_mode='fast', provider='exa-keyless', fallback_provider=None,
+        searches=2, successful_searches=1, duration_ms=325, max_duration_ms=200,
+        fallback_count=0, cost_microusd=None if unknown_cost else 0,
+        result_count=13, extract_count=3, last_used_at=21,
+    )]
+    assert stamp == 21 and 'PRIVATEHASH' not in json.dumps(rows)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize('field', ['duration_ms', 'result_count', 'extract_count'])
+def test_search_incomplete_group_is_exported_as_source_failed(tmp_path, monkeypatch, field):
+    path = tmp_path / 'search.db'; search_pair_db(path)
+    db = sqlite3.connect(path)
+    db.execute('UPDATE searches SET ' + field + '=NULL WHERE id=2')
+    db.commit(); db.close()
+    before = path.read_bytes()
+    cfg = config(tmp_path)
+    cfg['profiles']['majak']['search'] = str(path)
+    # This regression exercises only the synthetic Search source.
+    for name in ('QUEUE_PATH', 'CODEX_USAGE_PATH', 'ADMISSION_PATH', 'RELEASE_PATH', 'SWARM_PATH'):
+        monkeypatch.setattr(sources, name, None)
+
+    value = collect(cfg, 100)
+
+    result = next(s for s in value['sources'] if s['profile'] == 'majak' and s['kind'] == 'search')
+    assert result['status'] == 'unavailable' and result['reason'] == 'source_failed'
+    assert result['rows'] == [] and result['data_at'] is None
+    assert path.read_bytes() == before
+    assert 'PRIVATEHASH' not in json.dumps(value)
+
+
+@pytest.mark.parametrize('groups', [50, 51])
+def test_search_group_cap_preserves_overflow_rejection(tmp_path, groups):
+    path = tmp_path / 'search.db'; search_db(path)
+    db = sqlite3.connect(path)
+    db.execute('DELETE FROM searches')
+    db.executemany(
+        'INSERT INTO searches VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        [(i, 100 + i, None, 'fast', f'provider-{i}', None, 0, 1, 0, 0, 1, None,
+          'PRIVATEHASH', 99) for i in range(1, groups + 1)],
+    )
+    db.commit(); db.close()
+    before = path.read_bytes()
+
+    if groups == 51:
+        with pytest.raises(ValueError):
+            sources.search(str(path), 'majak')
+    else:
+        rows, stamp = sources.search(str(path), 'majak')
+        assert len(rows) == 50 and stamp == 150
+        assert {row['provider'] for row in rows} == {f'provider-{i}' for i in range(1, 51)}
+
+    assert path.read_bytes() == before
+
+
+def test_search_required_completeness_is_limited_to_newest_1000_records(tmp_path):
+    path = tmp_path / 'search.db'; search_db(path)
+    db = sqlite3.connect(path)
+    db.execute('UPDATE searches SET duration_ms=NULL')
+    db.executemany(
+        'INSERT INTO searches VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        [(i, i, None, 'fast', 'exa-keyless', None, 0, 1, 0, 0, 1, None,
+          'PRIVATEHASH', 99) for i in range(2, 1002)],
+    )
+    db.commit(); db.close()
+    before = path.read_bytes()
+
+    rows, stamp = sources.search(str(path), 'majak')
+
+    assert len(rows) == 1 and rows[0]['searches'] == 1000
+    assert rows[0]['duration_ms'] == 1000 and rows[0]['max_duration_ms'] == 1
+    assert rows[0]['result_count'] == rows[0]['extract_count'] == 0
+    assert rows[0]['cost_microusd'] is None and stamp == 1001
+    assert path.read_bytes() == before
+
+def test_search_rejects_corrupted_individual_cost_hidden_by_aggregate_sum(tmp_path):
+    path = tmp_path / 'search.db'; search_pair_db(path)
+    db = sqlite3.connect(path)
+    # -0.000001 + 0.000002 = 1 microusd, a valid aggregate of two invalid rows.
+    db.execute('UPDATE searches SET cost_usd=-0.000001 WHERE id=1')
+    db.execute('UPDATE searches SET cost_usd=0.000002 WHERE id=2')
+    db.commit(); db.close()
+    before = path.read_bytes()
+
+    with pytest.raises(ValueError):
+        sources.search(str(path), 'majak')
+
+    assert path.read_bytes() == before
+
+
+def test_search_corrupted_individual_cost_group_is_exported_as_source_failed(tmp_path, monkeypatch):
+    path = tmp_path / 'search.db'; search_pair_db(path)
+    db = sqlite3.connect(path)
+    db.execute('UPDATE searches SET cost_usd=1e8 WHERE id=2')
+    db.commit(); db.close()
+    before = path.read_bytes()
+    cfg = config(tmp_path)
+    cfg['profiles']['majak']['search'] = str(path)
+    for name in ('QUEUE_PATH', 'CODEX_USAGE_PATH', 'ADMISSION_PATH', 'RELEASE_PATH', 'SWARM_PATH'):
+        monkeypatch.setattr(sources, name, None)
+
+    value = collect(cfg, 100)
+
+    result = next(s for s in value['sources'] if s['profile'] == 'majak' and s['kind'] == 'search')
+    assert result['status'] == 'unavailable' and result['reason'] == 'source_failed'
+    assert result['rows'] == [] and result['data_at'] is None
+    assert path.read_bytes() == before
+    assert 'PRIVATEHASH' not in json.dumps(value)
+
+
+def test_search_cost_validation_is_limited_to_newest_1000_records(tmp_path):
+    path = tmp_path / 'search.db'; search_db(path)
+    db = sqlite3.connect(path)
+    # Row 1 falls outside the newest 1000 selected searches, so its corruption
+    # must not be validated; rows 2..1001 stay valid.
+    db.execute('UPDATE searches SET cost_usd=-1.0 WHERE id=1')
+    db.executemany(
+        'INSERT INTO searches VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        [(i, i, None, 'fast', 'exa-keyless', None, 0, 1, 0, 0, 1, 0.0,
+          'PRIVATEHASH', 99) for i in range(2, 1002)],
+    )
+    db.commit(); db.close()
+    before = path.read_bytes()
+
+    rows, stamp = sources.search(str(path), 'majak')
+
+    assert len(rows) == 1 and rows[0]['searches'] == 1000
+    assert rows[0]['cost_microusd'] == 0 and stamp == 1001
+    assert path.read_bytes() == before
+
+
+def test_search_valid_measured_zero_and_unknown_cost_stay_unchanged(tmp_path):
+    path = tmp_path / 'search.db'; search_pair_db(path)
+    db = sqlite3.connect(path)
+    db.execute('UPDATE searches SET cost_usd=0.0 WHERE id=2')
+    db.commit(); db.close()
+
+    rows, _ = sources.search(str(path), 'majak')
+
+    assert rows[0]['cost_microusd'] == 0
+
+
+def test_search_all_nullable_cost_stays_unknown_not_failed(tmp_path):
+    path = tmp_path / 'search.db'; search_pair_db(path)
+    db = sqlite3.connect(path)
+    db.execute('UPDATE searches SET cost_usd=NULL')
+    db.commit(); db.close()
+
+    rows, _ = sources.search(str(path), 'majak')
+
+    assert rows[0]['cost_microusd'] is None
 
 
 def test_search_projection_accepts_no_fallback_and_tracks_provider_recency(tmp_path):
@@ -757,7 +963,6 @@ def test_swarm_collect_and_staleness_are_fail_closed(tmp_path, monkeypatch):
     assert swarm_source['status'] == 'available'
     assert swarm_source['observed_at'] == 100
     assert swarm_source['rows'][0]['tasks'][0]['task_id'] == 'child'
-
     projected = c.project(value, ('quantlab',), 191)
     swarm_source = next(s for s in projected['sources'] if s['kind'] == 'swarm')
     assert swarm_source['status'] == 'unavailable'
@@ -773,7 +978,10 @@ def test_swarm_collect_and_staleness_are_fail_closed(tmp_path, monkeypatch):
 
 def config(tmp_path):
     return dict(version=1, output=str(tmp_path / 'snapshot.json'), herdr=None,
-                profiles={p: dict(router=None, search=None, kanban=None, git=None, tests=None) for p in c.PROFILES})
+                profiles={p: dict(router=None, search=None, kanban=None, git=None, tests=None,
+                                  **({} if p == 'majak'
+                                     else {'metrics': None, 'route': None, 'lifecycle': None}))
+                          for p in c.PROFILES})
 
 
 def test_release_projection_is_fixed_bounded_and_sanitized(tmp_path, monkeypatch):
@@ -804,13 +1012,211 @@ def test_release_projection_is_fixed_bounded_and_sanitized(tmp_path, monkeypatch
 
 
 
+def route_payload(path, reason='cost'):
+    path.write_text(json.dumps({'version': 1, 'routes': [dict(
+        route_id='route-1', tier='free', model='model-a', reason=reason,
+        policy_version='pol-1', policy_freshness='fresh', decisions=1, observed_at=100)]}))
+    return path
+
+
+def test_route_read_contract_replays_selection_reason(tmp_path, monkeypatch):
+    path = route_payload(tmp_path / 'route.json')
+    monkeypatch.setattr(sources, 'ROUTE_PATH', str(path))
+    cfg = config(tmp_path)
+    cfg['profiles']['quantlab']['route'] = str(path)
+    before = path.read_bytes()
+
+    value = collect(cfg, 100)
+
+    source = next(s for s in value['sources'] if s['kind'] == 'route')
+    assert source['status'] == 'available' and source['rows'][0]['reason'] == 'cost'
+    assert source['rows'][0]['policy_freshness'] == 'fresh'
+    assert path.read_bytes() == before
+
+
+def test_route_reason_is_required_for_explainability():
+    # A reason-free route row is not explainable and must fail closed.
+    with pytest.raises(ValueError):
+        c.row('route', dict(route_id='route-1', tier='free', model='model-a',
+                            reason='not-a-reason', policy_version='pol-1',
+                            policy_freshness='fresh', decisions=1, observed_at=50))
+    c.row('route', dict(route_id='route-1', tier='free', model='model-a', reason='cost',
+                        policy_version='pol-1', policy_freshness='fresh',
+                        decisions=1, observed_at=50))
+
+
+def lifecycle_payload(path, phase='VERIFY'):
+    path.write_text(json.dumps({'version': 1, 'work': [dict(
+        work_id='work-1', phase=phase, entered_at=40, duration_s=10,
+        plan_gate='auto_pass', gate_kind='auto', verifier_iterations=3,
+        build_attempts=1, calls_after_pass=0, stop_reason=None,
+        artifact_hash='a' * 64, artifact_state='unchanged',
+        evidence_state='verified', policy_version='pol-1',
+        skill_bundle={'version': None, 'hash': None},
+        runtime_status='unavailable', runtime_freshness='unknown', observed_at=100)]}))
+    return path
+
+
+def test_lifecycle_read_contract_separates_runtime_from_durable_phase(tmp_path, monkeypatch):
+    path = lifecycle_payload(tmp_path / 'lifecycle.json')
+    monkeypatch.setattr(sources, 'LIFECYCLE_PATH', str(path))
+    cfg = config(tmp_path)
+    cfg['profiles']['quantlab']['lifecycle'] = str(path)
+    before = path.read_bytes()
+
+    value = collect(cfg, 100)
+
+    source = next(s for s in value['sources'] if s['kind'] == 'lifecycle')
+    row = source['rows'][0]
+    assert source['status'] == 'available'
+    assert row['phase'] == 'VERIFY' and row['runtime_status'] == 'unavailable'
+    assert row['plan_gate'] == 'auto_pass' and row['gate_kind'] == 'auto'
+    assert row['evidence_state'] == 'verified' and row['artifact_state'] == 'unchanged'
+    assert path.read_bytes() == before
+
+
+def test_lifecycle_changed_artifact_is_not_published_as_verified(tmp_path, monkeypatch):
+    path = lifecycle_payload(tmp_path / 'lifecycle.json')
+    raw = json.loads(path.read_text())
+    raw['work'][0].update(artifact_state='changed', evidence_state='unverified')
+    path.write_text(json.dumps(raw))
+    monkeypatch.setattr(sources, 'LIFECYCLE_PATH', str(path))
+    cfg = config(tmp_path)
+    cfg['profiles']['quantlab']['lifecycle'] = str(path)
+
+    rows, _ = sources.lifecycle(str(path), 'quantlab')
+
+    assert rows[0]['artifact_state'] == 'changed' and rows[0]['evidence_state'] == 'unverified'
+
+
+def test_lifecycle_plan_gate_without_result_fails_closed(tmp_path, monkeypatch):
+    path = lifecycle_payload(tmp_path / 'lifecycle.json', phase='PLAN_GATE')
+    raw = json.loads(path.read_text())
+    raw['work'][0]['plan_gate'] = 'unknown'
+    path.write_text(json.dumps(raw))
+    monkeypatch.setattr(sources, 'LIFECYCLE_PATH', str(path))
+
+    with pytest.raises(ValueError):
+        sources.lifecycle(str(path), 'quantlab')
+
+
+def test_disabled_route_and_lifecycle_inputs_are_never_opened(tmp_path, monkeypatch):
+    cfg = config(tmp_path)
+    cfg['profiles']['quantlab']['route'] = None
+    cfg['profiles']['quantlab']['lifecycle'] = None
+    for name in ('QUEUE_PATH', 'CODEX_USAGE_PATH', 'ADMISSION_PATH', 'RELEASE_PATH', 'SWARM_PATH'):
+        monkeypatch.setattr(sources, name, None)
+    opened = []
+    for kind in ('route', 'lifecycle'):
+        monkeypatch.setattr(sources, kind,
+                            (lambda name: lambda *a: opened.append(name) or (_ for _ in ()).throw(AssertionError('opened')))(kind))
+
+    collect(cfg, 100)
+
+    assert opened == []
+
+
+def metrics_payload(path, fabrics):
+    path.write_text(json.dumps(dict(version=1, fabrics=fabrics)))
+    return path
+
+
+def test_metrics_read_contract_reports_every_fabric_unavailable_with_reason(tmp_path, monkeypatch):
+    path = tmp_path / 'metrics.json'
+    metrics_payload(path, [dict(category=category, freshness='unknown') for category in
+                           ('work', 'cost', 'context', 'execution', 'verification', 'search',
+                            'prompt', 'approval', 'evidence', 'experiments', 'teamwork', 'memory')])
+    # Explicitly configured durable input: the exporter must open this exact path.
+    cfg = config(tmp_path)
+    cfg['profiles']['quantlab']['metrics'] = str(path)
+    for name in ('QUEUE_PATH', 'CODEX_USAGE_PATH', 'ADMISSION_PATH', 'RELEASE_PATH', 'SWARM_PATH'):
+        monkeypatch.setattr(sources, name, None)
+    before = path.read_bytes()
+
+    value = collect(cfg, 100)
+
+    source = next(s for s in value['sources'] if s['kind'] == 'metrics')
+    assert source['profile'] == 'quantlab'
+    assert source['status'] == 'unavailable' and source['reason'] == 'source_failed'
+    assert source['rows'] == [] and source['data_at'] is None
+    assert path.read_bytes() == before
+    assert 'PRIVATE' not in json.dumps(value)
+
+
+def test_disabled_metrics_input_is_never_opened(tmp_path, monkeypatch):
+    cfg = config(tmp_path)
+    cfg['profiles']['quantlab']['metrics'] = None
+    for name in ('QUEUE_PATH', 'CODEX_USAGE_PATH', 'ADMISSION_PATH', 'RELEASE_PATH', 'SWARM_PATH'):
+        monkeypatch.setattr(sources, name, None)
+    opened = []
+    monkeypatch.setattr(sources, 'metrics',
+                        lambda *args: opened.append(args) or (_ for _ in ()).throw(AssertionError('opened')))
+
+    collect(cfg, 100)
+
+    assert opened == []
+    source = next(s for s in collect(cfg, 100)['sources'] if s['kind'] == 'metrics')
+    assert source['status'] == 'unavailable' and source['reason'] == 'not_configured'
+
+
+def test_metrics_source_never_publishes_unverified_measurements(tmp_path, monkeypatch):
+    # A fresh fabric snapshot must not turn into published numbers: #77 requires
+    # an explicit producer integration before any measurement is displayed.
+    path = tmp_path / 'metrics.json'
+    metrics_payload(path, [dict(
+        category='work', freshness='fresh',
+        measurements=[dict(
+            id='work.completed', category='work', label='Dokončená práce', unit='count',
+            window=86400, denominator='tasks', source='producer', value=7, coverage=100,
+            freshness='fresh', note='producer',
+        )],
+    )])
+    monkeypatch.setattr(sources, 'METRICS_PATH', str(path))
+
+    with pytest.raises(ValueError):
+        sources.metrics(str(path), 'quantlab')
+
+
+def test_metrics_row_requires_unit_window_denominator_and_source():
+    c.metrics_row(dict(id='work.completed', category='work', label='Dokončená práce',
+                       unit='count', window=3600, denominator='tasks', source='producer',
+                       value=3, coverage=100, freshness='fresh', note=None))
+    broken = dict(id='work.completed', category='work', label='l', unit='widgets', window=3600,
+                  denominator='tasks', source='producer', value=None, coverage=0,
+                  freshness='unknown', note=None)
+    with pytest.raises(ValueError):
+        c.metrics_row(broken)
+
+
+def test_metrics_unknown_value_must_not_claim_full_coverage():
+    item = dict(id='cost.verified', category='cost', label='Náklady', unit='usd', window=86400,
+                denominator='tasks', source='producer', value=None, coverage=100,
+                freshness='unknown', note=None)
+    with pytest.raises(ValueError):
+        c.metrics_row(item)
+
+
+def test_metrics_rejects_configured_producer_without_read_contract(tmp_path):
+    cfg = config(tmp_path)
+    cfg['profiles']['quantlab']['metrics'] = str(tmp_path / 'metrics.json')
+    (tmp_path / 'metrics.json').write_text('{}')
+    value = collect(cfg, 100)
+    source = next(s for s in value['sources'] if s['kind'] == 'metrics')
+    assert source['status'] == 'unavailable' and source['reason'] == 'source_failed'
+    assert source['rows'] == []
+
+
 def test_export_configuration_accepts_legacy_profile_shape_during_search_rollout(tmp_path):
     cfg = dict(version=1, output=str(tmp_path / 'snapshot.json'), herdr=None,
                profiles={p: dict(router=None, kanban=None, git=None, tests=None) for p in c.PROFILES})
     normalized = configuration(cfg)
     assert all(settings['search'] is None for settings in normalized['profiles'].values())
+    # Metrics/route/lifecycle are quantlab-only; legacy shapes must round-trip.
     assert all(set(settings) == {'router', 'search', 'kanban', 'git', 'tests'}
-               for settings in normalized['profiles'].values())
+               for profile, settings in normalized['profiles'].items() if profile == 'majak')
+    assert all(set(settings) == {'router', 'search', 'kanban', 'git', 'tests',
+                                 'metrics', 'route', 'lifecycle'}
+               for profile, settings in normalized['profiles'].items() if profile == 'quantlab')
 
 def test_export_partial_failure_and_zero_different(tmp_path):
     cfg = config(tmp_path)

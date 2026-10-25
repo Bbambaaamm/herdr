@@ -18,6 +18,18 @@ const STATUS = { idle: 'Čeká', working: 'Pracuje', blocked: 'Blokováno', done
 const QUEUE_STATUS = { pending: 'Čeká', running: 'Běží', blocked: 'Blokováno', done: 'Hotovo', failed: 'Selhalo' };
 const SWARM_STATUS = { pending: 'pending', ready: 'pending', running: 'running', review: 'running', blocked: 'blocked', done: 'done', failed: 'failed', cancelled: 'done' };
 const GITHUB_REPO = 'Bbambaaamm/Autonomous-Quant-Lab';
+const METRIC_UNITS = ['count', 'usd', 'microusd', 'tokens', 'bytes', 'ms', 'seconds', 'percent'];
+const METRIC_SOURCES = ['producer', 'dashboard_read_model'];
+const METRIC_FRESHNESS = ['fresh', 'stale', 'unknown'];
+const METRIC_WINDOWS = [1800, 900, 3600, 86400, 604800, 2592000, 31536000];
+const METRIC_DENOMINATORS = ['requests', 'tasks', 'searches', 'nodes', 'tokens', 'contexts',
+  'episodes', 'variants', 'executions', 'runs', 'prompts', 'proposals', 'trials', 'all', 'none'];
+const METRIC_CATEGORIES = ['work', 'cost', 'context', 'execution', 'verification', 'search',
+  'prompt', 'approval', 'evidence', 'experiments', 'teamwork', 'memory'];
+const METRIC_WINDOW_LABELS = { 900: '15 min', 1800: '30 min', 3600: '1 h', 86400: '24 h', 604800: '7 dní', 2592000: '30 dní', 31536000: '365 dní' };
+const ROUTE_REASONS = ['cost','latency','quality','premium_denied','fallback','availability','policy','unknown'];
+const WORK_PHASES = ['DISCOVER','PLAN_GATE','BASELINE','BUILD','VERIFY','HANDOFF'];
+const PLAN_GATE_RESULTS = ['auto_pass','human_approved','credential_required','privilege_required','denied','unknown'];
 const fmt = new Intl.NumberFormat('cs-CZ');
 const compact = new Intl.NumberFormat('cs-CZ', { notation: 'compact', maximumFractionDigits: 1 });
 const escapeHTML = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
@@ -820,6 +832,50 @@ export function mountDashboard(createScene) {
     ].join('');
   }
 
+  function metricsSource() {
+    return (liveData?.sources || []).find(value => value.kind === 'metrics') || null;
+  }
+  function metricValue(entry) {
+    // Unknown stays UNKNOWN: null is rendered as a reason, never as 0 or as a
+    // percentage. Only a producer-measured value is turned into a number.
+    return entry.value == null ? 'Neznámé' : `${fmt.format(entry.value)} ${escapeHTML(entry.unit)}`;
+  }
+  function metricWindow(windowSeconds) {
+    return escapeHTML(METRIC_WINDOW_LABELS[windowSeconds] || `${windowSeconds} s`);
+  }
+  function renderMetrics() {
+    const grid = $('#metrics-fabric-grid'), source = metricsSource();
+    if (!liveData || !source) {
+      grid.innerHTML = '<article class="obs-panel full"><div class="obs-empty">Metriky nejsou v snapshotu dostupné.</div></article>';
+      return;
+    }
+    if (source.status !== 'available') {
+      grid.innerHTML = `<article class="obs-panel full"><header><div><h3>Metriky #77 · work / cost / context / execution</h3><span>read model</span></div><span>${escapeHTML(source.status)} · ${escapeHTML(source.reason)}</span></header><div class="obs-empty">Producent těchto metrik není integrován. Nedostupná hodnota není zobrazena jako nula ani jako záruka úspory.</div></article>`;
+      return;
+    }
+    const row = source.rows[0];
+    const measured = row.measured || [], unavailable = row.unavailable || [];
+    const shown = [...measured.slice(0, 12), ...unavailable.slice(0, 12)];
+    grid.innerHTML = `<article class="obs-panel full"><header><div><h3>Metriky #77 · work / cost / context / execution</h3><span>jednotka · okno · jmenovatel · zdroj · coverage</span></div><span>${measured.length} měřených · ${unavailable.length} nedostupných</span></header><div class="metric-fabric">${shown.map(entry => `<div class="metric-entry" data-state="${entry.value == null ? 'unavailable' : 'measured'}"><b>${escapeHTML(entry.label)}</b><span>${escapeHTML(metricValue(entry))}</span><small>${escapeHTML(entry.unit)} · ${metricWindow(entry.window)} · jmenovatel ${escapeHTML(entry.denominator)} · ${escapeHTML(entry.source)} · coverage ${entry.coverage == null ? '—' : entry.coverage + ' %'} · ${escapeHTML(entry.freshness)}</small>${entry.value == null ? `<small class="metric-reason">${escapeHTML(entry.note || 'Producent neintegrován.')}</small>` : ''}</div>`).join('')}</div><p class="obs-note">Neznámá hodnota není nulová spotřeba ani garantovaná úspora. Za jmenovatelem ${escapeHTML(String(row.denominator ?? '—'))}.</p></article>`;
+  }
+  function renderRouteAndLifecycle() {
+    const grid = $('#route-lifecycle-grid');
+    const sources = (liveData?.sources || []).filter(value => value.kind === 'route' || value.kind === 'lifecycle');
+    if (!liveData || !sources.length) {
+      grid.innerHTML = '<article class="obs-panel full"><div class="obs-empty">Životní cyklus a důvody routení nejsou v snapshotu dostupné.</div></article>';
+      return;
+    }
+    grid.innerHTML = sources.map(source => {
+      if (source.status !== 'available') {
+        return `<article class="obs-panel"><header><div><h3>${escapeHTML(source.kind === 'route' ? 'Route decisions' : 'Work lifecycle')} · ${escapeHTML(source.profile)}</h3><span>read model</span></div><span>${escapeHTML(source.status)} · ${escapeHTML(source.reason)}</span></header><div class="obs-empty">Producent není integrován. Nedostupný stav není zobrazen jako odhad.</div></article>`;
+      }
+      const rows = source.rows.slice(0, 8);
+      const body = source.kind === 'route'
+        ? rows.map(row => `<div class="metric-entry" data-state="measured"><b>${escapeHTML(row.model)} · ${escapeHTML(row.tier)}</b><span>${escapeHTML(row.reason)}</span><small>politika ${escapeHTML(row.policy_version || '—')} · ${escapeHTML(row.policy_freshness)} · rozhodnutí ${escapeHTML(String(row.decisions))}</small></div>`).join('')
+        : rows.map(row => `<div class="metric-entry" data-state="${row.evidence_state === 'verified' && row.artifact_state === 'unchanged' ? 'measured' : 'unavailable'}"><b>${escapeHTML(row.phase)}</b><span>${escapeHTML(row.plan_gate)} · ${escapeHTML(row.gate_kind)}</span><small>artefakt ${escapeHTML(row.artifact_state)} · důkaz ${escapeHTML(row.evidence_state)} · runtime ${escapeHTML(row.runtime_status)}/${escapeHTML(row.runtime_freshness)}${row.calls_after_pass ? ` · volání po PASS ${escapeHTML(String(row.calls_after_pass))}` : ''}</small></div>`).join('');
+      return `<article class="obs-panel"><header><div><h3>${escapeHTML(source.kind === 'route' ? 'Route decisions' : 'Work lifecycle')} · ${escapeHTML(source.profile)}</h3><span>read only</span></div><span>${source.rows.length} záznamů</span></header><div class="metric-fabric">${body || '<div class="obs-empty">Žádné záznamy v okně.</div>'}</div><p class="obs-note">Runtime health je oddělen od durable fáze. Důkaz je uváděn jen u ověřeného artefaktu.</p></article>`;
+    }).join('');
+  }
   function renderQueue() {
     const values = queueSources(), summary = $('#queue-summary'), list = $('#queue-list');
     if (!values.some(value => value.status === 'available')) {
@@ -1057,7 +1113,7 @@ export function mountDashboard(createScene) {
     const color = demo ? '#e49a34' : liveData ? '#6adf9a' : '#ff7159'; ui.liveDot.style.background = color; ui.liveDot.style.color = color;
   }
   function renderAll() {
-    updateHeader(); renderProjects(); renderTelemetry(); renderSwarm(); renderWork(); renderFace();
+    updateHeader(); renderProjects(); renderTelemetry(); renderSwarm(); renderWork(); renderFace(); renderMetrics(); renderRouteAndLifecycle();
     if (!ui.detail.hidden) renderDetail();
   }
   function validateSnapshot(value) {
@@ -1171,6 +1227,59 @@ export function mountDashboard(createScene) {
               || typeof edge.from_task !== 'string' || typeof edge.to_task !== 'string'
               || !taskIds.has(edge.from_task) || !taskIds.has(edge.to_task)) throw new Error('invalid');
           }
+        }
+      }
+      if (item.kind === 'metrics') {
+        // #77: metrics is a quantlab-only read contract. Rows are never inferred:
+        // measured entries carry unit/window/denominator/source/coverage and every
+        // unavailable fabric is reported with its own reason instead of zero.
+        if (item.profile !== 'quantlab' || (item.status === 'available' && item.rows.length !== 1)) throw new Error('invalid');
+        for (const row of item.rows) {
+          if (!Array.isArray(row.measured) || !Array.isArray(row.unavailable)
+            || (row.denominator != null && (!Number.isSafeInteger(row.denominator) || row.denominator < 0))) throw new Error('invalid');
+          if (row.measured.length > 64 || row.unavailable.length > 64) throw new Error('invalid');
+          const ids = new Set();
+          for (const entry of [...row.measured, ...row.unavailable]) {
+            if (!entry || typeof entry.id !== 'string' || ids.has(entry.id)) throw new Error('invalid');
+            ids.add(entry.id);
+            if (!METRIC_UNITS.includes(entry.unit) || !METRIC_SOURCES.includes(entry.source)
+              || !METRIC_FRESHNESS.includes(entry.freshness)
+              || !METRIC_WINDOWS.includes(entry.window)
+              || !METRIC_DENOMINATORS.includes(entry.denominator)
+              || typeof entry.label !== 'string' || !entry.label
+              || !METRIC_CATEGORIES.includes(entry.category)) throw new Error('invalid');
+            if (entry.value != null && (!Number.isSafeInteger(entry.value) || entry.value < 0)) throw new Error('invalid');
+            if (entry.coverage != null && (!Number.isSafeInteger(entry.coverage) || entry.coverage < 0 || entry.coverage > 100)) throw new Error('invalid');
+            if (entry.value == null && entry.coverage === 100) throw new Error('invalid');
+          }
+          if (row.measured.some(entry => entry.value == null)) throw new Error('invalid');
+        }
+      }
+      if (item.kind === 'route') {
+        if (item.profile !== 'quantlab' || (item.status === 'available' && item.rows.length > 50)) throw new Error('invalid');
+        for (const row of item.rows) {
+          if (typeof row.route_id !== 'string' || !Number.isFinite(row.observed_at)
+            || !['free','sol','astra','browser','direct','unknown'].includes(row.tier)
+            || typeof row.model !== 'string' || !ROUTE_REASONS.includes(row.reason)
+            || !['fresh','stale','unknown'].includes(row.policy_freshness)
+            || (row.policy_version != null && typeof row.policy_version !== 'string')
+            || !Number.isSafeInteger(row.decisions) || row.decisions < 0) throw new Error('invalid');
+        }
+      }
+      if (item.kind === 'lifecycle') {
+        if (item.profile !== 'quantlab' || (item.status === 'available' && item.rows.length > 50)) throw new Error('invalid');
+        for (const row of item.rows) {
+          if (typeof row.work_id !== 'string' || !WORK_PHASES.includes(row.phase)
+            || !Number.isFinite(row.observed_at) || !Number.isSafeInteger(row.entered_at)
+            || !PLAN_GATE_RESULTS.includes(row.plan_gate)
+            || !['auto','human','credential','privilege','unknown'].includes(row.gate_kind)
+            || !['unchanged','changed','missing','unverified'].includes(row.artifact_state)
+            || !['verified','unverified','unavailable','uncertain'].includes(row.evidence_state)
+            || (row.artifact_hash != null && !/^[0-9a-f]{64}$/.test(row.artifact_hash))
+            || (row.skill_bundle != null && (typeof row.skill_bundle !== 'object'
+              || !('version' in row.skill_bundle) || !('hash' in row.skill_bundle)))
+            || !['available','unavailable','not_applicable'].includes(row.runtime_status)
+            || !['fresh','stale','unknown'].includes(row.runtime_freshness)) throw new Error('invalid');
         }
       }
       if (item.kind === 'release') {

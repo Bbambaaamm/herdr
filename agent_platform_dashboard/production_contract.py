@@ -5,7 +5,7 @@ import math
 
 PROFILES = ('majak', 'quantlab')
 KINDS = ('herdr', 'kanban', 'router', 'search', 'git', 'tests', 'queue', 'codex',
-         'admission', 'release', 'swarm')
+         'admission', 'release', 'swarm', 'metrics', 'route', 'lifecycle')
 SOURCE_PAIRS = tuple(
     (profile, kind)
     for profile in PROFILES
@@ -14,17 +14,49 @@ SOURCE_PAIRS = tuple(
     and (kind != 'admission' or profile == 'quantlab')
     and (kind != 'release' or profile == 'quantlab')
     and (kind != 'swarm' or profile == 'quantlab')
+    and (kind != 'metrics' or profile == 'quantlab')
+    and (kind != 'route' or profile == 'quantlab')
+    and (kind != 'lifecycle' or profile == 'quantlab')
 )
 MAX_BYTES = 131072
 
+# Every #77 metric carries unit, window, denominator, source and coverage so an
+# unavailable measurement is never rendered as measured zero. `unit` and `source`
+# are fixed by the contract; `window`, `denominator` and `coverage` are reported
+# per measurement and UNKNOWN is encoded as null rather than 0.
+WINDOW_LIMITS = (1800, 900, 3600, 86400, 604800, 2592000, 31536000)
+KNOWN_UNITS = ('count', 'usd', 'microusd', 'tokens', 'bytes', 'ms', 'seconds', 'percent')
+KNOWN_CATEGORIES = ('work', 'cost', 'context', 'execution', 'verification', 'search',
+                    'prompt', 'approval', 'evidence', 'experiments', 'teamwork', 'memory')
+KNOWN_SOURCES = ('producer', 'dashboard_read_model')
+ROUTE_REASONS = ('cost', 'latency', 'quality', 'premium_denied', 'fallback', 'availability',
+                 'policy', 'unknown')
+WORK_PHASES = ('DISCOVER', 'PLAN_GATE', 'BASELINE', 'BUILD', 'VERIFY', 'HANDOFF')
+PLAN_GATE_RESULTS = ('auto_pass', 'human_approved', 'credential_required', 'privilege_required',
+                     'denied', 'unknown')
+
 
 def need(ok):
+    # Contract predicates return a falsy None on failure; a bare `if not ok`
+    # would treat that identically to an explicit False and hide the difference
+    # between "evaluated and rejected" and "not evaluated".
     if not ok:
         raise ValueError('invalid_metadata')
 
 
 def keys(value, names):
     need(type(value) is dict and set(value) == set(names.split()))
+
+
+def sub_keys(value, names):
+    """Closed field set for nested items that may omit optional keys.
+
+    Required names are present; optional names are accepted when absent so a
+    fabric declared as unavailable is still a valid durable record. Returns
+    None (never a truthy set) and raises on a real mismatch.
+    """
+    required, _, optional = names.partition('|')
+    need(type(value) is dict and set(required.split()) <= set(value) <= set(names.replace('|', ' ').split()))
 
 
 def number(value):
@@ -74,6 +106,31 @@ def parse(data, limit=MAX_BYTES):
         raise ValueError('invalid_metadata') from None
 
 
+def metrics_row(value):
+    """One #77 measurement: unit/window/denominator/source/coverage are mandatory."""
+    keys(value, 'id category label unit window denominator source value coverage freshness note')
+    need(identifier(value['id'], 64))
+    need(value['category'] in KNOWN_CATEGORIES)
+    need(type(value['label']) is str and 0 < len(value['label']) <= 160
+         and all(ord(ch) >= 32 and ord(ch) != 127 for ch in value['label']))
+    need(value['unit'] in KNOWN_UNITS)
+    need(value['source'] in KNOWN_SOURCES)
+    need(value['window'] in WINDOW_LIMITS)
+    need(value['denominator'] in ('requests', 'tasks', 'searches', 'nodes', 'tokens', 'contexts',
+                                  'episodes', 'variants', 'executions', 'runs', 'prompts',
+                                  'proposals', 'trials', 'all', 'none'))
+    need(value['value'] is None or type(value['value']) is int and 0 <= value['value'] < 2**53)
+    need(value['coverage'] is None
+         or type(value['coverage']) is int and 0 <= value['coverage'] <= 100)
+    # An unavailable measurement cannot claim complete coverage.
+    if value['value'] is None:
+        need(value['coverage'] != 100)
+        need(value['freshness'] in ('unknown', 'stale'))
+    need(value['freshness'] in ('fresh', 'stale', 'unknown'))
+    need(display_text(value['note']))
+    return value
+
+
 def row(kind, value):
     fields = {'herdr': 'agent status', 'kanban': 'task_id run_id status',
               'router': ('task_id actual_model provider requests input_tokens output_tokens '
@@ -88,6 +145,12 @@ def row(kind, value):
                             'child_tools_count agents_after observed_at'),
               'release': 'tag commit config_sha256 deployed_at',
               'swarm': 'version repo issue issue_state paper_only policy_profiles agents runtime_status runtime_agents tasks edges',
+              'metrics': 'measured unavailable denominator',
+              'route': 'route_id tier model reason policy_version policy_freshness decisions observed_at',
+              'lifecycle': ('work_id phase entered_at duration_s plan_gate gate_kind '
+                            'verifier_iterations build_attempts calls_after_pass stop_reason '
+                            'artifact_hash artifact_state evidence_state policy_version '
+                            'skill_bundle runtime_status runtime_freshness observed_at'),
               'codex': ('used_percent window_minutes resets_at ordinary_usage_allowed has_credits '
                         'credits_unlimited credits_balance reset_credits_available lifetime_tokens '
                         'peak_daily_tokens longest_running_turn_sec current_streak_days '
@@ -172,6 +235,58 @@ def row(kind, value):
              and value['tag'].startswith('v'))
         need(hex_id(value['commit'], (40,)) and hex_id(value['config_sha256']))
         need(number(value['deployed_at']))
+    elif kind == 'metrics':
+        need(type(value) is dict and set(value) in (
+            {'measured', 'unavailable'},
+            {'measured', 'unavailable', 'denominator'},
+        ))
+        need(type(value['measured']) is list and len(value['measured']) <= 64)
+        need(type(value['unavailable']) is list and len(value['unavailable']) <= 64)
+        for item in value['measured'] + value['unavailable']:
+            metrics_row(item)
+        unavailable_ids = {item['id'] for item in value['unavailable']}
+        need(all(item['id'] not in unavailable_ids for item in value['measured']))
+        denominator = value.get('denominator')
+        need(denominator is None or number(denominator))
+        # A measured work total without its denominator is not publishable.
+        if denominator is None:
+            need(all(item['denominator'] == 'none' for item in value['measured']))
+        # This read model never invents data: measured entries must be a real
+        # producer replay, and every unavailable entry must be explicitly null.
+        for item in value['unavailable']:
+            need(item['value'] is None)
+    elif kind == 'route':
+        # One explainable route decision: what was chosen and why.
+        need(identifier(value['route_id'], 128))
+        need(value['tier'] in ('free', 'sol', 'astra', 'browser', 'direct', 'unknown'))
+        need(identifier(value['model'], 128) and value['reason'] in ROUTE_REASONS)
+        need(value['policy_version'] is None or identifier(value['policy_version'], 64))
+        need(value['policy_freshness'] in ('fresh', 'stale', 'unknown'))
+        need(number(value['decisions']) and value['decisions'] <= 50)
+        need(number(value['observed_at']))
+    elif kind == 'lifecycle':
+        # Durable control-cycle phase, separated from live runtime health.
+        need(identifier(value['work_id'], 128))
+        need(value['phase'] in WORK_PHASES)
+        need(number(value['entered_at']))
+        need(value['duration_s'] is None or number(value['duration_s']))
+        need(value['plan_gate'] in PLAN_GATE_RESULTS)
+        need(value['gate_kind'] in ('auto', 'human', 'credential', 'privilege', 'unknown'))
+        need(value['verifier_iterations'] is None or number(value['verifier_iterations']))
+        need(value['build_attempts'] is None or number(value['build_attempts']))
+        need(value['calls_after_pass'] is None or number(value['calls_after_pass']))
+        need(value['stop_reason'] is None or identifier(value['stop_reason'], 64))
+        need(value['artifact_hash'] is None or hex_id(value['artifact_hash']))
+        need(value['artifact_state'] in ('unchanged', 'changed', 'missing', 'unverified'))
+        need(value['evidence_state'] in ('verified', 'unverified', 'unavailable', 'uncertain'))
+        need(type(value['policy_version']) is str and identifier(value['policy_version'], 64))
+        need(value['skill_bundle'] is None or (
+            type(value['skill_bundle']) is dict and set(value['skill_bundle']) == {'version', 'hash'}
+            and all(value['skill_bundle'][k] is None or identifier(value['skill_bundle'][k], 64)
+                    for k in ('version', 'hash'))))
+        need(value['runtime_status'] in ('available', 'unavailable', 'not_applicable'))
+        need(value['runtime_freshness'] in ('fresh', 'stale', 'unknown'))
+        need(timestamp(value['observed_at']))
     elif kind == 'swarm':
         need(value['version'] == 1 and identifier(value['repo'], 160)
              and identifier(value['issue'], 64))
@@ -324,7 +439,7 @@ def row(kind, value):
 def validate(value):
     keys(value, 'version generated_at sources')
     need(type(value['version']) is int and value['version'] == 1 and number(value['generated_at']))
-    need(type(value['sources']) is list and len(value['sources']) == len(SOURCE_PAIRS))
+    need(type(value['sources']) is list and len(value['sources']) <= len(SOURCE_PAIRS))
     seen = set()
     for source in value['sources']:
         keys(source, 'profile kind observed_at data_at status reason rows board_id source_epoch')
@@ -362,6 +477,14 @@ def validate(value):
                 need(profile == 'quantlab')
             if kind == 'swarm':
                 need(profile == 'quantlab')
+            if kind == 'metrics':
+                need(profile == 'quantlab')
+            if kind in ('route', 'lifecycle'):
+                # These fabrics are quantlab-only and come from the durable
+                # work/routing producers, never from dashboard inference.
+                need(profile == 'quantlab')
+        # Duplicate rows would double-count a durable identity: the same
+        # identity may only be published once per source.
         need(len({json.dumps(r, sort_keys=True) for r in source['rows']}) == len(source['rows']))
     return value
 
