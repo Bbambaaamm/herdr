@@ -208,3 +208,5 @@ requires the exact stored original outcome and its current plan/tree before
 commit or result capture, so a stale request cannot claim a newly verified
 artifact. Hygiene executes the same approved resolved bootstrap interpreter as
 the oracle, including profiles without the logical Python alias.
+
+Parent-host PR publication uses the original protected local-result receipt through the optional port described in [Parent result publication](PARENT_RESULT_PUBLICATION.md). It grants no worker push permission and leaves shared #85 CI/review acceptance, the original attempt and budgets unchanged.
