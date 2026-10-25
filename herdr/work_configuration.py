@@ -205,6 +205,15 @@ def inspect_discovery(workspace, paths, snapshot):
         os.close(directory)
 
 
+def _work_catalogue(raw):
+    """Keep catalogue field inventory shared across selection and admission."""
+    catalogue = raw.get("work_contracts")
+    names = {"version", "environment", "plans", "review_records"}
+    if isinstance(catalogue, dict) and "runtime_scratch" in catalogue:
+        names.add("runtime_scratch")
+    return closed(catalogue, names, "host work catalogue")
+
+
 def _completion_base_selection(root, task, raw, definition):
     """Validate a protected base choice; task data never supplies its ref or hash."""
     import re
@@ -240,9 +249,7 @@ def approved_completion_base(root, task, *, configuration_path=HOST_POLICY_CONFI
     """Select an explicitly approved base from the protected exact-spec catalogue."""
     from agent_completion_evidence import spec_digest
     raw = _read_configuration(configuration_path)
-    catalogue = closed(raw.get("work_contracts"),
-                       ("version", "environment", "plans", "review_records"),
-                       "host work catalogue")
+    catalogue = _work_catalogue(raw)
     require(type(catalogue["version"]) is int and catalogue["version"] == 1,
             "host work catalogue version unsupported")
     plans = catalogue["plans"]
@@ -577,11 +584,7 @@ def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG
         catalogue = None
     else:
         require(workspace.resolve(strict=True) == workspace, "canonical worktree required")
-        catalogue = raw.get("work_contracts")
-        names = {"version", "environment", "plans", "review_records"}
-        if isinstance(catalogue, dict) and "runtime_scratch" in catalogue:
-            names.add("runtime_scratch")
-        catalogue = closed(catalogue, names, "host work catalogue")
+        catalogue = _work_catalogue(raw)
         require(type(catalogue["version"]) is int and catalogue["version"] == 1,
                 "host work catalogue version unsupported")
         plans = catalogue["plans"]

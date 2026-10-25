@@ -189,3 +189,40 @@ def test_unapproved_base_stops_before_graph_and_budget_publication(tmp_path,monk
         config.build_root_work_factory(Path(raw["task_store_root"]),task,git=git)
     assert not graph_path(raw,task).exists()
     assert not list((Path(raw["storage"])/"work-budget").glob("*/events.jsonl"))
+
+def runtime_scratch_catalogue(raw, tmp_path):
+    result = {}
+    for name in ("check_storage", "commit_storage"):
+        path = tmp_path / ("reviewed-base-" + name)
+        path.mkdir(mode=0o700)
+        result[name] = str(path)
+    raw["work_contracts"]["runtime_scratch"] = result
+    return result
+
+def test_reviewed_base_selects_with_host_runtime_scratch(reviewed, tmp_path):
+    root, _, task, definition, raw = reviewed
+    runtime_scratch_catalogue(raw, tmp_path)
+    assert config.approved_completion_base(root, task) == (
+        definition["completion_base"]["remote_ref"], definition["base_sha"])
+
+def test_reviewed_base_and_factory_compose_with_same_runtime_scratch(tmp_path, monkeypatch):
+    raw, task, definition, graph, grant, git = configured_base(tmp_path, monkeypatch)
+    scratch = runtime_scratch_catalogue(raw, tmp_path)
+    root = Path(raw["task_store_root"])
+    assert config.approved_completion_base(root, task) == (
+        definition["completion_base"]["remote_ref"], definition["base_sha"])
+    factory = config.build_root_work_factory(root, task, git=git)
+    assert factory.host_admission["runtime_scratch"] == scratch
+    assert factory.budget_authority is not None
+
+@pytest.mark.parametrize("entry", ["selection", "factory"])
+def test_reviewed_catalogue_unknown_field_still_denied(tmp_path, monkeypatch, entry):
+    raw, task, _, _, _, git = configured_base(tmp_path, monkeypatch)
+    runtime_scratch_catalogue(raw, tmp_path)
+    raw["work_contracts"]["unexpected_slot"] = {}
+    root = Path(raw["task_store_root"])
+    with pytest.raises(WorkContractError):
+        if entry == "selection":
+            config.approved_completion_base(root, task)
+        else:
+            config.build_root_work_factory(root, task, git=git)
