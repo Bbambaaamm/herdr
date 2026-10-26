@@ -590,6 +590,7 @@ def test_snapshot_rechecked_after_sealed_profile_io(ui, monkeypatch, change):
     "\n\t", "unicode: žluťoučký 😀", "literal [200~ and [201~ without ESC",
 ])
 def test_encoder_exact_roundtrip_without_normalization(text):
+    assert transport.validate_native_prompt(text) == text
     encoded = transport.encode_native_prompt(text)
     assert encoded == "\x1b[200~" + text + "\x1b[201~"
     assert encoded[6:-6] == text
@@ -920,3 +921,12 @@ def test_same_original_grant_expiry_during_sealed_io_cancels(ui, monkeypatch):
     ui.loop.flush()
     assert ui.guard.grant is original_grant and original_grant.is_active() is False
     assert ui.calls == [] and ui.cli._pending_input.empty()
+
+
+@pytest.mark.parametrize("text", [
+    "", "bad\x1b[201~command", "bad\0", "\r", "\x7f", "\u0085",
+    "x" * 65525, "č" * 32763, "\ud800",
+])
+def test_native_api_validator_denies_unsafe_or_oversized_input(text):
+    with pytest.raises(PolicyDenied):
+        transport.validate_native_prompt(text)

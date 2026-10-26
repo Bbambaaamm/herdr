@@ -1529,10 +1529,11 @@ def run_prompt(task: dict) -> tuple[int, str]:
     timeout_seconds = int(task.get("timeout_seconds") or 1800)
     prompt = prompt_text(task)
     if modern_work_contract(task):
-        # One native delivery. Framing is validated before recording intent;
-        # the authenticated CLI transport preserves the SDK paste guard.
-        from herdr.hermes_terminal_transport import encode_native_prompt
-        prompt = encode_native_prompt(prompt)
+        # Herdr agent.prompt frames text according to the live terminal mode.
+        # Validate before recording intent; a second frame reaches the SDK as
+        # escaped paste content rather than one submitted prompt.
+        from herdr.hermes_terminal_transport import validate_native_prompt
+        prompt = validate_native_prompt(prompt)
     cmd = [
         str(HERDR), "agent", "prompt", agent, prompt,
         "--wait", "--timeout", str(timeout_seconds * 1000),
