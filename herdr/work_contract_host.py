@@ -352,6 +352,12 @@ class WorkInvocationGuard(InvocationGuard):
             raise PolicyDenied("model_grant_lifetime_insufficient") from exc
         return receipt
 
+    def execute_model_effect(self, receipt, request_id, payload):
+        transport = getattr(self.work_authority, "model_transport", None)
+        if not callable(transport):
+            raise PolicyDenied("host_model_transport_unavailable")
+        return transport(self.grant.identity, self.grant.hash, request_id, receipt, payload)
+
     def returned_model_effect(self,receipt):
         if receipt is not None:
             return self.work_authority.effect(self.grant.identity,self.grant.hash,"returned",

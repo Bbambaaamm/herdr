@@ -82,6 +82,52 @@ class WorkAuthorityClient:
         except (EvidenceError,OSError,ValueError,TypeError) as exc:
             raise PolicyDenied("work_budget_unavailable") from exc
 
+    def model_transport(self, identity, grant_sha256, request_id, receipt, payload):
+        """Two bounded frames; the authenticated header precedes the large body."""
+        from .host_model_transport import MAX_BODY, MAX_RESPONSE
+        import hashlib
+        body = canonical(payload)
+        require(0 < len(body) <= MAX_BODY, "bounded host model body required")
+        header = canonical({"op": "work-model", "identity": identity.to_json(),
+            "grant_sha256": grant_sha256, "operation_id": receipt["operation_id"],
+            "request_id": request_id, "body_bytes": len(body),
+            "body_sha256": hashlib.sha256(body).hexdigest()}) + b"\n"
+        require(len(header) <= 8192, "bounded host model header required")
+        deadline = time.monotonic() + receipt["max_work_ms"] / 1000
+        def remaining(connection):
+            seconds = deadline - time.monotonic()
+            require(seconds > 0, "host model exchange deadline exhausted")
+            connection.settimeout(seconds)
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                remaining(connection); connection.connect(str(SOCKET_PATH))
+                remaining(connection); connection.sendall(header)
+                ack = bytearray()
+                while len(ack) < 32 and not ack.endswith(b"\n"):
+                    remaining(connection)
+                    part = connection.recv(1)
+                    if not part: break
+                    ack.extend(part)
+                require(bytes(ack) == b"model-body-ready\n", "host model header denied")
+                remaining(connection); connection.sendall(body)
+                result = bytearray()
+                while len(result) <= MAX_RESPONSE:
+                    remaining(connection)
+                    part = connection.recv(min(65536, MAX_RESPONSE + 1 - len(result)))
+                    if not part: break
+                    result.extend(part)
+                    if b"\n" in result: break
+            require(len(result) <= MAX_RESPONSE and result.endswith(b"\n")
+                    and result.count(b"\n") == 1, "bounded host model result required")
+            value = json.loads(result)
+            require(type(value) is dict and value.get("kind") in
+                    {"http_response", "invalid_response", "unknown"}, "host model result invalid")
+            return value
+        except PolicyDenied:
+            raise
+        except Exception as error:
+            raise PolicyDenied("host_model_transport_unavailable") from error
+
     def observe(self, identity, grant_sha256, observation):
         # No retry: a lost ACK may follow a durable observation. This transport
         # does not authorize any effect and cannot change budget delivery state.
@@ -266,6 +312,37 @@ def _dispatch_work_connection(owner, connection):
             owner.launch.mount.verify_mounted(pid, owner.launch.sealed)
             require_work_time()
             connection.sendall(b"observation-ok\n")
+        elif request.get("op") == "work-model":
+            from .host_model_transport import MAX_BODY, MAX_RESPONSE, execute_host_model
+            import re
+            require(set(request) == {"op", "identity", "grant_sha256", "operation_id",
+                    "request_id", "body_bytes", "body_sha256"}
+                    and type(request["body_bytes"]) is int and 0 < request["body_bytes"] <= MAX_BODY
+                    and isinstance(request["request_id"], str)
+                    and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request["request_id"])
+                    and all(isinstance(request[key], str) and
+                        re.fullmatch(r"[0-9a-f]{64}", request[key])
+                        for key in ("operation_id", "body_sha256")),
+                    "closed host model header required")
+            operation = "work-model"
+            connection.sendall(b"model-body-ready\n")
+            body = bytearray(); body_deadline = time.monotonic() + 5
+            while len(body) < request["body_bytes"]:
+                seconds = min(body_deadline - time.monotonic(), remaining_work_seconds(5))
+                require(seconds > 0, "host model body deadline exhausted")
+                connection.settimeout(seconds)
+                part = connection.recv(min(65536, request["body_bytes"] - len(body)))
+                require(bool(part), "host model body shortened")
+                body.extend(part)
+            result = execute_host_model(owner, request, bytes(body))
+            require_work_time()
+            after = inspect_peer(pid)
+            require(after == peer and owner.launch.grant.is_active(), "host model peer changed")
+            owner.launch.mount.verify_mounted(pid, owner.launch.sealed)
+            encoded = canonical(result) + b"\n"
+            require(len(encoded) <= MAX_RESPONSE, "host model response exceeds bound")
+            connection.settimeout(remaining_work_seconds(5))
+            connection.sendall(encoded)
         elif request.get("op") == "work-budget":
             require(set(request)=={"op","identity","grant_sha256","action","payload"}
                     and request["action"] in {"status","ceiling","start","returned"} and isinstance(request["payload"],dict),

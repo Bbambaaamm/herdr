@@ -1063,6 +1063,15 @@ def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None,
             authorize_agent_provider(agent)  # after callbacks may switch routes
             begin=getattr(guard,"start_model_effect",None)
             receipt=None
+            assurance = getattr(getattr(guard, "grant", None), "runtime_assurance", None)
+            access = getattr(getattr(assurance, "network_access", None), "value", None)
+            host_transport = access == "none" and callable(begin) and guard.budget_required()
+            transport = getattr(guard, "execute_model_effect", None)
+            if host_transport:
+                if (not callable(transport) or agent.provider != "nous"
+                        or not agent.model.endswith(":free")
+                        or agent.base_url != "https://inference-api.nousresearch.com/v1"):
+                    raise PolicyDenied("host_model_transport_profile_unsupported")
             if callable(begin) and guard.budget_required():
                 from .evidence import canonical
                 from .work_model_deadline import validate_text_request
@@ -1089,8 +1098,22 @@ def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None,
             else:
                 from .work_model_deadline import model_deadline
                 with model_deadline(receipt["max_work_ms"]):
-                    response=next_call(payload)
-                guard.returned_model_effect(receipt)
+                    if host_transport:
+                        answer = transport(receipt, context.get("api_request_id"), payload)
+                        if answer["kind"] == "unknown":
+                            raise PolicyDenied("host_model_delivery_unknown_reconcile_original")
+                        guard.returned_model_effect(receipt)
+                        if answer["kind"] != "http_response":
+                            raise PolicyDenied("host_model_response_invalid")
+                        if not 200 <= answer["http_status"] < 300:
+                            raise PolicyDenied("host_model_provider_http_error",
+                                               str(answer["http_status"]))
+                        from openai.types.chat import ChatCompletion
+                        response = ChatCompletion.model_validate(answer["body"])
+                    else:
+                        response=next_call(payload)
+                if not host_transport:
+                    guard.returned_model_effect(receipt)
             return response
         return original_middleware(request, guarded_next, **context)
 

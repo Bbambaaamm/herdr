@@ -476,6 +476,69 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
             assert (len(effects), len(network_requests)) == before
             assert request == {**original, "model": model_name, **wrong_cap}
             assert agent._disable_streaming is False
+        # A NoNet SDK uses the host for its exact reserved request, including
+        # known HTTP errors. It never invokes the original direct transport.
+        saved_route = policy.grant.provider_routes
+        saved_authorize = policy.authorize_provider
+        saved_agent = (agent.provider, agent.base_url, agent.api_mode, agent.model,
+                       getattr(agent, "_credential_pool", None), getattr(agent, "api_key", None))
+        policy.grant.runtime_assurance = types.SimpleNamespace(
+            network_access=types.SimpleNamespace(value="none"))
+        route = types.SimpleNamespace(**vars(saved_route[0]))
+        route.provider = "nous"; route.base_url = "https://inference-api.nousresearch.com/v1"
+        route.credential_refs = ("pool:nous:entry-1",)
+        policy.grant.provider_routes = (route,)
+        policy.authorize_provider = lambda request: None
+        agent.provider = "nous"; agent.base_url = route.base_url
+        agent.model = "test-model:free"; agent.api_key = "private-test-key"
+        agent._credential_pool = types.SimpleNamespace(provider="nous", entries=lambda: [
+            types.SimpleNamespace(id="entry-1", runtime_api_key="private-test-key")])
+        agent._test_model_request = {"model": agent.model,
+            "messages": [{"role": "user", "content": "bounded host request"}]}
+        converted = []
+        chat_module = types.ModuleType("openai.types.chat")
+        class Completion:
+            @staticmethod
+            def model_validate(value):
+                converted.append(value)
+                return types.SimpleNamespace(choices=value["choices"])
+        chat_module.ChatCompletion = Completion
+        monkeypatch.setitem(sys.modules, "openai.types.chat", chat_module)
+        host_calls = []
+        answer = {"kind": "http_response", "http_status": 200,
+                  "body": {"choices": [{"message": {"content": "ACK"}}]}}
+        def execute(receipt, request_id, payload):
+            host_calls.append((receipt, request_id, payload))
+            return answer
+        policy.execute_model_effect = execute
+        network_before = len(network_requests)
+        response = loop.perform_api_call(agent)
+        assert response.choices and converted == [answer["body"]]
+        assert len(host_calls) == 1 and host_calls[0][1] == "sdk:fixture"
+        assert host_calls[0][2]["max_tokens"] == 100
+        assert [row[0] for row in effects[-2:]] == ["start", "returned"]
+        assert len(network_requests) == network_before
+        answer = {"kind": "unknown", "http_status": None, "error_type": "TimeoutError"}
+        effects_before = len(effects)
+        with pytest.raises(PolicyDenied, match="delivery_unknown"):
+            loop.perform_api_call(agent)
+        assert [row[0] for row in effects[effects_before:]] == ["start"]
+        assert len(network_requests) == network_before
+        answer = {"kind": "http_response", "http_status": 429, "body": {"error": "limited"}}
+        with pytest.raises(PolicyDenied, match="provider_http_error"):
+            loop.perform_api_call(agent)
+        assert [row[0] for row in effects[-2:]] == ["start", "returned"]
+        assert len(network_requests) == network_before
+        agent.model = "paid-model"
+        effects_before = len(effects)
+        with pytest.raises(PolicyDenied, match="profile_unsupported"):
+            loop.perform_api_call(agent)
+        assert len(effects) == effects_before
+        policy.grant.provider_routes = saved_route
+        policy.authorize_provider = saved_authorize
+        del policy.grant.runtime_assurance
+        (agent.provider, agent.base_url, agent.api_mode, agent.model,
+         agent._credential_pool, agent.api_key) = saved_agent
         agent.model = original["model"]
         policy.budget_required = lambda: False
         policy.grant.provider_routes[0].api_mode = "openai"
