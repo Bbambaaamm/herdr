@@ -655,6 +655,8 @@ def _install_private_sdk_configuration(installation, policy):
 
     installation._remember(managed_scope, "get_managed_dir", private_managed_dir)
     installation._remember(config, "get_config_path", private_config_path)
+    from .private_sdk_credentials import install_private_sdk_credentials
+    install_private_sdk_credentials(installation, policy)
 
 
 def _check_private_sdk_agent(policy, agent):
