@@ -253,3 +253,44 @@ def test_approved_branch_freeze_retains_protected_ref(reviewed,monkeypatch):
     _,published=freeze_ports(monkeypatch,definition["base_sha"])
     completion.freeze_plan(root,task)
     assert published[0]["base_branch"]==definition["completion_base"]["remote_ref"].removeprefix("refs/remotes/origin/")
+
+
+@pytest.mark.parametrize("fault", ["model-change", "stored-hash"])
+def test_stale_reviewed_graph_is_rejected_before_git_or_plan_publication(tmp_path, monkeypatch, fault):
+    raw, task, definition, _, _, _ = configured_base(tmp_path, monkeypatch)
+    reviewed = definition["reviewed_graph"]
+    if fault == "model-change":
+        reviewed["graph"]["nodes"][0]["model_policy"]["model"] = "meituan/longcat-2.0:free"
+    else:
+        reviewed["graph_sha256"] = "f" * 64
+    expected_hash = reviewed["graph_sha256"]
+    root = Path(raw["task_store_root"])
+    calls, published = freeze_ports(monkeypatch, definition["base_sha"])
+    with pytest.raises(WorkContractError, match="reviewed graph hash"):
+        config.approved_completion_base(root, task)
+    with pytest.raises(completion.EvidenceError):
+        completion.freeze_plan(root, task)
+    assert calls == [] and published == []
+    assert reviewed["graph_sha256"] == expected_hash
+    assert not list(Path(raw["storage"]).glob("work-budget/*/events.jsonl"))
+
+
+def test_prepared_reviewed_model_change_requires_explicit_matching_graph_hash(tmp_path, monkeypatch):
+    from herdr.taskgraph import TaskGraph
+    raw, task, definition, _, _, _ = configured_base(tmp_path, monkeypatch)
+    reviewed = definition["reviewed_graph"]
+    reviewed["graph"]["nodes"][0]["model_policy"]["model"] = "meituan/longcat-2.0:free"
+    reviewed["graph_sha256"] = TaskGraph.parse_planner_output(reviewed["graph"]).graph_hash()
+    assert config.approved_completion_base(Path(raw["task_store_root"]), task) == (
+        definition["completion_base"]["remote_ref"], definition["base_sha"])
+    assert not list(Path(raw["storage"]).glob("work-budget/*/events.jsonl"))
+
+
+def test_valid_hash_cannot_hide_reviewed_scope_drift_during_preparation(tmp_path, monkeypatch):
+    from herdr.taskgraph import TaskGraph
+    raw, task, definition, _, _, _ = configured_base(tmp_path, monkeypatch)
+    reviewed = definition["reviewed_graph"]
+    reviewed["graph"]["nodes"][0]["tools"] = ["write_file"]
+    reviewed["graph_sha256"] = TaskGraph.parse_planner_output(reviewed["graph"]).graph_hash()
+    with pytest.raises(WorkContractError, match="ordinary task scope"):
+        config.approved_completion_base(Path(raw["task_store_root"]), task)
