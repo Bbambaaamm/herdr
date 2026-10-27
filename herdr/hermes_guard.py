@@ -1065,14 +1065,20 @@ def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None,
             receipt=None
             assurance = getattr(getattr(guard, "grant", None), "runtime_assurance", None)
             access = getattr(getattr(assurance, "network_access", None), "value", None)
-            host_transport = access == "none" and callable(begin) and guard.budget_required()
+            budgeted_transport = callable(begin) and guard.budget_required()
             transport = getattr(guard, "execute_model_effect", None)
+            supported_host_route = (agent.provider == "nous" and agent.model.endswith(":free")
+                and agent.base_url == "https://inference-api.nousresearch.com/v1")
+            # The native bridge may share the host network namespace. Its
+            # observed network mode must not bypass the authenticated work port.
+            host_transport = budgeted_transport and (private_sdk_policy is not None
+                or access == "none" or (callable(transport) and supported_host_route))
             if host_transport:
                 if (not callable(transport) or agent.provider != "nous"
                         or not agent.model.endswith(":free")
                         or agent.base_url != "https://inference-api.nousresearch.com/v1"):
                     raise PolicyDenied("host_model_transport_profile_unsupported")
-            if callable(begin) and guard.budget_required():
+            if budgeted_transport:
                 from .evidence import canonical
                 from .work_model_deadline import validate_text_request
                 # Bound the exact SDK payload using the protected route's quote.

@@ -529,6 +529,19 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
             loop.perform_api_call(agent)
         assert [row[0] for row in effects[-2:]] == ["start", "returned"]
         assert len(network_requests) == network_before
+        # Actual ordinary launches currently attest a shared network namespace.
+        # The authenticated host port must still win over the SDK's direct client.
+        policy.grant.runtime_assurance.network_access.value = "global"
+        answer = {"kind": "http_response", "http_status": 200,
+                  "body": {"choices": [{"message": {"content": "HOST ACK"}}]}}
+        before_global = (len(host_calls), len(network_requests))
+        response = loop.perform_api_call(agent)
+        assert response.choices
+        assert len(host_calls) == before_global[0] + 1
+        assert len(network_requests) == before_global[1]
+        assert [row[0] for row in effects[-2:]] == ["start", "returned"]
+        # NoNet routes continue to reject an unsupported provider profile.
+        policy.grant.runtime_assurance.network_access.value = "none"
         agent.model = "paid-model"
         effects_before = len(effects)
         with pytest.raises(PolicyDenied, match="profile_unsupported"):
