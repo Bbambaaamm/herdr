@@ -1,4 +1,5 @@
 import copy
+import os
 import importlib.util
 from pathlib import Path
 import pytest
@@ -63,3 +64,22 @@ def test_entire_offline_cycle_is_bound_to_same_composition():
         with pytest.raises(ReadinessError):require_offline_acceptance(dict(proof,**{field:False}),'frozen',now_epoch=1001)
     for field,value in [('composition_sha256','different'),('checked_at_epoch',-90000),('external_provider_http_requests',1),('external_authentication_http_requests',True)]:
         with pytest.raises(ReadinessError):require_offline_acceptance(dict(proof,**{field:value}),'frozen',now_epoch=1001)
+
+
+@pytest.mark.skipif(os.geteuid()!=0,reason='cross-user protected-file observation requires administrator')
+def test_protected_read_accepts_access_time_change_for_an_unprivileged_reader():
+    import subprocess
+    import sys
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix='herdr-protected-atime-',dir='/var/lib') as folder:
+        root=Path(folder);source=root/'marker';source.write_bytes(b'protected-observation')
+        source.chmod(0o444);os.utime(source,ns=(1_000_000_000,source.stat().st_mtime_ns));before=source.stat()
+        root.chmod(0o555)
+        module=Path(__file__).resolve().parents[2]/'herdr/operation_readiness.py'
+        code="import importlib.util,sys;spec=importlib.util.spec_from_file_location('readiness_atime',sys.argv[1]);m=importlib.util.module_from_spec(spec);sys.modules[spec.name]=m;spec.loader.exec_module(m);assert m.read_protected(sys.argv[2])==b'protected-observation';print('PASS')"
+        def drop():os.setgroups([]);os.setgid(1001);os.setuid(1001)
+        result=subprocess.run([sys.executable,'-I','-B','-c',code,str(module),str(source)],preexec_fn=drop,
+                              capture_output=True,text=True,timeout=10,env={'PATH':'/usr/bin:/bin','LANG':'C.UTF-8'})
+        assert result.returncode==0,result.stderr
+        after=source.stat()
+        assert (before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns)==(after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns)

@@ -52,6 +52,28 @@ def user_tree(path):
         os.chown(member,1001,1001)
 
 
+def snapshot_stamp(info):
+    # Reading can legitimately update atime. It cannot change these identity,
+    # content-version or permission fields without invalidating the snapshot.
+    return (info.st_dev,info.st_ino,info.st_uid,info.st_gid,info.st_mode,info.st_nlink,
+            info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+
+
+def read_native_snapshot(source, *, owner=1001):
+    fd=os.open(source,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_NOATIME)
+    try:
+        opened=os.fstat(fd)
+        need(stat.S_ISREG(opened.st_mode) and opened.st_uid==owner and opened.st_nlink==1
+             and 0<opened.st_size<33554432,'native_binary_snapshot_denied')
+        data=bytearray()
+        while len(data)<opened.st_size:
+            part=os.read(fd,min(1048576,opened.st_size-len(data)))
+            need(bool(part),'native_snapshot_shortened');data.extend(part)
+        need(not os.read(fd,1) and snapshot_stamp(opened)==snapshot_stamp(os.fstat(fd)),'native_snapshot_changed')
+        return bytes(data)
+    finally:os.close(fd)
+
+
 def snapshot_live(root):
     home=root/'home-diagnostic15/agentops'
     paths=[root/'resume-task-reviewed-approved38.json',root/'approved38-source-and-scripts-prepared.json',
@@ -79,17 +101,10 @@ def prepare_fixture(composition_path, composition_sha, output):
     for name in ('herdr','hermes'):
         source=home/'.local/bin'/name;info=source.lstat()
         need(stat.S_ISREG(info.st_mode) and info.st_nlink==1,'native_fixture_binary_alias')
-        fd=os.open(source,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
-        try:
-            opened=os.fstat(fd);need(stat.S_ISREG(opened.st_mode) and opened.st_uid==1001 and opened.st_nlink==1 and 0<opened.st_size<33554432,'native_binary_snapshot_denied')
-            data=bytearray()
-            while len(data)<opened.st_size:
-                part=os.read(fd,min(1048576,opened.st_size-len(data)));need(bool(part),'native_snapshot_shortened');data.extend(part)
-            need(not os.read(fd,1) and opened==os.fstat(fd),'native_snapshot_changed')
-            if name=='herdr':need(data[:4]==b'\x7fELF','native_binary_format_changed')
-            if name=='hermes':need(b'coordinator_hermes_cli.py' in data and len(data)<512,'native_hermes_wrapper_changed')
-            write(test_home/'.local/bin'/name,bytes(data),0o555,1001)
-        finally:os.close(fd)
+        data=read_native_snapshot(source)
+        if name=='herdr':need(data[:4]==b'\x7fELF','native_binary_format_changed')
+        if name=='hermes':need(b'coordinator_hermes_cli.py' in data and len(data)<512,'native_hermes_wrapper_changed')
+        write(test_home/'.local/bin'/name,data,0o555,1001)
     # Original GitHub keys and host guard configuration are deliberately absent.
     (test_home/'.local/bin/gh').symlink_to('/usr/local/libexec/herdr-heating-guard/gh')
     detection=home/'.local/state/herdr/agent-detection'

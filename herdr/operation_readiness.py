@@ -65,7 +65,9 @@ def read_protected(path, *, owner=0, limit=1048576):
             block = os.read(fd, min(1048576, before.st_size - len(body)))
             require(bool(block), "protected_snapshot_shortened")
             body.extend(block)
-        require(not os.read(fd, 1) and before == os.fstat(fd), "protected_snapshot_changed")
+        stamp=lambda info:(info.st_dev,info.st_ino,info.st_uid,info.st_gid,info.st_mode,info.st_nlink,
+                           info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+        require(not os.read(fd, 1) and stamp(before) == stamp(os.fstat(fd)), "protected_snapshot_changed")
         return bytes(body)
     finally:
         os.close(fd)

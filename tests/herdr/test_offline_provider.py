@@ -58,3 +58,25 @@ def test_fixture_custody_rejects_symlink_without_chowning_target(tmp_path,monkey
     changed=[];monkeypatch.setattr(m.os,'chown',lambda path,*args:changed.append(Path(path)))
     with pytest.raises(RuntimeError,match='unexpected_link'):m.user_tree(root)
     assert target not in changed and target.read_text()=='keep'
+
+
+def test_native_snapshot_read_does_not_reject_or_change_old_access_time(tmp_path):
+    import os
+    m=load('offline_pilot.py');source=tmp_path/'binary';source.write_bytes(b'fixture-native-source')
+    old=1_000_000_000;os.utime(source,ns=(old,source.stat().st_mtime_ns))
+    assert m.read_native_snapshot(source,owner=os.geteuid())==b'fixture-native-source'
+    assert source.stat().st_atime_ns==old
+
+
+def test_native_snapshot_still_rejects_a_content_version_change(tmp_path,monkeypatch):
+    import os
+    m=load('offline_pilot.py');source=tmp_path/'binary';source.write_bytes(b'fixture-native-source')
+    original=m.os.read;changed=False
+    def read(fd,size):
+        nonlocal changed
+        data=original(fd,size)
+        if not changed:
+            changed=True;stamp=source.stat();os.utime(source,ns=(stamp.st_atime_ns,stamp.st_mtime_ns+1))
+        return data
+    monkeypatch.setattr(m.os,'read',read)
+    with pytest.raises(RuntimeError,match='snapshot_changed'):m.read_native_snapshot(source,owner=os.geteuid())
