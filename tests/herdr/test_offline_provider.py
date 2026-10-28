@@ -105,3 +105,16 @@ def test_retained_preparation_does_not_follow_a_file_alias(tmp_path):
     m=load('reconcile_offline_preparation.py');target=tmp_path/'target';target.write_bytes(b'keep');alias=tmp_path/'alias';alias.symlink_to(target)
     with pytest.raises(RuntimeError,match='retained_preparation_file_changed'):m.exact_file(alias,b'keep',owner=os.geteuid())
     assert target.read_bytes()==b'keep'
+
+
+def test_profile_inventory_uses_approved_manifest_including_sdk_policy(tmp_path):
+    import hashlib
+    m=load('offline_pilot.py');names=['profile.yaml','config.yaml','SOUL.md','herdr-sdk-policy.json']
+    expected={}
+    for name in names:
+        (tmp_path/name).write_bytes(b'approved fixture');expected[name]=hashlib.sha256(b'approved fixture').hexdigest()
+    assert {p.name for p in m.frozen_profile_members(tmp_path,expected)}==set(names)
+    (tmp_path/'SOUL.md').write_bytes(b'changed')
+    with pytest.raises(RuntimeError,match='profile_source_changed'):m.frozen_profile_members(tmp_path,expected)
+    (tmp_path/'unexpected').write_bytes(b'new')
+    with pytest.raises(RuntimeError,match='profile_inventory_changed'):m.frozen_profile_members(tmp_path,expected)

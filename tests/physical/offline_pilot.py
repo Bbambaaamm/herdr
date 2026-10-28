@@ -67,6 +67,21 @@ def safe_profile_environment(body):
     return ''.join(key+'='+value+'\n' for key,value in sorted(fields.items())).encode()
 
 
+
+def frozen_profile_members(source, expected):
+    # Use the already approved manifest, not a second hand-written inventory.
+    need(isinstance(expected,dict) and set(expected)=={p.name for p in source.iterdir()},'fixture_profile_inventory_changed')
+    members=[]
+    for name,sha in sorted(expected.items()):
+        need(name not in {'.','..'} and '/' not in name and name,'fixture_profile_name_denied')
+        p=source/name;info=p.lstat()
+        need(stat.S_ISREG(info.st_mode) and info.st_nlink==1,'fixture_profile_member')
+        # The real login is never copied or exported by this fixture.
+        if name!='auth.json':need(hashlib.sha256(p.read_bytes()).hexdigest()==sha,'fixture_profile_source_changed')
+        members.append(p)
+    return members
+
+
 def snapshot_stamp(info):
     # Reading can legitimately update atime. It cannot change these identity,
     # content-version or permission fields without invalidating the snapshot.
@@ -173,12 +188,11 @@ def prepare_fixture(composition_path, composition_sha, output):
                       'agent_key':token,'access_token':token,'scope':scope},token),sort_keys=True).encode()
     source_profile=Path(raw['private_launch']['profile']['source'])
     base=copied/'profiles-offline-base/quantlab';base.mkdir(parents=True)
-    for source in source_profile.iterdir():
-        need(source.is_file() and not source.is_symlink(),'fixture_profile_member')
+    for source in frozen_profile_members(source_profile,raw['private_launch']['profile']['files']):
         payload=body if source.name=='auth.json' else source.read_bytes().replace(b'meituan/longcat-2.5-preview:free',b'meituan/longcat-2.0:free')
         if source.name=='.env':payload=safe_profile_environment(payload)
         write(base/source.name,payload,0o444)
-        if source.name in ('auth.json','config.yaml','.env','profile.yaml'):write(test_home/'.hermes/profiles/quantlab'/source.name,payload,owner=1001)
+        write(test_home/'.hermes/profiles/quantlab'/source.name,payload,owner=1001)
     base.chmod(0o555);base.parent.chmod(0o555)
     write(test_home/'.hermes/auth.json',body,owner=1001)
     raw['private_launch']['profile']['source']=str(root/'profiles-offline-base/quantlab')

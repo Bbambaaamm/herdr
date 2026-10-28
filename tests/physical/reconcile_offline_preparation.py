@@ -68,9 +68,13 @@ print('PASS')
         if isinstance(value,list):return all(no_refresh(child) for child in value)
         return True
     need(no_refresh(store),'retained_auth_contains_refresh_material')
-    helpers['json_file'](output/'reconciliation-intent.json',{'at_epoch':time.time(),'composition_sha256':composition_sha,'original_sha256':before,'native_sdk_not_previously_started':True,'automatic_retry_allowed':False})
-    for member in source.iterdir():
-        need(member.name in {'auth.json','config.yaml','profile.yaml','.env'} and member.is_file() and not member.is_symlink(),'frozen_profile_member_changed')
+    intent=output/'reconciliation-intent.json'
+    if intent.exists():
+        prior=json.loads(intent.read_bytes())
+        need(prior.get('composition_sha256')==composition_sha and prior.get('original_sha256')==before and prior.get('native_sdk_not_previously_started') is True,'prior_preparation_intent_changed')
+        helpers['json_file'](output/'reconciliation-inventory-continuation.json',{'at_epoch':time.time(),'prior_intent_sha256':hashlib.sha256(intent.read_bytes()).hexdigest(),'original_sha256':before,'first_inner_cycle_not_started':True,'automatic_retry_allowed':False})
+    else:helpers['json_file'](intent,{'at_epoch':time.time(),'composition_sha256':composition_sha,'original_sha256':before,'native_sdk_not_previously_started':True,'automatic_retry_allowed':False})
+    for member in helpers['frozen_profile_members'](source,raw['private_launch']['profile']['files']):
         body=auth if member.name=='auth.json' else member.read_bytes().replace(b'meituan/longcat-2.5-preview:free',b'meituan/longcat-2.0:free')
         if member.name=='.env':body=helpers['safe_profile_environment'](body)
         exact_file(base/member.name,body,mode=0o444)
