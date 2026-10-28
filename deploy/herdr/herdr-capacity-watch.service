@@ -1,0 +1,16 @@
+[Unit]
+Description=Herdr staging capacity observation (no cleanup or work admission)
+
+[Service]
+Type=oneshot
+User=agentops
+Group=agentops
+ExecStart=/opt/herdr/operations/current/python -I -B /opt/herdr/operations/current/deploy/herdr/check_capacity.py --report /var/lib/herdr-capacity-watch/status.json
+NoNewPrivileges=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/herdr-capacity-watch
+RestrictAddressFamilies=AF_UNIX
+RuntimeMaxSec=20
