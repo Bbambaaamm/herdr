@@ -86,6 +86,25 @@ class SwarmExportTests(unittest.TestCase):
         self.assertEqual(rows[0]["tasks"][0]["state"], "done")
         self.assertEqual(rows[0]["edges"], [])
 
+
+    def test_terminal_unknown_stays_blocked_through_snapshot_pipeline(self):
+        from agent_platform_dashboard import production_contract as contract
+        self.write_task("blocked", self.herdr_task(
+            "root", attempt_state="terminal_unknown", fencing_token=7,
+            watchdog_blocker="terminal_unknown_delivery", delivery_reconcile_count=20))
+        payload = self.exporter.materialize(self.exporter.load_records(), observed_at=100)
+        self.assertEqual(payload["tasks"][0]["state"], "blocked")
+        self.assertEqual(payload["tasks"][0]["attempt_state"], "terminal_unknown")
+        self.assertEqual(payload["tasks"][0]["blocker"], "terminal_unknown_delivery")
+        self.assertEqual(payload["agents"], [])
+        self.exporter.publish(payload)
+        with patch.object(sources, "SWARM_PATH", str(self.output)):
+            rows, stamp = sources.swarm(str(self.output), "quantlab")
+        self.assertEqual(stamp, 100)
+        contract.row("swarm", rows[0])
+        self.assertEqual(rows[0]["tasks"][0]["state"], "blocked")
+        self.assertIsNone(rows[0]["tasks"][0]["result_sha"])
+
     def test_runtime_projection_keeps_live_state_separate_from_durable_delivery_uncertain(self):
         self.write_task(
             "pending",
