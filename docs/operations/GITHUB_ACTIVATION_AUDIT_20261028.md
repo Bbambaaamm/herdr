@@ -97,3 +97,27 @@ unprivileged exec. These are component tests, not complete ordinary SDK acceptan
 actual inference, deployment proof or full autonomy. Exact-head CI and independent
 review of these changes remain mandatory. No finding is considered resolved
 solely because its implementation changed.
+
+
+### Follow-up mount-ancestry finding
+
+The independent review of `29769de8ddea12ec6c51f6a5473e2179a347df2d`
+identified [one further P1](https://github.com/Bbambaaamm/herdr/pull/181#discussion_r4403382750):
+a concurrent HOME/.config rename could retain a credential mount under its old
+name while the publisher masked a replacement pathname. The regression now
+executes the actual publish/child functions with synthetic credential bytes,
+renames HOME/.config as the unprivileged user between mounting and masking,
+and verifies the subsequent unprivileged process cannot read the old mount.
+It fails on the reviewed source before correction.
+
+The correction never mounts GitHub credentials beneath HOME. The root transport
+selects GH_CONFIG_DIR under a root-owned 0700 parent. Before privilege drop the
+publisher checks protected ancestry, pins the original directory object using
+no-follow descriptors, mounts an empty view through those descriptors and
+verifies that the named object was replaced with a root-only mount. This uses
+[GitHub CLI's documented GH_CONFIG_DIR](https://cli.github.com/manual/gh_help_environment)
+and preserves the existing guard. CI's transport stub now uses a root-owned
+system executable rather than the runner-owned Python interpreter; executable
+custody checks remain enabled, including a regression rejecting a changed client
+before external execution. Neither change grants inference, dispatch, merge or
+deployment permission. Exact corrected-head review and CI are still required.

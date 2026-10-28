@@ -149,42 +149,82 @@ except (ConnectionResetError,BrokenPipeError):pass
 
 
 @pytest.mark.skipif(os.geteuid()!=0,reason="credential mount masking requires administrator")
-def test_publisher_masks_credentials_before_dropping_uid_and_exec(tmp_path):
-    import ast
-    import textwrap
-    source=Path(ROOT)/'deploy/herdr/native_pilot/host_action.py'
-    node=next(n for n in ast.parse(source.read_text()).body if isinstance(n,ast.FunctionDef) and n.name=='publisher_child')
-    function=ast.unparse(node)
-    # Controlled fixture bytes only; existing guard mount is hidden in the new
-    # mount namespace, never read or modified on the host.
+def test_publisher_masks_credentials_before_dropping_uid_and_exec():
+    """Exercise publish -> a real HOME rename -> the actual child masking code."""
     import tempfile
-    temporary=tempfile.TemporaryDirectory(prefix='herdr-mask-fixture-',dir='/dev/shm')
-    fixture=Path(temporary.name);fixture.chmod(0o755)
-    home=fixture/'home';(home/'.config/gh').mkdir(parents=True,mode=0o755)
-    (home/'.config/gh/hosts.yml').write_text('NONSECRET_FIXTURE')
-    home.chmod(0o755);(home/'.config').chmod(0o755)
-    baseline=subprocess.run([sys.executable,'-I','-B','-c',
-        "import os,sys;os.setgroups([]);os.setgid(1001);os.setuid(1001);assert open(sys.argv[1]).read()=='NONSECRET_FIXTURE'",
-        str(home/'.config/gh/hosts.yml')],capture_output=True,text=True,timeout=5)
-    assert baseline.returncode==0,baseline.stderr
-    program=r"""
-import ctypes,json,os,signal,subprocess,sys
+    with tempfile.TemporaryDirectory(prefix='herdr-root-mount-race-',dir='/var/lib') as folder:
+        root=Path(folder);root.chmod(0o755)
+        home=root/'mutable-home';(home/'.config/gh').mkdir(parents=True,mode=0o755)
+        for path in (home,home/'.config',home/'.config/gh'):
+            os.chown(path,1001,1001);path.chmod(0o755)
+        pins=root/'host-only-github-approved38';pins.mkdir(mode=0o700)
+        gh=pins/'gh';gh.mkdir(mode=0o751);os.chown(gh,1001,1001)
+        credential=gh/'hosts.yml';credential.write_text('NONSECRET_FIXTURE')
+        os.chown(credential,1001,1001);credential.chmod(0o600)
+        guard=pins/'guard';guard.mkdir(mode=0o755);(guard/'config').write_text('NONSECRET_GUARD')
+        program=r"""
+import ast,ctypes,json,os,secrets,signal,socket,stat,subprocess,sys,time
 from pathlib import Path
-HOME=Path(sys.argv[1]);CODE=Path('/unused-physical-fixture');PYTHON=sys.executable
+from types import SimpleNamespace
+from dataclasses import asdict
+CODE=Path(sys.argv[1]);ROOT=Path(sys.argv[2]);HOME=ROOT/'mutable-home'
+PYTHON=sys.executable;COMPOSITION_PATH='/fixture-composition';COMPOSITION_SHA='fixture'
+sys.path.insert(0,str(CODE))
+from herdr import operation_readiness
+import herdr.parent_github_transport as transport_module
+original_client=transport_module.GitHubParentTransport
+def checked_client(**kwargs):
+    client=original_client(**kwargs)
+    assert client.env['GH_CONFIG_DIR']==str(ROOT/'host-only-github-approved38/gh')
+    assert not any(k in client.env for k in ('GH_TOKEN','GITHUB_TOKEN'))
+    return client
+transport_module.GitHubParentTransport=checked_client
+from herdr.parent_publication import ParentPublicationPermit
+_helpers={'_readiness':lambda:operation_readiness}
+source=CODE/'deploy/herdr/native_pilot/host_action.py'
+__file__=str(source)
+nodes=ast.parse(source.read_text()).body
+for name in ('environment','publisher_child','publish'):
+    node=next(n for n in nodes if isinstance(n,ast.FunctionDef) and n.name==name)
+    exec(compile(ast.Module(body=[node],type_ignores=[]),str(source),'exec'))
+child_function=ast.unparse(next(n for n in nodes if isinstance(n,ast.FunctionDef) and n.name=='publisher_child'))
+real_sp=subprocess
+def launch(argv,**kwargs):
+    # Run the exact adversarial rename after publish's mounts, before child
+    # masking. This is the vulnerable ordering identified by independent review.
+    attack="import os,sys;h=sys.argv[1];os.setgroups([]);os.setgid(1001);os.setuid(1001);os.rename(h+'/.config',h+'/.config-moved');os.makedirs(h+'/.config/gh')"
+    changed=real_sp.run([PYTHON,'-I','-B','-c',attack,str(HOME)],capture_output=True,text=True,timeout=5)
+    assert changed.returncode==0,changed.stderr
+    child_code=r'''
+import ctypes,os,signal,stat,subprocess,sys
+from pathlib import Path
+ROOT=Path(sys.argv[1]);HOME=ROOT/'mutable-home';CODE=Path(sys.argv[3]);PYTHON=sys.executable
+sys.path.insert(0,str(CODE))
 def observed_exec(*args):
     assert os.geteuid()==1001
-    for p in (HOME/'.config/gh/hosts.yml',Path('/etc/herdr/heating-github-guard/config')):
-        try:p.read_bytes()
+    for path in (HOME/'.config-moved/gh/hosts.yml',
+                 ROOT/'host-only-github-approved38/gh/hosts.yml',
+                 Path('/etc/herdr/heating-github-guard/config')):
+        try:path.read_bytes()
         except (FileNotFoundError,PermissionError):pass
-        else:raise AssertionError('credential mount remained visible')
+        else:raise AssertionError('credential mount survived HOME rename')
     print('MASKED',flush=True)
     raise SystemExit(0)
 os.execve=observed_exec
-""" + '\n' + function + "\npublisher_child(Path('/unused-permit'), int(sys.argv[2]))\n"
-    result=subprocess.run(['/usr/bin/unshare','--mount','--',sys.executable,'-I','-B','-c',
-        program,str(home),str(os.getpid())],capture_output=True,text=True,timeout=10,
-        env={'PATH':'/usr/bin:/bin','LANG':'C.UTF-8'})
-    assert result.returncode==0,result.stderr[-3000:]
-    assert result.stdout.strip()=='MASKED'
-    assert (home/'.config/gh/hosts.yml').read_text()=='NONSECRET_FIXTURE'
-    temporary.cleanup()
+'''+ '\n'+child_function+"\npublisher_child(Path('/fixture-permit'),int(sys.argv[2]))\n"
+    return real_sp.Popen(['/usr/bin/unshare','--mount','--',PYTHON,'-I','-B','-c',
+                         child_code,str(ROOT),str(os.getpid()),str(CODE)],**kwargs)
+subprocess=SimpleNamespace(run=real_sp.run,Popen=launch)
+p=ParentPublicationPermit({'id':'fixture','run_token':'original','idempotency_key':'original',
+    'attempt':1,'fencing_token':1},'org/repo','a'*64,'b'*64,'c'*40,'review/base',
+    'herdr/result',int(time.time())+60,'public fixture only')
+value={'version':1,'permit':asdict(p),'transport':{'mode':'root-peer',
+    'address':'herdr-parent-'+secrets.token_hex(24),'root_pid':os.getpid()}}
+raise SystemExit(publish(value,{'HERDR_ENV':'1'}))
+"""
+        result=subprocess.run(['/usr/bin/unshare','--mount','--',sys.executable,'-I','-B','-c',
+            program,ROOT,str(root)],capture_output=True,text=True,timeout=20,
+            env={'PATH':'/usr/bin:/bin','LANG':'C.UTF-8'})
+        assert result.returncode==0,result.stderr[-4000:]
+        assert result.stdout.strip()=='MASKED'
+        assert credential.read_text()=='NONSECRET_FIXTURE'

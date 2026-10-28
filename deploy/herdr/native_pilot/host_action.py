@@ -42,8 +42,21 @@ def publisher_child(target, root_pid):
     subprocess.run(['/usr/bin/mount', '--make-rprivate', '/'], check=True)
     # This is a new mount namespace. Mask host credentials before ANY
     # unprivileged exec, including its initial dumpable interpreter window.
-    for path in (HOME/'.config/gh', Path('/etc/herdr/heating-github-guard')):
-        subprocess.run(['/usr/bin/mount', '-t', 'tmpfs', '-o', 'mode=700,size=4096', 'tmpfs', str(path)], check=True)
+    from herdr.policy_launch import _verify_root_owned_ancestry
+    for path in (ROOT/'host-only-github-approved38', Path('/etc/herdr/heating-github-guard')):
+        _verify_root_owned_ancestry(path)
+        held = os.open(path, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            before, named = os.fstat(held), path.stat()
+            assert (before.st_dev,before.st_ino)==(named.st_dev,named.st_ino)
+            subprocess.run(['/usr/bin/mount', '--no-canonicalize', '-t', 'tmpfs', '-o',
+                'mode=700,size=4096', 'tmpfs', '/proc/self/fd/'+str(held)],
+                check=True, pass_fds=(held,))
+            masked=path.stat()
+            assert (masked.st_dev,masked.st_ino)!=(before.st_dev,before.st_ino)
+            assert masked.st_uid==0 and stat.S_IMODE(masked.st_mode)==0o700
+        finally:
+            os.close(held)
     os.setgroups([]); os.setgid(1001); os.setuid(1001)
     assert libc.prctl(1, signal.SIGKILL, 0, 0, 0) == 0 and os.getppid() == root_pid
     command = [PYTHON, '-I', '-B', str(CODE/'agent-stack/bin/agent-herdr-host-entrypoint'),
@@ -58,19 +71,22 @@ def publish(value, context):
     permit = ParentPublicationPermit(**value['permit'])
     # dispatch/reconcile never mount credentials. Only this root executor does.
     subprocess.run(['/usr/bin/mount', '--make-rprivate', '/'], check=True)
-    for descriptor, target in ((os.open(ROOT/'host-only-github-approved38/gh', os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW), HOME / '.config/gh'),
-            (os.open(ROOT/'host-only-github-approved38/guard', os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW), Path('/etc/herdr/heating-github-guard'))):
-        assert stat.S_ISDIR(os.fstat(descriptor).st_mode) and target.is_dir()
-        subprocess.run(['/usr/bin/mount', '--no-canonicalize', '--bind', '/proc/self/fd/' + str(descriptor),
+    # The original gh directory is already pinned beneath root-only ancestry.
+    # Never bind it beneath mutable HOME/.config, even in a privileged child.
+    descriptor = os.open(ROOT/'host-only-github-approved38/guard', os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        target = Path('/etc/herdr/heating-github-guard')
+        subprocess.run(['/usr/bin/mount', '--no-canonicalize', '--bind', '/proc/self/fd/'+str(descriptor),
                         str(target)], check=True, pass_fds=(descriptor,))
         subprocess.run(['/usr/bin/mount', '--no-canonicalize', '-o', 'remount,bind,ro', str(target)], check=True)
-        held = os.fstat(descriptor)
-        observed = target.stat()
-        assert (held.st_dev, held.st_ino) == (observed.st_dev, observed.st_ino), 'original host directory object required'
+        held, observed = os.fstat(descriptor), target.stat()
+        assert (held.st_dev,held.st_ino)==(observed.st_dev,observed.st_ino)
+    finally:
         os.close(descriptor)
 
     client = GitHubParentTransport(repo=permit.repo, scratch=ROOT/'root-parent-transport-approved38',
-        gh=Path('/usr/local/libexec/herdr-heating-guard/gh'), home=HOME)
+        gh=Path('/usr/local/libexec/herdr-heating-guard/gh'), home=HOME,
+        config_dir=ROOT/'host-only-github-approved38/gh')
     target = ROOT/'parent-publication-permit-approved38.json'
     _helpers['_readiness']().write_owned_json(target, value)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:

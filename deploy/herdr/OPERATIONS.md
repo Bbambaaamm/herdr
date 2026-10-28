@@ -59,3 +59,10 @@ existing GitHubParentTransport and root-protected guard executable. Same-UID
 processes with a different PID are rejected. Dispatch/reconciliation receive no
 GitHub mounts. This does not relocate or redefine trust for existing host-wide
 user-owned credential stores or other projects.
+
+
+Credential mounts never use HOME/.config as a target. The root transport selects
+its pinned configuration through GH_CONFIG_DIR below root-only ancestry. Before
+privilege drop the child verifies and masks pinned directory objects through
+no-follow descriptors, then verifies the root-only replacement. The regression
+includes an actual unprivileged HOME rename between mounting and masking.

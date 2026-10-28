@@ -125,6 +125,30 @@ def _root_client_identity(path):
         os.close(fd)
 
 
+def _root_private_config_directory(path):
+    """Pin a host-selected credential directory beneath root-only ancestry."""
+    path = Path(path)
+    require(os.geteuid() == 0 and path.is_absolute() and ".." not in path.parts,
+            "root private GitHub configuration required")
+    fd = os.open("/", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for part in path.parts[1:-1]:
+            parent = os.fstat(fd)
+            require(parent.st_uid == 0 and not parent.st_mode & 0o022,
+                    "protected GitHub configuration ancestry required")
+            nxt = os.open(part, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        parent = os.fstat(fd)
+        require(parent.st_uid == 0 and stat.S_IMODE(parent.st_mode) == 0o700,
+                "root-only GitHub configuration parent required")
+        final = os.open(path.name, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+        os.close(final)
+    finally:
+        os.close(fd)
+    return path
+
+
 class GitHubParentTransport:
     """The host selects these paths; queue/model fields never select executables.
 
@@ -132,7 +156,7 @@ class GitHubParentTransport:
     Git itself receives a new bare directory and a closed configuration. The
     worker directory is never the cwd of a credential-bearing operation.
     """
-    def __init__(self, *, repo, scratch, gh, home, git=Path("/usr/bin/git")):
+    def __init__(self, *, repo, scratch, gh, home, git=Path("/usr/bin/git"), config_dir=None):
         self.repo, self.scratch = repo, Path(scratch)
         self.gh, self.git, self.home = Path(gh), Path(git), Path(home)
         self.clients = {path: _root_client_identity(path) for path in (self.gh, self.git)}
@@ -146,6 +170,8 @@ class GitHubParentTransport:
         self.env = {"PATH": "/usr/bin:/bin", "HOME": str(self.home), "LANG": "C.UTF-8",
             "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/false"}
+        if config_dir is not None:
+            self.env["GH_CONFIG_DIR"] = str(_root_private_config_directory(config_dir))
 
     def protect_from(self, writable_roots):
         require(all(not self.scratch.is_relative_to(Path(root).resolve())
