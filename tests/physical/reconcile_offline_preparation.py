@@ -105,9 +105,63 @@ print('PASS')
     return sha
 
 
+
+def synthetic_credential_after_delay(previous,now):
+    # These unsigned fixture-only credentials have no external authority. A real
+    # Nous key can never enter this function or be refreshed by this recipe.
+    token=previous['providers']['nous']['agent_key'];header,payload,signature=token.split('.')
+    decode=lambda part:json.loads(base64.urlsafe_b64decode(part+'='*((-len(part))%4)))
+    claims=decode(payload)
+    need(decode(header)=={'alg':'HS256','typ':'JWT'} and signature=='Zml4dHVyZQ'
+         and set(claims)=={'sub','scope','exp'} and claims['sub']=='herdr-offline-fixture','synthetic_fixture_credential_required')
+    claims['exp']=int(now)+7200
+    encode=lambda value:base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip('=')
+    fresh=header+'.'+encode(claims)+'.'+signature
+    return ({'id':'ab19ef','source':'device_code','credential_type':'oauth',
+             'agent_key':fresh,'access_token':fresh,'scope':claims['scope']},fresh,claims['exp'])
+
+
+def renewed_synthetic_store(previous,now):
+    entry,fresh,expiry=synthetic_credential_after_delay(previous,now)
+    helper=runpy.run_path(str(BOOTSTRAP/'deploy/herdr/existing_credential_snapshot.py'))
+    store=helper['minimal_store'](entry,fresh)
+    return json.dumps(store,sort_keys=True).encode(),expiry
+
+
+def renew_synthetic_before_first_cycle(composition_path,composition_sha,output,new_composition):
+    need(os.geteuid()==0 and output==Path('/var/lib/herdr-ordinary-offline-a0c5371-20261028'),'exact_root_fixture_required')
+    sys.path.insert(0,str(BOOTSTRAP));from herdr.operation_readiness import load_composition
+    cfg=load_composition(composition_path,composition_sha);root=Path(cfg['runtime']['root'])
+    helpers=runpy.run_path(str(Path(__file__).with_name('offline_pilot.py')));before=helpers['snapshot_live'](root)
+    need(not (output/'isolated-private.log').exists() and not (output/'preparation-completed.json').exists(),'first_inner_cycle_already_started')
+    saved=output/'root';home=saved/'home-diagnostic15/agentops';base=saved/'profiles-offline-base/quantlab'
+    for home_path in (home,root/'home-diagnostic15/agentops'):
+        need(not list((home_path/'.local/state/herdr-policy-approved38').glob('work-budget/*/events.jsonl')),'economic_admission_already_started')
+    old=(base/'auth.json').read_bytes();body,expiry=renewed_synthetic_store(json.loads(old),time.time())
+    paths=[(base/'auth.json',0,0o444),(home/'.hermes/auth.json',1001,0o600),(home/'.hermes/profiles/quantlab/auth.json',1001,0o600)]
+    for path,owner,mode in paths:exact_file(path,old,owner=owner,mode=mode)
+    helpers['json_file'](output/'synthetic-credential-refresh-intent.json',{'at_epoch':time.time(),'previous_auth_sha256':hashlib.sha256(old).hexdigest(),'new_auth_sha256':hashlib.sha256(body).hexdigest(),'fixture_only':True,'external_http_requests':0,'automatic_retry_allowed':False})
+    # The outer fixture directory is root-only; no worker has been admitted.
+    def replace(path,previous,content,mode,owner=0):
+        need(path.read_bytes()==previous and path.is_file() and not path.is_symlink(),'retained_fixture_changed')
+        temporary=path.with_name('.synthetic-ready-'+__import__('uuid').uuid4().hex)
+        exact_file(temporary,content,mode=mode,owner=owner);os.replace(temporary,path)
+    for path,owner,mode in paths:replace(path,old,body,mode,owner)
+    policy=saved/'etc-approved38/host-policy.json';old_policy=policy.read_bytes();raw=json.loads(old_policy)
+    raw['private_launch']['profile']['files']['auth.json']=hashlib.sha256(body).hexdigest()
+    replace(policy,old_policy,(json.dumps(raw,sort_keys=True,separators=(',',':'))+'\n').encode(),0o640)
+    for member in (Path(__file__).resolve(),Path(__file__).with_name('offline_pilot.py').resolve()):cfg['files'][str(member)]=hashlib.sha256(member.read_bytes()).hexdigest()
+    new_body=(json.dumps(cfg,sort_keys=True,separators=(',',':'))+'\n').encode();exact_file(new_composition,new_body,mode=0o444)
+    sha=hashlib.sha256(new_body).hexdigest()
+    need(helpers['snapshot_live'](root)==before,'original_changed_during_fixture_clock_binding')
+    helpers['json_file'](output/'synthetic-credential-ready.json',{'composition_sha256':sha,'credential_valid_until_epoch':expiry,'fixture_only':True,'original_sha256':before,'external_http_requests':0,'first_inner_cycle_not_started':True})
+    return sha
+
+
 def main():
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--composition',type=Path,required=True);parser.add_argument('--sha256',required=True);parser.add_argument('--output',type=Path,required=True);parser.add_argument('--new-composition',type=Path,required=True);args=parser.parse_args()
-    sha=complete(args.composition,args.sha256,args.output,args.new_composition)
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--composition',type=Path,required=True);parser.add_argument('--sha256',required=True);parser.add_argument('--output',type=Path,required=True);parser.add_argument('--new-composition',type=Path,required=True);parser.add_argument('--renew-synthetic-before-first-cycle',action='store_true');args=parser.parse_args()
+    action=renew_synthetic_before_first_cycle if args.renew_synthetic_before_first_cycle else complete
+    sha=action(args.composition,args.sha256,args.output,args.new_composition)
     print(json.dumps({'retained_preparation_reconciled':True,'composition':str(args.new_composition),'sha256':sha,'native_cycle_not_yet_started':True,'model_calls':0}),flush=True)
 
 

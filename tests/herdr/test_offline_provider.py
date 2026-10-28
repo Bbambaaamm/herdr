@@ -118,3 +118,24 @@ def test_profile_inventory_uses_approved_manifest_including_sdk_policy(tmp_path)
     with pytest.raises(RuntimeError,match='profile_source_changed'):m.frozen_profile_members(tmp_path,expected)
     (tmp_path/'unexpected').write_bytes(b'new')
     with pytest.raises(RuntimeError,match='profile_inventory_changed'):m.frozen_profile_members(tmp_path,expected)
+
+
+def test_late_fixture_clock_binding_only_accepts_unsigned_fixture_credentials():
+    import base64,time
+    m=load('reconcile_offline_preparation.py')
+    encode=lambda v:base64.urlsafe_b64encode(json.dumps(v).encode()).decode().rstrip('=')
+    token=encode({'alg':'HS256','typ':'JWT'})+'.'+encode({'sub':'a-real-account','scope':'invoke','exp':1})+'.Zml4dHVyZQ'
+    with pytest.raises(RuntimeError,match='synthetic_fixture_credential_required'):
+        m.synthetic_credential_after_delay({'providers':{'nous':{'agent_key':token}}},time.time())
+
+
+def test_late_fixture_clock_starts_at_readiness_and_keeps_original_untouched():
+    import base64
+    m=load('reconcile_offline_preparation.py');encode=lambda v:base64.urlsafe_b64encode(json.dumps(v).encode()).decode().rstrip('=')
+    old=encode({'alg':'HS256','typ':'JWT'})+'.'+encode({'sub':'herdr-offline-fixture','scope':'invoke','exp':1})+'.Zml4dHVyZQ'
+    original={'providers':{'nous':{'agent_key':old}}}
+    entry,key,expiry=m.synthetic_credential_after_delay(original,1_000_000)
+    assert expiry==1_007_200 and entry['agent_key']==entry['access_token']==key and key!=old
+    assert original['providers']['nous']['agent_key']==old and all('refresh' not in k.lower() for k in entry)
+    claims=json.loads(base64.urlsafe_b64decode(key.split('.')[1]+'=='))
+    assert claims=={'sub':'herdr-offline-fixture','scope':'invoke','exp':expiry}

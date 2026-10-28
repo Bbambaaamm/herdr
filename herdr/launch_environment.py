@@ -2,6 +2,10 @@
 from __future__ import annotations
 import os
 
+# Existing measured allowance for verifying pinned code, Hermes and Python
+# before a host entrypoint can serve or acknowledge admission.
+IMMUTABLE_HOST_STARTUP_TIMEOUT_SECONDS = 60.0
+
 # Clear before the first native executable, including the pane shell and FD
 # launcher. Unsetting only in the shim would be too late for its /bin/sh loader.
 STARTUP_CONTROLS=(
