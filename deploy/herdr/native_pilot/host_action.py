@@ -1,5 +1,9 @@
 """Fixed host commands in a private credential namespace; no SDK execution."""
 from pathlib import Path
+import ctypes
+import secrets
+import signal
+import socket
 import hashlib
 import json
 import os
@@ -23,6 +27,67 @@ PYTHON = '/opt/herdr/releases/p0-5035d92-test/python/bin/python3.11'
 CODE=Path(_composition['runtime']['code'])
 sys.path.insert(0, str(CODE))
 from herdr.evidence import binding
+
+
+def environment(context):
+    return {'PATH': '/home/agentops/.local/bin:/usr/local/bin:/usr/bin:/bin',
+            'HOME': str(HOME), 'LANG': 'C.UTF-8', 'SHELL': '/bin/bash',
+            'XDG_RUNTIME_DIR': '/run/user/1001', **context}
+
+
+def publisher_child(target, root_pid):
+    assert os.geteuid() == 0 and os.getppid() == root_pid
+    libc = ctypes.CDLL(None, use_errno=True)
+    assert libc.prctl(1, signal.SIGKILL, 0, 0, 0) == 0 and os.getppid() == root_pid
+    subprocess.run(['/usr/bin/mount', '--make-rprivate', '/'], check=True)
+    # This is a new mount namespace. Mask host credentials before ANY
+    # unprivileged exec, including its initial dumpable interpreter window.
+    for path in (HOME/'.config/gh', Path('/etc/herdr/heating-github-guard')):
+        subprocess.run(['/usr/bin/mount', '-t', 'tmpfs', '-o', 'mode=700,size=4096', 'tmpfs', str(path)], check=True)
+    os.setgroups([]); os.setgid(1001); os.setuid(1001)
+    assert libc.prctl(1, signal.SIGKILL, 0, 0, 0) == 0 and os.getppid() == root_pid
+    command = [PYTHON, '-I', '-B', str(CODE/'agent-stack/bin/agent-herdr-host-entrypoint'),
+               'scripts/publish-herdr-parent-result.py', '--permit', str(target)]
+    os.execve(command[0], command, dict(os.environ))
+
+
+def publish(value, context):
+    from herdr.parent_publication import ParentPublicationPermit
+    from herdr.parent_github_transport import GitHubParentTransport
+    from herdr.parent_github_peer import serve_parent_transport
+    permit = ParentPublicationPermit(**value['permit'])
+    # dispatch/reconcile never mount credentials. Only this root executor does.
+    subprocess.run(['/usr/bin/mount', '--make-rprivate', '/'], check=True)
+    for descriptor, target in ((os.open(ROOT/'host-only-github-approved38/gh', os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW), HOME / '.config/gh'),
+            (os.open(ROOT/'host-only-github-approved38/guard', os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW), Path('/etc/herdr/heating-github-guard'))):
+        assert stat.S_ISDIR(os.fstat(descriptor).st_mode) and target.is_dir()
+        subprocess.run(['/usr/bin/mount', '--no-canonicalize', '--bind', '/proc/self/fd/' + str(descriptor),
+                        str(target)], check=True, pass_fds=(descriptor,))
+        subprocess.run(['/usr/bin/mount', '--no-canonicalize', '-o', 'remount,bind,ro', str(target)], check=True)
+        held = os.fstat(descriptor)
+        observed = target.stat()
+        assert (held.st_dev, held.st_ino) == (observed.st_dev, observed.st_ino), 'original host directory object required'
+        os.close(descriptor)
+
+    client = GitHubParentTransport(repo=permit.repo, scratch=ROOT/'root-parent-transport-approved38',
+        gh=Path('/usr/local/libexec/herdr-heating-guard/gh'), home=HOME)
+    target = ROOT/'parent-publication-permit-approved38.json'
+    _helpers['_readiness']().write_owned_json(target, value)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind('\0'+value['transport']['address'])
+        listener.listen(4)
+        child = subprocess.Popen(['/usr/bin/unshare', '--mount', '--', PYTHON, '-I', '-B',
+            str(Path(__file__).resolve()), COMPOSITION_PATH, COMPOSITION_SHA,
+            '--publisher-child', str(target), str(os.getpid())],
+            env=environment(context), close_fds=True, start_new_session=True)
+        try:
+            return serve_parent_transport(listener, child, permit=permit, transport=client)
+        finally:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait(timeout=3)
 
 
 def main():
@@ -50,19 +115,6 @@ def main():
     assert len(context) <= 40 and all(isinstance(k, str) and k.startswith('HERDR_')
         and isinstance(v, str) and len(v) <= 4096 and '\0' not in v
         for k, v in context.items())
-    # Only this privileged child receives the two pre-opened directory FDs.
-    # The native server and its SDK descendants never receive these mounts.
-    subprocess.run(['/usr/bin/mount', '--make-rprivate', '/'], check=True)
-    for descriptor, target in ((os.open(ROOT/'host-only-github-approved38/gh', os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW), HOME / '.config/gh'),
-            (os.open(ROOT/'host-only-github-approved38/guard', os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW), Path('/etc/herdr/heating-github-guard'))):
-        assert stat.S_ISDIR(os.fstat(descriptor).st_mode) and target.is_dir()
-        subprocess.run(['/usr/bin/mount', '--no-canonicalize', '--bind', '/proc/self/fd/' + str(descriptor),
-                        str(target)], check=True, pass_fds=(descriptor,))
-        subprocess.run(['/usr/bin/mount', '--no-canonicalize', '-o', 'remount,bind,ro', str(target)], check=True)
-        held = os.fstat(descriptor)
-        observed = target.stat()
-        assert (held.st_dev, held.st_ino) == (observed.st_dev, observed.st_ino), 'original host directory object required'
-        os.close(descriptor)
     os.close(int(sys.argv[2])); os.close(int(sys.argv[3]))
     prefix = [PYTHON, '-I', '-B', str(CODE / 'agent-stack/bin/agent-herdr-host-entrypoint')]
     if operation == 'dispatch':
@@ -98,12 +150,9 @@ def main():
                 'head_branch': 'herdr/issue77-validation-20261026-fsqlbiyr',
                 'expires_at_epoch': int(time.time()) + 1800,
                 'public_summary': (ROOT / 'parent-public-summary.txt').read_text()},
-                'transport': {'gh': '/home/agentops/.local/bin/gh', 'home': '/home/agentops'}}
-            target = ROOT / 'parent-publication-permit-approved38.json'
-            with target.open('x') as stream:
-                json.dump(permit, stream, ensure_ascii=False);stream.flush();os.fsync(stream.fileno())
-            target.chmod(0o444)
-            command = prefix + ['scripts/publish-herdr-parent-result.py', '--permit', str(target)]
+                'transport': {'mode': 'root-peer', 'address': 'herdr-parent-'+secrets.token_hex(24),
+                              'root_pid': os.getpid()}}
+            return publish(permit, context)
     env = {'PATH': '/home/agentops/.local/bin:/usr/local/bin:/usr/bin:/bin',
            'HOME': str(HOME), 'LANG': 'C.UTF-8', 'SHELL': '/bin/bash',
            'XDG_RUNTIME_DIR': '/run/user/1001', **context}
@@ -112,4 +161,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    if len(sys.argv) == 4 and sys.argv[1] == '--publisher-child':
+        publisher_child(Path(sys.argv[2]), int(sys.argv[3]))
+    else:
+        raise SystemExit(main())

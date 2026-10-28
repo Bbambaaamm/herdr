@@ -4,6 +4,10 @@ The caller supplies no URL, credentials, or new budget. A durable one-shot
 intent binds the exact already-started operation to its immutable request.
 """
 from pathlib import Path
+import ctypes
+import socket
+import struct
+import secrets
 import hashlib
 import json
 import os
@@ -25,12 +29,8 @@ def _json(value):
                       ensure_ascii=False, allow_nan=False).encode()
 
 
-def _http_child():
+def _request_http(request):
     """Fixed URL, no proxy, redirects, refresh, retries, or inherited secrets."""
-    raw = sys.stdin.buffer.read(MAX_BODY + 32769)
-    if len(raw) > MAX_BODY + 32768:
-        raise SystemExit(2)
-    request = json.loads(raw)
     if set(request) != {"credential", "payload", "timeout_seconds"}:
         raise SystemExit(2)
     seconds = request["timeout_seconds"]
@@ -79,13 +79,67 @@ def _http_child():
                 "URLError" if isinstance(error, urllib.error.URLError) else
                 "SSLError" if isinstance(error, ssl.SSLError) else "TransportError")
         result = {"kind": "unknown", "http_status": None, "error_type": kind}
-    sys.stdout.buffer.write(_json(result) + b"\n")
+    return result
+
+
+def _protect_process():
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(4, 0, 0, 0, 0) or libc.prctl(3, 0, 0, 0, 0) != 0:
+        raise RuntimeError("private transport process required")
+
+
+def _peer(connection):
+    return struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+
+
+def _receive(connection, maximum):
+    def exact(size):
+        result = bytearray()
+        while len(result) < size:
+            block = connection.recv(min(65536, size - len(result)))
+            if not block:
+                raise ValueError("short private transport frame")
+            result.extend(block)
+        return bytes(result)
+    size = struct.unpack("!I", exact(4))[0]
+    if not 0 < size <= maximum:
+        raise ValueError("private transport frame exceeds bound")
+    return json.loads(exact(size), parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+
+
+def _send(connection, value, maximum):
+    raw = _json(value)
+    if not 0 < len(raw) <= maximum:
+        raise ValueError("private transport frame exceeds bound")
+    connection.sendall(struct.pack("!I", len(raw)) + raw)
+
+
+def _http_child(address, parent_pid, seconds):
+    # Exec resets dumpability. Protect FIRST, then create a NEW socket. Never
+    # send credentials or response bodies over descriptors inherited at exec:
+    # a same-UID observer could have opened those pipes before protection.
+    _protect_process()
+    if not address.startswith("herdr-model-") or len(address) > 100:
+        raise SystemExit(2)
+    if parent_pid != os.getppid() or not 0 < seconds <= 900:
+        raise SystemExit(2)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(seconds)
+        connection.connect("\0" + address)
+        pid, uid, _ = _peer(connection)
+        if pid != parent_pid or uid != os.getuid():
+            raise SystemExit(2)
+        request = _receive(connection, MAX_BODY + 32768)
+        # Budget time includes setup; a request cannot extend the parent's
+        # original deadline. The parent also kills its owned group on expiry.
+        request["timeout_seconds"] = min(request["timeout_seconds"], seconds)
+        _send(connection, _request_http(request), MAX_RESPONSE + 16384)
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] != ["--http-child"]:
+    if len(sys.argv) != 5 or sys.argv[1] != "--http-child":
         raise SystemExit(2)
-    _http_child()
+    _http_child(sys.argv[2], int(sys.argv[3]), float(sys.argv[4]))
     raise SystemExit(0)
 
 from .evidence import canonical, digest
@@ -148,25 +202,49 @@ def _credential(snapshot, reference):
 
 
 def _perform_http(credential, payload, seconds):
-    request = _json({"credential": credential, "payload": payload, "timeout_seconds": seconds})
-    process = subprocess.Popen([sys.executable, "-I", "-B", str(Path(__file__).resolve()),
-                                "--http-child"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, close_fds=True, start_new_session=True,
-                               env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"})
-    try:
-        stdout, _ = process.communicate(request, timeout=seconds)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL); process.communicate()
-        return {"kind": "unknown", "http_status": None, "error_type": "TimeoutError"}
-    if process.returncode or len(stdout) > MAX_RESPONSE + 16384:
-        return {"kind": "unknown", "http_status": None, "error_type": "TransportProcessError"}
-    try:
-        answer = json.loads(stdout)
-        require(type(answer) is dict and answer.get("kind") in
-                {"http_response", "invalid_response", "unknown"}, "invalid host model result")
-        return answer
-    except Exception:
-        return {"kind": "unknown", "http_status": None, "error_type": "InvalidTransportResult"}
+    request = {"credential": credential, "payload": payload, "timeout_seconds": seconds}
+    # The existing host entrypoint must have protected the credential owner.
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(3, 0, 0, 0, 0) != 0 or not 0 < seconds <= 900:
+        raise RuntimeError("protected model host required")
+    deadline = time.monotonic() + seconds
+    address = "herdr-model-" + secrets.token_hex(24)
+    process = None
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind("\0" + address)
+        listener.listen(4)
+        try:
+            process = subprocess.Popen([sys.executable, "-I", "-B", str(Path(__file__).resolve()),
+                "--http-child", address, str(os.getpid()), str(seconds)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                close_fds=True, start_new_session=True,
+                env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"})
+            # Reject connections from every other PID, even the same UID.
+            for _ in range(16):
+                listener.settimeout(max(0.001, deadline - time.monotonic()))
+                connection, _ = listener.accept()
+                with connection:
+                    if _peer(connection)[:2] != (process.pid, os.getuid()):
+                        continue
+                    connection.settimeout(max(0.001, deadline - time.monotonic()))
+                    _send(connection, request, MAX_BODY + 32768)
+                    answer = _receive(connection, MAX_RESPONSE + 16384)
+                    process.wait(timeout=max(0.001, deadline-time.monotonic()))
+                    if process.returncode:
+                        raise ValueError("private transport process failed")
+                    require(type(answer) is dict and answer.get("kind") in
+                        {"http_response", "invalid_response", "unknown"}, "invalid host model result")
+                    return answer
+            raise ValueError("private transport peer not established")
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return {"kind": "unknown", "http_status": None, "error_type": "TransportProcessError"}
+        finally:
+            if process is not None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=3)
 
 
 

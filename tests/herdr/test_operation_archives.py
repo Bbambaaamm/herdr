@@ -166,3 +166,25 @@ def test_process_inspection_error_fails_closed(tmp_path):
     (proc / "99999999/fd").write_text("invalid")
     with pytest.raises(a.ArchiveError, match="could_not_be_inspected"):
         a.active_references([], proc=proc)
+
+
+def test_missing_directory_durability_never_allows_original_removal(cache,monkeypatch):
+    destination,_=prepare(cache);original=a.os.fsync
+    def unavailable(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):raise OSError('directory durability unavailable')
+        return original(fd)
+    monkeypatch.setattr(a.os,'fsync',unavailable)
+    with pytest.raises(OSError,match='directory durability'):a.reclaim_cache_archive(destination)
+    assert (cache[0]/'nested/payload').read_bytes()==b'unique-cache-data'*900
+
+
+def test_prepared_archive_and_its_parent_names_are_fsynced(cache,monkeypatch):
+    seen=[];original=a.os.fsync
+    def record(fd):
+        info=os.fstat(fd)
+        if stat.S_ISDIR(info.st_mode):seen.append((info.st_dev,info.st_ino))
+        return original(fd)
+    monkeypatch.setattr(a.os,'fsync',record)
+    destination,_=prepare(cache)
+    for p in [destination,destination.parent]:
+        info=p.stat();assert (info.st_dev,info.st_ino) in seen

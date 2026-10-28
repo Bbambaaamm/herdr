@@ -12,6 +12,7 @@ import runpy
 import sys
 COMPOSITION_PATH,COMPOSITION_SHA=sys.argv[1:3]
 _helpers=runpy.run_path(str(Path(__file__).resolve().parents[1]/'approved_pilot.py'),run_name='native_pilot_helpers')
+_readiness_module=_helpers['_readiness']()
 _composition=_helpers['_readiness']().load_composition(COMPOSITION_PATH,COMPOSITION_SHA)
 sys.argv=[sys.argv[0],*sys.argv[3:]]
 ROOT=Path(_composition['runtime']['root'])
@@ -27,10 +28,8 @@ def mount(args, fds=()):
 
 
 def save(path, value, owner=0):
-    temp = path.with_suffix('.tmp')
-    with temp.open('w') as stream:
-        json.dump(value, stream, sort_keys=True);stream.flush();os.fsync(stream.fileno())
-    os.chown(temp, owner, 1001);temp.chmod(0o600);os.replace(temp, path)
+    _readiness_module.write_owned_json(path, value, owner=owner,
+        mode=0o444 if owner == 0 else 0o600)
 
 
 def drop():
@@ -39,6 +38,9 @@ def drop():
 
 def main():
     assert os.geteuid() == 0
+    replies = ROOT/'host-responses-approved38'
+    replies.mkdir(mode=0o755)
+    os.chown(replies, 0, 0)
     gh_fd = os.open('/home/agentops/.config/gh', os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW)
     guard_fd = os.open('/etc/herdr/heating-github-guard', os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW)
     mount(['--make-rprivate', '/'])
@@ -114,7 +116,7 @@ def main():
                 if request.stem.endswith('-publish') and response['ok']:
                     lines = (ROOT / ('host-action-approved38-' + request.stem + '.log')).read_text().splitlines()
                     receipt = json.loads(lines[-1]);response['pull_request'] = receipt['pull_request']
-                save(CONTROL / 'responses' / request.name, response, 1001)
+                save(replies / request.name, response)
                 del children[key]
             time.sleep(.2)
         assert worker.returncode == 0, 'ordinary parent stopped; retain original'

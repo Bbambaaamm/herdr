@@ -264,8 +264,7 @@ def test_http_child_flattens_sdk_metadata_and_never_uses_environment_proxy(monke
             return Response()
         return SimpleNamespace(open=open_)
     monkeypatch.setattr(urllib.request, "build_opener", build)
-    transport._http_child()
-    answer = json.loads(stdout.buffer.getvalue())
+    answer = transport._request_http(json.loads(stdin.buffer.getvalue()))
     assert answer == {"kind": "http_response", "http_status": 200, "body": {"choices": []}}
     proxy = next(value for value in handlers if isinstance(value, urllib.request.ProxyHandler))
     assert proxy.proxies == {}
@@ -285,8 +284,8 @@ def test_http_child_reports_fixed_unknown_metadata_without_exception_secret(monk
     def fail(*args, **kwargs):
         raise urllib.error.URLError("contains private-fixture-key")
     monkeypatch.setattr(transport.urllib.request, "build_opener", lambda *args: SimpleNamespace(open=fail))
-    transport._http_child()
-    assert json.loads(stdout.buffer.getvalue()) == {
+    answer = transport._request_http(json.loads(stdin.buffer.getvalue()))
+    assert answer == {
         "kind": "unknown", "http_status": None, "error_type": "URLError"}
     assert b"private-fixture-key" not in stdout.buffer.getvalue()
 

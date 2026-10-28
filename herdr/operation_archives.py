@@ -235,6 +235,15 @@ def _write_new(path, body):
         os.fsync(stream.fileno())
 
 
+def _sync_directories(*paths):
+    for path in paths:
+        fd = _open_dir(path)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
 def _protected(path):
     for parent in [Path(path), *Path(path).parents]:
         info = parent.lstat()
@@ -272,6 +281,9 @@ def prepare_cache_archive(source, parent, *, owner, scratch=Path("/dev/shm")):
                    "rows": rows, "archive_sha256": archive_sha, "archive_bytes": temp.stat().st_size,
                    "original_bytes_verified": True, "created_at_epoch": time.time()}
         _write_new(destination / "restore-catalogue.json", (json.dumps(receipt, sort_keys=True) + "\n").encode())
+        # Persist both the archive entries and the new directory name before
+        # this catalogue can be used to reclaim its original.
+        _sync_directories(destination, destination.parent)
         return destination, receipt
 
 
@@ -317,7 +329,20 @@ def restore_cache_archive(destination):
     try:
         parent_info = os.fstat(parent_fd)
         need((parent_info.st_dev, parent_info.st_ino) == (receipt["source_parent"]["device"], receipt["source_parent"]["inode"]), "restore_parent_changed")
+        # Persist restored bytes/metadata and their directory entries before
+        # publishing the restored source name. The protected archive remains.
+        for row in reversed(receipt["rows"]):
+            target = restored / _safe_relative(row["path"])
+            synced = (_open_dir(target) if row["kind"] == "directory" else
+                os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC))
+            try:
+                os.fsync(synced)
+            finally:
+                os.close(synced)
+        os.fsync(destination_fd)
         _rename_noreplace(destination_fd, "restored", parent_fd, source.name)
+        os.fsync(parent_fd)
+        os.fsync(destination_fd)
     finally:
         os.close(parent_fd)
         os.close(destination_fd)
@@ -337,7 +362,24 @@ def reclaim_cache_archive(destination, *, remove=shutil.rmtree):
         parent_info = os.fstat(parent_fd)
         need((parent_info.st_dev, parent_info.st_ino) == (receipt["source_parent"]["device"], receipt["source_parent"]["inode"]), "cache_parent_changed")
         _write_new(destination / "reclamation-intent.json", json.dumps({"at": time.time(), "source": str(source)}).encode())
+        # Revalidate durability for pre-existing catalogues as well. A file
+        # fsync alone does not persist the directory entry naming that file.
+        for name in ("content.tar.xz", "restore-catalogue.json"):
+            saved = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=destination_fd)
+            try:
+                os.fsync(saved)
+            finally:
+                os.close(saved)
+        _sync_directories(destination.parent)
+        os.fsync(destination_fd)
         _rename_noreplace(parent_fd, source.name, destination_fd, "quarantine")
+        try:
+            os.fsync(parent_fd)
+            os.fsync(destination_fd)
+        except BaseException:
+            # Keep the actual original if persisting the isolation fails.
+            _rename_noreplace(destination_fd, "quarantine", parent_fd, source.name)
+            raise
     finally:
         os.close(parent_fd)
         os.close(destination_fd)
@@ -347,10 +389,12 @@ def reclaim_cache_archive(destination, *, remove=shutil.rmtree):
         need(not active_references(rows), "isolated_cache_has_active_process_references")
         need(shutil.rmtree.avoids_symlink_attacks, "safe_recursive_removal_unavailable")
         remove(quarantine)
+        _sync_directories(destination)
         verify_archive(destination / "content.tar.xz", rows, receipt["archive_sha256"])
         result = {"completed": True, "all_original_bytes_preserved": True, "source": str(source),
                   "entries": len(rows), "restore_catalogue": str(destination / "restore-catalogue.json")}
         _write_new(destination / "completion.json", json.dumps(result, sort_keys=True).encode())
+        _sync_directories(destination)
         return result
     except BaseException:
         if not source.exists():

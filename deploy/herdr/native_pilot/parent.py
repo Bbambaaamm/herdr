@@ -30,13 +30,7 @@ from herdr.evidence import binding, digest
 ENV = {'PATH': str(HOME / '.local/bin') + ':/usr/local/bin:/usr/bin:/bin', 'HOME': str(HOME), 'LANG': 'C.UTF-8', 'SHELL': '/bin/bash', 'XDG_RUNTIME_DIR': '/run/user/1001'}
 
 def save(path, value):
-    temporary = path.with_suffix('.tmp')
-    with temporary.open('w') as stream:
-        json.dump(value, stream, sort_keys=True)
-        stream.flush()
-        os.fsync(stream.fileno())
-    temporary.chmod(384)
-    os.replace(temporary, path)
+    _helpers['_readiness']().write_owned_json(path, value, owner=os.geteuid(), mode=0o600)
 
 def call(args, *, timeout_seconds=20):
     result = subprocess.run([str(NATIVE), '--session', SESSION, *args], env=ENV, capture_output=True, text=True, timeout=timeout_seconds)
@@ -64,13 +58,13 @@ def host_action(operation, context, **data):
     identity = f'{sequence:04d}-{operation}'
     request = {'operation': operation, 'request_id': identity, 'native_context': context, **data}
     save(CONTROL / 'requests' / (identity + '.json'), request)
-    response = CONTROL / 'responses' / (identity + '.json')
+    response = ROOT / 'host-responses-approved38' / (identity + '.json')
     deadline = time.monotonic() + 240
     while not response.exists():
         if time.monotonic() > deadline:
             raise RuntimeError('host action unresolved; original request retained')
         time.sleep(0.2)
-    result = json.loads(response.read_text())
+    result = json.loads(_helpers['_readiness']().read_protected(response))
     if not result.get('ok'):
         raise RuntimeError('host action stopped; inspect original private evidence')
     return result
@@ -118,7 +112,7 @@ def progress(phase, **extra):
 
 def main():
     CONTROL.mkdir(mode=448, parents=True, exist_ok=True)
-    for name in ('requests', 'responses'):
+    for name in ('requests',):
         (CONTROL / name).mkdir(mode=448, exist_ok=True)
     assert not list((CONTROL / 'requests').glob('*.json'))
     log = (CONTROL / 'native-server.log').open('ab')

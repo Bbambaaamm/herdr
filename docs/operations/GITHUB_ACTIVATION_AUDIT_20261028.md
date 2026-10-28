@@ -64,3 +64,36 @@ Basic context/memory, capability matching, workers and approval primitives are r
 #182 currently records an initial historical index and explicitly leaves paper-level metadata/deduplication incomplete. Its comments were empty at audit. Main has CI and release workflows only; this does not exclude an external research schedule. Recurring GitHub research writes are UNKNOWN until their actual schedule, delivery and exact write evidence are reconciled. Do not create a duplicate scheduler, register or evaluator. Research summaries are not verified scientific findings or authorization to implement a proposal.
 
 Use #100/#183 for versioned routine provenance, freshness, scope, deduplication and admission. Use #184 for the one-issue canary and #185 for original uncertain-delivery reconciliation. No new issue, model allowance, merge, deployment or proactive execution is implied by this report.
+
+
+## Security review follow-up
+
+The later review of `dc21dad83415a8d38b034052f6bc93f59a67391b` supersedes
+the earlier "no major issues" code-review receipt. It found three P1s and one P2:
+
+- [HTTP child credential exposure](https://github.com/Bbambaaamm/herdr/pull/181#discussion_r4402350517):
+  exec resets dumpability, and inherited credential pipes can be opened early.
+- [Archive directory durability](https://github.com/Bbambaaamm/herdr/pull/181#discussion_r4402350541):
+  verified file bytes do not by themselves persist directory entries.
+- [Privileged response alias substitution](https://github.com/Bbambaaamm/herdr/pull/181#discussion_r4402350563):
+  predictable temporary paths in a user-owned directory can redirect root writes.
+- [Mutable publication client](https://github.com/Bbambaaamm/herdr/pull/181#discussion_r4402350591):
+  a user-owned executable alias is not a trusted credential client.
+
+The candidate now uses a fresh authenticated Unix connection created after the
+HTTP child disables dumpability; inherited stdin/stdout carry no credential or
+model response. Root responses use exclusive random temporary names, opened
+descriptors and a protected root-owned response directory. Archive reclamation
+requires fsynced files, archive directory and parent, including existing archives.
+Publication selects the root-protected GitHub guard directly and pins executable
+identity. Its credential-bearing transport stays root; the original unprivileged
+ParentArtifactPublisher retains result verification and the durable intent ledger
+and receives only the three bounded semantic transport methods. Dispatch and
+reconciliation do not receive credential mounts.
+
+Regression tests cover the original alias/durability failures, a real same-UID
+observer, exact publisher PID authentication and masking credentials before the
+unprivileged exec. These are component tests, not complete ordinary SDK acceptance,
+actual inference, deployment proof or full autonomy. Exact-head CI and independent
+review of these changes remain mandatory. No finding is considered resolved
+solely because its implementation changed.

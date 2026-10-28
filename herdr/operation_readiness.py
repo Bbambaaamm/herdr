@@ -115,3 +115,46 @@ def host_action_command(python, script, composition_path, composition_sha256, re
     require(type(gh_fd)is int and type(guard_fd)is int and gh_fd>=0 and guard_fd>=0, "host_action_descriptors")
     return ['/usr/bin/unshare','--mount','--fork',str(python),'-I','-B',str(script),
             str(composition_path),composition_sha256,str(request),str(gh_fd),str(guard_fd)]
+
+
+def write_owned_json(path, value, *, owner=0, group=1001, mode=0o444):
+    """Atomic descriptor-relative writes; never follow a caller's temp alias."""
+    path = Path(path)
+    require(path.is_absolute() and ".." not in path.parts, "absolute_output_required")
+    raw = (json.dumps(value, sort_keys=True, allow_nan=False) + "\n").encode()
+    require(len(raw) <= 1048576, "bounded_output_required")
+    directory = os.open("/", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    temporary = None
+    try:
+        for part in path.parts[1:-1]:
+            child = os.open(part, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        info = os.fstat(directory)
+        require(info.st_uid == os.geteuid() and not info.st_mode & 0o022, "owned_output_directory_required")
+        sync_fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=directory)
+        try:
+            temporary = ".herdr-json-" + os.urandom(16).hex()
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         0o600, dir_fd=directory)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(raw)
+                stream.flush()
+                if os.geteuid() == 0:
+                    os.fchown(stream.fileno(), owner, group)
+                else:
+                    require(owner == os.geteuid(), "output_owner_change_denied")
+                os.fchmod(stream.fileno(), mode)
+                os.fsync(stream.fileno())
+            os.replace(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory)
+            temporary = None
+            os.fsync(sync_fd)
+        finally:
+            os.close(sync_fd)
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+        os.close(directory)

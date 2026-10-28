@@ -41,3 +41,21 @@ A fixture PASS is not real inference or acceptance. #9 remains open until the
 live result, independent review, exact PR/CI, original-worker acceptance,
 interrupted completion recovery, delegation, rollback and at least 24-hour soak
 have their own evidence for the deployed composition.
+
+
+## Credential and archive boundaries after security review
+
+The HTTP child protects itself after exec and creates a fresh peer-authenticated
+Unix connection. Inherited standard descriptors contain neither credentials nor
+model responses. Root IPC responses are published through pinned no-follow
+lookups into a root-owned response directory, with random exclusive temporary
+files and descriptor-based metadata changes. Cache reclamation persists archive
+file and directory names before isolating or removing any original.
+
+GitHub publication keeps the existing ParentArtifactPublisher and its evidence
+and intent authority. Its unprivileged process runs without GitHub credential
+mounts. A bounded root peer executes only observe/push/create-PR through the
+existing GitHubParentTransport and root-protected guard executable. Same-UID
+processes with a different PID are rejected. Dispatch/reconciliation receive no
+GitHub mounts. This does not relocate or redefine trust for existing host-wide
+user-owned credential stores or other projects.
