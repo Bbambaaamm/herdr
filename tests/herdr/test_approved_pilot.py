@@ -38,3 +38,21 @@ def test_clock_never_changes_after_economic_admission_or_start_intent(tmp_path,b
  else:(tmp_path/'approved38-unit-start-intent.json').write_text('{}')
  with pytest.raises(AssertionError):m.refresh_pending_start_clock()
  assert not (tmp_path/'approved38-before-admission-clock.json').exists()
+
+
+def test_auth_child_uses_versioned_snapshot_with_derived_lifetime(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    m=load();m.R=tmp_path;m.P='/pinned/python';m.REQUIRED_CREDENTIAL_SECONDS=3330
+    calls=[]
+    def run(command,**kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=1,stdout='',stderr='')
+    monkeypatch.setattr(m.subprocess,'run',run)
+    monkeypatch.setattr(m,'save',lambda *args,**kwargs:None)
+    with pytest.raises(AssertionError,match='authentication unavailable'):m.prepare_auth()
+    assert len(calls)==1
+    child=calls[0]
+    assert child[3]==str(ROOT/'existing_credential_snapshot.py')
+    assert child[-2:]==['--required-validity-seconds','3330']
+    assert 'approved38-existing-credential-snapshot.py' not in child[3]
+    assert not (tmp_path/'approved38-unit-start-intent.json').exists()

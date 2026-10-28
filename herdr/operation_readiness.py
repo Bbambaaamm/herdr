@@ -93,15 +93,15 @@ def require_new_failure_evidence(previous, current):
 
 def require_offline_acceptance(proof, composition_sha256, *, now_epoch):
     fields={"schema_version","composition_sha256","checked_at_epoch","ordinary_worker_used","actual_sdk_used",
-            "host_ipc_used","work_tools_verified","validation_verified","result_accepted","provider_http_requests",
-            "authentication_http_requests","fixture_only"}
+            "host_ipc_used","work_tools_verified","validation_verified","local_result_accepted","external_provider_http_requests",
+            "external_authentication_http_requests","fixture_only"}
     require(set(proof)==fields and proof["schema_version"]=="herdr-ordinary-offline-acceptance-1", "offline_proof_schema")
     require(proof["composition_sha256"]==composition_sha256, "offline_proof_composition_changed")
     for field in ("ordinary_worker_used","actual_sdk_used","host_ipc_used","work_tools_verified",
-                  "validation_verified","result_accepted","fixture_only"):
+                  "validation_verified","local_result_accepted","fixture_only"):
         require(proof[field] is True, "offline_cycle_not_accepted")
-    require(type(proof["provider_http_requests"])is int and proof["provider_http_requests"]==0
-            and type(proof["authentication_http_requests"])is int and proof["authentication_http_requests"]==0,
+    require(type(proof["external_provider_http_requests"])is int and proof["external_provider_http_requests"]==0
+            and type(proof["external_authentication_http_requests"])is int and proof["external_authentication_http_requests"]==0,
             "offline_external_effect_recorded")
     at=proof["checked_at_epoch"]
     require(type(at) in (int,float) and 0<=now_epoch-at<=86400, "offline_proof_stale")

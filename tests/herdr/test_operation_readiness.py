@@ -56,10 +56,10 @@ def test_entire_offline_cycle_is_bound_to_same_composition():
     from herdr.operation_readiness import require_offline_acceptance
     proof={'schema_version':'herdr-ordinary-offline-acceptance-1','composition_sha256':'frozen',
            'checked_at_epoch':1000,'ordinary_worker_used':True,'actual_sdk_used':True,'host_ipc_used':True,
-           'work_tools_verified':True,'validation_verified':True,'result_accepted':True,
-           'provider_http_requests':0,'authentication_http_requests':0,'fixture_only':True}
+           'work_tools_verified':True,'validation_verified':True,'local_result_accepted':True,
+           'external_provider_http_requests':0,'external_authentication_http_requests':0,'fixture_only':True}
     require_offline_acceptance(proof,'frozen',now_epoch=1001)
-    for field in ('ordinary_worker_used','actual_sdk_used','host_ipc_used','work_tools_verified','validation_verified','result_accepted','fixture_only'):
+    for field in ('ordinary_worker_used','actual_sdk_used','host_ipc_used','work_tools_verified','validation_verified','local_result_accepted','fixture_only'):
         with pytest.raises(ReadinessError):require_offline_acceptance(dict(proof,**{field:False}),'frozen',now_epoch=1001)
-    for field,value in [('composition_sha256','different'),('checked_at_epoch',-90000),('provider_http_requests',1),('authentication_http_requests',True)]:
+    for field,value in [('composition_sha256','different'),('checked_at_epoch',-90000),('external_provider_http_requests',1),('external_authentication_http_requests',True)]:
         with pytest.raises(ReadinessError):require_offline_acceptance(dict(proof,**{field:value}),'frozen',now_epoch=1001)

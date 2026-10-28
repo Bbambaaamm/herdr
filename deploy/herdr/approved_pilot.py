@@ -153,7 +153,7 @@ def prepare_auth():
     # This child can select an existing key but cannot contact any network.
     import uuid,stat
     output=Path('/dev/shm')/('herdr38-existing-auth-'+uuid.uuid4().hex)
-    helper=R/'approved38-existing-credential-snapshot.py'
+    helper=Path(__file__).with_name('existing_credential_snapshot.py')
     result=subprocess.run([P,'-I','-B',str(helper),'--snapshot-existing-login',str(output),'--required-validity-seconds',str(REQUIRED_CREDENTIAL_SECONDS)],preexec_fn=drop,
         env={'HOME':'/home/agentops','PATH':'/usr/bin:/bin','LANG':'C.UTF-8'},cwd='/home/agentops',capture_output=True,text=True,timeout=65)
     save(R/'approved38-current-existing-auth-child-status.json',{'returncode':result.returncode,'private_snapshot':str(output),'auth_http_requests':0,'model_calls':0},0o400)
@@ -271,7 +271,7 @@ def refresh_pending_start_clock():
     prepared['admission_clock_only_fields']=['attempt_started_at','dispatch_claimed_at']
     save(prepared_path,prepared,0o444)
 
-def main():
+def prepare_existing():
     prepared=check()
     sys.path.insert(0,str(C))
     from herdr.work_configuration import _reviewed_graph
@@ -294,6 +294,10 @@ def main():
     assert original_budget()==prepared['previous_budget_sha256']
     admin_deadline()
     assert os.statvfs('/').f_bavail*os.statvfs('/').f_frsize>=STOP_FLOOR+START_GUARD
+    return prepared,duration
+
+def main():
+    prepared,duration=prepare_existing()
     once(R/'approved38-unit-start-intent.json',{'at_utc':datetime.now(timezone.utc).isoformat(),'automatic_retry_allowed':False,'budget_admission':'ordinary_host_work_factory'})
     command=['/usr/bin/systemd-run','--unit=herdr-taskgraph77-approved38','--property=RuntimeMaxSec='+str(min(2100,int(admin_deadline()-time.time()-30))),'--property=TimeoutStopSec=15','--property=KillMode=control-group','--property=Restart=no','/usr/bin/unshare','--mount','--pid','--fork','--mount-proc',P,'-I','-B',str(Path(__file__).parent/'native_pilot/init.py'),COMPOSITION['_path'],COMPOSITION['_sha256']]
     result=subprocess.run(command,capture_output=True,text=True,timeout=20)
