@@ -15,6 +15,9 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from herdr.recovery_unknown import held as terminal_unknown_hold
+
 HOME = Path("/home/agentops")
 ROOT = HOME / ".local/state/agent-stack/tasks"
 PENDING = ROOT / "pending"
@@ -393,6 +396,8 @@ def _rename_exclusive(directory_fd, source, target):
 
 def publish_task(path, task, admission):
     # The dispatcher only sees a complete fsynced JSON, published without replace.
+    if terminal_unknown_hold(task):
+        raise AdmissionDenied("terminal_unknown_requires_operator_reconciliation")
     directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     temporary = None
     try:
@@ -891,6 +896,8 @@ Operating rules:
 
 
 def _queue_issue_locked(consumer: dict, issue: dict, records: list[dict]) -> str:
+    if any(terminal_unknown_hold(record["task"]) for record in records):
+        raise AdmissionDenied("terminal_unknown_requires_operator_reconciliation")
     issue, admission = approved_revision(consumer, issue)
     number = issue["number"]
     task_id = f"github-{consumer['consumer']}-issue-{number}-approval-{admission['approval_id']}"
@@ -955,6 +962,9 @@ def _queue_issue_locked(consumer: dict, issue: dict, records: list[dict]) -> str
 def intervention_blocker(
     records: list[dict], *, allow_failed_replan: bool = False
 ) -> tuple[str, str] | None:
+    for record in records:
+        if terminal_unknown_hold(record["task"]):
+            return str(record["task"].get("id") or ""), "terminal_unknown_requires_operator_reconciliation"
     if not records:
         return None
     latest = records[0]
