@@ -168,7 +168,10 @@ def test_unapproved_or_active_inputs_fail_without_task_transition(prepared, chan
             {"identity": task["work_contract"]["identity"], "event": "work_budget_reserve"})
     elif change == "events": put(p["events"], p["events"].read_bytes() + b'{"event":"work_result"}\n')
     elif change == "result":
-        p["result"].unlink();put(p["result"], b"")
+        original_inode = p["result"].stat().st_ino
+        p["result"].rename(p["result"].with_name("retained-original-slot"))
+        put(p["result"], b"")
+        assert p["result"].stat().st_ino != original_inode
     elif change == "nonempty_result": put(p["result"], b'{"status":"completed"}')
     elif change == "child":
         from agent_durable_children import ensure_attempt_directory
@@ -351,3 +354,77 @@ def test_protected_decision_accepts_only_root_owned_metadata(prepared, monkeypat
         alias = root / "retained"
         path.rename(alias);path.symlink_to(alias)
         with pytest.raises(OSError): unknown.load_decision(p["task"]["id"])
+
+def test_uninspectable_decision_holds_all_automatic_entrypoints(prepared, monkeypatch):
+    p = prepared
+    original = unknown.os.lstat
+    def denied(path, *args, **kwargs):
+        if Path(path) == p["approval"]:
+            raise PermissionError("synthetic protected decision")
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(unknown.os, "lstat", denied)
+    assert unknown.held(p["task"]) is True
+    recovery = script("agent-stack-recovery")
+    monkeypatch.setattr(recovery, "BLOCKED", p["root"] / "blocked")
+    monkeypatch.setattr(recovery, "ensure_live_task_bridge",
+                        lambda *args: pytest.fail("uninspectable decision did not hold"))
+    before = p["path"].read_bytes()
+    recovery.reconcile_watchdog_blocked_tasks()
+    assert p["path"].read_bytes() == before
+
+
+def test_resumed_intent_requires_successful_directory_sync_before_task_write(prepared, monkeypatch):
+    p = prepared
+    original_sync = unknown.os.fsync
+    observations = []
+    def fail_receipt_directory(fd):
+        target = Path(os.readlink("/proc/self/fd/" + str(fd)))
+        if target == p["root"] / "results":
+            observations.append("results-sync-failed")
+            raise OSError("synthetic results directory fsync failure")
+        return original_sync(fd)
+    monkeypatch.setattr(unknown.os, "fsync", fail_receipt_directory)
+    original = p["path"].read_bytes()
+    # First attempt publishes the intent's name but cannot confirm durability.
+    with pytest.raises(OSError): apply(p)
+    assert p["path"].read_bytes() == original
+    assert list((p["root"] / "results").glob("*.watchdog-terminal-unknown-*.json"))
+    # Retrying must not skip the same failed durability barrier.
+    with pytest.raises(OSError): apply(p)
+    assert p["path"].read_bytes() == original
+    assert observations == ["results-sync-failed", "results-sync-failed"]
+    def observe_sync(fd):
+        if Path(os.readlink("/proc/self/fd/" + str(fd))) == p["root"] / "results":
+            observations.append("results-durable")
+        return original_sync(fd)
+    original_write = unknown._write
+    def observe_write(path, raw, **kwargs):
+        if path == p["path"]:
+            assert observations[-1] == "results-durable"
+        return original_write(path, raw, **kwargs)
+    monkeypatch.setattr(unknown.os, "fsync", observe_sync)
+    monkeypatch.setattr(unknown, "_write", observe_write)
+    assert apply(p)["status"] == "terminal_unknown"
+
+@pytest.mark.parametrize("decision_only", [True, False])
+def test_bridge_and_canonical_parent_composition_reject_unknown(prepared, monkeypatch, decision_only):
+    p = prepared
+    if not decision_only:
+        apply(p)
+        p["approval"].unlink()  # Persisted marker remains a hold independently.
+    bridge = script("agent-durable-bridge")
+    with pytest.raises(ValueError, match="terminal_unknown"):
+        bridge._current_task_file(p["root"], p["task"]["id"], p["task"]["run_token"])
+    from herdr.host_configuration import read_canonical_parent
+    with pytest.raises(SecurityError, match="terminal_unknown"):
+        read_canonical_parent(p["root"], p["task"]["id"], p["task"]["run_token"])
+
+
+def test_empty_result_metadata_change_is_not_original_slot_generation(prepared):
+    p = prepared
+    info = p["result"].stat()
+    os.utime(p["result"], ns=(info.st_atime_ns, info.st_mtime_ns + 1000000000))
+    before = p["path"].read_bytes()
+    with pytest.raises(EvidenceError, match="approved_inputs_changed"):
+        apply(p)
+    assert p["path"].read_bytes() == before

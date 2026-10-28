@@ -3,7 +3,8 @@
 This is delivery reconciliation for an original uncertain attempt. It does not
 prove task completion, issue completion, usage, cost, or safe redispatch. The
 task stays in `blocked/` with `attempt_state=terminal_unknown`; intake,
-dispatcher, worker, recovery and queue export retain the operator blocker.
+dispatcher, worker, durable bridge, canonical parent composition, recovery and
+queue export retain the operator blocker.
 No dependency is released and no successful result is manufactured.
 
 ## Preparation and activation are separate
@@ -36,7 +37,7 @@ A future activation requires a separately approved maintenance operation:
 
 The closed decision schema is defined by `load_decision`. It binds task ID,
 original run/idempotency/attempt/fence digest, all semantic task fields,
-the observed empty result's device/inode/hash, the complete matching original
+the observed empty result's device/inode/hash and modification/change timestamps, the complete matching original
 budget-ledger inventory, the work-history hash and a separately reviewed
 evidence hash. It also includes an approval reference, issuance/expiry (at
 most one hour) and the maintenance attestation

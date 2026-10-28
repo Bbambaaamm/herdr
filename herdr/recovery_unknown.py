@@ -52,8 +52,9 @@ def held(task):
         return True
     try:
         path = decision_path(task.get("id"))
-        return os.path.lexists(path)
-    except EvidenceError:
+        os.lstat(path)
+        return True
+    except (EvidenceError, FileNotFoundError):
         return False  # Existing callers validate malformed/non-task inputs.
     except OSError:
         return True
@@ -152,9 +153,9 @@ def load_decision(task_id):
     need(all(type(value[k]) is int for k in ("issued_at_epoch", "expires_at_epoch"))
          and 0 < value["expires_at_epoch"] - value["issued_at_epoch"] <= 3600, "decision_lifetime")
     need(type(value["result"]) is dict and set(value["result"]) ==
-         {"device", "inode", "bytes", "sha256"}
+         {"device", "inode", "bytes", "sha256", "mtime_ns", "ctime_ns"}
          and all(type(value["result"][k]) is int and value["result"][k] >= 0
-                 for k in ("device", "inode", "bytes"))
+                 for k in ("device", "inode", "bytes", "mtime_ns", "ctime_ns"))
          and value["result"]["bytes"] == 0
          and value["result"]["sha256"] == hashlib.sha256(b"").hexdigest(), "result_binding")
     need(type(value["budget_ledgers"]) is list and 1 <= len(value["budget_ledgers"]) <= 1024,
@@ -218,6 +219,7 @@ def _observations(root, storage, task):
     raw, info = snapshot(result_path, maximum=1048576)
     need(raw == b"", "empty_original_result_required")
     result = {"device": info.st_dev, "inode": info.st_ino, "bytes": len(raw),
+              "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns,
               "sha256": hashlib.sha256(raw).hexdigest()}
     path = storage / "work-contracts" / digest(binding(task)) / "events.jsonl"
     events_raw, _ = snapshot(path)
@@ -373,6 +375,13 @@ def apply(root, task_id, *, active_workers):
         except FileExistsError:
             old, _ = snapshot(receipt_path, maximum=MAX_BYTES)
             need(old == receipt_bytes, "interrupted_receipt_requires_reconciliation")
+            # A prior rename can be visible without a durable directory entry.
+            # Re-establish the intent barrier even after an fsync failure/restart.
+            directory = _directory(receipt_path.parent)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
         # Recheck the exact task and all immutable inputs AFTER durable intent.
         current, current_stamp = snapshot(path, maximum=1048576)
         need(current == raw and _stamp(current_stamp) == _stamp(stamp), "task_changed_before_transition")
