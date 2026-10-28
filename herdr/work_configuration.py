@@ -254,7 +254,11 @@ def approved_completion_base(root, task, *, configuration_path=HOST_POLICY_CONFI
             "bounded approved work plans required")
     definition = plans.get(spec_digest(task))
     require(isinstance(definition, dict), "exact work spec is not host approved")
-    return _completion_base_selection(root, task, raw, definition)
+    selected = _completion_base_selection(root, task, raw, definition)
+    # Completion preparation must validate the same graph as work admission.
+    # A model change also changes its reviewed hash; never repair it here.
+    _reviewed_graph(definition, task)
+    return selected
 
 
 def _reviewed_graph(definition, task):

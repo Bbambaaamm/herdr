@@ -40,7 +40,7 @@ FILES = (
 OUTPUT = Path("provenance/CANONICAL_SOURCE_MANIFEST.sha256")
 TEXT_SUFFIXES = {
     ".txt", ".css", ".html", ".in", ".js", ".json", ".md", ".mjs", ".py",
-    ".service", ".sh", ".sha256", ".yaml",
+    ".service", ".timer", ".sh", ".sha256", ".yaml",
 }
 
 

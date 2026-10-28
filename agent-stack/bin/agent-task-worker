@@ -35,7 +35,7 @@ LOGS = ROOT / "logs"
 LOCK = ROOT / "worker.lock"
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
-from herdr.launch_environment import sanitize_environment
+from herdr.launch_environment import sanitize_environment, IMMUTABLE_HOST_STARTUP_TIMEOUT_SECONDS
 from herdr.host_configuration import host_entrypoint_command
 from herdr.policy_launch import process_start_ticks
 ENV = {key: value for key, value in sanitize_environment(os.environ).items()
@@ -306,7 +306,7 @@ TASK_PANE_ENV = "HERDR_DURABLE_TASK_PANE"
 POLICY_BIN = Path(__file__).resolve().parents[1] / "policy-bin"
 CHILD_HELPER = Path(__file__).resolve().parent / "agent-durable-child"
 BRIDGE = Path(__file__).resolve().parent / "agent-durable-bridge"
-BRIDGE_STARTUP_TIMEOUT_SECONDS = 60.0
+BRIDGE_STARTUP_TIMEOUT_SECONDS = IMMUTABLE_HOST_STARTUP_TIMEOUT_SECONDS
 
 
 def bridge_socket_name(task: dict) -> str:
@@ -722,6 +722,31 @@ def _recover_root_local_result(task):
         raise EvidenceError("original passed handoff request is missing")
     port.deliver(cycle, requests[-1])
     return True
+
+
+def _policy_failure_diagnostic(exc):
+    """Retain bounded source locations, never exception messages or locals."""
+    repository = Path(__file__).resolve().parents[2]
+    allowed_types = {"RuntimeError", "SecurityError", "ValueError", "KeyError",
+                     "TypeError", "OSError", "FileNotFoundError", "PermissionError"}
+    chain, seen = [], set()
+    while exc is not None and id(exc) not in seen and len(chain) < 4:
+        seen.add(id(exc))
+        frames = []
+        trace = exc.__traceback__
+        while trace is not None and len(frames) < 16:
+            try:
+                source = Path(trace.tb_frame.f_code.co_filename).absolute().relative_to(repository)
+            except ValueError:
+                source = None
+            if source is not None and (source.as_posix() == "agent-stack/bin/agent-task-worker"
+                    or (source.parts[0] == "herdr" and source.suffix == ".py")):
+                frames.append({"file": source.as_posix(), "line": trace.tb_lineno})
+            trace = trace.tb_next
+        name = type(exc).__name__
+        chain.append({"error_type": name if name in allowed_types else "other", "frames": frames})
+        exc = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+    return {"schema_version": "herdr-invocation-policy-diagnostic-1", "chain": chain}
 
 
 def _root_policy_factory():
@@ -1529,10 +1554,11 @@ def run_prompt(task: dict) -> tuple[int, str]:
     timeout_seconds = int(task.get("timeout_seconds") or 1800)
     prompt = prompt_text(task)
     if modern_work_contract(task):
-        # One native delivery. Framing is validated before recording intent;
-        # the authenticated CLI transport preserves the SDK paste guard.
-        from herdr.hermes_terminal_transport import encode_native_prompt
-        prompt = encode_native_prompt(prompt)
+        # Herdr agent.prompt frames text according to the live terminal mode.
+        # Validate before recording intent; a second frame reaches the SDK as
+        # escaped paste content rather than one submitted prompt.
+        from herdr.hermes_terminal_transport import validate_native_prompt
+        prompt = validate_native_prompt(prompt)
     cmd = [
         str(HERDR), "agent", "prompt", agent, prompt,
         "--wait", "--timeout", str(timeout_seconds * 1000),
@@ -2142,6 +2168,7 @@ def _main_with_epoch(task_path: Path) -> int:
                     block_task(task_path, task, exc.code, detail[:1024])
                     return 1
                 if detail.startswith(("task_invocation_policy_", "task_work_contract_", "host grant")):
+                    task["invocation_policy_diagnostic"] = _policy_failure_diagnostic(exc)
                     block_task(task_path, task, "task_invocation_policy_unavailable",
                                "Host invocation policy must be supplied before execution.")
                     return 1

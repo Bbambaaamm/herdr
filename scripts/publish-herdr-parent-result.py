@@ -67,16 +67,23 @@ def load_permit(path):
     if (not isinstance(raw, dict) or set(raw) != {"version", "permit", "transport"}
             or type(raw["version"]) is not int or raw["version"] != 1
             or not isinstance(raw["transport"], dict)
-            or set(raw["transport"]) != {"gh", "home"}):
+            or set(raw["transport"]) not in ({"gh", "home"}, {"mode", "address", "root_pid"})):
         raise EvidenceError("closed root-approved parent publication configuration required")
     try:
         permit = ParentPublicationPermit(**raw["permit"])
     except TypeError as exc:
         raise EvidenceError("closed parent publication permit required") from exc
-    for name in ("gh", "home"):
-        value = raw["transport"][name]
-        if not isinstance(value, str) or not Path(value).is_absolute() or "\0" in value:
-            raise EvidenceError("approved absolute parent client path required")
+    transport = raw["transport"]
+    if set(transport) == {"mode", "address", "root_pid"}:
+        if (transport["mode"] != "root-peer" or type(transport["root_pid"]) is not int
+                or transport["root_pid"] <= 0 or type(transport["address"]) is not str
+                or not transport["address"].startswith("herdr-parent-") or len(transport["address"]) > 100):
+            raise EvidenceError("closed root publication peer required")
+    else:
+        for name in ("gh", "home"):
+            value = transport[name]
+            if not isinstance(value, str) or not Path(value).is_absolute() or "\0" in value:
+                raise EvidenceError("approved absolute parent client path required")
     return permit, raw["transport"]
 
 
@@ -110,8 +117,13 @@ def main(argv=None):
     # Receipt-backed recovery already exists in the original worker. This
     # command neither allocates a work budget nor invokes the oracle/model.
     store = EvidenceStore(factory.result_authority.store.root/"parent-publication")
-    transport = GitHubParentTransport(repo=permit.repo, scratch=store.root/"transport",
-        gh=Path(transport_config["gh"]), home=Path(transport_config["home"]))
+    if transport_config.get("mode") == "root-peer":
+        from herdr.parent_github_peer import GitHubParentTransportProxy
+        transport = GitHubParentTransportProxy(permit=permit, address=transport_config["address"],
+                                               root_pid=transport_config["root_pid"])
+    else:
+        transport = GitHubParentTransport(repo=permit.repo, scratch=store.root/"transport",
+            gh=Path(transport_config["gh"]), home=Path(transport_config["home"]))
     receipt = ParentArtifactPublisher(permit=permit, receipt_store=store,
         transport=transport).publish(task=task, payload=payload, plan=plan, factory=factory)
     print(json.dumps({"published": True, "task_id": task["id"],

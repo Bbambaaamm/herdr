@@ -27,8 +27,10 @@ def permit():
 
 
 def transport(tmp_path):
+    # HTTP/Git execution is explicitly mocked by these component tests. Use a
+    # real root-owned executable for custody, not CI's user-owned interpreter.
     return GitHubParentTransport(repo="org/repo",scratch=tmp_path/"transport",
-        gh=Path(sys.executable),home=tmp_path/"parent-home")
+        gh=Path("/usr/bin/git"),home=tmp_path/"parent-home")
 
 
 def test_http_observation_uses_fixed_repo_branches_and_complete_bounded_query(tmp_path,monkeypatch):
@@ -224,3 +226,14 @@ def test_parent_command_rejects_noncanonical_work_marker_before_recovery(tmp_pat
     with pytest.raises(EvidenceError,match="modern parent task"):
         module.main(["--permit","/root-approved/component.json"])
 
+
+
+def test_client_identity_change_stops_before_external_process(tmp_path,monkeypatch):
+    import herdr.parent_github_transport as module
+    client=transport(tmp_path);p=permit();effects=[]
+    original=module._root_client_identity
+    monkeypatch.setattr(module,'_root_client_identity',lambda path:('changed',original(path)))
+    monkeypatch.setattr(module,'_bounded_process',lambda *a,**k:effects.append(True))
+    with pytest.raises(EvidenceError,match='client changed'):
+        client._run(p,[str(client.gh),'api','repos/org/repo'])
+    assert effects==[]

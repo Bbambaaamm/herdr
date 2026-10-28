@@ -47,12 +47,11 @@ def _need(ok, reason):
 
 
 
-def encode_native_prompt(text):
-    """Frame approved plain text for ONE native agent prompt, without sending it.
+def validate_native_prompt(text):
+    """Validate plain text for agent.prompt, which supplies its own paste frame.
 
-    Content cannot inject a terminator, terminal escape, or another input event.
-    No stripping/newline normalization; only LF and TAB are allowed controls.
-    Native API pass-through and real SDK submission require separate evidence.
+    Keep the complete wire-byte ceiling, including Herdr's twelve framing bytes.
+    Content cannot inject a terminator, escape, or another terminal input event.
     """
     _need(type(text) is str and 0 < len(text) <= MAX_NATIVE_PROMPT_BYTES - 12,
           "native_cli_prompt_invalid")
@@ -63,7 +62,12 @@ def encode_native_prompt(text):
     except UnicodeError:
         raise PolicyDenied("native_cli_prompt_invalid") from None
     _need(len(raw) + 12 <= MAX_NATIVE_PROMPT_BYTES, "native_cli_prompt_too_large")
-    return _PASTE_START + text + _PASTE_END
+    return text
+
+
+def encode_native_prompt(text):
+    """Frame validated text for raw PTY writers, never for Herdr agent.prompt."""
+    return _PASTE_START + validate_native_prompt(text) + _PASTE_END
 
 
 

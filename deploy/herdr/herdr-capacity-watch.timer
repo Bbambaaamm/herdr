@@ -1,0 +1,12 @@
+[Unit]
+Description=Observe Herdr staging capacity every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=15s
+Persistent=true
+Unit=herdr-capacity-watch.service
+
+[Install]
+WantedBy=timers.target

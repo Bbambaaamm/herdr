@@ -1,4 +1,4 @@
-"""One-shot native prompt framing at the actual worker delivery boundary."""
+"""One-shot native prompt validation at the actual worker delivery boundary."""
 import subprocess
 import pytest
 from herdr.security import PolicyDenied
@@ -31,7 +31,7 @@ def capture(monkeypatch):
 
 
 @pytest.mark.parametrize("text", ["ordinary task", "line one\nline two\tČeský text", "x" * 60000], ids=["plain", "multiline-utf8", "large"])
-def test_modern_prompt_framed_once_and_intent_precedes_native(tmp_path, monkeypatch, text):
+def test_modern_prompt_uses_native_framing_and_intent_precedes_native(tmp_path, monkeypatch, text):
     task, session = admitted(tmp_path, monkeypatch)
     monkeypatch.setattr(worker, "prompt_text", lambda task: text)
     events = capture(monkeypatch)
@@ -39,7 +39,18 @@ def test_modern_prompt_framed_once_and_intent_precedes_native(tmp_path, monkeypa
     assert events[0] == ("intent", True) and len(events) == 2
     _, argv, options = events[1]
     assert argv[:4] == [str(worker.HERDR), "agent", "prompt", session["agent_name"]]
-    assert argv[4] == "\x1b[200~" + text + "\x1b[201~"
+    # The real native API contributes the paste frame (physically verified with
+    # the installed binary). Parse that wire input with prompt_toolkit itself:
+    # one paste with unchanged content, then one Enter, never nested escapes.
+    from prompt_toolkit.input.vt100_parser import Vt100Parser
+    from prompt_toolkit.keys import Keys
+    keys = []
+    parser = Vt100Parser(keys.append)
+    parser.feed("\x1b[200~" + argv[4] + "\x1b[201~\r")
+    parser.flush()
+    assert len(keys) == 2
+    assert keys[0].key == Keys.BracketedPaste and keys[0].data == text
+    assert keys[1].key == Keys.ControlM
     assert argv[5:7] == ["--wait", "--timeout"] and options["text"] is True
     with pytest.raises(RuntimeError, match="already_started"):
         worker.run_prompt(task)

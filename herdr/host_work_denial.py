@@ -2,9 +2,9 @@
 import sys
 from types import CodeType, FunctionType, ModuleType
 
-OPERATIONS = frozenset({"work-authorize", "work-budget", "work-verify",
+OPERATIONS = frozenset({"work-authorize", "work-budget", "work-verify", "work-model",
                         "work-sdk-observation", "external-knowledge-query"})
-SOURCES = frozenset({"work_authority", "work_contract_host", "work_cycle", "work_handoff",
+SOURCES = frozenset({"work_authority", "host_model_transport", "work_contract_host", "work_cycle", "work_handoff",
                     "work_hygiene", "work_failure_control", "work_budget_configuration",
                     "work_budget", "check_runner", "evidence", "scope_evidence"})
 ERROR_TYPES = frozenset({"WorkContractError", "EvidenceError", "EvidenceUnavailable",

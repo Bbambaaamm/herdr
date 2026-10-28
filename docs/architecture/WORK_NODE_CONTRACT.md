@@ -210,3 +210,45 @@ artifact. Hygiene executes the same approved resolved bootstrap interpreter as
 the oracle, including profiles without the logical Python alias.
 
 Parent-host PR publication uses the original protected local-result receipt through the optional port described in [Parent result publication](PARENT_RESULT_PUBLICATION.md). It grants no worker push permission and leaves shared #85 CI/review acceptance, the original attempt and budgets unchanged.
+
+
+## Primary model transport from a network-isolated SDK
+
+A native worker with `runtime_assurance.network_access=none` cannot make direct
+HTTPS requests, even when its separately approved provider route permits global
+egress. A budgeted Nous `:free` primary completion therefore uses the existing
+authenticated host authority socket. The worker's network namespace stays closed.
+Other providers and routes need their own approved transport; this path never
+selects a fallback, refreshes authentication, or changes a budget.
+
+The header binds the observed SDK process, grant, identity, original operation,
+request ID, exact body size and SHA256. The host validates peer credentials,
+executable/start identity and mounted launch before acknowledging the header.
+Only then does it read a bounded body (512 KiB, five-second body deadline).
+The host verifies the exact already-started cumulative budget reservation, work
+phase, signed provider route, request quote and output ceiling. Credentials come
+from the retained sealed profile descriptor and exact approved pool identity;
+neither a URL nor an authentication value is accepted from the worker.
+
+Before HTTPS the host fsyncs an exclusive one-shot intent. A separate pinned
+Python process receives credentials and the request through private standard
+input, uses the fixed Nous chat-completions endpoint, and permits no environment
+proxy, redirect, retry or refresh. Its process deadline consumes the original
+model quote and signed grant lifetime. The private response is bounded to 2 MiB
+and retained with its operation/body binding. A lost reply can replay that exact
+response without another HTTP request. An intent without a response never resends.
+Changed requests, receipts or identities fail closed.
+
+Known HTTP responses, including HTTP errors and invalid bounded response bodies,
+allow the authenticated SDK to record the original returned effect. The charged
+call/token/cost/work upper bounds remain retained. Network errors or timeouts
+leave delivery UNKNOWN and keep the original reservation in flight. Transport
+intent/receipt audit records are descriptive: replay cannot advance a work phase,
+settle a budget, satisfy verification or authorize publication.
+
+Regression coverage includes actual Unix peer framing above 8 KiB, sealed
+credential selection, SDK middleware routing, no resend after process loss,
+changed-response rejection, and error/timeout accounting. The administrator-only
+component test also crosses real network namespaces and validates the response
+with the pinned OpenAI SDK. Its explicit mount test port is not a substitute for
+full native-worker acceptance, real model inference or TaskGraph completion.

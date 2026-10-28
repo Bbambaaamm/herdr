@@ -17,7 +17,7 @@ BIN = Path(__file__).resolve().parent
 WORKER = BIN / "agent-task-worker"
 sys.path.insert(0, str(BIN.parents[1]))
 from herdr.host_configuration import host_entrypoint_command
-from herdr.launch_environment import sanitize_environment
+from herdr.launch_environment import sanitize_environment, IMMUTABLE_HOST_STARTUP_TIMEOUT_SECONDS
 from herdr.policy_launch import process_start_ticks
 ROOT = HOME / ".local/state/agent-stack/tasks"
 PENDING = ROOT / "pending"
@@ -25,7 +25,10 @@ RUNNING = ROOT / "running"
 LOG = HOME / ".local/state/agent-stack/task-dispatch.log"
 DISPATCH_LOCK = ROOT / "dispatcher.lock"
 
-ADMISSION_TIMEOUT = 15.0
+# The worker cannot acknowledge until its immutable host wrapper has finished.
+# Keep a separate bounded handshake allowance after that shared startup budget.
+DISPATCH_ACK_TIMEOUT_SECONDS = 15.0
+ADMISSION_TIMEOUT = IMMUTABLE_HOST_STARTUP_TIMEOUT_SECONDS + DISPATCH_ACK_TIMEOUT_SECONDS
 LIBC = ctypes.CDLL(None, use_errno=True)
 
 ENV = os.environ.copy()
