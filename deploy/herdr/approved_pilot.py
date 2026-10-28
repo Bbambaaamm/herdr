@@ -224,7 +224,7 @@ def publish(raw):
     save(R/'etc-approved38/launch-plan-issuer.json',issuer,0o640)
 
 def preflight(mode):
-    result=subprocess.run(['/usr/bin/unshare','--mount','--fork',P,'-I','-B',str(R/'approved38-preflight.py'),mode],capture_output=True,text=True,timeout=150)
+    result=subprocess.run(['/usr/bin/unshare','--mount','--fork',P,'-I','-B',str(Path(__file__).parent/'native_pilot/preflight.py'),COMPOSITION['_path'],COMPOSITION['_sha256'],mode],capture_output=True,text=True,timeout=150)
     path=R/('approved38-preflight-'+mode+'-outer-private.log');path.write_text(result.stdout+result.stderr);path.chmod(0o600)
     assert result.returncode==0,'pre-admission readiness denied: '+mode
     return json.loads((R/('approved38-preflight-'+mode+'-private.json')).read_bytes())
@@ -295,7 +295,7 @@ def main():
     admin_deadline()
     assert os.statvfs('/').f_bavail*os.statvfs('/').f_frsize>=STOP_FLOOR+START_GUARD
     once(R/'approved38-unit-start-intent.json',{'at_utc':datetime.now(timezone.utc).isoformat(),'automatic_retry_allowed':False,'budget_admission':'ordinary_host_work_factory'})
-    command=['/usr/bin/systemd-run','--unit=herdr-taskgraph77-approved38','--property=RuntimeMaxSec='+str(min(2100,int(admin_deadline()-time.time()-30))),'--property=TimeoutStopSec=15','--property=KillMode=control-group','--property=Restart=no','/usr/bin/unshare','--mount','--pid','--fork','--mount-proc',P,'-I','-B',str(R/'pilot_native_init_approved38.py')]
+    command=['/usr/bin/systemd-run','--unit=herdr-taskgraph77-approved38','--property=RuntimeMaxSec='+str(min(2100,int(admin_deadline()-time.time()-30))),'--property=TimeoutStopSec=15','--property=KillMode=control-group','--property=Restart=no','/usr/bin/unshare','--mount','--pid','--fork','--mount-proc',P,'-I','-B',str(Path(__file__).parent/'native_pilot/init.py'),COMPOSITION['_path'],COMPOSITION['_sha256']]
     result=subprocess.run(command,capture_output=True,text=True,timeout=20)
     save(R/'approved38-start-result.json',{'returncode':result.returncode,'stdout':result.stdout,'stderr':result.stderr},0o600)
     assert result.returncode==0,'inspect original service start; never repeat'
@@ -313,6 +313,7 @@ def cli():
     args=parser.parse_args()
     value=load_composition(args.composition,args.sha256)
     configure(value)
+    COMPOSITION['_path']=str(Path(args.composition));COMPOSITION['_sha256']=args.sha256
     Lifetimes(**value['lifetimes']).require_admin(admin_deadline()-time.time())
     prepared=check()
     fs=os.statvfs('/')

@@ -15,7 +15,7 @@ from herdr.work_cycle import WorkContractError
 from tests.herdr.test_work_contract_host import factory_fixture
 
 
-def prepared(tmp_path, monkeypatch, large=False):
+def prepared(tmp_path, monkeypatch, large=False, shared=False):
     factory, root, original, grant, log = factory_fixture(tmp_path)
     route = replace(grant.provider_routes[0], provider="nous", base_url=transport.ENDPOINT,
                     api_mode="chat_completions", max_egress=Egress.GLOBAL,
@@ -23,6 +23,9 @@ def prepared(tmp_path, monkeypatch, large=False):
     grant = replace(grant, scope=replace(grant.scope, providers=("nous",),
                     max_egress=Egress.GLOBAL, max_cost_microusd=0, max_context_tokens=65536),
                     provider_routes=(route,), credential_refs=("pool:nous:test",))
+    if shared:
+        from herdr.security import NetworkAccess
+        grant = replace(grant, runtime_assurance=replace(grant.runtime_assurance,network_access=NetworkAccess.GLOBAL))
     limits = BudgetLimits(1000000, 1000000, 5, 100000, 0, 2, 1, 1, 1)
     allocation = BudgetAllocation(digest("transport-allocation"), grant.identity.consumer,
                     digest("transport-work"), digest("transport-lineage"), digest("approval"), limits)
@@ -149,12 +152,13 @@ def test_untrusted_callback_cannot_masquerade_as_host_authority():
     with pytest.raises(WorkContractError, match="protected host"):
         transport.execute_host_model(owner, {}, b"")
 
-def test_real_peer_large_framed_request_and_response(tmp_path, monkeypatch):
+@pytest.mark.parametrize("shared", [False, True])
+def test_real_peer_large_framed_request_and_response(tmp_path, monkeypatch, shared):
     import socket
     import threading
     from herdr.work_authority import WorkAuthorityClient, dispatch_work_connection
     from tests.herdr.test_work_authority import owner_for
-    factory, original, header, body, _ = prepared(tmp_path, monkeypatch, large=True)
+    factory, original, header, body, _ = prepared(tmp_path, monkeypatch, large=True, shared=shared)
     owner, observed = owner_for(factory, original.launch.grant)
     owner.work_budget = factory.budget_effect
     owner.launch.private_profile_snapshot = object()
@@ -358,3 +362,11 @@ print(json.dumps({'sdk_response_converted':True,'http_status':result['http_statu
         if process.poll() is None:
             import signal
             os.killpg(process.pid,signal.SIGKILL);process.communicate()
+
+
+def test_unverified_or_credential_exposed_runtime_cannot_use_host_transport(tmp_path, monkeypatch):
+    from herdr.security import RuntimeAssurance, NetworkAccess
+    _, owner, header, body, _ = prepared(tmp_path, monkeypatch)
+    owner.launch.grant=replace(owner.launch.grant,runtime_assurance=RuntimeAssurance(False,None,NetworkAccess.NONE,(),False))
+    with pytest.raises(WorkContractError,match='verified credential-isolated'):
+        transport.execute_host_model(owner,header,body,perform=lambda *args:pytest.fail('unverified runtime reached provider'))

@@ -105,3 +105,11 @@ def require_offline_acceptance(proof, composition_sha256, *, now_epoch):
             "offline_external_effect_recorded")
     at=proof["checked_at_epoch"]
     require(type(at) in (int,float) and 0<=now_epoch-at<=86400, "offline_proof_stale")
+
+
+def host_action_command(python, script, composition_path, composition_sha256, request, gh_fd, guard_fd):
+    """Credential mounts must occur in a distinct host-action mount namespace."""
+    require(all(Path(value).is_absolute() for value in (python,script,composition_path,request)), "host_action_absolute_paths")
+    require(type(gh_fd)is int and type(guard_fd)is int and gh_fd>=0 and guard_fd>=0, "host_action_descriptors")
+    return ['/usr/bin/unshare','--mount','--fork',str(python),'-I','-B',str(script),
+            str(composition_path),composition_sha256,str(request),str(gh_fd),str(guard_fd)]

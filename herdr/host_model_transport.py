@@ -236,8 +236,14 @@ def execute_host_model(owner, header, body, *, perform=None):
             "host model request body changed")
     payload = json.loads(body)
     require(canonical(payload) == body, "canonical host model request required")
-    require(grant.is_active() and grant.runtime_assurance.network_access.value == "none",
-            "isolated primary model profile required")
+    assurance = grant.runtime_assurance
+    # The exact grant was sealed against the authenticated native peer. Native
+    # IPC may require a shared namespace; host delivery must not reject that
+    # approved mode after the SDK correctly selected its protected work port.
+    # This asserts the observed boundary, never claims physical NoNet isolation.
+    require(grant.is_active() and assurance.sandbox_verified and assurance.credentials_isolated
+            and assurance.network_access.value in {"none", "global"},
+            "verified credential-isolated primary model profile required")
     routes = [route for route in grant.provider_routes if route.provider == "nous"]
     require(len(routes) == 1 and routes[0].base_url == ENDPOINT
             and routes[0].api_mode == "chat_completions"
