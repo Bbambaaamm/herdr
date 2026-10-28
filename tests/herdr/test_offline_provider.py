@@ -80,3 +80,28 @@ def test_native_snapshot_still_rejects_a_content_version_change(tmp_path,monkeyp
         return data
     monkeypatch.setattr(m.os,'read',read)
     with pytest.raises(RuntimeError,match='snapshot_changed'):m.read_native_snapshot(source,owner=os.geteuid())
+
+
+def test_frozen_browser_environment_is_config_not_a_credential():
+    m=load('offline_pilot.py')
+    value=b'# nonsecret profile setting\nAGENT_BROWSER_EXECUTABLE_PATH=/home/agentops/.local/bin/chromium-with-playwright-libs\n'
+    assert m.safe_profile_environment(value)==value.split(b'\n',1)[1]
+    for invalid in (b'NOUS_API_KEY=private\n',b'LD_PRELOAD=/tmp/injection\n',b'AGENT_BROWSER_EXECUTABLE_PATH=$(unsafe)\n',value+value):
+        with pytest.raises(RuntimeError,match='environment_.*denied'):m.safe_profile_environment(invalid)
+
+
+def test_retained_preparation_never_replaces_changed_or_foreign_file(tmp_path):
+    import os
+    m=load('reconcile_offline_preparation.py');p=tmp_path/'retained';p.write_bytes(b'keep');p.chmod(0o600)
+    m.exact_file(p,b'keep',owner=os.geteuid())
+    with pytest.raises(RuntimeError,match='retained_preparation_file_changed'):m.exact_file(p,b'new',owner=os.geteuid())
+    p.chmod(0o644)
+    with pytest.raises(RuntimeError,match='retained_preparation_file_changed'):m.exact_file(p,b'keep',owner=os.geteuid())
+    assert p.read_bytes()==b'keep'
+
+
+def test_retained_preparation_does_not_follow_a_file_alias(tmp_path):
+    import os
+    m=load('reconcile_offline_preparation.py');target=tmp_path/'target';target.write_bytes(b'keep');alias=tmp_path/'alias';alias.symlink_to(target)
+    with pytest.raises(RuntimeError,match='retained_preparation_file_changed'):m.exact_file(alias,b'keep',owner=os.geteuid())
+    assert target.read_bytes()==b'keep'

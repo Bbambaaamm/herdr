@@ -52,6 +52,21 @@ def user_tree(path):
         os.chown(member,1001,1001)
 
 
+def safe_profile_environment(body):
+    # This frozen pilot permits only a browser executable hint, never provider,
+    # authentication, loader or process-control overrides. Drop comments.
+    fields={}
+    for line in body.decode('utf-8').splitlines():
+        if not line.strip() or line.lstrip().startswith('#'):continue
+        key,separator,value=line.partition('=')
+        need(separator and key=='AGENT_BROWSER_EXECUTABLE_PATH' and key not in fields,
+             'fixture_profile_environment_field_denied')
+        need(value=='/home/agentops/.local/bin/chromium-with-playwright-libs',
+             'fixture_profile_environment_value_denied')
+        fields[key]=value
+    return ''.join(key+'='+value+'\n' for key,value in sorted(fields.items())).encode()
+
+
 def snapshot_stamp(info):
     # Reading can legitimately update atime. It cannot change these identity,
     # content-version or permission fields without invalidating the snapshot.
@@ -161,9 +176,9 @@ def prepare_fixture(composition_path, composition_sha, output):
     for source in source_profile.iterdir():
         need(source.is_file() and not source.is_symlink(),'fixture_profile_member')
         payload=body if source.name=='auth.json' else source.read_bytes().replace(b'meituan/longcat-2.5-preview:free',b'meituan/longcat-2.0:free')
-        if source.name=='.env':need(not payload.strip(),'fixture_original_env_credentials_denied')
+        if source.name=='.env':payload=safe_profile_environment(payload)
         write(base/source.name,payload,0o444)
-        if source.name in ('auth.json','config.yaml','.env'):write(test_home/'.hermes/profiles/quantlab'/source.name,payload,owner=1001)
+        if source.name in ('auth.json','config.yaml','.env','profile.yaml'):write(test_home/'.hermes/profiles/quantlab'/source.name,payload,owner=1001)
     base.chmod(0o555);base.parent.chmod(0o555)
     write(test_home/'.hermes/auth.json',body,owner=1001)
     raw['private_launch']['profile']['source']=str(root/'profiles-offline-base/quantlab')
