@@ -1600,3 +1600,35 @@ test('verification pending preserves a valid blocked task and does not imply new
   assert.doesNotMatch(h.get('#face-task').textContent, /live práce probíhá/);
   assert.equal(h.calls.activity.at(-1).workingAgents, 0);
 });
+
+test('terminal UNKNOWN remains visible as blocked without successful work', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
+  queue.rows = [];
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '53', issue_state: 'open',
+      paper_only: false, policy_profiles: ['herdr-core'],
+      runtime_status: 'unavailable', runtime_agents: [], agents: [],
+      tasks: [{
+        task_id: 'root-unknown', parent_task_id: null, parent_agent_id: null,
+        agent_id: null, state: 'blocked', role: 'github_root_orchestration',
+        model: 'profile-router', fallback_model: null, attempt: 1, max_attempts: 4,
+        attempt_state: 'terminal_unknown', delivery_reconcile_count: 20,
+        blocker: 'terminal_unknown_delivery', fencing_token: 7,
+        dependencies: [], result_sha: null,
+      }],
+      edges: [],
+    }],
+  });
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().freshSnapshot, true);
+  const html = h.get('#swarm-kpis').innerHTML;
+  assert.match(html, /<span>Blocked \/ Failed<\/span><b>1 \/ 0<\/b>/);
+  assert.match(h.get('#coordinator-current').textContent, /root-unknown/);
+  assert.notEqual(h.ui.diagnostics().state, 'complete');
+  assert.equal(h.calls.activity.at(-1).running, 0);
+});

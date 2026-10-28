@@ -19,6 +19,7 @@ sys.path.insert(0, str(BIN.parents[1]))
 from herdr.host_configuration import host_entrypoint_command
 from herdr.launch_environment import sanitize_environment
 from herdr.policy_launch import process_start_ticks
+from herdr.recovery_unknown import held as terminal_unknown_hold
 ROOT = HOME / ".local/state/agent-stack/tasks"
 PENDING = ROOT / "pending"
 RUNNING = ROOT / "running"
@@ -105,6 +106,8 @@ def due_tasks() -> list[Path]:
     for path in sorted(PENDING.glob("*.json")):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
+            if terminal_unknown_hold(data):
+                continue
             when = parse_time(data.get("not_before"))
             priority = int(data.get("priority", 50))
         except Exception as exc:
@@ -218,6 +221,8 @@ def await_dispatch_admission(proc, running, claimed, nonce, parent_pid) -> int:
 
 def _launch_with_epoch(path: Path) -> int:
     task = json.loads(path.read_text(encoding="utf-8"))
+    if terminal_unknown_hold(task):
+        return 1
     task_id = str(task["id"])
     running = RUNNING / f"{task_id}.json"
     if running.exists():

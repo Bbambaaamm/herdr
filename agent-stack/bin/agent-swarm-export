@@ -34,7 +34,7 @@ SNAPSHOT_RETRIES = 3
 RUNTIME_AGENT_NAMES = {"herdr-hermes", "herdr-codex"}
 RUNTIME_STATES = {"idle", "working", "blocked", "done", "unknown"}
 MAX_RUNTIME_AGENTS = 16
-ATTEMPT_STATES = {"dispatching", "accepted", "working", "delivery_uncertain", "verifying", "completed", "done", "blocked", "failed", "retry_scheduled", "verification_pending"}
+ATTEMPT_STATES = {"dispatching", "accepted", "working", "delivery_uncertain", "terminal_unknown", "verifying", "completed", "done", "blocked", "failed", "retry_scheduled", "verification_pending"}
 
 
 class SnapshotRace(RuntimeError):

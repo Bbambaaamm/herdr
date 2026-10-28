@@ -365,6 +365,8 @@ def read_canonical_parent(root, task_id, run_token):
                     task=json.loads(raw,object_pairs_hook=unique)
                     require(isinstance(task,dict) and task.get("id")==task_id,"canonical parent identity invalid")
                     if task.get("run_token")==run_token:
+                        from .recovery_unknown import held
+                        require(not held(task), "terminal_unknown_requires_operator_reconciliation")
                         found.append(task)
                 finally:
                     os.close(fd)
