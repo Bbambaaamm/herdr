@@ -172,6 +172,8 @@ def main():
                 if time.monotonic() >= next_reconcile:
                     host_action('reconcile', native_context)
                     next_reconcile = time.monotonic() + 30
+            elif path.parent.name == 'blocked' and task.get('attempt_state') == 'verification_pending':
+                pass  # Keep the original deadline while worker cleanup finishes.
             elif path.parent.name in ('failed', 'blocked'):
                 raise RuntimeError('original ordinary attempt stopped; no redispatch')
             elif path.parent.name == 'pending':

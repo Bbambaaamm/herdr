@@ -243,3 +243,153 @@ def test_pending_dispatch_contract_is_unchanged(host_action_fixture):
     with pytest.raises(f.exec_error):
         f.invoke("dispatch")
     assert f.observed[-1][2][-1] == "agent-stack/bin/agent-task-dispatcher"
+
+
+@pytest.fixture
+def parent_completion_fixture(tmp_path):
+    """Run the actual coordinator loop with synthetic task files and transports."""
+    import ast
+    import json
+    from types import SimpleNamespace
+    from herdr.evidence import binding, digest
+
+    repo = Path(__file__).resolve().parents[2]
+    source = repo / "deploy/herdr/native_pilot/parent.py"
+    queue, control = tmp_path / "queue", tmp_path / "control"
+    for state in ("running", "blocked", "failed", "done", "pending", "results"):
+        (queue / state).mkdir(parents=True)
+    task = {"id": "synthetic-original-task", "run_token": "same-run",
+            "idempotency_key": "same-key", "fencing_token": 8,
+            "attempt_id": 0, "attempts": 0, "max_attempts": 1,
+            "attempt_state": "verification_pending", "execution_session": {}}
+    events, stops = [], []
+    config = {"directory": "blocked", "closed": False, "quiet": False,
+              "release": True, "step": 2, "reconciliations": 1}
+    clock = SimpleNamespace(now=0, sleeps=0)
+
+    def path():
+        return queue / config["directory"] / (task["id"] + ".json")
+
+    def save(target, value):
+        target.write_text(json.dumps(value))
+
+    def sleep(seconds):
+        clock.sleeps += 1
+        clock.now += config["step"]
+        if config["release"]:
+            config["quiet"] = True
+            task["execution_session"]["closed_at"] = "synthetic-closed"
+            if path().exists():
+                save(path(), task)
+
+    server = SimpleNamespace(poll=lambda: 0 if stops else None,
+                             wait=lambda **kw: 0)
+    def call(args, **kw):
+        if args[:2] == ["workspace", "create"]:
+            return {"result": {"root_pane": {"pane_id": "coordinator"},
+                               "workspace": {"workspace_id": "workspace"}}}
+        if args[:2] == ["tab", "create"]:
+            return {"result": {"root_pane": {"pane_id": "control"}}}
+        if args == ["server", "stop"]:
+            stops.append(True)
+        return {}
+
+    def host_action(operation, context, **data):
+        events.append((operation, clock.sleeps))
+        if operation == "publish":
+            assert data["completion_identity"] == binding(task)
+            assert task["execution_session"].get("closed_at") and config["quiet"]
+            return {"pull_request": 999}
+        if operation == "reconcile":
+            if sum(e[0] == "reconcile" for e in events) == config["reconciliations"]:
+                path().unlink()
+                done = dict(task, verification_status="accepted")
+                save(queue / "done" / (task["id"] + ".json"), done)
+                (queue / "results" / (task["id"] + ".json")).write_text("{}")
+        return {}
+
+    def read_plan(kind, identity):
+        assert kind == "plan" and identity == digest(binding(task))
+        return {"identity": binding(task), "plan_hash": "a" * 64,
+                "spec_hash": "b" * 64}
+
+    def no_real_process(*args, **kwargs):
+        raise AssertionError("unexpected real process transport")
+
+    namespace = {
+        "Path": Path, "json": json, "hashlib": __import__("hashlib"),
+        "subprocess": SimpleNamespace(Popen=lambda *a, **kw: server,
+            run=no_real_process, TimeoutExpired=subprocess.TimeoutExpired),
+        "os": SimpleNamespace(killpg=no_real_process), "signal": __import__("signal"),
+        "time": SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep),
+        "CONTROL": control, "HOME": tmp_path, "QUEUE": queue, "TASK": task["id"],
+        "NATIVE": Path("/synthetic/native"), "SESSION": "synthetic", "ENV": {},
+        "save": save, "call": call, "ready": lambda *a: {"shell_pid": 1},
+        "process_environment": lambda p: {"HERDR_ENV": "1"},
+        "progress": lambda *a, **kw: None, "host_action": host_action,
+        "worker_quiet": lambda: config["quiet"], "budget_observation": lambda: {},
+        "store_for": lambda *a: SimpleNamespace(read=read_plan),
+        "binding": binding, "digest": digest,
+    }
+    for name in ("canonical_task", "main"):
+        node = next(n for n in ast.parse(source.read_text()).body
+                    if isinstance(n, ast.FunctionDef) and n.name == name)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"),
+             namespace)
+
+    def invoke(**changes):
+        config.update(changes)
+        if config["closed"]:
+            task["execution_session"]["closed_at"] = "synthetic-closed"
+        save(path(), task)
+        return namespace["main"]()
+
+    return SimpleNamespace(invoke=invoke, task=task, events=events, stops=stops,
+                           clock=clock, path=path, config=config)
+
+
+@pytest.mark.parametrize("directory", ["blocked", "running"])
+@pytest.mark.parametrize("closed,quiet", [(False, True), (True, False), (False, False)])
+def test_parent_waits_for_original_worker_cleanup(
+        parent_completion_fixture, directory, closed, quiet):
+    f = parent_completion_fixture
+    f.invoke(directory=directory, closed=closed, quiet=quiet)
+    assert [e[0] for e in f.events] == ["dispatch", "publish", "reconcile"]
+    assert all(tick >= 1 for op, tick in f.events if op != "dispatch")
+    assert len(f.stops) == 1
+
+
+@pytest.mark.parametrize("closed,quiet", [(False, True), (True, False), (False, False)])
+def test_parent_cleanup_wait_retains_original_deadline(
+        parent_completion_fixture, closed, quiet):
+    f = parent_completion_fixture
+    with pytest.raises(RuntimeError, match="bounded original task deadline"):
+        f.invoke(closed=closed, quiet=quiet, release=False, step=1200)
+    assert [e[0] for e in f.events] == ["dispatch"]
+    assert f.clock.sleeps == 3 and f.path().exists() and len(f.stops) == 1
+
+
+@pytest.mark.parametrize("state", [
+    "terminal_unknown", "delivery_uncertain", "failed", "working", "completed"])
+def test_parent_does_not_wait_for_non_verification_blocker(parent_completion_fixture, state):
+    f = parent_completion_fixture
+    f.task["attempt_state"] = state
+    with pytest.raises(RuntimeError, match="original ordinary attempt stopped"):
+        f.invoke()
+    assert [e[0] for e in f.events] == ["dispatch"] and f.clock.sleeps == 0
+    assert f.path().exists() and len(f.stops) == 1
+
+
+@pytest.mark.parametrize("directory", ["failed", "pending"])
+def test_parent_cleanup_wait_does_not_admit_other_queues(parent_completion_fixture, directory):
+    f = parent_completion_fixture
+    with pytest.raises(RuntimeError, match="no redispatch"):
+        f.invoke(directory=directory)
+    assert [e[0] for e in f.events] == ["dispatch"] and f.clock.sleeps == 0
+
+
+def test_parent_publishes_once_during_reconciliation_wait(parent_completion_fixture):
+    f = parent_completion_fixture
+    f.invoke(reconciliations=2)
+    assert [e[0] for e in f.events] == ["dispatch", "publish", "reconcile", "reconcile"]
+    assert len(f.stops) == 1
