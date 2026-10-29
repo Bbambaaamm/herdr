@@ -42,6 +42,19 @@ jobs:
           python -m pip install --disable-pip-version-check pytest==8.4.2 cryptography==50.0.0 prompt-toolkit==3.0.52 wcwidth==0.6.0 -r requirements-mcp.txt
           python -m compileall -q herdr deploy agent_platform_dashboard tests integrations/search-router
           python -m pytest -q tests
+      - name: Install real namespace test dependency
+        timeout-minutes: 5
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install --yes --no-install-recommends bubblewrap
+          dpkg-query --show bubblewrap
+      - name: Verify complete offline autonomy contract coverage
+        run: |
+          proof="${{ runner.temp }}/herdr-offline-${{ github.run_id }}-${{ github.run_attempt }}"
+          python scripts/probe-herdr-autonomy-offline.py --evidence-dir "$proof" || {
+            tail -n 100 "$proof/pytest.log"
+            exit 1
+          }
       - name: Validate deployment and shell entrypoints
         run: |
           python -m json.tool deploy/agent_platform/production/herdr.example.json >/dev/null
