@@ -16,6 +16,7 @@ ROOTS = (
     Path("scripts"),
 )
 FILES = (
+    Path("docs/operations/autonomy-offline-acceptance.md"),
     Path("configs/consumers/herdr.yaml"),
     Path("docs/CONSUMERS.md"),
     Path("docs/architecture/A2A_GATEWAY_71.md"),
