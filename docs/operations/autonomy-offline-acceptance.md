@@ -14,7 +14,11 @@ python scripts/probe-herdr-autonomy-offline.py --evidence-dir /tmp/herdr-offline
 
 The output directory must not exist and must be outside the checkout. No network,
 credential, administrator or model setup is needed. Test fixtures use temporary
-repositories, queue data and synthetic transports. This command does not start
+repositories, queue data and synthetic transports. The command creates its own
+private `boundary` directory for the existing real-Git fixtures, overriding any
+inherited `HERDR_BOUNDARY_TEST_ROOT`. It does not require `/home/agentops/tmp`
+on CI and never substitutes a live workspace when that default is absent.
+This command does not start
 the live watchdog, read its queue, invoke a model, publish to GitHub, merge or
 deploy. It runs once with a 15-minute bound and no automatic retry.
 
@@ -23,6 +27,8 @@ tree and all tracked source bytes before and after testing. Any required skip or
 xfail, missing test, duplicate testcase, failed collection, nonzero exit, timeout,
 dirty checkout or source drift blocks the aggregate result. Pytest plugin
 autoload is disabled; the fixed test selectors cannot be replaced by CLI options.
+The summary includes blocked gate names, pytest exit code and failure/error/skip
+counts, so environment failures cannot be mistaken for successful coverage.
 
 ## Coverage and limits
 

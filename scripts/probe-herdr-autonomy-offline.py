@@ -153,6 +153,9 @@ def evaluate_junit(raw: bytes, returncode: int, before: dict, after: dict) -> di
             "required_gates": len(CASES), "testcases": len(rows),
             "pytest_exit_code": returncode, "junit_parse_error": parse_error,
             "duplicate_testcase": duplicate, "source_unchanged": before == after,
+            "blocked_gates": [name for name, value in gates.items() if value["status"] != "PASS"],
+            "test_outcomes": {tag: sum(r.find(tag) is not None for r in rows)
+                              for tag in ("failure", "error", "skipped")},
             "source_before": before, "source_after": after,
             "evidence_level": "offline_component_contracts",
             "full_autonomy_verified": False, "native_sdk_cycle_verified": False,
@@ -161,11 +164,14 @@ def evaluate_junit(raw: bytes, returncode: int, before: dict, after: dict) -> di
             "historical_cost_and_tokens": "UNKNOWN"}
 
 
-def test_environment() -> dict:
+def test_environment(boundary: Path) -> dict:
     # PYTEST_ADDOPTS can silently deselect individual parameter variants;
     # PYTEST_PLUGINS also bypasses plugin autoload suppression.
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")}
     env.update(PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", PYTHONDONTWRITEBYTECODE="1")
+    # The existing real-Git fixtures otherwise default to /home/agentops/tmp,
+    # which is absent on CI. Never skip them or borrow a live workspace.
+    env["HERDR_BOUNDARY_TEST_ROOT"] = str(boundary)
     return env
 
 
@@ -205,6 +211,8 @@ def main(argv=None) -> int:
         parser.error("evidence must be outside the source checkout")
     before = source_snapshot(root)
     evidence.mkdir(mode=0o700, parents=False, exist_ok=False)
+    boundary = evidence / "boundary"
+    boundary.mkdir(mode=0o700)
     selectors = list(dict.fromkeys(s for group in CASES.values() for s in group))
     # Preserve the selected Python dependency runtime (including offline zip
     # installations), not PYTHONPATH or arbitrary extra pytest CLI options.
@@ -220,7 +228,7 @@ def main(argv=None) -> int:
     with (evidence / "pytest.log").open("xb") as log:
         previous = signal.signal(signal.SIGTERM, interrupted)
         try:
-            returncode = run_tests(command, root, test_environment(), log)
+            returncode = run_tests(command, root, test_environment(boundary), log)
         finally:
             signal.signal(signal.SIGTERM, previous)
     try:
@@ -236,7 +244,8 @@ def main(argv=None) -> int:
         json.dump(report, output, sort_keys=True, indent=2)
         output.write("\n")
     print(json.dumps({k: report[k] for k in ("schema_version", "status", "verified_gates",
-        "required_gates", "testcases", "source_unchanged", "full_autonomy_verified")}))
+        "required_gates", "testcases", "source_unchanged", "full_autonomy_verified",
+        "pytest_exit_code", "blocked_gates", "test_outcomes")}))
     return 0 if report["status"] == "OFFLINE_CONTRACTS_PASSED" else 1
 
 

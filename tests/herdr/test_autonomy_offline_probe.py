@@ -104,15 +104,26 @@ def test_wrong_class_or_similar_test_name_cannot_cover_required_selector():
     assert evaluate(suite)["status"] == "BLOCKED"
 
 
-def test_inherited_selection_overrides_and_explicit_plugins_are_removed(monkeypatch):
+def test_inherited_selection_overrides_and_explicit_plugins_are_removed(monkeypatch, tmp_path):
     monkeypatch.setenv("PYTEST_ADDOPTS", "--deselect=secretly-missing-variant")
     monkeypatch.setenv("PYTEST_PLUGINS", "unapproved_plugin")
     monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "0")
     monkeypatch.setenv("HERDR_UNRELATED_VALUE", "keep")
-    env = probe.test_environment()
+    monkeypatch.setenv("HERDR_BOUNDARY_TEST_ROOT", "/no-such-live-workspace")
+    env = probe.test_environment(tmp_path / "private-boundary")
     assert "PYTEST_ADDOPTS" not in env and "PYTEST_PLUGINS" not in env
     assert env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "1"
     assert env["HERDR_UNRELATED_VALUE"] == "keep"
+    assert env["HERDR_BOUNDARY_TEST_ROOT"] == str(tmp_path / "private-boundary")
+
+
+def test_blocked_report_explains_skips_without_turning_them_into_success():
+    suite = junit()
+    ET.SubElement(suite[0], "skipped", message="physical Git boundary workspace unavailable")
+    report = evaluate(suite)
+    assert report["status"] == "BLOCKED"
+    assert report["test_outcomes"] == {"failure": 0, "error": 0, "skipped": 1}
+    assert report["blocked_gates"] == ["duplicate_event"]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="actual Linux process-group boundary")
