@@ -11,6 +11,113 @@ class ReadinessError(RuntimeError):
     pass
 
 
+class SnapshotChanged(ReadinessError):
+    """A read-only observation changed; this conveys no execution authority."""
+
+
+def _task_stamp(info):
+    return (info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_mode,
+            info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _task_directory(path):
+    path = Path(path)
+    require(path.is_absolute() and '..' not in path.parts, 'absolute_task_queue_required')
+    fd = os.open('/', os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for part in path.parts[1:]:
+            child = os.open(part, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def observe_task(queue, task_id, expected_identity, *, owner=1001):
+    """One bounded consistent observation, never admission or acceptance.
+
+    Callers may poll SnapshotChanged only inside their original deadline. A
+    stable absence/duplicate, unsafe file or identity mismatch remains fatal.
+    """
+    from herdr.evidence import binding
+    require(isinstance(task_id, str) and task_id not in ('', '.', '..')
+            and '/' not in task_id and '\\' not in task_id, 'task_name_required')
+    require(isinstance(expected_identity, dict) and expected_identity.get('id') == task_id
+            and set(expected_identity) == {'id', 'run_token', 'idempotency_key', 'attempt', 'fencing_token'},
+            'trusted_task_identity_required')
+    queue = Path(queue)
+    states = ('running', 'blocked', 'failed', 'done', 'pending')
+    name = task_id + '.json'
+    for _ in range(3):
+        held = []
+        try:
+            root = _task_directory(queue)
+            held.append(root)
+            root_info = os.fstat(root)
+            require(root_info.st_uid == owner and not root_info.st_mode & 0o022, 'task_queue_owner_required')
+            directories = {}
+            for state in states:
+                fd = os.open(state, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root)
+                held.append(fd)
+                info = os.fstat(fd)
+                require(info.st_uid == owner and not info.st_mode & 0o022, 'task_state_owner_required')
+                directories[state] = (fd, _task_stamp(info))
+            def unchanged():
+                if _task_stamp(os.fstat(root)) != _task_stamp(root_info):
+                    return False
+                for state, (fd, stamp) in directories.items():
+                    if stamp != _task_stamp(os.fstat(fd)):
+                        return False
+                    if stamp != _task_stamp(os.stat(state, dir_fd=root, follow_symlinks=False)):
+                        return False
+                named = _task_directory(queue)
+                try:
+                    return _task_stamp(os.fstat(named)) == _task_stamp(root_info)
+                finally:
+                    os.close(named)
+            matches = []
+            for state, (fd, _) in directories.items():
+                try:
+                    info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                require(stat.S_ISREG(info.st_mode) and info.st_uid == owner and info.st_nlink == 1
+                        and not info.st_mode & 0o022 and 0 < info.st_size <= 1048576, 'safe_task_file_required')
+                matches.append((state, info))
+            if not unchanged():
+                continue
+            require(len(matches) == 1, 'canonical task count differs from one')
+            state, before = matches[0]
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                             dir_fd=directories[state][0])
+            except FileNotFoundError:
+                if not unchanged():
+                    continue
+                raise
+            held.append(fd)
+            if _task_stamp(os.fstat(fd)) != _task_stamp(before):
+                continue
+            body = bytearray()
+            while len(body) <= before.st_size:
+                chunk = os.read(fd, min(65536, before.st_size + 1 - len(body)))
+                if not chunk:
+                    break
+                body.extend(chunk)
+            if _task_stamp(os.fstat(fd)) != _task_stamp(before) or not unchanged():
+                continue
+            require(len(body) == before.st_size, 'task_snapshot_shortened')
+            task = json.loads(body)
+            require(isinstance(task, dict) and binding(task) == expected_identity, 'task_identity_changed')
+            return queue / state / name, task
+        finally:
+            for fd in reversed(held):
+                os.close(fd)
+    raise SnapshotChanged('canonical task snapshot changed during observation')
+
+
 def require(ok, reason):
     if not ok:
         raise ReadinessError(reason)

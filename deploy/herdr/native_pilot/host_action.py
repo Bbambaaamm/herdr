@@ -144,15 +144,14 @@ def main():
         assert task.get('completion_plan_pending') is True
         command = prefix + ['agent-stack/bin/agent-task-dispatcher']
     else:
-        matches = [QUEUE / state / (TASK + '.json') for state in ('running', 'blocked', 'failed', 'done', 'pending')
-                   if (QUEUE / state / (TASK + '.json')).exists()]
-        assert len(matches) == 1
-        assert matches[0].parent.name in ('running', 'blocked', 'done')
-        task = json.loads(matches[0].read_text())
-        assert task['attempt_state'] == 'verification_pending' and binding(task) == json.loads((ROOT/'same-identity-approved38.json').read_text())['identity']
+        readiness = _helpers['_readiness']()
+        expected = json.loads(readiness.read_protected(ROOT / 'same-identity-approved38.json'))['identity']
+        task_path, task = readiness.observe_task(QUEUE, TASK, expected)
+        assert task_path.parent.name in ('running', 'blocked', 'done')
+        assert task['attempt_state'] == 'verification_pending' and binding(task) == expected
         assert task.get('execution_session', {}).get('closed_at')
         if operation == 'reconcile':
-            command = prefix + ['agent-stack/bin/agent-task-worker', str(matches[0])]
+            command = prefix + ['agent-stack/bin/agent-task-worker', str(task_path)]
         else:
             sys.path.insert(0, str(CODE))
             assert binding(task) == request['completion_identity']

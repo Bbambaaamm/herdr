@@ -3,7 +3,8 @@ from pathlib import Path
 import subprocess
 import sys
 import pytest
-from herdr.operation_readiness import host_action_command
+from herdr.operation_readiness import host_action_command, ReadinessError
+from herdr import operation_readiness as readiness
 
 
 def test_credential_mount_action_cannot_start_in_the_coordinator_namespace(tmp_path):
@@ -92,6 +93,9 @@ def host_action_fixture(tmp_path):
         "secrets": secrets, "binding": binding, "publish": publish,
         "ROOT": root, "HOME": tmp_path, "QUEUE": queue, "TASK": task["id"],
         "CONTROL": control, "PYTHON": "/pinned/python", "CODE": tmp_path / "code",
+        # Protected-root ownership is doubled; observation and file IPC are real.
+        "_helpers": {'_readiness': lambda: SimpleNamespace(observe_task=readiness.observe_task,
+            SnapshotChanged=readiness.SnapshotChanged, read_protected=lambda p: p.read_bytes())},
     }
     for path, name in ((host_path, "main"), (parent_path, "canonical_task")):
         node = next(n for n in ast.parse(path.read_text()).body
@@ -129,7 +133,26 @@ def host_action_fixture(tmp_path):
 
     return SimpleNamespace(task=task, expected=expected, place=place, invoke=invoke,
                            select=namespace["canonical_task"], observed=observed,
-                           exec_error=ObservedExec, root=root)
+                           exec_error=ObservedExec, root=root, queue=queue)
+
+
+@pytest.mark.parametrize('source,target', [('running','blocked'),('pending','running')])
+@pytest.mark.parametrize('consumer', ['parent','host'])
+def test_real_canonical_reader_survives_atomic_move(host_action_fixture, monkeypatch, source, target, consumer):
+    f=host_action_fixture; old=f.place(source); new=f.queue/target/old.name
+    original=os.stat; moved=[]
+    def during_scan(path, *args, **kwargs):
+        directory=Path(os.readlink('/proc/self/fd/'+str(kwargs['dir_fd']))) if 'dir_fd' in kwargs else Path(path).parent
+        trigger=Path(path).name==old.name and directory.name=='running' and not moved
+        try:return original(path,*args,**kwargs)
+        finally:
+            if trigger:old.rename(new);moved.append(True)
+    monkeypatch.setattr(os,'stat',during_scan)
+    if consumer=='parent':assert f.select()[0]==new
+    else:
+        with pytest.raises(f.exec_error):f.invoke('reconcile')
+        assert f.observed[-1][2][-1]==str(new)
+    assert moved==[True] and not old.exists()
 
 
 @pytest.mark.parametrize("directory", ["running", "blocked", "done"])
@@ -185,7 +208,7 @@ def test_blocked_verification_keeps_original_identity_guard(
     f = host_action_fixture
     f.task[field] = value
     f.place("blocked")
-    with pytest.raises(AssertionError):
+    with pytest.raises(ReadinessError, match='identity_changed'):
         f.invoke(operation)
     assert not f.observed
 
@@ -199,7 +222,7 @@ def test_duplicate_blocked_and_other_canonical_task_is_rejected(
     f.place(other)
     with pytest.raises(RuntimeError, match="canonical task count"):
         f.select()
-    with pytest.raises(AssertionError):
+    with pytest.raises(ReadinessError, match='canonical task count'):
         f.invoke(operation)
     assert not f.observed
 
@@ -262,6 +285,7 @@ def parent_completion_fixture(tmp_path):
             "idempotency_key": "same-key", "fencing_token": 8,
             "attempt_id": 0, "attempts": 0, "max_attempts": 1,
             "attempt_state": "verification_pending", "execution_session": {}}
+    (tmp_path / 'same-identity-approved38.json').write_text(json.dumps({'identity': binding(task)}))
     events, stops = [], []
     config = {"directory": "blocked", "closed": False, "quiet": False,
               "release": True, "step": 2, "reconciliations": 1}
@@ -330,6 +354,9 @@ def parent_completion_fixture(tmp_path):
         "worker_quiet": lambda: config["quiet"], "budget_observation": lambda: {},
         "store_for": lambda *a: SimpleNamespace(read=read_plan),
         "binding": binding, "digest": digest,
+        "ROOT": tmp_path,
+        "_helpers": {'_readiness': lambda: SimpleNamespace(observe_task=readiness.observe_task,
+            SnapshotChanged=readiness.SnapshotChanged, read_protected=lambda p: p.read_bytes())},
     }
     for name in ("canonical_task", "main"):
         node = next(n for n in ast.parse(source.read_text()).body
@@ -393,3 +420,13 @@ def test_parent_publishes_once_during_reconciliation_wait(parent_completion_fixt
     f.invoke(reconciliations=2)
     assert [e[0] for e in f.events] == ["dispatch", "publish", "reconcile", "reconcile"]
     assert len(f.stops) == 1
+
+
+def test_parent_snapshot_changes_keep_original_deadline(parent_completion_fixture,monkeypatch):
+    f=parent_completion_fixture
+    def changing(*args,**kwargs):raise readiness.SnapshotChanged('controlled changing snapshot')
+    monkeypatch.setattr(readiness,'observe_task',changing)
+    with pytest.raises(RuntimeError,match='bounded original task deadline'):
+        f.invoke(step=1200)
+    assert f.clock.sleeps==3 and [op for op,_ in f.events]==['dispatch']
+    assert len(f.stops)==1

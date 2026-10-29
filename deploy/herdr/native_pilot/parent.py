@@ -70,11 +70,9 @@ def host_action(operation, context, **data):
     return result
 
 def canonical_task():
-    matches = [QUEUE / state / (TASK + '.json') for state in ('running', 'blocked', 'failed', 'done', 'pending') if (QUEUE / state / (TASK + '.json')).exists()]
-    if len(matches) != 1:
-        raise RuntimeError('canonical task count differs from one')
-    path = matches[0]
-    return (path, json.loads(path.read_text()))
+    readiness = _helpers['_readiness']()
+    expected = json.loads(readiness.read_protected(ROOT / 'same-identity-approved38.json'))['identity']
+    return readiness.observe_task(QUEUE, TASK, expected)
 
 def worker_quiet():
     path = QUEUE / 'worker.loop.lock'
@@ -149,7 +147,11 @@ def main():
         deadline = time.monotonic() + 3600
         next_reconcile = 0
         while time.monotonic() < deadline:
-            path, task = canonical_task()
+            try:
+                path, task = canonical_task()
+            except _helpers['_readiness']().SnapshotChanged:
+                time.sleep(0.05)
+                continue
             session = task.get('execution_session') or {}
             if session.get('pane_id') and (not session.get('economic_delivery_attempted')):
                 observation = subprocess.run([str(NATIVE), '--session', SESSION, 'pane', 'read', session['pane_id'], '--lines', '80', '--format', 'text'], env=ENV, capture_output=True, timeout=5)

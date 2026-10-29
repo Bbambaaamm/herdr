@@ -146,6 +146,8 @@ def offline_handoff_observer(tmp_path):
     """Execute the real physical observer loop with private files and a clock."""
     import ast
     from types import SimpleNamespace
+    from herdr import operation_readiness as readiness
+    from herdr.evidence import binding
     source=Path(__file__).resolve().parents[1]/'physical/offline_pilot.py'
     tree=ast.parse(source.read_text())
     inner=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='inner')
@@ -155,7 +157,9 @@ def offline_handoff_observer(tmp_path):
     for state in ('pending','running','blocked','failed','done','results'):
         (queue/state).mkdir(parents=True)
     clock=SimpleNamespace(now=0,sleeps=0)
-    task={'id':task_id,'attempt_state':'verification_pending','execution_session':{}}
+    task={'id':task_id,'run_token':'same-run','idempotency_key':'same-key',
+          'attempt_id':0,'fencing_token':8,'attempt_state':'verification_pending','execution_session':{}}
+    expected=binding(task)
 
     def invoke(directory='blocked',closed=True,release=False,result=b'{}',other=None,move=False):
         if closed:task['execution_session']['closed_at']='fixture-closed'
@@ -175,7 +179,10 @@ def offline_handoff_observer(tmp_path):
         ns={'Path':lambda value:queue,'TASK':task_id,'json':json,
             'process':SimpleNamespace(poll=lambda:None),
             'time':SimpleNamespace(monotonic=lambda:clock.now,sleep=sleep),
-            'deadline':3,'passed':False}
+            'deadline':3,'passed':False,'root':tmp_path,
+            'readiness':SimpleNamespace(observe_task=readiness.observe_task,
+                SnapshotChanged=readiness.SnapshotChanged,
+                read_protected=lambda p:json.dumps({'identity':expected}))}
         exec(compile(ast.Module(body=[need,loop],type_ignores=[]),str(source),'exec'),ns)
         return ns['passed']
     return SimpleNamespace(invoke=invoke,task=task,clock=clock,queue=queue)
@@ -213,7 +220,7 @@ def test_offline_observer_cleanup_wait_keeps_deadline(offline_handoff_observer):
 @pytest.mark.parametrize('other',['running','pending','done','failed'])
 def test_offline_observer_rejects_duplicate_canonical_task(offline_handoff_observer,other):
     f=offline_handoff_observer
-    with pytest.raises(RuntimeError,match='ordinary_fixture_task_count'):
+    with pytest.raises(RuntimeError,match='canonical task count'):
         f.invoke(other=other)
 
 
@@ -231,3 +238,23 @@ def test_offline_observer_does_not_accept_unexpected_done_task(offline_handoff_o
 def test_offline_observer_tracks_pending_to_blocked_handoff(offline_handoff_observer):
     f=offline_handoff_observer
     assert f.invoke(directory='pending',move=True) and f.clock.sleeps==1
+
+
+@pytest.mark.parametrize('source,target',[('running','blocked'),('pending','running')])
+def test_offline_observer_uses_same_atomic_transition_contract(offline_handoff_observer,monkeypatch,source,target):
+    import os
+    f=offline_handoff_observer;name=f.task['id']+'.json';moved=[];stat=os.stat
+    def moving(path,*args,**kwargs):
+        directory=Path(os.readlink('/proc/self/fd/'+str(kwargs['dir_fd']))) if 'dir_fd' in kwargs else Path(path).parent
+        try:return stat(path,*args,**kwargs)
+        finally:
+            if str(path)==name and directory.name=='running' and not moved:
+                (f.queue/source/name).rename(f.queue/target/name);moved.append(True)
+    monkeypatch.setattr(os,'stat',moving)
+    assert f.invoke(directory=source) and moved==[True] and f.clock.sleeps==0
+
+
+@pytest.mark.parametrize('field,value',[('run_token','other'),('fencing_token',9),('attempt_id',1)])
+def test_offline_observer_does_not_adopt_mutable_identity(offline_handoff_observer,field,value):
+    f=offline_handoff_observer;f.task[field]=value
+    with pytest.raises(RuntimeError,match='identity_changed'):f.invoke()

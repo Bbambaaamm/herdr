@@ -293,14 +293,18 @@ def inner(composition_path,composition_sha,output):
     process=subprocess.Popen(command,stdout=log,stderr=subprocess.STDOUT)
     passed=False
     try:
+        # Resolve the observer's identity contract from the pinned worker code.
+        sys.path.insert(0,str(code))
         deadline=time.monotonic()+780
         while process.poll() is None and time.monotonic()<deadline:
             queue=Path('/home/agentops/.local/state/agent-stack/tasks')
             result_path=queue/'results'/(TASK+'.json')
-            matches=[queue/state/(TASK+'.json') for state in ('running','blocked','failed','done','pending')
-                     if (queue/state/(TASK+'.json')).exists()]
-            need(len(matches)==1,'ordinary_fixture_task_count')
-            task_path=matches[0];task=json.loads(task_path.read_bytes())
+            expected=json.loads(readiness.read_protected(root/'same-identity-approved38.json'))['identity']
+            try:
+                task_path,task=readiness.observe_task(queue,TASK,expected)
+            except readiness.SnapshotChanged:
+                time.sleep(.05)
+                continue
             waiting=(task_path.parent.name in ('running','blocked')
                      and task.get('attempt_state')=='verification_pending')
             if task_path.parent.name=='failed' or (task_path.parent.name=='blocked' and not waiting):
