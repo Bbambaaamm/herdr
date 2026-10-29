@@ -92,6 +92,63 @@ def _bounded_process(argv, *, env, cwd, data=None, timeout=30, output_limit=2_00
                 stream.close()
 
 
+def _root_client_identity(path):
+    """Pin a regular executable through root-owned, non-writable ancestry."""
+    import hashlib
+    path = Path(path)
+    require(path.is_absolute() and ".." not in path.parts, "canonical parent client required")
+    fd = os.open("/", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for index, part in enumerate(path.parts[1:]):
+            parent = os.fstat(fd)
+            require(parent.st_uid == 0 and not parent.st_mode & 0o022, "root parent client ancestry required")
+            final = index == len(path.parts) - 2
+            flags = os.O_RDONLY | os.O_NONBLOCK if final else os.O_PATH | os.O_DIRECTORY
+            nxt = os.open(part, flags | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        before = os.fstat(fd)
+        require(stat.S_ISREG(before.st_mode) and before.st_uid == 0 and not before.st_mode & 0o6022
+                and before.st_mode & 0o111 and before.st_nlink == 1 and before.st_size <= 134217728,
+                "root protected parent executable required")
+        stamp = lambda st: (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_gid,
+                           st.st_nlink, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        digest = hashlib.sha256()
+        while True:
+            block = os.read(fd, 1048576)
+            if not block:
+                break
+            digest.update(block)
+        require(stamp(before) == stamp(os.fstat(fd)), "parent executable changed while pinning")
+        return stamp(before), digest.hexdigest()
+    finally:
+        os.close(fd)
+
+
+def _root_private_config_directory(path):
+    """Pin a host-selected credential directory beneath root-only ancestry."""
+    path = Path(path)
+    require(os.geteuid() == 0 and path.is_absolute() and ".." not in path.parts,
+            "root private GitHub configuration required")
+    fd = os.open("/", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for part in path.parts[1:-1]:
+            parent = os.fstat(fd)
+            require(parent.st_uid == 0 and not parent.st_mode & 0o022,
+                    "protected GitHub configuration ancestry required")
+            nxt = os.open(part, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        parent = os.fstat(fd)
+        require(parent.st_uid == 0 and stat.S_IMODE(parent.st_mode) == 0o700,
+                "root-only GitHub configuration parent required")
+        final = os.open(path.name, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+        os.close(final)
+    finally:
+        os.close(fd)
+    return path
+
+
 class GitHubParentTransport:
     """The host selects these paths; queue/model fields never select executables.
 
@@ -99,12 +156,10 @@ class GitHubParentTransport:
     Git itself receives a new bare directory and a closed configuration. The
     worker directory is never the cwd of a credential-bearing operation.
     """
-    def __init__(self, *, repo, scratch, gh, home, git=Path("/usr/bin/git")):
+    def __init__(self, *, repo, scratch, gh, home, git=Path("/usr/bin/git"), config_dir=None):
         self.repo, self.scratch = repo, Path(scratch)
         self.gh, self.git, self.home = Path(gh), Path(git), Path(home)
-        for path in (self.gh, self.git):
-            require(path.is_absolute() and path.resolve(strict=True).is_file(),
-                "approved parent client executable required")
+        self.clients = {path: _root_client_identity(path) for path in (self.gh, self.git)}
         require(self.scratch.is_absolute() and self.scratch.resolve() == self.scratch,
             "canonical parent transport storage required")
         self.scratch.mkdir(mode=0o700, parents=False, exist_ok=True)
@@ -115,6 +170,8 @@ class GitHubParentTransport:
         self.env = {"PATH": "/usr/bin:/bin", "HOME": str(self.home), "LANG": "C.UTF-8",
             "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/false"}
+        if config_dir is not None:
+            self.env["GH_CONFIG_DIR"] = str(_root_private_config_directory(config_dir))
 
     def protect_from(self, writable_roots):
         require(all(not self.scratch.is_relative_to(Path(root).resolve())
@@ -124,6 +181,8 @@ class GitHubParentTransport:
         require(permit.repo == self.repo, "parent transport repository changed")
         remaining = permit.expires_at_epoch - time.time()
         require(remaining > 0, "parent transport authorization expired")
+        require(all(_root_client_identity(path) == identity for path, identity in self.clients.items()),
+                "approved parent client changed")
         return _bounded_process(argv, env=self.env, cwd=cwd or self.scratch, data=data,
             timeout=min(timeout, remaining))
 

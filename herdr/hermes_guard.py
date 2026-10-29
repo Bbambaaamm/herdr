@@ -655,6 +655,8 @@ def _install_private_sdk_configuration(installation, policy):
 
     installation._remember(managed_scope, "get_managed_dir", private_managed_dir)
     installation._remember(config, "get_config_path", private_config_path)
+    from .private_sdk_credentials import install_private_sdk_credentials
+    install_private_sdk_credentials(installation, policy)
 
 
 def _check_private_sdk_agent(policy, agent):
@@ -1061,7 +1063,22 @@ def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None,
             authorize_agent_provider(agent)  # after callbacks may switch routes
             begin=getattr(guard,"start_model_effect",None)
             receipt=None
-            if callable(begin) and guard.budget_required():
+            assurance = getattr(getattr(guard, "grant", None), "runtime_assurance", None)
+            access = getattr(getattr(assurance, "network_access", None), "value", None)
+            budgeted_transport = callable(begin) and guard.budget_required()
+            transport = getattr(guard, "execute_model_effect", None)
+            supported_host_route = (agent.provider == "nous" and agent.model.endswith(":free")
+                and agent.base_url == "https://inference-api.nousresearch.com/v1")
+            # The native bridge may share the host network namespace. Its
+            # observed network mode must not bypass the authenticated work port.
+            host_transport = budgeted_transport and (private_sdk_policy is not None
+                or access == "none" or (callable(transport) and supported_host_route))
+            if host_transport:
+                if (not callable(transport) or agent.provider != "nous"
+                        or not agent.model.endswith(":free")
+                        or agent.base_url != "https://inference-api.nousresearch.com/v1"):
+                    raise PolicyDenied("host_model_transport_profile_unsupported")
+            if budgeted_transport:
                 from .evidence import canonical
                 from .work_model_deadline import validate_text_request
                 # Bound the exact SDK payload using the protected route's quote.
@@ -1087,8 +1104,22 @@ def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None,
             else:
                 from .work_model_deadline import model_deadline
                 with model_deadline(receipt["max_work_ms"]):
-                    response=next_call(payload)
-                guard.returned_model_effect(receipt)
+                    if host_transport:
+                        answer = transport(receipt, context.get("api_request_id"), payload)
+                        if answer["kind"] == "unknown":
+                            raise PolicyDenied("host_model_delivery_unknown_reconcile_original")
+                        guard.returned_model_effect(receipt)
+                        if answer["kind"] != "http_response":
+                            raise PolicyDenied("host_model_response_invalid")
+                        if not 200 <= answer["http_status"] < 300:
+                            raise PolicyDenied("host_model_provider_http_error",
+                                               str(answer["http_status"]))
+                        from openai.types.chat import ChatCompletion
+                        response = ChatCompletion.model_validate(answer["body"])
+                    else:
+                        response=next_call(payload)
+                if not host_transport:
+                    guard.returned_model_effect(receipt)
             return response
         return original_middleware(request, guarded_next, **context)
 

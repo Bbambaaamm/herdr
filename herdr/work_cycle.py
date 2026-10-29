@@ -337,11 +337,18 @@ class WorkCycle:
     def _restore(self):
         sdk_observations = []
         host_denials = []
+        model_transport_events = []
         for event in self._events():
             require(event.get("plan_sha256") == self.plan.hash, "work plan changed during restart")
             kind = event["event"]
             if kind == "work_plan":
                 require(event.get("plan") == json.loads(canonical(self.plan.to_json())), "persisted work plan changed")
+            elif kind in {"work_model_transport_intent", "work_model_transport_receipt"}:
+                from .host_model_transport import validate_transport_events
+                model_transport_events.append(event)
+                validate_transport_events(model_transport_events, self.plan.identity,
+                                          self.plan.hash, self.plan.grant_sha256)
+                # Descriptive network receipts: no phase, budget, or verification transition.
             elif kind == "work_sdk_observation":
                 from .sdk_observation import validate_observation_events
                 sdk_observations.append(event)

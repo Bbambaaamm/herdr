@@ -160,11 +160,14 @@ class PrivateSDKPolicy:
     profile_name: str
     profile_sha256: str
     config_sha256: str
+    auth_sha256: str | None = None
 
     def __post_init__(self):
         _need(isinstance(self.profile_name, str) and bool(_PROFILE.fullmatch(self.profile_name))
               and all(isinstance(x, str) and bool(_HEX.fullmatch(x))
                       for x in (self.profile_sha256, self.config_sha256)), "private_sdk_policy_invalid")
+        _need(self.auth_sha256 is None or (type(self.auth_sha256) is str and bool(_HEX.fullmatch(self.auth_sha256))),
+              "private_sdk_auth_hash_invalid")
 
     @property
     def profile_home(self):
@@ -198,6 +201,33 @@ class PrivateSDKPolicy:
             os.close(fd)
 
 
+    def read_auth_store(self):
+        """Return only bytes bound to this profile's authenticated auth member."""
+        _need(self.auth_sha256 is not None, "private_sdk_auth_manifest_required")
+        self.reassert()
+        self.verify_config_path(self.profile_home / "config.yaml")
+        fd = os.open(_HOME, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            member = _open_beneath(fd, ".hermes/profiles/" + self.profile_name + "/auth.json")
+            try:
+                before = os.fstat(member)
+                _need(stat.S_ISREG(before.st_mode) and 0 < before.st_size <= _MAX_FILE_BYTES,
+                      "private_sdk_auth_invalid")
+                raw = os.pread(member, before.st_size + 1, 0)
+                after = os.fstat(member)
+                fields = ("st_dev", "st_ino", "st_uid", "st_gid", "st_mode", "st_nlink",
+                          "st_size", "st_mtime_ns", "st_ctime_ns")
+                _need(all(getattr(before, key) == getattr(after, key) for key in fields)
+                      and len(raw) == before.st_size
+                      and hashlib.sha256(raw).hexdigest() == self.auth_sha256,
+                      "private_sdk_auth_changed")
+            finally:
+                os.close(member)
+        finally:
+            os.close(fd)
+        return _closed_json(raw, "private_sdk_auth_invalid")
+
+
 def private_sdk_policy(approved_profile, policy_raw: bytes, config_raw: bytes) -> PrivateSDKPolicy:
     approved = verified_profile_identity(approved_profile)
     files = approved["files"]
@@ -213,7 +243,8 @@ def private_sdk_policy(approved_profile, policy_raw: bytes, config_raw: bytes) -
     config = _closed_json(config_raw, "private_sdk_config_json_required")
     _need(all(key in config and type(config[key]) is list and not config[key]
               for key in ("fallback_providers", "fallback_model")), "private_sdk_fallback_not_empty")
-    return PrivateSDKPolicy(approved["name"], approved["manifest_sha256"], files["config.yaml"])
+    return PrivateSDKPolicy(approved["name"], approved["manifest_sha256"], files["config.yaml"],
+                            files.get("auth.json"))
 
 
 @dataclass

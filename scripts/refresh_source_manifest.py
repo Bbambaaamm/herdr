@@ -16,6 +16,7 @@ ROOTS = (
     Path("scripts"),
 )
 FILES = (
+    Path("docs/operations/autonomy-offline-acceptance.md"),
     Path("configs/consumers/herdr.yaml"),
     Path("docs/CONSUMERS.md"),
     Path("docs/architecture/A2A_GATEWAY_71.md"),
@@ -40,7 +41,7 @@ FILES = (
 OUTPUT = Path("provenance/CANONICAL_SOURCE_MANIFEST.sha256")
 TEXT_SUFFIXES = {
     ".txt", ".css", ".html", ".in", ".js", ".json", ".md", ".mjs", ".py",
-    ".service", ".sh", ".sha256", ".yaml",
+    ".service", ".timer", ".sh", ".sha256", ".yaml",
 }
 
 
