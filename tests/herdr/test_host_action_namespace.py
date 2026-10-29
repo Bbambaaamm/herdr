@@ -23,3 +23,223 @@ def test_private_host_action_mount_never_changes_parent_view(tmp_path):
     result=subprocess.run(command,capture_output=True,text=True,timeout=15)
     assert result.returncode==0,result.stderr
     assert view.read_text()=='coordinator-view' and (view.stat().st_dev,view.stat().st_ino)==before
+
+
+@pytest.fixture
+def host_action_fixture(tmp_path):
+    """Real source main/selector, synthetic UID-1001 queue, no external effects."""
+    import ast
+    import json
+    import secrets
+    from types import SimpleNamespace
+    from herdr.evidence import binding
+
+    if sys.platform != "linux" or os.geteuid() != 1001:
+        pytest.skip("synthetic host request ownership requires Linux UID 1001")
+    repo = Path(__file__).resolve().parents[2]
+    host_path = repo / "deploy/herdr/native_pilot/host_action.py"
+    parent_path = repo / "deploy/herdr/native_pilot/parent.py"
+    root = tmp_path / "approved"
+    queue = tmp_path / "queue"
+    control = tmp_path / "control"
+    for directory in (root, control / "requests", *(
+            queue / s for s in ("pending", "running", "blocked", "failed", "done"))):
+        directory.mkdir(parents=True, exist_ok=True)
+    task = {
+        "id": "issue77-validation-repair-20261026",
+        "run_token": "retained-unit-run", "idempotency_key": "retained-unit-key",
+        "attempt_id": 0, "attempts": 0, "fencing_token": 8, "max_attempts": 1,
+        "attempt_state": "verification_pending",
+        "completion_plan_pending": True,
+        "execution_session": {"closed_at": "2026-10-29T00:00:00+00:00"},
+    }
+    expected = binding(task)
+    (root / "same-identity-approved38.json").write_text(
+        json.dumps({"identity": expected}))
+    (root / "resume-task-reviewed-approved38.json").write_text(json.dumps(task))
+    (root / "parent-public-summary.txt").write_text("synthetic reviewed artifact")
+    observed = []
+
+    class ObservedExec(Exception):
+        pass
+
+    def observe_exec(path, argv, env):
+        observed.append(("exec", path, argv, env))
+        raise ObservedExec()
+
+    # Privileged execution and publication transports are intercepted. File
+    # reads, metadata, identity/state/session guards and lookup run unchanged.
+    class HostOS:
+        def __getattr__(self, name):
+            return getattr(os, name)
+        def geteuid(self):
+            return 0
+        def setgroups(self, groups):
+            observed.append(("setgroups", groups))
+        def setgid(self, gid):
+            observed.append(("setgid", gid))
+        def setuid(self, uid):
+            observed.append(("setuid", uid))
+        execve = staticmethod(observe_exec)
+
+    def publish(value, context):
+        observed.append(("publish", value, context))
+        return {"pull_request": 999, "fixture_only": True}
+
+    namespace = {
+        "Path": Path, "json": json, "stat": __import__("stat"),
+        "os": HostOS(), "sys": SimpleNamespace(argv=[], path=[]), "time": __import__("time"),
+        "secrets": secrets, "binding": binding, "publish": publish,
+        "ROOT": root, "HOME": tmp_path, "QUEUE": queue, "TASK": task["id"],
+        "CONTROL": control, "PYTHON": "/pinned/python", "CODE": tmp_path / "code",
+    }
+    for path, name in ((host_path, "main"), (parent_path, "canonical_task")):
+        node = next(n for n in ast.parse(path.read_text()).body
+                    if isinstance(n, ast.FunctionDef) and n.name == name)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"),
+             namespace)
+
+    def place(directory, value=None):
+        path = queue / directory / (task["id"] + ".json")
+        path.write_text(json.dumps(task if value is None else value))
+        return path
+
+    def invoke(operation, **extra):
+        request = {"operation": operation, "request_id": "request",
+                   "native_context": {"HERDR_ENV": "1"}}
+        if operation == "publish":
+            request.update(completion_identity=expected,
+                           completion_plan_hash="a" * 64,
+                           completion_spec_hash=
+                           "80802792c7b2790aac5a0ddc3557274e4030d822fb2f2ffa46551a6948a51e61")
+        request.update(extra)
+        path = control / "requests/request.json"
+        path.write_text(json.dumps(request))
+        path.chmod(0o600)
+        descriptors = [os.open(os.devnull, os.O_RDONLY) for _ in range(2)]
+        namespace["sys"].argv = ["host_action.py", str(path), *map(str, descriptors)]
+        try:
+            return namespace["main"]()
+        finally:
+            for fd in descriptors:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    return SimpleNamespace(task=task, expected=expected, place=place, invoke=invoke,
+                           select=namespace["canonical_task"], observed=observed,
+                           exec_error=ObservedExec, root=root)
+
+
+@pytest.mark.parametrize("directory", ["running", "blocked", "done"])
+@pytest.mark.parametrize("operation", ["publish", "reconcile"])
+def test_closed_verification_task_uses_same_canonical_path_as_parent(
+        host_action_fixture, directory, operation):
+    f = host_action_fixture
+    path = f.place(directory)
+    before = path.read_bytes()
+    assert f.select()[0] == path
+    if operation == "publish":
+        assert f.invoke(operation) == {"pull_request": 999, "fixture_only": True}
+        assert f.observed[-1][0] == "publish"
+        assert f.observed[-1][1]["permit"]["identity"] == f.expected
+    else:
+        with pytest.raises(f.exec_error):
+            f.invoke(operation)
+        assert f.observed[-1][2][-2:] == [
+            "agent-stack/bin/agent-task-worker", str(path)]
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("state", [
+    "terminal_unknown", "delivery_uncertain", "failed", "working", "completed"])
+@pytest.mark.parametrize("operation", ["publish", "reconcile"])
+def test_blocked_non_verification_states_never_reach_host_effect(
+        host_action_fixture, state, operation):
+    f = host_action_fixture
+    f.task["attempt_state"] = state
+    path = f.place("blocked")
+    before = path.read_bytes()
+    with pytest.raises(AssertionError):
+        f.invoke(operation)
+    assert not f.observed and path.read_bytes() == before
+
+
+@pytest.mark.parametrize("operation", ["publish", "reconcile"])
+def test_blocked_verification_requires_closed_session(host_action_fixture, operation):
+    f = host_action_fixture
+    f.task["execution_session"] = {}
+    f.place("blocked")
+    with pytest.raises(AssertionError):
+        f.invoke(operation)
+    assert not f.observed
+
+
+@pytest.mark.parametrize("field,value", [
+    ("run_token", "other-run"), ("idempotency_key", "other-key"),
+    ("fencing_token", 9)])
+@pytest.mark.parametrize("operation", ["publish", "reconcile"])
+def test_blocked_verification_keeps_original_identity_guard(
+        host_action_fixture, field, value, operation):
+    f = host_action_fixture
+    f.task[field] = value
+    f.place("blocked")
+    with pytest.raises(AssertionError):
+        f.invoke(operation)
+    assert not f.observed
+
+
+@pytest.mark.parametrize("other", ["running", "done", "pending", "failed"])
+@pytest.mark.parametrize("operation", ["publish", "reconcile"])
+def test_duplicate_blocked_and_other_canonical_task_is_rejected(
+        host_action_fixture, other, operation):
+    f = host_action_fixture
+    f.place("blocked")
+    f.place(other)
+    with pytest.raises(RuntimeError, match="canonical task count"):
+        f.select()
+    with pytest.raises(AssertionError):
+        f.invoke(operation)
+    assert not f.observed
+
+
+@pytest.mark.parametrize("directory", ["pending", "failed"])
+@pytest.mark.parametrize("operation", ["publish", "reconcile"])
+def test_non_publishable_queue_directory_is_not_admitted(
+        host_action_fixture, directory, operation):
+    f = host_action_fixture
+    f.place(directory)
+    with pytest.raises(AssertionError):
+        f.invoke(operation)
+    assert not f.observed
+
+
+def test_publish_retains_request_completion_identity_check(host_action_fixture):
+    f = host_action_fixture
+    f.place("blocked")
+    changed = dict(f.expected, run_token="other-request")
+    with pytest.raises(AssertionError):
+        f.invoke("publish", completion_identity=changed)
+    assert not f.observed
+
+
+def test_dispatch_still_rejects_blocked_terminal_unknown(host_action_fixture):
+    f = host_action_fixture
+    f.task["attempt_state"] = "terminal_unknown"
+    path = f.place("blocked")
+    before = path.read_bytes()
+    with pytest.raises(AssertionError):
+        f.invoke("dispatch")
+    assert not f.observed and path.read_bytes() == before
+
+
+def test_pending_dispatch_contract_is_unchanged(host_action_fixture):
+    f = host_action_fixture
+    f.task["attempt_state"] = "pending"
+    f.place("pending")
+    (f.root / "resume-task-reviewed-approved38.json").write_text(
+        __import__("json").dumps(f.task))
+    with pytest.raises(f.exec_error):
+        f.invoke("dispatch")
+    assert f.observed[-1][2][-1] == "agent-stack/bin/agent-task-dispatcher"
