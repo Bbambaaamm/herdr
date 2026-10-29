@@ -26,7 +26,10 @@ CASES = {
         "tests/herdr/test_parent_publication.py::test_parent_publishes_one_exact_result_and_replay_has_no_effects",
     ),
     "ambiguous_delivery": (
-        "tests/herdr/test_parent_publication.py::test_lost_remote_reply_reconciles_without_repeating_the_effect",
+        "tests/herdr/test_parent_publication.py::test_lost_remote_reply_reconciles_without_repeating_the_effect[False-push]",
+        "tests/herdr/test_parent_publication.py::test_lost_remote_reply_reconciles_without_repeating_the_effect[True-push]",
+        "tests/herdr/test_parent_publication.py::test_lost_remote_reply_reconciles_without_repeating_the_effect[False-create]",
+        "tests/herdr/test_parent_publication.py::test_lost_remote_reply_reconciles_without_repeating_the_effect[True-create]",
         "tests/agent_stack/test_terminal_unknown_recovery.py::test_dispatch_worker_intake_and_export_hold_terminal_unknown",
     ),
     "budget_exhaustion": (
@@ -135,8 +138,7 @@ def evaluate_junit(raw: bytes, returncode: int, before: dict, after: dict) -> di
             if len(parts) == 2:
                 classname += "." + parts[0]
             name = parts[-1]
-            found = [r for r in rows if r.get("classname") == classname and
-                     (r.get("name") == name or (r.get("name") or "").startswith(name + "["))]
+            found = [r for r in rows if r.get("classname") == classname and r.get("name") == name]
             complete &= bool(found)
             matching.extend(found)
         gates[case] = {"status": "PASS" if complete and all(
@@ -157,6 +159,38 @@ def evaluate_junit(raw: bytes, returncode: int, before: dict, after: dict) -> di
             "live_dispatch_authorized": False, "merge_authorized": False,
             "deployment_authorized": False,
             "historical_cost_and_tokens": "UNKNOWN"}
+
+
+def test_environment() -> dict:
+    # PYTEST_ADDOPTS can silently deselect individual parameter variants;
+    # PYTEST_PLUGINS also bypasses plugin autoload suppression.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")}
+    env.update(PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", PYTHONDONTWRITEBYTECODE="1")
+    return env
+
+
+def run_tests(command, root, env, log) -> int:
+    process = subprocess.Popen(command, cwd=root, env=env, stdout=log,
+                               stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        try:
+            return process.wait(timeout=900)
+        except subprocess.TimeoutExpired:
+            return 124
+        except KeyboardInterrupt:
+            return 130
+    finally:
+        # Includes operator interruption and unexpected exceptions, not just
+        # timeout. The isolated session must not outlive its test supervisor.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=10)
+
+
+def interrupted(signum, frame):
+    raise KeyboardInterrupt()
 
 
 def main(argv=None) -> int:
@@ -181,18 +215,14 @@ def main(argv=None) -> int:
                "-o", "addopts=", "-o", "xfail_strict=true", "-o", "junit_family=xunit2",
                "--basetemp=" + str(evidence / "scratch"),
                "--junitxml=" + str(evidence / "junit.xml"), *selectors]
-    env = dict(os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", PYTHONDONTWRITEBYTECODE="1")
     # No live queue, administrator, model, GitHub publication or service entrypoint
     # is invoked here. Selected existing tests use disposable, offline fixtures.
     with (evidence / "pytest.log").open("xb") as log:
-        process = subprocess.Popen(command, cwd=root, env=env, stdout=log,
-                                   stderr=subprocess.STDOUT, start_new_session=True)
+        previous = signal.signal(signal.SIGTERM, interrupted)
         try:
-            returncode = process.wait(timeout=900)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
-            returncode = 124
+            returncode = run_tests(command, root, test_environment(), log)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
     try:
         after = source_snapshot(root)
     except (ValueError, OSError, subprocess.SubprocessError):

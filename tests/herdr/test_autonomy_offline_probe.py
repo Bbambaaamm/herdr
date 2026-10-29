@@ -2,6 +2,8 @@
 import importlib.util
 from pathlib import Path
 import subprocess
+import os
+import sys
 import xml.etree.ElementTree as ET
 
 import pytest
@@ -83,13 +85,15 @@ def test_duplicate_result_cannot_cover_missing_or_repeat_a_required_test():
     assert report["status"] == "BLOCKED"
 
 
-def test_every_reported_parameter_variant_must_pass():
+def test_every_required_parameter_variant_must_be_present_and_pass():
     suite = junit()
-    original = suite[0]
-    name = original.get("name")
-    original.set("name", name + "[one]")
-    variant = ET.SubElement(suite, "testcase", classname=original.get("classname"), name=name + "[two]")
+    variants = [r for r in suite if r.get("name").startswith("test_lost_remote_reply_reconciles")]
+    assert len(variants) == 4
     assert evaluate(suite)["status"] == "OFFLINE_CONTRACTS_PASSED"
+    suite.remove(variants[0])
+    assert evaluate(suite)["gates"]["ambiguous_delivery"]["status"] == "BLOCKED"
+    suite = junit()
+    variant = next(r for r in suite if r.get("name").endswith("[False-create]"))
     ET.SubElement(variant, "skipped")
     assert evaluate(suite)["status"] == "BLOCKED"
 
@@ -98,6 +102,50 @@ def test_wrong_class_or_similar_test_name_cannot_cover_required_selector():
     suite = junit()
     suite[0].set("name", suite[0].get("name") + "_not_the_test")
     assert evaluate(suite)["status"] == "BLOCKED"
+
+
+def test_inherited_selection_overrides_and_explicit_plugins_are_removed(monkeypatch):
+    monkeypatch.setenv("PYTEST_ADDOPTS", "--deselect=secretly-missing-variant")
+    monkeypatch.setenv("PYTEST_PLUGINS", "unapproved_plugin")
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "0")
+    monkeypatch.setenv("HERDR_UNRELATED_VALUE", "keep")
+    env = probe.test_environment()
+    assert "PYTEST_ADDOPTS" not in env and "PYTEST_PLUGINS" not in env
+    assert env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "1"
+    assert env["HERDR_UNRELATED_VALUE"] == "keep"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="actual Linux process-group boundary")
+@pytest.mark.parametrize("failure", ["interrupt", "timeout", "unexpected"])
+def test_interruption_timeout_and_exception_kill_and_reap_actual_child(tmp_path, monkeypatch, failure):
+    popen = subprocess.Popen
+    children = []
+    def start(*args, **kwargs):
+        child = popen(*args, **kwargs)
+        children.append(child)
+        wait = child.wait
+        first = True
+        def interrupted(*args, **kwargs):
+            nonlocal first
+            if first:
+                first = False
+                if failure == "interrupt":
+                    raise KeyboardInterrupt()
+                if failure == "timeout":
+                    raise subprocess.TimeoutExpired(child.args, 900)
+                raise RuntimeError("supervisor failure")
+            return wait(*args, **kwargs)
+        child.wait = interrupted
+        return child
+    monkeypatch.setattr(probe.subprocess, "Popen", start)
+    with (tmp_path / "child.log").open("wb") as log:
+        args = ([sys.executable, "-c", "import time; time.sleep(60)"], tmp_path, os.environ.copy(), log)
+        if failure == "unexpected":
+            with pytest.raises(RuntimeError, match="supervisor"):
+                probe.run_tests(*args)
+        else:
+            assert probe.run_tests(*args) == (130 if failure == "interrupt" else 124)
+    assert len(children) == 1 and children[0].poll() is not None
 
 
 def git(root, *args):
