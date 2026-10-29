@@ -297,13 +297,17 @@ def inner(composition_path,composition_sha,output):
         while process.poll() is None and time.monotonic()<deadline:
             queue=Path('/home/agentops/.local/state/agent-stack/tasks')
             result_path=queue/'results'/(TASK+'.json')
-            running=queue/'running'/(TASK+'.json')
-            if result_path.exists() and result_path.stat().st_size and running.exists():
-                task=json.loads(running.read_bytes())
-                if task.get('attempt_state')=='verification_pending' and task.get('execution_session',{}).get('closed_at'):
-                    passed=True;break
-            for state in ('failed','blocked'):
-                if (queue/state/(TASK+'.json')).exists():raise RuntimeError('ordinary_fixture_worker_stopped')
+            matches=[queue/state/(TASK+'.json') for state in ('running','blocked','failed','done','pending')
+                     if (queue/state/(TASK+'.json')).exists()]
+            need(len(matches)==1,'ordinary_fixture_task_count')
+            task_path=matches[0];task=json.loads(task_path.read_bytes())
+            waiting=(task_path.parent.name in ('running','blocked')
+                     and task.get('attempt_state')=='verification_pending')
+            if task_path.parent.name=='failed' or (task_path.parent.name=='blocked' and not waiting):
+                raise RuntimeError('ordinary_fixture_worker_stopped')
+            if (waiting and task.get('execution_session',{}).get('closed_at')
+                    and result_path.exists() and result_path.stat().st_size):
+                passed=True;break
             time.sleep(.2)
         need(passed and response_fixture.complete and not observations['errors'],'complete_ordinary_local_handoff_unavailable')
         json_file(output/'local-handoff-observed.json',{'ordinary_worker_used':True,'actual_sdk_used':True,'host_ipc_used':True,

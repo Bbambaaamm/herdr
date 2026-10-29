@@ -139,3 +139,95 @@ def test_late_fixture_clock_starts_at_readiness_and_keeps_original_untouched():
     assert original['providers']['nous']['agent_key']==old and all('refresh' not in k.lower() for k in entry)
     claims=json.loads(base64.urlsafe_b64decode(key.split('.')[1]+'=='))
     assert claims=={'sub':'herdr-offline-fixture','scope':'invoke','exp':expiry}
+
+
+@pytest.fixture
+def offline_handoff_observer(tmp_path):
+    """Execute the real physical observer loop with private files and a clock."""
+    import ast
+    from types import SimpleNamespace
+    source=Path(__file__).resolve().parents[1]/'physical/offline_pilot.py'
+    tree=ast.parse(source.read_text())
+    inner=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='inner')
+    loop=next(n for n in ast.walk(inner) if isinstance(n,ast.While))
+    need=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='need')
+    queue=tmp_path/'queue';task_id='observer-original'
+    for state in ('pending','running','blocked','failed','done','results'):
+        (queue/state).mkdir(parents=True)
+    clock=SimpleNamespace(now=0,sleeps=0)
+    task={'id':task_id,'attempt_state':'verification_pending','execution_session':{}}
+
+    def invoke(directory='blocked',closed=True,release=False,result=b'{}',other=None,move=False):
+        if closed:task['execution_session']['closed_at']='fixture-closed'
+        path=queue/directory/(task_id+'.json')
+        path.write_text(json.dumps(task))
+        if other:(queue/other/path.name).write_text(json.dumps(task))
+        result_path=queue/'results'/path.name
+        if result is not None:result_path.write_bytes(result)
+        def sleep(seconds):
+            clock.now+=1;clock.sleeps+=1
+            assert clock.sleeps<=3,'observer reset its original deadline'
+            if release:
+                task['execution_session']['closed_at']='fixture-closed'
+                path.write_text(json.dumps(task));result_path.write_text('{}')
+            if move and directory=='pending' and path.exists():
+                path.rename(queue/'blocked'/path.name)
+        ns={'Path':lambda value:queue,'TASK':task_id,'json':json,
+            'process':SimpleNamespace(poll=lambda:None),
+            'time':SimpleNamespace(monotonic=lambda:clock.now,sleep=sleep),
+            'deadline':3,'passed':False}
+        exec(compile(ast.Module(body=[need,loop],type_ignores=[]),str(source),'exec'),ns)
+        return ns['passed']
+    return SimpleNamespace(invoke=invoke,task=task,clock=clock,queue=queue)
+
+
+@pytest.mark.parametrize('directory',['running','blocked'])
+@pytest.mark.parametrize('closed,release',[(True,False),(False,True)])
+def test_offline_observer_accepts_same_closed_handoff(
+        offline_handoff_observer,directory,closed,release):
+    f=offline_handoff_observer
+    assert f.invoke(directory=directory,closed=closed,release=release)
+    assert f.clock.sleeps==(0 if closed else 1)
+
+
+@pytest.mark.parametrize('state',[
+    'terminal_unknown','delivery_uncertain','failed','blocked','working'])
+def test_offline_observer_rejects_other_blockers(offline_handoff_observer,state):
+    f=offline_handoff_observer;f.task['attempt_state']=state
+    with pytest.raises(RuntimeError,match='ordinary_fixture_worker_stopped'):
+        f.invoke()
+    assert f.clock.sleeps==0
+
+
+@pytest.mark.parametrize('result',[b'',None])
+def test_offline_observer_waits_for_nonempty_result(offline_handoff_observer,result):
+    f=offline_handoff_observer
+    assert f.invoke(result=result,release=True) and f.clock.sleeps==1
+
+
+def test_offline_observer_cleanup_wait_keeps_deadline(offline_handoff_observer):
+    f=offline_handoff_observer
+    assert not f.invoke(closed=False) and f.clock.sleeps==3
+
+
+@pytest.mark.parametrize('other',['running','pending','done','failed'])
+def test_offline_observer_rejects_duplicate_canonical_task(offline_handoff_observer,other):
+    f=offline_handoff_observer
+    with pytest.raises(RuntimeError,match='ordinary_fixture_task_count'):
+        f.invoke(other=other)
+
+
+def test_offline_observer_does_not_accept_failed_verification_task(offline_handoff_observer):
+    f=offline_handoff_observer
+    with pytest.raises(RuntimeError,match='ordinary_fixture_worker_stopped'):
+        f.invoke(directory='failed')
+
+
+def test_offline_observer_does_not_accept_unexpected_done_task(offline_handoff_observer):
+    f=offline_handoff_observer
+    assert not f.invoke(directory='done') and f.clock.sleeps==3
+
+
+def test_offline_observer_tracks_pending_to_blocked_handoff(offline_handoff_observer):
+    f=offline_handoff_observer
+    assert f.invoke(directory='pending',move=True) and f.clock.sleeps==1
