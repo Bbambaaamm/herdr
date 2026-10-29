@@ -31,6 +31,7 @@ CASES = {
         "tests/herdr/test_parent_publication.py::test_lost_remote_reply_reconciles_without_repeating_the_effect[False-create]",
         "tests/herdr/test_parent_publication.py::test_lost_remote_reply_reconciles_without_repeating_the_effect[True-create]",
         "tests/agent_stack/test_terminal_unknown_recovery.py::test_dispatch_worker_intake_and_export_hold_terminal_unknown",
+        "tests/agent_stack/test_terminal_unknown_recovery.py::test_visible_terminal_marker_reestablishes_task_directory_durability",
     ),
     "budget_exhaustion": (
         "tests/herdr/test_work_budget.py::test_parent_children_atomically_reserve_last_shared_capacity",
@@ -202,9 +203,32 @@ def interrupted(signum, frame):
     raise KeyboardInterrupt()
 
 
+
+def evaluate_collection(raw: bytes, returncode: int, before: dict, after: dict) -> dict:
+    expected = sorted({s for group in CASES.values() for s in group})
+    found = [line.strip() for line in raw.decode("utf-8", errors="replace").splitlines()
+             if line.strip().startswith("tests/") and "::" in line]
+    complete = sorted(found) == expected
+    valid = complete and returncode == 0 and before == after
+    return {"schema_version": "herdr-offline-autonomy-collection-1",
+            "status": "COLLECTION_VALIDATED" if valid else "BLOCKED",
+            "evidence_level": "offline_test_collection", "collection_only": True,
+            "collection_complete": complete, "collected_nodeids": found,
+            "expected_nodeids": expected, "verified_gates": 0,
+            "required_gates": len(CASES), "testcases": 0,
+            "pytest_exit_code": returncode, "source_unchanged": before == after,
+            "source_before": before, "source_after": after,
+            "gates": {name: {"status": "NOT_EXECUTED", "selectors": list(selectors)}
+                      for name, selectors in CASES.items()},
+            "blocked_gates": list(CASES), "test_outcomes": {}, "blocked_test_outcomes": [],
+            "full_autonomy_verified": False, "native_sdk_cycle_verified": False,
+            "live_dispatch_authorized": False, "merge_authorized": False,
+            "deployment_authorized": False, "historical_cost_and_tokens": "UNKNOWN"}
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--evidence-dir", required=True, type=Path)
+    parser.add_argument("--collect-only", action="store_true", help="validate selectors without executing contracts")
     args = parser.parse_args(argv)
     root = Path(__file__).resolve().parents[1]
     evidence = args.evidence_dir.absolute()
@@ -222,10 +246,12 @@ def main(argv=None) -> int:
     code = ("import json,sys;sys.path[:]=json.loads(sys.argv.pop(1));"
             "import pytest;raise SystemExit(pytest.main(sys.argv[1:]))")
     command = [sys.executable, "-I", "-B", "-c", code,
-               json.dumps([str(root), *sys.path]), "-q", "-p", "no:cacheprovider",
+               json.dumps([str(root), *sys.path]), "-q", "--color=no", "--rootdir=" + str(root), "-p", "no:cacheprovider",
                "-o", "addopts=", "-o", "xfail_strict=true", "-o", "junit_family=xunit2",
                "--basetemp=" + str(evidence / "scratch"),
                "--junitxml=" + str(evidence / "junit.xml"), *selectors]
+    if args.collect_only:
+        command.append("--collect-only")
     # No live queue, administrator, model, GitHub publication or service entrypoint
     # is invoked here. Selected existing tests use disposable, offline fixtures.
     with (evidence / "pytest.log").open("xb") as log:
@@ -240,7 +266,8 @@ def main(argv=None) -> int:
         after = {"inspection_failed": True}
     junit = evidence / "junit.xml"
     raw = junit.read_bytes() if junit.is_file() else b""
-    report = evaluate_junit(raw, returncode, before, after)
+    report = (evaluate_collection((evidence / "pytest.log").read_bytes(), returncode, before, after)
+              if args.collect_only else evaluate_junit(raw, returncode, before, after))
     report["junit_sha256"] = hashlib.sha256(raw).hexdigest()
     report["log_sha256"] = hashlib.sha256((evidence / "pytest.log").read_bytes()).hexdigest()
     with (evidence / "report.json").open("x", encoding="utf-8") as output:
@@ -249,7 +276,8 @@ def main(argv=None) -> int:
     print(json.dumps({k: report[k] for k in ("schema_version", "status", "verified_gates",
         "required_gates", "testcases", "source_unchanged", "full_autonomy_verified",
         "pytest_exit_code", "blocked_gates", "test_outcomes", "blocked_test_outcomes")}))
-    return 0 if report["status"] == "OFFLINE_CONTRACTS_PASSED" else 1
+    expected_status = "COLLECTION_VALIDATED" if args.collect_only else "OFFLINE_CONTRACTS_PASSED"
+    return 0 if report["status"] == expected_status else 1
 
 
 if __name__ == "__main__":

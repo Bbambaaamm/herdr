@@ -16,6 +16,7 @@ from herdr.evidence import EvidenceError, binding, canonical, digest
 from herdr.security import SecurityError
 
 SOURCE = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(SOURCE / "agent-stack/bin"))
 
 
 def script(name):
@@ -428,3 +429,35 @@ def test_empty_result_metadata_change_is_not_original_slot_generation(prepared):
     with pytest.raises(EvidenceError, match="approved_inputs_changed"):
         apply(p)
     assert p["path"].read_bytes() == before
+
+
+def test_visible_terminal_marker_reestablishes_task_directory_durability(prepared, monkeypatch):
+    p = prepared
+    real_sync = unknown.os.fsync
+    failed = []
+    def fail_task_directory(fd):
+        if Path(os.readlink("/proc/self/fd/" + str(fd))) == p["path"].parent:
+            failed.append("blocked")
+            raise OSError("synthetic task directory fsync failure")
+        return real_sync(fd)
+    monkeypatch.setattr(unknown.os, "fsync", fail_task_directory)
+    with pytest.raises(OSError, match="task directory"):
+        apply(p)
+    assert json.loads(p["path"].read_bytes())["attempt_state"] == "terminal_unknown"
+    preserved = {f: (f.stat().st_ino, f.stat().st_mtime_ns, f.read_bytes())
+                 for f in [p["path"], p["result"], p["events"], p["ledger"],
+                           *list((p["root"] / "results").glob("*.watchdog-terminal-unknown-*.json"))]}
+    monkeypatch.setattr(unknown, "_write", lambda *a, **kw:
+                        pytest.fail("idempotent durability repair cannot rewrite task or receipt"))
+    with pytest.raises(OSError, match="task directory"):
+        apply(p)
+    assert failed == ["blocked", "blocked"]
+    durable = []
+    def observed_sync(fd):
+        if Path(os.readlink("/proc/self/fd/" + str(fd))) == p["path"].parent:
+            durable.append("blocked")
+        return real_sync(fd)
+    monkeypatch.setattr(unknown.os, "fsync", observed_sync)
+    assert apply(p)["status"] == "already_terminal_unknown"
+    assert durable == ["blocked"]
+    assert preserved == {f: (f.stat().st_ino, f.stat().st_mtime_ns, f.read_bytes()) for f in preserved}

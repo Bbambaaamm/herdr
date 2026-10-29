@@ -184,3 +184,32 @@ def test_source_inventory_rejects_dirty_untracked_and_changed_oracle(tmp_path):
     (tmp_path / "extra.py").write_text("unreviewed\n")
     with pytest.raises(ValueError, match="clean"):
         probe.source_snapshot(tmp_path)
+
+
+def collection_log():
+    return ("\n".join(dict.fromkeys(s for group in probe.CASES.values() for s in group)) + "\n").encode()
+
+
+def test_collection_inventory_cannot_be_mistaken_for_executed_contracts():
+    report = probe.evaluate_collection(collection_log(), 0, SOURCE, SOURCE)
+    assert report["status"] == "COLLECTION_VALIDATED"
+    assert report["schema_version"] != probe.SCHEMA
+    assert report["evidence_level"] == "offline_test_collection"
+    assert report["collection_only"] and report["collection_complete"]
+    assert report["verified_gates"] == report["testcases"] == 0
+    assert all(g["status"] == "NOT_EXECUTED" for g in report["gates"].values())
+    assert report["full_autonomy_verified"] is report["live_dispatch_authorized"] is False
+
+
+@pytest.mark.parametrize("fault", ["missing", "duplicate", "unexpected", "exit_code", "source_drift"])
+def test_incomplete_or_rebound_collection_is_blocked(fault):
+    raw = collection_log()
+    code, after = 0, SOURCE
+    if fault == "missing": raw = b"\n".join(raw.splitlines()[1:])
+    elif fault == "duplicate": raw += raw.splitlines()[0] + b"\n"
+    elif fault == "unexpected": raw += b"tests/foreign.py::test_not_authorized\n"
+    elif fault == "exit_code": code = 2
+    elif fault == "source_drift": after = {**SOURCE, "head": "changed"}
+    report = probe.evaluate_collection(raw, code, SOURCE, after)
+    assert report["status"] == "BLOCKED"
+    assert report["verified_gates"] == report["testcases"] == 0

@@ -79,3 +79,18 @@ through the existing contract, without resetting attempts, budget or ownership.
 Track the connected live acceptance in #184 and rollout/soak in #78. Proactive
 routines remain under #100/#183; research under #182; evaluation/evolution under
 #74/#98. Do not create duplicate backlog owners, schedules or dashboards.
+
+## CI and supported-host evidence are distinct
+
+Generic hosted CI validates the complete selector inventory with `--collect-only`.
+Its separate `herdr-offline-autonomy-collection-1` report says
+`COLLECTION_VALIDATED`, zero executed tests and zero verified runtime gates.
+It is never an `OFFLINE_CONTRACTS_PASSED` receipt. The unchanged full Python and
+browser suites remain mandatory CI checks.
+
+Execute the strict default probe separately on an authorized unprivileged Linux
+test host with installed bubblewrap and working PID/network namespaces. All
+required cases must execute successfully there; missing kernel/runtime support,
+skips or failures keep that execution report BLOCKED. Preserve the supported-host
+report for the exact source tree before any activation. Do not relax namespace
+controls or substitute collection evidence for physical or native SDK acceptance.

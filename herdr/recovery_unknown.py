@@ -343,6 +343,13 @@ def apply(root, task_id, *, active_workers):
             receipt = _json(receipt_raw)
             need(receipt.get("decision_sha256") == decision_sha
                  and receipt.get("after_task") == task, "terminal_receipt_changed")
+            # A visible marker can follow a failed task-directory fsync.
+            # Re-establish durability before acknowledging the original decision.
+            directory = _directory(path.parent)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
             return {"status": "already_terminal_unknown", "task_id": task_id,
                     "task_acceptance": "UNKNOWN", "accounting_mutated": False}
         need(decision["issued_at_epoch"] <= time.time() < decision["expires_at_epoch"], "approval_expired")
