@@ -132,6 +132,13 @@ def prepare_queue():
     if receipt.exists():
         assert json.loads(receipt.read_bytes())['fresh_identity']==json.loads((R/'same-identity-approved38.json').read_bytes())['identity']
         return queue
+    seed_path=R/'resume-task-reviewed-approved38.json'
+    prepared_path=R/'approved38-source-and-scripts-prepared.json'
+    seed_bytes=seed_path.read_bytes()
+    prepared=json.loads(prepared_path.read_bytes())
+    assert prepared['task_seed_sha256']==hashlib.sha256(seed_bytes).hexdigest()
+    task=json.loads(seed_bytes)
+    assert task['model']==MODEL and task['fencing_token']==json.loads((R/'same-identity-approved38.json').read_bytes())['identity']['fencing_token']
     assert queue.resolve(strict=True)==queue
     preserved=R/'approved37-original-queue-preserved-before-approved38'
     assert not preserved.exists()
@@ -139,12 +146,15 @@ def prepare_queue():
     queue.mkdir(mode=0o700);os.chown(queue,1001,1001)
     for name in QUEUE_DIRS:
         path=queue/name;path.mkdir(mode=0o700);os.chown(path,1001,1001)
-    task=json.loads((R/'resume-task-reviewed-approved38.json').read_bytes())
     now=datetime.now(timezone.utc).isoformat()
     task['attempt_started_at']=task['dispatch_claimed_at']=now
-    assert task['model']==MODEL and task['fencing_token']==json.loads((R/'same-identity-approved38.json').read_bytes())['identity']['fencing_token']
-    save(R/'resume-task-reviewed-approved38.json',task,0o600,1001)
-    save(queue/'pending'/(TASK+'.json'),task,0o600,1001)
+    save(seed_path,task,0o600,1001)
+    pending=queue/'pending'/(TASK+'.json')
+    save(pending,task,0o600,1001)
+    actual=seed_path.read_bytes()
+    assert pending.read_bytes()==actual
+    prepared['task_seed_sha256']=hashlib.sha256(actual).hexdigest()
+    save(prepared_path,prepared,0o444)
     save(receipt,{'original_queue':str(preserved),'fresh_identity':json.loads((R/'same-identity-approved38.json').read_bytes())['identity'],'model_calls':0})
     return queue
 

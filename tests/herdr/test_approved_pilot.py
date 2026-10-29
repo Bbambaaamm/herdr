@@ -56,3 +56,114 @@ def test_auth_child_uses_versioned_snapshot_with_derived_lifetime(tmp_path,monke
     assert child[-2:]==['--required-validity-seconds','3330']
     assert 'approved38-existing-credential-snapshot.py' not in child[3]
     assert not (tmp_path/'approved38-unit-start-intent.json').exists()
+
+
+@pytest.fixture
+def fresh_queue_preparation(tmp_path, monkeypatch):
+    """Synthetic owned files; real preparation/refresh and identity code."""
+    import hashlib
+    from herdr.evidence import binding
+
+    m = load()
+    m.R = tmp_path / "approved"
+    m.H = tmp_path / "private-home"
+    m.STORE = tmp_path / "not-admitted"
+    m.R.mkdir()
+    queue = m.H / ".local/state/agent-stack/tasks"
+    queue.mkdir(parents=True)
+    (queue / "retained.marker").write_bytes(b"original queue evidence")
+    seed = task()
+    seed_path = m.R / "resume-task-reviewed-approved38.json"
+    prepared_path = m.R / "approved38-source-and-scripts-prepared.json"
+
+    def seed_files(pretty=False):
+        raw = json.dumps(seed, indent=2 if pretty else None).encode()
+        seed_path.write_bytes(raw)
+        prepared_path.write_text(json.dumps({
+            "task_seed_sha256": hashlib.sha256(raw).hexdigest(),
+            "source_commit": "retained-source",
+            "previous_budget_sha256": "preserved-budget-hash",
+            "files": {"kept.py": "unchanged-source-hash"},
+        }))
+        (m.R / "same-identity-approved38.json").write_text(
+            json.dumps({"identity": binding(seed)}))
+        return raw
+
+    seed_files()
+    # Ownership changes are outside this unprivileged unit fixture. The actual
+    # atomic JSON writer, seed/queue logic and canonical identity remain in use.
+    monkeypatch.setattr(m.os, "chown", lambda *args, **kwargs: None)
+    return m, seed, seed_path, prepared_path, queue, seed_files
+
+
+@pytest.mark.parametrize("pretty", [False, True])
+def test_first_queue_preparation_then_clock_refresh_preserves_seed_hash(
+        fresh_queue_preparation, pretty):
+    import hashlib
+    from herdr.evidence import binding
+
+    m, original, seed, prepared, queue, seed_files = fresh_queue_preparation
+    seed_files(pretty)
+    assert m.prepare_queue() == queue
+    pending = queue / "pending" / (m.TASK + ".json")
+    assert seed.read_bytes() == pending.read_bytes()
+    m.refresh_pending_start_clock()
+
+    actual = seed.read_bytes()
+    assert pending.read_bytes() == actual
+    metadata = json.loads(prepared.read_bytes())
+    assert metadata["task_seed_sha256"] == hashlib.sha256(actual).hexdigest()
+    after = json.loads(actual)
+    assert binding(after) == binding(original)
+    clock_fields = {"attempt_started_at", "dispatch_claimed_at"}
+    assert {k: v for k, v in after.items() if k not in clock_fields} == {
+        k: v for k, v in original.items() if k not in clock_fields}
+    assert metadata["source_commit"] == "retained-source"
+    assert metadata["previous_budget_sha256"] == "preserved-budget-hash"
+    assert metadata["files"] == {"kept.py": "unchanged-source-hash"}
+    assert (m.R / "approved37-original-queue-preserved-before-approved38" /
+            "retained.marker").read_bytes() == b"original queue evidence"
+    before_reentry = (seed.read_bytes(), pending.read_bytes(),
+                      prepared.read_bytes())
+    assert m.prepare_queue() == queue
+    assert before_reentry == (seed.read_bytes(), pending.read_bytes(),
+                              prepared.read_bytes())
+    assert not (m.R / "approved38-unit-start-intent.json").exists()
+    assert not list(m.STORE.glob("work-budget/*/events.jsonl"))
+
+
+def test_changed_seed_hash_denies_before_replacing_the_original_queue(
+        fresh_queue_preparation):
+    m, _, seed, prepared, queue, _ = fresh_queue_preparation
+    value = json.loads(prepared.read_bytes())
+    value["task_seed_sha256"] = "0" * 64
+    prepared.write_text(json.dumps(value))
+    original = seed.read_bytes()
+    with pytest.raises(AssertionError):
+        m.prepare_queue()
+    assert seed.read_bytes() == original
+    assert (queue / "retained.marker").read_bytes() == b"original queue evidence"
+    assert not (m.R / "approved37-original-queue-preserved-before-approved38").exists()
+    assert not (m.R / "approved38-queue-prepared.json").exists()
+
+
+def test_prepared_metadata_write_failure_never_acknowledges_or_replays_queue(
+        fresh_queue_preparation, monkeypatch):
+    m, _, _, prepared, _, _ = fresh_queue_preparation
+    save = m.save
+
+    def fail_metadata(path, *args, **kwargs):
+        if path == prepared:
+            raise OSError("synthetic prepared metadata persistence failure")
+        return save(path, *args, **kwargs)
+
+    monkeypatch.setattr(m, "save", fail_metadata)
+    with pytest.raises(OSError, match="metadata persistence"):
+        m.prepare_queue()
+    assert not (m.R / "approved38-queue-prepared.json").exists()
+    with pytest.raises(AssertionError):
+        m.prepare_queue()
+    assert (m.R / "approved37-original-queue-preserved-before-approved38" /
+            "retained.marker").read_bytes() == b"original queue evidence"
+    assert not (m.R / "approved38-unit-start-intent.json").exists()
+    assert not list(m.STORE.glob("work-budget/*/events.jsonl"))
