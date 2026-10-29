@@ -145,7 +145,7 @@ def main():
         command = prefix + ['agent-stack/bin/agent-task-dispatcher']
     else:
         readiness = _helpers['_readiness']()
-        expected = json.loads(readiness.read_protected(ROOT / 'same-identity-approved38.json'))['identity']
+        expected = readiness.read_host_task_identity(ROOT / 'same-identity-approved38.json')
         task_path, task = readiness.observe_task(QUEUE, TASK, expected)
         assert task_path.parent.name in ('running', 'blocked', 'done')
         assert task['attempt_state'] == 'verification_pending' and binding(task) == expected

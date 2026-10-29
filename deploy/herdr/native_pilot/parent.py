@@ -71,7 +71,7 @@ def host_action(operation, context, **data):
 
 def canonical_task():
     readiness = _helpers['_readiness']()
-    expected = json.loads(readiness.read_protected(ROOT / 'same-identity-approved38.json'))['identity']
+    expected = readiness.read_host_task_identity(ROOT / 'same-identity-approved38.json')
     return readiness.observe_task(QUEUE, TASK, expected)
 
 def worker_quiet():

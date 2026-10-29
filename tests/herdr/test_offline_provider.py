@@ -182,7 +182,7 @@ def offline_handoff_observer(tmp_path):
             'deadline':3,'passed':False,'root':tmp_path,
             'readiness':SimpleNamespace(observe_task=readiness.observe_task,
                 SnapshotChanged=readiness.SnapshotChanged,
-                read_protected=lambda p:json.dumps({'identity':expected}))}
+                read_host_task_identity=lambda p:expected)}
         exec(compile(ast.Module(body=[need,loop],type_ignores=[]),str(source),'exec'),ns)
         return ns['passed']
     return SimpleNamespace(invoke=invoke,task=task,clock=clock,queue=queue)

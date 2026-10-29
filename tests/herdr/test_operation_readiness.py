@@ -92,6 +92,77 @@ def test_task_queue_alias_and_untrusted_binding_are_denied(canonical_queue,tmp_p
     with pytest.raises(ReadinessError):observe_task(f.queue,'original',{},owner=os.geteuid())
 
 
+@pytest.fixture
+def host_identity_producer(tmp_path,monkeypatch):
+    """Actual save/call and reader policy; root UID/ancestry metadata doubled."""
+    import ast,hashlib,json,stat
+    from types import SimpleNamespace
+    from herdr.evidence import binding
+    from herdr import operation_readiness as r
+    source=Path(__file__).resolve().parents[2]/'deploy/herdr/approved_pilot.py'
+    tree=ast.parse(source.read_text())
+    save=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='save')
+    profile=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='prepare_profile')
+    producer=next(n for n in ast.walk(profile) if isinstance(n,ast.Expr) and isinstance(n.value,ast.Call)
+                  and isinstance(n.value.func,ast.Name) and n.value.func.id=='save'
+                  and isinstance(n.value.args[0],ast.BinOp) and isinstance(n.value.args[0].right,ast.Constant)
+                  and n.value.args[0].right.value=='same-identity-approved38.json')
+    assert isinstance(producer.value.args[2],ast.Constant) and producer.value.args[2].value==0o644
+    task={'id':'original','run_token':'run','idempotency_key':'key','attempt_id':0,'fencing_token':8}
+    (tmp_path/'approved38-human-approval.json').write_bytes(b'synthetic approval')
+    class ProducerOS:
+        def __getattr__(self,name):return getattr(os,name)
+        def chown(self,*args):pass # Root ownership only; actual mode/write/fsync/rename run.
+    ns={'os':ProducerOS(),'json':json,'hashlib':hashlib,'R':tmp_path,'task':task,'binding':binding}
+    exec(compile(ast.Module(body=[save,producer],type_ignores=[]),str(source),'exec'),ns)
+    path=tmp_path/'same-identity-approved38.json'
+    assert stat.S_IMODE(path.stat().st_mode)==0o644
+    config={'owner':0}
+    def metadata(info):
+        values={name:getattr(info,name) for name in ('st_dev','st_ino','st_uid','st_gid','st_mode',
+            'st_nlink','st_size','st_mtime_ns','st_ctime_ns')}
+        values['st_uid']=0 if stat.S_ISDIR(info.st_mode) else config['owner']
+        if stat.S_ISDIR(info.st_mode):values['st_mode']&=~0o022
+        return SimpleNamespace(**values)
+    class RootMetadataOS:
+        def __getattr__(self,name):return getattr(os,name)
+        def fstat(self,fd):return metadata(os.fstat(fd))
+        def stat(self,*args,**kwargs):return metadata(os.stat(*args,**kwargs))
+    monkeypatch.setattr(r,'os',RootMetadataOS())
+    # The fallback is the previous consumer expression for red/green proof.
+    reader=getattr(r,'read_host_task_identity',lambda p:json.loads(r.read_protected(p))['identity'])
+    return SimpleNamespace(path=path,expected=binding(task),config=config,reader=reader)
+
+
+def test_actual_host_identity_producer_mode_matches_reader(host_identity_producer):
+    f=host_identity_producer
+    assert f.reader(f.path)==f.expected
+    # The separate immutable composition contract is not weakened to pass.
+    from herdr.operation_readiness import read_protected
+    with pytest.raises(ReadinessError,match='protected_file_required'):read_protected(f.path)
+
+
+@pytest.mark.parametrize('fault',['owner','writable','symlink','hardlink','corrupt','duplicate','version'])
+def test_root_binding_reader_denies_unsafe_or_changed_inputs(host_identity_producer,monkeypatch,fault):
+    from herdr import operation_readiness as r
+    f=host_identity_producer
+    if fault=='owner':f.config['owner']=1001
+    elif fault=='writable':f.path.chmod(0o666)
+    elif fault=='symlink':p=f.path.with_suffix('.original');f.path.rename(p);f.path.symlink_to(p)
+    elif fault=='hardlink':os.link(f.path,f.path.with_suffix('.link'))
+    elif fault=='corrupt':f.path.write_bytes(b'{broken')
+    elif fault=='duplicate':f.path.write_bytes(b'{"identity":{},"identity":{}}')
+    else:
+        read=os.read;changed=[]
+        def changing(fd,size):
+            result=read(fd,size)
+            if not changed:
+                info=f.path.stat();os.utime(f.path,ns=(info.st_atime_ns,info.st_mtime_ns+1));changed.append(True)
+            return result
+        monkeypatch.setattr(r.os,'read',changing)
+    with pytest.raises((ReadinessError,OSError,ValueError)):f.reader(f.path)
+
+
 def test_independent_lifetimes_cover_grant_and_complete_work():
     life=Lifetimes(grant_seconds=2700,work_seconds=1800,preparation_seconds=600,cleanup_seconds=300)
     assert life.credential_seconds()==3330

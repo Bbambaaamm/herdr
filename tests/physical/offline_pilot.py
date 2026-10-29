@@ -299,7 +299,7 @@ def inner(composition_path,composition_sha,output):
         while process.poll() is None and time.monotonic()<deadline:
             queue=Path('/home/agentops/.local/state/agent-stack/tasks')
             result_path=queue/'results'/(TASK+'.json')
-            expected=json.loads(readiness.read_protected(root/'same-identity-approved38.json'))['identity']
+            expected=readiness.read_host_task_identity(root/'same-identity-approved38.json')
             try:
                 task_path,task=readiness.observe_task(queue,TASK,expected)
             except readiness.SnapshotChanged:

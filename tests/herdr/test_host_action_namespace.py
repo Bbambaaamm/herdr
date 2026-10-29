@@ -95,7 +95,7 @@ def host_action_fixture(tmp_path):
         "CONTROL": control, "PYTHON": "/pinned/python", "CODE": tmp_path / "code",
         # Protected-root ownership is doubled; observation and file IPC are real.
         "_helpers": {'_readiness': lambda: SimpleNamespace(observe_task=readiness.observe_task,
-            SnapshotChanged=readiness.SnapshotChanged, read_protected=lambda p: p.read_bytes())},
+            SnapshotChanged=readiness.SnapshotChanged, read_host_task_identity=lambda p: json.loads(p.read_bytes())['identity'])},
     }
     for path, name in ((host_path, "main"), (parent_path, "canonical_task")):
         node = next(n for n in ast.parse(path.read_text()).body
@@ -356,7 +356,7 @@ def parent_completion_fixture(tmp_path):
         "binding": binding, "digest": digest,
         "ROOT": tmp_path,
         "_helpers": {'_readiness': lambda: SimpleNamespace(observe_task=readiness.observe_task,
-            SnapshotChanged=readiness.SnapshotChanged, read_protected=lambda p: p.read_bytes())},
+            SnapshotChanged=readiness.SnapshotChanged, read_host_task_identity=lambda p: json.loads(p.read_bytes())['identity'])},
     }
     for name in ("canonical_task", "main"):
         node = next(n for n in ast.parse(source.read_text()).body

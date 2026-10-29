@@ -20,15 +20,75 @@ def _task_stamp(info):
             info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
-def _task_directory(path):
+def _task_json(body):
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            require(key not in value, 'duplicate_task_field')
+            value[key] = item
+        return value
+    return json.loads(body, object_pairs_hook=unique)
+
+
+def read_host_task_identity(path):
+    """Read the existing root-owned binding, which its producer writes 0644.
+
+    Owner-write is permitted only for this data input. Protected runtime and
+    composition snapshots continue to require their existing immutable modes.
+    """
+    path = Path(path)
+    require(path.is_absolute() and '..' not in path.parts
+            and path.name == 'same-identity-approved38.json', 'host_task_binding_path_required')
+    fd = os.open('/', os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for index, part in enumerate(path.parts[1:]):
+            info = os.fstat(fd)
+            require(info.st_uid == 0 and not info.st_mode & 0o022, 'host_binding_ancestry_required')
+            last = index == len(path.parts) - 2
+            flags = os.O_RDONLY | os.O_NONBLOCK if last else os.O_PATH | os.O_DIRECTORY
+            child = os.open(part, flags | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        before = os.fstat(fd)
+        require(stat.S_ISREG(before.st_mode) and before.st_uid == 0 and before.st_nlink == 1
+                and not before.st_mode & 0o022 and 0 < before.st_size <= 1048576, 'host_binding_file_required')
+        body = bytearray()
+        while len(body) <= before.st_size:
+            chunk = os.read(fd, min(65536, before.st_size + 1 - len(body)))
+            if not chunk:
+                break
+            body.extend(chunk)
+        require(len(body) == before.st_size and _task_stamp(before) == _task_stamp(os.fstat(fd))
+                == _task_stamp(os.stat(path, follow_symlinks=False)), 'host_binding_snapshot_changed')
+        # Re-walk ancestors without following links after the content read.
+        named = _task_directory(path.parent, owner=0)
+        try:
+            require(_task_stamp(os.stat(path.name, dir_fd=named, follow_symlinks=False))
+                    == _task_stamp(before), 'host_binding_named_identity_changed')
+        finally:
+            os.close(named)
+        value = _task_json(body)
+        require(isinstance(value, dict) and isinstance(value.get('identity'), dict), 'host_binding_identity_required')
+        return value['identity']
+    finally:
+        os.close(fd)
+
+
+def _task_directory(path, *, owner=None):
     path = Path(path)
     require(path.is_absolute() and '..' not in path.parts, 'absolute_task_queue_required')
     fd = os.open('/', os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
         for part in path.parts[1:]:
+            if owner is not None:
+                info = os.fstat(fd)
+                require(info.st_uid == owner and not info.st_mode & 0o022, 'host_binding_ancestry_required')
             child = os.open(part, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
             os.close(fd)
             fd = child
+        if owner is not None:
+            info = os.fstat(fd)
+            require(info.st_uid == owner and not info.st_mode & 0o022, 'host_binding_ancestry_required')
         return fd
     except BaseException:
         os.close(fd)
@@ -109,7 +169,7 @@ def observe_task(queue, task_id, expected_identity, *, owner=1001):
             if _task_stamp(os.fstat(fd)) != _task_stamp(before) or not unchanged():
                 continue
             require(len(body) == before.st_size, 'task_snapshot_shortened')
-            task = json.loads(body)
+            task = _task_json(body)
             require(isinstance(task, dict) and binding(task) == expected_identity, 'task_identity_changed')
             return queue / state / name, task
         finally:
