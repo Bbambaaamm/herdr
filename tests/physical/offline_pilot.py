@@ -1,5 +1,9 @@
 """Bounded ordinary-worker acceptance in a private mount/PID/network namespace.
 
+--prepare-clean-inputs CASE --case-sha256 SHA --run-token NONCE is a
+unprivileged, data-only preparation mode for a fresh synthetic case. It does
+not invoke this historical pilot, allocate a budget or establish physical PASS.
+
 Only the external Nous responses are supplied by a local TLS fixture. No real
 login or GitHub credentials enter this environment. Passing this proof is local
 handoff acceptance, not inference, publication, final task DONE or rollout.
@@ -330,13 +334,198 @@ def inner(composition_path,composition_sha,output):
         json_file(output/'transport-observations.json',dict(observations,fixture_only=True,external_provider_http_requests=0))
 
 
+
+# Fresh preparation is deliberately a data-only mode. The legacy pilot below
+# still consumes its original protected composition; its authority is not reused.
+def _closed_object(value, keys, reason):
+    need(type(value) is dict and set(value) == set(keys), reason)
+
+
+def _fixture_relative(name):
+    from pathlib import PurePosixPath
+    import re
+    need(type(name) is str and len(name) <= 128
+         and re.fullmatch(r'[A-Za-z0-9_./-]+', name) is not None,
+         'clean_case_path_denied')
+    path = PurePosixPath(name)
+    need(not path.is_absolute() and path.as_posix() == name
+         and all(part not in ('', '.', '..') and not part.startswith('.')
+                 for part in name.split('/')),
+         'clean_case_path_denied')
+    return name
+
+
+def read_clean_case(path, expected_sha256):
+    import re
+    need(type(expected_sha256) is str and re.fullmatch('[0-9a-f]{64}', expected_sha256),
+         'clean_case_digest_required')
+    path = Path(path).absolute()
+    need(path.resolve(strict=True) == path and not path.is_symlink(),
+         'clean_case_alias_denied')
+    info = path.lstat()
+    need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+         and 0 < info.st_size <= 65536, 'clean_case_file_denied')
+    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
+    fd = os.open(path, flags)
+    try:
+        before = os.fstat(fd)
+        # Windows 3.13 lstat reports creation time in ctime while fstat reports
+        # change time. Compare each version through the same API; bind the
+        # handle to the named file by every other stable identity field.
+        cross_stamp = lambda value: snapshot_stamp(value)[:-1] if os.name=='nt' else snapshot_stamp(value)
+        need(cross_stamp(info) == cross_stamp(before), 'clean_case_changed')
+        raw = bytearray()
+        while len(raw) <= 65536:
+            part = os.read(fd, min(8192, 65537-len(raw)))
+            if not part:
+                break
+            raw.extend(part)
+        after, named = os.fstat(fd), path.lstat()
+        need(snapshot_stamp(before) == snapshot_stamp(after)
+             and snapshot_stamp(info) == snapshot_stamp(named)
+             and cross_stamp(after) == cross_stamp(named) and len(raw) == before.st_size,
+             'clean_case_changed')
+    finally:
+        os.close(fd)
+    need(hashlib.sha256(raw).hexdigest() == expected_sha256, 'clean_case_digest_changed')
+    def closed_pairs(pairs):
+        value = {}
+        for key, item in pairs:
+            need(key not in value, 'clean_case_duplicate_field')
+            value[key] = item
+        return value
+    case = json.loads(raw, object_pairs_hook=closed_pairs,
+                      parse_constant=lambda value: need(False, 'clean_case_nonfinite'))
+    _closed_object(case, ('schema_version', 'case_id', 'consumer', 'source_main',
+                         'files', 'edits', 'check', 'limits'), 'clean_case_schema')
+    need(case['schema_version'] == 'herdr-offline-clean-case-1'
+         and case['case_id'] == 'arithmetic-v1'
+         and case['consumer'] == 'github:Bbambaaamm/herdr'
+         and case['source_main'] == '5fbabd5864d2f74f5c4658aa6e5f577967e88ffa',
+         'clean_case_identity_denied')
+    files, edits = case['files'], case['edits']
+    need(type(files) is dict and 1 <= len(files) <= 16
+         and type(edits) is dict and 1 <= len(edits) <= len(files),
+         'clean_case_inventory_denied')
+    total = 0
+    for name, body in files.items():
+        _fixture_relative(name)
+        need(type(body) is str and 0 < len(body.encode()) <= 8192,
+             'clean_case_content_bound')
+        total += len(body.encode())
+    need(total <= 32768, 'clean_case_content_bound')
+    for name, body in edits.items():
+        _fixture_relative(name)
+        need(name in files and type(body) is str and 0 < len(body.encode()) <= 8192
+             and body != files[name], 'clean_case_edit_denied')
+    check = case['check']
+    _closed_object(check, ('id', 'script', 'expected_baseline_exit',
+                          'expected_baseline_stdout', 'expected_pass_stdout'),
+                   'clean_case_check_schema')
+    need(check['id'] == 'arithmetic' and type(check['script']) is str and check['script'] in files
+         and check['script'] not in edits and check['script'].endswith('.py')
+         and type(check['expected_baseline_exit']) is int
+         and check['expected_baseline_exit'] == 1,
+         'clean_case_check_denied')
+    need(all(type(check[key]) is str and 0 < len(check[key]) <= 1024
+             for key in ('expected_baseline_stdout', 'expected_pass_stdout'))
+         and check['expected_baseline_stdout'] != check['expected_pass_stdout'],
+         'clean_case_check_denied')
+    expected_limits = {
+        'max_external_model_calls': 0, 'max_external_auth_calls': 0,
+        'max_external_github_calls': 0, 'max_cost_microusd': 0,
+        'max_local_fixture_requests': 16, 'max_work_seconds': 900,
+        'max_envelope_seconds': 1800, 'max_managed_children': 1,
+    }
+    need(type(case['limits']) is dict and case['limits'] == expected_limits
+         and all(type(value) is int for value in case['limits'].values()),
+         'clean_case_limits_denied')
+    return case
+
+
+def prepare_clean_inputs(path, expected_sha256, run_token):
+    """Return a proposal, never queue state, policy, a grant or an allowance.
+
+    Pure preparation neither consumes a historical Work nor creates authority.
+    The approved physical envelope must still bind its own absolute deadlines,
+    protected admission, immutable runtime, profile, grant and actual evidence.
+    """
+    import re
+    need(type(run_token) is str and re.fullmatch('[0-9a-f]{32}', run_token),
+         'clean_case_fresh_nonce_required')
+    case = read_clean_case(path, expected_sha256)
+    source = Path(__file__).resolve().parents[2]
+    if str(source) not in sys.path:
+        sys.path.insert(0, str(source))
+    from herdr.security import (InvocationIdentity, canonical_json_bytes as canonical,
+                                canonical_digest as digest)
+    task_id = 'offline188-' + run_token
+    workspace = '/home/agentops/worktrees/' + task_id + '/workspace'
+    task = {
+        'id': task_id, 'run_token': run_token, 'idempotency_key': 'fixture:' + task_id,
+        'fencing_token': 1, 'attempt_id': 0, 'attempts': 0,
+        'repo': 'Bbambaaamm/herdr', 'kind': 'coding',
+        'workspace': workspace, 'work_contract_version': 1, 'work_budget_version': 1,
+        'prompt': 'Repair add in arithmetic.py only. Run the frozen arithmetic check. '
+                  'Stop after verified local handoff; do not publish or deploy.',
+    }
+    root_identity = InvocationIdentity(
+        consumer=case['consumer'], agent_id='fixture-parent',
+        parent_agent_id='fixture-supervisor', parent_task_id='offline188-envelope',
+        task_id=task_id, run_token=run_token, fencing_token=1)
+    child_identity = InvocationIdentity(
+        consumer=case['consumer'], agent_id='fixture-child',
+        parent_agent_id=root_identity.agent_id, parent_task_id=task_id,
+        task_id=task_id+'-child', run_token=run_token, fencing_token=1)
+    tools = ['read_file', 'write_file', 'herdr_verify_work', 'herdr_submit_result']
+    proposal = {
+        'schema_version': 'herdr-offline-clean-inputs-1',
+        'case_sha256': expected_sha256, 'source_main': case['source_main'],
+        'status': 'PROPOSAL_ONLY_NOT_ADMITTED',
+        'task_seed': task,
+        'root_identity': root_identity.to_json(),
+        'managed_child_identity': child_identity.to_json(),
+        'graph_shape': {'node_count': 2, 'max_depth': 2, 'max_fanout': 1},
+        'workspace_files': case['files'],
+        'workspace_sha256': digest(case['files']),
+        'provider_edits': case['edits'],
+        'write_files': sorted(case['edits']),
+        'tools': tools, 'permissions': ['repo:read', 'repo:write'],
+        'check': case['check'], 'limits': case['limits'],
+        'authority_created': False, 'budget_allocated': False,
+        'credentials_created': False, 'queue_written': False,
+        'physical_acceptance': 'NOT_ESTABLISHED',
+        'execution_requirements': [
+            'Protected existing Herdr admission and one original budget lineage',
+            'Immutable code/runtime/profile with a real root issuer and managed child',
+            'Private HOME/network/IPC before any SDK import; synthetic credentials only',
+            'Original absolute grant/work/envelope deadlines bound once at admission',
+            'Existing trusted result verifier and original-worker cold recovery',
+        ],
+    }
+    # This digest is integrity only. It is not an approval or acceptance receipt.
+    proposal['proposal_sha256'] = digest(proposal)
+    return json.loads(canonical(proposal))
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--composition',required=True,type=Path)
-    parser.add_argument('--sha256',required=True)
-    parser.add_argument('--output',required=True,type=Path)
+    parser.add_argument('--composition',type=Path)
+    parser.add_argument('--sha256')
+    parser.add_argument('--output',type=Path)
     parser.add_argument('--inner',action='store_true')
+    parser.add_argument('--prepare-clean-inputs',type=Path)
+    parser.add_argument('--case-sha256')
+    parser.add_argument('--run-token')
     args=parser.parse_args()
+    if args.prepare_clean_inputs is not None:
+        need(not any((args.composition,args.sha256,args.output,args.inner)), 'clean_case_mode_is_data_only')
+        need(not hasattr(os,'geteuid') or os.geteuid()!=0, 'clean_case_preparation_must_be_unprivileged')
+        print(json.dumps(prepare_clean_inputs(args.prepare_clean_inputs,args.case_sha256,args.run_token),sort_keys=True))
+        return 0
+    need(args.case_sha256 is None and args.run_token is None
+         and args.composition is not None and args.sha256 is not None and args.output is not None,
+         'closed_legacy_fixture_invocation_required')
     if args.inner:return inner(args.composition,args.sha256,args.output)
     cfg,token=prepare_fixture(args.composition,args.sha256,args.output)
     tls=args.output/'tls';tls.mkdir(mode=0o700)

@@ -1,0 +1,30 @@
+{
+  "schema_version": "herdr-offline-clean-case-1",
+  "case_id": "arithmetic-v1",
+  "consumer": "github:Bbambaaamm/herdr",
+  "source_main": "5fbabd5864d2f74f5c4658aa6e5f577967e88ffa",
+  "files": {
+    "arithmetic.py": "def add(left, right):\n    return left - right\n",
+    "check_arithmetic.py": "import runpy\nadd = runpy.run_path('arithmetic.py')['add']\nif add(1, 2) != 3 or add(-1, 2) != 1:\n    print('ARITHMETIC_BASELINE')\n    raise SystemExit(1)\nprint('ARITHMETIC_PASS')\n"
+  },
+  "edits": {
+    "arithmetic.py": "def add(left, right):\n    return left + right\n"
+  },
+  "check": {
+    "id": "arithmetic",
+    "script": "check_arithmetic.py",
+    "expected_baseline_exit": 1,
+    "expected_baseline_stdout": "ARITHMETIC_BASELINE\n",
+    "expected_pass_stdout": "ARITHMETIC_PASS\n"
+  },
+  "limits": {
+    "max_external_model_calls": 0,
+    "max_external_auth_calls": 0,
+    "max_external_github_calls": 0,
+    "max_cost_microusd": 0,
+    "max_local_fixture_requests": 16,
+    "max_work_seconds": 900,
+    "max_envelope_seconds": 1800,
+    "max_managed_children": 1
+  }
+}

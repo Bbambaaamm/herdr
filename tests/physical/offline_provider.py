@@ -47,6 +47,24 @@ class ProviderFixture:
         self.scope_claim=scope_claim
         self.turn=0
         self.complete=False
+        self.files=FILES
+        self.workspace='/home/agentops/worktrees/pilot/workspace/'
+
+    @classmethod
+    def for_clean_case(cls, path, expected_sha256, run_token):
+        # The case is a pinned synthetic data file, never live task/profile data.
+        # Reuse preparation validation; do not accept caller-supplied edits/paths.
+        import runpy
+        pilot = runpy.run_path(str(Path(__file__).with_name('offline_pilot.py')))
+        inputs = pilot['prepare_clean_inputs'](path, expected_sha256, run_token)
+        result = object.__new__(cls)
+        result.edits = dict(inputs['provider_edits'])
+        result.files = tuple(inputs['workspace_files'])
+        result.workspace = inputs['task_seed']['workspace'] + '/'
+        result.scope_claim = None
+        result.turn = 0
+        result.complete = False
+        return result
 
     @staticmethod
     def _tools(payload):
@@ -58,9 +76,9 @@ class ProviderFixture:
         names=self._tools(payload)
         required={'read_file','write_file','herdr_verify_work','herdr_submit_result'}
         if not required<=names:raise ValueError('actual_sdk_required_tools_missing')
-        workspace='/home/agentops/worktrees/pilot/workspace/'
+        workspace=getattr(self,'workspace','/home/agentops/worktrees/pilot/workspace/')
         if self.turn==1:
-            calls=[('read_file',{'path':workspace+name,'offset':1,'limit':2000}) for name in FILES]
+            calls=[('read_file',{'path':workspace+name,'offset':1,'limit':2000}) for name in getattr(self,'files',FILES)]
         elif self.turn==2:
             calls=[('write_file',{'path':workspace+name,'content':body}) for name,body in self.edits.items()]
         elif self.turn==3:
