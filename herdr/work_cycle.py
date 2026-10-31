@@ -11,7 +11,6 @@ import re
 import stat
 from dataclasses import asdict, dataclass
 from enum import StrEnum
-from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
 from .evidence import EvidenceError, EvidenceUnavailable, canonical, digest, read_only_git
@@ -116,6 +115,9 @@ class ValidationCheck:
         require(not self.expected_baseline_failure or isinstance(self.expected_baseline_output_sha256,str)
                 and _SHA.fullmatch(self.expected_baseline_output_sha256),
                 "expected baseline failure needs a predeclared output fingerprint")
+
+
+from contextlib import contextmanager
 
 
 @dataclass(frozen=True)
