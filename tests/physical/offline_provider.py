@@ -112,3 +112,44 @@ class ProviderFixture:
         return {'id':f'offline-completion-{self.turn}','object':'chat.completion','created':1,
             'model':payload.get('model'),'choices':[{'index':0,'message':message,'finish_reason':'tool_calls' if calls else 'stop'}],
             'usage':{'prompt_tokens':1,'completion_tokens':1,'total_tokens':2}}
+
+
+class TeamFixture:
+    """Transport fixture only; never an acceptance/receipt authority.
+
+    The root proposes one protected child. Its response (including a GitHub
+    acceptance gate) is not interpreted as semantic completion. Both roles
+    still need actual host oracle submissions, checked by the supervisor.
+    """
+    @classmethod
+    def for_proposal(cls, proposal, delegation):
+        obj = cls(); obj.delegation = delegation; obj.delegated = False
+        def role(workspace):
+            fixture = object.__new__(ProviderFixture)
+            fixture.edits = dict(proposal['provider_edits'])
+            fixture.files = tuple(proposal['workspace_files'])
+            fixture.workspace = workspace.rstrip('/') + '/'
+            fixture.scope_claim = None; fixture.turn = 0; fixture.complete = False
+            return fixture
+        obj.root = role(proposal['task_seed']['workspace'])
+        obj.child = role(delegation['cwd'])
+        return obj
+
+    @property
+    def complete(self):
+        return self.delegated and self.root.complete and self.child.complete
+
+    def answer(self, payload):
+        names = {item['function']['name'] for item in payload.get('tools', [])}
+        if 'herdr_delegate_child' not in names:
+            return self.child.answer(payload)
+        if self.delegated:
+            return self.root.answer(payload)
+        self.delegated = True
+        return {'id': 'offline-delegation', 'object': 'chat.completion', 'created': 1,
+            'model': payload.get('model'), 'choices': [{'index': 0, 'message': {
+                'role': 'assistant', 'content': None, 'tool_calls': [{
+                    'id': 'offline_delegate_once', 'type': 'function', 'function': {
+                        'name': 'herdr_delegate_child', 'arguments': json.dumps(self.delegation)}}]},
+                'finish_reason': 'tool_calls'}],
+            'usage': {'prompt_tokens': 1, 'completion_tokens': 1, 'total_tokens': 2}}

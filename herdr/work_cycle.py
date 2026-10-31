@@ -11,6 +11,7 @@ import re
 import stat
 from dataclasses import asdict, dataclass
 from enum import StrEnum
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
 from .evidence import EvidenceError, EvidenceUnavailable, canonical, digest, read_only_git
@@ -118,6 +119,131 @@ class ValidationCheck:
 
 
 @dataclass(frozen=True)
+class SnapshotPartition:
+    """A protected original child domain, not an ignore list supplied by work."""
+    payload: str
+
+    def __post_init__(self):
+        data = self.to_json()
+        require(set(data) == {"version", "admission_sha256", "identity", "spec_sha256", "root", "children", "grant_sha256", "sandbox_attestation_sha256", "parent_writable_roots"}
+                and type(data["version"]) is int and data["version"] == 1
+                and all(isinstance(data[k], str) and _SHA.fullmatch(data[k])
+                        for k in ("admission_sha256", "spec_sha256", "grant_sha256", "sandbox_attestation_sha256")), "snapshot partition schema invalid")
+        InvocationIdentity.from_dict(data["identity"])
+        root = data["root"]
+        require(isinstance(root, dict) and set(root) == {"path", "device", "inode", "mount_id"}
+                and isinstance(root["path"], str) and Path(root["path"]).is_absolute()
+                and str(Path(root["path"])) == root["path"] and ".." not in Path(root["path"]).parts,
+                "snapshot partition root invalid")
+        children = data["children"]
+        require(isinstance(children, list) and 1 <= len(children) <= 8, "snapshot partition children invalid")
+        writes = data["parent_writable_roots"]
+        require(isinstance(writes, list) and len(writes) <= 256
+                and all(isinstance(p, str) and Path(p).is_absolute() and str(Path(p)) == p
+                        and ".." not in Path(p).parts for p in writes), "snapshot partition write proof invalid")
+        paths, keys = [], set()
+        for row in [root, *children]:
+            require(all(type(row.get(k)) is int and 0 <= row[k] < 2**64 for k in ("device", "inode", "mount_id"))
+                    and row["inode"] > 0 and row["mount_id"] > 0, "snapshot partition inode invalid")
+        for row in children:
+            require(set(row) == {"path", "device", "inode", "mount_id", "key", "spec_sha256", "ownership_sha256"}
+                    and isinstance(row["key"], str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", row["key"])
+                    and row["key"] not in keys and row["mount_id"] == root["mount_id"]
+                    and all(isinstance(row[k], str) and _SHA.fullmatch(row[k])
+                            for k in ("spec_sha256", "ownership_sha256")), "snapshot partition child invalid")
+            relative(row["path"])
+            child = Path(root["path"]) / row["path"]
+            require(not any(Path(p) == child or Path(p) in child.parents or child in Path(p).parents
+                            for p in writes), "snapshot partition is parent writable")
+            require(not any(row["path"] == p or row["path"].startswith(p + "/") or p.startswith(row["path"] + "/")
+                            for p in paths), "snapshot partition overlap")
+            paths.append(row["path"]); keys.add(row["key"])
+        require(len(self.payload) <= 32768 and canonical(data).decode() == self.payload,
+                "snapshot partition is not canonical")
+
+    def to_json(self):
+        require(isinstance(self.payload, str) and len(self.payload) <= 32768, "snapshot partition bound")
+        return json.loads(self.payload)
+
+    @classmethod
+    def from_json(cls, raw):
+        return cls(canonical(raw).decode())
+
+    def require_binding(self, identity, spec_sha256, files, grant_sha256=None, checks=()):
+        data = self.to_json()
+        require(data["identity"] == identity.to_json() and data["spec_sha256"] == spec_sha256
+                and (grant_sha256 is None or data["grant_sha256"] == grant_sha256),
+                "snapshot partition parent binding changed")
+        require(not any(self.contains(path) for check in checks for path, sha in check.protected_inputs),
+                "snapshot partition overlaps protected oracle input")
+        for row in data["children"]:
+            require(not any(scope.path == row["path"] or scope.path.startswith(row["path"] + "/")
+                            or row["path"].startswith(scope.path + "/") for scope in files),
+                    "snapshot partition overlaps parent self-write scope")
+
+    def contains(self, name):
+        return any(name == row["path"] or name.startswith(row["path"] + "/") for row in self.to_json()["children"])
+
+    @contextmanager
+    def pinned(self, root):
+        from .private_mount_plan import PinnedLaunchPath
+        from .owned_write_mounts import _mount_id
+        data = self.to_json(); pins = []
+        require(str(root) == data["root"]["path"], "snapshot partition workspace changed")
+        try:
+            for row in [data["root"], *data["children"]]:
+                path = Path(row["path"]) if row is data["root"] else Path(root) / row["path"]
+                pin = PinnedLaunchPath(path, directory=True, expected=(row["device"], row["inode"]))
+                pins.append((pin, row))
+                require(_mount_id(pin.fd) == row["mount_id"], "snapshot partition mount alias changed")
+            yield pins[0][0].fd
+            for pin, row in pins:
+                pin.verify()
+                fresh = PinnedLaunchPath(pin.logical, directory=True, expected=(row["device"], row["inode"]))
+                try:
+                    require(_mount_id(fresh.fd) == row["mount_id"], "snapshot partition mount alias changed")
+                finally:
+                    fresh.close()
+        finally:
+            for pin, row in reversed(pins): pin.close()
+
+    @classmethod
+    def capture(cls, admission, task, identity, root_pin, grant):
+        from .claimed_child_contracts import retained
+        from .evidence import binding
+        from .owned_write_mounts import _mount_id
+        from .private_mount_plan import PinnedLaunchPath
+        from agent_completion_evidence import spec_digest
+        require(admission["identity"] == binding(task) and admission["spec_sha256"] == spec_digest(task),
+                "snapshot partition original admission changed")
+        derived = retained(admission, task, identity=identity)
+        require(derived is not None and isinstance(root_pin, PinnedLaunchPath)
+                and root_pin.logical == Path(task["workspace"]), "snapshot partition host root pin required")
+        require(grant.identity == identity and grant.workspace_root == str(root_pin.logical)
+                and grant.runtime_assurance.sandbox_verified, "snapshot partition verified physical grant required")
+        root_pin.verify(); mount = _mount_id(root_pin.fd)
+        data = {"version": 1, "admission_sha256": digest(admission), "identity": identity.to_json(),
+                "spec_sha256": admission["spec_sha256"], "grant_sha256": grant.hash,
+                "sandbox_attestation_sha256": grant.runtime_assurance.sandbox_attestation_sha256,
+                "parent_writable_roots": list(grant.runtime_assurance.writable_roots), "root": {"path": str(root_pin.logical),
+                "device": root_pin.device, "inode": root_pin.inode, "mount_id": mount}, "children": []}
+        for spec, row in sorted(derived["children"].items()):
+            logical, stamp = row["scope"]["worktree_identity"].rsplit("|", 1)
+            pin = PinnedLaunchPath(Path(logical), directory=True, expected=tuple(map(int, stamp.split(":"))))
+            try:
+                require(_mount_id(pin.fd) == mount, "snapshot partition child mount alias")
+                data["children"].append({"path": Path(logical).relative_to(root_pin.logical).as_posix(),
+                    "device": pin.device, "inode": pin.inode, "mount_id": mount, "key": row["key"],
+                    "spec_sha256": spec, "ownership_sha256": row["ownership_sha256"]})
+            finally:
+                pin.close()
+        result = cls.from_json(data)
+        result.require_binding(identity, admission["spec_sha256"], tuple(FileScope(**x) for x in admission["definition"]["files"]))
+        with result.pinned(root_pin.logical): pass
+        return result
+
+
+@dataclass(frozen=True)
 class WorkPlan:
     identity: InvocationIdentity
     spec_version: str
@@ -138,6 +264,8 @@ class WorkPlan:
     baseline_policy: str = "required"
     planning: object = None
     hygiene_sha256: str | None = None
+    delegated_seal_sha256: str | None = None
+    snapshot_partition: object = None
 
     def __post_init__(self):
         require(isinstance(self.identity, InvocationIdentity), "admitted work identity required")
@@ -182,12 +310,24 @@ class WorkPlan:
             self.planning.require_binding(self)
         require(self.hygiene_sha256 is None or isinstance(self.hygiene_sha256, str)
                 and _SHA.fullmatch(self.hygiene_sha256), "hygiene policy binding invalid")
+        if self.snapshot_partition is not None:
+            if isinstance(self.snapshot_partition, dict):
+                object.__setattr__(self, "snapshot_partition", SnapshotPartition.from_json(self.snapshot_partition))
+            require(isinstance(self.snapshot_partition, SnapshotPartition), "host snapshot partition required")
+            self.snapshot_partition.require_binding(self.identity, self.spec_sha256, self.files, self.grant_sha256, self.checks)
+        require(self.delegated_seal_sha256 is None or isinstance(self.delegated_seal_sha256, str)
+                and _SHA.fullmatch(self.delegated_seal_sha256), "delegated seal audit binding invalid")
         require(len(canonical(self.to_json())) <= 131072, "work plan exceeds bound")
 
     def to_json(self):
         value = asdict(self)
         if self.planning is not None:
             value["planning"] = self.planning.to_json()
+        if self.snapshot_partition is not None:
+            value["snapshot_partition"] = self.snapshot_partition.to_json()
+        if self.delegated_seal_sha256 is not None or self.snapshot_partition is not None:
+            return {"version": 4, **value}
+        value.pop("delegated_seal_sha256"); value.pop("snapshot_partition")
         if self.hygiene_sha256 is not None:
             return {"version": 3, **value}
         value.pop("hygiene_sha256")
@@ -200,12 +340,16 @@ class WorkPlan:
     def from_json(cls, raw):
         from dataclasses import fields
         names = {x.name for x in fields(cls)}
+        legacy = names - {"delegated_seal_sha256", "snapshot_partition"}
         require(isinstance(raw, dict) and type(raw.get("version")) is int
-                and ((raw["version"] == 1 and set(raw) == {"version", *(names - {"planning", "hygiene_sha256"})})
-                     or (raw["version"] == 2 and set(raw) == {"version", *(names - {"hygiene_sha256"})}
+                and ((raw["version"] == 1 and set(raw) == {"version", *(legacy - {"planning", "hygiene_sha256"})})
+                     or (raw["version"] == 2 and set(raw) == {"version", *(legacy - {"hygiene_sha256"})}
                          and isinstance(raw["planning"], dict))
-                     or (raw["version"] == 3 and set(raw) == {"version", *names}
-                         and isinstance(raw["hygiene_sha256"], str))), "work plan schema invalid")
+                     or (raw["version"] == 3 and set(raw) == {"version", *legacy}
+                         and isinstance(raw["hygiene_sha256"], str))
+                     or (raw["version"] == 4 and set(raw) == {"version", *names}
+                         and (isinstance(raw["delegated_seal_sha256"], str)
+                              or isinstance(raw["snapshot_partition"], dict)))), "work plan schema invalid")
         return cls(**{**{k:v for k,v in raw.items() if k!="version"},
             "identity":InvocationIdentity.from_dict(raw["identity"]),
             "mode":WorkMode(raw["mode"]),
@@ -242,19 +386,34 @@ class CheckResult:
         return digest(asdict(self))
 
 
-def tree_snapshot(root, *, git=None, max_bytes=67_108_864):
-    """Read every tracked/untracked byte, including ignored paths, without filters."""
+def tree_snapshot(root, *, git=None, max_bytes=67_108_864, partition=None):
+    """All bytes, except the exact physically separated original child domain."""
     root = Path(root)
-    query = git or read_only_git(root)
-    names = query(["ls-files", "-z", "--cached", "--others"]).split("\0")
-    names = sorted(set(x for x in names if x))
-    require(len(names) <= 4096, "work tree file count exceeded")
+    if partition is not None:
+        require(isinstance(partition, SnapshotPartition), "protected snapshot partition required")
+        with partition.pinned(root) as pinned:
+            return _snapshot_directory(root, git, max_bytes, partition, os.dup(pinned))
     directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    return _snapshot_directory(root, git, max_bytes, None, directory)
+
+
+def _snapshot_directory(root, git, max_bytes, partition, directory):
     records, total = {}, 0
     try:
+        query = git or read_only_git(root)
+        if partition is not None:
+            cached = [p for p in query(["ls-files", "-z", "--cached"]).split("\0") if p]
+            require(len(cached) <= 4096 and not any(partition.contains(relative(p)) for p in cached),
+                    "snapshot partition overlaps parent tracked inventory")
+        names = query(["ls-files", "-z", "--cached", "--others"]).split("\0")
+        names = sorted(set(x for x in names if x))
+        require(len(names) <= 4096, "work tree file count exceeded")
         for name in names:
             from .work_lifetime import require_work_time
             require_work_time()
+            if partition is not None and partition.contains(name.removesuffix("/")):
+                relative(name.removesuffix("/"))
+                continue
             relative(name)
             try:
                 fd = _open_relative(directory, name)
@@ -322,7 +481,25 @@ class WorkCycle:
         self.artifact, self.bundle_hash = None, None
         self.verification_requests = {}
         self.verification_open = True
+        if plan.snapshot_partition is not None:
+            plan.snapshot_partition.require_binding(plan.identity, plan.spec_sha256, plan.files, plan.grant_sha256, plan.checks)
+            with plan.snapshot_partition.pinned(self.root): pass
         self._restore()
+        self._verify_delegated_seal()
+
+    def _verify_delegated_seal(self):
+        if self.plan.delegated_seal_sha256 is None:
+            return
+        seals = [e for e in self.audit_log.replay() if e.get("event") == "host_delegated_write_sealed"
+                 and e.get("identity") == self.plan.identity.to_json()]
+        require(len(seals) == 1 and digest(seals[0]) == self.plan.delegated_seal_sha256
+                and seals[0].get("grant_sha256") == self.plan.grant_sha256
+                and seals[0].get("spec_sha256") == self.plan.spec_sha256,
+                "original delegated seal audit missing or changed")
+
+    def _snapshot(self):
+        return tree_snapshot(self.root, git=self.git,
+            **({"partition": self.plan.snapshot_partition} if self.plan.snapshot_partition is not None else {}))
 
     def _events(self):
         return [x for x in self.audit_log.replay() if x.get("work_cycle") == self.plan.identity.to_json()]
@@ -503,7 +680,7 @@ class WorkCycle:
                     "required artifact is not integrated in base")
         if not any(event.get("event") == "work_plan" for event in self._events()):
             self._record("plan",plan=json.loads(canonical(self.plan.to_json())))
-        snapshot = tree_snapshot(self.root,git=self.git)
+        snapshot = self._snapshot()
         self._protected_inputs(snapshot)
         if self.plan.planning is not None:
             self.plan.planning.require_binding(self.plan)
@@ -531,7 +708,7 @@ class WorkCycle:
                     self._record("blocked",reason="baseline_validation_failed",tree_sha256=digest(snapshot),checks=proofs)
                     self.phase = WorkPhase.BLOCKED
                     raise
-        require(tree_snapshot(self.root,git=self.git) == snapshot, "baseline modified work inputs")
+        require(self._snapshot() == snapshot, "baseline modified work inputs")
         self._record("baseline",tree=snapshot,checks=proofs,omission=self.plan.baseline_omission_reason)
         self.baseline, self.phase = snapshot, WorkPhase.WORK
 
@@ -559,7 +736,8 @@ class WorkCycle:
                         "verification input changed; independent reviewed replan required")
 
     def verify_scope(self):
-        current = tree_snapshot(self.root,git=self.git)
+        self._verify_delegated_seal()
+        current = self._snapshot()
         self._protected_inputs(current)
         require(self.baseline is not None, "baseline required")
         changed = [name for name in set(current)|set(self.baseline) if current.get(name) != self.baseline.get(name)]
@@ -597,7 +775,7 @@ class WorkCycle:
         for check in self.plan.checks:
             proof = runner(check,self.root,self.plan,tree)
             self._validate_check(proof,check,tree)
-            require(tree_snapshot(self.root,git=self.git) == snapshot, "validation changed tested inputs")
+            require(self._snapshot() == snapshot, "validation changed tested inputs")
             self._record("check",check=asdict(proof))
             self.phase = WorkPhase.VERIFY
             self.verified_checks[check.id] = asdict(proof)
@@ -654,7 +832,7 @@ class WorkCycle:
                 "explicit bounded repair paths required")
         require(not any(value is None for value in self.verification_requests.values()),
                 "uncertain verification must reconcile before repair")
-        snapshot=tree_snapshot(self.root,git=self.git)
+        snapshot=self._snapshot()
         require(digest(snapshot)==failure.tree_sha256,"failed repair inputs changed before authorization")
         texts={}
         for path in repair_paths:
@@ -746,7 +924,7 @@ class WorkCycle:
     def invalidate_if_live_changed(self, reason):
         if self.phase is not WorkPhase.HYGIENE or self.verified_tree is None:return False
         try:
-            changed=digest(tree_snapshot(self.root,git=self.git))!=self.verified_tree
+            changed=digest(self._snapshot())!=self.verified_tree
         except Exception:
             changed=True
         if changed:self.invalidate_verification(reason)
@@ -791,7 +969,7 @@ class WorkCycle:
         require(self.git(["rev-parse","HEAD"]).strip()==self.plan.base_sha
                 and not self.git(["diff","--cached","--name-only"]),
                 "rollback cannot change committed or staged work")
-        current=tree_snapshot(self.root,git=self.git)
+        current=self._snapshot()
         edits=authority(self.plan.identity,self.plan.hash,digest(self.baseline),digest(current))
         require(isinstance(edits,tuple) and edits and len(edits)<=256
                 and all(isinstance(x,OwnedChange) for x in edits)
