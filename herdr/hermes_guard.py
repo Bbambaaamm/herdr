@@ -35,6 +35,26 @@ from herdr.file_authority import FileAuthorityError, RootFDWorkspace
 from herdr.security import InvocationGuard, PolicyDenied, SecurityError, ProviderRequest, canonical_digest
 
 
+def _runtime_file_roots(grant, file_rules):
+    """Read roots stay broad; observed RW leaves select existing in-place I/O.
+
+    These are pins in the SDK's attested namespace, never host write authority.
+    A broad read-directory FD remains on its readonly mount and cannot bypass
+    the exact writable leaf mounts. Logical delegation scope is unchanged.
+    """
+    roots = {root for tool in ("read_file", "write_file", "patch", "search_files")
+             for root in getattr(file_rules.get(tool), "allowed_roots", ())}
+    assurance = getattr(grant, "runtime_assurance", None)
+    if getattr(assurance, "sandbox_verified", False) is True:
+        for raw in assurance.writable_roots:
+            path = Path(raw)
+            if any(path == Path(root) or Path(root) in path.parents
+                   for tool in ("write_file", "patch")
+                   for root in getattr(file_rules.get(tool), "allowed_roots", ())):
+                roots.add(str(path))
+    return roots
+
+
 class _PolicyFileOps:
     """Hermes FileOperations facade backed by pinned nofollow root FDs."""
 
@@ -753,11 +773,7 @@ def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None,
     # goes through RootFDWorkspace so a path/symlink swap after authorization
     # cannot redirect an open or rename outside the signed roots.
     file_rules = {rule.tool: rule for rule in getattr(guard.grant, "tool_rules", ())}
-    file_roots = {
-        root
-        for tool in ("read_file", "write_file", "patch", "search_files")
-        for root in getattr(file_rules.get(tool), "allowed_roots", ())
-    }
+    file_roots = _runtime_file_roots(guard.grant, file_rules)
     file_workspace = RootFDWorkspace(file_roots) if file_roots else None
     if file_workspace is not None:
         from tools import file_operations_common, patch_parser

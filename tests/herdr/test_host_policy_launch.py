@@ -532,3 +532,22 @@ def test_owned_write_roots_narrow_the_host_grant_and_deny_scope_escape(tmp_path,
     finally:
         if prepared is not None:prepared.cleanup_after_pane_closed()
         cleanup(item)
+
+
+def test_delegated_binding_is_one_shot_and_never_comes_from_serialized_grant(tmp_path):
+    from herdr.policy_launch import PreparedPolicyLaunch
+    from herdr.security import DelegatedWriteAuthority
+    from tests.herdr.test_security import _parent_and_disjoint_child
+    parent, child = _parent_and_disjoint_child(tmp_path)
+    item = object.__new__(PreparedPolicyLaunch)
+    item.sealed = None; item._private_key = object(); item._parent = parent
+    item._delegated_writes = None; item.grant = child
+    checked = []
+    authority = DelegatedWriteAuthority(parent.hash, child.identity, 'c' * 64, 'd' * 64, 'e' * 64,
+        child.runtime_assurance.writable_roots,
+        lambda actual, ceiling: checked.append(actual.hash) or child.runtime_assurance.writable_roots,
+        lambda *a: None)
+    item.bind_delegated_writes(authority)
+    assert checked == [child.hash] and item._delegated_writes is authority
+    with pytest.raises(SecurityError, match='one original'):
+        item.bind_delegated_writes(authority)

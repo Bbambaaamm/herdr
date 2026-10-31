@@ -1002,3 +1002,26 @@ finally:
                             env=env, capture_output=True, text=True, timeout=45)
     assert result.returncode == 0, result.stdout + result.stderr
     assert json.loads(result.stdout.strip().splitlines()[-1])["actual_sdk_formatter_json"] is True
+
+
+def test_runtime_file_roots_add_only_attested_write_leaves_without_narrowing_delegation():
+    from pathlib import Path
+    parent = '/work/parent'
+    rules = {name: types.SimpleNamespace(allowed_roots=(parent,))
+             for name in ('read_file', 'write_file', 'patch', 'search_files')}
+    assurance = types.SimpleNamespace(sandbox_verified=True, writable_roots=(
+        parent + '/own.py', '/work/parent-other/foreign.py', '/run/cache'))
+    grant = types.SimpleNamespace(runtime_assurance=assurance)
+    roots = hermes_guard._runtime_file_roots(grant, rules)
+    assert roots == {parent, parent + '/own.py'}
+    assert rules['write_file'].allowed_roots == (parent,)
+    assurance.sandbox_verified = False
+    assert hermes_guard._runtime_file_roots(grant, rules) == {parent}
+    assert hermes_guard._runtime_file_roots(types.SimpleNamespace(), rules) == {parent}
+
+
+def test_read_only_logical_rule_cannot_acquire_an_attested_write_root():
+    rules = {'read_file': types.SimpleNamespace(allowed_roots=('/work',))}
+    grant = types.SimpleNamespace(runtime_assurance=types.SimpleNamespace(
+        sandbox_verified=True, writable_roots=('/work/child/result.py',)))
+    assert hermes_guard._runtime_file_roots(grant, rules) == {'/work'}
