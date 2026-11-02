@@ -321,6 +321,10 @@ def test_producer_persist_original_authority_child_factory_and_cold_replay(prepa
         scope=replace(parent_grant.scope,tools=tuple(CHILD_TOOLS)),tool_rules=rules(CHILD_TOOLS,p.child),
         parent_grant_hash=parent_grant.hash)
     child_grant.require_logical_subset_of(parent_grant)
+    # Source-only admission reader fixture: synthetic seal event, never physical acceptance.
+    child_factory.audit_log.append({"event":"host_delegated_write_sealed", "identity":p.child_identity.to_json(),
+        "grant_sha256":child_grant.hash, "spec_sha256":child_spec(rec)})
+    child_factory.audit_log.flush()
     approved_work=child_factory.approve(identity=p.child_identity,workspace=p.child,grant=child_grant,spec_sha256=child_spec(rec))
     assert isinstance(approved_work,WorkPlan) and approved_work.identity==p.child_identity
     assert approved_work.spec_sha256==child_spec(rec) and approved_work.grant_sha256==child_grant.hash
@@ -564,3 +568,214 @@ def test_legacy_static_child_and_cold_admission_unchanged_without_parent_templat
     cold=configuration.build_root_work_factory(task_root,task,recovery=True,spec_sha256=spec)
     assert cold.host_admission==expected
     assert before=={x.name:x.read_bytes() for x in directory.iterdir() if x.is_file()}
+
+
+def root_write_helper():
+    source = Path(__file__).resolve().parents[2] / 'agent-stack/bin/agent-task-worker'
+    tree = ast.parse(source.read_bytes())
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_root_self_write_pins')
+    scope = {'Path': Path}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), 'exec'), scope)
+    return scope[node.name]
+
+
+def test_parent_self_pins_use_original_host_scope_and_keep_logical_delegation(prepared):
+    from herdr.private_mount_plan import PinnedLaunchPath
+    p = prepared
+    pin = PinnedLaunchPath(p.root, directory=True)
+    grant = SimpleNamespace(process=SimpleNamespace(enabled=False), tool_rules=('logical ceiling unchanged',))
+    launch = SimpleNamespace(identity=p.identity, private_profile_snapshot=object(), grant=grant,
+                             mount=SimpleNamespace(private_workspace_pin=pin))
+    try:
+        pins = root_write_helper()(SimpleNamespace(host_admission=admission(p)), p.task, launch)
+        try:
+            assert pins.roots == (str(p.root / 'result.py'),)
+            pins.verify()
+            assert grant.tool_rules == ('logical ceiling unchanged',)
+        finally:
+            pins.close()
+    finally:
+        pin.close()
+
+
+@pytest.mark.parametrize('fault', ['spec', 'identity', 'process', 'profile', 'subtree', 'child-overlap'])
+def test_parent_self_pins_reject_authority_drift_and_child_overlap(prepared, fault):
+    p = prepared
+    old = admission(p)
+    grant = SimpleNamespace(process=SimpleNamespace(enabled=fault == 'process'))
+    launch = SimpleNamespace(identity=p.identity, private_profile_snapshot=None if fault == 'profile' else object(),
+                             grant=grant, mount=SimpleNamespace(private_workspace_pin=None))
+    if fault == 'spec': old['spec_sha256'] = '0' * 64
+    elif fault == 'identity': old['identity']['run_token'] = 'foreign'
+    elif fault in {'subtree', 'child-overlap'}:
+        old['definition']['files'] = [{'path': '.stage3-child/repo/result.py' if fault == 'child-overlap' else 'result.py',
+                                       'subtree': fault == 'subtree'}]
+        old['managed_children'] = derived.derive(old['definition'], p.task, p.identity)
+    with pytest.raises((RuntimeError, WorkContractError)):
+        root_write_helper()(SimpleNamespace(host_admission=old), p.task, launch)
+
+
+@pytest.mark.parametrize('fault', [None, 'fence', 'expired', 'ownership', 'admission', 'parent', 'inode', 'scope', 'key', 'model', 'idempotency'])
+def test_original_child_context_rechecks_claim_and_owned_pins_at_seal(prepared, monkeypatch, fault):
+    """Host admission/proof/lease readers are doubles; file pins and ownership parsing are real."""
+    from herdr.private_mount_plan import PinnedLaunchPath
+    from herdr.owned_write_mounts import OwnedWritePins
+    from herdr.child_ownership import OwnershipError
+    from herdr.policy_launch import PreparedPolicyLaunch
+    from herdr.security import SecurityError
+    from herdr.scheduler import Lease, AuditLog
+    from herdr.taskgraph import LifecycleState
+    import herdr.host_configuration as hc
+    import herdr.policy_launch as pl
+    import agent_durable_children as dc
+    p = prepared; original = admission(p); spec, row = next(iter(original['managed_children']['children'].items()))
+    own = ChildOwnership.from_json(p.definition['managed_children']['children'][0]['ownership'])
+    pin = PinnedLaunchPath(p.child, directory=True)
+    try:
+        with OwnedWritePins(own, pin) as pins: mounted = tuple(pins.evidence())
+        ci = p.child_identity
+        rec = SimpleNamespace(node=SimpleNamespace(id=ci.task_id, model_policy=row['model_policy'], **{k: row['scope'][k]
+            for k in ('objective', 'role', 'tools', 'permissions')}), id=ci.task_id,
+            run_token=ci.run_token, delegation_key=row['key'], idempotency_key='child-key', attempts=1, fencing_token=ci.fencing_token,
+            repo=p.task['repo'], issue=str(p.task['issue']), parent_task_id=ci.parent_task_id,
+            parent_agent_id=ci.parent_agent_id, parent_run_token=p.task['run_token'], agent_id=ci.agent_id,
+            execution_sandbox_attestation=None, execution_agent=ci.agent_id, execution_pane='child-pane',
+            execution_marker='child-marker', execution_sandbox_verified=False,
+            worktree_identity=row['scope']['worktree_identity'], ownership=own, owned_write_mounts=mounted,
+            state=LifecycleState.RUNNING, lease=Lease(ci.task_id, ci.agent_id, 'host', ci.fencing_token, 1000))
+        from herdr.child_evidence import child_task
+        task = child_task(rec)
+        task.update(workspace=str(p.child), delegation_key=row['key'], model_policy=row['model_policy'],
+                    derived_parent_admission_sha256=digest(original['managed_children']))
+        state = p.tmp / 'state'; state.mkdir(); (state / 'child-ownership').mkdir()
+        factory = SimpleNamespace(host_task=task, task_store_root=state, host_configuration_path=state/'host.json',
+            host_admission={'spec_sha256': spec, 'definition': row['work_definition'], 'environment': original['environment']},
+            audit_log=AuditLog(state/'audit.jsonl'))
+        parent = deepcopy(p.task); parent['execution_session'] = {'sandbox_pid': 123,
+            'invocation_policy': {}, 'sandbox_attestation': {}}
+        pg = replace(synthetic_grant(p.root, tools=('write_file',)), identity=p.identity)
+        cg = replace(synthetic_grant(p.child, tools=('write_file',)), identity=ci, parent_grant_hash=pg.hash,
+            tool_rules=tuple(replace(r, allowed_roots=(str(p.child/'result.py'),))
+                             for r in synthetic_grant(p.child, tools=('write_file',)).tool_rules))
+        launch = object.__new__(PreparedPolicyLaunch)
+        launch._parent=pg; launch.grant=cg; launch._delegated_writes=None; launch._private_key=object(); launch.sealed=None
+        launch.mount=SimpleNamespace(private_workspace_pin=pin)
+        fresh = deepcopy(original)
+        monkeypatch.setattr(hc, 'read_canonical_parent', lambda *a: parent)
+        monkeypatch.setattr(configuration, '_original_work_admission', lambda *a: (state, fresh))
+        verified = [pg]
+        monkeypatch.setattr(pl, 'verify_retained_policy_evidence', lambda *a, **k: verified[0])
+        scheduler = SimpleNamespace(_tasks={ci.task_id: rec}, current_time=lambda: 1,
+                                    _require_current_ownership=lambda r: None)
+        monkeypatch.setattr(dc, 'replay_host_scheduler', lambda *a: scheduler)
+        configuration._bind_original_delegated_writes(factory, launch)
+        authority = launch._delegated_writes
+        if fault == 'key': rec.delegation_key = 'foreign'
+        elif fault == 'model': rec.node.model_policy = {'model': 'foreign', 'fallback_model': None}
+        elif fault == 'idempotency': rec.idempotency_key = 'foreign'
+        elif fault == 'fence': rec.fencing_token += 1
+        elif fault == 'expired': rec.lease = replace(rec.lease, lease_until=0)
+        elif fault == 'ownership': rec.ownership = replace(own, handoff_ref='foreign')
+        elif fault == 'admission': fresh['spec_sha256'] = '0'*64
+        elif fault == 'parent': verified[0] = replace(pg, grant_id='foreign')
+        elif fault == 'inode':
+            (p.child/'result.py').rename(p.child/'old-result.py'); (p.child/'result.py').write_text('replacement')
+        elif fault == 'scope': cg = replace(cg, tool_rules=tuple(replace(r, allowed_roots=(str(p.child),)) for r in cg.tool_rules))
+        if fault is None:
+            assert authority.validated_roots(cg, pg) == (str(p.child/'result.py'),)
+            authority.record_sealed(cg, pg)
+            event, = factory.audit_log.replay()
+            assert event['grant_sha256'] == cg.hash and event['parent_grant_sha256'] == pg.hash
+            assert event['admission_sha256'] == digest(original) and event['ownership_sha256'] == own.hash
+        else:
+            with pytest.raises((SecurityError, WorkContractError, OwnershipError, OSError)):
+                authority.validated_roots(cg, pg)
+            assert factory.audit_log.replay() == []
+    finally:
+        pin.close()
+
+
+def test_original_partition_excludes_only_admitted_child_across_baseline_and_cold_recovery(prepared):
+    from herdr.private_mount_plan import PinnedLaunchPath
+    from herdr.work_cycle import SnapshotPartition, WorkCycle, tree_snapshot
+    from herdr.scheduler import AuditLog
+    from tests.herdr.test_work_cycle import runner
+    p=prepared; pin=PinnedLaunchPath(p.root,directory=True)
+    pg=replace(synthetic_grant(p.root,tools=('write_file',)),identity=p.identity)
+    try: partition=SnapshotPartition.capture(admission(p),p.task,p.identity,pin,pg)
+    finally: pin.close()
+    plan=replace(p.plan,grant_sha256=pg.hash,snapshot_partition=partition)
+    assert WorkPlan.from_json(plan.to_json()).hash==plan.hash and plan.to_json()['version']==4
+    with pytest.raises((WorkContractError,OSError)):
+        tree_snapshot(p.root,git=trusted_git(p.root))
+    before=tree_snapshot(p.root,git=trusted_git(p.root),partition=partition)
+    assert 'result.py' in before and 'foreign.txt' in before
+    assert not any(x.startswith('.stage3-child/') for x in before)
+    log=AuditLog(p.tmp/'partition-audit.jsonl')
+    cycle=WorkCycle(plan,p.root,log,git=trusted_git(p.root));cycle.start(runner)
+    (p.child/'result.py').write_text('child own change')
+    assert tree_snapshot(p.root,git=trusted_git(p.root),partition=partition)==before
+    cold=WorkCycle(WorkPlan.from_json(plan.to_json()),p.root,log,git=trusted_git(p.root))
+    cold.verify_scope()
+    with (p.root/'.git/info/exclude').open('a') as out: out.write('ignored-foreign.txt\n')
+    (p.root/'ignored-foreign.txt').write_text('foreign ignored bytes are still evidence')
+    assert 'ignored-foreign.txt' in tree_snapshot(p.root,git=trusted_git(p.root),partition=partition)
+    with pytest.raises(WorkContractError,match='escaped approved work scope'):cold.verify_scope()
+
+
+@pytest.mark.parametrize('fault',['identity','spec','ownership','child-overlap','rename','symlink','mount'])
+def test_partition_rejects_original_admission_or_named_inode_alias_drift(prepared,monkeypatch,fault):
+    from herdr.private_mount_plan import PinnedLaunchPath
+    from herdr.work_cycle import SnapshotPartition, tree_snapshot
+    from herdr.security import SecurityError
+    from herdr import owned_write_mounts
+    p=prepared; old=admission(p); pin=PinnedLaunchPath(p.root,directory=True)
+    pg=replace(synthetic_grant(p.root,tools=('write_file',)),identity=p.identity)
+    try: partition=SnapshotPartition.capture(old,p.task,p.identity,pin,pg)
+    finally: pin.close()
+    if fault in {'identity','spec','ownership'}:
+        if fault=='identity':old['identity']['run_token']='foreign'
+        elif fault=='spec':old['spec_sha256']='0'*64
+        else:next(iter(old['managed_children']['children'].values()))['ownership_sha256']='0'*64
+        pin=PinnedLaunchPath(p.root,directory=True)
+        try:
+            with pytest.raises((SecurityError,WorkContractError,OSError)):
+                SnapshotPartition.capture(old,p.task,p.identity,pin,pg)
+        finally:pin.close()
+        return
+    if fault=='child-overlap':
+        with pytest.raises(WorkContractError,match='overlaps parent'):
+            replace(p.plan,grant_sha256=pg.hash,files=(type(p.plan.files[0])('.stage3-child/repo/result.py'),),snapshot_partition=partition)
+        return
+    if fault in {'rename','symlink'}:
+        original=p.child.with_name('original');p.child.rename(original)
+        if fault=='rename':p.child.mkdir()
+        else:p.child.symlink_to(original,target_is_directory=True)
+    else:
+        actual=owned_write_mounts._mount_id
+        monkeypatch.setattr(owned_write_mounts,'_mount_id',lambda fd:actual(fd)+1)
+    with pytest.raises((SecurityError,WorkContractError,OSError)):
+        tree_snapshot(p.root,git=trusted_git(p.root),partition=partition)
+
+
+def test_partition_cannot_hide_parent_tracked_or_parent_writable_child_data(prepared):
+    from herdr.private_mount_plan import PinnedLaunchPath
+    from herdr.work_cycle import SnapshotPartition, tree_snapshot
+    p=prepared; pin=PinnedLaunchPath(p.root,directory=True)
+    grant=replace(synthetic_grant(p.root,tools=('write_file',)),identity=p.identity)
+    try:
+        for writable in (p.root,p.child,p.child/'result.py'):
+            broad=replace(grant,runtime_assurance=replace(grant.runtime_assurance,writable_roots=(str(writable),)))
+            with pytest.raises(WorkContractError,match='parent writable'):
+                SnapshotPartition.capture(admission(p),p.task,p.identity,pin,broad)
+        partition=SnapshotPartition.capture(admission(p),p.task,p.identity,pin,grant)
+    finally:pin.close()
+    actual=trusted_git(p.root)
+    def indexed(args):
+        if args==['ls-files','-z','--cached']:return actual(args)+'.stage3-child/repo/tracked.py\0'
+        return actual(args)
+    with pytest.raises(WorkContractError,match='parent tracked inventory'):
+        tree_snapshot(p.root,git=indexed,partition=partition)
+    check=replace(p.plan.checks[0],protected_inputs=(('.stage3-child/repo/result.py','a'*64),))
+    with pytest.raises(WorkContractError,match='protected oracle input'):
+        replace(p.plan,grant_sha256=grant.hash,checks=(check,),snapshot_partition=partition)

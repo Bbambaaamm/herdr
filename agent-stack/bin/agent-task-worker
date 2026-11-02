@@ -491,6 +491,41 @@ def _root_workspace_writable(grant, workspace: Path) -> bool:
                 for root in rule.allowed_roots) for rule in grant.tool_rules)
 
 
+def _root_self_write_pins(work_factory, task, launch):
+    """Physical self-scope from the original host admission, not task tool data.
+
+    The broader logical grant stays intact as the child delegation ceiling.
+    Only finite existing files are supported in this managed-parent mode.
+    """
+    admitted = getattr(work_factory, "host_admission", None)
+    if not isinstance(admitted, dict) or "managed_children" not in admitted:
+        return None
+    from agent_completion_evidence import spec_digest
+    from herdr.evidence import binding
+    from herdr.claimed_child_contracts import retained
+    from herdr.work_cycle import FileScope
+    from herdr.child_ownership import ChildOwnership
+    from herdr.owned_write_mounts import OwnedWritePins
+    if admitted["identity"] != binding(task) or admitted["spec_sha256"] != spec_digest(task):
+        raise RuntimeError("root_original_self_scope_changed")
+    retained(admitted, task, identity=launch.identity)
+    if launch.private_profile_snapshot is None or launch.grant.process.enabled:
+        raise RuntimeError("root_finite_private_self_scope_required")
+    scopes = tuple(FileScope(**item) for item in admitted["definition"]["files"])
+    if not scopes or any(item.subtree for item in scopes):
+        raise RuntimeError("root_existing_file_self_scope_required")
+    workspace = Path(task["workspace"])
+    children = [Path(row["scope"]["worktree_identity"].rsplit("|", 1)[0])
+                for row in admitted["managed_children"]["children"].values()]
+    if any((workspace / item.path).is_relative_to(child) for child in children for item in scopes):
+        raise RuntimeError("root_self_scope_overlaps_child")
+    ownership = ChildOwnership.from_json({
+        "write_scope": [{"kind": "file", "key": item.path} for item in scopes],
+        "decision_scope": [], "hard_dependencies": [], "shared_dependencies": [],
+        "integration_owner": task["id"], "handoff_ref": "root-self-scope"})
+    return OwnedWritePins(ownership, launch.mount.private_workspace_pin)
+
+
 def ensure_parent_scope(task: dict) -> None:
     """Request the current consumer scope only before a new root admission."""
     scope_fields = ("parent_role", "parent_tools", "parent_permissions", "worktree_root")
@@ -628,6 +663,7 @@ def _cleanup_setup_pane(pane_id: str, coordinator_pane: str, marker: str,
 # Host embedding supplies the accepted factory; queue/model fields never select it.
 HOST_POLICY_LAUNCH_FACTORY = None
 HOST_POLICY_LAUNCHES = {}
+HOST_ROOT_WRITE_PINS = {}
 HOST_WORK_CONTRACT_FACTORY = None
 HOST_WORK_CYCLES = {}
 HOST_WORK_FACTORIES = {}
@@ -847,6 +883,9 @@ def _cleanup_prepared_root_launch(task):
     if launch is not None:
         launch.cleanup_after_pane_closed()
         del HOST_POLICY_LAUNCHES[key]
+        pins = HOST_ROOT_WRITE_PINS.pop(key, None)
+        if pins is not None:
+            pins.close()
     else:
         session=task.get("execution_session") or {}
         proof=session.get("invocation_policy") or {}
@@ -877,7 +916,7 @@ def _wait_for_task_pane_input(pane_id, pane_marker, *, timeout_seconds=10.0):
 
 
 def _wait_for_task_sandbox(pane_id, pane_marker, *, policy, policy_mount,
-                           private_profile_snapshot=None, timeout_seconds=10.0):
+                           private_profile_snapshot=None, owned_write_pins=None, timeout_seconds=10.0):
     """Wait for native pane.run to become a fully verified physical sandbox."""
     deadline = time.monotonic() + timeout_seconds
     while True:
@@ -890,6 +929,9 @@ def _wait_for_task_sandbox(pane_id, pane_marker, *, policy, policy_mount,
         pid = inner_pid(process_info if isinstance(process_info, dict) else {}, pane_marker)
         if pid and verify_sandbox(pid, HERDR, pane_marker, policy=policy,
                                   policy_mount=policy_mount, attempts=1,
+                                  **({"owned_write_pins": owned_write_pins,
+                                      "pinned_worktree": owned_write_pins.worktree}
+                                     if owned_write_pins is not None else {}),
                                   **({"private_profile_snapshot": private_profile_snapshot}
                                      if private_profile_snapshot is not None else {})):
             if time.monotonic() <= deadline:
@@ -989,9 +1031,19 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         # snapshot stale; retain legacy preflight only for legacy launches.
         if private_snapshot is None:
             _preflight_root_provider(profile)
+        root_write_pins = _root_self_write_pins(work_factory, task, launch)
+        if work_factory is not None and private_snapshot is not None:
+            work_factory.workspace_pin = launch.mount.private_workspace_pin
+        root_verify_options = {}
+        if root_write_pins is not None:
+            HOST_ROOT_WRITE_PINS[(task["id"], task["run_token"])] = root_write_pins
+            root_verify_options = {"owned_write_pins": root_write_pins,
+                                   "pinned_worktree": root_write_pins.worktree}
         root_mount_options = ({"root_workspace_writable":
             _root_workspace_writable(launch.grant, Path(workspace))}
             if private_snapshot is not None else {})
+        if root_write_pins is not None:
+            root_mount_options = {"root_workspace_writable": False, "owned_write_pins": root_write_pins}
         if private_snapshot is not None:
             # Bind and approve the exact slot/command before split or bridge.
             policy = frozen_policy()
@@ -1063,6 +1115,7 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         _herdr_json(["pane", "run", pane_id, serialized_command], timeout_seconds=15.0)
         sandbox_pid = _wait_for_task_sandbox(pane_id, pane_marker,
                                              policy=policy, policy_mount=launch.mount,
+                                             **({"owned_write_pins": root_write_pins} if root_write_pins is not None else {}),
                                              **({"private_profile_snapshot": private_snapshot}
                                                 if private_snapshot is not None else {}))
         session["sandbox_pid"] = sandbox_pid
@@ -1139,7 +1192,7 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
                 hashlib.sha256(policy.read_bytes()).hexdigest()
                 == session["sandbox_attestation"]["policy_sha256"]
                 and verify_sandbox(sandbox_pid, HERDR, pane_marker, policy=policy,
-                                   policy_mount=launch.mount, attempts=1,
+                                   policy_mount=launch.mount, attempts=1, **root_verify_options,
                                    **({"private_profile_snapshot": private_snapshot}
                                       if private_snapshot is not None else {}))),
             bootstrap_peer=lambda *, timeout_seconds: launch.mount.bootstrap.confirm(

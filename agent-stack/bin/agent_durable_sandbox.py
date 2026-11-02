@@ -725,7 +725,9 @@ def command(
         from herdr.owned_write_mounts import OwnedWritePins
         if (not isinstance(owned_write_pins,OwnedWritePins) or
                 owned_write_pins.worktree is not pinned_worktree or
-                child_workspace_writable is not False or policy_mount is None):
+                not (child_workspace_writable is False and root_workspace_writable is None
+                     or root_workspace_writable is False and child_workspace_writable is None)
+                or policy_mount is None):
             raise RuntimeError("owned_write_mount_authority_required")
         owned_write_pins.verify()
     real_binary = real_binary.absolute()

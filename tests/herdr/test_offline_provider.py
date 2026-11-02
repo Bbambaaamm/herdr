@@ -258,3 +258,244 @@ def test_offline_observer_uses_same_atomic_transition_contract(offline_handoff_o
 def test_offline_observer_does_not_adopt_mutable_identity(offline_handoff_observer,field,value):
     f=offline_handoff_observer;f.task[field]=value
     with pytest.raises(RuntimeError,match='identity_changed'):f.invoke()
+
+
+# Clean-room preparation contracts. These are input/fixture tests, not a root,
+# namespace or SDK acceptance proof. Kernel/ordinary-worker evidence is separate.
+@pytest.fixture
+def clean_case_file(tmp_path):
+    import hashlib
+    source = Path(__file__).resolve().parents[1]/'physical/offline_case_inputs.json'
+    target = tmp_path/'case.json'
+    target.write_bytes(source.read_bytes())
+    return target, hashlib.sha256(target.read_bytes()).hexdigest()
+
+
+def clean_inputs(pair, token='a'*32):
+    return load('offline_pilot.py').prepare_clean_inputs(*pair, token)
+
+
+def rewrite_case(pair, change):
+    import hashlib
+    path, _ = pair
+    value = json.loads(path.read_bytes())
+    change(value)
+    path.write_text(json.dumps(value), encoding='utf8')
+    return path, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_clean_inputs_use_core_identity_and_binding_without_old_work(clean_case_file,monkeypatch):
+    import builtins
+    from herdr.security import InvocationIdentity, canonical_digest as digest
+    original = builtins.__import__
+    def no_sdk(name,*args,**kwargs):
+        assert not name.startswith(('hermes_cli','openai','httpx')), 'preparation imported SDK/auth'
+        return original(name,*args,**kwargs)
+    monkeypatch.setattr(builtins,'__import__',no_sdk)
+    prepared = clean_inputs(clean_case_file)
+    assert prepared['status']=='PROPOSAL_ONLY_NOT_ADMITTED'
+    task = prepared['task_seed']
+    parent = InvocationIdentity.from_dict(prepared['root_identity'])
+    child = InvocationIdentity.from_dict(prepared['managed_child_identity'])
+    assert parent.consumer==child.consumer=='github:Bbambaaamm/herdr'
+    assert child.parent_task_id==parent.task_id==task['id']
+    assert child.parent_agent_id==parent.agent_id
+    assert parent.run_token==child.run_token==task['run_token']=='a'*32
+    assert parent.fencing_token==child.fencing_token==1
+    assert task['attempt_id']==task['attempts']==0
+    assert all(prepared[key] is False for key in (
+        'authority_created','budget_allocated','credentials_created','queue_written'))
+    assert prepared['physical_acceptance']=='NOT_ESTABLISHED'
+    assert 'attempt_started_at' not in task and 'dispatch_claimed_at' not in task
+    assert 'approval' not in prepared and 'ledger' not in prepared and 'auth' not in prepared
+    claimed = prepared.pop('proposal_sha256')
+    assert claimed==digest(prepared)
+
+
+def test_clean_input_preparation_only_reads_case_and_approved_code(clean_case_file,monkeypatch):
+    import os
+    m = load('offline_pilot.py')
+    before = dict(os.environ)
+    original = m.os.open
+    opened = []
+    def observed(path,*args,**kwargs):
+        opened.append(Path(path))
+        assert Path(path)==clean_case_file[0]
+        return original(path,*args,**kwargs)
+    monkeypatch.setattr(m.os,'open',observed)
+    monkeypatch.setattr(m.subprocess,'Popen',lambda *a,**k:pytest.fail('preparation started process'))
+    value = m.prepare_clean_inputs(*clean_case_file,'a'*32)
+    assert opened==[clean_case_file[0]] and dict(os.environ)==before
+    assert value['limits']['max_external_model_calls']==0
+
+
+def test_clean_nonce_does_not_borrow_historical_identity_or_start_clocks(clean_case_file,monkeypatch):
+    m = load('offline_pilot.py')
+    monkeypatch.setattr(m.time,'time',lambda:pytest.fail('economic clock started during preparation'))
+    monkeypatch.setattr(m.time,'monotonic',lambda:pytest.fail('deadline started during preparation'))
+    first = m.prepare_clean_inputs(*clean_case_file,'a'*32)
+    second = m.prepare_clean_inputs(*clean_case_file,'b'*32)
+    assert first['task_seed']['run_token']!=second['task_seed']['run_token']
+    assert first['proposal_sha256']!=second['proposal_sha256']
+    assert first['task_seed']['workspace']!=second['task_seed']['workspace']
+    assert m.prepare_clean_inputs(*clean_case_file,'a'*32)==first
+
+
+@pytest.mark.parametrize('nonce',[None,'', 'issue77', 'A'*32, 'a'*31, 'a'*33, '../'+'a'*29])
+def test_clean_preparation_rejects_unbound_nonce_before_case_read(clean_case_file,nonce,monkeypatch):
+    m = load('offline_pilot.py')
+    monkeypatch.setattr(m,'read_clean_case',lambda *a:pytest.fail('invalid nonce reached input'))
+    with pytest.raises(RuntimeError,match='nonce_required'):
+        m.prepare_clean_inputs(*clean_case_file,nonce)
+
+
+@pytest.mark.parametrize('field,value',[
+    ('source_main','0'*40),('consumer','github:foreign/repo'),
+    ('case_id','issue77-validation-repair-20261026'),('schema_version',True),
+    ('files',{}),('edits',{}),
+])
+def test_clean_preparation_denies_changed_identity_or_empty_input(clean_case_file,field,value):
+    pair = rewrite_case(clean_case_file,lambda case:case.update({field:value}))
+    with pytest.raises(RuntimeError,match='clean_case_'):clean_inputs(pair)
+
+
+@pytest.mark.parametrize('path',[
+    '../escape.py','/etc/auth.json','C:/auth.json','a/../b.py',
+    'a//b.py','./script.py','.git/config','a\\b.py','a/./b.py','a/.secret',
+])
+def test_clean_preparation_denies_workspace_path_substitution(clean_case_file,path):
+    pair = rewrite_case(clean_case_file,lambda case:case['files'].update({path:'denied'}))
+    with pytest.raises(RuntimeError,match='path_denied'):clean_inputs(pair)
+
+
+@pytest.mark.parametrize('fault',[
+    'extra-authority','extra-budget','extra-credential','external-model',
+    'external-auth','external-github','cost','deadline','child-fanout','bool-limit',
+    'outside-edit','no-delta','large-source','oracle-edited','bool-exit','check-unknown',
+])
+def test_clean_preparation_denies_scope_or_implicit_authority(clean_case_file,fault):
+    def change(case):
+        if fault.startswith('extra-'):case[fault]={'approved':True}
+        elif fault in ('external-model','external-auth','external-github'):
+            case['limits']['max_external_'+fault.split('-')[1]+'_calls']=1
+        elif fault=='cost':case['limits']['max_cost_microusd']=1
+        elif fault=='deadline':case['limits']['max_work_seconds']=901
+        elif fault=='child-fanout':case['limits']['max_managed_children']=2
+        elif fault=='bool-limit':case['limits']['max_cost_microusd']=False
+        elif fault=='outside-edit':case['edits']['other.py']='foreign'
+        elif fault=='no-delta':case['edits']['arithmetic.py']=case['files']['arithmetic.py']
+        elif fault=='large-source':case['files']['arithmetic.py']='x'*8193
+        elif fault=='oracle-edited':case['edits']['check_arithmetic.py']='pass'
+        elif fault=='bool-exit':case['check']['expected_baseline_exit']=True
+        else:case['check']['argv']=['unsafe']
+    with pytest.raises(RuntimeError,match='clean_case_'):
+        clean_inputs(rewrite_case(clean_case_file,change))
+
+
+def test_clean_case_pin_and_duplicate_keys_fail_closed(clean_case_file):
+    import hashlib
+    path, old = clean_case_file
+    path.write_bytes(path.read_bytes()+b' ')
+    with pytest.raises(RuntimeError,match='digest_changed'):clean_inputs((path,old))
+    path.write_bytes(b'{"schema_version":1,"schema_version":2}')
+    with pytest.raises(RuntimeError,match='duplicate_field'):
+        clean_inputs((path,hashlib.sha256(path.read_bytes()).hexdigest()))
+
+
+def test_clean_case_hardlink_is_not_an_independent_input(clean_case_file,tmp_path):
+    import os
+    path, sha = clean_case_file
+    os.link(path,tmp_path/'alias.json')
+    with pytest.raises(RuntimeError,match='file_denied'):clean_inputs((path,sha))
+
+
+def test_clean_provider_runs_full_tool_sequence_with_real_check_submission(clean_case_file):
+    m = load('offline_provider.py')
+    f = m.ProviderFixture.for_clean_case(*clean_case_file,'a'*32)
+    p = payload()
+    reads = calls(f.answer(p))
+    assert {json.loads(row['function']['arguments'])['path'] for row in reads}=={
+        f.workspace+'arithmetic.py',f.workspace+'check_arithmetic.py'}
+    writes = calls(f.answer(p))
+    assert len(writes)==1
+    edit = json.loads(writes[0]['function']['arguments'])
+    assert edit['path']==f.workspace+'arithmetic.py'
+    assert 'left + right' in edit['content']
+    assert calls(f.answer(p))[0]['function']['name']=='herdr_verify_work'
+    # Provider must relay the actual trusted verifier result, never invent one.
+    with pytest.raises(ValueError,match='did_not_pass'):f.answer(p)
+    f = m.ProviderFixture.for_clean_case(*clean_case_file,'b'*32)
+    for _ in range(3):f.answer(p)
+    submission = {'status':'completed','evidence':[{'origin':'host-verifier'}]}
+    p['messages']=[{'role':'tool','content':json.dumps({'status':'pass','submission':submission})}]
+    assert json.loads(calls(f.answer(p))[0]['function']['arguments'])==submission
+    assert not calls(f.answer(p)) and f.complete
+
+
+def test_clean_arithmetic_oracle_fails_before_and_passes_after_only_golden_edit(clean_case_file,tmp_path):
+    import subprocess,sys
+    prepared = clean_inputs(clean_case_file)
+    work = tmp_path/'workspace';work.mkdir()
+    for name,body in prepared['workspace_files'].items():
+        (work/name).write_text(body,encoding='utf8')
+    def run():
+        return subprocess.run([sys.executable,'-I','-B',prepared['check']['script']],
+            cwd=work,capture_output=True,text=True,timeout=10)
+    before = run()
+    assert before.returncode==1
+    assert before.stdout==prepared['check']['expected_baseline_stdout']
+    unchanged = (work/'check_arithmetic.py').read_bytes()
+    for name,body in prepared['provider_edits'].items():
+        (work/name).write_text(body,encoding='utf8')
+    after = run()
+    assert after.returncode==0 and after.stdout==prepared['check']['expected_pass_stdout']
+    assert (work/'check_arithmetic.py').read_bytes()==unchanged
+
+
+def test_clean_cli_refuses_execution_mode_arguments_before_any_old_preparation(clean_case_file,monkeypatch,capsys):
+    import sys
+    m = load('offline_pilot.py')
+    monkeypatch.setattr(m,'prepare_fixture',lambda *a:pytest.fail('legacy preparation reached'))
+    monkeypatch.setattr(sys,'argv',['fixture','--prepare-clean-inputs',str(clean_case_file[0]),
+        '--case-sha256',clean_case_file[1],'--run-token','a'*32,'--inner'])
+    with pytest.raises(RuntimeError,match='data_only'):m.main()
+    assert capsys.readouterr().out==''
+
+
+def test_clean_cli_produces_only_data_and_never_legacy_execution(clean_case_file,monkeypatch,capsys):
+    import sys
+    m = load('offline_pilot.py')
+    monkeypatch.setattr(m,'prepare_fixture',lambda *a:pytest.fail('legacy preparation reached'))
+    monkeypatch.setattr(m.os,'geteuid',lambda:1001,raising=False)
+    monkeypatch.setattr(sys,'argv',['fixture','--prepare-clean-inputs',str(clean_case_file[0]),
+        '--case-sha256',clean_case_file[1],'--run-token','c'*32])
+    assert m.main()==0
+    result = json.loads(capsys.readouterr().out)
+    assert result['status']=='PROPOSAL_ONLY_NOT_ADMITTED'
+    assert not result['authority_created'] and not result['queue_written']
+
+
+def test_clean_cli_refuses_root_without_issuing_inputs(clean_case_file,monkeypatch,capsys):
+    import sys
+    m = load('offline_pilot.py')
+    monkeypatch.setattr(m,'prepare_clean_inputs',lambda *a:pytest.fail('root preparation reached'))
+    monkeypatch.setattr(m.os,'geteuid',lambda:0,raising=False)
+    monkeypatch.setattr(sys,'argv',['fixture','--prepare-clean-inputs',str(clean_case_file[0]),
+        '--case-sha256',clean_case_file[1],'--run-token','c'*32])
+    with pytest.raises(RuntimeError,match='must_be_unprivileged'):m.main()
+    assert capsys.readouterr().out==''
+
+
+def test_clean_case_version_change_during_read_is_denied(clean_case_file,monkeypatch):
+    import os
+    m = load('offline_pilot.py');path,sha=clean_case_file
+    original=m.os.read;changed=False
+    def changing(fd,size):
+        nonlocal changed
+        data=original(fd,size)
+        if not changed:
+            changed=True;before=path.stat()
+            os.utime(path,ns=(before.st_atime_ns,before.st_mtime_ns+1000000))
+        return data
+    monkeypatch.setattr(m.os,'read',changing)
+    with pytest.raises(RuntimeError,match='changed'):m.prepare_clean_inputs(path,sha,'a'*32)

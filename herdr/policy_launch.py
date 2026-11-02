@@ -493,7 +493,8 @@ class PolicyMount:
                                 tuple(sorted(path for path, modes in rows.items() if "rw" in modes)), False)
 
     def seal(self, pid, grant: SecurityGrant, *, identity: InvocationIdentity, attestation,
-             tools, permissions, private_key, key_id, parent: SecurityGrant | None = None):
+             tools, permissions, private_key, key_id, parent: SecurityGrant | None = None,
+             delegated_writes=None):
         _require(isinstance(grant, SecurityGrant) and grant.identity == identity,
                  "grant differs from admitted identity")
         _require(set(grant.scope.tools) == set(tools) and set(grant.scope.permissions) <= set(permissions),
@@ -519,12 +520,20 @@ class PolicyMount:
         assurance = self.observed_assurance(pid, attestation)
         bound = replace(grant, runtime_assurance=assurance)
         if parent is not None:
-            bound.require_subset_of(parent)
+            if delegated_writes is None:
+                bound.require_subset_of(parent)
+            else:
+                bound.require_delegated_subset_of(parent, delegated_writes)
+        else:
+            _require(delegated_writes is None, "root cannot use child delegated authority")
         if bound.process.enabled:
             _require(assurance.credentials_isolated, "process credential isolation unavailable")
         sealed = self.stage.seal(bound, private_key, key_id=key_id, expected_identity=identity,
                                  expected_attestation_sha256=assurance.sandbox_attestation_sha256)
         self.verify_mounted(pid, sealed)
+        if delegated_writes is not None:
+            delegated_writes.validated_roots(bound, parent)
+            delegated_writes.record_sealed(bound, parent)
         return bound, sealed
 
 def validate_policy_evidence(evidence, *, identity: InvocationIdentity):
@@ -977,6 +986,7 @@ class PreparedPolicyLaunch:
         self._published_bootstrap_receipt = None
         self._continuation_sink = None
         self._ownership = None
+        self._delegated_writes = None
         self.private_plan_handoff = None
         self._private_handoff_verify = None
         self._private_handoff_state = None
@@ -1016,6 +1026,15 @@ class PreparedPolicyLaunch:
             replace(rule,result_slot=slot) if rule.tool == TOOL else rule for rule in self.grant.tool_rules))
         if self._parent is not None:
             self.grant.require_logical_subset_of(self._parent)
+
+    def bind_delegated_writes(self, authority):
+        from .security import DelegatedWriteAuthority
+        _require(self.sealed is None and self._private_key is not None
+                 and self._parent is not None and self._delegated_writes is None
+                 and isinstance(authority, DelegatedWriteAuthority),
+                 "one original host child delegation binding required")
+        authority.validated_roots(self.grant, self._parent)
+        self._delegated_writes = authority
 
     def bind_private_mount_plan(self, path):
         from .private_mount_plan import ApprovedPrivateMountPlan
@@ -1076,7 +1095,9 @@ class PreparedPolicyLaunch:
             attestation["immutable_sources"] = sources
         bound, sealed = self.mount.seal(pid, self.grant, identity=self.identity, attestation=attestation,
                                        tools=tools, permissions=permissions, private_key=self._private_key,
-                                       key_id=self._key_id, parent=self._parent)
+                                       key_id=self._key_id, parent=self._parent,
+                                       **({"delegated_writes": self._delegated_writes}
+                                          if self._delegated_writes is not None else {}))
         self.grant, self.sealed = bound, sealed
         self._process_start_ticks = process_start_ticks(pid)
         self._private_key = None
