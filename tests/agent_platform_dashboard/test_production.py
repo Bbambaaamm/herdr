@@ -381,6 +381,84 @@ def test_search_required_completeness_is_limited_to_newest_1000_records(tmp_path
     assert rows[0]['cost_microusd'] is None and stamp == 1001
     assert path.read_bytes() == before
 
+def test_search_rejects_corrupted_individual_cost_hidden_by_aggregate_sum(tmp_path):
+    path = tmp_path / 'search.db'; search_pair_db(path)
+    db = sqlite3.connect(path)
+    # -0.000001 + 0.000002 = 1 microusd, a valid aggregate of two invalid rows.
+    db.execute('UPDATE searches SET cost_usd=-0.000001 WHERE id=1')
+    db.execute('UPDATE searches SET cost_usd=0.000002 WHERE id=2')
+    db.commit(); db.close()
+    before = path.read_bytes()
+
+    with pytest.raises(ValueError):
+        sources.search(str(path), 'majak')
+
+    assert path.read_bytes() == before
+
+
+def test_search_corrupted_individual_cost_group_is_exported_as_source_failed(tmp_path, monkeypatch):
+    path = tmp_path / 'search.db'; search_pair_db(path)
+    db = sqlite3.connect(path)
+    db.execute('UPDATE searches SET cost_usd=1e8 WHERE id=2')
+    db.commit(); db.close()
+    before = path.read_bytes()
+    cfg = config(tmp_path)
+    cfg['profiles']['majak']['search'] = str(path)
+    for name in ('QUEUE_PATH', 'CODEX_USAGE_PATH', 'ADMISSION_PATH', 'RELEASE_PATH', 'SWARM_PATH'):
+        monkeypatch.setattr(sources, name, None)
+
+    value = collect(cfg, 100)
+
+    result = next(s for s in value['sources'] if s['profile'] == 'majak' and s['kind'] == 'search')
+    assert result['status'] == 'unavailable' and result['reason'] == 'source_failed'
+    assert result['rows'] == [] and result['data_at'] is None
+    assert path.read_bytes() == before
+    assert 'PRIVATEHASH' not in json.dumps(value)
+
+
+def test_search_cost_validation_is_limited_to_newest_1000_records(tmp_path):
+    path = tmp_path / 'search.db'; search_db(path)
+    db = sqlite3.connect(path)
+    # Row 1 falls outside the newest 1000 selected searches, so its corruption
+    # must not be validated; rows 2..1001 stay valid.
+    db.execute('UPDATE searches SET cost_usd=-1.0 WHERE id=1')
+    db.executemany(
+        'INSERT INTO searches VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        [(i, i, None, 'fast', 'exa-keyless', None, 0, 1, 0, 0, 1, 0.0,
+          'PRIVATEHASH', 99) for i in range(2, 1002)],
+    )
+    db.commit(); db.close()
+    before = path.read_bytes()
+
+    rows, stamp = sources.search(str(path), 'majak')
+
+    assert len(rows) == 1 and rows[0]['searches'] == 1000
+    assert rows[0]['cost_microusd'] == 0 and stamp == 1001
+    assert path.read_bytes() == before
+
+
+def test_search_valid_measured_zero_and_unknown_cost_stay_unchanged(tmp_path):
+    path = tmp_path / 'search.db'; search_pair_db(path)
+    db = sqlite3.connect(path)
+    db.execute('UPDATE searches SET cost_usd=0.0 WHERE id=2')
+    db.commit(); db.close()
+
+    rows, _ = sources.search(str(path), 'majak')
+
+    assert rows[0]['cost_microusd'] == 0
+
+
+def test_search_all_nullable_cost_stays_unknown_not_failed(tmp_path):
+    path = tmp_path / 'search.db'; search_pair_db(path)
+    db = sqlite3.connect(path)
+    db.execute('UPDATE searches SET cost_usd=NULL')
+    db.commit(); db.close()
+
+    rows, _ = sources.search(str(path), 'majak')
+
+    assert rows[0]['cost_microusd'] is None
+
+
 def test_search_projection_accepts_no_fallback_and_tracks_provider_recency(tmp_path):
     path = tmp_path / 'search.db'; search_db(path)
     db = sqlite3.connect(path)
