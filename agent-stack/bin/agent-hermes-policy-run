@@ -15,6 +15,7 @@ import json
 import os
 import re
 import socket
+import secrets
 import stat
 import subprocess
 import sys
@@ -28,15 +29,15 @@ BOOTSTRAP_PROOF = BOOTSTRAP_ROOT / "immutable-trees.json"
 STAGE1_PROOF_ENV = "HERDR_POLICY_STAGE1_PROOF_SHA256"
 STAGE2_FD_ENV = "HERDR_VERIFIED_STAGE2_FD"
 BOOTSTRAP_AUTH_FD_ENV = "HERDR_BOOTSTRAP_AUTH_FD"
-MAX_AUTH_RESPONSE = 128
+MAX_AUTH_RESPONSE = 32768
 MAX_BUNDLE = 2 * 1024 * 1024
 POLICY_CODE_ROOT = Path("/run/herdr/policy-code")
 BOOTSTRAP_STAGE1 = POLICY_CODE_ROOT / "agent-stack/bin/agent-hermes-policy-stage1"
 HERMES_ROOT = Path("/home/agentops/.hermes/hermes-agent")
-HERMES_HEAD = "ee5ee84a345204a3b1d6ef6ba1ab747e602867b9"
-HERMES_SOURCE_SHA256 = "525219e866137f43c8c8b068488e07d97f14529d2d67497cd52fbfd1197da4f4"
+HERMES_HEAD = "candidate-b54a131be69f0918690847fb345a491c1c437317"
+HERMES_SOURCE_SHA256 = "b54a131be69f0918690847fb345a491c1c4373176b02beb64ed803b17ad103d6"
 HERMES_INVENTORY_PATH = POLICY_CODE_ROOT / "herdr/hermes_source_inventory.json"
-HERMES_INVENTORY_SHA256 = "8ff6ff1a3ef0160b7930da71a503f6401b0b8dcb26117756fc8db0c9cabc5803"
+HERMES_INVENTORY_SHA256 = "784ba1664a432ac0b2f8392dee4a95d14ead2b37053dc2f4de3dff3604a80756"
 MAX_HERMES_INVENTORY = 1_048_576
 PYTHON_PATH = Path("/home/agentops/.local/share/uv/python/cpython-3.11.16-linux-x86_64-gnu/bin/python3.11")
 PYTHON_ROOT = PYTHON_PATH.parents[1]
@@ -167,11 +168,7 @@ def _load_stage1_module() -> Any:
 
 def _require_held_stage2_source(source_path: str | None = None) -> None:
     """Prove this trusted stage-two source was held open by verified stage one."""
-    raw = os.environ.get(STAGE2_FD_ENV, "")
-    try:
-        fd = int(raw)
-    except (TypeError, ValueError):
-        raise SystemExit("verified stage-two source FD is required")
+    fd = _startup_descriptor(STAGE2_FD_ENV)
     actual_source = source_path if source_path is not None else __file__
     if source_path is None and not str(actual_source).startswith("/proc/self/fd/"):
         raise SystemExit("stage-two must execute from the held source FD")
@@ -200,6 +197,15 @@ def _require_stage1_continuity() -> None:
     rows = stage1._mount_rows()
     stage1._require_exact_ro_tree(BOOTSTRAP_ROOT, rows)
     stage1._verify_trees(proof, rows)
+    # Stage one passes this held source FD solely for the continuity check.
+    # It must not survive into policy imports, SDK startup, or credential
+    # observation.  Removing its environment handle also prevents a descendant
+    # from rediscovering the descriptor by name.
+    fd = _startup_descriptor(STAGE2_FD_ENV, retire=True)
+    try:
+        os.close(fd)
+    except (OSError, ValueError) as exc:
+        raise SystemExit("verified stage-two FD could not be retired") from exc
     return proof
 
 
@@ -257,7 +263,7 @@ def _canonical_bootstrap(value: object) -> bytes:
     return raw
 
 
-def _recv_bootstrap_status(connection: socket.socket, expected: bytes) -> None:
+def _recv_bootstrap_status(connection: socket.socket, expected: bytes):
     data = bytearray()
     while len(data) < MAX_AUTH_RESPONSE:
         chunk = connection.recv(min(64, MAX_AUTH_RESPONSE - len(data)))
@@ -266,32 +272,117 @@ def _recv_bootstrap_status(connection: socket.socket, expected: bytes) -> None:
         data.extend(chunk)
         if b"\n" in data:
             line, tail = bytes(data).split(b"\n", 1)
-            if tail or line + b"\n" != expected:
+            if tail:
                 raise SystemExit("host bootstrap authority denied stage two")
-            return
+            if line + b"\n" == expected:
+                return None
+            if expected == b"stage2-ok\n" and line.startswith(b"stage2-ok "):
+                raw = line[len(b"stage2-ok "):]
+                try:
+                    value = json.loads(raw)
+                    if (type(value) is not dict or json.dumps(value, sort_keys=True,
+                            separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode() != raw):
+                        raise ValueError()
+                except (UnicodeError, ValueError, TypeError) as exc:
+                    raise SystemExit("host reference bootstrap response invalid") from exc
+                return value
+            raise SystemExit("host bootstrap authority denied stage two")
     raise SystemExit("host bootstrap authority response incomplete")
 
 
-def _require_host_bootstrap_authority() -> None:
-    raw_fd = os.environ.pop(BOOTSTRAP_AUTH_FD_ENV, "")
+_BOOTSTRAP_REPLY_TOKEN = object()
+
+
+class _AuthenticatedKernelReply:
+    """Local one-shot input receipt, NEVER authority for a host effect."""
+    __slots__ = ("_raw", "challenge", "_used")
+    def __init__(self, value, challenge, token):
+        if token is not _BOOTSTRAP_REPLY_TOKEN:
+            raise SystemExit("inherited bootstrap transport required")
+        self._raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
+        if len(self._raw) > MAX_AUTH_RESPONSE:
+            raise SystemExit("bounded bootstrap receipt required")
+        self.challenge, self._used = challenge, False
+    def consume(self):
+        if self._used:
+            raise SystemExit("bootstrap input receipt already consumed")
+        self._used = True
+        return json.loads(self._raw), self.challenge
+
+
+def _requested_self_observation(proof_digest):
+    with BOOTSTRAP_PROOF.open("rb") as source:
+        raw = source.read(65537)
+    if len(raw) > 65536 or hashlib.sha256(raw).hexdigest() != proof_digest:
+        raise SystemExit("immutable bootstrap proof changed")
     try:
-        fd = int(raw_fd)
+        proof = json.loads(raw)
+        if proof.get("schema_version") == "herdr-policy-bootstrap-3":
+            if proof["self_observation"]["mode"] != "authenticated-root-kernel-v1":
+                raise ValueError("mode")
+            return "authenticated-root-kernel-v1"
+        return None
+    except (ValueError, TypeError, KeyError) as exc:
+        raise SystemExit("bootstrap observation mode invalid") from exc
+
+
+_FIXED_STARTUP_DESCRIPTORS = {
+    _INTERPRETER_FD_ENV: 197,
+    STAGE2_FD_ENV: 198,
+    BOOTSTRAP_AUTH_FD_ENV: 199,
+}
+_RETIRED_STARTUP_DESCRIPTORS = set()
+
+
+def _startup_descriptor(name, *, retire=False):
+    """Versioned handle selection is integrity plumbing, never authority.
+
+    V3 source/proof authenticates fixed roles and NEVER puts descriptor hints
+    in exec's environment. Actual source inode/interpreter and inherited host
+    socket checks still independently authenticate every handle.
+    """
+    if name not in _FIXED_STARTUP_DESCRIPTORS:
+        raise SystemExit("unknown startup descriptor role")
+    mode = _requested_self_observation(os.environ.get(STAGE1_PROOF_ENV, ""))
+    if mode is not None:
+        if any(key in os.environ for key in _FIXED_STARTUP_DESCRIPTORS):
+            raise SystemExit("v3 startup descriptor environment forbidden")
+        if name in _RETIRED_STARTUP_DESCRIPTORS:
+            raise SystemExit("startup descriptor already retired")
+        if retire:
+            _RETIRED_STARTUP_DESCRIPTORS.add(name)
+        return _FIXED_STARTUP_DESCRIPTORS[name]
+    raw = os.environ.pop(name, "") if retire else os.environ.get(name, "")
+    try:
+        fd = int(raw)
     except (TypeError, ValueError) as exc:
-        raise SystemExit("host bootstrap authority session required") from exc
+        raise SystemExit("verified legacy startup descriptor required") from exc
+    if fd <= 2:
+        raise SystemExit("startup descriptor cannot replace standard IO")
+    return fd
+
+
+def _require_host_bootstrap_authority():
+    fd = _startup_descriptor(BOOTSTRAP_AUTH_FD_ENV, retire=True)
     proof_digest = os.environ.get(STAGE1_PROOF_ENV, "")
     if not re.fullmatch(r"[0-9a-f]{64}", proof_digest):
         raise SystemExit("verified stage-one proof is required")
-    request = _canonical_bootstrap({
-        "op": "stage2",
-        "identity": _raw_identity_from_env(),
-        "proof_sha256": proof_digest,
-        "bundle_sha256": _sha256_regular_path(BUNDLE_PATH, MAX_BUNDLE),
-    }) + b"\n"
+    mode = _requested_self_observation(proof_digest)
+    fields = {"op": "stage2", "identity": _raw_identity_from_env(),
+              "proof_sha256": proof_digest, "bundle_sha256": _sha256_regular_path(BUNDLE_PATH, MAX_BUNDLE)}
+    challenge = None
+    if mode is not None:
+        challenge = secrets.token_hex(32)
+        fields.update(self_observation_mode=mode, challenge=challenge)
+    request = _canonical_bootstrap(fields) + b"\n"
     try:
         connection = socket.socket(fileno=fd)
         connection.settimeout(5)
         connection.sendall(request)
-        _recv_bootstrap_status(connection, b"stage2-ok\n")
+        response = _recv_bootstrap_status(connection, b"stage2-ok\n")
+        if mode is not None:
+            return _AuthenticatedKernelReply(response, challenge, _BOOTSTRAP_REPLY_TOKEN)
+        return response
     except (OSError, TimeoutError) as exc:
         raise SystemExit("host bootstrap authority unavailable") from exc
     finally:
@@ -367,7 +458,7 @@ def _verify_runtime(hermes_root: Path) -> None:
     if not sys.flags.isolated or not sys.flags.no_site or sys.version_info[:2] != (3, 11):
         raise SystemExit("audited Python requires isolated no-site startup")
     try:
-        fd = int(os.environ.pop(_INTERPRETER_FD_ENV))
+        fd = _startup_descriptor(_INTERPRETER_FD_ENV, retire=True)
         inherited = os.fstat(fd)
         active = os.stat("/proc/self/exe")
         if (inherited.st_dev, inherited.st_ino) != (active.st_dev, active.st_ino):
@@ -630,12 +721,12 @@ def _native_hermes_process_label():
 
 
 def _verified_private_sdk_policy(proof, hermes_args):
-    """Only a host-authenticated v2 manifest may enable private SDK configuration."""
+    """Only an authenticated v2/v3 manifest enables private SDK configuration."""
     if not isinstance(proof, dict):
         raise SystemExit("verified bootstrap proof unavailable")
     if proof.get("schema_version") == "herdr-policy-bootstrap-1":
         return None  # Historical private/legacy proof cannot opt in by file presence.
-    if proof.get("schema_version") != "herdr-policy-bootstrap-2":
+    if proof.get("schema_version") not in ("herdr-policy-bootstrap-2", "herdr-policy-bootstrap-3"):
         raise SystemExit("verified bootstrap proof version unsupported")
     from herdr.private_profile_namespace import (
         _HOME, _MAX_FILE_BYTES, _open_beneath, SDK_POLICY_MEMBER,
@@ -680,7 +771,8 @@ def _verified_private_sdk_policy(proof, hermes_args):
                     os.close(member)
         finally:
             os.close(fd)
-        policy = private_sdk_policy(approved, values[SDK_POLICY_MEMBER], values["config.yaml"])
+        policy = private_sdk_policy(approved, values[SDK_POLICY_MEMBER], values["config.yaml"],
+                                    credentialless=True)
         _require_production_mount(POLICY_CODE_ROOT, exact=True)
         policy.reassert()  # Sentinel is absent below the verified, nonshadowable RO code tree.
         return policy
@@ -688,10 +780,34 @@ def _verified_private_sdk_policy(proof, hermes_args):
         raise SystemExit("authenticated private SDK configuration rejected") from None
 
 
+def _verified_bootstrap_reference(authenticated, proof, grant, observation_module, policy_launch_module):
+    """Combines authenticated root data with local facts; grants no host authority."""
+    if proof.get("schema_version") == "herdr-policy-bootstrap-3":
+        if not isinstance(authenticated, _AuthenticatedKernelReply):
+            raise SystemExit("inherited authenticated v3 bootstrap response required")
+        payload, challenge = authenticated.consume()
+        if (type(payload) is not dict or set(payload) != {"schema_version", "reference", "self_observation"}
+                or payload["schema_version"] != "herdr-stage2-authenticated-envelope-1"
+                or type(payload["reference"]) is not dict):
+            raise SystemExit("closed bootstrap self-observation envelope required")
+        self_module = importlib.import_module("herdr.bootstrap_self_observation")
+        _require_module_origin(self_module, POLICY_CODE_ROOT, "herdr.bootstrap_self_observation")
+        if not self_module.observe_self_from_bootstrap(payload["self_observation"], challenge=challenge, grant=grant,
+                bootstrap_proof=proof, bundle_sha256=_sha256_regular_path(BUNDLE_PATH, MAX_BUNDLE)):
+            raise SystemExit("stage-two local and root observation denied")
+        return payload["reference"]
+    if isinstance(authenticated, _AuthenticatedKernelReply):
+        raise SystemExit("unexpected v3 bootstrap response in legacy mode")
+    if not observation_module.observe_sdk_credentials(os.getpid(), proof["approved_profile"],
+            policy_launch_module.mount_rows(os.getpid()), grant.workspace_root):
+        raise SystemExit("stage-two credential isolation observation denied")
+    return authenticated
+
+
 def bootstrap(hermes_args: list[str]) -> int:
     """Every entry uses the fixed authenticated production path."""
     bundle_path,policy_code_root,hermes_root=BUNDLE_PATH,POLICY_CODE_ROOT,HERMES_ROOT
-    _require_host_bootstrap_authority()
+    authenticated_reference = _require_host_bootstrap_authority()
     bootstrap_proof = _require_stage1_continuity()
     _require_production_mount(bundle_path, exact=True)
     _require_production_mount(policy_code_root, exact=True)
@@ -734,9 +850,44 @@ def bootstrap(hermes_args: list[str]) -> int:
     except (security_module.SecurityError, KeyError, TypeError, ValueError) as exc:
         raise SystemExit(f"signed Herdr grant rejected: {exc}") from exc
 
+    reference_binding = None
+    if private_sdk_policy is not None:
+        observation_module = importlib.import_module("herdr.credential_isolation")
+        policy_launch_module = importlib.import_module("herdr.policy_launch")
+        _require_module_origin(observation_module, policy_code_root, "herdr.credential_isolation")
+        _require_module_origin(policy_launch_module, policy_code_root, "herdr.policy_launch")
+        authenticated_reference = _verified_bootstrap_reference(authenticated_reference, bootstrap_proof, grant,
+            observation_module, policy_launch_module)
+        if type(authenticated_reference) is not dict:
+            raise SystemExit("authenticated host reference required")
+        reference_module = importlib.import_module("agent.host_reference")
+        _require_module_origin(reference_module, hermes_root, "agent.host_reference")
+        try:
+            reference_binding = reference_module.HostCredentialReference(**authenticated_reference)
+            route = next((route for route in grant.provider_routes if route.provider == "nous"), None)
+            if (not grant.is_active() or grant.runtime_assurance.credentials_isolated is not True
+                    or route is None or reference_binding.grant_hash != grant.hash
+                    or reference_binding.profile_sha256 != private_sdk_policy.profile_sha256
+                    or reference_binding.projection_sha256 != private_sdk_policy.projection_sha256
+                    or reference_binding.workspace != grant.workspace_root
+                    or reference_binding.fence != str(grant.identity.fencing_token)
+                    or reference_binding.lineage != grant.identity.parent_task_id
+                    or reference_binding.endpoint != route.base_url
+                    or reference_binding.api_mode != route.api_mode
+                    or tuple(route.credential_refs) != (reference_binding.credential_ref,)
+                    or tuple(grant.credential_refs) != (reference_binding.credential_ref,)):
+                raise ValueError("authenticated host reference mismatches signed grant")
+        except (TypeError, ValueError, reference_module.HostReferenceDenied) as exc:
+            raise SystemExit("authenticated host reference invalid") from exc
+        guard._admitted_host_reference = reference_binding
+    elif authenticated_reference is not None:
+        raise SystemExit("unexpected host reference bootstrap response")
+
     cli_binding = None
     use_cli_identity = (private_sdk_policy is not None and len(hermes_args) >= 3
                         and hermes_args[0] in ("-p", "--profile") and hermes_args[2] == "chat")
+    if reference_binding is not None and not use_cli_identity:
+        raise SystemExit("host reference requires canonical guarded CLI entry")
     if use_cli_identity:
         binding_module = importlib.import_module("herdr.hermes_cli_identity")
         _require_module_origin(binding_module, policy_code_root, "herdr.hermes_cli_identity")
@@ -765,7 +916,8 @@ def bootstrap(hermes_args: list[str]) -> int:
     if cli_binding is not None:
         agent_module = importlib.import_module("run_agent")
         _require_module_origin(agent_module, hermes_root, "run_agent")
-        identity_transport = cli_binding.factory(cli_module.HermesCLI, agent_module.AIAgent)
+        identity_transport = cli_binding.factory(cli_module.HermesCLI, agent_module.AIAgent,
+                                                 host_reference=reference_binding)
     _configure_ephemeral_sdk_state(hermes_root)
     with _native_hermes_process_label(), native_transport, identity_transport:
         result = hermes_main_module.main()
@@ -775,13 +927,13 @@ def bootstrap(hermes_args: list[str]) -> int:
 def main() -> int:
     # Production stage two is reachable only through the independently frozen
     # stage-one bootstrap. Direct execution of policy-code is never authority.
-    if (
-        _INTERPRETER_FD_ENV not in os.environ
-        or STAGE1_PROOF_ENV not in os.environ
-        or STAGE2_FD_ENV not in os.environ
-        or BOOTSTRAP_AUTH_FD_ENV not in os.environ
-    ):
+    if STAGE1_PROOF_ENV not in os.environ:
         raise SystemExit("verified immutable stage-one bootstrap required")
+    mode = _requested_self_observation(os.environ[STAGE1_PROOF_ENV])
+    if mode is None and any(name not in os.environ for name in _FIXED_STARTUP_DESCRIPTORS):
+        raise SystemExit("verified immutable stage-one bootstrap required")
+    if mode is not None and any(name in os.environ for name in _FIXED_STARTUP_DESCRIPTORS):
+        raise SystemExit("v3 startup descriptors must not enter exec environment")
     return bootstrap(sys.argv[1:])
 
 

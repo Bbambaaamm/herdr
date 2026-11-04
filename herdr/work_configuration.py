@@ -416,7 +416,7 @@ def original_derived_children(root, task, *, identity=None, configuration_path=H
     return retained(admitted,task,identity=identity)
 
 
-def _derived_child_definition(root, task, spec_hash, configuration_path, *, optional=False):
+def _derived_child_definition(root, task, spec_hash, configuration_path, *, optional=False, recovery=False):
     from .host_configuration import read_canonical_parent
     from .child_ownership import ChildOwnership
     from .child_evidence import child_scope_spec
@@ -429,7 +429,11 @@ def _derived_child_definition(root, task, spec_hash, configuration_path, *, opti
     if not isinstance(parent_id,str) or not isinstance(parent_run,str):
         require(optional and not marker_present,"original derived child parent unavailable")
         return None,None
-    parent=read_canonical_parent(root,parent_id,parent_run)
+    if recovery:
+        from .canonical_case_claim import read_replay_task
+        parent=read_replay_task(root,parent_id,parent_run)
+    else:
+        parent=read_canonical_parent(root,parent_id,parent_run)
     if parent is None:
         require(optional and not marker_present,"original derived child parent unavailable")
         return None,None
@@ -577,7 +581,7 @@ def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG
             require(task.get(marker)==admitted[marker],"original derived child binding missing or changed")
         if task.get("parent_task_id") is not None or marker in task or marker in admitted:
             original_definition, original_environment = _derived_child_definition(
-                root,task,spec_hash,configuration_path,optional=marker not in admitted)
+                root,task,spec_hash,configuration_path,optional=marker not in admitted,recovery=True)
             require(original_definition is None or marker in admitted
                     and definition==original_definition and admitted["environment"]==original_environment,
                     "recovered child differs from original parent admission")

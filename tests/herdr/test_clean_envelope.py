@@ -415,7 +415,8 @@ def test_actual_seal_records_revalidated_delegation_after_mounted_check(tmp_path
         child.runtime_assurance.writable_roots,
         lambda *a: events.append('revalidate') or child.runtime_assurance.writable_roots,
         lambda *a: events.append('durable-audit'))
-    fake = SimpleNamespace(observed_assurance=lambda *a: child.runtime_assurance,
+    fake = SimpleNamespace(private_profile_snapshot=None,
+        observed_assurance=lambda *a, **k: child.runtime_assurance,
         stage=SimpleNamespace(seal=lambda *a, **k: events.append('signed') or 'sealed'),
         verify_mounted=lambda *a: events.append('mounted'))
     actual, sealed = scope['seal'](fake, 123, child, identity=child.identity,

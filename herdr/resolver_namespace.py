@@ -7,8 +7,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-import os
-from pathlib import Path
+from .observed_proc import os
+from .observed_proc import Path
 import pwd
 import stat
 
@@ -52,11 +52,11 @@ def _stamp(info):
 
 def _trusted_read(target, owners):
     """Open a fixed path component by component; never follow source links."""
-    parent = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    parent = os.open("/", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
     fd = -1
     try:
         for name in Path(target).parts[1:-1]:
-            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            child = os.open(name, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
                             dir_fd=parent)
             os.close(parent)
             parent = child
@@ -82,7 +82,7 @@ def _trusted_read(target, owners):
 def read_host_resolver(*, host_uid=None):
     """Select only a regular /etc file or the two supported systemd targets."""
     host_uid = os.geteuid() if host_uid is None else host_uid
-    etc = os.open("/etc", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    etc = os.open("/etc", os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
         directory = os.fstat(etc)
         require(directory.st_uid == 0 and not directory.st_mode & 0o022,

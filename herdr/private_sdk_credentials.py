@@ -174,9 +174,124 @@ def _replace_aliases(installation, auth, name, replacement):
                 seen.add(key)
 
 
+class CredentiallessReferenceAuthView:
+    """Deny-only SDK auth view bound to the ORIGINAL admitted host reference.
+
+    Empty store/state is an enforced absence of SDK auth access, not evidence
+    of isolation, provider readiness, a credential or host-effect authority.
+    Native inference keeps the independent original WorkAuthority transport.
+    """
+    def __init__(self, installation, policy, binding):
+        self.guard = installation.guard
+        self.policy, self.binding = policy, binding
+        self.grant = self.guard.grant
+        self.grant_hash = self.grant.hash
+        self.identity = self.grant.identity
+        self.closed = False
+        self._check()
+
+    def _check(self):
+        from .security import InvocationGuard
+        from .work_contract_host import WorkInvocationGuard
+        from .private_profile_namespace import PrivateSDKPolicy
+        from agent.host_reference import HostCredentialReference
+        grant, binding = self.guard.grant, self.binding
+        _need(not self.closed and type(self.guard) in (InvocationGuard, WorkInvocationGuard)
+              and type(self.policy) is PrivateSDKPolicy and type(binding) is HostCredentialReference
+              and getattr(self.guard, "_admitted_host_reference", None) is binding
+              and grant is self.grant and grant.identity == self.identity
+              and grant.hash == self.grant_hash and grant.is_active()
+              and grant.runtime_assurance.sandbox_verified is True
+              and grant.runtime_assurance.credentials_isolated is True
+              and self.policy.auth_sha256 is None
+              and self.policy.projection_sha256 is not None,
+              "credentialless_reference_bootstrap_binding_required")
+        _need(frozenset(grant.scope.providers) == {"nous"}
+              and len(grant.provider_routes) == len(grant.credential_refs) == 1,
+              "credentialless_reference_single_route_required")
+        route = grant.provider_routes[0]
+        _need(route.provider == binding.provider == "nous"
+              and route.base_url == binding.endpoint == "https://inference-api.nousresearch.com/v1"
+              and route.api_mode == binding.api_mode == "chat_completions"
+              and tuple(route.credential_refs) == tuple(grant.credential_refs) == (binding.credential_ref,)
+              and binding.credential_ref == "pool:nous:" + binding.entry_id
+              and binding.model.endswith(":free")
+              and binding.profile_sha256 == self.policy.profile_sha256
+              and binding.projection_sha256 == self.policy.projection_sha256
+              and binding.grant_hash == self.grant_hash
+              and binding.workspace == grant.workspace_root
+              and binding.fence == str(grant.identity.fencing_token)
+              and binding.lineage == grant.identity.parent_task_id,
+              "credentialless_reference_route_or_profile_changed")
+        self.policy.reassert()
+        self.policy.verify_config_path(self.policy.profile_home / "config.yaml")
+
+    def read(self, auth_file=None):
+        from pathlib import Path
+        self._check()
+        _need(auth_file is None or Path(auth_file) == self.policy.profile_home / "auth.json",
+              "credentialless_reference_auth_path_changed")
+        return {}  # No SDK auth.json is made up, opened, cached or persisted.
+
+    def provider_state(self, auth_store, provider_id):
+        self._check()
+        _need(type(auth_store) is dict and not auth_store and provider_id == "nous",
+              "credentialless_reference_auth_state_denied")
+        return None
+
+    def provider_state_with_source(self, auth_store, provider_id):
+        return self.provider_state(auth_store, provider_id), None
+
+    def deny(self, *_args, **_kwargs):
+        self._check()
+        raise PolicyDenied("credentialless_reference_auth_effect_forbidden")
+
+    def close(self):
+        self.closed = True
+
+
+def _install_credentialless_reference(installation, policy, binding):
+    """Block legacy identity/OAuth/global-store effects BEFORE native cmd_chat.
+
+    No SDK bytes, ready booleans, provider resolver or native request authority
+    are changed. Original config.provider readiness and actual typed reference
+    constructor remain independent. A missing/changed native surface denies.
+    """
+    from hermes_cli import auth, auth_nous, anon_auth
+    view = CredentiallessReferenceAuthView(installation, policy, binding)
+    replacements = {
+        (auth, "_load_auth_store"): view.read,
+        (auth, "_load_provider_state"): view.provider_state,
+        (auth, "_load_provider_state_with_source"): view.provider_state_with_source,
+    }
+    for owner, names in (
+        (auth, ("_load_global_auth_store", "_save_auth_store", "_auth_store_lock",
+                "_nous_shared_store_lock", "_merge_shared_nous_oauth_state", "_write_shared_nous_state",
+                "get_auth_status", "resolve_nous_runtime_credentials", "_refresh_nous_or_quarantine")),
+        (auth_nous, ("_nous_http_client",)),
+        (anon_auth, ("ensure_portal_identity",)),
+    ):
+        for name in names:
+            replacements[owner, name] = view.deny
+    # Validate the complete pinned surface before replacing any attribute.
+    for (owner, name) in replacements:
+        _need(callable(getattr(owner, name, None)), "credentialless_reference_auth_surface_changed")
+    for name, value in (("_RESOLVE_TOKEN_CACHE", {}), ("_nous_auth_status_cache", None),
+                        ("_global_auth_store_cache", None)):
+        if name in vars(auth):
+            installation._remember(auth, name, value)
+    for (owner, name), replacement in replacements.items():
+        _replace_aliases(installation, owner, name, replacement)
+    installation.finalizers.append(view.close)
+    return view
+
+
 def install_private_sdk_credentials(installation, policy):
     """Keep the SDK's credential selection and pool bookkeeping inside one view."""
     if policy.auth_sha256 is None:
+        binding = getattr(installation.guard, "_admitted_host_reference", None)
+        if binding is not None:
+            return _install_credentialless_reference(installation, policy, binding)
         return None  # Existing configuration-only / zero-provider profiles.
     providers = frozenset(installation.guard.grant.scope.providers)
     if providers != {"nous"}:

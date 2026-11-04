@@ -224,14 +224,24 @@ def _read_proof(path: Path = PROOF_PATH) -> tuple[dict, bytes]:
         _fail("bootstrap proof malformed")
     expected_keys = {"schema_version", "authority", "identity", "trees"}
     version = proof.get("schema_version") if isinstance(proof, dict) else None
-    if version == "herdr-policy-bootstrap-2":
+    if version in ("herdr-policy-bootstrap-2", "herdr-policy-bootstrap-3"):
         expected_keys.add("approved_profile")
+    if version == "herdr-policy-bootstrap-3":
+        expected_keys.add("self_observation")
     if not isinstance(proof, dict) or set(proof) != expected_keys:
         _fail("bootstrap proof fields differ")
-    if version not in (PROOF_VERSION, "herdr-policy-bootstrap-2") or proof["authority"] != PROOF_AUTHORITY:
+    if version not in (PROOF_VERSION, "herdr-policy-bootstrap-2", "herdr-policy-bootstrap-3") or proof["authority"] != PROOF_AUTHORITY:
         _fail("bootstrap proof authority/version mismatch")
-    if version == "herdr-policy-bootstrap-2":
+    if version in ("herdr-policy-bootstrap-2", "herdr-policy-bootstrap-3"):
         _validate_profile_identity(proof["approved_profile"])
+    if version == "herdr-policy-bootstrap-3":
+        observation = proof["self_observation"]
+        fields = {"mode", "role", "roster_sha256", "worker_source_sha256", "loaded_policy_sha256",
+                  "filter_program_sha256", "system_files_sha256"}
+        if (type(observation) is not dict or set(observation) != fields
+                or observation["mode"] != "authenticated-root-kernel-v1" or observation["role"] not in ("root", "child")
+                or any(type(observation[k]) is not str or not _SHA.fullmatch(observation[k]) for k in fields - {"mode", "role"})):
+            _fail("closed root observation mode required")
     identity = proof["identity"]
     if identity != _identity_from_env():
         _fail("bootstrap proof identity mismatch")
@@ -445,6 +455,49 @@ def _open_verified_python() -> int:
         raise
 
 
+def _fixed_v3_descriptors(python_fd, stage2_fd, authority_fd):
+    """Collision-safe, explicit v3 handoff; FD numbers never grant authority.
+
+    Copy all sources before replacing any target. os.dup is non-inheritable;
+    temporary collisions with reserved destinations stay held until all source
+    copies exist. Only the three verified role handles survive exec.
+    """
+    sources = (python_fd, stage2_fd, authority_fd)
+    targets = (197, 198, 199)
+    if len(set(sources)) != 3 or any(type(fd) is not int or fd <= 2 for fd in sources):
+        raise SystemExit("distinct verified startup descriptors required")
+    before = [os.fstat(fd) for fd in sources]
+    identity = lambda info: (info.st_dev, info.st_ino, info.st_mode, info.st_rdev)
+    temporary = []
+    copies = []
+    completed = False
+    try:
+        for source in sources:
+            for _ in range(4):  # At most the three fixed targets can collide.
+                duplicate = os.dup(source)
+                temporary.append(duplicate)
+                os.set_inheritable(duplicate, False)
+                if duplicate not in targets:
+                    copies.append(duplicate)
+                    break
+            else:
+                raise SystemExit("bounded startup descriptor duplication denied")
+        for copied, target, original in zip(copies, targets, before):
+            if identity(os.fstat(copied)) != identity(original):
+                raise SystemExit("startup descriptor changed before handoff")
+            os.dup2(copied, target, inheritable=True)
+            if identity(os.fstat(target)) != identity(original):
+                raise SystemExit("startup descriptor changed at fixed handoff")
+        completed = True
+        return targets
+    finally:
+        # Reserved targets now carry role handles, even if a source originally
+        # used a different reserved number. Never close a newly installed role.
+        for fd in set(temporary) | (set(sources) if completed else set()):
+            if fd not in targets:
+                os.close(fd)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(os.sys.argv[1:] if argv is None else argv)
     _require_independent_stage0()
@@ -463,14 +516,21 @@ def main(argv: list[str] | None = None) -> int:
     stage2_fd = _open_verified_stage2()
     python_fd = _open_verified_python()
     authority_fd = _connect_host_authority(raw, stage2_fd, python_fd)
-    os.set_inheritable(stage2_fd, True)
-    os.set_inheritable(python_fd, True)
     pycache_prefix = _fresh_pycache_prefix()
     env = dict(os.environ)
     env[PROOF_ENV] = hashlib.sha256(raw).hexdigest()
-    env[INTERPRETER_FD_ENV] = str(python_fd)
-    env[STAGE2_FD_ENV] = str(stage2_fd)
-    env[AUTHORITY_FD_ENV] = str(authority_fd)
+    if proof["schema_version"] == "herdr-policy-bootstrap-3":
+        python_fd, stage2_fd, authority_fd = _fixed_v3_descriptors(python_fd, stage2_fd, authority_fd)
+        # /proc/PID/environ retains exec's initial bytes. These hints must never
+        # enter that initial environment; pop() in stage2 cannot scrub it.
+        for name in (INTERPRETER_FD_ENV, STAGE2_FD_ENV, AUTHORITY_FD_ENV):
+            env.pop(name, None)
+    else:
+        os.set_inheritable(stage2_fd, True)
+        os.set_inheritable(python_fd, True)
+        env[INTERPRETER_FD_ENV] = str(python_fd)
+        env[STAGE2_FD_ENV] = str(stage2_fd)
+        env[AUTHORITY_FD_ENV] = str(authority_fd)
     executable = f"/proc/self/fd/{python_fd}"
     stage2_source = f"/proc/self/fd/{stage2_fd}"
     os.execve(

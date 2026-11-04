@@ -67,6 +67,10 @@ def _open_trusted_bwrap():
 
 def capture_namespace_lifetime(pid):
     """Bind an already-verified payload to its actual trusted bwrap PID1."""
+    from .observed_proc import native_scope_enabled
+    if native_scope_enabled():
+        from .native_lifetime import capture_namespace_lifetime as native_capture
+        return native_capture(pid)
     require(type(pid) is int and pid > 0, "ownership_namespace_pid")
     payload = _process_snapshot(pid)
     require(2 <= len(payload["ids"]) <= 32 and payload["ids"][-1] > 1,
@@ -106,6 +110,9 @@ def capture_namespace_lifetime(pid):
 
 
 def validate_namespace_lifetime(value):
+    if isinstance(value, dict) and value.get('version') == 3:
+        from .native_lifetime import validate_namespace_lifetime as native_validate
+        return native_validate(value)
     require(isinstance(value, dict) and type(value.get("version")) is int
             and value["version"] in (1, 2), "ownership_namespace_proof")
     keys = {"version", "pid", "start_ticks", "namespace"}
@@ -124,6 +131,9 @@ def validate_namespace_lifetime(value):
 
 
 def namespace_exited(value):
+    if isinstance(value, dict) and value.get('version') == 3:
+        from .native_lifetime import namespace_exited as native_exited
+        return native_exited(value)
     value = validate_namespace_lifetime(value)
     pid = value["init_pid"] if value["version"] == 2 else value["pid"]
     start_ticks = value["init_start_ticks"] if value["version"] == 2 else value["start_ticks"]
@@ -174,6 +184,12 @@ class HostOwnershipRelease:
             require(actual == identity and any(e.get("event") == "child_ownership_reserved"
                     and e.get("parent") == parent.to_json() and e.get("task_id") == rec.id
                     for e in events), "ownership_release_binding")
+            retired = [event for event in events if event.get("event") == "case_execution_retired"
+                       and event.get("identity", {}).get("task_id") == rec.id]
+            if retired:
+                require(len(retired) == 1, "ambiguous native case retirement")
+                from .canonical_case_recovery import require_root_release
+                require_root_release(self.root, parent, rec, retired[0])
             if rec.namespace_lifetime is not None:
                 # V2 keeps pid bound to the attested payload; only its separately
                 # captured trusted init determines whole-namespace retirement.

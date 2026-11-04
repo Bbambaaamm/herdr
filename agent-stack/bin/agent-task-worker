@@ -246,25 +246,9 @@ def _wait_for_task_agent(pane_id: str, agent_name: str, *, timeout_seconds: floa
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 
-def _task_session_identity(task: dict) -> tuple[str, str]:
-    run_token = str(task.get("run_token") or "")
-    if not run_token:
-        raise RuntimeError("task session requires run_token")
-    routing = task.get("routing") if isinstance(task.get("routing"), dict) else {}
-    coordinator = str(
-        routing.get("selected_agent") or task.get("agent") or "quantlab-hermes"
-    )
-    digest = hashlib.sha256(
-        f"{coordinator}:{task['id']}:{run_token}".encode("utf-8")
-    ).hexdigest()
-    # Herdr agent names are capped at 32 characters. Keep a readable,
-    # coordinator-derived prefix and bind uniqueness to the full coordinator,
-    # task id and run token through a 64-bit digest suffix.
-    prefix = coordinator[:13].rstrip("-_") or "task"
-    agent_name = f"{prefix}-t-{digest[:16]}"
-    if len(agent_name) > 32:
-        raise RuntimeError("task session agent name exceeds Herdr limit")
-    return agent_name, f"durable-{digest[:20]}"
+def _task_session_identity(task):
+    from herdr.canonical_case_claim import task_session_identity
+    return task_session_identity(task)
 
 
 def observe_task_execution(task: dict) -> str:
@@ -812,14 +796,8 @@ def _preflight_root_provider(profile):
 
 
 def _claimed_root_identity(task):
-    from herdr.security import InvocationIdentity
-    routing = task.get("routing") if isinstance(task.get("routing"), dict) else {}
-    coordinator = str(routing.get("selected_agent") or task.get("agent") or "quantlab-hermes")
-    agent, marker = _task_session_identity(task)
-    identity = InvocationIdentity(consumer="github:"+str(task["repo"]), agent_id=agent,
-        parent_agent_id=coordinator, parent_task_id="coordinator:"+coordinator,
-        task_id=str(task["id"]), run_token=str(task["run_token"]), fencing_token=task["fencing_token"])
-    return identity
+    from herdr.canonical_case_claim import claimed_root_identity
+    return claimed_root_identity(task)
 
 
 def _root_launch_identity(task):

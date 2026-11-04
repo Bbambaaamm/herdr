@@ -860,6 +860,20 @@ class DynamicChildScheduler:
             raise KeyError(task_id)
         return record.node
 
+    def record_for(self, task_id):
+        """Existing record; lookup creates no claim or authority."""
+        try: return self._tasks[task_id]
+        except KeyError: raise SchedulerError("canonical task record unavailable") from None
+
+    def children_of(self, task_id):
+        """Finite host orchestration/recovery lookup, no state transition."""
+        return tuple(rec for rec in self._tasks.values() if rec.parent_task_id == task_id)
+
+    def retire_fenced_case_execution(self, task_id, binding):
+        """Narrow nonsemantic retirement after original case fence/all-holder proof."""
+        from .canonical_case_recovery import retire_fenced_execution
+        return retire_fenced_execution(self, task_id, binding)
+
     def task_context(self, task_id: str) -> dict[str, str]:
         record = self._tasks.get(task_id)
         if record is None:
@@ -2488,6 +2502,9 @@ class DynamicChildScheduler:
                     rec.lease = None
                     self._claims.pop(task_id, None)
                     rec.attempts = int(e.get("attempts", 1))
+            elif event_type == "case_execution_retired":
+                from .canonical_case_recovery import apply_retirement
+                apply_retirement(self, e)
             elif event_type == "cancel":
                 task_id = str(e.get("task_id", ""))
                 rec = self._tasks.get(task_id)

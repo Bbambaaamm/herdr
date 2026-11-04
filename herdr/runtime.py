@@ -549,6 +549,11 @@ class AdmissionRegistry:
         fd = self._lock_fd()
         try:
             entries = self._read()
+            from .canonical_case_recovery import require_case_admission_release
+            for entry in entries:
+                if (entry["agent_id"] == agent_id and (task_id is None or
+                        (entry["task_id"], entry["fencing_token"]) == (task_id, fencing_token))):
+                    require_case_admission_release(entry)
             entries = [entry for entry in entries if not (
                 entry["agent_id"] == agent_id and
                 (task_id is None or

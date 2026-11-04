@@ -295,6 +295,10 @@ def _dispatch_work_connection(owner, connection):
         require(request.get("identity") == owner.launch.identity.to_json()
                 and request.get("grant_sha256") == owner.launch.grant.hash, "work authority binding invalid")
         authenticated_binding = (owner.launch.identity, owner.launch.grant.hash)
+        case_guard = getattr(owner, "case_live_guard", None)
+        if case_guard is not None:
+            require(callable(case_guard), "canonical case guard invalid")
+            case_guard()
         if request.get("op") == "work-sdk-observation":
             from .sdk_observation import validate_observation
             require(set(request) == {"op", "identity", "grant_sha256", "observation"},

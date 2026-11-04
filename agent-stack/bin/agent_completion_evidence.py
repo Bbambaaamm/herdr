@@ -753,12 +753,12 @@ def child_completion_for_root(task_file, identity, *, factory):
 def child_completion_for_replay(root, scheduler):
     """Restore the same frozen source ports; do not grant, dispatch or call a model."""
     from herdr.child_completion_policy import authority_for_parent, policy_key
-    from herdr.host_configuration import read_canonical_parent
+    from herdr.canonical_case_claim import read_replay_task
     parents=[rec for rec in scheduler._tasks.values() if rec.parent_task_id is None]
     if len(parents)!=1:
         return None
     parent=parents[0]
-    task=read_canonical_parent(root,parent.id,parent.run_token)
+    task=read_replay_task(root,parent.id,parent.run_token)
     if task is None:
         from herdr.child_completion_policy import policy_key
         existing=Path(root)/"verification"
