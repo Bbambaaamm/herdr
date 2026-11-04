@@ -42,7 +42,7 @@ class SourceRebase(unittest.TestCase):
     def test_canonical_manifest_is_an_explicit_pinned_overlay(self):
         name = "provenance/CANONICAL_SOURCE_MANIFEST.sha256"
         overlay = "overlays/" + name
-        expected = "507b03ebb27855a84cf5b9c4ea4a02e4e9b9e370755a8e19599747dd28800df5"
+        expected = "182e58758cbcf56e1f6f57ffd8dcfaf279aeb4157522da4ac8922e83b2f71c92"
         self.assertEqual(digest((reference_support.repo_root() / name).read_bytes()), expected)
         self.assertEqual(self.build["files"][overlay], expected)
         self.assertEqual(self.build["overlay_targets"]["composed-core/" + name], overlay)

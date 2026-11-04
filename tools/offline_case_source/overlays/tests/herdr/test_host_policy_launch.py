@@ -572,8 +572,11 @@ def test_actual_parent_child_seal_accepts_only_bound_delegated_result_inode(tmp_
         args=sandbox.command(workspace,cli,writable=(destination,),policy=policy,
             child_workspace_writable=root_writable,pinned_worktree=pin,policy_mount=item,owned_write_pins=pins)
         for forbidden in extra:
-            # Deliberately create an unexpected physical mount for rejection.
-            index=args.index("--")
+            # Preserve final HOME seals so the intended physical ownership
+            # check observes and rejects this unexpected writable mount.
+            index=args.index("--") - 4
+            assert args[index:index + 4] == ["--remount-ro", "/home",
+                                            "--remount-ro", "/home/agentops"]
             args[index:index]=["--bind",str(forbidden),str(forbidden)]
         proc=subprocess.Popen(args,stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,env=env)
         resources.append((proc,pin,item,pins))
