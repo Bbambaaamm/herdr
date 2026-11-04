@@ -25,7 +25,7 @@ class SourceRebase(unittest.TestCase):
 
     def test_closed_source_and_immutable_accepted_inputs(self):
         validate_build(self.build, reference_support.package_root(), baseline=reference_support.package_root() / "accepted-source")
-        self.assertEqual((len(self.build["files"]), len(self.build["core_files"])), (123, 476))
+        self.assertEqual((len(self.build["files"]), len(self.build["core_files"])), (124, 476))
         self.assertEqual(self.build["baseline_index_sha256"],
                          digest((ROOT / "accepted-source-index.json").read_bytes()))
 
@@ -42,7 +42,7 @@ class SourceRebase(unittest.TestCase):
     def test_canonical_manifest_is_an_explicit_pinned_overlay(self):
         name = "provenance/CANONICAL_SOURCE_MANIFEST.sha256"
         overlay = "overlays/" + name
-        expected = "d8506b7156f1e9d426ae091e49575a45aea395cb531ed48b8388fc9eeeaddcfb"
+        expected = "507b03ebb27855a84cf5b9c4ea4a02e4e9b9e370755a8e19599747dd28800df5"
         self.assertEqual(digest((reference_support.repo_root() / name).read_bytes()), expected)
         self.assertEqual(self.build["files"][overlay], expected)
         self.assertEqual(self.build["overlay_targets"]["composed-core/" + name], overlay)

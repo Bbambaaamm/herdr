@@ -170,7 +170,11 @@ def test_actual_bwrap_seals_same_inode_after_mount_and_denies_writes(tmp_path, m
     if shadow:
         unrelated=tmp_path/"unrelated-shadow.py"
         unrelated.write_text("unrelated = True")
-        index=args.index("--")
+        # Keep the required final HOME seals intact so this reaches the
+        # physical stacked-code attestation rather than an argv-order denial.
+        index=args.index("--") - 4
+        assert args[index:index + 4] == ["--remount-ro", "/home",
+                                        "--remount-ro", "/home/agentops"]
         args[index:index]=["--ro-bind",str(unrelated),str(CODE_TARGET/"module.py")]
     process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                stderr=subprocess.PIPE, env=env)

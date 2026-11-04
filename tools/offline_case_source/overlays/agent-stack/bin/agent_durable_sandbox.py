@@ -572,13 +572,25 @@ if private_home:
     # The pinned FD is the only source Bubblewrap may mount; pathname
     # swaps performed after this check cannot alter that inode's identity.
 else:
-    if str(home) in tmpfs_targets:
-        # A legacy admitted pane may mask HOME to construct its pinned
-        # runtime destinations beneath an otherwise read-only host root.
-        # Seal that private base after every child mount, too.
-        if (tmpfs_targets.count(str(home)) != 1
-            or args[arg_end - 2:arg_end] != ["--remount-ro", str(home)]):
+    if (str(home) in tmpfs_targets
+        or args[:4] == ["/usr/bin/bwrap", "--ro-bind", "/", "/"]):
+        # The host may have a different account home (e.g. /home/runner).
+        # Construct HOME beneath a private /home instead of trying to mkdir
+        # on the read-only host root. Never rebind the host home inventory.
+        # Seal both private bases after every child mount, nonrecursively.
+        if (args[:8] != ["/usr/bin/bwrap", "--ro-bind", "/", "/",
+                         "--tmpfs", str(home.parent), "--tmpfs", str(home)]
+            or tmpfs_targets.count(str(home.parent)) != 1
+            or tmpfs_targets.count(str(home)) != 1
+            or args[arg_end - 4:arg_end] != ["--remount-ro", str(home.parent),
+                                            "--remount-ro", str(home)]):
             raise SystemExit("policy_fd_runtime_home_not_readonly")
+        home_environment = [args[i + 1:i + 3] for i in range(arg_end - 2)
+                            if args[i] == "--setenv" and args[i + 1] == "HOME"]
+        if (home_environment != [["HOME", str(home)]]
+            or any(args[i:i + 2] == ["--unsetenv", "HOME"]
+                   for i in range(arg_end - 1))):
+            raise SystemExit("policy_fd_runtime_home_env_invalid")
     if any(item["kind"] == "sealed-resolver-data" for item in entries):
         raise SystemExit("policy_fd_resolver_without_private_home")
     if approved_files:
@@ -835,7 +847,10 @@ def command(
     args = [
         str(BWRAP),
         *(["--tmpfs", "/"] if private_profile_mounts else ["--ro-bind", "/", "/"]),
-        *(["--tmpfs", str(HOME)] if policy_mount is not None and not private_profile_mounts else []),
+        # /home exists on the host, but the fixed account home need not.
+        # A private parent permits destination creation and hides other homes.
+        *(["--tmpfs", str(HOME.parent), "--tmpfs", str(HOME)]
+          if policy_mount is not None and not private_profile_mounts else []),
         *((part for name in sorted(_system_runtime_files) for part in
            ("--ro-bind", name, name)) if private_profile_mounts else []),
         "--dev", "/dev",
@@ -936,12 +951,15 @@ def command(
         for name in sorted(set(STARTUP_CONTROLS)|{key for key in os.environ if key.startswith("LD_")}):
             args += ["--unsetenv",name]
         args += ["--setenv", "PATH", "/run/herdr/policy-code/agent-stack/policy-bin:/usr/bin:/bin"]
+        if not private_profile_mounts:
+            args += ["--setenv", "HOME", str(HOME)]
     args += [
         "--setenv", "HERDR_DURABLE_SANDBOX", "1",
         *(part for anchor in (private_anchors if private_profile_mounts else [])
           for part in ("--remount-ro", str(anchor))),
         *(private_profile_mounts[-2:] if private_profile_mounts else []),
-        *(["--remount-ro", str(HOME)] if policy_mount is not None and not private_profile_mounts else []),
+        *(["--remount-ro", str(HOME.parent), "--remount-ro", str(HOME)]
+          if policy_mount is not None and not private_profile_mounts else []),
         *(["--remount-ro", "/"] if private_profile_mounts else []),
         "--", "/bin/bash", "--noprofile", "--norc", "-i",
     ]
@@ -1323,6 +1341,22 @@ def inner_pid(process_info: dict, marker: str) -> int | None:
     return None
 
 
+def _runtime_home_mounts_verified(mounts: str) -> bool:
+    """Attest both generic HOME bases from uncollapsed kernel mount records."""
+    bases = {str(HOME.parent): [], str(HOME): []}
+    try:
+        for line in mounts.splitlines():
+            left, right = line.split(" - ", 1)
+            row = left.split()
+            if row[4] in bases:
+                bases[row[4]].append((set(row[5].split(",")), right.split()[0]))
+        return all(len(records) == 1 and "ro" in records[0][0]
+                   and "rw" not in records[0][0] and records[0][1] == "tmpfs"
+                   for records in bases.values())
+    except (ValueError, IndexError):
+        return False
+
+
 def _sdk_runtime_masks_verified(root: Path, modes: dict[str, set[str]],
                                 filesystems: dict[str, str]) -> bool:
     """A verified namespace must mask every *present* SDK write directory.
@@ -1477,6 +1511,9 @@ def verify(
                 and workspace_matches
                 and (policy_mount is None or _sdk_runtime_masks_verified(
                     root, modes, filesystems))
+                and (policy_mount is None or private_profile_snapshot is not None
+                     or (_runtime_home_mounts_verified(mounts)
+                         and f"HOME={HOME}".encode() in env))
                 and (private_profile_snapshot is None
                      or _private_profile_namespace_verified(
                          root, modes, filesystems, private_profile_snapshot))
