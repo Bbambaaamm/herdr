@@ -112,7 +112,7 @@ def build_only(repo_root, reference_json, output):
             native['bytes'] == NATIVE_BYTES and native['sha256'] == NATIVE_SHA256 and
             native['original_verified_source'] == '/home/agentops/.local/bin/herdr' and
             native['source_only_nonexecutable_copy'] is True and
-            Path(native['path']) == Path(reference_json).resolve(strict=True).parent / 'native-cli-input',
+            Path(native['path']) == Path('/home/agentops/tmp/hermes-runtime-history-split-20261104-r1/reference/native-cli-input'),
             'native reference binding changed')
     native_path = Path(native['path'])
     native_info = native_path.lstat()

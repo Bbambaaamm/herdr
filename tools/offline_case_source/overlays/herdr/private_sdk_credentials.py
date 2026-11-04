@@ -289,7 +289,7 @@ def _install_credentialless_reference(installation, policy, binding):
 def install_private_sdk_credentials(installation, policy):
     """Keep the SDK's credential selection and pool bookkeeping inside one view."""
     if policy.auth_sha256 is None:
-        binding = getattr(installation.guard, "_admitted_host_reference", None)
+        binding = getattr(getattr(installation, "guard", None), "_admitted_host_reference", None)
         if binding is not None:
             return _install_credentialless_reference(installation, policy, binding)
         return None  # Existing configuration-only / zero-provider profiles.

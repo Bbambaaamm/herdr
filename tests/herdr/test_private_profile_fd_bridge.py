@@ -30,8 +30,9 @@ def fixture_snapshot(tmp_path):
     profile = tmp_path / "approved"
     profile.mkdir()
     data = {
-        "config.yaml": b"approved: fixture\n",
-        ".env": b"DUMMY_TOKEN=non-secret-fixture\n",
+        "config.yaml": b'{"model":"fixture","api_key":null}\n',
+        ".env": b"",
+        "auth.json": b'{"fixture_token":"non-secret-fixture"}\n',
     }
     for name, contents in data.items():
         (profile / name).write_bytes(contents)
@@ -39,6 +40,24 @@ def fixture_snapshot(tmp_path):
     return profile, data, PrivateProfileSnapshot.from_approved(
         profile, name="quantlab", approved_sha256=digests,
     )
+
+
+def test_credential_snapshot_is_host_bound_and_never_projected(tmp_path):
+    from herdr.private_profile_namespace import PrivateProfileError
+    _, values, snapshot = fixture_snapshot(tmp_path)
+    with snapshot:
+        assert {row.relative for row in snapshot.sdk_files} == {"config.yaml", ".env"}
+        assert "auth.json" not in {row["target"].rsplit("/", 1)[-1]
+                                   for row in snapshot.fd_descriptors()}
+        assert values["auth.json"] not in json.dumps(snapshot.fd_descriptors()).encode()
+        auth = next(row for row in snapshot.files if row.relative == "auth.json")
+        original = snapshot.files
+        try:
+            snapshot.files = tuple(row for row in original if row is not auth)
+            with pytest.raises(PrivateProfileError, match="host_credential_snapshot_required"):
+                snapshot.fd_descriptors()
+        finally:
+            snapshot.files = original
 
 
 def command_for(sandbox, snapshot, *, descriptors=None, opts=None):

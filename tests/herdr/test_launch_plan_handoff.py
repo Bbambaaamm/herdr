@@ -88,7 +88,7 @@ def test_worker_waits_for_independent_plan_then_consumes_exact_live_fds(live):
     assert record["grant_sha256"] == live.launch.grant.hash
     assert record["approved_profile"] == live.profile.identity
     assert record["plan"] == live.launch.mount.private_mount_request
-    assert all(body not in raw for body in live.inputs.values())
+    assert all(body not in raw for body in live.inputs.values() if body)
     assert proposal.stat().st_mode & 0o777 == 0o400
     assert live.work.fd >= 0 and live.output.fd >= 0
 

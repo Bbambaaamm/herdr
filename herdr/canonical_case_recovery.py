@@ -10,12 +10,16 @@ from herdr.scheduler import SchedulerError
 
 def validate_retirement(scheduler, event, *, inspect_root=True):
     from herdr.child_evidence import child_identity
+    from herdr.ownership_release import required_namespace_kind, validate_recorded_namespace_lifetime
     keys = {"event", "identity", "idempotency_key", "binding", "closure_sha256", "reason"}
     if not (type(event) is dict and set(event) == keys and event["event"] == "case_execution_retired"
             and event["reason"] == "offline-case-fenced-and-observed-empty"):
         raise SchedulerError("closed case retirement event required")
     identity = InvocationIdentity.from_dict(event["identity"])
     rec = scheduler.record_for(identity.task_id)
+    if required_namespace_kind(scheduler, rec) != "native":
+        raise SchedulerError("native case retirement requires admitted child")
+    validate_recorded_namespace_lifetime(scheduler, rec, rec.namespace_lifetime)
     if not (child_identity(rec) == identity and rec.idempotency_key == event["idempotency_key"]
             and rec.delegation_key and rec.execution_sandbox_verified and rec.namespace_lifetime
             and rec.economic_delivery_attempted is True and rec.result_status is None
@@ -140,6 +144,11 @@ def require_case_admission_release(entry):
     finally: os.close(fd)
     scheduler = DynamicChildScheduler(audit_log=_InventoryAudit(events)); scheduler.replay()
     rec = scheduler.record_for(entry["task_id"])
+    from .ownership_release import required_namespace_kind, validate_recorded_namespace_lifetime
+    if required_namespace_kind(scheduler, rec) != "native":
+        raise SchedulerError("case admission release lacks admitted native child")
+    if rec.namespace_lifetime is not None:
+        validate_recorded_namespace_lifetime(scheduler, rec, rec.namespace_lifetime)
     if not (rec.agent_id == entry["agent_id"] and rec.fencing_token == entry["fencing_token"] and
             rec.attempt_state == "terminal" and rec.cleanup_complete and rec.lease is None):
         raise SchedulerError("case admission release lacks original terminal cleanup")

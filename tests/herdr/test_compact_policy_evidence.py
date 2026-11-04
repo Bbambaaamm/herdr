@@ -37,6 +37,7 @@ def emitted(tmp_path, monkeypatch):
         runtime=tuple(tree for tree in trees if tree is not code),
         private_mount_plan=plan, private_identity=identity)
     proof['approved_profile'] = profile
+    proof['worker_confinement_sha256'] = 'a' * 64
     proof['immutable_sources'] = launch.PolicyMount.immutable_source_evidence(mount)
     return SimpleNamespace(identity=identity, proof=proof, names=names, mount=mount)
 

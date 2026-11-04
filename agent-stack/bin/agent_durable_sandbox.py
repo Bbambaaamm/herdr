@@ -55,7 +55,7 @@ import os
 import re
 import stat
 import sys
-from herdr.observed_proc import Path
+from pathlib import Path
 
 if len(sys.argv) < 3 or len(sys.argv[1]) > 65536:
     raise SystemExit("policy_fd_launch_invalid")
@@ -75,6 +75,12 @@ if isinstance(entries, dict):
 if not isinstance(entries, list) or not 1 <= len(entries) <= 96:
     raise SystemExit("policy_fd_launch_invalid")
 if plan_envelope is not None and "transport" in plan_envelope:
+    # This source tree is selected by the approved launcher.  -I -S removes
+    # ambient imports, so admit only this exact sibling package directory.
+    package_root = Path(__HERDR_PACKAGE_ROOT__)
+    if not package_root.is_absolute() or package_root.name != 'herdr':
+        raise SystemExit('policy_fd_package_root_invalid')
+    sys.path.insert(0, str(package_root.parent))
     from herdr.native_fd_handoff import receive_descriptors
     received_fds = receive_descriptors(plan_envelope, args)
 mapping, targets, approved_files = {}, set(), set()
@@ -622,6 +628,8 @@ _POLICY_FD_LAUNCHER = _POLICY_FD_LAUNCHER.replace(
     "__HERDR_FIXED_INGRESS_FILTER_HEX__", _ingress_filter_bytes().hex())
 _POLICY_FD_LAUNCHER = _POLICY_FD_LAUNCHER.replace(
     "__HERDR_SYSTEM_RUNTIME_FILES__", repr(sorted(_system_runtime_files)))
+_POLICY_FD_LAUNCHER = _POLICY_FD_LAUNCHER.replace(
+    "__HERDR_PACKAGE_ROOT__", repr(str(Path(__file__).resolve().parents[2] / 'herdr')))
 
 @dataclass
 class PinnedWorktree:

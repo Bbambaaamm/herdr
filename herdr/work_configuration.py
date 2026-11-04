@@ -17,6 +17,7 @@ from .work_contract_host import HostWorkContractFactory
 from .work_cycle import FileScope, ValidationCheck, WorkPlan, WorkMode, require, tree_snapshot, relative, python_symbols
 from .policy_launch import _open_relative
 from .work_planning import DiscoveryRecord, PlanArtifact, bounded, closed, sha, strings
+from .taskgraph import _thaw_json
 
 
 def definition_target(spec_sha256, definition):
@@ -709,7 +710,10 @@ def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG
     require(task.get("work_budget_version") != 1 or factory.budget_authority is not None,
             "new coding work has no cumulative host budget")
     factory.host_admission = admitted
-    factory.host_task = copy.deepcopy(task)
+    # Canonical child tasks can contain recursively frozen graph fields.  The
+    # host stores a detached JSON value for replay; deepcopy cannot serialize
+    # MappingProxyType and must not mutate the graph's immutable originals.
+    factory.host_task = _thaw_json(task)
     factory.local_commit_policy = hygiene
     checks=tuple(ValidationCheck(**item) for item in definition["checks"])
     factory.baseline_wall_seconds=sum(check.timeout_seconds+13 for check in checks)+120

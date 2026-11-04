@@ -311,8 +311,13 @@ class _AuthenticatedKernelReply:
 
 
 def _requested_self_observation(proof_digest):
-    with BOOTSTRAP_PROOF.open("rb") as source:
-        raw = source.read(65537)
+    if not re.fullmatch(r"[0-9a-f]{64}", proof_digest):
+        raise SystemExit("bootstrap authority requires verified stage-one proof")
+    try:
+        with BOOTSTRAP_PROOF.open("rb") as source:
+            raw = source.read(65537)
+    except OSError as exc:
+        raise SystemExit("bootstrap authority proof unavailable") from exc
     if len(raw) > 65536 or hashlib.sha256(raw).hexdigest() != proof_digest:
         raise SystemExit("immutable bootstrap proof changed")
     try:

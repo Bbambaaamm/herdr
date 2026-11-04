@@ -11,9 +11,9 @@ import sys
 
 import pytest
 
-from herdr import security, work_authority, work_contract_host
+from herdr import security, work_authority, work_contract_host, policy_launch
 from tests.herdr.test_policy_bootstrap import _launcher, LAUNCHER
-from tests.herdr.test_security import grant as grant_fixture
+from tests.herdr.test_security import grant as grant_fixture, route
 
 
 def wiring(monkeypatch, tmp_path, *, private=True, outcome=None, fault=None):
@@ -33,28 +33,43 @@ def wiring(monkeypatch, tmp_path, *, private=True, outcome=None, fault=None):
     monkeypatch.setattr(module, "_verify_hermes_build", lambda root: module.HERMES_EXECUTOR)
     monkeypatch.setattr(module, "_reset_import_path", lambda *args: None)
     monkeypatch.setattr(module, "_configure_ephemeral_sdk_state", lambda root: events.append("sdk-state"))
-    policy = SimpleNamespace(display={"cli_multiline_shortcuts": False}) if private else None
+    policy = SimpleNamespace(display={"cli_multiline_shortcuts": False},
+                             profile_sha256="a" * 64, projection_sha256="b" * 64) if private else None
     failure = RuntimeError("unit-only boundary failure")
     def verify_policy(got, args):
-        assert got is proof and args == ["chat", "--profile", "approved"]
+        assert got is proof and args == ["--profile", "approved", "chat"]
         events.append("verified-policy")
         if fault == "verification": raise failure
         return policy
     monkeypatch.setattr(module, "_verified_private_sdk_policy", verify_policy)
     grant = grant_fixture(tmp_path)
     grant = replace(grant, scope=replace(grant.scope, executors=(module.HERMES_EXECUTOR,)))
+    if private:
+        credential_ref = "pool:nous:fixture"
+        selected = replace(route("nous"), credential_refs=(credential_ref,))
+        grant = replace(grant, scope=replace(grant.scope, providers=("nous",)),
+                        provider_routes=(selected,), credential_refs=(credential_ref,))
+        reference = dict(grant_hash=grant.hash, profile_sha256=policy.profile_sha256,
+                         projection_sha256=policy.projection_sha256,
+                         workspace=grant.workspace_root, fence=str(grant.identity.fencing_token),
+                         lineage=grant.identity.parent_task_id, endpoint=selected.base_url,
+                         api_mode=selected.api_mode, credential_ref=credential_ref)
+        monkeypatch.setattr(module, "_verified_bootstrap_reference",
+                            lambda authenticated, proof, approved, observation, launch: reference)
     for name, env_name in module.IDENTITY_ENV.items():
         monkeypatch.setenv(env_name, str(getattr(grant.identity, name)))
     monkeypatch.setattr(security, "load_policy_bundle",
                         lambda root, identity: grant if identity == grant.identity else pytest.fail("identity drift"))
     installed = []
+    cli_bindings = []
     guard_module = ModuleType("herdr.hermes_guard")
     guard_module.__file__ = str(policy_root / "herdr/hermes_guard.py")
     def install_guard(guard, **kwargs):
         assert type(guard) is work_contract_host.WorkInvocationGuard
         assert type(guard.work_authority) is work_authority.WorkAuthorityClient
         assert guard.grant is grant
-        assert kwargs == ({"private_sdk_policy": policy} if private else {})
+        assert kwargs == ({"private_sdk_policy": policy,
+                           "cli_invocation_binding": cli_bindings[0]} if private else {})
         events.append("guard-installed")
         if fault == "guard": raise failure
         installed.append(guard)
@@ -73,13 +88,38 @@ def wiring(monkeypatch, tmp_path, *, private=True, outcome=None, fault=None):
     original_init = cli_type.__init__
     transport_module = ModuleType("herdr.hermes_terminal_transport")
     transport_module.__file__ = str(policy_root / "herdr/hermes_terminal_transport.py")
+    observation_module = ModuleType("herdr.credential_isolation")
+    observation_module.__file__ = str(policy_root / "herdr/credential_isolation.py")
+    reference_module = ModuleType("agent.host_reference")
+    reference_path = hermes / "agent/host_reference.py"
+    reference_path.parent.mkdir()
+    reference_path.write_text("")
+    reference_module.__file__ = str(reference_path)
+    reference_module.HostReferenceDenied = type("HostReferenceDenied", (ValueError,), {})
+    reference_module.HostCredentialReference = lambda **fields: SimpleNamespace(**fields)
+    binding_module = ModuleType("herdr.hermes_cli_identity")
+    binding_module.__file__ = str(policy_root / "herdr/hermes_cli_identity.py")
+    class CLIInvocationBinding:
+        def __init__(self, bound_guard):
+            assert bound_guard.grant is grant
+            cli_bindings.append(self)
+        @contextmanager
+        def factory(self, cli, agent, *, host_reference):
+            assert cli is cli_type and host_reference.credential_ref == credential_ref
+            yield
+    binding_module.CLIInvocationBinding = CLIInvocationBinding
+    agent_module = ModuleType("run_agent")
+    agent_path = hermes / "run_agent.py"
+    agent_path.write_text("")
+    agent_module.__file__ = str(agent_path)
+    agent_module.AIAgent = type("AIAgent", (), {})
     active = []
     @contextmanager
     def factory(got_cli, guard, *, private_sdk_policy):
         assert got_cli is cli_type and guard is installed[0] and private_sdk_policy is policy
         assert policy.display["cli_multiline_shortcuts"] is False
         assert events.index("guard-installed") < events.index("transport-import")
-        assert sys.argv == [str(hermes / "hermes"), "chat", "--profile", "approved"]
+        assert sys.argv == [str(hermes / "hermes"), "--profile", "approved", "chat"]
         events.append("transport-enter")
         if fault == "factory": raise failure
         def scoped(instance, *args, **kwargs):
@@ -114,7 +154,10 @@ def wiring(monkeypatch, tmp_path, *, private=True, outcome=None, fault=None):
     modules = {"herdr.security": security, "herdr.hermes_guard": guard_module,
                "herdr.work_contract_host": work_contract_host,
                "herdr.work_authority": work_authority, "hermes_cli.main": main_module,
-               "herdr.hermes_terminal_transport": transport_module, "cli": cli_module}
+               "herdr.hermes_terminal_transport": transport_module, "cli": cli_module,
+               "herdr.credential_isolation": observation_module,
+               "herdr.policy_launch": policy_launch, "agent.host_reference": reference_module,
+               "herdr.hermes_cli_identity": binding_module, "run_agent": agent_module}
     def import_module(name):
         imports.append(name)
         if name in ("cli", "herdr.hermes_terminal_transport"):
@@ -135,7 +178,7 @@ def wiring(monkeypatch, tmp_path, *, private=True, outcome=None, fault=None):
 def test_private_bootstrap_scopes_factory_around_actual_main(monkeypatch, tmp_path, outcome, expected):
     case = wiring(monkeypatch, tmp_path, outcome=outcome)
     monkeypatch.setattr(sys, "argv", ["unit-bootstrap"])
-    assert case.module.bootstrap(["chat", "--profile", "approved"]) == expected
+    assert case.module.bootstrap(["--profile", "approved", "chat"]) == expected
     assert case.events.index("guard-installed") < case.events.index("transport-enter") < case.events.index("main")
     assert case.events[-2:] == ["transport-restored", "label-restored"]
     assert len(case.created) == 1 and case.active == []
@@ -147,7 +190,7 @@ def test_exception_restores_factory_and_preserves_original(monkeypatch, tmp_path
     case = wiring(monkeypatch, tmp_path, outcome=original)
     monkeypatch.setattr(sys, "argv", ["unit-bootstrap"])
     with pytest.raises(ValueError) as caught:
-        case.module.bootstrap(["chat", "--profile", "approved"])
+        case.module.bootstrap(["--profile", "approved", "chat"])
     assert caught.value is original
     assert case.events[-2:] == ["transport-restored", "label-restored"]
     assert case.active == [] and case.cli_type.__init__ is case.original_init
@@ -156,7 +199,7 @@ def test_exception_restores_factory_and_preserves_original(monkeypatch, tmp_path
 def test_legacy_bootstrap_does_not_import_or_enter_transport(monkeypatch, tmp_path):
     case = wiring(monkeypatch, tmp_path, private=False)
     monkeypatch.setattr(sys, "argv", ["unit-bootstrap"])
-    assert case.module.bootstrap(["chat", "--profile", "approved"]) == 0
+    assert case.module.bootstrap(["--profile", "approved", "chat"]) == 0
     assert "cli" not in case.imports and "herdr.hermes_terminal_transport" not in case.imports
     assert "transport-enter" not in case.events and not case.created
     assert case.cli_type.__init__ is case.original_init
@@ -167,7 +210,7 @@ def test_predelivery_failure_never_enters_main(monkeypatch, tmp_path, fault):
     case = wiring(monkeypatch, tmp_path, fault=fault)
     monkeypatch.setattr(sys, "argv", ["unit-bootstrap"])
     with pytest.raises(RuntimeError) as caught:
-        case.module.bootstrap(["chat", "--profile", "approved"])
+        case.module.bootstrap(["--profile", "approved", "chat"])
     assert caught.value is case.failure
     assert "main" not in case.events and not case.created and case.active == []
     assert case.cli_type.__init__ is case.original_init
@@ -183,7 +226,7 @@ def test_untrusted_module_origin_denied_before_context_or_main(monkeypatch, tmp_
     case = wiring(monkeypatch, tmp_path, fault=fault)
     monkeypatch.setattr(sys, "argv", ["unit-bootstrap"])
     with pytest.raises(SystemExit, match=label):
-        case.module.bootstrap(["chat", "--profile", "approved"])
+        case.module.bootstrap(["--profile", "approved", "chat"])
     assert "transport-enter" not in case.events and "main" not in case.events
     assert not case.created and case.cli_type.__init__ is case.original_init
 

@@ -1121,9 +1121,9 @@ class DynamicChildScheduler:
                 rec.parent_task_id,rec.id,rec.run_token,rec.fencing_token))
 
     def record_namespace_lifetime(self,task_id,proof):
-        from .ownership_release import validate_namespace_lifetime
+        from .ownership_release import validate_recorded_namespace_lifetime
         rec=self._tasks[task_id]
-        proof=validate_namespace_lifetime(proof)
+        proof=validate_recorded_namespace_lifetime(self,rec,proof)
         if rec.state is not LifecycleState.RUNNING or not rec.execution_pane:
             raise SchedulerError("namespace lifetime requires bound running child")
         if rec.namespace_lifetime is not None:
@@ -2672,13 +2672,13 @@ class DynamicChildScheduler:
                 rec.execution_sandbox_verified = True
                 rec.execution_sandbox_attestation = json.loads(json.dumps(attestation))
             elif event_type == "child_namespace_lifetime":
-                from .ownership_release import validate_namespace_lifetime
+                from .ownership_release import validate_recorded_namespace_lifetime
                 rec=self._tasks.get(e.get("task_id"))
                 if (rec is None or rec.state is not LifecycleState.RUNNING
                         or (rec.run_token,rec.fencing_token,rec.idempotency_key)!=
                            (e.get("run_token"),e.get("fencing_token"),e.get("idempotency_key"))):
                     raise SchedulerError("namespace lifetime replay binding")
-                proof=validate_namespace_lifetime(e.get("proof"))
+                proof=validate_recorded_namespace_lifetime(self,rec,e.get("proof"))
                 if rec.namespace_lifetime is not None and rec.namespace_lifetime!=proof:
                     raise SchedulerError("namespace lifetime replay changed")
                 rec.namespace_lifetime=proof
