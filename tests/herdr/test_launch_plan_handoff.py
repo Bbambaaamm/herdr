@@ -17,7 +17,7 @@ from herdr.private_mount_plan import PinnedLaunchPath, request_for
 from herdr.result_submission import reserve_empty_result, reservation_binding, ResultSlot
 from herdr.security import SecurityError, canonical_json_bytes
 from tests.herdr.test_policy_launch import grant
-from tests.herdr.test_private_profile_fd_bridge import fixture_snapshot
+from tests.herdr.test_private_profile_fd_bridge import fixture_snapshot, fixture_mount_arguments
 from tests.herdr.test_private_host_composition import private_config
 
 
@@ -55,7 +55,7 @@ def live(tmp_path, monkeypatch):
         calls.append("build")
         descriptors = [work.descriptor(), output.descriptor(), *profile.fd_descriptors()]
         argv = ["/usr/bin/bwrap", "--unshare-net", "--bind-fd", str(work.fd), str(work.logical),
-                "--bind-fd", str(output.fd), str(output.logical), *profile.mount_arguments(),
+                "--bind-fd", str(output.fd), str(output.logical), *fixture_mount_arguments(profile),
                 "--", "/bin/bash", "--noprofile", "--norc", "-i"]
         if state["fault"] is not None: state["fault"](descriptors, argv)
         mount.private_mount_request = request_for(launch.identity, descriptors, argv)

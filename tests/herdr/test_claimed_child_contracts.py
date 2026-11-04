@@ -690,7 +690,11 @@ def test_original_child_context_rechecks_claim_and_owned_pins_at_seal(prepared, 
         elif fault == 'fence': rec.fencing_token += 1
         elif fault == 'expired': rec.lease = replace(rec.lease, lease_until=0)
         elif fault == 'ownership': rec.ownership = replace(own, handoff_ref='foreign')
-        elif fault == 'admission': fresh['spec_sha256'] = '0'*64
+        elif fault == 'admission':
+            # The binder snapshots the reader's value. Change the value the
+            # next admission read returns, rather than the detached input.
+            monkeypatch.setattr(configuration, '_original_work_admission',
+                                lambda *a: (state, {**fresh, 'spec_sha256': '0'*64}))
         elif fault == 'parent': verified[0] = replace(pg, grant_id='foreign')
         elif fault == 'inode':
             (p.child/'result.py').rename(p.child/'old-result.py'); (p.child/'result.py').write_text('replacement')

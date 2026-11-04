@@ -134,6 +134,32 @@ def test_fd_launcher_rejects_ambiguous_or_changed_mounts(tmp_path, mutation):
     finally:
         cleanup(item)
 
+
+def test_generic_policy_mount_prepares_readonly_home_before_runtime_targets(tmp_path, monkeypatch):
+    """The admitted generic pane can construct pinned HOME targets under a RO root."""
+    sandbox = sandbox_module()
+    for name in ("bwrap", "policy", "herdr"):
+        (tmp_path / name).write_text("fixture")
+    for name in ("config", "releases", "workspace"):
+        (tmp_path / name).mkdir()
+    monkeypatch.setattr(sandbox, "BWRAP", tmp_path / "bwrap")
+    monkeypatch.setattr(sandbox, "HERDR_CONFIG", tmp_path / "config")
+    monkeypatch.setattr(sandbox, "HERDR_RELEASES", tmp_path / "releases")
+    monkeypatch.setattr(sandbox, "DEFAULT_WRITABLE", ())
+    item = mount(tmp_path)
+    try:
+        command = sandbox.command(tmp_path / "workspace", tmp_path / "herdr",
+                                  writable=(), policy=tmp_path / "policy", policy_mount=item)
+        args = command[command.index(str(tmp_path / "bwrap")):]
+        home = [i for i in range(len(args) - 1)
+                if args[i:i + 2] == ["--tmpfs", "/home/agentops"]]
+        runtime = [args.index(str(target)) for target in RUNTIME_TARGETS]
+        assert len(home) == 1 and home[0] < min(runtime)
+        assert args[args.index("--") - 2:args.index("--")] == [
+            "--remount-ro", "/home/agentops"]
+    finally:
+        cleanup(item)
+
 @pytest.mark.parametrize("shadow",[False,True])
 def test_actual_bwrap_seals_same_inode_after_mount_and_denies_writes(tmp_path, monkeypatch,shadow):
     sandbox = sandbox_module()
