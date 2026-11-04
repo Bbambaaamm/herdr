@@ -148,12 +148,17 @@ class CLIInvocationBinding:
             self._owners.clear()
 
     @contextmanager
-    def factory(self, cli_type, agent_type):
+    def factory(self, cli_type, agent_type, *, host_reference=None):
         """Caller independently verifies both classes' immutable module origins."""
         _need(isinstance(cli_type, type) and cli_type.__name__ == "HermesCLI"
               and cli_type.__module__ == "cli" and isinstance(agent_type, type)
               and agent_type.__name__ == "AIAgent" and agent_type.__module__ == "run_agent",
               "cli_binding_canonical_types_required")
+        if host_reference is not None:
+            from agent.host_reference import HostCredentialReference
+            _need(type(host_reference) is HostCredentialReference
+                  and host_reference is getattr(self.guard, "_admitted_host_reference", None),
+                  "cli_binding_host_reference_not_admitted")
         original_init = cli_type.__init__
         original_run = agent_type.run_conversation
         previous_init = vars(cli_type).get("__init__", _MISSING)
@@ -177,8 +182,15 @@ class CLIInvocationBinding:
                 initialized = True
                 try:
                     self._check_grant()
+                    if host_reference is not None:
+                        _need(not hasattr(cli, "_host_reference"),
+                              "cli_binding_reference_preselected")
+                        cli._host_reference = host_reference
                     result = original_init(cli, *args, **kwargs)
                     _need(result is None, "cli_binding_constructor_invalid")
+                    if host_reference is not None:
+                        _need(getattr(cli, "_host_reference", None) is host_reference,
+                              "cli_binding_reference_changed")
                     self._register(cli)
                     return result
                 finally:

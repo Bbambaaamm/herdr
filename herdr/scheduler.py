@@ -860,6 +860,20 @@ class DynamicChildScheduler:
             raise KeyError(task_id)
         return record.node
 
+    def record_for(self, task_id):
+        """Existing record; lookup creates no claim or authority."""
+        try: return self._tasks[task_id]
+        except KeyError: raise SchedulerError("canonical task record unavailable") from None
+
+    def children_of(self, task_id):
+        """Finite host orchestration/recovery lookup, no state transition."""
+        return tuple(rec for rec in self._tasks.values() if rec.parent_task_id == task_id)
+
+    def retire_fenced_case_execution(self, task_id, binding):
+        """Narrow nonsemantic retirement after original case fence/all-holder proof."""
+        from .canonical_case_recovery import retire_fenced_execution
+        return retire_fenced_execution(self, task_id, binding)
+
     def task_context(self, task_id: str) -> dict[str, str]:
         record = self._tasks.get(task_id)
         if record is None:
@@ -1107,9 +1121,9 @@ class DynamicChildScheduler:
                 rec.parent_task_id,rec.id,rec.run_token,rec.fencing_token))
 
     def record_namespace_lifetime(self,task_id,proof):
-        from .ownership_release import validate_namespace_lifetime
+        from .ownership_release import validate_recorded_namespace_lifetime
         rec=self._tasks[task_id]
-        proof=validate_namespace_lifetime(proof)
+        proof=validate_recorded_namespace_lifetime(self,rec,proof)
         if rec.state is not LifecycleState.RUNNING or not rec.execution_pane:
             raise SchedulerError("namespace lifetime requires bound running child")
         if rec.namespace_lifetime is not None:
@@ -2488,6 +2502,9 @@ class DynamicChildScheduler:
                     rec.lease = None
                     self._claims.pop(task_id, None)
                     rec.attempts = int(e.get("attempts", 1))
+            elif event_type == "case_execution_retired":
+                from .canonical_case_recovery import apply_retirement
+                apply_retirement(self, e)
             elif event_type == "cancel":
                 task_id = str(e.get("task_id", ""))
                 rec = self._tasks.get(task_id)
@@ -2655,13 +2672,13 @@ class DynamicChildScheduler:
                 rec.execution_sandbox_verified = True
                 rec.execution_sandbox_attestation = json.loads(json.dumps(attestation))
             elif event_type == "child_namespace_lifetime":
-                from .ownership_release import validate_namespace_lifetime
+                from .ownership_release import validate_recorded_namespace_lifetime
                 rec=self._tasks.get(e.get("task_id"))
                 if (rec is None or rec.state is not LifecycleState.RUNNING
                         or (rec.run_token,rec.fencing_token,rec.idempotency_key)!=
                            (e.get("run_token"),e.get("fencing_token"),e.get("idempotency_key"))):
                     raise SchedulerError("namespace lifetime replay binding")
-                proof=validate_namespace_lifetime(e.get("proof"))
+                proof=validate_recorded_namespace_lifetime(self,rec,e.get("proof"))
                 if rec.namespace_lifetime is not None and rec.namespace_lifetime!=proof:
                     raise SchedulerError("namespace lifetime replay changed")
                 rec.namespace_lifetime=proof

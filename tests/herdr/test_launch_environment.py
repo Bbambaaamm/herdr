@@ -56,7 +56,8 @@ def test_unreadable_spawn_source_denies_before_creation():
 def test_poisoned_spawn_parent_is_denied(monkeypatch):
     import pytest
     import herdr.launch_environment as module
-    from pathlib import Path
+    from herdr import observed_proc
+    Path = observed_proc.Path
     def status(pid,parent):
         values=["S",str(parent)]+["0"]*18
         values[19]="1234"

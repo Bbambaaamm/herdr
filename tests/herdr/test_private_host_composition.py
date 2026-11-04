@@ -38,6 +38,19 @@ def private_config(tmp_path,monkeypatch):
             "valid_until":(datetime.now(UTC)+timedelta(hours=2)).isoformat(),
             "minimum_ttl_seconds":1860}}
     monkeypatch.setattr(config,"_read_configuration",lambda path:deepcopy(raw))
+    # Portable composition tests provide the same closed worker-policy fields
+    # that the real host reads from its protected approval and kernel profile.
+    from herdr import credential_isolation
+    from herdr.credential_ingress_filter import filter_bytes
+    monkeypatch.setattr(credential_isolation,"_approved_confinement",
+                        lambda: {"schema_version": "herdr-worker-confinement-1",
+                                 "profile": credential_isolation.WORKER_PROFILE,
+                                 "source_sha256": credential_isolation.WORKER_PROFILE_SOURCE_SHA256,
+                                 "loaded_sha256": "a" * 64,
+                                 "filter_sha256": hashlib.sha256(filter_bytes()).hexdigest(),
+                                 "system_files": dict.fromkeys(credential_isolation.SYSTEM_RUNTIME_FILES,
+                                                               "0" * 64)})
+    monkeypatch.setattr(credential_isolation,"_loaded_profile_sha256",lambda: "a" * 64)
     return raw,workspace,parent,approved
 
 

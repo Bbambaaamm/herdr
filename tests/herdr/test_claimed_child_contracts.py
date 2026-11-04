@@ -303,7 +303,21 @@ def test_producer_persist_original_authority_child_factory_and_cold_replay(prepa
                 git=trusted_git(p.child),recovery=consumer_fault=="old-wrong-child-admission")
         assert events.count("budget-binding-port-double")==before_budget
         return
+    child_task_data["execution_session"]["sandbox_attestation"]["inert_nested"] = [
+        {"measurements": ["original"]}]
     child_factory=configuration.build_root_work_factory(task_root,child_task_data,spec_sha256=child_spec(rec),git=trusted_git(p.child))
+    original_attestation = child_task_data["execution_session"]["sandbox_attestation"]["inert_nested"]
+    host_attestation = child_factory.host_task["execution_session"]["sandbox_attestation"]["inert_nested"]
+    assert host_attestation == original_attestation and host_attestation is not original_attestation
+    assert host_attestation[0] is not original_attestation[0]
+    assert host_attestation[0]["measurements"] is not original_attestation[0]["measurements"]
+    host_attestation[0]["measurements"][0] = "changed-only-in-host"
+    assert original_attestation == [{"measurements": ["original"]}]
+    detached=deepcopy(child_factory.host_task)
+    json.dumps(detached,sort_keys=True)
+    detached["model_policy"]["model"]="changed-only-in-copy"
+    assert rec.node.model_policy["model"]=="fixture-model"
+    assert child_factory.host_task["model_policy"]["model"]=="fixture-model"
     assert child_factory.host_admission["definition"]==expected
     assert child_factory.host_admission["derived_parent_admission_sha256"]==digest(persisted)
     assert child_factory.budget_definition==expected["budget"]
@@ -676,7 +690,11 @@ def test_original_child_context_rechecks_claim_and_owned_pins_at_seal(prepared, 
         elif fault == 'fence': rec.fencing_token += 1
         elif fault == 'expired': rec.lease = replace(rec.lease, lease_until=0)
         elif fault == 'ownership': rec.ownership = replace(own, handoff_ref='foreign')
-        elif fault == 'admission': fresh['spec_sha256'] = '0'*64
+        elif fault == 'admission':
+            # The binder snapshots the reader's value. Change the value the
+            # next admission read returns, rather than the detached input.
+            monkeypatch.setattr(configuration, '_original_work_admission',
+                                lambda *a: (state, {**fresh, 'spec_sha256': '0'*64}))
         elif fault == 'parent': verified[0] = replace(pg, grant_id='foreign')
         elif fault == 'inode':
             (p.child/'result.py').rename(p.child/'old-result.py'); (p.child/'result.py').write_text('replacement')

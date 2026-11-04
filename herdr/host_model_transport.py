@@ -5,6 +5,7 @@ intent binds the exact already-started operation to its immutable request.
 """
 from pathlib import Path
 import ctypes
+import fcntl
 import socket
 import struct
 import secrets
@@ -297,6 +298,208 @@ def _record_receipt(cycle, grant, operation, answer):
         cycle._record("model_transport_receipt", **values)
 
 
+_OFFLINE_NONCE = "03414499dd0d1986968b2393d44275d0"
+_OFFLINE_HOST_LABEL = "herdr-offline-controller-03414499dd0d1986 (enforce)"
+_FIXTURE_MODEL = "meituan/longcat-2.0:free"
+_FIXTURE_EDIT = "def add(left, right):\n    return left + right\n"
+
+
+def _case_host():
+    fd = os.open("/proc/self/attr/current", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        label = os.read(fd, 256).strip().decode("ascii", "strict")
+    finally:
+        os.close(fd)
+    return label == _OFFLINE_HOST_LABEL
+
+
+def _case_unit():
+    fd = os.open("/proc/self/cgroup", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        groups = os.read(fd, 8192).decode("ascii", "strict").splitlines()
+    finally:
+        os.close(fd)
+    return groups == ["0::/system.slice/herdr-offline-host-03414499dd0d1986.service"]
+
+
+def _fixture_binding(factory, identity, grant, payload):
+    """Use the existing root-approved selector and original work admission."""
+    from .host_configuration import _read_configuration
+    selector = _read_configuration(Path("/etc/herdr/offline-case-host.json"))
+    require(selector.get("nonce") == _OFFLINE_NONCE and
+            selector.get("host_label") + " (enforce)" == _OFFLINE_HOST_LABEL and
+            grant.identity == identity and identity.consumer == "github:Bbambaaamm/herdr" and
+            payload.get("model") == _FIXTURE_MODEL,
+            "foreign offline fixture binding")
+    task = factory.host_task
+    require(type(task) is dict and task.get("id") == identity.task_id and
+            task.get("run_token") == identity.run_token and
+            task.get("fencing_token") == identity.fencing_token,
+            "offline fixture task differs from original work")
+    if identity.task_id == selector["task_id"]:
+        require(identity.task_id.endswith(_OFFLINE_NONCE),
+                "offline root task is outside the fixed case")
+        require(identity.run_token == selector["run_token"] and
+                identity.fencing_token == selector["fencing_token"],
+                "offline root selector changed")
+        role = "root"
+    else:
+        require(selector["task_id"].endswith(_OFFLINE_NONCE) and
+                identity.parent_task_id == selector["task_id"] and
+                identity.parent_agent_id == task.get("parent_agent_id") and
+                task.get("derived_parent_admission_sha256"),
+                "offline child lacks original parent admission")
+        role = "child"
+    admitted = factory.host_admission
+    definition = admitted.get("definition") if type(admitted) is dict else None
+    require(type(definition) is dict and
+            definition.get("spec_version") == "offline-arithmetic-1" and
+            definition.get("policy_version") == "offline-clean-1" and
+            definition.get("criteria") == ["arithmetic"] and
+            definition.get("discovery_files") == ["arithmetic.py", "check_arithmetic.py"] and
+            definition.get("files") == [{"path": "arithmetic.py", "subtree": False,
+                                         "symbols": []}],
+            "offline arithmetic work definition changed")
+    return role, definition
+
+
+def _fixture_response(payload, role, definition, ordinal, workspace):
+    """Fixed transport data; SDK tools and host semantic checks still decide work."""
+    require(type(payload.get("tools")) is list and
+            type(workspace) is str and workspace.startswith("/") and
+            ".." not in Path(workspace).parts, "offline fixture tool or workspace changed")
+    names = {row.get("function", {}).get("name") for row in payload["tools"]
+             if type(row) is dict and row.get("type") == "function" and
+             type(row.get("function")) is dict}
+    require({"read_file", "write_file", "herdr_verify_work", "herdr_submit_result"} <= names and
+            ("herdr_delegate_child" in names) == (role == "root"),
+            "offline fixture SDK tool guard changed")
+    calls = []
+    if role == "root" and ordinal == 1:
+        children = definition.get("managed_children", {}).get("children")
+        require(type(children) is list and len(children) == 1,
+                "one original managed child template required")
+        child = children[0]
+        require(child.get("key") == "arithmetic-child" and
+                child.get("worktree_identity", "").count("|") == 1,
+                "original child template changed")
+        child_workspace = child["worktree_identity"].rsplit("|", 1)[0]
+        require(Path(child_workspace).is_relative_to(Path(workspace)) and
+                child_workspace != workspace, "child workspace outside original parent")
+        calls = [("herdr_delegate_child", {"key": child["key"],
+                  "objective": child["objective"], "role": child["role"],
+                  "ownership": child["ownership"],
+                  "prompt": "Repair add in arithmetic.py only; verify the frozen check and submit local result.",
+                  "tool": child["tools"], "permission": child["permissions"],
+                  "cwd": child_workspace, "model": _FIXTURE_MODEL,
+                  "fallback_model": None})]
+    else:
+        step = ordinal - (1 if role == "root" else 0)
+        if step == 1:
+            calls = [("read_file", {"path": workspace.rstrip("/") + "/" + name,
+                                    "offset": 1, "limit": 2000})
+                     for name in ("arithmetic.py", "check_arithmetic.py")]
+        elif step == 2:
+            calls = [("write_file", {"path": workspace.rstrip("/") + "/arithmetic.py",
+                                     "content": _FIXTURE_EDIT})]
+        elif step == 3:
+            calls = [("herdr_verify_work", {"request_id": "offline_validation_once",
+                                            "handoff": {"pr_number": None}})]
+        elif step == 4:
+            submissions = []
+            def collect(value):
+                if type(value) is dict:
+                    if "submission" in value:
+                        require(value.get("status") == "pass" and
+                                type(value["submission"]) is dict,
+                                "actual host verification did not pass")
+                        submissions.append(value["submission"])
+                    else:
+                        for child in value.values():
+                            collect(child)
+                elif type(value) is list:
+                    for child in value:
+                        collect(child)
+            for message in payload.get("messages", []):
+                if type(message) is dict and message.get("role") == "tool":
+                    try:
+                        collect(json.loads(message.get("content")))
+                    except (TypeError, ValueError):
+                        continue
+            require(len(submissions) == 1, "actual host verification receipt required")
+            calls = [("herdr_submit_result", submissions[0])]
+        else:
+            require(step == 5, "offline fixture turn bound exceeded")
+    message = {"role": "assistant", "content": None if calls else
+               "OFFLINE FIXTURE: exact local handoff submitted."}
+    if calls:
+        message["tool_calls"] = [{"id": "offline_%s_%d_%d" % (role, ordinal, index),
+            "type": "function", "function": {"name": name,
+            "arguments": json.dumps(arguments, sort_keys=True, separators=(",", ":"))}}
+            for index, (name, arguments) in enumerate(calls)]
+    return {"kind": "http_response", "http_status": 200,
+            "body": {"id": "offline-%s-%d" % (role, ordinal),
+            "object": "chat.completion", "created": 1, "model": _FIXTURE_MODEL,
+            "choices": [{"index": 0, "message": message,
+                         "finish_reason": "tool_calls" if calls else "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}}
+
+
+def _perform_fixture(factory, identity, grant, payload, operation_id):
+    role, definition = _fixture_binding(factory, identity, grant, payload)
+    from .host_configuration import HOST_POLICY_CONFIG, _read_configuration
+    storage = Path(_read_configuration(HOST_POLICY_CONFIG)["storage"])
+    owner = storage.lstat()
+    import stat
+    require(storage.is_absolute() and storage.resolve(strict=True) == storage and
+            stat.S_ISDIR(owner.st_mode) and owner.st_uid == os.geteuid() and
+            owner.st_mode & 0o077 == 0 and factory.storage.is_relative_to(storage),
+            "original private shared host storage required")
+    root = storage / ("offline-fixture-" + _OFFLINE_NONCE)
+    root.mkdir(mode=0o700, exist_ok=True)
+    info = root.lstat()
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and
+            info.st_mode & 0o077 == 0 and root.resolve(strict=True) == root,
+            "private shared fixture counter required")
+    lock = os.open(root / "counter.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        info = os.fstat(lock)
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and
+                info.st_mode & 0o777 == 0o600 and info.st_nlink == 1,
+                "fixture counter lock changed")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        rows = []
+        for path in root.iterdir():
+            if path.name == "counter.lock":
+                continue
+            require(path.name.endswith(".json") and len(path.name) == 69 and
+                    all(c in "0123456789abcdef" for c in path.name[:-5]),
+                    "foreign fixture counter entry")
+            row = _read_private(path)
+            require(type(row) is dict and set(row) ==
+                    {"role", "operation_id", "identity", "ordinal"} and
+                    row["role"] in {"root", "child"} and
+                    type(row["operation_id"]) is str and
+                    path.name == row["operation_id"] + ".json" and
+                    type(row["identity"]) is dict and
+                    type(row["ordinal"]) is int and row["ordinal"] > 0,
+                    "fixture counter record changed")
+            rows.append(row)
+        require(len(rows) < 16 and not any(row.get("operation_id") == operation_id for row in rows),
+                "offline fixture cap or replay reached")
+        ordinal = 1 + sum(row.get("role") == role for row in rows)
+        from .canonical_case_probe import probe_response
+        answer = probe_response(payload, identity, grant, role, ordinal)
+        if answer is None:
+            answer = _fixture_response(payload, role, definition, ordinal, grant.workspace_root)
+        _write_once(root / (operation_id + ".json"),
+                    {"role": role, "operation_id": operation_id,
+                     "identity": identity.to_json(), "ordinal": ordinal})
+        return answer
+    finally:
+        os.close(lock)
+
+
 def execute_host_model(owner, header, body, *, perform=None):
     """Host-only operation; never trust a route/key chosen by the SDK peer."""
     from types import MethodType, SimpleNamespace
@@ -370,6 +573,21 @@ def execute_host_model(owner, header, body, *, perform=None):
         binding = {"version": 1, "identity": identity.to_json(), "grant_sha256": grant.hash,
                    "plan_sha256": cycle.plan.hash, "operation_id": header["operation_id"],
                    "request_id": header["request_id"], "body_sha256": header["body_sha256"]}
+        offline = _case_host()
+        in_case_unit = _case_unit()
+        require(offline == in_case_unit,
+                "offline fixture host label or cgroup changed")
+        # An offline case whose host confinement is missing must never fall
+        # through to the ordinary credential and HTTPS transport.
+        case_identity = (identity.run_token == _OFFLINE_NONCE or
+                         identity.task_id.endswith(_OFFLINE_NONCE) or
+                         bool(identity.parent_task_id and
+                              identity.parent_task_id.endswith(_OFFLINE_NONCE)))
+        require(offline or not case_identity,
+                "offline case host profile missing; HTTP fallback forbidden")
+        if offline:
+            require(perform is None, "offline fixture cannot accept a replacement transport")
+            _fixture_binding(factory, identity, grant, payload)
         if intent.exists():
             require(_read_private(intent) == binding, "original model transport intent changed")
             require(result.is_file(), "original model transport unresolved; never resend")
@@ -386,12 +604,15 @@ def execute_host_model(owner, header, body, *, perform=None):
         seconds = min(seconds, (datetime.fromisoformat(grant.expires_at) -
                        datetime.now(datetime.fromisoformat(grant.expires_at).tzinfo)).total_seconds() - 5)
         require(seconds > 0, "host model transport deadline exhausted")
-        credential = _credential(launch.private_profile_snapshot, route.credential_refs[0])
+        if not offline:
+            credential = _credential(launch.private_profile_snapshot, route.credential_refs[0])
         _write_once(intent, binding)  # Durable one-shot boundary precedes HTTPS.
         cycle._record("model_transport_intent", grant_sha256=grant.hash,
             operation_id=header["operation_id"], body_sha256=header["body_sha256"])
         # No URL or authentication comes from the peer. The fixed child performs one request.
-        answer = (perform or _perform_http)(credential, payload, seconds)
+        answer = (_perform_fixture(factory, identity, grant, payload,
+                                   header["operation_id"]) if offline else
+                  (perform or _perform_http)(credential, payload, seconds))
         encoded = canonical(answer)
         require(len(encoded) <= MAX_RESPONSE, "bounded host model response required")
         _write_once(result, {"binding": binding, "result": answer})

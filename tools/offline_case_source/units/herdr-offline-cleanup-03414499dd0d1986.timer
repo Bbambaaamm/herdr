@@ -1,0 +1,9 @@
+[Unit]
+Description=Hermes single offline case absolute cleanup deadline
+
+[Timer]
+OnCalendar=2026-11-04 16:43:08 UTC
+OnUnitActiveSec=60s
+AccuracySec=1s
+Persistent=yes
+Unit=herdr-offline-expire-03414499dd0d1986.service

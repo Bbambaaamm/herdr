@@ -354,9 +354,43 @@ def _effective_request_data_class(guard: InvocationGuard) -> Any:
         raise PolicyDenied("request_data_class_unknown") from exc
 
 
-def _actual_provider_credential_ref(agent: Any, route: Any) -> str | None:
+def _actual_provider_credential_ref(agent: Any, route: Any, *, guard=None, private_sdk_policy=None) -> str | None:
     """Resolve the actual selected key through Hermes' credential pool identity."""
     refs = tuple(getattr(route, "credential_refs", ()) or ())
+    binding = getattr(agent, "_host_reference", None)
+    if binding is not None:
+        from agent.host_reference import HostCredentialReference, ReferencePool, validate_reference_runtime
+        pool = getattr(agent, "_credential_pool", None)
+        if (guard is None or private_sdk_policy is None
+                or type(binding) is not HostCredentialReference or type(pool) is not ReferencePool):
+            raise PolicyDenied("host_reference_authenticated_binding_required")
+        if binding is not getattr(guard, "_admitted_host_reference", None):
+            raise PolicyDenied("host_reference_not_admitted_by_stage2")
+        try:
+            validate_reference_runtime(binding, provider=agent.provider, model=agent.model,
+                base_url=agent.base_url, api_mode=agent.api_mode, api_key=agent.api_key,
+                pool=pool)
+        except Exception as exc:
+            raise PolicyDenied("host_reference_route_mismatch") from exc
+        grant = guard.grant
+        identity = grant.identity
+        if (getattr(private_sdk_policy, "auth_sha256", None) is not None
+                or getattr(getattr(grant, "runtime_assurance", None), "credentials_isolated", None) is not True
+                or binding.grant_hash != grant.hash
+                or binding.profile_sha256 != private_sdk_policy.profile_sha256
+                or binding.projection_sha256 != private_sdk_policy.projection_sha256
+                or binding.workspace != grant.workspace_root
+                or binding.fence != str(identity.fencing_token)
+                or binding.lineage != identity.parent_task_id
+                or binding.provider != route.provider
+                or binding.endpoint != route.base_url
+                or binding.api_mode != route.api_mode
+                or binding.credential_ref not in refs
+                or binding.credential_ref not in grant.credential_refs
+                or pool.current_ref != binding.credential_ref
+                or pool.current_entry_id != binding.entry_id):
+            raise PolicyDenied("host_reference_authenticated_binding_mismatch")
+        return binding.credential_ref
     raw = getattr(agent, "api_key", None)
     if getattr(agent, "api_mode", None) == "anthropic_messages":
         raw = getattr(agent, "_anthropic_api_key", None) or raw
@@ -1033,7 +1067,8 @@ def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None,
         # data handling contract. Never infer these from model request fields.
         if len(route.regions) != 1 or len(route.data_classes) != 1:
             raise PolicyDenied("provider_route_ambiguous", str(provider))
-        credential_ref = _actual_provider_credential_ref(agent, route)
+        credential_ref = _actual_provider_credential_ref(agent, route,
+            guard=guard, private_sdk_policy=private_sdk_policy)
         data_class = _effective_request_data_class(guard)
         guard.authorize_provider(ProviderRequest(
             provider=provider, region=route.regions[0], data_class=data_class,
@@ -1089,6 +1124,8 @@ def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None,
             # observed network mode must not bypass the authenticated work port.
             host_transport = budgeted_transport and (private_sdk_policy is not None
                 or access == "none" or (callable(transport) and supported_host_route))
+            if getattr(agent, "_host_reference", None) is not None and not host_transport:
+                raise PolicyDenied("host_reference_protected_transport_required")
             if host_transport:
                 if (not callable(transport) or agent.provider != "nous"
                         or not agent.model.endswith(":free")

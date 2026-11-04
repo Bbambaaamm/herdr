@@ -40,6 +40,7 @@ def _stage1():
 
 def test_fixed_production_entry_preserves_argv_without_policy_override(monkeypatch):
     module = _launcher()
+    monkeypatch.setattr(module, '_requested_self_observation', lambda digest: None)
     seen = []
     monkeypatch.setattr(module, 'bootstrap', lambda args: seen.append(args) or 0)
     monkeypatch.setenv(module._INTERPRETER_FD_ENV, 'test-stage-two')
@@ -462,7 +463,7 @@ def test_stage1_execs_verified_stage2_source_fd(monkeypatch):
     monkeypatch.setattr(module, "_require_independent_stage0", lambda: None)
     monkeypatch.setattr(module, "_mount_rows", lambda: {})
     monkeypatch.setattr(module, "_require_exact_ro_tree", lambda *args: None)
-    monkeypatch.setattr(module, "_read_proof", lambda *args: ({}, b"proof"))
+    monkeypatch.setattr(module, "_read_proof", lambda *args: ({"schema_version": "herdr-policy-bootstrap-2"}, b"proof"))
     monkeypatch.setattr(module, "_verify_trees", lambda *args: None)
     monkeypatch.setattr(module, "_open_verified_stage2", lambda: 41)
     monkeypatch.setattr(module, "_open_verified_python", lambda: 42)
@@ -492,6 +493,7 @@ def test_stage1_execs_verified_stage2_source_fd(monkeypatch):
 
 def test_stage2_continuity_binds_loaded_source_to_held_fd(monkeypatch):
     module = _launcher()
+    monkeypatch.setattr(module, '_requested_self_observation', lambda digest: None)
     fd = os.open(LAUNCHER, os.O_RDONLY)
     try:
         monkeypatch.setenv(module.STAGE2_FD_ENV, str(fd))
@@ -869,5 +871,7 @@ def test_committed_hermes_inventory_matches_launcher_pins(monkeypatch):
     monkeypatch.setattr(module, "HERMES_INVENTORY_PATH", inventory)
     data = module._hermes_source_inventory()
     assert data["revision"] == module.HERMES_HEAD
-    assert len(data["files"]) == 15208
+    # This is the complete original SDK source set.  The generic installed
+    # runtime inventory is a separate closure with a different member count.
+    assert len(data["files"]) == 1249
     assert data["source_sha256"] == module.HERMES_SOURCE_SHA256

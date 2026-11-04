@@ -12,6 +12,7 @@ from herdr.taskgraph import (
     PersistentTaskGraph,
     TaskGraph,
     TaskGraphEnvelope,
+    _thaw_json,
 )
 
 
@@ -79,6 +80,29 @@ def test_payload_is_deeply_immutable_after_validation():
     with pytest.raises(TypeError):
         g.nodes[0].model_policy["model"] = "changed"
     assert g.graph_hash() == before
+
+
+def test_nested_attestation_lists_detach_from_immutable_graph_snapshot():
+    attestation = {"execution_session": {"sandbox_attestation": {
+        "inert_nested": [{"measurements": ["original"]}]}}}
+    g = graph([node(inputs=[attestation])])
+    before = g.graph_hash()
+    with pytest.raises(TypeError):
+        g.nodes[0].inputs[0]["execution_session"]["sandbox_attestation"]["inert_nested"][0]["measurements"][0] = "changed"
+    detached = g.nodes[0].to_json()
+    detached["inputs"][0]["execution_session"]["sandbox_attestation"]["inert_nested"][0]["measurements"][0] = "changed"
+    assert g.nodes[0].inputs[0]["execution_session"]["sandbox_attestation"]["inert_nested"][0]["measurements"][0] == "original"
+    assert g.graph_hash() == before
+
+
+def test_thaw_detaches_mutable_attestation_lists_at_every_depth():
+    task = {"execution_session": {"sandbox_attestation": {
+        "inert_nested": [{"measurements": ["original"]}]}}}
+    detached = _thaw_json(task)
+    detached["execution_session"]["sandbox_attestation"]["inert_nested"][0]["measurements"][0] = "changed"
+    assert task["execution_session"]["sandbox_attestation"]["inert_nested"] == [
+        {"measurements": ["original"]}]
+    assert json.loads(json.dumps(task, sort_keys=True))["execution_session"] == task["execution_session"]
 
 def test_planner_output_strict_parser():
     payload = {"envelope": envelope().to_json(), "nodes": [node()]}

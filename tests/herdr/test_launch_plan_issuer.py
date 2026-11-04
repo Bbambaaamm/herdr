@@ -80,7 +80,7 @@ class RootOS:
         return (lambda: 0) if key == "geteuid" else getattr(os, key)
 
 
-def configure(live, monkeypatch):
+def configure(live, monkeypatch, *, with_listener=True):
     grant = live.launch.grant
     now = datetime.now(UTC)
     grant = replace(grant, issued_at=now.isoformat(), expires_at=(now + timedelta(minutes=5)).isoformat())
@@ -116,9 +116,11 @@ def configure(live, monkeypatch):
     monkeypatch.setattr(issuer, "_physical", lambda *args: None)
     monkeypatch.setattr(handoff, "time", time)
     endpoint = live.proposals.parent / "s"
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-    listener.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
-    listener.bind(str(endpoint)); listener.listen(2); listener.settimeout(3)
+    listener = None
+    if with_listener:
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+        listener.bind(str(endpoint)); listener.listen(2); listener.settimeout(3)
     def connect(timeout):
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         connection.settimeout(timeout); connection.connect(str(endpoint)); return connection
@@ -157,7 +159,7 @@ def test_automatic_issuer_releases_existing_handoff_without_operator_ticket(live
         assert stat.S_IMODE(ticket.stat().st_mode) == 0o400
         assert stat.S_IMODE(plan.stat().st_mode) == 0o444
         assert json.loads(plan.read_bytes()) == live.launch.mount.private_mount_request
-        assert all(body not in ticket.read_bytes() for body in live.inputs.values())
+        assert all(body not in ticket.read_bytes() for body in live.inputs.values() if body)
         live.launch.verify_private_handoff()
     finally: listener.close(); thread.join(4)
 
@@ -342,6 +344,61 @@ def test_host_composition_selects_automatic_client_only_by_root_policy(tmp_path,
 def physical(live, monkeypatch):
     from tests.herdr.test_policy_launch import frozen
     from herdr.host_bootstrap import SHIM_SOURCE, STAGE1_SOURCE
+    from herdr import credential_isolation, policy_launch
+    from herdr.credential_ingress_filter import filter_bytes
+    # The issuer's real grammar reads a root-published confinement record.
+    # Supply the exact record and reviewed source in a disposable directory;
+    # only root ownership and the kernel-loaded digest are doubled here.
+    approval_dir = live.proposals.parent / "confinement-fixture"
+    approval_dir.mkdir(mode=0o755)
+    source_file = approval_dir / "worker-profile.apparmor"
+    source_file.write_bytes((Path(__file__).resolve().parents[2] /
+        "tools/offline_case_source/overlays/worker-profile.apparmor").read_bytes())
+    source_file.chmod(0o444)
+    loaded_digest = hashlib.sha256(b"isolated-loaded-policy-fixture").hexdigest()
+    runtime_dir = approval_dir / "runtime-files"
+    runtime_dir.mkdir(mode=0o755)
+    runtime_paths = {}
+    for name in credential_isolation.SYSTEM_RUNTIME_FILES:
+        path = runtime_dir / hashlib.sha256(name.encode()).hexdigest()
+        path.write_bytes(("approved-runtime:" + name).encode()); path.chmod(0o444)
+        runtime_paths[name] = path
+    system_files = {name: hashlib.sha256(path.read_bytes()).hexdigest()
+                    for name, path in runtime_paths.items()}
+    record = {"schema_version": "herdr-worker-confinement-1",
+              "profile": credential_isolation.WORKER_PROFILE,
+              "source_sha256": hashlib.sha256(source_file.read_bytes()).hexdigest(),
+              "loaded_sha256": loaded_digest,
+              "filter_sha256": hashlib.sha256(filter_bytes()).hexdigest(),
+              "system_files": system_files}
+    approval_file = approval_dir / "worker-confinement.json"
+    approval_file.write_bytes(canonical_json_bytes(record)); approval_file.chmod(0o444)
+    assert record["source_sha256"] == credential_isolation.WORKER_PROFILE_SOURCE_SHA256
+    monkeypatch.setattr(credential_isolation, "CONFINEMENT_APPROVAL", approval_file)
+    monkeypatch.setattr(credential_isolation, "CONFINEMENT_SOURCE", source_file)
+    real_ancestry = policy_launch._verify_root_owned_ancestry
+    def fixture_ancestry(path):
+        if Path(path) in (approval_dir, runtime_dir):
+            assert Path(path).is_dir() and not stat.S_IMODE(Path(path).stat().st_mode) & 0o022
+        else:
+            real_ancestry(path)
+    monkeypatch.setattr(policy_launch, "_verify_root_owned_ancestry", fixture_ancestry)
+    class FixturePath(type(Path())):
+        def resolve(self, *args, **kwargs):
+            if str(self) in runtime_paths:
+                return FixturePath(runtime_paths[str(self)])
+            return super().resolve(*args, **kwargs)
+        def lstat(self, *args, **kwargs):
+            info = super().lstat(*args, **kwargs)
+            if self in (approval_file, source_file, *runtime_paths.values()):
+                values = list(info); values[4] = 0
+                return os.stat_result(values)
+            return info
+    monkeypatch.setattr(credential_isolation, "Path", FixturePath)
+    monkeypatch.setattr(credential_isolation, "CONFINEMENT_APPROVAL", FixturePath(approval_file))
+    monkeypatch.setattr(credential_isolation, "CONFINEMENT_SOURCE", FixturePath(source_file))
+    monkeypatch.setattr(credential_isolation, "_loaded_profile_sha256", lambda: loaded_digest)
+    assert credential_isolation._approved_confinement() == record
     trees = []
     code_fixture = live.proposals.parent / "code-fixture"; code_fixture.mkdir()
     _, code = frozen(code_fixture, files={
@@ -350,7 +407,7 @@ def physical(live, monkeypatch):
     for target in sorted(RUNTIME_TARGETS, key=str):
         directory = live.proposals.parent / ("runtime-" + str(len(trees))); directory.mkdir()
         _, tree = frozen(directory, target=target); trees.append(tree)
-    raw, _, _, listener = configure(live, monkeypatch); listener.close()
+    raw, _, _, _ = configure(live, monkeypatch, with_listener=False)
     raw["storage"] = str(live.proposals.parent)
     raw["code"] = {"source": str(code.path), "target": str(code.target)}
     raw["runtime"] = [{"source": str(tree.path), "target": str(tree.target)} for tree in trees[1:]]
@@ -368,8 +425,8 @@ def physical(live, monkeypatch):
     source = live.proposals.parent / "bootstrap-fixture"; source.mkdir()
     _, bootstrap = frozen(source, target=Path("/run/herdr-bootstrap"), files={"hermes": b"shim",
                          "agent-hermes-policy-stage1": b"stage1", "immutable-trees.json": canonical_json_bytes(proof)})
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); sock.bind(str(live.proposals.parent / "bootstrap.sock"))
-    sockfd = os.open(live.proposals.parent / "bootstrap.sock", os.O_PATH | os.O_CLOEXEC)
+    sock, sock_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    sockfd = os.dup(sock.fileno())
     bundle = live.proposals.parent / "bundle"; bundle.touch(mode=0o600)
     bundlefd = os.open(bundle, os.O_RDONLY)
     clifd = os.open(code.path / "agent-stack/policy-bin/herdr", os.O_RDONLY)
@@ -378,6 +435,9 @@ def physical(live, monkeypatch):
         return {"source": f"/proc/{os.getpid()}/fd/{fd}", "fd": fd, "device": info.st_dev,
                 "inode": info.st_ino, "kind": kind, "target": str(target)}
     from herdr.resolver_namespace import ResolverSnapshot
+    from herdr import resolver_namespace
+    monkeypatch.setattr(resolver_namespace, "read_host_resolver",
+                        lambda *, host_uid=None: ("/etc/resolv.conf", b"nameserver 192.0.2.53\n"))
     resolver = ResolverSnapshot.create()
     descriptors = [live.work.descriptor(), live.output.descriptor(), *live.profile.fd_descriptors(),
                    resolver.descriptor(),
@@ -393,7 +453,11 @@ def physical(live, monkeypatch):
                     result_slot=ResultSlot.from_dict({k: v for k, v in binding.items() if k != "schema_version"}))
     grant = replace(grant, scope=replace(grant.scope, tools=(*grant.scope.tools, "herdr_submit_result")),
                     tool_rules=(*grant.tool_rules, rule))
-    argv = ["/usr/bin/bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--unshare-pid", "--die-with-parent",
+    argv = ["/usr/bin/bwrap", "--tmpfs", "/",
+            *(part for name in sorted(credential_isolation.SYSTEM_RUNTIME_FILES)
+              for part in ("--ro-bind", name, name)),
+            "--dev", "/dev", "--unshare-pid", "--die-with-parent",
+            "--disable-userns", "--cap-drop", "ALL",
             "--tmpfs", "/tmp", "--tmpfs", "/home/agentops", "--proc", "/proc", "--chdir", grant.workspace_root,
             "--tmpfs", "/home/agentops/.config/herdr", "--tmpfs", "/opt/agent-platform", "--tmpfs", "/run"]
     argv += resolver.parent_args()
@@ -403,7 +467,8 @@ def physical(live, monkeypatch):
         argv += [op, str(value["fd"]), value["target"]]
     argv += ["--setenv", "HOME", "/home/agentops", "--setenv", "PATH",
              "/run/herdr/policy-code/agent-stack/policy-bin:/usr/bin:/bin", "--setenv", "HERDR_DURABLE_SANDBOX", "1",
-             "--remount-ro", "/home/agentops", "--", "/bin/bash", "--noprofile", "--norc", "-i"]
+             "--remount-ro", "/home/agentops", "--remount-ro", "/",
+             "--", "/bin/bash", "--noprofile", "--norc", "-i"]
     # Undo the IPC fixture's physical double for these direct source checks.
     monkeypatch.setattr(issuer, "_physical", ORIGINAL_PHYSICAL)
     try:
@@ -412,7 +477,7 @@ def physical(live, monkeypatch):
                               live=live, bundle=bundle, bootstrap=bootstrap, trees=trees, resolver=resolver)
     finally:
         for fd in (sockfd, bundlefd, clifd): os.close(fd)
-        sock.close(); bootstrap.close(); resolver.close()
+        sock.close(); sock_peer.close(); bootstrap.close(); resolver.close()
         for tree in trees: tree.close()
 
 

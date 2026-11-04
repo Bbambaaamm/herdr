@@ -339,6 +339,7 @@ def test_profile_identity_is_canonical_and_signed_evidence_shape_is_bounded(tmp_
         for modern in (False, True):
             proof = policy_fixture(planned.identity, modern=modern)
             proof["approved_profile"] = snapshot.identity
+            proof["worker_confinement_sha256"] = "f" * 64
             from tests.policy_launch_fakes import immutable_sources_fixture
             proof["immutable_sources"] = immutable_sources_fixture(proof)
             assert validate_policy_evidence(proof, identity=planned.identity) == proof
@@ -440,6 +441,7 @@ def test_retained_profile_identity_must_match_signed_attestation(tmp_path):
     planned = grant(workspace)
     proof = policy_fixture(planned.identity)
     proof["approved_profile"] = approved.identity
+    proof["worker_confinement_sha256"] = "f" * 64
     from tests.policy_launch_fakes import immutable_sources_fixture
     proof["immutable_sources"] = immutable_sources_fixture(proof)
     proof["process_start_ticks"] = process_start_ticks(os.getpid())

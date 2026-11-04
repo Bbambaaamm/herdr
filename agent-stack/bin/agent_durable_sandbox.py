@@ -1,5 +1,5 @@
 """Construct and verify the durable task pane's mount and PID boundary."""
-import os
+from herdr.observed_proc import os
 import re
 import json
 import hashlib
@@ -12,7 +12,7 @@ import tempfile
 import termios
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from herdr.observed_proc import Path
 
 BWRAP = Path("/usr/bin/bwrap")
 HOME = Path("/home/agentops")
@@ -61,6 +61,7 @@ if len(sys.argv) < 3 or len(sys.argv[1]) > 65536:
     raise SystemExit("policy_fd_launch_invalid")
 entries = json.loads(sys.argv[1])
 args = sys.argv[2:]
+system_runtime_files = set(__HERDR_SYSTEM_RUNTIME_FILES__)
 plan_envelope = None
 received_fds = []
 if isinstance(entries, dict):
@@ -74,6 +75,12 @@ if isinstance(entries, dict):
 if not isinstance(entries, list) or not 1 <= len(entries) <= 96:
     raise SystemExit("policy_fd_launch_invalid")
 if plan_envelope is not None and "transport" in plan_envelope:
+    # This source tree is selected by the approved launcher.  -I -S removes
+    # ambient imports, so admit only this exact sibling package directory.
+    package_root = Path(__HERDR_PACKAGE_ROOT__)
+    if not package_root.is_absolute() or package_root.name != 'herdr':
+        raise SystemExit('policy_fd_package_root_invalid')
+    sys.path.insert(0, str(package_root.parent))
     from herdr.native_fd_handoff import receive_descriptors
     received_fds = receive_descriptors(plan_envelope, args)
 mapping, targets, approved_files = {}, set(), set()
@@ -231,7 +238,8 @@ root = home / ".hermes"
 profiles = root / "profiles"
 tmpfs_targets = [args[i + 1] for i in range(arg_end - 1)
                  if args[i] == "--tmpfs"]
-private_home = str(home) in tmpfs_targets
+private_home = str(home) in tmpfs_targets and (
+    bool(approved_files) or plan_envelope is not None)
 if private_home:
     if (plan_envelope is not None or any(item["kind"] != "sealed-profile-data" for item in entries)
         or any(args[i] in ("--bind", "--ro-bind") and i != 1
@@ -302,7 +310,7 @@ if private_home:
     # allows a same-UID process to rename the mounted profile and replace the
     # logical pathname while Hermes is still running. The four runtime tmpfs
     # submounts are separate and remain writable (nonrecursive remount).
-    if args[:4] != ["/usr/bin/bwrap", "--ro-bind", "/", "/"]:
+    if args[:3] != ["/usr/bin/bwrap", "--tmpfs", "/"]:
         raise SystemExit("policy_fd_private_home_base_invalid")
     try:
         end = args.index("--")
@@ -312,10 +320,11 @@ if private_home:
     # --args: recursive option expansion bypasses ordinary mount validation.
     # Deny capability grants, alternate PID namespaces, fail-open modes and
     # new options unless independently audited and added to this contract.
-    flags = {"--unshare-pid", "--die-with-parent", "--unshare-net"}
+    flags = {"--unshare-pid", "--die-with-parent", "--unshare-net",
+             "--disable-userns"}
     path_options = {"--dev", "--proc", "--tmpfs", "--dir", "--chdir",
                     "--remount-ro"}
-    one_value = path_options | {"--unsetenv"}
+    one_value = path_options | {"--unsetenv", "--cap-drop"}
     two_values = {"--ro-bind", "--bind", "--ro-bind-fd", "--bind-fd",
                   "--ro-bind-data", "--setenv"}
     bind_options = two_values - {"--setenv"}
@@ -340,6 +349,8 @@ if private_home:
                 raise SystemExit("policy_fd_private_home_env_invalid")
             if values[0] == "HOME" and values[1] != str(home):
                 raise SystemExit("policy_fd_private_home_env_invalid")
+        if option == "--cap-drop" and values != ["ALL"]:
+            raise SystemExit("policy_fd_private_capability_invalid")
         if option == "--unsetenv" and values[0] == "HOME":
             raise SystemExit("policy_fd_private_home_env_invalid")
         parsed.append((option, values, offset))
@@ -358,8 +369,8 @@ if private_home:
         source = Path(source_text)
         resolved = Path(os.path.realpath(source_text))
         destination = Path(destination_text)
-        if (position == 1 and option == "--ro-bind"
-            and values == ["/", "/"]):
+        if (option == "--ro-bind" and source_text == destination_text
+            and source_text in system_runtime_files):
             continue
         if (source == Path("/") or resolved == Path("/")
             or source == home.parent or resolved == home.parent
@@ -378,6 +389,10 @@ if private_home:
         or sum(option == "--proc" and value == ["/proc"]
                for option, value, _ in parsed) != 1):
         raise SystemExit("policy_fd_private_proc_missing")
+    if (sum(option == "--disable-userns" for option, _, _ in parsed) != 1
+        or sum(option == "--cap-drop" and value == ["ALL"]
+               for option, value, _ in parsed) != 1):
+        raise SystemExit("policy_fd_private_lifetime_boundary_missing")
     if (sum(option == "--setenv" and value == ["HOME", str(home)]
             for option, value, _ in parsed) != 1):
         raise SystemExit("policy_fd_private_home_env_invalid")
@@ -395,8 +410,10 @@ if private_home:
                 or Path("/proc") in Path(value[-1]).parents)
            for option, value, position in parsed if position > 1):
         raise SystemExit("policy_fd_private_proc_shadowed")
-    if (args[end - 2:end] != ["--remount-ro", str(home)]
+    if (args[end - 4:end] != ["--remount-ro", str(home), "--remount-ro", "/"]
         or sum(op == "--remount-ro" and value == [str(home)]
+               for op, value, _ in parsed) != 1
+        or sum(op == "--remount-ro" and value == ["/"]
                for op, value, _ in parsed) != 1
         or any(op == "--remount-ro" and value[0] not in tmpfs_targets
                for op, value, _ in parsed)):
@@ -425,9 +442,7 @@ if private_home:
             # shadows the complete profile namespace even when the private
             # /home/agentops tmpfs itself has already been mounted.
             if destination == home or destination in home.parents:
-                if not (i == 1 and arg == "--ro-bind"
-                        and args[i + 1:i + 3] == ["/", "/"]):
-                    raise SystemExit("policy_fd_private_home_shadowed")
+                raise SystemExit("policy_fd_private_home_shadowed")
             if destination == root or root in destination.parents:
                 # Only the independently verified immutable Hermes SDK tree
                 # may live outside the sealed selected-profile input files.
@@ -439,7 +454,8 @@ if private_home:
             if i + 1 >= end:
                 raise SystemExit("policy_fd_launch_invalid")
             destination = Path(args[i + 1])
-            if destination in home.parents:
+            if destination in home.parents and not (i == 1 and arg == "--tmpfs"
+                                                    and destination == Path("/")):
                 raise SystemExit("policy_fd_private_home_shadowed")
             if destination == root or root in destination.parents:
                 if not (arg == "--tmpfs" and str(destination) in profile_runtime):
@@ -460,6 +476,19 @@ if private_home:
         if args[i] == "--tmpfs" and args[i + 1] in profile_runtime:
             if not home_mask < i < end - 2:
                 raise SystemExit("policy_fd_private_home_order_invalid")
+    # Literal mounts cannot inherit authority from a plan's claimed target.
+    # Check them before classifying the exact pinned system-runtime sequence.
+    for option, values, position in parsed:
+        if option not in ("--bind", "--ro-bind"):
+            continue
+        if (option == "--ro-bind" and values[0] == values[1]
+                and values[0] in system_runtime_files):
+            continue
+        raise SystemExit("policy_fd_private_literal_source_unpinned")
+    runtime_bindings = [(value[0], value[1]) for option, value, _ in parsed
+                        if option == "--ro-bind" and value[0] in system_runtime_files]
+    if runtime_bindings != [(name, name) for name in sorted(system_runtime_files)]:
+        raise SystemExit("policy_fd_system_runtime_mounts_incomplete")
 
     # All FD-backed mounts must also be host-policy destinations, not just
     # correct caller-supplied inode tuples. Without this check an attacker can
@@ -488,12 +517,16 @@ if private_home:
     }
     approved_file_targets = {
         Path("/run/herdr-policy/grant.bundle.json"),
+        home / ".local/bin/herdr",
+        home / ".local/bin/hermes",
     }
-    if plan_envelope is not None:
+    if plan_envelope is not None and workspace is not None:
         approved_dir_targets.update(Path(e["target"]) for e in approved_plan["descriptors"]
-                                    if e["kind"] == "directory")
+                                    if e["kind"] == "directory"
+                                    and workspace in Path(e["target"]).parents)
         approved_file_targets.update(Path(e["target"]) for e in approved_plan["descriptors"]
-                                     if e["kind"] in ("file","reserved-result"))
+                                     if e["kind"] == "file"
+                                     and workspace in Path(e["target"]).parents)
     approved_socket_targets = {
         Path("/run/herdr-policy/bootstrap-authority.sock"),
     }
@@ -507,7 +540,9 @@ if private_home:
             "reserved-result": approved_file_targets,
             "socket": approved_socket_targets,
         }[item["kind"]]
-        if target not in allowed:
+        if (target not in allowed and not (item["kind"] == "reserved-result"
+            and plan_envelope is not None and target not in sensitive
+            and not any(root_path in target.parents for root_path in sensitive[3:]))):
             raise SystemExit("policy_fd_private_fd_target_untrusted")
         bind_mode = next(op for op, value, _ in parsed
                          if op in ("--bind-fd", "--ro-bind-fd")
@@ -534,17 +569,28 @@ if private_home:
                 raise SystemExit("policy_fd_private_fd_source_untrusted")
             if (target == workspace or item["kind"]=="reserved-result") and path != target:
                 raise SystemExit("policy_fd_private_fd_source_untrusted")
-    # Every additional source comes from the exact root-approved descriptor
-    # plan. Reopening a literal caller path would reintroduce a rename race.
-    for option, values, position in parsed:
-        if option not in ("--bind", "--ro-bind") or position == 1:
-            continue
-        # Root-authorized plans use descriptors for every mutable source and
-        # exact CLI artefact. Never reopen a caller pathname for these mounts.
-        raise SystemExit("policy_fd_private_literal_source_unpinned")
     # The pinned FD is the only source Bubblewrap may mount; pathname
     # swaps performed after this check cannot alter that inode's identity.
 else:
+    if (str(home) in tmpfs_targets
+        or args[:4] == ["/usr/bin/bwrap", "--ro-bind", "/", "/"]):
+        # The host may have a different account home (e.g. /home/runner).
+        # Construct HOME beneath a private /home instead of trying to mkdir
+        # on the read-only host root. Never rebind the host home inventory.
+        # Seal both private bases after every child mount, nonrecursively.
+        if (args[:8] != ["/usr/bin/bwrap", "--ro-bind", "/", "/",
+                         "--tmpfs", str(home.parent), "--tmpfs", str(home)]
+            or tmpfs_targets.count(str(home.parent)) != 1
+            or tmpfs_targets.count(str(home)) != 1
+            or args[arg_end - 4:arg_end] != ["--remount-ro", str(home.parent),
+                                            "--remount-ro", str(home)]):
+            raise SystemExit("policy_fd_runtime_home_not_readonly")
+        home_environment = [args[i + 1:i + 3] for i in range(arg_end - 2)
+                            if args[i] == "--setenv" and args[i + 1] == "HOME"]
+        if (home_environment != [["HOME", str(home)]]
+            or any(args[i:i + 2] == ["--unsetenv", "HOME"]
+                   for i in range(arg_end - 1))):
+            raise SystemExit("policy_fd_runtime_home_env_invalid")
     if any(item["kind"] == "sealed-resolver-data" for item in entries):
         raise SystemExit("policy_fd_resolver_without_private_home")
     if approved_files:
@@ -569,8 +615,49 @@ else:
     required = {str(p) for p in candidates if p.is_dir()}
     if actual != required:
         raise SystemExit("policy_fd_runtime_mount_mismatch")
+if approved_files:
+    # This audited fixed filter is added after validating the root-approved
+    # mount command. Bubblewrap installs it before the waiting shell; all
+    # descendant forks and execs inherit it. No worker input selects rules.
+    # The exact program is embedded by this pinned source module before an
+    # isolated -S manual launcher starts; that launcher has no import path.
+    if os.uname().machine != "x86_64":
+        raise SystemExit("policy_fd_filter_architecture_unsupported")
+    program = bytes.fromhex("__HERDR_FIXED_INGRESS_FILTER_HEX__")
+    filter_fd = os.memfd_create("herdr-credential-ingress-filter",
+                                os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+    if os.write(filter_fd, program) != len(program):
+        raise SystemExit("policy_fd_filter_incomplete")
+    fcntl.fcntl(filter_fd, getattr(fcntl, "F_ADD_SEALS", 1033),
+                getattr(fcntl, "F_SEAL_SEAL", 1) | getattr(fcntl, "F_SEAL_SHRINK", 2) |
+                getattr(fcntl, "F_SEAL_GROW", 4) | getattr(fcntl, "F_SEAL_WRITE", 8))
+    os.lseek(filter_fd, 0, os.SEEK_SET)
+    os.set_inheritable(filter_fd, True)
+    args[arg_end:arg_end] = ["--seccomp", str(filter_fd)]
+    # Drop a possible host cwd and every host descriptor that is not an exact
+    # mount source or the fixed filter BEFORE bwrap drops capabilities.
+    os.chdir("/")
+    kept = {0, 1, 2, filter_fd, *(opened for opened, _, _ in mapping.values())}
+    for name in os.listdir("/proc/self/fd"):
+        if name.isdecimal() and int(name) not in kept:
+            try:
+                os.close(int(name))
+            except OSError as exc:
+                if exc.errno != 9:  # listdir may have closed its own FD.
+                    raise
 os.execv(args[0], args)
 """
+
+# This replacement is performed by the verified candidate source before the
+# command is formed; the host-approved argv binds the resulting exact bytes.
+from herdr.credential_ingress_filter import filter_bytes as _ingress_filter_bytes
+from herdr.credential_isolation import SYSTEM_RUNTIME_FILES as _system_runtime_files
+_POLICY_FD_LAUNCHER = _POLICY_FD_LAUNCHER.replace(
+    "__HERDR_FIXED_INGRESS_FILTER_HEX__", _ingress_filter_bytes().hex())
+_POLICY_FD_LAUNCHER = _POLICY_FD_LAUNCHER.replace(
+    "__HERDR_SYSTEM_RUNTIME_FILES__", repr(sorted(_system_runtime_files)))
+_POLICY_FD_LAUNCHER = _POLICY_FD_LAUNCHER.replace(
+    "__HERDR_PACKAGE_ROOT__", repr(str(Path(__file__).resolve().parents[2] / 'herdr')))
 
 @dataclass
 class PinnedWorktree:
@@ -752,14 +839,23 @@ def command(
                                      pinned_worktree.root in result.parents):
             raise RuntimeError("managed_child_result_inside_worktree_root")
 
-    # Keep the host root read-only. Private roots use their admitted grant;
+    # Private launch starts with an empty root and exact approved runtime
+    # files. Other host paths, including sibling workspaces, do not exist.
+    # Legacy launch retains its historical read-only root.
     # managed children retain their separate admitted workspace mode.
     # Mask control paths after writable binds and over-mount the local CLI.
     args = [
         str(BWRAP),
-        "--ro-bind", "/", "/",
+        *(["--tmpfs", "/"] if private_profile_mounts else ["--ro-bind", "/", "/"]),
+        # /home exists on the host, but the fixed account home need not.
+        # A private parent permits destination creation and hides other homes.
+        *(["--tmpfs", str(HOME.parent), "--tmpfs", str(HOME)]
+          if policy_mount is not None and not private_profile_mounts else []),
+        *((part for name in sorted(_system_runtime_files) for part in
+           ("--ro-bind", name, name)) if private_profile_mounts else []),
         "--dev", "/dev",
         "--unshare-pid",
+        *(["--disable-userns", "--cap-drop", "ALL"] if private_profile_mounts else []),
         *(["--die-with-parent"] if admission_root is not None else []),
         "--tmpfs", "/tmp",
         *(private_profile_mounts[:-2] if private_profile_mounts else []),
@@ -855,11 +951,16 @@ def command(
         for name in sorted(set(STARTUP_CONTROLS)|{key for key in os.environ if key.startswith("LD_")}):
             args += ["--unsetenv",name]
         args += ["--setenv", "PATH", "/run/herdr/policy-code/agent-stack/policy-bin:/usr/bin:/bin"]
+        if not private_profile_mounts:
+            args += ["--setenv", "HOME", str(HOME)]
     args += [
         "--setenv", "HERDR_DURABLE_SANDBOX", "1",
         *(part for anchor in (private_anchors if private_profile_mounts else [])
           for part in ("--remount-ro", str(anchor))),
         *(private_profile_mounts[-2:] if private_profile_mounts else []),
+        *(["--remount-ro", str(HOME.parent), "--remount-ro", str(HOME)]
+          if policy_mount is not None and not private_profile_mounts else []),
+        *(["--remount-ro", "/"] if private_profile_mounts else []),
         "--", "/bin/bash", "--noprofile", "--norc", "-i",
     ]
     if policy_mount is not None:
@@ -923,6 +1024,9 @@ def _env(pid: int) -> set[bytes]:
 
 def _terminal_input_ready(pid: int, marker: str) -> bool:
     """Require the marked process to own an active, noncanonical foreground TTY."""
+    from herdr.observed_proc import native_scope_enabled, _DIRECT, rpc
+    if native_scope_enabled() and not _DIRECT.get():
+        return rpc(pid, '', 'terminal')[0]['ready']
     fd = None
     try:
         if pid <= 0:
@@ -1237,6 +1341,22 @@ def inner_pid(process_info: dict, marker: str) -> int | None:
     return None
 
 
+def _runtime_home_mounts_verified(mounts: str) -> bool:
+    """Attest both generic HOME bases from uncollapsed kernel mount records."""
+    bases = {str(HOME.parent): [], str(HOME): []}
+    try:
+        for line in mounts.splitlines():
+            left, right = line.split(" - ", 1)
+            row = left.split()
+            if row[4] in bases:
+                bases[row[4]].append((set(row[5].split(",")), right.split()[0]))
+        return all(len(records) == 1 and "ro" in records[0][0]
+                   and "rw" not in records[0][0] and records[0][1] == "tmpfs"
+                   for records in bases.values())
+    except (ValueError, IndexError):
+        return False
+
+
 def _sdk_runtime_masks_verified(root: Path, modes: dict[str, set[str]],
                                 filesystems: dict[str, str]) -> bool:
     """A verified namespace must mask every *present* SDK write directory.
@@ -1309,7 +1429,7 @@ def _private_profile_namespace_verified(
             if (candidate == protected or protected in candidate.parents):
                 if "rw" in options and mountpath not in writable:
                     return False
-        for entry in snapshot.files:
+        for entry in snapshot.sdk_files:
             destination = snapshot.destination / entry.relative
             target = root / str(destination).lstrip("/")
             if (target.is_symlink() or not target.is_file()
@@ -1391,6 +1511,9 @@ def verify(
                 and workspace_matches
                 and (policy_mount is None or _sdk_runtime_masks_verified(
                     root, modes, filesystems))
+                and (policy_mount is None or private_profile_snapshot is not None
+                     or (_runtime_home_mounts_verified(mounts)
+                         and f"HOME={HOME}".encode() in env))
                 and (private_profile_snapshot is None
                      or _private_profile_namespace_verified(
                          root, modes, filesystems, private_profile_snapshot))

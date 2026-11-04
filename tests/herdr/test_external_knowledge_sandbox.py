@@ -87,7 +87,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 "--tmpfs", "/run",
                 "--dir", "/run/herdr-policy",
                 "--dir", "/run/herdr-external-knowledge",
-                "--tmpfs", "/home/agentops",
+                "--tmpfs", "/home",
                 "--ro-bind", str(broker), "/run/herdr-policy/bootstrap-authority.sock",
                 "--",
                 "/usr/bin/python3", "-I", "-c", script,
