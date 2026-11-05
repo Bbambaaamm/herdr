@@ -233,8 +233,8 @@ class GitHubIntakeTests(unittest.TestCase):
 
     def test_loxxess_priority_respects_p0_and_p1_labels(self):
         consumer = self.loxxess_consumer()
-        self.assertEqual(self.intake.issue_priority(consumer, {"title": "[P0] Critical"}), 90)
-        self.assertEqual(self.intake.issue_priority(consumer, {"title": "[P1] Important"}), 70)
+        self.assertEqual(self.intake.issue_priority(consumer, {"title": "[P0] Critical"}), 10)
+        self.assertEqual(self.intake.issue_priority(consumer, {"title": "[P1] Important"}), 20)
         self.assertEqual(self.intake.issue_priority(consumer, {"title": "[P2] Optional"}), 60)
 
     def test_queue_loxxess_issue_carries_consumer_safety_contract(self):
@@ -252,7 +252,7 @@ class GitHubIntakeTests(unittest.TestCase):
         self.assertEqual(task["safety_profile"], "loxxess-technical")
         self.assertEqual(task["hermes_profile"], "quantlab")
         self.assertEqual(task["agent"], "loxxess-hermes")
-        self.assertEqual(task["priority"], 90)
+        self.assertEqual(task["priority"], 10)
         self.assertIn("DLP/ACP", task["prompt"])
         self.assertIn("config/*.local.json", task["prompt"])
         self.assertIn("not evidence of a live Teams", task["prompt"])

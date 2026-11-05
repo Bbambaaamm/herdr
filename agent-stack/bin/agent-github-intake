@@ -819,9 +819,9 @@ def issue_priority(consumer: dict, issue: dict) -> int:
     title = str(issue.get("title") or "").strip().lower()
     if consumer.get("consumer") == "loxxess":
         if title.startswith("[p0]"):
-            return max(default, 90)
+            return 10
         if title.startswith("[p1]"):
-            return max(default, 70)
+            return 20
     if title.startswith("roadmap:"):
         return max(default, 90)
     if "architecture" in title or "architektura" in title:
