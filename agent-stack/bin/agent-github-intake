@@ -911,6 +911,40 @@ Gate handling:
 Do not flatten the Herdr backlog into duplicate outer durable tasks. This root owns backlog selection and bounded delegation.
 """.strip()
 
+    if name == "heating":
+        return f"""
+Continue Heating repository-only Hermes pilot root issue #{number} as ONE bounded engineering cycle.
+Issue: {title}
+URL: {url}
+
+Current root issue body:
+{body[:12000]}
+
+Prior durable evidence for this root:
+{prior}
+
+This is a repository-engineering control root, not authorization to operate the live heating system.
+Before acting:
+- fetch current origin/main, the live root issue, open pull requests, exact-head CI/reviews and prior durable results;
+- identify any active task, branch, worktree or PR so work is never duplicated;
+- choose one small dependency-safe repository slice that fits this cycle.
+
+Operating rules:
+- heating-hermes is the stable coordinator; use only the tools granted by the heating-safe-engineering contract;
+- work only in an isolated clean worktree under {str(consumer.get('worktree_root') or Path(consumer['workspace']) / 'worktrees').rstrip('/')}/;
+- repository inspection, code/configuration edits, offline tests, documentation and PR preparation are allowed;
+- never access or modify Home Assistant, Supervisor, SSH, MQTT, devices, valves, pumps, boiler controls or production configuration;
+- never deploy, reload, restart or call a live service; repository changes and CI results do not prove runtime behavior or physical actuation;
+- never write directly to main, bypass branch protection/CI/review, expand permissions, expose credentials or fabricate live evidence;
+- safety-relevant deployment or actuation requires a separate explicit Heating project gate outside this issue;
+- the pilot is Hermes-only: do not delegate economic child work or create unmanaged agents;
+- finish mergeable work at an open PR with relevant tests and exact-head evidence unless an existing separately authorized merge flow permits more;
+- if the issue is already satisfied, produce closure evidence instead of inventing changes.
+
+Stop and report the precise blocker for any live-system access, credential, deployment, physical action, permission increase or other human-only gate.
+Keep root #{number} open until the pilot gates are explicitly reviewed; do not expand this root into the full Heating backlog.
+""".strip()
+
     if name == "quantlab":
         return f"""
 Continue Autonomous Quant Lab GitHub issue #{number} as ONE bounded, dependency-safe work slice.

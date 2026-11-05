@@ -78,6 +78,17 @@ DESIRED = [
             {"tab": "Hermes", "name": "loxxess-hermes", "kind": "hermes", "args": ["-p", "quantlab", "chat"]},
         ],
     },
+    {
+        "label": "Heating",
+        "cwd": str(HOME / "workspaces/heating"),
+        "repository": "Bbambaaamm/heating",
+        "repo_url": "https://github.com/Bbambaaamm/heating.git",
+        "agents": [
+            # Pilot reuses deployed Hermes model/tool wiring. Repository authority
+            # and the no-actuation boundary come from heating-safe-engineering.
+            {"tab": "Hermes", "name": "heating-hermes", "kind": "hermes", "args": ["-p", "quantlab", "chat"]},
+        ],
+    },
 ]
 
 def log(message):

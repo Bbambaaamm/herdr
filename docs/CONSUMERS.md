@@ -76,6 +76,21 @@ Repository: Bbambaaamm/heating
 Primary roles: repository engineering, diagnostics, tests, configuration review and safe deployment preparation.
 Direct production actuation is not implied by Herdr access. Any Home Assistant write/deploy/actuation capability must be explicitly granted by Heating policy and should remain human-gated where safety-relevant.
 
+### Repository-only Hermes pilot
+
+Heating uses root-only intake through consumer issue `#172`. The stable `heating-hermes`
+coordinator reuses the deployed `quantlab` Hermes runtime profile only for model/tool transport;
+repository authority comes from the separate `heating-safe-engineering` contract.
+
+The pilot is limited to repository inspection, isolated worktree edits, tests, documentation and
+pull-request preparation. It grants no Home Assistant, Supervisor, SSH, MQTT, device, boiler,
+reload, restart or production-deployment capability. A fresh maintainer approval bound to the
+current issue revision is required before every admitted pilot cycle.
+
+Runtime workspace: `/home/agentops/workspaces/heating`.
+Task worktrees: `/home/agentops/workspaces/heating/worktrees/`.
+Repository policy profile: `heating-safe-engineering`.
+
 ## Contract
 
 A consumer supplies:

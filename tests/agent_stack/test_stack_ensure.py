@@ -51,6 +51,19 @@ def test_loxxess_workspace_reuses_runtime_profile_with_separate_agent_identity()
                        "args": ["-p", "quantlab", "chat"]}]
 
 
+def test_heating_workspace_is_a_hermes_only_repository_pilot():
+    ensure = load_module()
+    groups = [group for group in ensure.DESIRED if group["label"] == "Heating"]
+    assert len(groups) == 1
+    group = groups[0]
+    assert group["repository"] == "Bbambaaamm/heating"
+    assert group["cwd"] == str(ensure.HOME / "workspaces/heating")
+    assert group["agents"] == [
+        {"tab": "Hermes", "name": "heating-hermes", "kind": "hermes",
+         "args": ["-p", "quantlab", "chat"]}
+    ]
+
+
 def test_checkout_rejects_malicious_push_url(monkeypatch, tmp_path):
     ensure = load_module()
     calls = []
