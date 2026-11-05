@@ -69,6 +69,16 @@ Consequently the overall report currently cannot claim full conformance PASS.
 The supported hard-stop and hooks_auto_accept settings are configuration observations,
 not a replacement for InvocationGuard or the original acceptance oracle.
 
+## Host verification workspace
+
+When /tmp is a bounded tmpfs, use a private, task-owned test directory on the
+approved host filesystem instead of relying on the default temporary location.
+Set TMPDIR to that verified directory and pass a fresh, unused child directory
+to pytest --basetemp, so unrelated temporary data is never reused or cleared.
+Keep every existing disk admission floor and margin unchanged. Never delete
+another task's temporary tree, move archives or alter foreign task files to make
+room. This guidance grants no cleanup, reclaim or storage-change permission.
+
 ## Bounds and privacy
 
 The POSIX command collector caps stdout and stderr at 65536 bytes each, uses a 30s
