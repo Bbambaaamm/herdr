@@ -15,6 +15,7 @@ import pytest
 from herdr.consumer_policies import (
     allow_all_consumer_policy,
     base_consumer_policy,
+    heating_safe_engineering_policy,
     policy_for_profile,
     quantlab_paper_policy,
 )
@@ -461,9 +462,37 @@ def test_quantlab_policy_and_other_profiles_are_separate() -> None:
     assert quantlab_paper_policy(identity, ("read_file",)) == "paper_only_required"
     assert base_consumer_policy(identity, ("read_file",)) is None
     assert policy_for_profile("majak")(identity, ("read_file",)) is None
-    assert policy_for_profile("heating")(identity, ("read_file",)) is None
+    assert policy_for_profile("heating-safe-engineering")(identity, ("read_file",)) is None
     assert policy_for_profile("loxxess-technical")(identity, ("read_file",)) is None
     assert policy_for_profile("unknown")(identity, ("read_file",)) == "unknown_consumer_profile"
+
+
+@pytest.mark.parametrize(
+    "tool",
+    (
+        "deploy",
+        "home_assistant.write_config",
+        "ha.service.call",
+        "supervisor.restart",
+        "mqtt.publish",
+        "ssh.exec",
+        "device.control",
+        "boiler.set_temperature",
+        "production.reload",
+    ),
+)
+def test_heating_policy_denies_runtime_and_actuation_tools(tool: str) -> None:
+    identity = _writer_identity(repo="Bbambaaamm/heating", issue="172", paper_only=False)
+    assert (
+        heating_safe_engineering_policy(identity, (tool,))
+        == "heating_runtime_or_actuation_tool"
+    )
+
+
+def test_heating_policy_allows_bounded_repository_tools() -> None:
+    identity = _writer_identity(repo="Bbambaaamm/heating", issue="172", paper_only=False)
+    tools = ("read_file", "search_files", "patch", "write_file", "herdr_verify_work")
+    assert heating_safe_engineering_policy(identity, tools) is None
 
 
 def test_consumer_policy_hook_can_only_tighten_admission(tmp_path: Path) -> None:

@@ -5,6 +5,10 @@ policy_profile: heating-safe-engineering
 hard_invariants:
   - repository_changes_do_not_imply_runtime_actuation
   - safety_relevant_production_changes_require_explicit_project_gate
+  - no_home_assistant_or_supervisor_write
+  - no_ssh_mqtt_device_or_boiler_control
+  - no_reload_restart_or_production_deploy
+  - repository_ci_is_not_live_runtime_evidence
 inheritance:
   child_may_expand_parent_permissions: false
 routing:

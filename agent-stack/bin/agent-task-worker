@@ -1531,6 +1531,25 @@ TASK COMPLETION CONTRACT:
 - Include concrete artifacts/checks in evidence. Put any blocker and next action in summary. The host binds repository "{repo}".
 - status must be one of completed, blocked, failed.
 """
+    elif profile == "heating-safe-engineering":
+        contract = f"""
+
+TASK COMPLETION CONTRACT:
+- You are running in isolated durable-task session {task_agent}, derived from coordinator {agent}, under Herdr for GitHub repository {repo}. The persistent coordinator chat is control-plane only and must not receive this task payload.
+- Work only from an isolated clean issue worktree under {str(task.get('worktree_root') or Path(workspace) / 'worktrees').rstrip('/')}. Never modify the persistent checkout, another issue's worktree or files outside the repository workspace.
+- This pilot authorizes repository engineering only: inspection, code/configuration edits, offline tests, documentation and pull-request preparation.
+- Do not access or modify Home Assistant, Supervisor, SSH, MQTT, devices, valves, pumps, boiler controls or production configuration.
+- Do not deploy, reload, restart, call a live service or interpret a repository edit, unit test, configuration check or CI result as evidence of live runtime behavior or physical actuation.
+- Do not push directly to main, bypass branch protection/CI/review, alter repository protections, expose credentials or widen tools/permissions.
+- Safety-relevant production deployment or actuation requires a separate explicit Heating project gate outside this task and issue.
+- This is a Hermes-only pilot. Do not delegate economic child work, send prompts to persistent child agents or create unmanaged processes.
+- Complete ordinary repository decisions autonomously inside the admitted slice, but stop on credentials, live-system access, deployment, physical action, permission increases or other human-only gates.
+- Completion flow for mergeable code is relevant offline tests -> PR -> exact-head CI/review evidence. Leave the PR open unless an existing separately authorized merge flow permits more.
+- Before finishing, use herdr_submit_result with status, a nonempty evidence list and summary. The host publishes to the exact attempt-owned result inode.
+- The host binds task_id="{task_id}", run_token="{run_token}", the fence and idempotency key; do not supply a path or identity arguments.
+- Include concrete repository artifacts/checks in evidence. Never claim production acceptance from offline evidence. Put any blocker and next action in summary.
+- status must be one of completed, blocked, failed.
+"""
     elif profile == "loxxess-technical":
         contract = f"""
 
@@ -1581,10 +1600,11 @@ TASK COMPLETION CONTRACT:
                      f"and idempotency_key={task['idempotency_key']} in its result JSON. "
                      "Include a nonempty evidence list and artifact_sha256 equal to the SHA-256 "
                      "of that list encoded as sorted-key UTF-8 JSON.\n")
-    contract += ("\n- For economic child work use the granted herdr_delegate_child tool with "
-                 "key, role, objective, prompt, tool and permission arguments. Reuse the same key "
-                 "for reconciliation. For write-capable children set cwd to the exact existing issue Git "
-                 "worktree. Returned evidence still requires shared acceptance.\n")
+    if profile != "heating-safe-engineering":
+        contract += ("\n- For economic child work use the granted herdr_delegate_child tool with "
+                     "key, role, objective, prompt, tool and permission arguments. Reuse the same key "
+                     "for reconciliation. For write-capable children set cwd to the exact existing issue Git "
+                     "worktree. Returned evidence still requires shared acceptance.\n")
     if modern_work_contract(task):
         from herdr.work_configuration import prompt_contract
         cycle = HOST_WORK_CYCLES.get((task["id"],task["run_token"]))

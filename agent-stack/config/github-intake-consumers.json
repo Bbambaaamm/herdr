@@ -125,16 +125,33 @@
     },
     {
       "consumer": "heating",
-      "enabled": false,
+      "enabled": true,
       "repository": "Bbambaaamm/heating",
-      "mode": "all_open",
+      "mode": "root_only",
+      "root_issue": 172,
       "coordinator_agent": "heating-hermes",
       "workspace": "/home/agentops/workspaces/heating",
       "safety_profile": "heating-safe-engineering",
-      "hermes_profile": "heating",
+      "parent_role": "writer",
+      "parent_tools": [
+        "read_file",
+        "search_files",
+        "patch",
+        "write_file",
+        "herdr_verify_work",
+        "herdr_submit_result"
+      ],
+      "parent_permissions": [
+        "workspace-write"
+      ],
+      "hermes_profile": "quantlab",
       "priority_default": 60,
-      "priority_architecture": 50,
-      "disabled_reason": "Enable only after the Heating coordinator and worker safety contract are deployed."
+      "priority_architecture": 60,
+      "worktree_root": "/home/agentops/workspaces/heating/worktrees",
+      "admission": {
+        "signal": "maintainer-comment-v1",
+        "max_age_seconds": 86400
+      }
     }
   ]
 }

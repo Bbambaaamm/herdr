@@ -39,6 +39,21 @@ QUANTLAB_PROTECTED_PATHS = (
     "backend/src/quantlab/security.py",
 )
 
+HEATING_FORBIDDEN_TOOL_MARKERS = (
+    "deploy",
+    "home_assistant",
+    "hass.",
+    "ha.service",
+    "supervisor",
+    "mqtt.publish",
+    "ssh",
+    "device.control",
+    "boiler",
+    "actuat",
+    "reload",
+    "restart",
+)
+
 
 def allow_all_consumer_policy(
     identity: AgentIdentity, tools: Sequence[str]
@@ -74,6 +89,20 @@ def quantlab_paper_policy(
     return None
 
 
+def heating_safe_engineering_policy(
+    identity: AgentIdentity, tools: Sequence[str]
+) -> str | None:
+    """Allow repository engineering while denying runtime/physical capability."""
+    common = base_consumer_policy(identity, tools)
+    if common is not None:
+        return common
+    for tool in tools:
+        lowered = tool.lower()
+        if any(marker in lowered for marker in HEATING_FORBIDDEN_TOOL_MARKERS):
+            return "heating_runtime_or_actuation_tool"
+    return None
+
+
 def _unknown_policy(profile: str) -> ConsumerPolicyHook:
     def deny_unknown(identity: AgentIdentity, tools: Sequence[str]) -> str | None:
         return "unknown_consumer_profile"
@@ -86,7 +115,8 @@ def policy_for_profile(profile: str) -> ConsumerPolicyHook:
         "quantlab-paper": quantlab_paper_policy,
         "majak": base_consumer_policy,
         "dotacni-majak": base_consumer_policy,
-        "heating": base_consumer_policy,
+        "heating": heating_safe_engineering_policy,
+        "heating-safe-engineering": heating_safe_engineering_policy,
         "herdr-core": base_consumer_policy,
         "loxxess-technical": base_consumer_policy,
     }

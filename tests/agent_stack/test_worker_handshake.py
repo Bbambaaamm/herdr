@@ -610,6 +610,43 @@ def test_loxxess_prompt_has_domain_contract_without_quantlab_invariants(tmp_path
     assert "/home/agentops/workspaces/loxxess-technical-ai-assistant/worktrees" in prompt
 
 
+def test_heating_prompt_is_repository_only_and_has_no_delegation_contract(tmp_path):
+    configure_paths(tmp_path)
+    task = base_task()
+    task.update(
+        {
+            "repo": "Bbambaaamm/heating",
+            "workspace": "/home/agentops/workspaces/heating",
+            "worktree_root": "/home/agentops/workspaces/heating/worktrees",
+            "safety_profile": "heating-safe-engineering",
+            "hermes_profile": "quantlab",
+            "run_token": "heating-pilot-run",
+            "routing": {
+                "selected_agent": "heating-hermes",
+                "tier": "profile-default",
+                "model": "profile-router",
+            },
+            "execution_session": {
+                "agent_name": "heating-hermes-t-deadbeef",
+                "session_name": "durable-heating",
+                "pane_id": "owned-heating-pane",
+                "coordinator_agent": "heating-hermes",
+                "owned_pane": True,
+            },
+        }
+    )
+
+    prompt = worker.prompt_text(task)
+    assert "repository Bbambaaamm/heating" in prompt
+    assert "repository engineering only" in prompt
+    assert "Do not access or modify Home Assistant" in prompt
+    assert "Do not deploy, reload, restart" in prompt
+    assert "This is a Hermes-only pilot" in prompt
+    assert "herdr_delegate_child" not in prompt
+    assert "PAPER-only, PIT/causality" not in prompt
+    assert "/home/agentops/workspaces/heating/worktrees" in prompt
+
+
 def test_run_prompt_fails_closed_without_isolated_session(tmp_path):
     configure_paths(tmp_path)
     task = base_task()

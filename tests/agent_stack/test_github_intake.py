@@ -57,6 +57,7 @@ class GitHubIntakeTests(unittest.TestCase):
             ("Bbambaaamm/dotacni-majak", 662, "HERDR CONTROL", "Finish Majak"),
             ("Bbambaaamm/Autonomous-Quant-Lab", 45, "Synthetic authorized issue", "Bounded work"),
             ("Bbambaaamm/loxxess-technical-ai-assistant", 2, "[P0] Visual search", "Bounded LOXXESS work"),
+            ("Bbambaaamm/heating", 172, "HERDR CONTROL: repository-only Hermes pilot", "Repository-only pilot"),
         ]:
             api = f"https://api.github.com/repos/{repo}"
             repository = {"id": number + 1000, "full_name": repo}
@@ -85,7 +86,8 @@ class GitHubIntakeTests(unittest.TestCase):
             api = f"https://api.github.com/repos/{repo}"
             number = {"Bbambaaamm/herdr": 53, "Bbambaaamm/dotacni-majak": 662,
                       "Bbambaaamm/Autonomous-Quant-Lab": 45,
-                      "Bbambaaamm/loxxess-technical-ai-assistant": 2}[repo]
+                      "Bbambaaamm/loxxess-technical-ai-assistant": 2,
+                      "Bbambaaamm/heating": 172}[repo]
             issue_url = f"{api}/issues/{number}"
             if url == api:
                 return copy.deepcopy(self.repository_rows[repo])
@@ -180,6 +182,28 @@ class GitHubIntakeTests(unittest.TestCase):
             "worktree_root": "/home/agentops/workspaces/loxxess-technical-ai-assistant/worktrees",
         }
 
+    @staticmethod
+    def heating_consumer():
+        return {
+            "consumer": "heating",
+            "enabled": True,
+            "admission": {"signal": "maintainer-comment-v1", "max_age_seconds": 86400},
+            "repository": "Bbambaaamm/heating",
+            "mode": "root_only",
+            "root_issue": 172,
+            "coordinator_agent": "heating-hermes",
+            "workspace": "/home/agentops/workspaces/heating",
+            "safety_profile": "heating-safe-engineering",
+            "hermes_profile": "quantlab",
+            "priority_default": 60,
+            "priority_architecture": 60,
+            "parent_role": "writer",
+            "parent_tools": ["read_file", "search_files", "patch", "write_file",
+                             "herdr_verify_work", "herdr_submit_result"],
+            "parent_permissions": ["workspace-write"],
+            "worktree_root": "/home/agentops/workspaces/heating/worktrees",
+        }
+
     def test_load_state_migrates_legacy_quantlab_keys(self):
         self.intake.STATE.write_text(
             json.dumps({"45": {"open": True, "scheduler_state": "active"}}),
@@ -210,25 +234,15 @@ class GitHubIntakeTests(unittest.TestCase):
         self.assertEqual(len(indexed["Bbambaaamm/Autonomous-Quant-Lab#45"]), 1)
         self.assertEqual(len(indexed["Bbambaaamm/dotacni-majak#45"]), 1)
 
-    def test_registry_enables_declared_consumers_but_not_disabled_heating(self):
-        heating = {
-            "consumer": "heating",
-            "enabled": False,
-            "repository": "Bbambaaamm/heating",
-            "mode": "all_open",
-            "coordinator_agent": "heating-hermes",
-            "workspace": "/home/agentops/workspaces/heating",
-            "safety_profile": "heating-safe-engineering",
-            "hermes_profile": "heating",
-        }
+    def test_registry_enables_declared_consumers_including_heating_pilot(self):
         self.write_config(
             [self.quantlab_consumer(), self.majak_consumer(), self.herdr_consumer(),
-             self.loxxess_consumer(), heating]
+             self.loxxess_consumer(), self.heating_consumer()]
         )
         consumers = self.intake.load_consumers()
         self.assertEqual(
             [row["consumer"] for row in consumers],
-            ["quantlab", "majak", "herdr", "loxxess"],
+            ["quantlab", "majak", "herdr", "loxxess", "heating"],
         )
 
     def test_loxxess_priority_respects_p0_and_p1_labels(self):
@@ -260,7 +274,7 @@ class GitHubIntakeTests(unittest.TestCase):
 
     def test_root_consumers_do_not_outrank_quantlab_default_work(self):
         quant = self.quantlab_consumer()
-        for root in (self.majak_consumer(), self.herdr_consumer()):
+        for root in (self.majak_consumer(), self.herdr_consumer(), self.heating_consumer()):
             self.assertGreaterEqual(
                 root["priority_default"],
                 quant["priority_default"],
@@ -269,6 +283,27 @@ class GitHubIntakeTests(unittest.TestCase):
                 root["priority_architecture"],
                 quant["priority_default"],
             )
+
+    def test_queue_heating_root_carries_repository_only_contract(self):
+        issue = {
+            "number": 172,
+            "title": "HERDR CONTROL: repository-only Hermes pilot",
+            "body": "Repository-only pilot",
+            "html_url": "https://github.com/Bbambaaamm/heating/issues/172",
+        }
+        task_id = self.intake.queue_issue(self.heating_consumer(), issue, [])
+        task = json.loads((self.intake.PENDING / f"{task_id}.json").read_text())
+        self.assertTrue(task_id.startswith("github-heating-issue-172-"))
+        self.assertEqual(task["kind"], "github_root_orchestration")
+        self.assertEqual(task["repo"], "Bbambaaamm/heating")
+        self.assertEqual(task["safety_profile"], "heating-safe-engineering")
+        self.assertEqual(task["hermes_profile"], "quantlab")
+        self.assertEqual(task["agent"], "heating-hermes")
+        self.assertNotIn("herdr_delegate_child", task["parent_tools"])
+        self.assertIn("repository-engineering control root", task["prompt"])
+        self.assertIn("never access or modify Home Assistant", task["prompt"])
+        self.assertIn("pilot is Hermes-only", task["prompt"])
+        self.assertNotIn("PAPER-only trading", task["prompt"])
 
     def test_registry_fails_closed_on_duplicate_repository(self):
         duplicate = self.majak_consumer()
