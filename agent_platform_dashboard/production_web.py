@@ -87,6 +87,11 @@ class Application:
             except (OSError, UnicodeError, ValueError):
                 return error('503 Service Unavailable')
             sections = []
+            model = data['observability']
+            sections.append('<section><h3>Machine City observability · production snapshot</h3>'
+                            + '<p>Lifecycle, measured metrics and producer availability are separate. '
+                            'UNKNOWN means no trusted producer supplied a result.</p><pre>'
+                            + escape(json.dumps(model, sort_keys=True, indent=2)) + '</pre></section>')
             for source in data['sources']:
                 count = str(len(source['rows'])) if source['status'] == 'available' else 'unavailable'
                 roles = provider_roles(source)

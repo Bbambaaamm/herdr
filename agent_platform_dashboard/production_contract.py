@@ -322,7 +322,7 @@ def row(kind, value):
 
 
 def validate(value):
-    keys(value, 'version generated_at sources')
+    keys(value, 'version generated_at sources observability')
     need(type(value['version']) is int and value['version'] == 1 and number(value['generated_at']))
     need(type(value['sources']) is list and len(value['sources']) == len(SOURCE_PAIRS))
     seen = set()
@@ -363,7 +363,52 @@ def validate(value):
             if kind == 'swarm':
                 need(profile == 'quantlab')
         need(len({json.dumps(r, sort_keys=True) for r in source['rows']}) == len(source['rows']))
+    observability(value['observability'])
     return value
+
+
+def observability(model):
+    from .observability import AXES, INVENTORY
+    keys(model, 'version lifecycle metrics inventory')
+    need(type(model['version']) is int and model['version'] == 1)
+    need(type(model['lifecycle']) is list and len(model['lifecycle']) == len(AXES)
+         and all(type(r) is dict for r in model['lifecycle'])
+         and [r.get('id') for r in model['lifecycle']] == list(AXES))
+    need(type(model['metrics']) is list and len(model['metrics']) <= 128)
+    need(type(model['inventory']) is list and len(model['inventory']) == len(INVENTORY)
+         and all(type(r) is dict for r in model['inventory'])
+         and [r.get('id') for r in model['inventory']] == list(INVENTORY))
+    ids = set()
+    for metric in model['lifecycle'] + model['metrics']:
+        need(type(metric) is dict and set(metric) in (
+            set('id value unit window source freshness source_age_seconds coverage reason'.split()),
+            set('id value unit window source freshness source_age_seconds coverage reason evidence_hash'.split())))
+        need(type(metric['id']) is str and identifier(metric['id'], 80) and metric['id'] not in ids)
+        ids.add(metric['id'])
+        need(metric['value'] is None or type(metric['value']) in (int, bool)
+             and (type(metric['value']) is bool or number(metric['value']))
+             or type(metric['value']) is str and identifier(metric['value'], 80))
+        need(type(metric['unit']) is str and identifier(metric['unit'], 32)
+             and type(metric['window']) is str and identifier(metric['window'], 32)
+             and type(metric['source']) is str and identifier(metric['source'], 80))
+        need(metric['freshness'] in ('fresh', 'stale', 'unavailable', 'unknown'))
+        need(metric['source_age_seconds'] is None or number(metric['source_age_seconds']))
+        keys(metric['coverage'], 'covered denominator')
+        need(number(metric['coverage']['covered']) and number(metric['coverage']['denominator'])
+             and metric['coverage']['covered'] <= metric['coverage']['denominator'])
+        need(metric['reason'] is None or identifier(metric['reason'], 64))
+        if 'evidence_hash' in metric:
+            need(hex_id(metric['evidence_hash'], (40, 64)))
+    for row in model['inventory']:
+        keys(row, 'id status reason source freshness source_age_seconds coverage')
+        need(row['id'] in INVENTORY and row['status'] in ('available', 'UNKNOWN'))
+        need(row['reason'] is None or identifier(row['reason'], 64))
+        need(type(row['source']) is str and identifier(row['source'], 80))
+        need(row['freshness'] in ('fresh', 'stale', 'unavailable', 'unknown'))
+        need(row['source_age_seconds'] is None or number(row['source_age_seconds']))
+        keys(row['coverage'], 'covered denominator')
+        need(number(row['coverage']['covered']) and number(row['coverage']['denominator'])
+             and row['coverage']['covered'] <= row['coverage']['denominator'])
 
 
 def decode(data):
@@ -380,10 +425,13 @@ def encode(value):
 
 
 def unavailable(now):
-    return {'version': 1, 'generated_at': now, 'sources': [
+    result = {'version': 1, 'generated_at': now, 'sources': [
         dict(profile=p, kind=k, observed_at=now, data_at=None, status='unavailable',
              reason='not_configured', rows=[], board_id=None, source_epoch=None)
         for p, k in SOURCE_PAIRS]}
+    from .observability import build
+    result['observability'] = build(result)
+    return result
 
 
 def project(value, profiles, now):
@@ -391,8 +439,13 @@ def project(value, profiles, now):
     need(type(profiles) is tuple and profiles and len(set(profiles)) == len(profiles)
          and all(p in PROFILES for p in profiles) and number(now))
     result = parse(encode(value))
-    result['sources'] = [s for s in result['sources'] if s['profile'] in profiles]
+    result['sources'] = [source for source in result['sources'] if source['profile'] in profiles]
     for source in result['sources']:
-        if not 0 <= now - source['observed_at'] <= 90:
+        if (not 0 <= now - source['observed_at'] <= 90
+                or source['data_at'] is not None and source['data_at'] > now):
             source.update(status='unavailable', reason='stale', rows=[], data_at=None)
+    # Rebuild only after authorization and temporal invalidation. Values from
+    # a source removed above cannot survive as fresh/available observations.
+    from .observability import build
+    result['observability'] = build(result, now=now, visible_profiles=profiles)
     return result

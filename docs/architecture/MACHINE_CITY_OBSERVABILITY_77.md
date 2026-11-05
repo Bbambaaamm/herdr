@@ -1,0 +1,112 @@
+# Machine City observability contract (#77)
+
+Machine City is a read-only projection. It does not execute tools, grant approvals, mutate TaskGraph,
+merge changes, deploy releases, start experiments, or call model providers.
+
+## Truth model
+
+The production snapshot contains a closed `observability` read model built server-side from already
+sanitized durable source projections. Browser code validates and renders this model; it is not allowed
+to infer lifecycle authority from log text, queue labels, demo state, or animation.
+
+Every lifecycle/metric row carries:
+- source;
+- freshness and source age;
+- unit and window;
+- coverage numerator and denominator;
+- reason code when unavailable or partial;
+- optional evidence/result hash only when the accepted source actually supplies one.
+
+The lifecycle axes are deliberately separate:
+1. `observed_live_execution` — runtime observation only;
+2. `delivery_reconciliation` — delivery/reconciliation evidence only;
+3. `settled_control_cycle` — durable task control state only;
+4. `verified_artifact` — UNKNOWN until the accepted #85 producer is wired;
+5. `integrated_change` — UNKNOWN until an accepted integration producer is wired;
+6. `deployed_version` — global deployed release identity from the release source. This is not proof
+   that a particular task/result was integrated or deployed.
+
+## Sources available on the #77 base
+
+| Projection | Accepted source | Meaning |
+| --- | --- | --- |
+| runtime / reconcile / settled | `quantlab/swarm` | Observed and durable control state; never artifact verification |
+| model router aggregates | `*/router` and Maják `codex` routing summary | Request-weighted tokens/cost/latency/fallback and current aggregate route policy |
+| per-node router metrics | task-bound rows in `*/router` | Bounded newest-node slice with explicit node coverage |
+| legacy search | `*/search` | Existing Search Router history only; explicitly not #97 Search+Verifier |
+| deployed release | `quantlab/release` | Global release tag/commit only |
+
+The read model emits explicit `UNKNOWN / producer_unavailable` rows for producers that are not
+accepted into this base, including Execution/Tool Fabric, #97 Search+Verifier, Prompt Runtime,
+Human/Event, Eval/Shadow, Budget, Context/Skill bundle, semantic guard, A2A/MCP specialist events,
+reviewer outcomes, approval/HITL state, evidence acceptance, execution plan/check runner,
+per-route durable decision trace, historical route policy, provider health, and circuit breaker state.
+
+No missing producer is represented by a fabricated zero or PASS.
+
+## Coverage and cost
+
+Router cost/token/duration values are summed only from rows that contain an actual measurement.
+A measured zero remains zero. A missing measurement remains `null` with
+`reason=measurement_missing` and request-weighted coverage.
+
+Per-node metrics use the source's already-anonymized task identity and derive a bounded display key
+from it. The newest bounded node slice publishes an explicit `node_coverage` metric; a partial slice
+is never described as complete.
+
+Demo mode changes only the synthetic scene. When a production snapshot is present the UI labels
+metrics as coming from that snapshot; when it is absent the UI says production metrics are
+unavailable.
+
+## Freshness and projection
+
+Freshness is recomputed at authorized projection time from both source observation time and data
+time. Profile projection rebuilds observability from the authorized source subset, preventing
+cross-profile values from leaking through a precomputed aggregate.
+
+Request-time source authorization and temporal invalidation happen before rebuilding the read
+model. Cleared source rows cannot survive as available metrics or inventory. Standalone builds
+also suppress source observations or data timestamps from the future rather than clamping their
+age to zero. Historical data behind a current source remains explicitly stale when its age warrants it.
+
+The embedded model router has its own `routing_observed_at`. Both routing metrics and inventory
+use the oldest relevant Codex-source or routing timestamp. A future or invalid routing timestamp
+produces UNKNOWN with `routing_time_invalid`; healthy Codex usage does not make missing routing
+available. That case retains `routing_unavailable` on every routing metric and the inventory row.
+
+Metric strings retain their strict 80-character bound. A valid source routing reason of 81–128
+characters stays intact in its sanitized source row, while its metric is UNKNOWN with
+`reason_over_bound` and coverage `0/1`. It is neither silently truncated nor allowed to suppress
+the entire snapshot. The source's existing 128-character bound remains unchanged.
+
+Legacy charts remain available under a clearly labeled legacy detail section. Missing legacy router
+or search sources render UNKNOWN/unavailable, not zero routes or 100% coverage.
+
+## Complete publication budget
+
+The complete canonical snapshot retains the original 131,072-byte limit, including ASCII escaping,
+source rows, lifecycle, inventory, metrics and JSON framing. Export and authorized profile rebuilds
+budget the derived model against the bytes actually left by their source snapshot.
+
+If the full derived model does not fit, oldest selected node-detail groups yield first, as complete
+groups. Their per-profile node coverage is reduced to the number actually represented. Further
+pressure removes unavailable optional metric placeholders before measured optional aggregates.
+An explicit UNKNOWN `observability.metric_coverage` row carries `publication_byte_budget` and the
+emitted/original metric-row coverage. Lifecycle and producer inventory remain present. Budgeting
+does not mutate, truncate or silently remove any underlying source row.
+
+Some valid source-only combinations leave too little space even for the required derived framing.
+Each collector admission therefore checks the complete frame. It first uses the existing explicit
+shared-queue failure path if needed, then rejects only an otherwise unpublishable new producer as
+`unavailable / source_failed`, with empty rows and no data timestamp. Already admitted nonqueue
+histories remain intact. Shared queue failure is sticky for both profiles; the cached payload cannot
+reappear later in the same collection, and its source is read only once. This changes only the
+read-model availability result, never a producer database, authoritative task/evidence state, queue
+file, budget, reservation or source limit. A standalone build that cannot fit required framing fails
+closed rather than returning an oversized or falsely complete model.
+
+## Data excluded
+
+The observability schema is closed and bounded. It does not carry raw prompts, raw tool arguments or
+results, credentials, approval tokens, private verifier rubrics, holdout answers, model chain-of-
+thought, or unbounded logs.
