@@ -82,6 +82,29 @@ the entire snapshot. The source's existing 128-character bound remains unchanged
 Legacy charts remain available under a clearly labeled legacy detail section. Missing legacy router
 or search sources render UNKNOWN/unavailable, not zero routes or 100% coverage.
 
+## Complete publication budget
+
+The complete canonical snapshot retains the original 131,072-byte limit, including ASCII escaping,
+source rows, lifecycle, inventory, metrics and JSON framing. Export and authorized profile rebuilds
+budget the derived model against the bytes actually left by their source snapshot.
+
+If the full derived model does not fit, oldest selected node-detail groups yield first, as complete
+groups. Their per-profile node coverage is reduced to the number actually represented. Further
+pressure removes unavailable optional metric placeholders before measured optional aggregates.
+An explicit UNKNOWN `observability.metric_coverage` row carries `publication_byte_budget` and the
+emitted/original metric-row coverage. Lifecycle and producer inventory remain present. Budgeting
+does not mutate, truncate or silently remove any underlying source row.
+
+Some valid source-only combinations leave too little space even for the required derived framing.
+Each collector admission therefore checks the complete frame. It first uses the existing explicit
+shared-queue failure path if needed, then rejects only an otherwise unpublishable new producer as
+`unavailable / source_failed`, with empty rows and no data timestamp. Already admitted nonqueue
+histories remain intact. Shared queue failure is sticky for both profiles; the cached payload cannot
+reappear later in the same collection, and its source is read only once. This changes only the
+read-model availability result, never a producer database, authoritative task/evidence state, queue
+file, budget, reservation or source limit. A standalone build that cannot fit required framing fails
+closed rather than returning an oversized or falsely complete model.
+
 ## Data excluded
 
 The observability schema is closed and bounded. It does not carry raw prompts, raw tool arguments or

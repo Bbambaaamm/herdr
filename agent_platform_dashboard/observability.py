@@ -1,5 +1,6 @@
 """Truthful, bounded Machine City observability from sanitized production sources."""
 import hashlib
+import json
 
 INVENTORY = {
     'runtime_swarm': ('quantlab', 'swarm'),
@@ -282,6 +283,59 @@ def _aggregate_rows(metrics, profile, kind, rows, freshness, age, source_reason)
             ))
 
 
+def _fit_publication(snapshot, model):
+    """Fit optional derived metrics around the original canonical source bytes."""
+    from .production_contract import MAX_BYTES
+
+    def fits(candidate):
+        # Match production_contract.encode, including ASCII escaping and framing.
+        raw = json.dumps({**snapshot, 'observability': candidate}, sort_keys=True,
+                         separators=(',', ':'), ensure_ascii=True, allow_nan=False).encode()
+        return len(raw) <= MAX_BYTES
+
+    if fits(model):
+        return model
+    metrics = list(model['metrics'])
+    denominator = len(metrics)
+
+    def bounded():
+        coverage = item('observability.metric_coverage', unit='metrics',
+            source='publication_budget', covered=len(metrics), denominator=denominator,
+            reason='publication_byte_budget')
+        return {**model, 'metrics': [*metrics, coverage]}
+
+    # Remove complete oldest selected node groups first, never a partial set of
+    # fields for a node. The underlying fifty-row histories are left untouched.
+    groups = list(dict.fromkeys(row['id'].rsplit('.', 1)[0] for row in metrics
+                               if '.node.' in row['id']))
+    for group in reversed(groups):
+        metrics = [row for row in metrics if not row['id'].startswith(group + '.')]
+        profile = group.split('.', 1)[0]
+        remaining = {row['id'].split('.')[2] for row in metrics
+                     if row['id'].startswith(profile + '.node.')}
+        metrics = [({**row, 'value': len(remaining),
+                     'coverage': {**row['coverage'], 'covered': len(remaining)},
+                     'reason': 'publication_byte_budget'}
+                    if row['id'] == profile + '.router.node_coverage' else row)
+                   for row in metrics]
+        result = bounded()
+        if fits(result):
+            return result
+
+    # Preserve measured aggregates before unavailable optional placeholders.
+    # The fixed lifecycle and producer inventory are never omitted.
+    omitted = [row['id'] for row in reversed(metrics) if row['value'] is None]
+    omitted += [row['id'] for row in reversed(metrics) if row['value'] is not None]
+    for identity in omitted:
+        metrics = [row for row in metrics if row['id'] != identity]
+        result = bounded()
+        if fits(result):
+            return result
+    # The caller must reject a source admission explicitly, rather than publish
+    # a false complete snapshot or silently discard original producer rows.
+    raise ValueError('observability_publication_budget')
+
+
 def build(snapshot, *, now=None, visible_profiles=None):
     """Build one deterministic read model. No task state is inferred from log text."""
     now = snapshot['generated_at'] if now is None else now
@@ -433,9 +487,10 @@ def build(snapshot, *, now=None, visible_profiles=None):
             source_reason if routing is None else None,
         ))
 
-    return dict(
+    model = dict(
         version=1,
         lifecycle=lifecycle,
         metrics=metrics,
         inventory=_inventory(snapshot, now, set(visible_profiles)),
     )
+    return _fit_publication(snapshot, model)

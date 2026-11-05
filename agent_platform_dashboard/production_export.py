@@ -107,7 +107,20 @@ def collect(config, now):
             if kind == 'kanban':
                 source.update(board_id=setting['board_id'], source_epoch=setting['source_epoch'])
             c.validate(snapshot)
-            if kind == 'swarm':
+            try:
+                snapshot['observability'] = build_observability(snapshot)
+                c.encode(snapshot)
+            except ValueError:
+                # Shared queue expansion already has an explicit failure path.
+                # Prefer it to losing an otherwise valid nonqueue history.
+                queue_sources = [item for item in snapshot['sources']
+                                 if item['kind'] == 'queue' and item['status'] == 'available']
+                if not queue_sources:
+                    raise
+                queue_load_failed = True  # The later profile cannot revive cached rows.
+                for queue_source in queue_sources:
+                    queue_source.update(rows=[], data_at=None, status='unavailable',
+                                        reason='source_failed')
                 snapshot['observability'] = build_observability(snapshot)
                 c.encode(snapshot)
         except sources.StaleSource:
@@ -119,8 +132,8 @@ def collect(config, now):
     # Queue input has its own bounded parser, but the final JSON encoding may expand
     # non-ASCII display text. Enforce the real publication bound end-to-end so a
     # valid near-limit queue cannot suppress the entire production snapshot.
-    snapshot['observability'] = build_observability(snapshot)
     try:
+        snapshot['observability'] = build_observability(snapshot)
         c.encode(snapshot)
     except ValueError:
         queue_sources = [
