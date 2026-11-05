@@ -402,3 +402,77 @@ def test_worker_freezes_scope_before_dispatch_and_denies_changed_contract(tmp_pa
     task["completion_contract"]["files"].append({"path":"unrelated.py","subtree":False})
     with pytest.raises(EvidenceError,match="immutable completion plan changed"):
         collector.freeze_plan(store.root.parent,task)
+
+
+@pytest.mark.parametrize("envelope", ["", "<!-- codex-review-receipt:v1 -->\n\n"])
+def test_clean_receipt_envelope_preserves_raw_digest_and_exact_commit(monkeypatch, envelope):
+    from herdr.evidence import digest
+    artifact, plan, pr, checks, comment = proof_fixture()
+    comment["body"] = envelope + comment["body"]
+    original = comment["body"]
+    calls = install_transport(monkeypatch, artifact, plan, pr, checks, comment)
+    proof = collector.collect_github(plan, artifact, 4)
+    assert proof["review"]["body_digest"] == digest(original)
+    assert proof["review"]["comment_id"] == comment["id"]
+    assert proof["review"]["commit_sha"] == artifact.commit_sha
+    assert comment["body"] == original
+    assert any(path.endswith(artifact.commit_sha[:10]) for path in calls)
+
+
+@pytest.mark.parametrize("envelope", [
+    "<!-- codex-review-receipt:v2 -->\n\n{clean}",
+    "<!-- codex-review-receipt:v1 -->\n\n<!-- codex-review-receipt:v1 -->\n\n{clean}",
+    "Untrusted introduction\n<!-- codex-review-receipt:v1 -->\n\n{clean}",
+    "\n<!-- codex-review-receipt:v1 -->\n\n{clean}",
+    "> <!-- codex-review-receipt:v1 -->\n\n{clean}",
+    "<!-- codex-review-receipt:v1 -->\n{clean}",
+    "<!-- codex-review-receipt:v1 -->\r\n\r\n{clean}",
+    "<!-- codex-review-receipt:v1  -->\n\n{clean}",
+    "{clean}\n<!-- codex-review-receipt:v1 -->",
+    "{clean}\n> <!-- codex-review-receipt:v2 -->",
+    "<!-- codex-review-receipt:v1 -->\n\n{clean}\n<!-- codex-review-receipt:v2 -->",
+])
+def test_unknown_ambiguous_or_quoted_receipt_envelope_is_not_review_evidence(monkeypatch, envelope):
+    artifact, plan, pr, checks, comment = proof_fixture()
+    comment["body"] = envelope.format(clean=comment["body"])
+    install_transport(monkeypatch, artifact, plan, pr, checks, comment)
+    with pytest.raises(EvidenceMissing, match="independent exact-commit"):
+        collector.collect_github(plan, artifact, 4)
+
+
+@pytest.mark.parametrize("fault", ["wrong_bot", "wrong_actor_type", "wrong_resolved_commit",
+    "wrong_app", "pending_ci", "wrong_workflow", "outstanding_changes", "unresolved_threads",
+    "newer_comment", "changed_comment", "newer_review"])
+def test_recognized_receipt_envelope_keeps_all_existing_acceptance_gates(monkeypatch, fault):
+    from copy import deepcopy
+    artifact, plan, pr, checks, comment = proof_fixture()
+    comment["body"] = "<!-- codex-review-receipt:v1 -->\n\n" + comment["body"]
+    reviews, resolved = (), None
+    if fault == "wrong_bot": comment["user"]["login"] = "another-bot"
+    elif fault == "wrong_actor_type": comment["user"]["type"] = "User"
+    elif fault == "wrong_resolved_commit": resolved = "d" * 40
+    elif fault == "wrong_app": checks["check_runs"][0]["app"]["id"] = 1
+    elif fault == "pending_ci": checks["check_runs"][0]["conclusion"] = None
+    elif fault == "outstanding_changes":
+        reviews = [{"id": 20, "user": {"login": "human"}, "state": "CHANGES_REQUESTED",
+                    "submitted_at": "2026-10-03T19:00:00Z", "commit_id": artifact.commit_sha}]
+    elif fault == "newer_review":
+        reviews = [{"id": 20, "user": {"login": collector.BOT}, "state": "COMMENTED",
+                    "submitted_at": "2026-10-03T21:00:00Z", "commit_id": artifact.commit_sha}]
+    install_transport(monkeypatch, artifact, plan, pr, checks, comment, resolved=resolved, reviews=reviews)
+    if fault == "unresolved_threads": monkeypatch.setattr(collector, "_unresolved_threads", lambda *a: True)
+    old = collector.github
+    count = 0
+    def api(path):
+        nonlocal count
+        value = deepcopy(old(path))
+        if fault == "wrong_workflow" and "/actions/runs/" in path: value["workflow_id"] = 1
+        if "/issues/" in path:
+            count += 1
+            if count == 2 and fault == "changed_comment": value[0]["body"] += "\nEdited after selection."
+            if count == 2 and fault == "newer_comment":
+                newer = deepcopy(value[0]); newer.update(id=9, created_at="2026-10-03T21:00:00Z")
+                value.append(newer)
+        return value
+    monkeypatch.setattr(collector, "github", api)
+    with pytest.raises(EvidenceError): collector.collect_github(plan, artifact, 4)

@@ -1,0 +1,491 @@
+"""Bounded sealed Hermes profile inputs for an isolated private HOME namespace.
+
+This module does not authorize model execution or deploy a profile. A host
+authority must provide trusted exact content digests before using a snapshot.
+Host input bytes are copied into sealed anonymous memory, never into a disk
+working tree. A sandbox can mount those bytes under a private HOME tmpfs so
+the host's mutable ~/.hermes path cannot be substituted mid-session.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import stat
+from typing import Mapping
+
+_PROFILE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}\Z")
+_HEX = re.compile(r"[a-f0-9]{64}\Z")
+_MAX_FILES = 16
+_MAX_FILE_BYTES = 131_072
+_MAX_TOTAL_BYTES = 524_288
+_HOME = Path("/home/agentops")
+_RUNTIME = ("sessions", "cache", "logs", "pastes")
+# The pinned SDK initializes this skeleton while reading configuration.
+# These directories are empty private-home entries, not new writable mounts.
+_INITIALIZATION = ("cron", "memories", "pairing", "hooks",
+                   "image_cache", "audio_cache", "skills")
+# Linux memfd seal constants (some Python builds omit exported names).
+_F_GET_SEALS = getattr(fcntl, "F_GET_SEALS", 1034)
+_F_ADD_SEALS = getattr(fcntl, "F_ADD_SEALS", 1033)
+_REQUIRED_SEALS = (getattr(fcntl, "F_SEAL_SEAL", 1)
+                   | getattr(fcntl, "F_SEAL_SHRINK", 2)
+                   | getattr(fcntl, "F_SEAL_GROW", 4)
+                   | getattr(fcntl, "F_SEAL_WRITE", 8))
+
+
+class PrivateProfileError(RuntimeError):
+    pass
+
+
+def profile_identity(name: str, files: Mapping[str, str]) -> dict[str, object]:
+    """Canonical host profile identity without exposing approved file bytes."""
+    _need(isinstance(name, str) and bool(_PROFILE.fullmatch(name)),
+          "profile_identity_invalid")
+    _need(isinstance(files, Mapping) and 2 <= len(files) <= _MAX_FILES
+          and {"config.yaml", ".env"} <= set(files), "profile_identity_invalid")
+    manifest = {}
+    for key, digest in files.items():
+        _relative(key)
+        _need(isinstance(digest, str) and bool(_HEX.fullmatch(digest)),
+              "profile_identity_invalid")
+        manifest[key] = digest
+    canonical = {"name": name, "files": dict(sorted(manifest.items()))}
+    source = json.dumps(canonical, sort_keys=True,
+                        separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    _need(len(source) <= 8192, "profile_identity_invalid")
+    return {**canonical, "manifest_sha256": hashlib.sha256(source).hexdigest()}
+
+
+def _need(ok: bool, reason: str) -> None:
+    if not ok:
+        raise PrivateProfileError(reason)
+
+
+def _relative(name: str) -> tuple[str, ...]:
+    _need(isinstance(name, str) and 0 < len(name) <= 256, "profile_path_invalid")
+    parsed = PurePosixPath(name)
+    parts = name.split("/")
+    _need(not parsed.is_absolute() and len(parts) <= 8
+          and all(part not in ("", ".", "..") and len(part) <= 80 for part in parts)
+          and "\\" not in name, "profile_path_invalid")
+    # Runtime/storage files must NEVER be reintroduced as frozen inputs.
+    _need(parts[0] not in {
+        "sessions", "logs", "cache", "pastes", "state.db", ".hermes_history",
+        "state.db-wal", "state.db-shm",
+    }, "profile_mutable_input_denied")
+    return tuple(parts)
+
+
+def _open_beneath(root_fd: int, name: str) -> int:
+    parts = _relative(name)
+    parent = os.dup(root_fd)
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=parent)
+            os.close(parent)
+            parent = child
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     dir_fd=parent)
+        return fd
+    finally:
+        os.close(parent)
+
+
+@dataclass
+class SealedProfileInput:
+    relative: str
+    fd: int
+    size: int
+    sha256: str
+
+    def verify(self) -> None:
+        _need(self.fd >= 0, "profile_seal_closed")
+        info = os.fstat(self.fd)
+        _need(stat.S_ISREG(info.st_mode) and info.st_size == self.size,
+              "profile_seal_identity_invalid")
+        actual = fcntl.fcntl(self.fd, _F_GET_SEALS)
+        _need(actual & _REQUIRED_SEALS == _REQUIRED_SEALS,
+              "profile_seal_missing")
+        _need(hashlib.sha256(os.pread(self.fd, self.size, 0)).hexdigest()
+              == self.sha256, "profile_seal_digest_invalid")
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+
+SDK_POLICY_MEMBER = "herdr-sdk-policy.json"
+MANAGED_SENTINEL = Path("/run/herdr/policy-code/no-managed-scope")
+
+
+def _closed_json(raw: bytes, reason: str) -> dict:
+    def pairs(entries):
+        result = {}
+        for key, value in entries:
+            _need(key not in result, reason)
+            result[key] = value
+        return result
+    def constant(value):
+        raise PrivateProfileError(reason)
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs, parse_constant=constant)
+    except (UnicodeError, ValueError, TypeError):
+        raise PrivateProfileError(reason) from None
+    _need(type(value) is dict, reason)
+    return value
+
+
+def verified_profile_identity(value) -> dict:
+    _need(isinstance(value, dict) and set(value) == {"name", "files", "manifest_sha256"},
+          "private_sdk_manifest_invalid")
+    expected = profile_identity(value["name"], value["files"])
+    _need(value == expected, "private_sdk_manifest_invalid")
+    return expected
+
+
+@dataclass(frozen=True)
+class PrivateSDKPolicy:
+    """Nonsecret data from an authenticated, mounted ApprovedProfile manifest.
+
+    Constructing this value is not approval. Only the verified bootstrap consumer
+    installs it; host callers derive it from their actual sealed snapshot.
+    """
+    profile_name: str
+    profile_sha256: str
+    config_sha256: str
+    auth_sha256: str | None = None
+    projection_sha256: str | None = None
+
+    def __post_init__(self):
+        _need(isinstance(self.profile_name, str) and bool(_PROFILE.fullmatch(self.profile_name))
+              and all(isinstance(x, str) and bool(_HEX.fullmatch(x))
+                      for x in (self.profile_sha256, self.config_sha256)), "private_sdk_policy_invalid")
+        _need(self.auth_sha256 is None or (type(self.auth_sha256) is str and bool(_HEX.fullmatch(self.auth_sha256))),
+              "private_sdk_auth_hash_invalid")
+        _need(self.projection_sha256 is None or (type(self.projection_sha256) is str
+              and bool(_HEX.fullmatch(self.projection_sha256))), "private_sdk_projection_hash_invalid")
+
+    @property
+    def profile_home(self):
+        return _HOME / ".hermes/profiles" / self.profile_name
+
+    def reassert(self):
+        try:
+            os.lstat(MANAGED_SENTINEL)
+        except FileNotFoundError:
+            pass
+        else:
+            raise PrivateProfileError("private_sdk_managed_sentinel_present")
+        os.environ["HERMES_HOME"] = str(self.profile_home)
+        os.environ["HERMES_MANAGED_DIR"] = str(MANAGED_SENTINEL)
+
+    def verify_config_path(self, path):
+        _need(Path(path) == self.profile_home / "config.yaml", "private_sdk_config_path_changed")
+        fd = os.open(_HOME, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            member = _open_beneath(fd, ".hermes/profiles/" + self.profile_name + "/config.yaml")
+            try:
+                info = os.fstat(member)
+                _need(stat.S_ISREG(info.st_mode) and 0 < info.st_size <= _MAX_FILE_BYTES,
+                      "private_sdk_config_invalid")
+                raw = os.pread(member, info.st_size + 1, 0)
+                _need(len(raw) == info.st_size and hashlib.sha256(raw).hexdigest() == self.config_sha256,
+                      "private_sdk_config_changed")
+            finally:
+                os.close(member)
+        finally:
+            os.close(fd)
+
+
+    def read_auth_store(self):
+        """Return only bytes bound to this profile's authenticated auth member."""
+        _need(self.auth_sha256 is not None, "private_sdk_auth_manifest_required")
+        self.reassert()
+        self.verify_config_path(self.profile_home / "config.yaml")
+        fd = os.open(_HOME, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            member = _open_beneath(fd, ".hermes/profiles/" + self.profile_name + "/auth.json")
+            try:
+                before = os.fstat(member)
+                _need(stat.S_ISREG(before.st_mode) and 0 < before.st_size <= _MAX_FILE_BYTES,
+                      "private_sdk_auth_invalid")
+                raw = os.pread(member, before.st_size + 1, 0)
+                after = os.fstat(member)
+                fields = ("st_dev", "st_ino", "st_uid", "st_gid", "st_mode", "st_nlink",
+                          "st_size", "st_mtime_ns", "st_ctime_ns")
+                _need(all(getattr(before, key) == getattr(after, key) for key in fields)
+                      and len(raw) == before.st_size
+                      and hashlib.sha256(raw).hexdigest() == self.auth_sha256,
+                      "private_sdk_auth_changed")
+            finally:
+                os.close(member)
+        finally:
+            os.close(fd)
+        return _closed_json(raw, "private_sdk_auth_invalid")
+
+
+def private_sdk_policy(approved_profile, policy_raw: bytes, config_raw: bytes, *,
+                       credentialless: bool = False) -> PrivateSDKPolicy:
+    approved = verified_profile_identity(approved_profile)
+    files = approved["files"]
+    _need(SDK_POLICY_MEMBER in files and "config.yaml" in files
+          and 0 < len(policy_raw) <= 4096 and 0 < len(config_raw) <= _MAX_FILE_BYTES
+          and hashlib.sha256(policy_raw).hexdigest() == files[SDK_POLICY_MEMBER]
+          and hashlib.sha256(config_raw).hexdigest() == files["config.yaml"], "private_sdk_input_changed")
+    policy = _closed_json(policy_raw, "private_sdk_policy_invalid")
+    _need(set(policy) == {"schema_version", "managed_scope", "fallback_chain"}
+          and type(policy["schema_version"]) is int and policy["schema_version"] == 1
+          and policy["managed_scope"] == "none" and policy["fallback_chain"] == "empty",
+          "private_sdk_policy_invalid")
+    config = _closed_json(config_raw, "private_sdk_config_json_required")
+    _need(all(key in config and type(config[key]) is list and not config[key]
+              for key in ("fallback_providers", "fallback_model")), "private_sdk_fallback_not_empty")
+    projected = profile_identity(approved["name"],
+                                 {name: digest for name, digest in files.items() if name != "auth.json"})
+    return PrivateSDKPolicy(approved["name"], approved["manifest_sha256"], files["config.yaml"],
+                            None if credentialless else files.get("auth.json"),
+                            projected["manifest_sha256"] if credentialless else None)
+
+
+@dataclass
+class PrivateProfileSnapshot:
+    name: str
+    files: tuple[SealedProfileInput, ...]
+    home: Path = _HOME
+
+    @classmethod
+    def from_approved(
+        cls, source_profile: Path, *, name: str,
+        approved_sha256: Mapping[str, str],
+        home: Path = _HOME,
+    ) -> "PrivateProfileSnapshot":
+        _need(isinstance(name, str) and bool(_PROFILE.fullmatch(name)),
+              "profile_name_invalid")
+        _need(home == _HOME, "profile_home_policy_invalid")
+        _need(isinstance(approved_sha256, Mapping)
+              and 2 <= len(approved_sha256) <= _MAX_FILES
+              and {"config.yaml", ".env"} <= set(approved_sha256),
+              "profile_manifest_invalid")
+        for relative, digest in approved_sha256.items():
+            _relative(relative)
+            _need(isinstance(digest, str) and bool(_HEX.fullmatch(digest)),
+                  "profile_manifest_invalid")
+        root_fd = os.open(source_profile, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        copies: list[SealedProfileInput] = []
+        total = 0
+        try:
+            root_info = os.fstat(root_fd)
+            _need(stat.S_ISDIR(root_info.st_mode), "profile_source_invalid")
+            for name_path, expected_digest in sorted(approved_sha256.items()):
+                source = _open_beneath(root_fd, name_path)
+                try:
+                    info = os.fstat(source)
+                    _need(stat.S_ISREG(info.st_mode)
+                          and 0 <= info.st_size <= _MAX_FILE_BYTES,
+                          "profile_source_size_invalid")
+                    total += info.st_size
+                    _need(total <= _MAX_TOTAL_BYTES, "profile_source_total_exceeded")
+                    raw = bytearray()
+                    while len(raw) < info.st_size:
+                        chunk = os.read(source, min(65536, info.st_size-len(raw)))
+                        _need(bool(chunk), "profile_source_short_read")
+                        raw.extend(chunk)
+                    _need(not os.read(source, 1)
+                          and hashlib.sha256(raw).hexdigest() == expected_digest,
+                          "profile_source_digest_mismatch")
+                    memfd = os.memfd_create("herdr-sealed-profile",
+                                           os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+                    try:
+                        offset = 0
+                        while offset < len(raw):
+                            count = os.write(memfd, raw[offset:])
+                            _need(count > 0, "profile_seal_write_failed")
+                            offset += count
+                        os.lseek(memfd, 0, os.SEEK_SET)
+                        fcntl.fcntl(memfd, _F_ADD_SEALS, _REQUIRED_SEALS)
+                        sealed = SealedProfileInput(name_path, memfd, len(raw), expected_digest)
+                        sealed.verify()
+                        copies.append(sealed)
+                    except BaseException:
+                        os.close(memfd)
+                        raise
+                    finally:
+                        raw[:] = bytes(len(raw))
+                finally:
+                    os.close(source)
+            snapshot = cls(name, tuple(copies), home)
+            snapshot.sdk_policy()  # A present invalid policy member never becomes legacy.
+            return snapshot
+        except BaseException:
+            for item in copies:
+                item.close()
+            raise
+        finally:
+            os.close(root_fd)
+
+    def sdk_policy(self):
+        self.verify()
+        files = {item.relative: item for item in self.files}
+        if SDK_POLICY_MEMBER not in files:
+            return None
+        policy, config = files[SDK_POLICY_MEMBER], files["config.yaml"]
+        return private_sdk_policy(self.identity, os.pread(policy.fd, policy.size + 1, 0),
+                                  os.pread(config.fd, config.size + 1, 0))
+
+    @property
+    def identity(self) -> dict[str, object]:
+        self.verify()
+        return profile_identity(self.name, {
+            item.relative: item.sha256 for item in self.files
+        })
+
+    @property
+    def destination(self) -> Path:
+        return self.home / ".hermes/profiles" / self.name
+
+    @property
+    def sdk_files(self) -> tuple[SealedProfileInput, ...]:
+        """Only the reviewed credentialless projection may cross the FD launcher.
+
+        The complete sealed snapshot, including auth.json, stays on the host for
+        host_model_transport.  An .env or an unclassified extra member cannot be
+        treated as harmless merely because its mount would be read only.
+        """
+        self.verify()
+        by_name = {item.relative: item for item in self.files}
+        _need("auth.json" in by_name, "host_credential_snapshot_required")
+        _need(set(by_name) <= {"auth.json", "config.yaml", ".env", SDK_POLICY_MEMBER},
+              "unclassified_sdk_profile_member")
+        _need(by_name[".env"].size == 0, "credential_bearing_sdk_environment_denied")
+        config = os.pread(by_name["config.yaml"].fd, by_name["config.yaml"].size, 0)
+        try:
+            parsed = _closed_json(config, "credential_bearing_sdk_config_denied")
+            auth = by_name["auth.json"]
+            secret_store = _closed_json(os.pread(auth.fd, auth.size, 0),
+                                        "host_credential_snapshot_invalid")
+            keys = {"api_key", "access_token", "refresh_token", "agent_key", "password",
+                    "secret", "client_secret", "authorization", "bearer", "token"}
+            secrets = set()
+            def inspect(value, *, protected=False):
+                if type(value) is dict:
+                    for key, member in value.items():
+                        _need(type(key) is str, "credential_bearing_sdk_config_denied")
+                        normalized = key.lower().replace("-", "_")
+                        selected = (normalized in keys or normalized.endswith(("_api_key", "_access_token",
+                            "_refresh_token", "_agent_key", "_password", "_secret", "_authorization")))
+                        if protected and selected:
+                            _need(member in (None, ""), "credential_bearing_sdk_config_denied")
+                        if not protected and selected and type(member) is str and member:
+                            secrets.add(member)
+                        inspect(member, protected=protected)
+                elif type(value) is list:
+                    for member in value:
+                        inspect(member, protected=protected)
+            inspect(parsed, protected=True)
+            inspect(secret_store)
+            _need(all(secret.encode() not in config for secret in secrets),
+                  "host_secret_repeated_in_sdk_config")
+        except (UnicodeError, ValueError, TypeError):
+            raise PrivateProfileError("credential_bearing_sdk_config_denied") from None
+        return tuple(item for item in self.files if item.relative != "auth.json")
+
+    def fd_descriptors(self) -> list[dict[str, str | int]]:
+        """Typed descriptor metadata for the host-pinned bwrap FD launcher.
+
+        Do not include contents or credentials in command strings; the host
+        launcher reopens each sealed memfd by immutable inode and digest.
+        """
+        self.verify()
+        result: list[dict[str, str | int]] = []
+        for record in self.sdk_files:
+            info = os.fstat(record.fd)
+            result.append({
+                "source": f"/proc/{os.getpid()}/fd/{record.fd}",
+                "fd": record.fd,
+                "device": info.st_dev,
+                "inode": info.st_ino,
+                "kind": "sealed-profile-data",
+                "target": str(self.destination / record.relative),
+                "sha256": record.sha256,
+                "size": record.size,
+            })
+        return result
+
+    def mount_arguments(self) -> list[str]:
+        """Construct only profile/home mounts; caller must pin code/workspace.
+
+        Mount the entire HOME root privately, under root-owned /home. The
+        mutable host ~/.hermes parent and nested profile paths disappear from
+        the sandbox namespace. The profile inputs are read-only bwrap copies.
+        """
+        self.verify()
+        parent = os.lstat(self.home.parent)
+        _need(stat.S_ISDIR(parent.st_mode) and parent.st_uid == 0
+              and not stat.S_IMODE(parent.st_mode) & 0o022,
+              "profile_home_anchor_untrusted")
+        roots = [
+            self.home / ".hermes",
+            self.home / ".hermes/profiles",
+            self.destination,
+        ]
+        dirs = [*roots, *(self.destination / name for name in _INITIALIZATION)]
+        for file in self.sdk_files:
+            parts = _relative(file.relative)
+            for index in range(1, len(parts)):
+                folder = self.destination.joinpath(*parts[:index])
+                if folder not in dirs:
+                    dirs.append(folder)
+        args = ["--tmpfs", str(self.home)]
+        for path in dirs:
+            args.extend(["--dir", str(path)])
+        for file in self.sdk_files:
+            args.extend([
+                "--ro-bind-data", str(file.fd), str(self.destination/file.relative),
+            ])
+        # The base HOME and all profile path ancestors must become immutable
+        # for the entire sandbox lifetime. Runtime writes are allowed only
+        # through separately mounted, non-recursive RW tmpfs submounts.
+        for name in _RUNTIME:
+            args.extend(["--tmpfs", str(self.destination / name)])
+        # bwrap's --remount-ro is NONRECURSIVE: runtime submounts stay RW.
+        # The host launcher must enforce this as the last mount operation.
+        # Never inherit SDK/XDG profile relocation directives from a host
+        # shell or a previous model session. Explicit CLI --profile remains
+        # bound to the host-approved profile name.
+        for key in ("HERMES_HOME", "HERMES_PROFILE", "HERMES_CONFIG_DIR",
+                    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+                    "XDG_CACHE_HOME"):
+            args.extend(["--unsetenv", key])
+        args.extend(["--setenv", "HOME", str(self.home)])
+        args.extend(["--remount-ro", str(self.home)])
+        return args
+
+    def verify(self) -> None:
+        _need(bool(_PROFILE.fullmatch(self.name)) and self.home == _HOME,
+              "profile_snapshot_invalid")
+        _need(2 <= len(self.files) <= _MAX_FILES
+              and {"config.yaml", ".env"} <= {x.relative for x in self.files},
+              "profile_snapshot_invalid")
+        _need(len({x.relative for x in self.files}) == len(self.files),
+              "profile_snapshot_invalid")
+        for file in self.files:
+            _relative(file.relative)
+            file.verify()
+
+    def close(self) -> None:
+        for file in self.files:
+            file.close()
+
+    def __enter__(self) -> "PrivateProfileSnapshot":
+        self.verify()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()

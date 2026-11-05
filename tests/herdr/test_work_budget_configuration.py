@@ -13,8 +13,11 @@ from herdr.work_model_deadline import model_deadline,validate_text_request
 from herdr.work_cycle import WorkPhase, WorkContractError
 from tests.herdr.test_work_contract_host import factory_fixture
 
-def approved_factory(tmp_path,*,repair=False,quote_overrides=None):
+def approved_factory(tmp_path,*,repair=False,quote_overrides=None,context_tokens=None):
     factory,root,original,grant,log=factory_fixture(tmp_path)
+    if context_tokens is not None:
+        grant=replace(grant,scope=replace(grant.scope,max_context_tokens=context_tokens))
+        original=replace(original,grant_sha256=grant.hash)
     limits=BudgetLimits(1000000,1000000,5,100000,100000,2,1,1,1)
     allocation=BudgetAllocation(digest("allocation"),grant.identity.consumer,digest("stable-work"),
         digest("lineage"),digest("authorization"),limits)
@@ -207,7 +210,7 @@ def test_fresh_admission_rejects_changed_persisted_ancestor_limits(tmp_path):
 
 @pytest.mark.parametrize("overrides,field,limit",[
     ({}, "max_tokens", 100),
-    ({"max_output_tokens":4200,"max_request_bytes":100}, "max_tokens", 4096),
+    ({"max_output_tokens":4200,"max_request_bytes":100}, "max_tokens", 4200),
     ({"model":"o1"}, "max_completion_tokens", 100),
     ({"model":"o3-2025-04-16"}, "max_completion_tokens", 100),
     ({"model":"openai/o4-mini"}, "max_completion_tokens", 100),
@@ -237,7 +240,7 @@ def test_protected_request_ceiling_respects_quote_without_an_economic_effect(tmp
 @pytest.mark.parametrize("answer",[
     None,{},{"output_token_field":"max_tokens","max_output_tokens":True},
     {"output_token_field":"max_tokens","max_output_tokens":0},
-    {"output_token_field":"max_tokens","max_output_tokens":4097},
+    {"output_token_field":"max_tokens","max_output_tokens":32769},
     {"output_token_field":"max_output_tokens","max_output_tokens":100},
     {"output_token_field":"max_tokens","max_output_tokens":100,"extra":True},
 ])
@@ -358,3 +361,35 @@ print(json.dumps(outcomes))
     else:
         assert result.returncode==0 and json.loads(result.stdout)==["returned"]
         assert row["usage"]["model_calls"]==1 and row["usage"]["cost_microusd"] is None
+
+
+@pytest.mark.parametrize("quoted,expected",[(1,1),(4096,4096),(4200,4200),(32768,32768),
+                                          (32769,32768),(1000000,32768)])
+def test_output_default_keeps_quote_and_absolute_adapter_bounds(quoted,expected):
+    from herdr.work_budget_configuration import model_request_ceiling
+    assert model_request_ceiling({"provider":"nous","model":"quoted-text-model",
+        "max_output_tokens":quoted})=={"output_token_field":"max_tokens","max_output_tokens":expected}
+
+
+def test_large_whole_file_output_still_requires_exact_host_quote_and_reservation(tmp_path):
+    from herdr.work_contract_host import WorkInvocationGuard
+    overrides={"max_output_tokens":32768,"max_request_bytes":100,"max_tokens":33000}
+    factory,root,plan,grant,cycle,raw,allocation,quote=approved_factory(
+        tmp_path,quote_overrides=overrides,context_tokens=33000)
+    class Port:
+        def __call__(self,*args,**kwargs):return True
+        def effect(self,*args):return factory.budget_effect(*args)
+    guard=WorkInvocationGuard(grant,work_authority=Port())
+    route={k:quote[k] for k in ("provider","model","api_mode","base_url")}
+    before=factory.budget_authority.audit_log._path.read_bytes()
+    assert guard.model_request_ceiling(route)["max_output_tokens"]==32768
+    assert factory.budget_authority.audit_log._path.read_bytes()==before
+    request={**model_request(quote),"output_tokens":32769}
+    with pytest.raises(WorkContractError,match="exceeds approved quote"):
+        factory.budget_effect(grant.identity,grant.hash,"start",request)
+    assert factory.budget_authority.audit_log._path.read_bytes()==before
+    operation=factory.budget_effect(grant.identity,grant.hash,"start",{**request,"output_tokens":32768})
+    state=factory.budget_authority.snapshot(allocation.allocation_id)
+    assert state["inflight"]==1 and state["charged_upper_bounds"]["tokens"]==33000
+    assert factory.budget_authority.reconcile(operation["operation_id"])["usage"] is None
+    # No SDK/provider invocation: the original synthetic reservation remains held.

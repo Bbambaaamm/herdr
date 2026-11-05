@@ -23,7 +23,7 @@ BIN=Path(__file__).resolve().parents[2]/"agent-stack/bin"
 sys.path.insert(0,str(BIN))
 import agent_completion_evidence as host
 
-def fixture(tmp_path,monkeypatch,kind="coding"):
+def fixture(tmp_path,monkeypatch,kind="coding",base_branch=None):
     rec,result,_,store,path,proof=artifact_fixture(tmp_path,monkeypatch)
     rec.parent_run_token="parent-run"
     scope={"version":1,"files":[{"path":"result.txt","subtree":False}],
@@ -41,7 +41,7 @@ def fixture(tmp_path,monkeypatch,kind="coding"):
          "ci_workflow_id":367993725,"github_actions_app_id":15368}
     baseline=[{"name":name,"head_sha":contracts["base_sha"],"status":"missing"} for name in host.CHECK_APPS]
     policy=freeze_policy(store,task,parent_spec_hash=host.spec_digest(task),contracts=contracts,
-                         environment=env,baseline=baseline)
+                         environment=env,baseline=baseline,base_branch=base_branch)
     return rec,result,store,path,task,policy
 
 @pytest.mark.parametrize("kind",["coding","research","review"])
@@ -153,3 +153,39 @@ def test_root_freeze_reuses_exact_child_policy_before_dispatch(tmp_path,monkeypa
     host.freeze_plan(store.root.parent,task)
     task["child_completion_contracts"]["base_sha"]="e"*40
     with pytest.raises(EvidenceError,match="changed"):host.freeze_plan(store.root.parent,task)
+
+@pytest.mark.parametrize("kind",["coding","research","review"])
+def test_reviewed_parent_branch_survives_policy_child_plan_and_restart(tmp_path,monkeypatch,kind):
+    branch="review/approved"
+    rec,_,store,_,task,policy=fixture(tmp_path,monkeypatch,kind,base_branch=branch)
+    authority=authority_for_parent(store,task,parent_spec_hash=host.spec_digest(task),collector=lambda *a:None)
+    authority.prepare(rec)
+    plan=store.read("plan",digest(binding(child_task(rec))))
+    assert policy["base_branch"]==plan["base_branch"]==branch
+    assert policy["policy_hash"]==digest({k:v for k,v in policy.items() if k!="policy_hash"})
+    cold=authority_for_parent(store,task,parent_spec_hash=host.spec_digest(task),collector=lambda *a:None)
+    cold.prepare(rec)
+    assert store.read("plan",digest(binding(child_task(rec))))==plan
+
+@pytest.mark.parametrize("branch",["",None,"../escape","review//other","review/.hidden","review/a.lock","x"*500])
+def test_child_policy_rejects_invalid_explicit_branch(tmp_path,monkeypatch,branch):
+    from herdr.child_completion_policy import validate_policy
+    *_,policy=fixture(tmp_path,monkeypatch)
+    policy["base_branch"]=branch
+    policy["policy_hash"]=digest({k:v for k,v in policy.items() if k!="policy_hash"})
+    with pytest.raises(EvidenceError):validate_policy(policy)
+
+def test_static_child_freeze_preserves_parent_branch_and_rejects_rebind(tmp_path,monkeypatch):
+    _,_,_,_,task,old=fixture(tmp_path/"source",monkeypatch)
+    root=tmp_path/"fresh";root.mkdir(mode=0o700)
+    monkeypatch.setattr(host,"workflow_blob",lambda *a:"f"*40)
+    monkeypatch.setattr(host,"collect_checks",lambda *a,**k:{row["name"]:row for row in old["baseline"]})
+    plan={"base_sha":task["child_completion_contracts"]["base_sha"],"base_branch":"review/approved"}
+    host.freeze_child_completion_contracts(root,task,plan)
+    store=host.store_for(root,task)
+    policy=store.read("plan",policy_key(task["repo"],task["id"],task["run_token"]))
+    assert policy["base_branch"]==plan["base_branch"]
+    host.freeze_child_completion_contracts(root,task,plan)
+    with pytest.raises(EvidenceError):
+        host.freeze_child_completion_contracts(root,task,{**plan,"base_branch":"review/other"})
+    assert store.read("plan",policy_key(task["repo"],task["id"],task["run_token"]))==policy

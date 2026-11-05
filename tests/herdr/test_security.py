@@ -933,3 +933,51 @@ def test_untrusted_taint_arrays_reject_scalar_or_object(key,scalar):
     directives={"deny_tools":[],"deny_providers":[]};directives[key]=scalar
     with pytest.raises(SecurityError):
         TaintRestrictions.from_untrusted_directives((),directives)
+
+
+def _parent_and_disjoint_child(tmp_path):
+    parent = grant(tmp_path, tools=('write_file',),
+                   runtime=assurance(writable_roots=(str(tmp_path / 'own.py'),)))
+    child_root = tmp_path / 'child'
+    child = replace(parent, grant_id='nested-child', workspace_root=str(child_root),
+        identity=identity(agent_id='nested-child', parent_agent_id=parent.identity.agent_id,
+                          parent_task_id=parent.identity.task_id, task_id='nested-child-task'),
+        parent_grant_hash=parent.hash,
+        tool_rules=tuple(replace(r, allowed_roots=(str(child_root / 'owned.py'),)) for r in parent.tool_rules),
+        runtime_assurance=replace(parent.runtime_assurance, sandbox_attestation_sha256='b' * 64,
+                                  writable_roots=(str(child_root / 'owned.py'),)))
+    return parent, child
+
+
+def test_parent_own_leaf_never_implicitly_authorizes_disjoint_child_leaf(tmp_path):
+    parent, child = _parent_and_disjoint_child(tmp_path)
+    child.require_logical_subset_of(parent)
+    with pytest.raises(SecurityError, match='runtime assurance'):
+        child.require_subset_of(parent)
+    # New host-only context is not a serialized grant field. Legacy hashes stay stable.
+    assert SecurityGrant.from_dict(parent.to_json()).hash == parent.hash
+    assert not any('delegat' in key for key in parent.to_json())
+
+
+@pytest.mark.parametrize('fault', [None, 'parent', 'child', 'stale', 'callback', 'extra-write', 'untyped'])
+def test_only_revalidated_host_context_admits_exact_disjoint_child_leaf(tmp_path, fault):
+    from herdr.security import DelegatedWriteAuthority
+    parent, child = _parent_and_disjoint_child(tmp_path)
+    checks = []
+    def reread(actual, ceiling):
+        checks.append((actual.identity, ceiling.hash))
+        if fault == 'stale': raise SecurityError('original host admission changed')
+        return child.runtime_assurance.writable_roots
+    authority = DelegatedWriteAuthority(parent.hash, child.identity, 'c' * 64, 'd' * 64, 'e' * 64,
+        child.runtime_assurance.writable_roots, reread, lambda *a: None)
+    if fault == 'parent': authority = replace(authority, parent_sha256='0' * 64)
+    elif fault == 'child': authority = replace(authority, identity=parent.identity)
+    elif fault == 'callback': authority = replace(authority, revalidate=None)
+    elif fault == 'extra-write': child = replace(child, runtime_assurance=replace(child.runtime_assurance,
+        writable_roots=(*authority.roots, str(tmp_path / 'child/foreign.py'))))
+    elif fault == 'untyped': authority = {'roots': authority.roots}
+    if fault is None:
+        child.require_delegated_subset_of(parent, authority)
+        assert len(checks) == 1 and parent.runtime_assurance.writable_roots == (str(tmp_path / 'own.py'),)
+    else:
+        with pytest.raises(SecurityError): child.require_delegated_subset_of(parent, authority)

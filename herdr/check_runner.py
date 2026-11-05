@@ -135,7 +135,8 @@ class HostCheckRunner:
         require(plan.checks and check in plan.checks,"check not in frozen plan")
         require(Path("/usr/bin/bwrap").is_file(),"required isolation unavailable")
         self.environment.verify_inputs()
-        snapshot=tree_snapshot(root,git=self.git)
+        snapshot=tree_snapshot(root,git=self.git,
+            **({"partition": plan.snapshot_partition} if plan.snapshot_partition is not None else {}))
         require(digest(snapshot)==tree_sha256,"check source tree changed")
         for path,sha in check.protected_inputs:
             require(snapshot.get(path,{}).get("sha256")==sha,"verification input changed")

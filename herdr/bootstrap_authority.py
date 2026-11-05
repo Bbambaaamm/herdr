@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
+from .observed_proc import os
 import socket
 import stat
 import struct
@@ -18,7 +18,7 @@ import threading
 import math
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
+from .observed_proc import Path
 from typing import Callable, Mapping
 from types import MappingProxyType
 from .security import InvocationIdentity, SecurityError
@@ -84,6 +84,7 @@ class BootstrapExpectation:
     python_device: int
     python_inode: int
     valid_until: float = field(default_factory=lambda: time.time() + 60)
+    self_observation_mode: str | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -91,6 +92,8 @@ class BootstrapExpectation:
         except (SecurityError,TypeError,ValueError) as exc:
             raise BootstrapAuthorityError("full admitted bootstrap identity required") from exc
         object.__setattr__(self,"identity",MappingProxyType(identity))
+        if self.self_observation_mode not in (None, "authenticated-root-kernel-v1"):
+            raise BootstrapAuthorityError("unsupported bootstrap observation mode")
         _canonical(dict(self.identity))
         if type(self.valid_until) not in (float,int) or not math.isfinite(self.valid_until):
             raise BootstrapAuthorityError("finite bootstrap deadline required")
@@ -145,6 +148,7 @@ class _Session:
     python_inode: int
     expectation: BootstrapExpectation
     continued: bool = False
+    self_observation: Mapping[str, object] | None = None
 
 
 def _proc_stat(pid: int) -> tuple[int, int]:
@@ -386,7 +390,13 @@ class BootstrapAuthority:
     def _continue(
         self, key: str, session: _Session, request: Mapping[str, object]
     ) -> None:
-        if set(request) != {"op", "identity", "proof_sha256", "bundle_sha256"} or request.get("op") != "stage2":
+        required = {"op", "identity", "proof_sha256", "bundle_sha256"}
+        if session.expectation.self_observation_mode is not None:
+            required |= {"self_observation_mode", "challenge"}
+            if request.get("self_observation_mode") != session.expectation.self_observation_mode:
+                raise BootstrapAuthorityError("stage-two observation mode mismatch")
+            _sha(request.get("challenge"), "stage-two challenge")
+        if set(request) != required or request.get("op") != "stage2":
             raise BootstrapAuthorityError("invalid stage-two request")
         identity = request["identity"]
         if not isinstance(identity, Mapping) or identity_key(identity) != key:
@@ -407,6 +417,9 @@ class BootstrapAuthority:
         if request["bundle_sha256"] != session.bundle_sha256:
             raise BootstrapAuthorityError("stage-two bundle mismatch")
         expected = session.expectation
+        # Peer/executable/proof/bundle have been verified. Root-only facts are
+        # obtained BEFORE any continuation is created/published; no circular SDK proof.
+        self._before_continuation(key, session, request, peer)
         receipt = BootstrapContinuation(
             identity=expected.identity, peer_pid=peer.pid,
             process_start_ticks=peer.start_ticks,
@@ -420,6 +433,10 @@ class BootstrapAuthority:
             session.continued = True
             self._continuations[key] = receipt
             self._changed.notify_all()
+
+    def _before_continuation(self, key, session, request, peer):
+        if session.expectation.self_observation_mode is not None:
+            raise BootstrapAuthorityError("root observation integration unavailable")
 
     def dispatch_connection(self, connection: socket.socket) -> bool:
         """Reject irrelevant peers before request reads; serve eligible peers concurrently."""
@@ -501,8 +518,14 @@ class BootstrapAuthority:
             connection.sendall(b"stage1-ok\n")
             cont = _recv_line(connection)
             self._continue(key, session, cont)
-            connection.sendall(b"stage2-ok\n")
-        except (BootstrapAuthorityError, OSError):
+            response = getattr(self, "_stage2_response", None)
+            if session.expectation.self_observation_mode is not None:
+                if not callable(response) or session.self_observation is None:
+                    raise BootstrapAuthorityError("root observation response unavailable")
+                connection.sendall(response(session))
+            else:
+                connection.sendall(response() if callable(response) else b"stage2-ok\n")
+        except (BootstrapAuthorityError, SecurityError, OSError, ValueError):
             try:
                 connection.sendall(b"denied\n")
             except OSError:

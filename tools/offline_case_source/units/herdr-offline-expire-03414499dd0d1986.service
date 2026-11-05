@@ -1,0 +1,21 @@
+[Unit]
+Description=Finite original-root case expiry and all-profile finalizer
+[Service]
+Type=oneshot
+User=root
+Group=root
+AppArmorProfile=unconfined
+RuntimeMaxSec=120
+TimeoutStartSec=120
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=5s
+CapabilityBoundingSet=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_MAC_ADMIN CAP_CHECKPOINT_RESTORE
+AmbientCapabilities=
+NoNewPrivileges=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/var/lib/herdr-offline-03414499dd0d1986 /var/lib/herdr-offline-observer-03414499dd0d1986/contexts /sys/kernel/security/apparmor /sys/fs/cgroup/system.slice
+ExecStart=/usr/bin/python3.14 -I -B -c 'import sys; sys.path.insert(0,"/opt/agent-platform/herdr-offline-03414499dd0d1986"); from offline_case.outer_lifecycle import main; main()'

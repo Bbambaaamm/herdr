@@ -431,6 +431,16 @@ def validate_criteria(kind: str, criteria: Any) -> None:
             raise EvidenceError("prebuild review target contract binding invalid")
 
 
+def valid_completion_base_branch(branch) -> bool:
+    """One canonical branch grammar for protected admission and frozen plans."""
+    return (isinstance(branch, str)
+            and 1 <= len(branch) <= 512 - len("refs/remotes/origin/")
+            and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch))
+            and ".." not in branch and "//" not in branch
+            and all(part and not part.startswith(".") and not part.endswith(".")
+                    and not part.lower().endswith(".lock") for part in branch.split("/")))
+
+
 def validate_plan(plan: dict) -> None:
     names = {"version", "identity", "repo", "kind", "spec_hash", "policy_hash",
              "plan_hash", "base_sha", "baseline", "workspace_root",
@@ -443,6 +453,10 @@ def validate_plan(plan: dict) -> None:
         from .scope_evidence import validate_scope_policy
         validate_scope_policy(plan["scope_policy"])
         names.add("scope_policy")
+    if isinstance(plan, dict) and "base_branch" in plan:
+        if not valid_completion_base_branch(plan["base_branch"]):
+            raise EvidenceError("invalid immutable completion base branch")
+        names.add("base_branch")
     if not isinstance(plan, dict) or set(plan) != names or type(plan["version"]) is not int or plan["version"] != VERSION:
         raise EvidenceError("unsupported completion plan")
     if (not isinstance(plan["kind"], str) or plan["kind"] not in {"coding", "research", "review"}

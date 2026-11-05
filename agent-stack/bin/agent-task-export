@@ -2,9 +2,13 @@
 import json
 import os
 import re
+import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from herdr.recovery_unknown import held as terminal_unknown_hold
 
 HOME = Path("/home/agentops")
 ROOT = HOME / ".local/state/agent-stack/tasks"
@@ -173,6 +177,8 @@ def rows():
                 max_attempts = 0
             kind = safe_text(raw.get("kind"), "unknown", limit=64)
             blocker, pr_number = result_info(task_id, raw.get("run_token"))
+            if terminal_unknown_hold(raw):
+                blocker, pr_number = "terminal_unknown_requires_operator_reconciliation", None
             meta = issues.get((repo, issue), {}) if issue is not None else {}
             items.append(
                 {

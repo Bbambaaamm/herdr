@@ -16,6 +16,7 @@ from herdr.external_knowledge_host import (
     HostExternalKnowledgePolicy,
 )
 from tests.herdr.test_security import identity
+from tests.herdr.test_external_knowledge_egress import capability, configured_grant
 
 
 def response_for(request, answer="found"):
@@ -36,7 +37,7 @@ def test_host_policy_is_explicit_and_source_bounded():
         "github:Bbambaaamm/herdr": {
             "corp": ("mail", "chat", "documents"),
         }
-    })
+    }, provider_capabilities=(capability(),))
     assert policy.allows(
         "github:Bbambaaamm/herdr", "corp", ("mail", "documents")
     )
@@ -51,6 +52,7 @@ def test_host_policy_is_explicit_and_source_bounded():
 def test_provider_client_sends_only_provider_and_request_not_grant_identity_or_secret(
     tmp_path, monkeypatch
 ):
+    item = configured_grant(tmp_path)
     request = KnowledgeRequest.create(
         "find prior incident",
         ("mail", "chat"),
@@ -58,7 +60,7 @@ def test_provider_client_sends_only_provider_and_request_not_grant_identity_or_s
     )
     policy = HostExternalKnowledgePolicy({
         identity().consumer: {"corp": ("mail", "chat")}
-    })
+    }, provider_capabilities=(capability(),))
     monkeypatch.setattr(
         "herdr.external_knowledge_host.HostExternalKnowledgePolicy.from_file",
         lambda _path: policy,
@@ -97,11 +99,12 @@ def test_provider_client_sends_only_provider_and_request_not_grant_identity_or_s
         thread = threading.Thread(target=serve)
         thread.start()
         client = HostExternalKnowledgeClient(
+        grant=item,
             policy_path=tmp_path / "unused-policy",
             socket_path=path,
             timeout_seconds=5,
         )
-        result = client.query(identity(), "a" * 64, "corp", request)
+        result = client.query(item.identity, item.hash, "corp", request)
         thread.join(6)
 
     assert not thread.is_alive() and not errors
@@ -113,29 +116,32 @@ def test_provider_client_sends_only_provider_and_request_not_grant_identity_or_s
 
 
 def test_policy_denial_never_touches_provider_socket(tmp_path, monkeypatch):
+    item = configured_grant(tmp_path)
     request = KnowledgeRequest.create("x", ("mail",), request_id="req")
     policy = HostExternalKnowledgePolicy({
         identity().consumer: {"corp": ("documents",)}
-    })
+    }, provider_capabilities=(capability(),))
     monkeypatch.setattr(
         "herdr.external_knowledge_host.HostExternalKnowledgePolicy.from_file",
         lambda _path: policy,
     )
     client = HostExternalKnowledgeClient(
+        grant=item,
         policy_path=tmp_path / "unused",
         socket_path=tmp_path / "missing.sock",
     )
-    result = client.query(identity(), "b" * 64, "corp", request)
+    result = client.query(item.identity, item.hash, "corp", request)
     assert result.status == "error"
     assert result.sources[0].error_code is KnowledgeErrorCode.AUTH_FORBIDDEN
     assert result.sources[0].retryable is False
 
 
 def test_missing_provider_degrades_only_knowledge_capability(tmp_path, monkeypatch):
+    item = configured_grant(tmp_path)
     request = KnowledgeRequest.create("x", ("mail",), request_id="req")
     policy = HostExternalKnowledgePolicy({
         identity().consumer: {"corp": ("mail",)}
-    })
+    }, provider_capabilities=(capability(),))
     monkeypatch.setattr(
         "herdr.external_knowledge_host.HostExternalKnowledgePolicy.from_file",
         lambda _path: policy,
@@ -148,19 +154,21 @@ def test_missing_provider_degrades_only_knowledge_capability(tmp_path, monkeypat
         ),
     )
     result = HostExternalKnowledgeClient(
+        grant=item,
         policy_path=tmp_path / "unused",
         socket_path=tmp_path / "missing.sock",
-    ).query(identity(), "c" * 64, "corp", request)
+    ).query(item.identity, item.hash, "corp", request)
     assert result.status == "error"
     assert result.sources[0].error_code is KnowledgeErrorCode.PROVIDER_UNAVAILABLE
     assert result.sources[0].retryable is True
 
 
 def test_provider_cannot_expand_or_omit_requested_sources(tmp_path, monkeypatch):
+    item = configured_grant(tmp_path)
     request = KnowledgeRequest.create("x", ("mail", "chat"), request_id="req")
     policy = HostExternalKnowledgePolicy({
         identity().consumer: {"corp": ("mail", "chat", "documents")}
-    })
+    }, provider_capabilities=(capability(),))
     monkeypatch.setattr(
         "herdr.external_knowledge_host.HostExternalKnowledgePolicy.from_file",
         lambda _path: policy,
@@ -194,10 +202,11 @@ def test_provider_cannot_expand_or_omit_requested_sources(tmp_path, monkeypatch)
         thread = threading.Thread(target=serve)
         thread.start()
         result = HostExternalKnowledgeClient(
+        grant=item,
             policy_path=tmp_path / "unused",
             socket_path=path,
             timeout_seconds=5,
-        ).query(identity(), "d" * 64, "corp", request)
+        ).query(item.identity, item.hash, "corp", request)
         thread.join(5)
     assert result.status == "error"
     assert {
