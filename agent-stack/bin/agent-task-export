@@ -22,11 +22,13 @@ REPO_PROFILES = {
     LEGACY_REPO: "quantlab",
     "Bbambaaamm/dotacni-majak": "majak",
     "Bbambaaamm/herdr": "herdr",
+    "Bbambaaamm/loxxess-technical-ai-assistant": "loxxess",
 }
 PROFILE_AGENTS = {
     "quantlab": "quantlab-hermes",
     "majak": "dotacni-majak-hermes",
     "herdr": "herdr-hermes",
+    "loxxess": "loxxess-hermes",
 }
 PROFILE_LIMIT = 50
 

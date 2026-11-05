@@ -56,6 +56,7 @@ class GitHubIntakeTests(unittest.TestCase):
             ("Bbambaaamm/herdr", 53, "HERDR CONTROL: autonomous backlog drain", "Drain Herdr safely"),
             ("Bbambaaamm/dotacni-majak", 662, "HERDR CONTROL", "Finish Majak"),
             ("Bbambaaamm/Autonomous-Quant-Lab", 45, "Synthetic authorized issue", "Bounded work"),
+            ("Bbambaaamm/loxxess-technical-ai-assistant", 2, "[P0] Visual search", "Bounded LOXXESS work"),
         ]:
             api = f"https://api.github.com/repos/{repo}"
             repository = {"id": number + 1000, "full_name": repo}
@@ -83,7 +84,8 @@ class GitHubIntakeTests(unittest.TestCase):
         for repo, issue in self.issue_rows.items():
             api = f"https://api.github.com/repos/{repo}"
             number = {"Bbambaaamm/herdr": 53, "Bbambaaamm/dotacni-majak": 662,
-                      "Bbambaaamm/Autonomous-Quant-Lab": 45}[repo]
+                      "Bbambaaamm/Autonomous-Quant-Lab": 45,
+                      "Bbambaaamm/loxxess-technical-ai-assistant": 2}[repo]
             issue_url = f"{api}/issues/{number}"
             if url == api:
                 return copy.deepcopy(self.repository_rows[repo])
@@ -161,6 +163,23 @@ class GitHubIntakeTests(unittest.TestCase):
             "priority_architecture": 60,
         }
 
+    @staticmethod
+    def loxxess_consumer():
+        return {
+            "consumer": "loxxess",
+            "enabled": True,
+            "admission": {"signal": "maintainer-comment-v1", "max_age_seconds": 86400},
+            "repository": "Bbambaaamm/loxxess-technical-ai-assistant",
+            "mode": "all_open",
+            "coordinator_agent": "loxxess-hermes",
+            "workspace": "/home/agentops/workspaces/loxxess-technical-ai-assistant",
+            "safety_profile": "loxxess-technical",
+            "hermes_profile": "quantlab",
+            "priority_default": 60,
+            "priority_architecture": 50,
+            "worktree_root": "/home/agentops/workspaces/loxxess-technical-ai-assistant/worktrees",
+        }
+
     def test_load_state_migrates_legacy_quantlab_keys(self):
         self.intake.STATE.write_text(
             json.dumps({"45": {"open": True, "scheduler_state": "active"}}),
@@ -191,7 +210,7 @@ class GitHubIntakeTests(unittest.TestCase):
         self.assertEqual(len(indexed["Bbambaaamm/Autonomous-Quant-Lab#45"]), 1)
         self.assertEqual(len(indexed["Bbambaaamm/dotacni-majak#45"]), 1)
 
-    def test_registry_enables_quantlab_majak_and_herdr_but_not_disabled_heating(self):
+    def test_registry_enables_declared_consumers_but_not_disabled_heating(self):
         heating = {
             "consumer": "heating",
             "enabled": False,
@@ -203,12 +222,41 @@ class GitHubIntakeTests(unittest.TestCase):
             "hermes_profile": "heating",
         }
         self.write_config(
-            [self.quantlab_consumer(), self.majak_consumer(), self.herdr_consumer(), heating]
+            [self.quantlab_consumer(), self.majak_consumer(), self.herdr_consumer(),
+             self.loxxess_consumer(), heating]
         )
         consumers = self.intake.load_consumers()
         self.assertEqual(
-            [row["consumer"] for row in consumers], ["quantlab", "majak", "herdr"]
+            [row["consumer"] for row in consumers],
+            ["quantlab", "majak", "herdr", "loxxess"],
         )
+
+    def test_loxxess_priority_respects_p0_and_p1_labels(self):
+        consumer = self.loxxess_consumer()
+        self.assertEqual(self.intake.issue_priority(consumer, {"title": "[P0] Critical"}), 90)
+        self.assertEqual(self.intake.issue_priority(consumer, {"title": "[P1] Important"}), 70)
+        self.assertEqual(self.intake.issue_priority(consumer, {"title": "[P2] Optional"}), 60)
+
+    def test_queue_loxxess_issue_carries_consumer_safety_contract(self):
+        issue = {
+            "number": 2,
+            "title": "[P0] Visual search",
+            "body": "Bounded LOXXESS work",
+            "html_url": "https://github.com/Bbambaaamm/loxxess-technical-ai-assistant/issues/2",
+        }
+        task_id = self.intake.queue_issue(self.loxxess_consumer(), issue, [])
+        task = json.loads((self.intake.PENDING / f"{task_id}.json").read_text())
+        self.assertTrue(task_id.startswith("github-loxxess-issue-2-"))
+        self.assertEqual(task["kind"], "github_issue_slice")
+        self.assertEqual(task["repo"], "Bbambaaamm/loxxess-technical-ai-assistant")
+        self.assertEqual(task["safety_profile"], "loxxess-technical")
+        self.assertEqual(task["hermes_profile"], "quantlab")
+        self.assertEqual(task["agent"], "loxxess-hermes")
+        self.assertEqual(task["priority"], 90)
+        self.assertIn("DLP/ACP", task["prompt"])
+        self.assertIn("config/*.local.json", task["prompt"])
+        self.assertIn("not evidence of a live Teams", task["prompt"])
+        self.assertNotIn("PAPER-only trading", task["prompt"])
 
     def test_root_consumers_do_not_outrank_quantlab_default_work(self):
         quant = self.quantlab_consumer()

@@ -462,6 +462,7 @@ def test_quantlab_policy_and_other_profiles_are_separate() -> None:
     assert base_consumer_policy(identity, ("read_file",)) is None
     assert policy_for_profile("majak")(identity, ("read_file",)) is None
     assert policy_for_profile("heating")(identity, ("read_file",)) is None
+    assert policy_for_profile("loxxess-technical")(identity, ("read_file",)) is None
     assert policy_for_profile("unknown")(identity, ("read_file",)) == "unknown_consumer_profile"
 
 

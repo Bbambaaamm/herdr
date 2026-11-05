@@ -39,6 +39,18 @@ def test_clone_timeout_stays_below_systemd_start_timeout():
     assert 0 < ensure.CHECKOUT_CLONE_TIMEOUT_SECONDS < 120
 
 
+def test_loxxess_workspace_reuses_runtime_profile_with_separate_agent_identity():
+    ensure = load_module()
+    groups = [group for group in ensure.DESIRED if group["label"] == "LoxxessTechnicalAI"]
+    assert len(groups) == 1
+    group = groups[0]
+    assert group["repository"] == "Bbambaaamm/loxxess-technical-ai-assistant"
+    assert group["cwd"] == str(ensure.HOME / "workspaces/loxxess-technical-ai-assistant")
+    hermes = [agent for agent in group["agents"] if agent["name"] == "loxxess-hermes"]
+    assert hermes == [{"tab": "Hermes", "name": "loxxess-hermes", "kind": "hermes",
+                       "args": ["-p", "quantlab", "chat"]}]
+
+
 def test_checkout_rejects_malicious_push_url(monkeypatch, tmp_path):
     ensure = load_module()
     calls = []

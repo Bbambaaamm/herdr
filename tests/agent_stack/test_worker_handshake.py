@@ -575,6 +575,41 @@ def test_herdr_core_prompt_has_generic_backlog_contract(tmp_path):
     assert "/home/agentops/workspaces/herdr/worktrees/" in prompt
 
 
+def test_loxxess_prompt_has_domain_contract_without_quantlab_invariants(tmp_path):
+    configure_paths(tmp_path)
+    task = base_task()
+    task.update(
+        {
+            "repo": "Bbambaaamm/loxxess-technical-ai-assistant",
+            "workspace": "/home/agentops/workspaces/loxxess-technical-ai-assistant",
+            "worktree_root": "/home/agentops/workspaces/loxxess-technical-ai-assistant/worktrees",
+            "safety_profile": "loxxess-technical",
+            "hermes_profile": "quantlab",
+            "run_token": "loxxess-run",
+            "routing": {
+                "selected_agent": "loxxess-hermes",
+                "tier": "profile-default",
+                "model": "profile-router",
+            },
+            "execution_session": {
+                "agent_name": "loxxess-hermes-t-deadbeef",
+                "session_name": "durable-loxxess",
+                "pane_id": "owned-loxxess-pane",
+                "coordinator_agent": "loxxess-hermes",
+                "owned_pane": True,
+            },
+        }
+    )
+
+    prompt = worker.prompt_text(task)
+    assert "repository Bbambaaamm/loxxess-technical-ai-assistant" in prompt
+    assert "DLP/ACP and permission failures as policy gates" in prompt
+    assert "config/*.local.json" in prompt
+    assert "unknown stock is not zero" in prompt
+    assert "PAPER-only, PIT/causality" not in prompt
+    assert "/home/agentops/workspaces/loxxess-technical-ai-assistant/worktrees" in prompt
+
+
 def test_run_prompt_fails_closed_without_isolated_session(tmp_path):
     configure_paths(tmp_path)
     task = base_task()

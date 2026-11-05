@@ -1,0 +1,16 @@
+schema_version: 1
+consumer: loxxess
+repository: Bbambaaamm/loxxess-technical-ai-assistant
+policy_profile: loxxess-technical
+hard_invariants:
+  - no_dlp_or_acp_bypass
+  - no_unapproved_paid_service_or_billing
+  - no_unapproved_m365_or_power_platform_publish
+  - no_raw_private_evidence_or_local_config_exposure
+  - unknown_is_not_zero_or_unavailable
+  - live_acceptance_requires_authorized_runtime_evidence
+inheritance:
+  child_may_expand_parent_permissions: false
+routing:
+  capability_aware: true
+  cost_aware: true

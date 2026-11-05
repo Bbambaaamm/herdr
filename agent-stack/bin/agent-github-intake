@@ -817,6 +817,11 @@ def issue_priority(consumer: dict, issue: dict) -> int:
     if consumer.get("mode") == "root_only":
         return default
     title = str(issue.get("title") or "").strip().lower()
+    if consumer.get("consumer") == "loxxess":
+        if title.startswith("[p0]"):
+            return max(default, 90)
+        if title.startswith("[p1]"):
+            return max(default, 70)
     if title.startswith("roadmap:"):
         return max(default, 90)
     if "architecture" in title or "architektura" in title:
@@ -930,6 +935,38 @@ Operating rules:
 - Prefer tests and evidence over broad refactors. Stop fail-closed on unclear migrations, external credentials, paid-provider requirements, or user-only decisions.
 - If the issue is already satisfied, do not invent changes: produce closure/writeback evidence instead.
 - If GitHub write authorization is the only missing step, preserve the exact local patch/branch/evidence and report blocker=github_write_auth_required; do not repeat implementation.
+""".strip()
+
+    if name == "loxxess":
+        return f"""
+Continue LOXXESS Technical AI Assistant GitHub issue #{number} as ONE bounded, dependency-safe work slice.
+Issue: {title}
+URL: {url}
+
+Current issue body:
+{body[:12000]}
+
+Prior durable evidence for this issue:
+{prior}
+
+Before acting:
+- fetch current origin/main and inspect the live issue, open PRs, active branches and prior durable results so work is never duplicated;
+- read AGENTS.md, README.md, docs/current-state.md, docs/roadmap.md, the relevant module documentation and evals/scenarios.json;
+- distinguish verified facts, observations, hypotheses and planned capabilities, and select only one dependency-ready slice that fits this task timeout.
+
+Operating rules:
+- loxxess-hermes is the stable coordinator and Herdr remains the deterministic admission, scheduling, isolation and recovery authority;
+- use an isolated clean issue worktree under {str(consumer.get('worktree_root') or Path(consumer['workspace']) / 'worktrees').rstrip('/')}/ for code changes; never modify the persistent checkout or another issue's worktree;
+- never reproduce raw files from evidence/private, config/*.local.json, credentials, personal communications or protected operational data in prompts, logs, issues, commits or external services;
+- preserve the existing Teams and Microsoft 365 / Power Platform architecture; do not introduce a replacement web chat or paid backend without explicit authorization;
+- DLP/ACP or permission failures are policy gates, not invitations to route through another connector, HTTP path, account, environment or proxy;
+- do not buy or enable licenses, billing, paid services, Gateway, production publication, permission changes or irreversible Microsoft 365 / Power Platform actions without an explicit separate authorization;
+- an offline unit test or template snapshot is not evidence of a live Teams, Copilot Studio, Power BI or Power Platform deployment;
+- never treat unknown stock as zero, an access failure as an unavailable part, or an owner-only result as proof that a colleague or unauthorized user has the correct access;
+- preserve working photo labels/OCR and use general matching rules rather than hard-coded LX corrections;
+- merge only after relevant tests, exact-head green CI and independent exact-head review with no unresolved applicable finding, and only when repository protection permits it;
+- if the issue requires a real authorized-account test, credential, policy-owner action, production publication or other human/external gate, complete any safe preparatory work and report the precise blocker without fabricating acceptance evidence;
+- if the issue is already satisfied, produce closure evidence instead of inventing changes; if GitHub write authorization alone is missing, preserve the exact branch/patch/evidence and report blocker=github_write_auth_required.
 """.strip()
 
     raise RuntimeError(f"enabled consumer has no safe prompt contract: {name}")
