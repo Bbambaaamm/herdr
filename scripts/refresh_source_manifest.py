@@ -30,6 +30,7 @@ FILES = (
     Path("docs/architecture/ROOT_PUBLISHED_RUNTIME_129.md"),
     Path("docs/architecture/COMPLETION_EVIDENCE.md"),
     Path("docs/architecture/PROMPT_RUNTIME.md"),
+    Path("docs/architecture/TRAJECTORY_OBSERVER_144.md"),
 
     Path("docs/architecture/WORK_NODE_CONTRACT.md"),
     Path("docs/architecture/PARENT_RESULT_PUBLICATION.md"),
