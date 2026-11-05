@@ -595,6 +595,26 @@ def test_queue_projection_is_bounded_sanitized_and_quantlab_only(tmp_path, monke
         sources.queue(str(path), 'quantlab')
 
 
+def test_queue_v3_accepts_loxxess_without_hiding_existing_consumers():
+    def task(task_id, repo, agent):
+        return dict(task_id=task_id, repo=repo, issue=1, issue_title='Issue',
+                    issue_open=True, scheduler_state='active', status='pending',
+                    attempts=0, max_attempts=3, not_before=None, updated_at=100,
+                    agent=agent, kind='github_root_orchestration', blocker=None,
+                    pr_number=None)
+
+    quantlab = task('quantlab-1', 'Bbambaaamm/Autonomous-Quant-Lab',
+                    'quantlab-hermes')
+    majak = task('majak-1', 'Bbambaaamm/dotacni-majak',
+                 'dotacni-majak-hermes')
+    loxxess = task('loxxess-1', 'Bbambaaamm/loxxess-technical-ai-assistant',
+                   'loxxess-hermes')
+    payload = dict(version=3, observed_at=100, tasks=[quantlab, majak, loxxess])
+
+    assert sources.queue_from_payload(payload, 'quantlab') == ([quantlab], 100)
+    assert sources.queue_from_payload(payload, 'majak') == ([majak], 100)
+
+
 def test_queue_collect_and_staleness_are_fail_closed(tmp_path, monkeypatch):
     path = tmp_path / 'queue.json'
     row = dict(task_id='issue190-prepare-20260926', issue=190,
