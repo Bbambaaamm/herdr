@@ -55,6 +55,7 @@ VALIDITY_HOURS = 168
 MAX_POLICY_BYTES = 4 * 1024 * 1024
 MAX_CODE_BYTES = 16 * 1024 * 1024
 MAX_CODE_FILE_BYTES = 4 * 1024 * 1024
+RELEASE_OWNER_UID = 0
 
 
 class ActivationError(RuntimeError):
@@ -107,7 +108,7 @@ def release_inventory(release: Path) -> tuple[dict[str, str], tuple[str, ...], i
     for directory in (release, *[item for item in release.rglob("*") if item.is_dir()]):
         info = directory.lstat()
         need(not directory.is_symlink() and stat.S_ISDIR(info.st_mode)
-             and info.st_uid == 0
+             and info.st_uid == RELEASE_OWNER_UID
              and (os.name == "nt" or not info.st_mode & 0o222),
              "release_tree_not_immutable")
     files: dict[str, str] = {}
@@ -116,7 +117,7 @@ def release_inventory(release: Path) -> tuple[dict[str, str], tuple[str, ...], i
     for path in sorted([item for item in release.rglob("*") if item.is_file()]):
         info = path.lstat()
         need(not path.is_symlink() and stat.S_ISREG(info.st_mode)
-             and info.st_uid == 0 and not info.st_mode & 0o222,
+             and info.st_uid == RELEASE_OWNER_UID and not info.st_mode & 0o222,
              "release_tree_not_immutable")
         need(info.st_size <= MAX_CODE_FILE_BYTES, "release_file_too_large")
         relative = path.relative_to(release).as_posix()

@@ -24,6 +24,12 @@ from herdr.security import (
 )
 
 
+@pytest.fixture(autouse=True)
+def current_user_owns_test_release(monkeypatch):
+    monkeypatch.setattr(
+        activation, "RELEASE_OWNER_UID", getattr(os, "getuid", lambda: 0)())
+
+
 def rule(tool, risk, root=()):
     arguments = {
         "read_file": ("limit", "offset", "path"),
@@ -112,6 +118,9 @@ def immutable_release(tmp_path):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(body)
         path.chmod(0o555 if name == "agent-entry" else 0o444)
+    if os.name != "nt":
+        (release / "herdr").chmod(0o555)
+        release.chmod(0o555)
     return release, bodies
 
 
