@@ -3,6 +3,7 @@
 import hashlib
 import fcntl
 import json
+import re
 import os
 import stat
 import sys
@@ -11,7 +12,9 @@ from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from herdr.scheduler import AuditLog, DynamicChildScheduler, SchedulerError
+from herdr.scheduler import (AuditLog, DynamicChildScheduler, SchedulerError,
+    CanonicalParentAdmission, _LEGACY_PARENT, _canonical_payload_parent,
+    validate_canonical_parent_initialization)
 from herdr.taskgraph import LifecycleState
 from herdr.runtime import AdmissionRegistry, HerdrChildRuntime, SubprocessHerdrRunner
 
@@ -103,6 +106,26 @@ def _read_control_file(path: Path) -> bytes:
             os.close(fd)
 
 
+def _canonical_initial_prefix(directory: Path) -> bytes:
+    """Only the immutable initialization prefix, not a growing child journal."""
+    fd = os.open(directory / "scheduler.jsonl", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise SchedulerError("invalid canonical initialization ledger")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            raw = b""
+            for _ in range(4):
+                line = handle.readline(MAX_INITIALIZATION_BYTES - len(raw) + 1)
+                raw += line
+                if len(raw) > MAX_INITIALIZATION_BYTES or not line.endswith(b"\n"):
+                    raise SchedulerError("invalid canonical initialization prefix")
+            return raw
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def _initialization(directory: Path, parent_task_id: str, run_token: str):
     try:
         document = json.loads(_read_control_file(directory / INITIALIZATION))
@@ -113,6 +136,15 @@ def _initialization(directory: Path, parent_task_id: str, run_token: str):
             or document.get("state") not in {"pending", "committed"}):
         raise SchedulerError("scheduler initialization identity mismatch")
     expected = {"schema", "parent_task_id", "run_token", "state", "ledger_sha256"}
+    if "canonical_parent" in document:
+        if (type(document["schema"]) is not int
+                or not isinstance(document.get("ledger_sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", document["ledger_sha256"])):
+            raise SchedulerError("invalid canonical initialization envelope")
+        expected.add("canonical_parent")
+        parent = _canonical_payload_parent(document["canonical_parent"])
+        if (parent.identity.task_id, parent.identity.run_token) != (parent_task_id, run_token):
+            raise SchedulerError("canonical initialization identity mismatch")
     if document["state"] == "pending":
         expected.add("ledger")
     if set(document) != expected or not isinstance(document["ledger_sha256"], str):
@@ -124,16 +156,26 @@ def _initialization(directory: Path, parent_task_id: str, run_token: str):
         if hashlib.sha256(raw).hexdigest() != document["ledger_sha256"]:
             raise SchedulerError("scheduler initialization digest mismatch")
         events = [json.loads(line) for line in raw.splitlines()]
-        if (len(events) != 3 or [event.get("event") for event in events] !=
-                ["submit", "claim", "execution_session_bound"]
-                or any(event.get("task_id") != parent_task_id for event in events)
-                or events[1].get("run_token") != run_token or events[2].get("run_token") != run_token
-                or events[1].get("attempt_state") != "accepted"
-                or not events[1].get("idempotency_key")
-                or not all(events[2].get(key) for key in ("agent_name", "pane_id", "marker"))
-                or events[0].get("agent_id") != events[1].get("agent_id")
-                or events[1].get("agent_id") != events[2].get("agent_name")):
-            raise SchedulerError("invalid scheduler parent initialization events")
+        if "canonical_parent" in document:
+            validate_canonical_parent_initialization(document["canonical_parent"], events)
+        else:
+            if (len(events) != 3 or [event.get("event") for event in events] !=
+                    ["submit", "claim", "execution_session_bound"]
+                    or any(event.get("task_id") != parent_task_id for event in events)
+                    or events[1].get("run_token") != run_token or events[2].get("run_token") != run_token
+                    or events[1].get("attempt_state") != "accepted"
+                    or not events[1].get("idempotency_key")
+                    or not all(events[2].get(key) for key in ("agent_name", "pane_id", "marker"))
+                    or events[0].get("agent_id") != events[1].get("agent_id")
+                    or events[1].get("agent_id") != events[2].get("agent_name")):
+                raise SchedulerError("invalid scheduler parent initialization events")
+    if ("canonical_parent" in document and document["state"] == "committed"
+            and os.path.lexists(directory / "scheduler.jsonl")):
+        raw = _canonical_initial_prefix(directory)
+        if hashlib.sha256(raw).hexdigest() != document["ledger_sha256"]:
+            raise SchedulerError("committed canonical initialization prefix changed")
+        validate_canonical_parent_initialization(document["canonical_parent"],
+            [json.loads(line) for line in raw.splitlines()])
     return document
 
 
@@ -165,7 +207,7 @@ def repair_initialization(directory: Path, parent_task_id: str, run_token: str) 
                          json.dumps(committed, sort_keys=True, allow_nan=False).encode("utf-8"))
 
 
-def initialize_parent_scheduler(directory: Path, **binding) -> DynamicChildScheduler:
+def initialize_parent_scheduler(directory: Path, *, completion_authority=None, ownership_registry=None, ownership_parent=None, canonical_parent=_LEGACY_PARENT, **binding) -> DynamicChildScheduler:
     """Stage the whole parent registration before publishing either required artifact."""
     ledger = directory / "scheduler.jsonl"
     if os.path.lexists(ledger) or ledger_required(directory) or os.path.lexists(directory / INITIALIZATION):
@@ -174,12 +216,25 @@ def initialize_parent_scheduler(directory: Path, **binding) -> DynamicChildSched
     os.close(fd)
     stage = Path(name)
     try:
-        scheduler = DynamicChildScheduler(audit_log=AuditLog(stage))
-        scheduler.register_external_parent_attempt(**binding)
+        scheduler = DynamicChildScheduler(audit_log=AuditLog(stage),completion_authority=completion_authority,
+            ownership_registry=ownership_registry, ownership_parent=ownership_parent)
+        if canonical_parent is _LEGACY_PARENT:
+            scheduler.register_external_parent_attempt(**binding)
+        else:
+            if not isinstance(canonical_parent, CanonicalParentAdmission):
+                raise SchedulerError("typed canonical parent data required")
+            canonical_parent.to_json()  # Validate root-only mode before staging submits.
+            scheduler.submit(canonical_parent.graph, repo=canonical_parent.repo, issue=canonical_parent.issue)
+            parent_record = scheduler.register_external_parent_attempt(
+                canonical_parent=canonical_parent, **binding)
         raw = _read_control_file(stage)
         document = {"schema": 1, "parent_task_id": binding["task_id"], "run_token": binding["run_token"],
                     "state": "pending", "ledger_sha256": hashlib.sha256(raw).hexdigest(),
                     "ledger": raw.decode("utf-8")}
+        if canonical_parent is not _LEGACY_PARENT:
+            document["canonical_parent"] = parent_record.canonical_parent
+            validate_canonical_parent_initialization(document["canonical_parent"],
+                [json.loads(line) for line in raw.splitlines()])
         _atomic_control_file(directory / INITIALIZATION,
                              json.dumps(document, sort_keys=True, allow_nan=False).encode("utf-8"))
         repair_initialization(directory, binding["task_id"], binding["run_token"])
@@ -193,7 +248,7 @@ def ledger_required(directory: Path) -> bool:
     return os.path.lexists(directory / LEDGER_REQUIRED)
 
 
-def publish_exact_child_result(scheduler: DynamicChildScheduler, rec, result_path: Path) -> str | None:
+def publish_exact_child_result(scheduler: DynamicChildScheduler, rec, result_path: Path, *, _recovered=False) -> str | None:
     """Publish only a result bound to this delegated child's current attempt."""
     try:
         _require_real_directory(result_path.parent)
@@ -215,7 +270,16 @@ def publish_exact_child_result(scheduler: DynamicChildScheduler, rec, result_pat
     finally:
         if fd >= 0:
             os.close(fd)
-    result = json.loads(raw.decode("utf-8", errors="strict"))
+    try:
+        result = json.loads(raw.decode("utf-8", errors="strict"))
+    except (ValueError, UnicodeError):
+        authority = scheduler.completion_authority
+        from herdr.child_evidence import ChildCompletionAuthority
+        if (not _recovered and rec.state is LifecycleState.RUNNING
+                and isinstance(authority, ChildCompletionAuthority)
+                and authority.recover_local_result(rec, result_path)):
+            return publish_exact_child_result(scheduler, rec, result_path, _recovered=True)
+        raise
     if not isinstance(result, dict):
         raise ValueError("child result invalid")
     evidence = result.get("evidence")
@@ -238,13 +302,98 @@ def publish_exact_child_result(scheduler: DynamicChildScheduler, rec, result_pat
         if not scheduler.publish_child_result(rec.node.id, rec.run_token, rec.agent_id,
                                               rec.fencing_token, rec.idempotency_key,
                                               evidence_sha, evidence,
-                                              status=result["status"]):
+                                              status=result["status"],result_payload=result):
             raise ValueError("child result publication denied")
-    if (rec.attempt_state != "terminal" or rec.result_status != result["status"]
+    rejection=getattr(rec,"completion_failure",None)
+    if rejection is not None:
+        from herdr.child_evidence import validate_child_rejection
+        from herdr.evidence import digest
+        validate_child_rejection(rec,rejection)
+        if rejection["result_payload_sha256"] != digest(result) or rec.result_status!="blocked":
+            raise ValueError("child candidate differs from permanent host rejection")
+    if (rec.attempt_state != "terminal" or (rec.result_status != result["status"] and rejection is None)
             or rec.result_artifact_sha256 != evidence_sha):
         raise ValueError("child result not durably terminal")
+    if result["status"]=="completed" and rejection is None:
+        from herdr.evidence import digest
+        receipt=getattr(rec,"completion_receipt",None)
+        if not isinstance(receipt,dict) or receipt.get("result_payload_sha256")!=digest(result):
+            raise ValueError("child result differs from accepted semantic receipt")
     return rec.result_status
 
+
+def replay_host_scheduler(root: Path, ledger: Path) -> DynamicChildScheduler:
+    """Restore host ownership ports from protected canonical reservation intents.
+
+    Reading this intent does not issue a grant or start work. Replay verifies
+    its full parent/claim bindings against the already reserved private store.
+    """
+    from herdr.security import InvocationIdentity
+    from herdr.child_ownership import OwnershipRegistry
+    from herdr.ownership_inventory import LegacyOwnershipInventory
+    audit = AuditLog(ledger)
+    owners = {}
+    for event in audit.replay():
+        if event.get("event") == "child_ownership_reserved":
+            owner = InvocationIdentity.from_dict(event.get("parent"))
+            owners[json.dumps(owner.to_json(),sort_keys=True)] = owner
+    if len(owners) > 1:
+        raise SchedulerError("multiple ownership parents in one attempt ledger")
+    owner = next(iter(owners.values()),None)
+    from herdr.ownership_release import HostOwnershipRelease
+    registry = None if owner is None else OwnershipRegistry(root,
+        verify_legacy=LegacyOwnershipInventory(root),verify_release=HostOwnershipRelease(root))
+    scheduler = DynamicChildScheduler(audit_log=audit,ownership_registry=registry,ownership_parent=owner)
+    scheduler.replay()
+    from agent_completion_evidence import child_completion_for_replay
+    authority=child_completion_for_replay(root,scheduler)
+    if authority is not None:
+        scheduler.completion_authority=authority
+    if any(rec.ownership is not None and rec.ownership_reservation is None
+           for rec in scheduler._tasks.values()):
+        raise SchedulerError("declared ownership lacks protected reservation")
+    return scheduler
+
+
+
+@contextmanager
+def recovery_worktree_pin(rec):
+    """Reopen only the exact protected claim inode; never grant or dispatch."""
+    if rec.ownership is None:
+        yield None
+        return
+    from agent_durable_sandbox import PinnedWorktree
+    raw = rec.worktree_identity
+    if not isinstance(raw, str) or len(raw) > 4096:
+        raise ValueError("owned recovery worktree identity missing")
+    logical_raw, separator, numbers = raw.rpartition("|")
+    device, colon, inode = numbers.partition(":")
+    if not separator or not colon or not device.isdecimal() or not inode.isdecimal():
+        raise ValueError("owned recovery worktree identity invalid")
+    logical = Path(logical_raw)
+    if (not logical.is_absolute() or str(logical) != logical_raw
+            or any(part in {".", ".."} for part in logical.parts)
+            or len(logical.parts) > 128):
+        raise ValueError("owned recovery worktree path invalid")
+    flags = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open("/", flags)
+    pin = None
+    try:
+        # No symlink ancestor can redirect a retained logical worktree name.
+        for part in logical.parts[1:]:
+            next_fd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        held = os.fstat(fd)
+        if (held.st_dev, held.st_ino) != (int(device), int(inode)):
+            raise ValueError("owned recovery worktree inode changed")
+        pin = PinnedWorktree(logical, fd, held.st_dev, held.st_ino)
+        if pin.identity != raw:
+            raise ValueError("owned recovery worktree identity changed")
+        pin.verify()
+        yield pin
+    finally:
+        os.close(fd)
 
 def reconcile_child_results(root: Path, parent_task_id: str, run_token: str) -> None:
     """Under bridge.lock, consume exact result files from this attempt's ledger."""
@@ -253,8 +402,7 @@ def reconcile_child_results(root: Path, parent_task_id: str, run_token: str) -> 
     if not ledger.is_file():
         return
     try:
-        scheduler = DynamicChildScheduler(audit_log=AuditLog(ledger))
-        scheduler.replay()
+        scheduler = replay_host_scheduler(root,ledger)
         events = scheduler.audit_log.replay()
         parent = scheduler._tasks.get(parent_task_id)
         children = [rec for rec in scheduler._tasks.values()
@@ -277,9 +425,11 @@ def reconcile_child_results(root: Path, parent_task_id: str, run_token: str) -> 
             try:
                 runner = SubprocessHerdrRunner(os.environ.get(
                     "HERDR_REAL_BINARY", "/home/agentops/.local/bin/herdr"))
-                runtime = HerdrChildRuntime(scheduler, runner, cwd=root,
-                    snapshot_path=directory / "swarm.json", admission_registry=AdmissionRegistry())
-                runtime.recover_interrupted_child_start(rec.id)
+                with recovery_worktree_pin(rec) as pin:
+                    runtime = HerdrChildRuntime(scheduler, runner, cwd=root,
+                        snapshot_path=directory / "swarm.json", admission_registry=AdmissionRegistry(),
+                        pinned_worktree=pin)
+                    runtime.recover_interrupted_child_start(rec.id)
             except (OSError, ValueError, TypeError, KeyError, RuntimeError):
                 # Retain exact intent when ownership is absent, ambiguous or unavailable.
                 continue
@@ -298,27 +448,30 @@ def reconcile_child_results(root: Path, parent_task_id: str, run_token: str) -> 
             try:
                 runner = SubprocessHerdrRunner(os.environ.get(
                     "HERDR_REAL_BINARY", "/home/agentops/.local/bin/herdr"))
-                runtime = HerdrChildRuntime(
-                    scheduler, runner, cwd=root,
-                    snapshot_path=directory / "swarm.json",
-                    admission_registry=AdmissionRegistry())
-                if rec.pre_delivery_failure and not rec.execution_pane:
-                    if rec.pre_delivery_pane_creation_attempted:
-                        runtime.recover_interrupted_child_start(rec.id)
+                with recovery_worktree_pin(rec) as pin:
+                    runtime = HerdrChildRuntime(
+                        scheduler, runner, cwd=root,
+                        snapshot_path=directory / "swarm.json",
+                        admission_registry=AdmissionRegistry(), pinned_worktree=pin)
+                    if rec.pre_delivery_failure and not rec.execution_pane:
+                        if rec.pre_delivery_pane_creation_attempted:
+                            runtime.recover_interrupted_child_start(rec.id)
+                            continue
+                        runtime.admission_registry.release(
+                            rec.agent_id, now=scheduler.current_time(),
+                            task_id=rec.id, fencing_token=rec.fencing_token)
+                        scheduler.mark_pre_delivery_cleanup_complete(rec.id)
                         continue
-                    runtime.admission_registry.release(
-                        rec.agent_id, now=scheduler.current_time(),
-                        task_id=rec.id, fencing_token=rec.fencing_token)
-                    scheduler.mark_pre_delivery_cleanup_complete(rec.id)
-                    continue
-                if rec.pre_delivery_failure:
-                    runtime.cleanup_bound_pre_delivery(rec.id)
-                else:
-                    runtime.cleanup_bound_child(rec.id)
-                scheduler.mark_pre_delivery_cleanup_complete(rec.id) if rec.pre_delivery_failure else scheduler.mark_child_cleanup_complete(rec.id)
+                    if rec.pre_delivery_failure:
+                        runtime.cleanup_bound_pre_delivery(rec.id)
+                    else:
+                        runtime.cleanup_bound_child(rec.id)
+                    scheduler.mark_pre_delivery_cleanup_complete(rec.id) if rec.pre_delivery_failure else scheduler.mark_child_cleanup_complete(rec.id)
             except (OSError, ValueError, TypeError, KeyError, RuntimeError):
                 # Retain the terminal result, but never open the parent gate.
                 continue
+        for rec in children:
+            scheduler.release_child_ownership(rec.id)
     except (OSError, ValueError, TypeError, KeyError, AttributeError, RuntimeError):
         return
 
@@ -362,8 +515,7 @@ def all_children_terminal(root: Path, parent_task_id: str, run_token: str, *,
     if not ledger.is_file():
         return lock_held and not os.path.lexists(ledger) and not ledger_required(directory)
     try:
-        scheduler = DynamicChildScheduler(audit_log=AuditLog(ledger))
-        scheduler.replay()
+        scheduler = replay_host_scheduler(root,ledger)
         events = scheduler.audit_log.replay()
         parent = scheduler._tasks.get(parent_task_id)
         if not events or not any(e.get("event") == "submit" and
@@ -381,9 +533,20 @@ def all_children_terminal(root: Path, parent_task_id: str, run_token: str, *,
             e.get("parent_run_token") != run_token for e in spawned
         ):
             return False
+        # Old accepted results remain historical when a shared contract changes;
+        # a stale dependent may not open the parent's completion barrier.
+        for rec in children:
+            if rec.namespace_lifetime is not None and rec.attempt_state == "terminal" and rec.cleanup_complete:
+                from herdr.ownership_release import namespace_exited
+                if not namespace_exited(rec.namespace_lifetime):
+                    return False
+            if rec.ownership is not None and (
+                    rec.result_status == "completed" or rec.attempt_state == "terminal" and rec.cleanup_complete):
+                scheduler._require_current_ownership(rec,result=rec.cleanup_complete)
         return all(rec.attempt_state == "terminal" and
                    (bool(rec.pre_delivery_failure) and rec.cleanup_complete or
                     rec.result_status in {"completed", "blocked", "failed"} and
+                    (rec.result_status!="completed" or rec.completion_receipt is not None) and
                     (not rec.execution_pane or rec.cleanup_complete)) and rec.lease is None and
                    rec.state in {LifecycleState.DONE, LifecycleState.FAILED,
                                  LifecycleState.BLOCKED} for rec in children)

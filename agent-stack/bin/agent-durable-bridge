@@ -19,8 +19,9 @@ loader.exec_module(child)
 
 FIELDS = {
     "operation", "task_id", "run_token", "agent", "pane", "marker",
-    "key", "role", "objective", "prompt", "tool", "permission", "cwd",
+    "key", "role", "objective", "prompt", "tool", "permission", "cwd", "ownership",
 }
+MODEL_FIELDS = {"model", "fallback_model"}
 ACTIVE_STATES = {"running", "blocked"}
 TERMINAL_STATES = {"done", "failed"}
 MAX_CONNECTIONS = 1024
@@ -36,7 +37,7 @@ def socket_name(task_id: str, run_token: str) -> str:
 def validate_request(request: object, identity: dict) -> argparse.Namespace:
     if (
         not isinstance(request, dict)
-        or set(request) != FIELDS
+        or set(request) - MODEL_FIELDS not in (FIELDS, FIELDS-{"ownership"})
         or request.get("operation") != "delegate"
     ):
         raise ValueError("invalid delegation request schema")
@@ -61,12 +62,19 @@ def validate_request(request: object, identity: dict) -> argparse.Namespace:
             or any(not isinstance(item, str) or not item or len(item) > 128 for item in value)
         ):
             raise ValueError("invalid delegation scope")
+    ownership = request.get("ownership")
+    if ownership is not None:
+        from herdr.child_ownership import ChildOwnership
+        ownership = ChildOwnership.from_json(ownership).to_json()
     return argparse.Namespace(
-        **{key: request[key] for key in ("key", "role", "objective", "prompt", "tool", "permission", "cwd")}
+        **{key: request[key] for key in ("key", "role", "objective", "prompt", "tool", "permission", "cwd")},
+        ownership=ownership,
+        **child.model_arguments(request),
     )
 
 
 def _current_task_file(root: Path, task_id: str, run_token: str) -> Path:
+    from herdr.recovery_unknown import held
     matches: list[Path] = []
     terminal: list[Path] = []
     for state in (*ACTIVE_STATES, *TERMINAL_STATES):
@@ -79,6 +87,8 @@ def _current_task_file(root: Path, task_id: str, run_token: str) -> Path:
             continue
         if payload.get("id") != task_id or payload.get("run_token") != run_token:
             continue
+        if held(payload):
+            raise ValueError("terminal_unknown_requires_operator_reconciliation")
         (terminal if state in TERMINAL_STATES else matches).append(path.resolve())
     if terminal:
         raise ValueError("parent task is terminal")
@@ -127,12 +137,15 @@ def _peer_in_pane(connection: socket.socket, process_info: dict, marker: str) ->
     return False
 
 
-def serve(task_file: Path, identity: dict, real_binary: Path, *, policy_launch_factory=None, policy_launch_factory_provider=None) -> None:
+def serve(task_file: Path, identity: dict, real_binary: Path, *, policy_launch_factory=None, policy_launch_factory_provider=None, completion_authority=None, completion_authority_provider=None) -> None:
     if not real_binary.is_absolute() or not real_binary.is_file():
         raise ValueError("real Herdr binary unavailable")
     startup_path = task_file.resolve(strict=True)
     root = startup_path.parent.parent.resolve()
     startup_task = json.loads(startup_path.read_text(encoding="utf-8"))
+    from herdr.recovery_unknown import held
+    if held(startup_task):
+        raise ValueError("terminal_unknown_requires_operator_reconciliation")
     pinned = {
         field: startup_task.get(field)
         for field in (
@@ -202,7 +215,12 @@ def serve(task_file: Path, identity: dict, real_binary: Path, *, policy_launch_f
                         if not callable(policy_launch_factory_provider):
                             raise ValueError("child host policy composition unavailable")
                         factory=policy_launch_factory_provider(current_path,identity)
-                    result = child.delegate(args, runner=runner, policy_launch_factory=factory)
+                    authority=completion_authority
+                    if authority is None:
+                        if not callable(completion_authority_provider):
+                            raise ValueError("child host completion composition unavailable")
+                        authority=completion_authority_provider(current_path,identity,factory=factory)
+                    result = child.delegate(args, runner=runner, policy_launch_factory=factory,completion_authority=authority)
                     response = {"ok": True, "result": result, "error": None}
                 except Exception as exc:
                     response = {"ok": False, "result": None, "error": str(exc)[:1000]}
@@ -231,8 +249,10 @@ def main() -> None:
         "marker": args.marker,
     }
     from herdr.host_configuration import child_factory_for_root
+    from agent_completion_evidence import child_completion_for_root
     serve(Path(args.task_file), identity, Path(args.real_binary),
-          policy_launch_factory_provider=child_factory_for_root)
+          policy_launch_factory_provider=child_factory_for_root,
+          completion_authority_provider=child_completion_for_root)
 
 
 if __name__ == "__main__":

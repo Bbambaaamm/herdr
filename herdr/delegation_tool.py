@@ -11,10 +11,11 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 from herdr.security import PolicyDenied, SecurityError
+from herdr.child_ownership import ChildOwnership, ownership_schema
 
 TOOL = "herdr_delegate_child"
 TOOLSET = "herdr_delegation"
-ARGUMENTS = ("key", "role", "objective", "prompt", "tool", "permission", "cwd")
+ARGUMENTS = ("key", "role", "objective", "prompt", "tool", "permission", "cwd", "ownership", "model", "fallback_model")
 SCHEMA = {
     "name": TOOL,
     "description": "Delegate bounded work through the current Herdr task. Reuse the same key to reconcile the same child. Returned evidence is submitted work, subject to shared acceptance.",
@@ -31,15 +32,40 @@ SCHEMA = {
             "permission": {"type": "array", "maxItems": 64, "uniqueItems": True,
                      "items": {"type": "string", "minLength": 1, "maxLength": 128}},
             "cwd": {"type": "string", "maxLength": 4096},
+            "ownership": ownership_schema(),
+            "model": {"type": "string", "minLength": 1, "maxLength": 256},
+            "fallback_model": {"type": ["string", "null"], "minLength": 1, "maxLength": 256},
         },
     },
 }
+
+
+def model_arguments(value):
+    """Preserve optional routing intent; this never authorizes a model route.
+
+    Absence retains ChildProposal defaults. Explicit fallback null disables it.
+    Concrete host tool rules, child grants and economic admission still apply.
+    """
+    result = {}
+    for name in ("model", "fallback_model"):
+        if name not in value:
+            continue
+        item = value[name]
+        if item is None and name == "fallback_model":
+            result[name] = None
+            continue
+        if (not isinstance(item, str) or not 0 < len(item) <= 256
+                or any(ord(char) <= 32 or ord(char) == 127 for char in item)):
+            raise ValueError("bounded delegation model identifier required")
+        result[name] = item
+    return result
 
 
 def _arguments(value):
     if not isinstance(value, dict) or set(value) - set(ARGUMENTS):
         raise SecurityError("closed delegation arguments required")
     checked = dict(value)
+    model_arguments(checked)
     for name, limit in (("key", 128), ("role", 32), ("objective", 8192), ("prompt", 32768)):
         item = checked.get(name)
         if not isinstance(item, str) or not 0 < len(item) <= limit or "\0" in item:
@@ -52,6 +78,8 @@ def _arguments(value):
                 or any(not isinstance(item, str) or not 0 < len(item) <= 128 or "\0" in item for item in items)
                 or len(set(items)) != len(items)):
             raise SecurityError("bounded unique delegation scope required")
+    if checked.get("ownership") is not None:
+        checked["ownership"] = ChildOwnership.from_json(checked["ownership"]).to_json()
     cwd = checked.setdefault("cwd", "")
     if not isinstance(cwd, str) or len(cwd) > 4096 or "\0" in cwd:
         raise SecurityError("bounded delegation cwd required")
@@ -106,10 +134,15 @@ def register_delegation_tool(installation, registry, authorized_call, call_diges
             _arguments(arguments)
             supplied = dict(arguments)
             _, checked = guard.authorize_tool_call(
-                TOOL, supplied, caller_task_id=task_id,
+                TOOL, supplied, caller_task_id=installation.resolve_caller_task_id(task_id),
                 consume_approval=authorized_call.get() != (
                     guard.grant.hash, TOOL, call_digest(TOOL, supplied)))
-            result = _client_delegate(_arguments(checked))
+            admitted = _arguments(checked)
+            if admitted.get("ownership") is not None:
+                owner = ChildOwnership.from_json(admitted["ownership"])
+                if owner.integration_owner != guard.grant.identity.task_id:
+                    raise PolicyDenied("delegation_integration_owner_mismatch")
+            result = _client_delegate(admitted)
             payload = json.dumps(result, ensure_ascii=False, allow_nan=False)
             if len(payload.encode()) > 524288:
                 raise SecurityError("bounded delegation result required")

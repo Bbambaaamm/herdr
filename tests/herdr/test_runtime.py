@@ -7,6 +7,7 @@ import os
 import re
 import threading
 import time
+import types
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -41,6 +42,7 @@ class FakeHerdrRunner:
         self.calls: list[tuple[str, ...]] = []
         self.created: list[str] = []
         self.closed: list[str] = []
+        self.agents: dict[str, dict[str, str]] = {}
         self.active_prompts = 0
         self.max_active_prompts = 0
         self.prompt_status = "done"
@@ -58,6 +60,32 @@ class FakeHerdrRunner:
             self.created.append(pane_id)
             payload = {"result": {"pane": {"pane_id": pane_id}}}
             return CommandResult(0, json.dumps(payload), "")
+        if call[:2] == ("pane", "run"):
+            if len(call) >= 4 and "exec hermes " in call[3]:
+                pane_id = call[2]
+                self.agents[pane_id] = {
+                    "agent": "hermes",
+                    "name": f"manual-{pane_id.replace(':', '-')}",
+                    "pane_id": pane_id,
+                    "agent_status": "idle",
+                }
+            return CommandResult(0, "", "")
+        if call[:2] == ("agent", "get"):
+            target = call[2]
+            agent = self.agents.get(target)
+            if agent is None:
+                agent = next((row for row in self.agents.values()
+                              if row.get("name") == target), None)
+            if agent is None:
+                return CommandResult(1, json.dumps({"error": {"code": "agent_not_found"}}), "")
+            return CommandResult(0, json.dumps({"result": {"agent": agent}}), "")
+        if call[:2] == ("agent", "rename"):
+            target, name = call[2], call[3]
+            agent = self.agents.get(target)
+            if agent is None:
+                return CommandResult(1, json.dumps({"error": {"code": "agent_not_found"}}), "")
+            agent["name"] = name
+            return CommandResult(0, json.dumps({"result": {"agent": agent}}), "")
         if call[:2] == ("agent", "start"):
             payload = {"result": {"agent": {"name": call[2]}}}
             return CommandResult(0, json.dumps(payload), "")
@@ -75,6 +103,7 @@ class FakeHerdrRunner:
             )
         if call[:2] == ("pane", "close"):
             self.closed.append(call[2])
+            self.agents.pop(call[2], None)
             return CommandResult(0, json.dumps({"result": {"closed": True}}), "")
         raise AssertionError(f"unexpected Herdr call: {call}")
 
@@ -339,6 +368,42 @@ def test_managed_runtime_binds_owned_pane_before_prompt(tmp_path: Path, monkeypa
     assert rec.state.value == "running"
 
 
+def test_private_child_approval_failure_precedes_provider_and_pane(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from tests.policy_launch_fakes import FakeHostPolicyLaunchFactory
+    from herdr.security import SecurityError
+    scheduler=DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path/"events.jsonl"))
+    scheduler.register_external_parent_attempt(task_id="parent",run_token="root-run",
+        idempotency_key="root-key",agent_name="parent-agent",pane_id="parent-pane",marker="parent-marker",
+        repo="Bbambaaamm/herdr",issue="82",role="writer",tools=("read_file",),
+        permissions=(),policy_profile="herdr-core")
+    child=scheduler.delegate_child("parent","root-run","research",
+        ChildProposal("writer",("read_file",),"reader",("read_file",),child_task="inspect"))
+    lease=scheduler.dispatch(task_ids={child.id})[0];rec=scheduler._tasks[child.id]
+    scheduler.bind_child_prompt(child.id,"inspect now")
+    class Runner:
+        executable="/bin/true"
+        def run(self,*args,**kwargs):pytest.fail("no native process before private approval")
+    factory=FakeHostPolicyLaunchFactory();original=factory.prepare_child
+    runtime=HerdrChildRuntime(scheduler,Runner(),cwd=tmp_path,policy_launch_factory=factory)
+    def prepare(**kwargs):
+        launch=original(**kwargs)
+        launch.private_profile_snapshot=SimpleNamespace(name=runtime.env.get("HERDR_HERMES_PROFILE","quantlab"))
+        return launch
+    monkeypatch.setattr(factory,"prepare_child",prepare)
+    monkeypatch.setattr(runtime,"prepare",lambda:None)
+    monkeypatch.setattr(runtime,"_admit_child",lambda lease:None)
+    def deny(task_id,real):raise SecurityError("private mount approval missing")
+    monkeypatch.setattr(runtime,"_prepare_private_child_command",deny)
+    monkeypatch.setattr(runtime,"_preflight_child_provider",lambda:pytest.fail("no mutable private credential preflight"))
+    monkeypatch.setattr(runtime,"_create_pane",lambda *args:pytest.fail("approval must precede pane"))
+    with pytest.raises(HerdrRuntimeError,match="child_pre_delivery_failed"):
+        runtime.run_managed_child(lease,"inspect now",run_token=rec.run_token,idempotency_key=rec.idempotency_key)
+    assert not runtime._policy_launches and not runtime._private_sandbox_commands
+    assert factory.created[0].events[-1]==("closed",)
+    assert rec.execution_pane is None and not rec.economic_delivery_attempted
+
+
 def test_managed_done_without_inner_sandbox_cannot_settle(tmp_path: Path, monkeypatch) -> None:
     scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
     scheduler.register_external_parent_attempt(
@@ -448,7 +513,7 @@ def test_child_workspace_write_requires_role_tool_and_permission(
     (("read_file", "search_files"), "file"),
     (("read_file", "write_file", "patch"), "file"),
 ])
-def test_managed_agent_start_uses_explicit_admitted_toolset(tmp_path, tools, expected):
+def test_legacy_canary_agent_start_uses_explicit_admitted_toolset(tmp_path, tools, expected):
     scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
     role = "writer" if set(tools) & {"patch","write_file"} else "reader"
     parent_role = "reviewer" if role == "reviewer" else "writer"
@@ -805,11 +870,8 @@ def test_two_real_child_contract_parallel_cleanup_and_snapshot(tmp_path: Path) -
     assert any(call == ("--skill",) for call in runner.calls)
     starts = [call for call in runner.calls if call[:2] == ("agent", "start")]
     assert len(starts) == 2
-    assert all("--toolsets" in call and
-               call[call.index("--toolsets") + 1] == "bot_room" for call in starts)
-    assert all(
-        "--max-turns" in call and call[call.index("--max-turns") + 1] == "1" for call in starts
-    )
+    assert all(call[call.index("--toolsets") + 1] == "bot_room" for call in starts)
+    assert all(call[call.index("--max-turns") + 1] == "1" for call in starts)
 
     payload = json.loads(snapshot_path.read_text())
     assert {
@@ -1057,6 +1119,16 @@ def test_actual_child_sandbox_proof_persists_exact_attestation(tmp_path, monkeyp
                 module.HERDR_CONFIG = config
                 module.HERDR_RELEASES = releases
                 module.DEFAULT_WRITABLE = ()
+                # Exercise the real copy routine on this fixture's filesystem;
+                # shared /tmp can have a separate per-UID quota on staging.
+                module.tempfile = types.SimpleNamespace(
+                    mkstemp=lambda **kwargs: tempfile.mkstemp(
+                        **{**kwargs, "dir": root}),
+                )
+                # This fixture launches bwrap through a pipe; native TTY readiness
+                # is covered separately by real-PTY and owned-server checks.
+                module.pane_input_ready = lambda *args: True
+                module.verify_pane_prompt = lambda *args, **kwargs: None
                 loaded["sandbox"] = module
         monkeypatch.setattr(SourceFileLoader, "exec_module", load)
         scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(root / "events.jsonl"))
@@ -1084,8 +1156,10 @@ def test_actual_child_sandbox_proof_persists_exact_attestation(tmp_path, monkeyp
                         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                         env={"PATH": "/usr/bin:/bin", "HOME": str(fake_home),
                              "HERDR_DURABLE_TASK_PANE": marker})
-                    return CommandResult(0, json.dumps({"result": {}}), "")
+                    return CommandResult(0, "", "")
                 assert args[:2] == ["pane", "process-info"]
+                if sandbox_process is None:
+                    return CommandResult(0, json.dumps({"result": {"process_info": {}}}), "")
                 processes = []
                 for _ in range(50):
                     assert sandbox_process.poll() is None, sandbox_process.stderr.read(8192).decode()
@@ -1202,13 +1276,23 @@ def test_child_sandbox_failure_removes_frozen_policy(tmp_path, monkeypatch, phas
             return ["bwrap", "/bin/bash"]
         module.command = command
         module.inner_pid = lambda *a: 123
+        module.pane_input_ready = lambda *a: True
+        module.verify_pane_prompt = lambda *a, **kw: None
         module.verify = lambda *a, **k: phase != "verify"
+    if phase == "verify":
+        from herdr import runtime as runtime_module
+        clock = [0.0]
+        monkeypatch.setattr(runtime_module.time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(runtime_module.time, "sleep",
+                            lambda seconds: clock.__setitem__(0, clock[0] + seconds))
     monkeypatch.setattr(SourceFileLoader, "exec_module", load)
     class Runner:
         def run(self, args, **kwargs):
             if (phase == "launch" and args[:2] == ["pane", "run"]
                     or phase == "inspect" and args[:2] == ["pane", "process-info"]):
                 raise RuntimeError("transport failed")
+            if args[:2] == ["pane", "run"]:
+                return CommandResult(0, "", "")
             return CommandResult(0, json.dumps({"result": {"process_info": {}}}), "")
     runtime = HerdrChildRuntime(scheduler, Runner(), cwd=tmp_path, snapshot_path=tmp_path / "scheduler.json")
     from tests.policy_launch_fakes import FakePreparedPolicyLaunch
@@ -1352,6 +1436,11 @@ def explicit_host_policy_for_lifecycle_tests(monkeypatch):
     from tests.policy_launch_fakes import install_runtime_policy_fixture
     from herdr.runtime import HerdrChildRuntime
     install_runtime_policy_fixture(monkeypatch, HerdrChildRuntime)
+
+@pytest.fixture(autouse=True)
+def explicit_host_completion_port_for_lifecycle_only(monkeypatch):
+    from tests.policy_launch_fakes import install_child_completion_fixture
+    install_child_completion_fixture(monkeypatch)
 
 
 @pytest.mark.parametrize("alias",["read","write","review"])
@@ -1620,3 +1709,198 @@ def test_atomic_managed_claim_survives_crash_before_runtime_entry(tmp_path,monke
     runtime.recover_interrupted_child_start(child.id)
     assert record.cleanup_complete and record.state.value=="blocked"
     assert record.fencing_token==lease.fencing_token
+
+def test_missing_modern_work_profile_blocks_before_split_or_agent(tmp_path,monkeypatch):
+    from herdr.work_cycle import WorkContractError
+    from herdr.child_evidence import ChildCompletionAuthority
+    scheduler=DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path/"events.jsonl"))
+    scheduler.register_external_parent_attempt(task_id="parent",run_token="parent-run",
+        idempotency_key="parent-key",agent_name="parent-agent",pane_id="parent-pane",
+        marker="parent-marker",repo="Bbambaaamm/herdr",issue="86",role="writer",
+        tools=("read_file",),permissions=(),policy_profile="herdr-core")
+    child=scheduler.delegate_child("parent","parent-run","coding",
+        ChildProposal("writer",("read_file",),"reader",("read_file",),child_task="inspect"))
+    lease=scheduler.dispatch(task_ids={child.id})[0];rec=scheduler._tasks[child.id]
+    scheduler.bind_child_prompt(child.id,"inspect")
+    class Runner(FakeHerdrRunner):
+        executable="/bin/true"
+    runtime=HerdrChildRuntime(scheduler,Runner(),cwd=tmp_path)
+    monkeypatch.setattr(runtime,"prepare",lambda:None)
+    monkeypatch.setattr(runtime,"_admit_child",lambda lease:None)
+    def unavailable(authority,record,launch):
+        assert record is rec and launch.identity.task_id==child.id
+        raise WorkContractError("approved modern work profile unavailable")
+    monkeypatch.setattr(ChildCompletionAuthority,"preflight_work",unavailable)
+    monkeypatch.setattr(runtime,"_create_pane",lambda *a:pytest.fail("missing profile cannot split"))
+    monkeypatch.setattr(runtime,"_start_agent",lambda *a:pytest.fail("missing profile cannot start"))
+    monkeypatch.setattr(runtime,"cleanup_managed_pre_delivery",lambda *a,**kw:None)
+    with pytest.raises(runtime_mod.PreDeliveryFailure,match="modern work profile"):
+        runtime.run_managed_child(lease,"inspect",run_token=rec.run_token,
+                                  idempotency_key=rec.idempotency_key)
+    assert not rec.pane_split_started and rec.execution_pane is None
+    assert not any(event["event"]=="child_pane_split_started" for event in scheduler.audit_log.replay())
+
+
+@pytest.mark.parametrize("case", ["delayed", "input-unready", "native-error", "json-ack", "text-ack", "stderr-ack", "prompt-unverified", "handoff-denied"])
+def test_managed_child_waits_before_single_native_launch_and_full_verification(tmp_path, monkeypatch, case):
+    from importlib.machinery import SourceFileLoader
+    from types import SimpleNamespace
+    from herdr import runtime as runtime_module
+    from tests.policy_launch_fakes import FakePreparedPolicyLaunch
+    from tests.herdr.test_security import identity
+    clock = [0.0]
+    monkeypatch.setattr(runtime_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(runtime_module.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    policy = tmp_path / "frozen-policy"
+    policy.write_text("frozen")
+    verification = []
+    original = SourceFileLoader.exec_module
+    def load(loader, module):
+        original(loader, module)
+        if loader.name != "agent_durable_sandbox_runtime":
+            return
+        module.frozen_policy = lambda: policy
+        module.command = lambda *args, **kwargs: ["/bin/true"]
+        module.pane_input_ready = lambda info, marker: info.get("ready") is True
+        def prompt(invoke, pane, marker, **kwargs):
+            assert runner.input_checks >= 2 and runner.launches == 0
+            runner.prompt_checks += 1
+            if case == "prompt-unverified":
+                raise RuntimeError("durable_pane_prompt_unverified")
+        module.verify_pane_prompt = prompt
+        module.inner_pid = lambda info, marker: info.get("pid")
+        def verify(pid, real, marker, **kwargs):
+            verification.append((pid, marker, kwargs))
+            return True
+        module.verify = verify
+    monkeypatch.setattr(SourceFileLoader, "exec_module", load)
+    record = SimpleNamespace(idempotency_key="slot-key", agent_id="child", run_token="run",
+                             fencing_token=1, worktree_identity=None, ownership=None,
+                             parent_agent_id=None, parent_task_id=None, id="task")
+    scheduler = SimpleNamespace(_tasks={"task": record},
+        task_node=lambda task: SimpleNamespace(tools=(), permissions=()))
+    class Runner:
+        def __init__(self):
+            self.input_checks = self.sandbox_checks = self.launches = self.prompt_checks = 0
+        def run(self, args, *, timeout_seconds=30.0):
+            if args[:2] == ["pane", "process-info"]:
+                assert args[2:] == ["--pane", "owned"]
+                assert 0 < timeout_seconds <= 10
+                if not self.launches:
+                    self.input_checks += 1
+                    value = {"ready": case != "input-unready" and self.input_checks >= 2}
+                else:
+                    self.sandbox_checks += 1
+                    value = {"pid": 123 if self.sandbox_checks >= 2 else None}
+                return CommandResult(0, json.dumps({"result": {"process_info": value}}), "")
+            assert args[:3] == ["pane", "run", "owned"]
+            assert self.input_checks >= 2 and self.prompt_checks == 1
+            self.launches += 1
+            return {
+                "native-error": CommandResult(1, "", "native launch failed"),
+                "json-ack": CommandResult(0, '{"result":{}}', ""),
+                "text-ack": CommandResult(0, "unexpected", ""),
+                "stderr-ack": CommandResult(0, "", "warning"),
+            }.get(case, CommandResult(0, "", ""))
+    runner = Runner()
+    runtime = HerdrChildRuntime(scheduler, runner, cwd=tmp_path, snapshot_path=tmp_path / "swarm.json")
+    launch = FakePreparedPolicyLaunch(identity(task_id="task"))
+    runtime._policy_launches["task"] = launch
+    from herdr.security import SecurityError
+    if case == "handoff-denied":
+        def denied(current):
+            assert current is launch and runner.input_checks == 2 and runner.prompt_checks == 1
+            raise SecurityError("handoff expired during pane readiness")
+        launch.private_plan_handoff = SimpleNamespace(verify_bound=denied)
+    monkeypatch.setattr(runtime, "_child_workspace_writable", lambda task: False)
+    if case == "delayed":
+        assert runtime._sandbox_child_pane("owned", "marker", "/bin/true", "task") == policy
+        assert runner.input_checks == runner.sandbox_checks == 2 and runner.launches == 1
+        assert verification[0][0:2] == (123, "marker")
+        assert verification[0][2]["attempts"] == 1
+        assert verification[0][2]["policy_mount"] is launch.mount
+        assert runtime._sandbox_proofs["owned"]["sandbox_pid"] == 123
+    else:
+        with pytest.raises(SecurityError if case == "handoff-denied" else HerdrRuntimeError):
+            runtime._sandbox_child_pane("owned", "marker", "/bin/true", "task")
+        assert runner.launches == (0 if case in {"input-unready", "prompt-unverified", "handoff-denied"} else 1)
+        assert runner.sandbox_checks == 0 and verification == []
+        assert not policy.exists() and "owned" not in runtime._sandbox_proofs
+
+def test_managed_start_cannot_fall_back_to_native_bare_shell_when_proof_missing(tmp_path):
+    scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
+    scheduler.register_external_parent_attempt(task_id="parent", run_token="run",
+        idempotency_key="key", agent_name="parent", pane_id="parent-pane", marker="marker",
+        repo="repo", issue="82", role="writer", tools=("read_file",),
+        permissions=(), policy_profile="default")
+    child = scheduler.delegate_child("parent", "run", "scope",
+        ChildProposal("writer", ("read_file",), "reader", ("read_file",), child_task="inspect"))
+    lease = scheduler.dispatch(task_ids={child.id})[0]
+    runner = FakeHerdrRunner()
+    runtime = HerdrChildRuntime(scheduler, runner, cwd=tmp_path,
+        env={"HERDR_ENV": "1", "HERDR_PANE_ID": "parent-pane"})
+    runtime._skill_checked = True
+    runtime._managed_launch_panes.add("owned-pane")
+    with pytest.raises(HerdrRuntimeError, match="child_invocation_policy_missing"):
+        runtime._start_agent(lease, "owned-pane")
+    assert runner.calls == []
+
+@pytest.mark.parametrize("ack", ["", "{\"result\":{}}"])
+def test_managed_start_uses_guarded_adapter_and_strict_empty_ack(tmp_path, monkeypatch, ack):
+    import importlib.machinery
+    scheduler = DynamicChildScheduler(audit_log=SchedulerAuditLog(tmp_path / "events.jsonl"))
+    scheduler.register_external_parent_attempt(task_id="parent", run_token="run",
+        idempotency_key="key", agent_name="parent", pane_id="parent-pane", marker="marker",
+        repo="repo", issue="82", role="writer", tools=("read_file",),
+        permissions=(), policy_profile="default")
+    child = scheduler.delegate_child("parent", "run", "scope",
+        ChildProposal("writer", ("read_file",), "reader", ("read_file",), child_task="inspect"))
+    lease = scheduler.dispatch(task_ids={child.id})[0]
+    class Runner:
+        calls = []
+        def run(self, args, timeout_seconds=30):
+            self.calls.append(args)
+            assert args[:2] == ["pane", "run"]
+            return CommandResult(0, ack, "")
+    runner = Runner()
+    runtime = HerdrChildRuntime(scheduler, runner, cwd=tmp_path,
+        env={"HERDR_ENV": "1", "HERDR_PANE_ID": "parent-pane"})
+    runtime._skill_checked = True
+    runtime._managed_launch_panes.add("owned-pane")
+    record = scheduler._tasks[child.id]
+    record.execution_marker = "child-marker"
+    launch = runtime._policy_launches[child.id]  # Explicit policy fixture.
+    runtime._policy_panes["owned-pane"] = launch
+    policy = tmp_path / "policy"
+    policy.write_text("frozen-policy")
+    runtime._sandbox_proofs["owned-pane"] = {"invocation_policy": {"test": True},
+        "sandbox_pid": 123, "policy_file": policy, "real_binary": "/native/herdr",
+        "policy_sha256": hashlib.sha256(policy.read_bytes()).hexdigest()}
+    original = importlib.machinery.SourceFileLoader.exec_module
+    observed = []
+    def execute(loader, module):
+        original(loader, module)
+        if loader.name != "agent_durable_sandbox_start":
+            return
+        def verify(pid, real, marker, **kwargs):
+            observed.append((pid, real, marker, kwargs))
+            return True
+        def start(invoke, pane, marker, pid, name, args, **kwargs):
+            assert kwargs["verify_boundary"]() is True
+            assert pane == "owned-pane" and marker == "child-marker" and pid == 123
+            assert args == ["-p", "quantlab", "chat", "--toolsets", "file",
+                            "--max-turns", "1", "--run-budget", "600"]
+            invoke(["pane", "run", pane, "owned adapter input"], timeout_seconds=5)
+            return {"result": {"agent": {"name": name, "pane_id": pane}}}
+        module.verify = verify
+        module.start_sandbox_agent = start
+    monkeypatch.setattr(importlib.machinery.SourceFileLoader, "exec_module", execute)
+    if ack:
+        with pytest.raises(HerdrRuntimeError, match="child_agent_input_unacknowledged"):
+            runtime._start_agent(lease, "owned-pane")
+    else:
+        runtime._start_agent(lease, "owned-pane")
+    assert observed == [(123, Path("/native/herdr"), "child-marker",
+        {"policy": policy, "attempts": 1, "pinned_worktree": None,
+         "child_workspace_writable": False, "policy_mount": launch.mount})]
+    assert not any(call[:2] == ["agent", "start"] for call in runner.calls)

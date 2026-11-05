@@ -134,6 +134,159 @@ def test_fd_launcher_rejects_ambiguous_or_changed_mounts(tmp_path, mutation):
     finally:
         cleanup(item)
 
+
+def test_generic_policy_mount_prepares_readonly_home_before_runtime_targets(tmp_path, monkeypatch):
+    """The admitted generic pane can construct pinned HOME targets under a RO root."""
+    sandbox = sandbox_module()
+    for name in ("bwrap", "policy", "herdr"):
+        (tmp_path / name).write_text("fixture")
+    for name in ("config", "releases", "workspace"):
+        (tmp_path / name).mkdir()
+    monkeypatch.setattr(sandbox, "BWRAP", tmp_path / "bwrap")
+    monkeypatch.setattr(sandbox, "HERDR_CONFIG", tmp_path / "config")
+    monkeypatch.setattr(sandbox, "HERDR_RELEASES", tmp_path / "releases")
+    monkeypatch.setattr(sandbox, "DEFAULT_WRITABLE", ())
+    item = mount(tmp_path)
+    try:
+        command = sandbox.command(tmp_path / "workspace", tmp_path / "herdr",
+                                  writable=(), policy=tmp_path / "policy", policy_mount=item)
+        args = command[command.index(str(tmp_path / "bwrap")):]
+        home = [i for i in range(len(args) - 1)
+                if args[i:i + 2] == ["--tmpfs", "/home/agentops"]]
+        runtime = [args.index(str(target)) for target in RUNTIME_TARGETS]
+        assert args[:8] == [str(tmp_path / "bwrap"), "--ro-bind", "/", "/",
+                            "--tmpfs", "/home", "--tmpfs", "/home/agentops"]
+        assert len(home) == 1 and home[0] < min(runtime)
+        assert args[args.index("--") - 4:args.index("--")] == [
+            "--remount-ro", "/home", "--remount-ro", "/home/agentops"]
+        home_env = [args[i + 1:i + 3] for i, token in enumerate(args[:-2])
+                    if token == "--setenv" and args[i + 1] == "HOME"]
+        assert home_env == [["HOME", "/home/agentops"]]
+        # Parent setup uses tmpfs, never an RW or RO bind of host credentials.
+        assert not any(args[i:i + 3] == [option, "/home", "/home"]
+                       for i in range(len(args) - 2)
+                       for option in ("--bind", "--ro-bind"))
+    finally:
+        cleanup(item)
+
+@pytest.mark.parametrize("mutation", [
+    "valid", "missing-parent", "duplicate-parent", "missing-home",
+    "missing-parent-seal", "missing-home-seal", "early-home-seal",
+    "foreign-home-env", "missing-home-env", "unset-home-env", "trailing-mount",
+])
+def test_generic_home_launcher_accepts_only_final_sealed_bases_without_exec(tmp_path, monkeypatch, mutation):
+    """Exercise the real FD grammar with an intercepted final exec, never bwrap."""
+    sandbox = sandbox_module()
+    home = tmp_path / "account-base" / "agentops"
+    home.mkdir(parents=True)
+    source = tmp_path / "source"
+    source.mkdir()
+    fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY)
+    opened = []
+    try:
+        info = os.fstat(fd)
+        entry = {"source": f"/proc/{os.getpid()}/fd/{fd}", "fd": fd,
+                 "device": info.st_dev, "inode": info.st_ino,
+                 "kind": "directory", "target": "/run/herdr/test-fixture"}
+        args = ["/usr/bin/bwrap", "--ro-bind", "/", "/",
+                "--tmpfs", str(home.parent), "--tmpfs", str(home),
+                "--ro-bind-fd", str(fd), entry["target"],
+                "--setenv", "HOME", str(home),
+                "--remount-ro", str(home.parent), "--remount-ro", str(home),
+                "--", "/bin/true"]
+        error = "policy_fd_runtime_home_not_readonly"
+        if mutation == "missing-parent":
+            del args[4:6]
+        elif mutation == "duplicate-parent":
+            args[8:8] = ["--tmpfs", str(home.parent)]
+        elif mutation == "missing-home":
+            del args[6:8]
+        elif mutation == "missing-parent-seal":
+            index = args.index("--remount-ro"); del args[index:index + 2]
+        elif mutation == "missing-home-seal":
+            index = args.index("--") - 2; del args[index:index + 2]
+        elif mutation == "early-home-seal":
+            index = args.index("--") - 2; del args[index:index + 2]
+            args[8:8] = ["--remount-ro", str(home)]
+        elif mutation == "trailing-mount":
+            index = args.index("--"); args[index:index] = ["--tmpfs", "/unexpected"]
+        elif mutation == "foreign-home-env":
+            args[args.index("--setenv") + 2] = "/home/runner"
+            error = "policy_fd_runtime_home_env_invalid"
+        elif mutation == "missing-home-env":
+            index = args.index("--setenv"); del args[index:index + 3]
+            error = "policy_fd_runtime_home_env_invalid"
+        elif mutation == "unset-home-env":
+            args[8:8] = ["--unsetenv", "HOME"]
+            error = "policy_fd_runtime_home_env_invalid"
+
+        def pinned_open(path, flags):
+            # No /proc read is required by this portable descriptor fixture.
+            assert path == entry["source"]
+            held = os.dup(fd); opened.append(held); return held
+
+        class ExecIntercepted(Exception):
+            pass
+
+        def no_exec(binary, argv):
+            assert mutation == "valid"
+            assert binary == "/usr/bin/bwrap"
+            assert argv[argv.index("--") - 4:argv.index("--")] == [
+                "--remount-ro", str(home.parent), "--remount-ro", str(home)]
+            raise ExecIntercepted
+
+        monkeypatch.setattr(os, "open", pinned_open)
+        monkeypatch.setattr(os, "execv", no_exec)
+        monkeypatch.setattr(sys, "argv", ["fixture", json.dumps([entry]), *args])
+        code = sandbox._POLICY_FD_LAUNCHER.replace(
+            'home = Path("/home/agentops")', "home = Path(" + repr(str(home)) + ")")
+        assert code != sandbox._POLICY_FD_LAUNCHER
+        if mutation == "valid":
+            with pytest.raises(ExecIntercepted):
+                exec(compile(code, "<portable-fd-launcher>", "exec"), {})
+        else:
+            with pytest.raises(SystemExit, match=error):
+                exec(compile(code, "<portable-fd-launcher>", "exec"), {})
+    finally:
+        for held in opened:
+            os.close(held)
+        os.close(fd)
+
+
+@pytest.mark.parametrize("mutation", [
+    "valid", "missing-parent", "missing-home", "rw-parent", "rw-home",
+    "ambiguous-home-mode", "host-parent", "host-home", "stacked-parent",
+    "stacked-home", "malformed",
+])
+def test_generic_home_mountinfo_requires_unique_readonly_tmpfs_bases(mutation):
+    sandbox = sandbox_module()
+    rows = ["10 1 0:10 / /home ro,nosuid - tmpfs tmpfs rw",
+            "11 10 0:11 / /home/agentops ro,nosuid - tmpfs tmpfs rw",
+            # Independent child runtimes remain writable after parent sealing.
+            "12 11 0:12 / /home/agentops/.cache rw,nosuid - tmpfs tmpfs rw"]
+    if mutation == "missing-parent":
+        del rows[0]
+    elif mutation == "missing-home":
+        del rows[1]
+    elif mutation == "rw-parent":
+        rows[0] = rows[0].replace("ro,nosuid", "rw,nosuid")
+    elif mutation == "rw-home":
+        rows[1] = rows[1].replace("ro,nosuid", "rw,nosuid")
+    elif mutation == "ambiguous-home-mode":
+        rows[1] = rows[1].replace("ro,nosuid", "ro,rw,nosuid")
+    elif mutation == "host-parent":
+        rows[0] = rows[0].replace("- tmpfs", "- ext4")
+    elif mutation == "host-home":
+        rows[1] = rows[1].replace("- tmpfs", "- ext4")
+    elif mutation == "stacked-parent":
+        rows.append(rows[0])
+    elif mutation == "stacked-home":
+        rows.append(rows[1])
+    elif mutation == "malformed":
+        rows.append("invalid kernel record")
+    assert sandbox._runtime_home_mounts_verified("\n".join(rows)) is (mutation == "valid")
+
+
 @pytest.mark.parametrize("shadow",[False,True])
 def test_actual_bwrap_seals_same_inode_after_mount_and_denies_writes(tmp_path, monkeypatch,shadow):
     sandbox = sandbox_module()
@@ -170,7 +323,11 @@ def test_actual_bwrap_seals_same_inode_after_mount_and_denies_writes(tmp_path, m
     if shadow:
         unrelated=tmp_path/"unrelated-shadow.py"
         unrelated.write_text("unrelated = True")
-        index=args.index("--")
+        # Keep the required final HOME seals intact so this reaches the
+        # physical stacked-code attestation rather than an argv-order denial.
+        index=args.index("--") - 4
+        assert args[index:index + 4] == ["--remount-ro", "/home",
+                                        "--remount-ro", "/home/agentops"]
         args[index:index]=["--ro-bind",str(unrelated),str(CODE_TARGET/"module.py")]
     process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                stderr=subprocess.PIPE, env=env)
@@ -377,7 +534,8 @@ def test_host_environment_rejects_presence_based_loader_controls(monkeypatch):
 
 
 @pytest.mark.parametrize("foreign_mount",[False,True])
-def test_actual_parent_child_seal_accepts_only_bound_delegated_result_inode(tmp_path,monkeypatch,foreign_mount,private_result_kernel_root):
+@pytest.mark.parametrize("owned_scope",[False,True])
+def test_actual_parent_child_seal_accepts_only_bound_delegated_result_inode(tmp_path,monkeypatch,foreign_mount,owned_scope,private_result_kernel_root):
     tmp_path=private_result_kernel_root
     from herdr.result_submission import ResultSlot,TOOL,ARGUMENTS
     from herdr.security import InvocationIdentity,ToolRule,RiskClass
@@ -394,26 +552,34 @@ def test_actual_parent_child_seal_accepts_only_bound_delegated_result_inode(tmp_
     parent_file=results/"parent.result.json";parent_file.touch(mode=0o600)
     child_file=results/"child.result.json";child_file.touch(mode=0o600)
     other=results/"other.json";other.touch(mode=0o600)
-    parent=grant(workspace)
+    owned=workspace/"owned.py";owned.write_text("original")
+    foreign=workspace/"foreign.py";foreign.write_text("foreign")
+    parent=grant(workspace,tools=("read_file","write_file") if owned_scope else ("read_file",))
+    if owned_scope:parent=replace(parent,scope=replace(parent.scope,permissions=("workspace-write",)))
     parent=replace(parent,scope=replace(parent.scope,tools=(*parent.scope.tools,TOOL)),
         tool_rules=(*parent.tool_rules,ToolRule(TOOL,RiskClass.RESULT_SUBMISSION,ARGUMENTS,
             allowed_roots=(str(results),),requires_sandbox=True,
             result_slot=ResultSlot.bind(parent_file,parent.identity,"parent-key"))))
     resources=[]
-    def physical_seal(planned,destination,extra=()):
+    def physical_seal(planned,destination,extra=(),*,ownership=None,root_writable=False):
         item=mount(tmp_path);marker="delegated-result-"+uuid.uuid4().hex
         fd=os.open(workspace,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);info=os.fstat(fd)
         pin=sandbox.PinnedWorktree(workspace,fd,info.st_dev,info.st_ino,workspace.parent)
+        from herdr.owned_write_mounts import OwnedWritePins
+        pins=OwnedWritePins(ownership,pin) if ownership is not None else None
         env={**os.environ,"HERDR_DURABLE_TASK_PANE":marker,
              **{key:str(getattr(planned.identity,field)) for field,key in IDENTITY_ENV.items()}}
         args=sandbox.command(workspace,cli,writable=(destination,),policy=policy,
-            child_workspace_writable=False,pinned_worktree=pin,policy_mount=item)
+            child_workspace_writable=root_writable,pinned_worktree=pin,policy_mount=item,owned_write_pins=pins)
         for forbidden in extra:
-            # Deliberately create an unexpected physical mount for rejection.
-            index=args.index("--")
+            # Preserve final HOME seals so the intended physical ownership
+            # check observes and rejects this unexpected writable mount.
+            index=args.index("--") - 4
+            assert args[index:index + 4] == ["--remount-ro", "/home",
+                                            "--remount-ro", "/home/agentops"]
             args[index:index]=["--bind",str(forbidden),str(forbidden)]
         proc=subprocess.Popen(args,stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,env=env)
-        resources.append((proc,pin,item))
+        resources.append((proc,pin,item,pins))
         pid=None
         for _ in range(100):
             if proc.poll() is not None:pytest.fail(proc.stderr.read(8192).decode())
@@ -429,20 +595,45 @@ def test_actual_parent_child_seal_accepts_only_bound_delegated_result_inode(tmp_
             if pid:break
             time.sleep(.02)
         assert pid
+        if pins is not None:
+            from herdr.policy_launch import mount_rows
+            pins.verify_mounted(pid,mount_rows(pid))
+            # Both the signed tool guard and actual kernel namespace must allow
+            # precisely the declared write target.
+            from herdr.security import InvocationGuard,PolicyDenied
+            InvocationGuard(planned).authorize_tool_call("write_file",{"path":str(owned),"content":"changed"})
+            with pytest.raises(PolicyDenied):
+                InvocationGuard(planned).authorize_tool_call("write_file",{"path":str(foreign),"content":"foreign"})
+            (Path(f"/proc/{pid}/root")/str(owned).lstrip("/")).write_text("kernel-owned")
+            with pytest.raises(OSError) as denied:
+                (Path(f"/proc/{pid}/root")/str(foreign).lstrip("/")).write_text("must-not-write")
+            import errno
+            assert denied.value.errno in (errno.EROFS,errno.EACCES)
+            assert foreign.read_text()=="foreign"
         bound,_=item.seal(pid,planned,identity=planned.identity,
             attestation={"task_id":planned.identity.task_id,"run_token":planned.identity.run_token,"sandbox_pid":pid},
             tools=planned.scope.tools,permissions=planned.scope.permissions,
             private_key=Ed25519PrivateKey.generate(),key_id="isolated-result-test")
         return bound
     try:
-        parent=physical_seal(parent,parent_file)
+        parent=physical_seal(parent,parent_file,root_writable=owned_scope)
         assert str(child_file) not in parent.runtime_assurance.writable_roots
         child_identity=InvocationIdentity(parent.identity.consumer,"child-agent",parent.identity.agent_id,
             parent.identity.task_id,"child-task","child-run",parent.identity.fencing_token+1)
         child=replace(parent,identity=child_identity,parent_grant_hash=parent.hash,
             tool_rules=tuple(replace(rule,result_slot=ResultSlot.bind(child_file,child_identity,"child-key"))
                 if rule.tool==TOOL else rule for rule in parent.tool_rules))
-        child=physical_seal(child,child_file,(other,) if foreign_mount else ())
+        scope=None
+        if owned_scope:
+            from herdr.child_ownership import ChildOwnership,WriteScope,OwnershipError
+            scope=ChildOwnership((WriteScope("file","owned.py"),),(),(),(),parent.identity.task_id,"handoff/owned")
+            child=replace(child,tool_rules=tuple(replace(rule,allowed_roots=(str(owned),))
+                if rule.tool=="write_file" else rule for rule in child.tool_rules))
+        if owned_scope and foreign_mount:
+            with pytest.raises(OwnershipError,match="unexpected_mount"):
+                physical_seal(child,child_file,(foreign,),ownership=scope)
+            return
+        child=physical_seal(child,child_file,(other,) if foreign_mount else (),ownership=scope)
         if foreign_mount:
             with pytest.raises(SecurityError,match="runtime assurance"):child.require_subset_of(parent)
         else:
@@ -450,10 +641,11 @@ def test_actual_parent_child_seal_accepts_only_bound_delegated_result_inode(tmp_
             assert str(child_file) in child.runtime_assurance.writable_roots
             assert parent_file.stat().st_ino!=child_file.stat().st_ino
     finally:
-        for proc,pin,item in reversed(resources):
+        for proc,pin,item,pins in reversed(resources):
             proc.stdin.close()
             try:proc.wait(timeout=3)
             except subprocess.TimeoutExpired:proc.kill();proc.wait(timeout=3)
+            if pins is not None:pins.close()
             pin.close();cleanup(item)
 
 
@@ -467,3 +659,55 @@ def private_result_kernel_root():
         root=Path(name).resolve()
         assert root.parent==repo.resolve()
         yield root
+
+def test_owned_write_roots_narrow_the_host_grant_and_deny_scope_escape(tmp_path, monkeypatch):
+    # Exercise grant admission separately from physical bootstrap. Kernel-backed
+    # scoped mounts are covered in test_owned_write_mounts; this tiny code fixture
+    # deliberately has no approved launcher and cannot create a sealed runtime.
+    from herdr.host_bootstrap import HostBootstrap
+    monkeypatch.setattr(HostBootstrap, "create", lambda *args, **kwargs: None)
+    item=mount(tmp_path)
+    workspace=tmp_path/"worker";workspace.mkdir()
+    owned=workspace/"owned.py";owned.write_text("owned")
+    foreign=workspace/"foreign.py";foreign.write_text("foreign")
+    parent=grant(workspace,tools=("read_file","write_file","patch"))
+    identity=replace(parent.identity,agent_id="owned-agent",parent_agent_id=parent.identity.agent_id,
+                     parent_task_id=parent.identity.task_id,task_id="owned-task",run_token="owned-run")
+    planned=replace(parent,identity=identity,parent_grant_hash=parent.hash)
+    factory=factory_for(tmp_path,item,lambda **kw:replace(planned,identity=kw["identity"]),parent=parent)
+    prepared=None
+    try:
+        prepared=factory.prepare_child(identity=identity,workspace=workspace,
+            tools=planned.scope.tools,permissions=planned.scope.permissions,
+            owned_write_roots=(str(owned),))
+        writes=[rule for rule in prepared.grant.tool_rules if rule.tool in {"write_file","patch"}]
+        assert writes and all(rule.allowed_roots==(str(owned),) for rule in writes)
+        assert any(rule.tool=="read_file" and rule.allowed_roots==(str(workspace),)
+                   for rule in prepared.grant.tool_rules)
+        for roots in [(),(str(workspace),),(str(tmp_path),)]:
+            with pytest.raises(SecurityError,match="owned write"):
+                factory.prepare_child(identity=replace(identity,task_id="denied-owned-task"),
+                    workspace=workspace,tools=planned.scope.tools,permissions=planned.scope.permissions,
+                    owned_write_roots=roots)
+    finally:
+        if prepared is not None:prepared.cleanup_after_pane_closed()
+        cleanup(item)
+
+
+def test_delegated_binding_is_one_shot_and_never_comes_from_serialized_grant(tmp_path):
+    from herdr.policy_launch import PreparedPolicyLaunch
+    from herdr.security import DelegatedWriteAuthority
+    from tests.herdr.test_security import _parent_and_disjoint_child
+    parent, child = _parent_and_disjoint_child(tmp_path)
+    item = object.__new__(PreparedPolicyLaunch)
+    item.sealed = None; item._private_key = object(); item._parent = parent
+    item._delegated_writes = None; item.grant = child
+    checked = []
+    authority = DelegatedWriteAuthority(parent.hash, child.identity, 'c' * 64, 'd' * 64, 'e' * 64,
+        child.runtime_assurance.writable_roots,
+        lambda actual, ceiling: checked.append(actual.hash) or child.runtime_assurance.writable_roots,
+        lambda *a: None)
+    item.bind_delegated_writes(authority)
+    assert checked == [child.hash] and item._delegated_writes is authority
+    with pytest.raises(SecurityError, match='one original'):
+        item.bind_delegated_writes(authority)

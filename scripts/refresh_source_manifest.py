@@ -16,22 +16,36 @@ ROOTS = (
     Path("scripts"),
 )
 FILES = (
+    Path("docs/architecture/CONTEXT_MEMORY_MARKET_DECISION_2026-10-05.md"),
+    Path("docs/operations/autonomy-offline-acceptance.md"),
+    Path("docs/operations/AGENT_HARNESS_V2026_10_1.md"),
     Path("configs/consumers/herdr.yaml"),
     Path("docs/CONSUMERS.md"),
     Path("docs/architecture/A2A_GATEWAY_71.md"),
     Path("docs/architecture/AGENT_SKILLS.md"),
     Path("docs/architecture/CONTEXT_MEMORY.md"),
+    Path("docs/architecture/ACTIVE_REASONING_STATE_95.md"),
+    Path("docs/architecture/INVOCATION_POLICY_LAUNCH.md"),
+    Path("docs/architecture/IMMUTABLE_PROFILE_NAMESPACE_129.md"),
+    Path("docs/architecture/PROFILE_HANDOFF_132.md"),
+    Path("docs/architecture/ROOT_PUBLISHED_RUNTIME_129.md"),
+    Path("docs/architecture/COMPLETION_EVIDENCE.md"),
     Path("docs/architecture/PROMPT_RUNTIME.md"),
+    Path("docs/architecture/TRAJECTORY_OBSERVER_144.md"),
+
+    Path("docs/architecture/WORK_NODE_CONTRACT.md"),
+    Path("docs/architecture/PARENT_RESULT_PUBLICATION.md"),
     Path("package.json"),
     Path("package-lock.json"),
     Path("requirements-mcp.txt"),
     Path("docs/architecture/MCP_GATEWAY.md"),
-    Path("docs/architecture/INVOCATION_POLICY_LAUNCH.md"),
+    Path("docs/architecture/EXTERNAL_KNOWLEDGE.md"),
+         Path("docs/architecture/GITHUB_INTAKE_ADMISSION.md"),
 )
 OUTPUT = Path("provenance/CANONICAL_SOURCE_MANIFEST.sha256")
 TEXT_SUFFIXES = {
     ".txt", ".css", ".html", ".in", ".js", ".json", ".md", ".mjs", ".py",
-    ".service", ".sh", ".sha256", ".yaml",
+    ".service", ".timer", ".sh", ".sha256", ".yaml",
 }
 
 

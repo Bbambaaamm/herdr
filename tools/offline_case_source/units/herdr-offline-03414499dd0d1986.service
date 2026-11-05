@@ -1,0 +1,21 @@
+[Unit]
+Description=Owned aggregate offline case 03414499dd0d1986
+Requires=herdr-offline-cleanup-03414499dd0d1986.timer
+After=herdr-offline-cleanup-03414499dd0d1986.timer
+[Service]
+Type=exec
+User=root
+Group=root
+AppArmorProfile=herdr-offline-observer-03414499dd0d1986
+RuntimeMaxSec=1800
+TimeoutStopSec=30
+KillMode=control-group
+Restart=no
+Delegate=no
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+StandardInput=null
+StandardOutput=null
+StandardError=null
+ExecStart=/usr/bin/python3.14 -I -B -c 'import sys; sys.path.insert(0,"/opt/agent-platform/herdr-offline-03414499dd0d1986"); from offline_case.case_anchor import main; main()'

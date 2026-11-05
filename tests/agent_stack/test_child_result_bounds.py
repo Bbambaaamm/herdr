@@ -37,6 +37,8 @@ def test_child_result_accepts_normal_and_exact_limit(tmp_path, exact_limit):
     if exact_limit:
         base = len(json.dumps({**result, "padding": ""}).encode())
         result["padding"] = "x" * (MAX_CHILD_RESULT_BYTES - base)
+    from herdr.evidence import digest as payload_digest
+    rec.completion_receipt={"result_payload_sha256":payload_digest(result)}
     path.write_text(json.dumps(result), encoding="utf-8")
     assert not exact_limit or path.stat().st_size == MAX_CHILD_RESULT_BYTES
     assert publish_exact_child_result(None, rec, path) == "completed"

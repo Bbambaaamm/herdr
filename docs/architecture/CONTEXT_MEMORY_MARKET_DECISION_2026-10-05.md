@@ -9,7 +9,7 @@ Herdr owns the Context + Memory Fabric. External projects are references, adapte
 
 The production direction is:
 
-- **#73 Context Compiler** remains authoritative for ContextPlan, ControlState, scope, provenance, redaction, original evidence and deterministic reconstruction.
+- **#73 Context Compiler** owns ContextPlan, ControlState, scope, provenance, redaction and deterministic context reconstruction from exact original-evidence references. **#85** retains original result/evidence acceptance authority; **#74** owns evaluation proof. Derived context and memory never replace those originals.
 - **#105 Memory Fabric** adds semantic/procedural memory and background consolidation while retaining #73 ExperienceMemory as the episodic baseline.
 - **#74 Eval** selects candidates by verified outcome, total-system tokens, cost, latency and safety.
 - **#96 Tool Fabric v2** owns deferred tool discovery and programmatic processing.
@@ -39,7 +39,7 @@ Benchmark:
 - LLMLingua-2 / LongLLMLingua where runtime/licensing fit;
 - provider-native compaction as a separate capability variant.
 
-A shorter prompt is not enough: source fidelity and verified success must remain at or above baseline.
+Compression applies only to eligible optional or derived bodies. Every ControlState field, required item and mandatory original-evidence reference must survive exactly. If the admitted budget cannot preserve them, block or split the work; do not compress away authority or required evidence. A shorter prompt is not enough: source fidelity and verified success must remain at or above baseline.
 
 ### LangMem — procedural/prompt learning principles
 
@@ -86,6 +86,8 @@ Where capability-detected and measured, adapters may use:
 - deferred tool search/schema loading;
 - programmatic tool processing/code execution.
 
+Capability detection is not permission to invoke `execute_code` or any nested tool. Code execution requires the existing #96/#76 authenticated operation grant, exact argument/path/process limits, signed RuntimeAssurance and verified physical boundary, invocation audit, per-call budget and applicable approval checks. Provider-native processing must use these same gates; no provider capability or memory proposal supplies a grant.
+
 These are optimizations, not task/evidence authority.
 
 ### LMCache-like KV reuse
@@ -117,6 +119,10 @@ race                - Episodic: #73 ExperienceMemory
  deferred schemas / programmatic transforms
             |
             v
+ approved SelectionSnapshot
+ + fresh #73 plan admission
+            |
+            v
        #79 ProviderAdapter
  cache / compaction / native capabilities
             |
@@ -126,6 +132,8 @@ race                - Episodic: #73 ExperienceMemory
             v
  #74 Eval -> CI/review -> canary/#78
 ```
+
+Deferred schema discovery must return through a host-approved `SelectionSnapshot` and a freshly admitted #73 ContextPlan before any selected schema or example is exposed to the provider. A previous plan cannot be widened after admission; stale pins, changed selection or missing admission block exposure. Programmatic transforms still require the per-invocation controls above.
 
 ## Optimization objective
 

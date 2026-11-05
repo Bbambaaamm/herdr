@@ -164,3 +164,31 @@ Managed root and child results use the granted herdr_submit_result Hermes tool. 
 A child's versioned pre-split ownership intent is durable before admission/policy resource preparation. Native split intent precedes the call; an invoked/legacy unknown split remains quarantined. A root session retains its full launch identity before policy proof publication and a one-use prompt intent. Typed native agent absence permits pre-prompt cleanup only with the same marker, current sandbox PID and physically retained grant/attestation. Result replay uses fsynced scheduler evidence even when the mutable source result is corrupted; cleanup failure preserves candidate evidence while withholding the parent gate.
 
 Nested child delegation is rejected before provisioning until a child-bound transport is available through #95. Root delegation retains its authenticated bridge.
+
+## Dispatcher cold-queue lock admission
+
+The ordinary dispatcher creates and probes `worker.lock` as a private 0600,
+single-link regular file owned by the host UID, using a pinned queue directory
+and non-following descriptors. The probe takes an exclusive nonblocking lock
+on the same inode used by the worker admission guard and namespace custodian.
+An existing shared or exclusive holder prevents another dispatch. Unsafe file
+metadata, process-probe errors and inode replacement stop admission before the
+pending task is claimed; the dispatcher never repairs existing lock permissions.
+The process check remains necessary during the spawn-before-lock interval.
+
+The liveness probe does not authorize a claim. The dispatcher holds the existing
+shared ownership epoch across queue claim and process handoff, with no lock FD
+inherited by the child. It waits for the worker's durable attempt identity or
+process exit. A failed spawn or dead child may quarantine only an exact unchanged
+claim with no attempt identity, session, parent or existing result. That task is
+blocked for reconciliation without retry; worker-written or uncertain state is
+never reset or requeued. Flock is advisory and does not prevent an owner chmod.
+
+Startup acknowledgement is a fresh per-launch nonce bound to the actual child
+PID/start ticks and dispatcher PID in the canonical task. Retained run tokens
+are never startup acknowledgement. The worker publishes this record only with
+its own shared epoch and loop lock, clears the temporary parent-death fence,
+and consumes the nonce before normal work/reconciliation. Unadmitted children
+are fenced by PR_SET_PDEATHSIG(SIGKILL); a bounded startup timeout terminates
+and reaps the exact child while the dispatcher still holds its epoch. Queue
+file disappearance during polling is observed as a transition.

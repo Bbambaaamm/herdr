@@ -19,10 +19,13 @@ from .context import (ContextBundle, ContextCompiler, ContextPlan, SecretRedacto
                       SourceRef, SourceState, TokenCounter, canonical, digest,
                       hash_value, token)
 from .security import InvocationGuard, InvocationIdentity, PolicyDenied, ProviderRequest, SecurityGrant
+from .reasoning_state import ReasoningProjection
 
 VERSION = "herdr.prompt.v1"
 MAX_PROMPT = 262144
 MAX_OUTPUT = 262144
+MAX_REASONING_BINDING = 65536
+REASONING_BINDING_VERSION = 1
 
 
 class PromptBlocked(ValueError):
@@ -362,6 +365,95 @@ def context_authority_hash(context):
                    "experiment_series": context.experiment_series})
 
 
+@dataclass(frozen=True)
+class ReasoningStateBinding:
+    """Host-pinned, read-only current context; never evidence acceptance.
+
+    The full projection stays host-side. Wire reconstruction and compilation
+    require the host's current projection, rather than trusting serialized
+    model-supplied claims or a self-declared VERIFIED source label.
+    """
+    identity: InvocationIdentity
+    projection_sha256: str
+    context_authority_sha256: str
+    projection: ReasoningProjection = field(repr=False)
+    _redactor: SecretRedactor = field(default=None, repr=False, compare=False)
+    version: int = REASONING_BINDING_VERSION
+
+    def __post_init__(self):
+        self.to_json()
+
+    def to_json(self):
+        try:
+            require(isinstance(self._redactor, SecretRedactor), "reasoning_binding_host_redactor")
+            require(type(self.version) is int and self.version == REASONING_BINDING_VERSION,
+                    "reasoning_binding_version")
+            require(type(self.identity) is InvocationIdentity
+                    and type(self.projection) is ReasoningProjection, "reasoning_binding_typed")
+            hash_value(self.projection_sha256)
+            hash_value(self.context_authority_sha256)
+            raw = self.projection.to_json()  # Revalidates graph, refs, types and bounds.
+            require(raw["identity"] == self.identity.to_json(), "reasoning_binding_identity")
+            require(digest(raw) == self.projection_sha256, "reasoning_binding_stale")
+            current = [row for row in raw["evidence"] if row["state"] == "ACTIVE"]
+            value = {
+                "version": self.version, "authority": "working_context_only",
+                "identity": raw["identity"], "projection_sha256": self.projection_sha256,
+                "context_authority_sha256": self.context_authority_sha256,
+                "redaction_policy_sha256": self._redactor.policy_hash,
+                "last_sequence": raw["last_sequence"], "active_evidence": current,
+                "claims": raw["claims"], "open_gaps": raw["open_gaps"],
+                "omitted_evidence": {state: sum(row["state"] == state for row in raw["evidence"])
+                                     for state in ("SUPERSEDED", "RETRACTED")},
+            }
+            require(len(canonical(value)) <= MAX_REASONING_BINDING, "reasoning_binding_bytes")
+            require(self._redactor.tree(value) == value, "reasoning_binding_secret")
+            return value
+        except PromptBlocked:
+            raise
+        except (TypeError, ValueError, UnicodeError, RecursionError, AttributeError):
+            raise PromptBlocked("reasoning_binding_invalid") from None
+
+    @classmethod
+    def from_projection(cls, projection, *, expected_identity, expected_projection_sha256,
+                        expected_context_authority_sha256, redactor):
+        return cls(expected_identity, expected_projection_sha256, expected_context_authority_sha256,
+                   projection, redactor)
+
+    @classmethod
+    def from_json(cls, raw, *, projection, redactor):
+        require(type(raw) is dict and set(raw) == {
+            "version", "authority", "identity", "projection_sha256", "context_authority_sha256",
+            "redaction_policy_sha256", "last_sequence",
+            "active_evidence", "claims", "open_gaps", "omitted_evidence"},
+            "reasoning_binding_schema")
+        require(type(raw["version"]) is int and raw["version"] == REASONING_BINDING_VERSION,
+                "reasoning_binding_version")
+        try:
+            identity = InvocationIdentity.from_dict(raw["identity"])
+            result = cls(identity, raw["projection_sha256"], raw["context_authority_sha256"],
+                         projection, redactor, raw["version"])
+            require(len(canonical(raw)) <= MAX_REASONING_BINDING
+                    and canonical(raw) == canonical(result.to_json()), "reasoning_binding_changed")
+            return result
+        except PromptBlocked:
+            raise
+        except (TypeError, ValueError, UnicodeError, RecursionError, AttributeError):
+            raise PromptBlocked("reasoning_binding_invalid") from None
+
+    @property
+    def hash(self):
+        return digest(self.to_json())
+
+    def require_current(self, projection, identity):
+        # Compare an explicit host snapshot at consumption, not a cached
+        # provider conversation or just the snapshot retained by this object.
+        current = type(self)(identity, self.projection_sha256, self.context_authority_sha256,
+                             projection, self._redactor, self.version)
+        require(canonical(current.to_json()) == canonical(self.to_json()), "reasoning_binding_changed")
+        return current.to_json()
+
+
 class DemonstrationSelector:
     def __init__(self, verify_evidence, redactor):
         require(callable(verify_evidence), "host_demonstration_evidence_required")
@@ -423,6 +515,7 @@ class PromptPlan:
     renderer_version: str = VERSION
     context_alternatives: tuple[str, ...] = ()
     _redactor: SecretRedactor = field(default=None, repr=False, compare=False)
+    reasoning_state_binding: ReasoningStateBinding | None = None
 
     def __post_init__(self):
         require(isinstance(self._redactor, SecretRedactor), "host_prompt_redaction_required")
@@ -455,6 +548,15 @@ class PromptPlan:
                 and len(set(self.context_alternatives)) == len(self.context_alternatives)
                 and self.context_plan_sha256 not in self.context_alternatives, "prompt_context_alternatives")
         for value in self.context_alternatives: hash_value(value)
+        if self.reasoning_state_binding is not None:
+            require(type(self.reasoning_state_binding) is ReasoningStateBinding,
+                    "reasoning_binding_typed")
+            self.reasoning_state_binding.to_json()
+            require(self.reasoning_state_binding.identity == self.identity, "reasoning_binding_identity")
+            require(self.reasoning_state_binding.context_authority_sha256 == self.context_authority_sha256,
+                    "reasoning_binding_context")
+            require(self.reasoning_state_binding._redactor.policy_hash == self._redactor.policy_hash,
+                    "reasoning_binding_redaction_policy")
         require(self.renderer_version == VERSION, "prompt_renderer_version")
         require(len(canonical(self.to_json())) <= MAX_PROMPT, "prompt_plan_bytes")
 
@@ -463,6 +565,17 @@ class PromptPlan:
 
     def to_json(self):
         raw = {name: getattr(self,name) for name in self.__dataclass_fields__ if name != "_redactor"}
+        if self.reasoning_state_binding is None:
+            raw.pop("reasoning_state_binding")
+        else:
+            require(type(self.reasoning_state_binding) is ReasoningStateBinding
+                    and self.reasoning_state_binding.identity == self.identity, "reasoning_binding_identity")
+            current = self.reasoning_state_binding.to_json()
+            require(self.reasoning_state_binding.context_authority_sha256 == self.context_authority_sha256,
+                    "reasoning_binding_context")
+            require(self.reasoning_state_binding._redactor.policy_hash == self._redactor.policy_hash,
+                    "reasoning_binding_redaction_policy")
+            raw["reasoning_state_binding"] = current
         raw["identity"] = self.identity.to_json()
         raw["instruction_refs"] = [asdict(ref) for ref in self.instruction_refs]
         raw["demonstrations"] = [asdict(ref) for ref in self.demonstrations]
@@ -476,9 +589,9 @@ class PromptPlan:
         return raw
 
     @classmethod
-    def from_json(cls, raw, *, redactor):
-        expected = (set(cls.__dataclass_fields__) - {"_redactor"}) | {"redaction_policy_sha256"}
-        require(isinstance(raw, dict) and set(raw) == expected
+    def from_json(cls, raw, *, redactor, reasoning_projection=None):
+        expected = (set(cls.__dataclass_fields__) - {"_redactor", "reasoning_state_binding"}) | {"redaction_policy_sha256"}
+        require(isinstance(raw, dict) and set(raw) in (expected, expected | {"reasoning_state_binding"})
                 and len(canonical(raw)) <= MAX_PROMPT, "prompt_plan_schema")
         require(isinstance(redactor, SecretRedactor)
                 and raw["redaction_policy_sha256"] == redactor.policy_hash, "prompt_redaction_policy")
@@ -488,6 +601,9 @@ class PromptPlan:
         del values["redaction_policy_sha256"]
         values["_redactor"] = redactor
         values["identity"] = InvocationIdentity.from_dict(values["identity"])
+        if "reasoning_state_binding" in values:
+            values["reasoning_state_binding"] = ReasoningStateBinding.from_json(
+                values["reasoning_state_binding"], projection=reasoning_projection, redactor=redactor)
         contract = values["output_contract"]
         require(isinstance(contract, dict) and set(contract) == {
             "result_schema", "minimum_evidence_refs", "schema_version", "hash",
@@ -596,8 +712,15 @@ class PromptRuntime:
         require(context.stable_prefix["project_map"]["base_sha"] == plan.base_revision,
                 "prompt_context_base_revision")
 
-    def compile(self, plan, *, context, grant, binding, counter, loader):
+    def compile(self, plan, *, context, grant, binding, counter, loader, reasoning_projection=None):
         self._binding(plan, context, grant)
+        reasoning = None
+        if plan.reasoning_state_binding is not None:
+            require(type(plan.reasoning_state_binding) is ReasoningStateBinding, "reasoning_binding_typed")
+            reasoning = plan.reasoning_state_binding.require_current(reasoning_projection, plan.identity)
+            require(self.redactor.tree(reasoning) == reasoning, "reasoning_binding_secret")
+        else:
+            require(reasoning_projection is None, "reasoning_binding_unpinned")
         require(isinstance(binding, RendererBinding) and isinstance(counter, TokenCounter)
                 and callable(loader), "host_prompt_renderer_required")
         require(binding.executor_id in grant.scope.executors
@@ -634,6 +757,13 @@ class PromptRuntime:
         try:InvocationGuard(grant).authorize_provider(request)
         except PolicyDenied as exc:raise PromptBlocked("prompt_provider_route_"+exc.reason) from None
         provider_classes = set(cap.data_policy.data_classes)&set(provider.data_policy.data_classes)&set(route.data_classes)&set(grant.scope.data_classes)
+        if reasoning is not None:
+            for row in reasoning["active_evidence"]:
+                for raw_source in row["sources"]:
+                    ref = SourceRef(**raw_source)  # Exact refs validated by #95.
+                    reason = source_reason(ref, context)
+                    require(reason is None, "reasoning_source_" + str(reason))
+                    require(ref.data_class in provider_classes, "reasoning_source_provider_data_class")
         self.context_compiler.preflight(context,executor_id=binding.executor_id,counter=counter,
             renderer="messages",allowed_data_classes=tuple(sorted(provider_classes,key=str)))
         selected_resources = {resource["sha256"] for item in context.stable_prefix["selection"]["skills"]
@@ -656,6 +786,10 @@ class PromptRuntime:
                    "evidence_requirement_sha256": plan.evidence_requirement_sha256,
                    "context": None,
                    "project_instructions": [], "demonstrations": []}
+        if reasoning is not None:
+            # Reserve mandatory current support and gaps in every complete
+            # envelope BEFORE ContextCompiler selects optional context.
+            dynamic["reasoning_state"] = reasoning
         stable = self.redactor.tree(stable); dynamic = self.redactor.tree(dynamic)
         rejected, selected = [], []
         allowance = plan.output_contract.output_token_allowance
@@ -737,6 +871,12 @@ class PromptRuntime:
                 else:
                     selected.append({"id":ref.id,"kind":kind,"source_sha256":ref.source.sha256,
                                      "reason_code":"verified_relevant_scoped_source"})
+        reasoning_audit = ({} if reasoning is None else {"reasoning_state": {
+            "version": reasoning["version"], "binding_sha256": plan.reasoning_state_binding.hash,
+            "projection_sha256": reasoning["projection_sha256"],
+            "active_evidence": len(reasoning["active_evidence"]),
+            "claims": len(reasoning["claims"]), "open_gaps": len(reasoning["open_gaps"]),
+            "omitted_evidence": reasoning["omitted_evidence"]}})
         trace = canonical({"version": VERSION, "plan_sha256": plan.hash, "binding_sha256": binding.hash,
                            "context_plan_sha256": context.hash, "context_bundle_sha256": compiled.hash,
                            "context_trace_sha256": hashlib.sha256(compiled.trace).hexdigest(),
@@ -745,7 +885,8 @@ class PromptRuntime:
                            "stable_prefix_sha256": digest(stable), "demonstrations_used": len(dynamic["demonstrations"]),
                            "selected": selected, "rejected": rejected, "cache_usage": "UNKNOWN",
                            "provider_usage": "UNKNOWN", "provider_route_sha256":digest(route.to_json()),
-                           "provider_region":region, "schema_mode": "native" if native else "validated_fallback"})
+                           "provider_region":region, "schema_mode": "native" if native else "validated_fallback",
+                           **reasoning_audit})
         return PromptBundle(plan.hash, binding.hash, compiled.hash, canonical(stable), canonical(dynamic),
                             wire, trace, compiled.payload, compiled.trace)
 

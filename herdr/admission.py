@@ -37,6 +37,7 @@ def _reader_tools() -> frozenset[str]:
             "grep",
             "web_search",
             "web_extract",
+            "herdr_external_knowledge",
             "git_status",
             "git_log",
         }
@@ -51,6 +52,7 @@ def _writer_tools() -> frozenset[str]:
             "delete_file",
             "git_add",
             "git_commit",
+            "herdr_verify_work",
         }
     )
 

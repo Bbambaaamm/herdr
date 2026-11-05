@@ -1,0 +1,24 @@
+[Unit]
+Description=Finite canonical offline host
+Before=herdr-offline-operator-03414499dd0d1986.service
+[Service]
+Type=exec
+User=1001
+Group=1001
+AppArmorProfile=herdr-offline-controller-03414499dd0d1986
+ExecStart=/opt/herdr/releases/p0-5035d92-test/python/bin/python3.11 -I -B /opt/agent-platform/herdr-offline-03414499dd0d1986/composed-core/agent-stack/bin/agent-herdr-host-entrypoint agent-stack/bin/offline-case-host-entry
+RuntimeMaxSec=1800
+TimeoutStopSec=30
+Restart=no
+Delegate=no
+KillMode=control-group
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX
+UMask=0077
+RuntimeDirectory=herdr-offline-host-03414499dd0d1986
+RuntimeDirectoryMode=0750
+StandardInput=null
+StandardOutput=null
+StandardError=null

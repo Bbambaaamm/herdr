@@ -15,6 +15,7 @@ authenticated Herdr grant has been verified.  It never reads model content as
 authority.
 """
 from __future__ import annotations
+import hashlib
 
 import os
 
@@ -34,29 +35,72 @@ from herdr.file_authority import FileAuthorityError, RootFDWorkspace
 from herdr.security import InvocationGuard, PolicyDenied, SecurityError, ProviderRequest, canonical_digest
 
 
+def _runtime_file_roots(grant, file_rules):
+    """Read roots stay broad; observed RW leaves select existing in-place I/O.
+
+    These are pins in the SDK's attested namespace, never host write authority.
+    A broad read-directory FD remains on its readonly mount and cannot bypass
+    the exact writable leaf mounts. Logical delegation scope is unchanged.
+    """
+    roots = {root for tool in ("read_file", "write_file", "patch", "search_files")
+             for root in getattr(file_rules.get(tool), "allowed_roots", ())}
+    assurance = getattr(grant, "runtime_assurance", None)
+    if getattr(assurance, "sandbox_verified", False) is True:
+        for raw in assurance.writable_roots:
+            path = Path(raw)
+            if any(path == Path(root) or Path(root) in path.parents
+                   for tool in ("write_file", "patch")
+                   for root in getattr(file_rules.get(tool), "allowed_roots", ())):
+                roots.add(str(path))
+    return roots
+
+
 class _PolicyFileOps:
     """Hermes FileOperations facade backed by pinned nofollow root FDs."""
 
-    def __init__(self, workspace: RootFDWorkspace, delegate: Any, common: Any, patch_parser: Any) -> None:
+    def __init__(self, workspace: RootFDWorkspace, delegate: Any, common: Any, patch_parser: Any,
+                 *, redaction_gate: Callable[[str, str], Any] | None = None) -> None:
         self._workspace = workspace
         self._delegate = delegate
         self._common = common
         self._patch_parser = patch_parser
+        self._redaction_gate = redaction_gate
 
     def __getattr__(self, name: str) -> Any:
         if name not in {"env","_add_line_numbers"}:
             raise PolicyDenied("file_operation_unattested",name[:64])
         return getattr(self._delegate, name)
 
+    def _read_hashes(self, path: str, content: str) -> dict[str, str]:
+        """Optional public digests of this exact read, never of redacted bytes."""
+        if not callable(self._redaction_gate) or "\x00" in content:
+            return {}
+        try:
+            redacted = self._redaction_gate(path, content)
+            if type(redacted) is not str or redacted != content:
+                return {}
+            # RootFDWorkspace uses strict UTF-8 decode without newline/BOM
+            # normalization. Re-encoding therefore recovers the same read bytes.
+            raw = content.encode("utf-8")
+            return {"raw_sha256": hashlib.sha256(raw).hexdigest(),
+                    "sha256_crlf_to_lf": hashlib.sha256(raw.replace(b"\r\n", b"\n")).hexdigest(),
+                    "hash_scope": "entire-read-buffer"}
+        except Exception:
+            # Missing/broken SDK redaction only disables optional metadata.
+            return {}
+
     def read_file_raw(self, path: str) -> Any:
         try:
             content = self._workspace.read_text(path)
         except (OSError, FileAuthorityError) as exc:
             return self._common.ReadResult(error=str(exc))
-        return self._common.ReadResult(
+        result = self._common.ReadResult(
             content=content, total_lines=len(content.splitlines()),
             file_size=len(content.encode("utf-8")),
         )
+        for key, value in self._read_hashes(path, content).items():
+            setattr(result, key, value)
+        return result
 
     def read_file_bytes(self, path: str, max_bytes: int | None = None) -> Any:
         limit = self._workspace_max_file_bytes() if max_bytes is None else max_bytes
@@ -87,10 +131,14 @@ class _PolicyFileOps:
         lines = result.content.splitlines(keepends=True)
         page = "".join(lines[offset - 1:offset - 1 + limit])
         numbered = self._delegate._add_line_numbers(page, offset)
-        return self._common.ReadResult(
+        page_result = self._common.ReadResult(
             content=numbered, total_lines=len(lines), file_size=result.file_size,
             truncated=(offset - 1 + limit) < len(lines),
         )
+        for key in ("raw_sha256", "sha256_crlf_to_lf", "hash_scope"):
+            if hasattr(result, key):
+                setattr(page_result, key, getattr(result, key))
+        return page_result
 
     def search(self,pattern,path=".",target="content",file_glob=None,limit=50,offset=0,
                output_mode="content",context=0,order="discovery"):
@@ -248,10 +296,12 @@ _POLICY_ENV = {
 }
 
 
-def _reassert_policy_environment() -> None:
+def _reassert_policy_environment(private_sdk_policy=None) -> None:
     import os
     for key, value in _POLICY_ENV.items():
         os.environ[key] = value
+    if private_sdk_policy is not None:
+        private_sdk_policy.reassert()
 
 
 def _require_local_backend(env_type: Any, env: Any | None = None) -> None:
@@ -304,9 +354,43 @@ def _effective_request_data_class(guard: InvocationGuard) -> Any:
         raise PolicyDenied("request_data_class_unknown") from exc
 
 
-def _actual_provider_credential_ref(agent: Any, route: Any) -> str | None:
+def _actual_provider_credential_ref(agent: Any, route: Any, *, guard=None, private_sdk_policy=None) -> str | None:
     """Resolve the actual selected key through Hermes' credential pool identity."""
     refs = tuple(getattr(route, "credential_refs", ()) or ())
+    binding = getattr(agent, "_host_reference", None)
+    if binding is not None:
+        from agent.host_reference import HostCredentialReference, ReferencePool, validate_reference_runtime
+        pool = getattr(agent, "_credential_pool", None)
+        if (guard is None or private_sdk_policy is None
+                or type(binding) is not HostCredentialReference or type(pool) is not ReferencePool):
+            raise PolicyDenied("host_reference_authenticated_binding_required")
+        if binding is not getattr(guard, "_admitted_host_reference", None):
+            raise PolicyDenied("host_reference_not_admitted_by_stage2")
+        try:
+            validate_reference_runtime(binding, provider=agent.provider, model=agent.model,
+                base_url=agent.base_url, api_mode=agent.api_mode, api_key=agent.api_key,
+                pool=pool)
+        except Exception as exc:
+            raise PolicyDenied("host_reference_route_mismatch") from exc
+        grant = guard.grant
+        identity = grant.identity
+        if (getattr(private_sdk_policy, "auth_sha256", None) is not None
+                or getattr(getattr(grant, "runtime_assurance", None), "credentials_isolated", None) is not True
+                or binding.grant_hash != grant.hash
+                or binding.profile_sha256 != private_sdk_policy.profile_sha256
+                or binding.projection_sha256 != private_sdk_policy.projection_sha256
+                or binding.workspace != grant.workspace_root
+                or binding.fence != str(identity.fencing_token)
+                or binding.lineage != identity.parent_task_id
+                or binding.provider != route.provider
+                or binding.endpoint != route.base_url
+                or binding.api_mode != route.api_mode
+                or binding.credential_ref not in refs
+                or binding.credential_ref not in grant.credential_refs
+                or pool.current_ref != binding.credential_ref
+                or pool.current_entry_id != binding.entry_id):
+            raise PolicyDenied("host_reference_authenticated_binding_mismatch")
+        return binding.credential_ref
     raw = getattr(agent, "api_key", None)
     if getattr(agent, "api_mode", None) == "anthropic_messages":
         raw = getattr(agent, "_anthropic_api_key", None) or raw
@@ -396,6 +480,8 @@ def _actual_aux_credential_ref(client: Any, route: Any) -> str | None:
 def _authorize_aux_transport(
     guard: InvocationGuard, client: Any, provider: Any, api_mode: Any
 ) -> None:
+    deny=getattr(guard,"deny_unbudgeted_auxiliary",None)
+    if callable(deny):deny()
     route = _effective_aux_route(guard, client, provider, api_mode)
     if len(route.regions) != 1 or len(route.data_classes) != 1:
         raise PolicyDenied("provider_route_ambiguous", str(route.provider))
@@ -548,6 +634,12 @@ class GuardInstallation:
     surface: dict[str, Any] = field(default_factory=dict)
     finalizers: list[Callable[[], Any]] = field(default_factory=list)
     installed: bool = True
+    cli_invocation_binding: Any = None
+
+    def resolve_caller_task_id(self, task_id: str | None) -> str | None:
+        """Resolve only a live host-bound tool context; SDK arguments stay raw."""
+        return (self.cli_invocation_binding.caller_task_id(task_id)
+                if self.cli_invocation_binding is not None else task_id)
 
     def _remember(self, owner: Any, name: str, replacement: Any) -> None:
         original = getattr(owner, name)
@@ -557,6 +649,8 @@ class GuardInstallation:
     def uninstall(self) -> None:
         if not self.installed:
             return
+        if self.cli_invocation_binding is not None:
+            self.cli_invocation_binding.close()
         for owner, name, original in reversed(self.originals):
             setattr(owner, name, original)
         for finalizer in reversed(self.finalizers):
@@ -567,14 +661,123 @@ class GuardInstallation:
         self.installed = False
 
 
-def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
+def _install_dotenv_environment(installation, private_sdk_policy=None):
+    from hermes_cli import env_loader
+    # Policy suppression is authority, not user config. Hermes reloads profile
+    # dotenv files with override=True after profile selection, so reassert the
+    # protected values after every dotenv layer and disable plugin discovery at
+    # the manager method itself. A .env cannot turn policy mode back off.
+    _reassert_policy_environment(private_sdk_policy)
+    original_dotenv_layer = env_loader._load_dotenv_with_fallback
+    @functools.wraps(original_dotenv_layer)
+    def guarded_dotenv_layer(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return original_dotenv_layer(*args, **kwargs)
+        finally:
+            _reassert_policy_environment(private_sdk_policy)
+    installation._remember(env_loader, "_load_dotenv_with_fallback", guarded_dotenv_layer)
+
+    original_dotenv_load = env_loader.load_hermes_dotenv
+    @functools.wraps(original_dotenv_load)
+    def guarded_dotenv_load(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return original_dotenv_load(*args, **kwargs)
+        finally:
+            _reassert_policy_environment(private_sdk_policy)
+    installation._remember(env_loader, "load_hermes_dotenv", guarded_dotenv_load)
+
+
+
+def _install_private_sdk_configuration(installation, policy):
+    from hermes_cli import config, managed_scope
+    original_managed = managed_scope.get_managed_dir
+    original_path = config.get_config_path
+
+    @functools.wraps(original_managed)
+    def private_managed_dir():
+        policy.reassert()
+        if original_managed() is not None:
+            raise PolicyDenied("private_sdk_managed_scope_changed")
+        return None
+
+    @functools.wraps(original_path)
+    def private_config_path():
+        policy.reassert()
+        path = original_path()
+        policy.verify_config_path(path)
+        return path
+
+    installation._remember(managed_scope, "get_managed_dir", private_managed_dir)
+    installation._remember(config, "get_config_path", private_config_path)
+    from .private_sdk_credentials import install_private_sdk_credentials
+    install_private_sdk_credentials(installation, policy)
+
+
+def _check_private_sdk_agent(policy, agent):
+    from hermes_cli import config
+    policy.reassert()
+    policy.verify_config_path(config.get_config_path())
+    chain = getattr(agent, "_fallback_chain", None)
+    if type(chain) is not list or chain:
+        raise PolicyDenied("private_sdk_fallback_not_empty")
+
+
+def _install_sdk_observation_formatter(installation, guard):
+    # The pinned CLI calls this formatter with the *actual* caught constructor
+    # exception before returning False. Observe enums, preserve all UI text.
+    authority = getattr(guard, "work_authority", None)
+    if not callable(getattr(authority, "observe", None)):
+        return
+    try:
+        from hermes_cli import cli_chat_error_copy
+        original = cli_chat_error_copy.agent_init_failure_message
+    except (ImportError, AttributeError):
+        return  # Optional diagnostics must not break a legacy SDK startup.
+    if not callable(original):
+        return
+    @functools.wraps(original)
+    def observed(error):
+        from .sdk_observation import report_failure
+        report_failure(guard, "sdk_agent_init", error)
+        return original(error)
+    installation._remember(cli_chat_error_copy, "agent_init_failure_message", observed)
+
+
+def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None,
+                         cli_invocation_binding=None) -> GuardInstallation:
     """Install #76 authority at all audited Hermes v0.21.5 execution seams.
 
     This must run before the model is allowed to issue tool calls.  Plugin
     pre_tool_call is intentionally *not* relied on: callers may set skip flags
     and middleware failures are fail-open in the audited Hermes version.
     """
-    surface = inspect_hermes_security_surface()
+    if cli_invocation_binding is not None:
+        from .hermes_cli_identity import CLIInvocationBinding
+        if type(cli_invocation_binding) is not CLIInvocationBinding or cli_invocation_binding.guard is not guard:
+            raise PolicyDenied("cli_binding_guard_required")
+    def caller_task_id(value):
+        return installation.resolve_caller_task_id(value)
+    installation = None
+    if private_sdk_policy is not None:
+        from .private_profile_namespace import PrivateSDKPolicy
+        if not isinstance(private_sdk_policy, PrivateSDKPolicy):
+            raise PolicyDenied("private_sdk_policy_unverified")
+        private_sdk_policy.reassert()
+        installation = GuardInstallation(guard=guard)
+        try:
+            # Protect import-time dotenv/config reads before model_tools or tools
+            # can import/cache configuration. env_loader is the definition-only seam.
+            _install_dotenv_environment(installation, private_sdk_policy)
+            _install_private_sdk_configuration(installation, private_sdk_policy)
+        except BaseException:
+            installation.uninstall()
+            raise
+    try:
+        surface = inspect_hermes_security_surface()
+    except BaseException:
+        if installation is not None:
+            installation.uninstall()
+        raise
 
     import model_tools
     from agent import auxiliary_client, conversation_loop, turn_api_call, tool_executor
@@ -588,25 +791,35 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
     aliases = dict(surface["legacy_aliases"])
     guard.aliases = aliases
     guard.path_resolver = lambda value, task_id: _resolve_path_for_task(
-        value, task_id
+        value, (cli_invocation_binding.path_task_id(task_id)
+                if cli_invocation_binding is not None else task_id)
     )
-    installation = GuardInstallation(guard=guard, surface=surface)
+    if installation is None:
+        installation = GuardInstallation(guard=guard, surface=surface)
+    else:
+        installation.surface = surface
+
+    installation.cli_invocation_binding = cli_invocation_binding
+    _install_sdk_observation_formatter(installation, guard)
 
     # Pin local file authority to the granted directory inodes. Hermes may keep
     # its higher-level formatting/search helpers, but physical read/write/patch
     # goes through RootFDWorkspace so a path/symlink swap after authorization
     # cannot redirect an open or rename outside the signed roots.
     file_rules = {rule.tool: rule for rule in getattr(guard.grant, "tool_rules", ())}
-    file_roots = {
-        root
-        for tool in ("read_file", "write_file", "patch", "search_files")
-        for root in getattr(file_rules.get(tool), "allowed_roots", ())
-    }
+    file_roots = _runtime_file_roots(guard.grant, file_rules)
     file_workspace = RootFDWorkspace(file_roots) if file_roots else None
     if file_workspace is not None:
         from tools import file_operations_common, patch_parser
         original_get_file_ops = file_tools._get_file_ops
         proxies: dict[int, _PolicyFileOps] = {}
+
+        def read_redaction_gate(path: str, content: str) -> Any:
+            # Use the SDK's current display redactor and secret-path context,
+            # not a cached replacement or a separate policy-mode heuristic.
+            return file_tools.redact_sensitive_text(
+                content, file_read=True, secret_file=file_tools._is_secret_file_arg(path)
+            )
 
         @functools.wraps(original_get_file_ops)
         def guarded_get_file_ops(task_id: str = "default") -> Any:
@@ -621,7 +834,8 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
             proxy = proxies.get(key)
             if proxy is None:
                 proxy = proxies[key] = _PolicyFileOps(
-                    file_workspace, delegate, file_operations_common, patch_parser
+                    file_workspace, delegate, file_operations_common, patch_parser,
+                    redaction_gate=read_redaction_gate,
                 )
             return proxy
 
@@ -657,31 +871,11 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
         installation._remember(file_tools, "_special_file_kind", lambda path: None)
         installation.finalizers.append(file_workspace.close)
 
-    # Policy suppression is authority, not user config. Hermes reloads profile
-    # dotenv files with override=True after profile selection, so reassert the
-    # protected values after every dotenv layer and disable plugin discovery at
-    # the manager method itself. A .env cannot turn policy mode back off.
-    _reassert_policy_environment()
-    original_dotenv_layer = env_loader._load_dotenv_with_fallback
-    @functools.wraps(original_dotenv_layer)
-    def guarded_dotenv_layer(*args: Any, **kwargs: Any) -> Any:
-        try:
-            return original_dotenv_layer(*args, **kwargs)
-        finally:
-            _reassert_policy_environment()
-    installation._remember(env_loader, "_load_dotenv_with_fallback", guarded_dotenv_layer)
-
-    original_dotenv_load = env_loader.load_hermes_dotenv
-    @functools.wraps(original_dotenv_load)
-    def guarded_dotenv_load(*args: Any, **kwargs: Any) -> Any:
-        try:
-            return original_dotenv_load(*args, **kwargs)
-        finally:
-            _reassert_policy_environment()
-    installation._remember(env_loader, "load_hermes_dotenv", guarded_dotenv_load)
+    if private_sdk_policy is None:
+        _install_dotenv_environment(installation)
 
     def disabled_plugin_discovery(self: Any, force: bool = False) -> None:
-        _reassert_policy_environment()
+        _reassert_policy_environment(private_sdk_policy)
         self._discovered = True
         return None
     installation._remember(plugins.PluginManager, "discover_and_load", disabled_plugin_discovery)
@@ -858,6 +1052,9 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
 
     installation._remember(codex_adapter, "create", guarded_codex_create)
 
+    from .sdk_observation import observe_failures
+
+    @observe_failures(guard, "sdk_provider_check")
     def authorize_agent_provider(agent: Any) -> None:
         provider = getattr(agent, "provider", None)
         routes = getattr(getattr(guard, "grant", None), "provider_routes", ())
@@ -870,7 +1067,8 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
         # data handling contract. Never infer these from model request fields.
         if len(route.regions) != 1 or len(route.data_classes) != 1:
             raise PolicyDenied("provider_route_ambiguous", str(provider))
-        credential_ref = _actual_provider_credential_ref(agent, route)
+        credential_ref = _actual_provider_credential_ref(agent, route,
+            guard=guard, private_sdk_policy=private_sdk_policy)
         data_class = _effective_request_data_class(guard)
         guard.authorize_provider(ProviderRequest(
             provider=provider, region=route.regions[0], data_class=data_class,
@@ -881,12 +1079,23 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
     original_perform = turn_api_call.perform_api_call
 
     @functools.wraps(original_perform)
+    @observe_failures(guard, "sdk_api_call")
     def guarded_perform(agent: Any, *args: Any, **kwargs: Any) -> Any:
+        if private_sdk_policy is not None:
+            _check_private_sdk_agent(private_sdk_policy, agent)
         authorize_agent_provider(agent)
         token = _ACTIVE_AGENT.set(agent)
+        budgeted=False
+        old_streaming=getattr(agent,"_disable_streaming",False)
         try:
+            budgeted=callable(getattr(guard,"budget_required",None)) and guard.budget_required()
+            if budgeted:
+                if getattr(getattr(agent,"client",None),"max_retries",None)!=0:
+                    raise PolicyDenied("budgeted_client_retry_profile_unsupported")
+                agent._disable_streaming=True
             return original_perform(agent, *args, **kwargs)
         finally:
+            if budgeted:agent._disable_streaming=old_streaming
             _ACTIVE_AGENT.reset(token)
 
     installation._remember(turn_api_call, "perform_api_call", guarded_perform)
@@ -895,6 +1104,7 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
     original_middleware = middleware.run_llm_execution_middleware
 
     @functools.wraps(original_middleware)
+    @observe_failures(guard, "sdk_middleware")
     def guarded_llm_execution(request: Any, next_call: Any, **context: Any) -> Any:
         agent = _ACTIVE_AGENT.get()
         if agent is None:
@@ -902,7 +1112,68 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
         authorize_agent_provider(agent)  # before any callback
         def guarded_next(payload: Any) -> Any:
             authorize_agent_provider(agent)  # after callbacks may switch routes
-            return next_call(payload)
+            begin=getattr(guard,"start_model_effect",None)
+            receipt=None
+            assurance = getattr(getattr(guard, "grant", None), "runtime_assurance", None)
+            access = getattr(getattr(assurance, "network_access", None), "value", None)
+            budgeted_transport = callable(begin) and guard.budget_required()
+            transport = getattr(guard, "execute_model_effect", None)
+            supported_host_route = (agent.provider == "nous" and agent.model.endswith(":free")
+                and agent.base_url == "https://inference-api.nousresearch.com/v1")
+            # The native bridge may share the host network namespace. Its
+            # observed network mode must not bypass the authenticated work port.
+            host_transport = budgeted_transport and (private_sdk_policy is not None
+                or access == "none" or (callable(transport) and supported_host_route))
+            if getattr(agent, "_host_reference", None) is not None and not host_transport:
+                raise PolicyDenied("host_reference_protected_transport_required")
+            if host_transport:
+                if (not callable(transport) or agent.provider != "nous"
+                        or not agent.model.endswith(":free")
+                        or agent.base_url != "https://inference-api.nousresearch.com/v1"):
+                    raise PolicyDenied("host_model_transport_profile_unsupported")
+            if budgeted_transport:
+                from .evidence import canonical
+                from .work_model_deadline import validate_text_request
+                # Bound the exact SDK payload using the protected route's quote.
+                resolve=getattr(guard,"model_request_ceiling",None)
+                if not callable(resolve):raise PolicyDenied("model_quote_ceiling_unavailable")
+                ceiling=resolve({key:getattr(agent,key) for key in ("provider","model","api_mode","base_url")})
+                if isinstance(payload,dict) and not any(key in payload for key in
+                        ("max_tokens","max_completion_tokens","max_output_tokens")):
+                    payload={**payload,ceiling["output_token_field"]:ceiling["max_output_tokens"]}
+                validate_text_request(payload,agent)
+                if ceiling["output_token_field"] not in payload:
+                    raise PolicyDenied("model_quote_token_field_mismatch")
+                encoded=canonical(payload)
+                output=next((payload[key] for key in ("max_completion_tokens","max_output_tokens","max_tokens")
+                             if key in payload),None)
+                receipt=begin({"request_id":context.get("api_request_id"),
+                    "provider":agent.provider,"model":agent.model,"api_mode":agent.api_mode,"base_url":agent.base_url,
+                    "request_sha256":hashlib.sha256(encoded).hexdigest(),"request_bytes":len(encoded),
+                    "output_tokens":output})
+            # Failure/timeout leaves the same pre-effect reservation UNKNOWN.
+            if receipt is None:
+                response=next_call(payload)
+            else:
+                from .work_model_deadline import model_deadline
+                with model_deadline(receipt["max_work_ms"]):
+                    if host_transport:
+                        answer = transport(receipt, context.get("api_request_id"), payload)
+                        if answer["kind"] == "unknown":
+                            raise PolicyDenied("host_model_delivery_unknown_reconcile_original")
+                        guard.returned_model_effect(receipt)
+                        if answer["kind"] != "http_response":
+                            raise PolicyDenied("host_model_response_invalid")
+                        if not 200 <= answer["http_status"] < 300:
+                            raise PolicyDenied("host_model_provider_http_error",
+                                               str(answer["http_status"]))
+                        from openai.types.chat import ChatCompletion
+                        response = ChatCompletion.model_validate(answer["body"])
+                    else:
+                        response=next_call(payload)
+                if not host_transport:
+                    guard.returned_model_effect(receipt)
+            return response
         return original_middleware(request, guarded_next, **context)
 
     installation._remember(middleware, "run_llm_execution_middleware", guarded_llm_execution)
@@ -915,14 +1186,26 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
                                 tool_call_id: str, execute: Callable[..., Any],
                                 **kwargs: Any) -> Any:
         def authorized_execute(final_args: dict[str, Any]) -> Any:
+            try:
+                token = (cli_invocation_binding.begin_tool(agent, effective_task_id)
+                         if cli_invocation_binding is not None else None)
+            except PolicyDenied as exc:
+                return _denied_result(exc.reason, exc.detail)
+            try:
+                return bound_execute(final_args)
+            finally:
+                if token is not None:
+                    cli_invocation_binding.end_tool(token)
+
+        def bound_execute(final_args: dict[str, Any]) -> Any:
             if function_name in _META_READ_TOOLS:
                 return execute(final_args)
             if function_name == _BRIDGE_TOOL:
-                denied = _precheck_bridge(guard, final_args, effective_task_id)
+                denied = _precheck_bridge(guard, final_args, caller_task_id(effective_task_id))
                 return denied if denied is not None else execute(final_args)
             try:
                 canonical, checked = guard.authorize_tool_call(
-                    function_name, final_args, caller_task_id=effective_task_id,
+                    function_name, final_args, caller_task_id=caller_task_id(effective_task_id),
                     consume_approval=True,
                 )
                 digest = _call_digest(canonical, checked)
@@ -961,7 +1244,7 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
             return original_handle(function_name, function_args, task_id, *args, **kwargs)
 
         if function_name == _BRIDGE_TOOL:
-            denied = _precheck_bridge(guard, function_args, task_id)
+            denied = _precheck_bridge(guard, function_args, caller_task_id(task_id))
             if denied is not None:
                 return denied
             return original_handle(function_name, function_args, task_id, *args, **kwargs)
@@ -970,7 +1253,7 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
             _, checked = guard.authorize_tool_call(
                 function_name,
                 function_args,
-                caller_task_id=task_id,
+                caller_task_id=caller_task_id(task_id),
                 consume_approval=False,
             )
         except PolicyDenied as exc:
@@ -1003,7 +1286,7 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
             _, checked = guard.authorize_tool_call(
                 canonical,
                 args,
-                caller_task_id=kwargs.get("task_id"),
+                caller_task_id=caller_task_id(kwargs.get("task_id")),
                 consume_approval=(already != (guard.grant.hash, canonical, digest)),
             )
         except PolicyDenied as exc:
@@ -1036,7 +1319,8 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
             _, checked = guard.authorize_tool_call(
                 canonical,
                 arguments,
-                caller_task_id=guard.grant.identity.task_id,
+                caller_task_id=(caller_task_id(None) if cli_invocation_binding is not None
+                                else guard.grant.identity.task_id),
                 consume_approval=(already != (guard.grant.hash, canonical, digest)),
             )
         except PolicyDenied as exc:
@@ -1060,6 +1344,12 @@ def install_hermes_guard(guard: InvocationGuard) -> GuardInstallation:
         register_delegation_tool(installation, registry, _AUTHORIZED_CALL, _call_digest)
         from herdr.result_submission import register_result_tool
         register_result_tool(installation, registry, _AUTHORIZED_CALL, _call_digest)
+        from herdr.work_tool import register_work_tool
+        register_work_tool(installation, registry, _AUTHORIZED_CALL, _call_digest)
+        from herdr.external_knowledge_tool import register_external_knowledge_tool
+        register_external_knowledge_tool(
+            installation, registry, _AUTHORIZED_CALL, _call_digest
+        )
     except BaseException:
         installation.uninstall()
         raise

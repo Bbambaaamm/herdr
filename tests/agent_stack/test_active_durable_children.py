@@ -41,6 +41,7 @@ def setup(tmp_path):
             "execution_session": {"owned_pane": True, "pane_id": "pane-1"}}
     path = worker.RUNNING / "parent.json"
     path.write_text(json.dumps(task))
+    path.chmod(0o600)
     directory = tmp_path / "durable-children" / hashlib.sha256(b"parent:run-1").hexdigest()
     scheduler = DynamicChildScheduler(audit_log=AuditLog(directory / "scheduler.jsonl"))
     scheduler.register_external_parent_attempt(
@@ -447,3 +448,8 @@ def test_pending_initialization_conflict_remains_fail_closed(tmp_path, monkeypat
             pass
     assert (directory / "scheduler.jsonl").read_bytes() == before
     assert not ledger_required(directory)
+
+@pytest.fixture(autouse=True)
+def explicit_host_completion_port_for_lifecycle_only(monkeypatch):
+    from tests.policy_launch_fakes import install_child_completion_fixture
+    install_child_completion_fixture(monkeypatch)

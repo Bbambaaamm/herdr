@@ -116,3 +116,38 @@ def test_delegation_rule_cannot_be_reclassified_or_grant_generic_process(tmp_pat
     with pytest.raises(SecurityError):
         grant(tmp_path, tools=(TOOL,), rules=(ToolRule(tool=TOOL, risk=risk,
             allowed_arg_keys=ARGUMENTS, requires_process=process, requires_sandbox=sandbox),))
+
+
+def test_closed_ownership_reaches_real_handler_with_exact_integration_owner(tmp_path,monkeypatch):
+    from herdr.child_ownership import ChildOwnership,WriteScope
+    installation,registry,_=installed(tmp_path,monkeypatch)
+    owner=installation.guard.grant.identity
+    scope=ChildOwnership((WriteScope("file","src/owned.py"),),(),(),(),owner.task_id,"artifact/handoff")
+    args={**arguments(),"ownership":scope.to_json()}
+    calls=[]
+    monkeypatch.setattr(delegation_tool,"_client_delegate",lambda value:calls.append(value) or {"task_id":"child"})
+    assert json.loads(registry.get_entry(TOOL).handler(args))=={"task_id":"child"}
+    assert calls[0]["ownership"]==scope.to_json()
+    calls.clear()
+    wrong=replace(scope,integration_owner="foreign-parent")
+    assert json.loads(registry.get_entry(TOOL).handler({**args,"ownership":wrong.to_json()}))=={
+        "error":"delegation_integration_owner_mismatch"}
+    assert calls==[]
+    installation.uninstall()
+
+
+def test_ownership_schema_and_handler_deny_unknown_or_scalar_scope_before_bridge(tmp_path,monkeypatch):
+    from herdr.child_ownership import ChildOwnership
+    from jsonschema import Draft202012Validator
+    installation,registry,_=installed(tmp_path,monkeypatch)
+    scope=ChildOwnership((),(),(),(),installation.guard.grant.identity.task_id,"artifact/handoff").to_json()
+    args={**arguments(),"ownership":scope}
+    assert Draft202012Validator(delegation_tool.SCHEMA["parameters"]).is_valid(args)
+    calls=[]
+    monkeypatch.setattr(delegation_tool,"_client_delegate",lambda value:calls.append(value))
+    for bad in [{**scope,"write_scope":"src"}, {**scope,"new_authority":True},
+                {**scope,"hard_dependencies":"child-id"}]:
+        assert not Draft202012Validator(delegation_tool.SCHEMA["parameters"]).is_valid({**args,"ownership":bad})
+        assert "error" in json.loads(registry.get_entry(TOOL).handler({**args,"ownership":bad}))
+    assert calls==[]
+    installation.uninstall()

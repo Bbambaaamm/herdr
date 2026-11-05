@@ -16,6 +16,97 @@ from dataclasses import replace
 from pathlib import Path
 
 
+
+def _probe_installed_work_budget(grant, workspace, outside, middleware):
+    """Real installed SDK middleware; host admission/transport is an explicit fixture."""
+    import threading
+    import time
+    from dataclasses import asdict
+    from types import SimpleNamespace
+    from herdr.capability import DataClass, Egress, Retention, Training
+    from herdr.security import ProviderRoute, PolicyDenied
+    from herdr.evidence import digest
+    from herdr.work_budget import BudgetAllocation, BudgetLimits
+    from herdr.work_budget_configuration import bind_budget, model_effect
+    from herdr.work_contract_host import WorkInvocationGuard
+    from herdr.work_cycle import WorkPhase, WorkContractError
+    from herdr.hermes_guard import install_hermes_guard, _ACTIVE_AGENT
+    from agent import turn_api_call
+    provider="budget-fixture"
+    route=ProviderRoute(provider,"https://budget-fixture.invalid/v1","chat_completions",
+        ("eu-central",),(DataClass.INTERNAL,),Egress.NONE,Retention.ZERO,Training.EXCLUDED)
+    grant=replace(grant,scope=replace(grant.scope,providers=(provider,)),provider_routes=(route,))
+    allocation=BudgetAllocation(digest("sdk-budget-allocation"),grant.identity.consumer,
+        digest("sdk-stable-work"),digest("sdk-lineage"),digest("sdk-host-approval"),
+        BudgetLimits(100000,100000,3,20000,0,1,0,1,1))
+    quote={"provider":provider,"model":"text-fixture","api_mode":route.api_mode,"base_url":route.base_url,
+           "max_request_bytes":4096,"max_output_tokens":100,"max_tokens":5000,
+           "max_cost_microusd":0,"max_work_ms":30}
+    cycle=SimpleNamespace(plan=SimpleNamespace(hash=digest("fixture-plan"),grant_sha256=grant.hash),
+                          phase=WorkPhase.WORK)
+    # Only protected admission/phase is supplied by this fixture. Quote parser,
+    # cumulative ledger, reservation/settlement and SDK guard are production code.
+    factory=SimpleNamespace(_lock=threading.RLock(),_refresh=lambda identity:(cycle,None),
+                            allocations={digest(grant.identity.to_json()):allocation})
+    storage=outside/"sdk-budget";storage.mkdir(mode=0o700)
+    bind_budget(factory,{"version":1,"allocation":asdict(allocation),"ancestors":[],
+                        "model_quotes":[quote]},storage=storage,writable_roots=(workspace,))
+    class HostBudgetTransportFixture:
+        deny_status=False
+        def __call__(self,identity,grant_hash,**kwargs):
+            assert identity==grant.identity and grant_hash==grant.hash
+            return True
+        def effect(self,identity,grant_hash,action,payload):
+            assert identity==grant.identity and grant_hash==grant.hash
+            if action=="status":
+                if self.deny_status:raise PolicyDenied("fixture_status_unavailable")
+                return {"required":True}
+            return model_effect(factory,identity,grant_hash,action,payload)
+    transport=HostBudgetTransportFixture()
+    guard=WorkInvocationGuard(grant,work_authority=transport)
+    installation=install_hermes_guard(guard)
+    agent=SimpleNamespace(provider=provider,model=quote["model"],api_mode=route.api_mode,
+        base_url=route.base_url,api_key=None,client=SimpleNamespace(max_retries=0),_disable_streaming=False)
+    request={"model":agent.model,"messages":[{"role":"user","content":"bounded fixture text"}],"max_tokens":50}
+    calls=[]
+    def returned(payload):
+        state=factory.budget_authority.snapshot(allocation.allocation_id)
+        assert state["inflight"]==1 and state["charged_upper_bounds"]["model_calls"]==1
+        calls.append("returned")
+        return {"fixture":"response"}
+    token=_ACTIVE_AGENT.set(agent)
+    try:
+        middleware.run_llm_execution_middleware(request,returned,api_request_id="sdk:original:1")
+        state=factory.budget_authority.snapshot(allocation.allocation_id)
+        assert state["inflight"]==0 and state["charged_upper_bounds"]["tokens"]==5000
+        def slow(payload):
+            state=factory.budget_authority.snapshot(allocation.allocation_id)
+            assert state["inflight"]==1 and state["charged_upper_bounds"]["model_calls"]==2
+            calls.append("timeout");time.sleep(1)
+        try:middleware.run_llm_execution_middleware(request,slow,api_request_id="sdk:original:2")
+        except PolicyDenied as exc:assert "reconcile_original" in exc.reason
+        else:raise AssertionError("SDK callback deadline must stop")
+        try:middleware.run_llm_execution_middleware(request,returned,api_request_id="renamed:session:1")
+        except WorkContractError as exc:assert "uncertain" in str(exc)
+        else:raise AssertionError("renamed session cannot refill unknown reservation")
+        assert calls==["returned","timeout"]
+        assert factory.budget_authority.snapshot(allocation.allocation_id)["inflight"]==1
+        try:guard.deny_unbudgeted_auxiliary()
+        except PolicyDenied as exc:assert exc.reason=="auxiliary_budget_profile_unsupported"
+        else:raise AssertionError("unsupported auxiliary must stop before callback")
+        agent.client.max_retries=2
+        try:turn_api_call.perform_api_call(agent)
+        except PolicyDenied as exc:assert exc.reason=="budgeted_client_retry_profile_unsupported"
+        else:raise AssertionError("internal SDK retries must be disabled")
+        assert _ACTIVE_AGENT.get() is agent and not agent._disable_streaming
+        transport.deny_status=True
+        try:turn_api_call.perform_api_call(agent)
+        except PolicyDenied as exc:assert exc.reason=="fixture_status_unavailable"
+        else:raise AssertionError("missing budget authority must stop")
+        assert _ACTIVE_AGENT.get() is agent
+    finally:
+        _ACTIVE_AGENT.reset(token);installation.uninstall()
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--hermes-root", required=True)
@@ -34,6 +125,7 @@ def main() -> int:
     from herdr.security import (
         InvocationGuard,
         InvocationIdentity,
+        PolicyDenied,
         NetworkAccess,
         ProcessPolicy,
         RiskClass,
@@ -312,6 +404,68 @@ def main() -> int:
                 if previous is None:os.environ.pop(key,None)
                 else:os.environ[key]=previous
 
+
+        # Real installed SDK dispatch; the host oracle transport is a fixture.
+        # Physical oracle/Git/Unix-peer behavior has separate Linux regressions.
+        from herdr.work_contract_host import WorkInvocationGuard
+        work_result = outside_file.parent / "work-result.json"
+        work_result.touch(mode=0o600)
+        work_slot = ResultSlot.bind(work_result, identity, "probe-work-result")
+        work_result_rule = replace(result_rule, result_slot=work_slot)
+        work_rule = ToolRule(tool="herdr_verify_work", risk=RiskClass.READ,
+                            allowed_arg_keys=("request_id","handoff"), requires_sandbox=True)
+        work_grant = replace(result_grant,
+            scope=replace(result_grant.scope,tools=("read_file",TOOL,"herdr_verify_work")),
+            tool_rules=tuple(rule for rule in result_grant.tool_rules if rule.tool != TOOL)
+                       + (work_result_rule, work_rule))
+        class HostTransportFixture:
+            phase = "WORK"
+            outcomes = {}
+            effects = 0
+            def __call__(self, identity_arg, grant_hash, *, kind, tool=None):
+                assert identity_arg == identity and grant_hash == work_grant.hash
+                if self.phase == "WORK" or kind == "tool" and tool in {"herdr_verify_work",TOOL}:
+                    return True
+                raise PolicyDenied("work_phase_forbids_invocation")
+            def verify(self, identity_arg, grant_hash, request_id, handoff=None):
+                assert identity_arg == identity and grant_hash == work_grant.hash
+                if request_id not in self.outcomes:
+                    self.effects += 1
+                    self.phase = "HANDOFF"
+                    self.outcomes[request_id] = {"status":"pass",
+                        "submission":{"status":"completed","evidence":[{"sdk_work_transport_fixture":True}],
+                                      "summary":"Observed installed SDK work/result dispatch"}}
+                return self.outcomes[request_id]
+        authority = HostTransportFixture()
+        phase_guard = WorkInvocationGuard(work_grant, work_authority=authority)
+        old_env = {key:os.environ.get(key) for key in (*IDENTITY_ENV.values(),"HERDR_DURABLE_SANDBOX")}
+        for field,key in IDENTITY_ENV.items():os.environ[key]=str(getattr(identity,field))
+        os.environ["HERDR_DURABLE_SANDBOX"]="1"
+        work_installation = install_hermes_guard(phase_guard)
+        try:
+            assert resolve_toolset("herdr_work") == ["herdr_verify_work"]
+            work_args={"request_id":"sdk-work-probe","handoff":{"pr_number":None}}
+            work_response=model_tools.handle_function_call("herdr_verify_work",work_args,
+                **{**common,"enabled_toolsets":["file","herdr_work","herdr_result"]})
+            observed=json.loads(work_response)
+            assert observed["status"]=="pass" and observed["result_delivery"]["submitted"],work_response
+            initial=work_result.read_bytes()
+            repeated=registry.dispatch("herdr_verify_work",work_args,task_id=identity.task_id)
+            assert json.loads(repeated)["result_delivery"]["submitted"] and authority.effects==1,repeated
+            assert work_result.read_bytes()==initial
+            after_pass=registry.dispatch("read_file",{"path":str(allowed_file)},task_id=identity.task_id)
+            assert "work_phase_forbids_invocation" in str(after_pass),after_pass
+            try:phase_guard.authorize_provider(None)
+            except PolicyDenied as exc:assert exc.reason=="work_phase_forbids_invocation"
+            else:raise AssertionError("PASS must stop provider calls")
+        finally:
+            work_installation.uninstall()
+            for key,value in old_env.items():
+                if value is None:os.environ.pop(key,None)
+                else:os.environ[key]=value
+        assert registry.get_entry("herdr_verify_work") is None
+        _probe_installed_work_budget(grant, workspace, outside, middleware)
+
         # A granted local write goes through the pinned RootFDWorkspace facade,
         # not a re-opened model pathname. This proves the installed Hermes
         # registry/file_tools seam actually uses the #76 nofollow adapter.
@@ -343,6 +497,30 @@ def main() -> int:
         )
         assert "HERDR_SECURITY_DENIED" not in str(write_result), write_result
         assert allowed_write.read_text(encoding="utf-8") == "ROOTFD_OK\n"
+        for control in (".git", ".herdr", ".herdr-private"):
+            attack = workspace / ("new-" + control.lstrip(".")) / control / "config"
+            denied = model_tools.handle_function_call("write_file",
+                {"path": str(attack), "content": "escape"}, **common)
+            denied_data = json.loads(denied) if isinstance(denied, str) else denied
+            assert denied_data.get("error") == "workspace control path is not writable", denied
+            assert denied_data.get("bytes_written") == 0 and denied_data.get("dirs_created") is False, denied
+            assert not attack.parent.parent.exists()
+        installation.uninstall()
+
+        # An existing file ownership root must bootstrap and use the same
+        # installed SDK guard without granting the parent directory writes.
+        exact_file_grant = replace(write_grant,grant_id="hermes-exact-file-probe",
+            tool_rules=(replace(write_grant.tool_rules[0],allowed_roots=(str(allowed_write),)),))
+        installation=install_hermes_guard(InvocationGuard(exact_file_grant))
+        exact_inode=allowed_write.stat().st_ino
+        exact_result=model_tools.handle_function_call("write_file",
+            {"path":str(allowed_write),"content":"EXACT_FILE_OK\n"},**common)
+        assert "HERDR_SECURITY_DENIED" not in str(exact_result),exact_result
+        assert allowed_write.read_text()=="EXACT_FILE_OK\n" and allowed_write.stat().st_ino==exact_inode
+        sibling=workspace/"exact-file-foreign.txt";sibling.write_text("foreign")
+        denied_sibling=model_tools.handle_function_call("write_file",
+            {"path":str(sibling),"content":"escape"},**common)
+        assert "HERDR_SECURITY_DENIED" in str(denied_sibling) and sibling.read_text()=="foreign"
         installation.uninstall()
 
         patch_scope = replace(
@@ -417,7 +595,17 @@ def main() -> int:
             "hermes_file_toolset": sorted(file_toolset),
             "read_file_allowed": True,
             "rootfd_write_allowed": True,
+            "nested_control_sdk_creation_denied": True,
+            "exact_file_sdk_write_allowed": True,
+            "exact_file_sdk_foreign_sibling_denied": True,
             "result_submission_sdk_dispatch": True,
+            "work_verification_sdk_dispatch": True,
+            "work_phase_after_pass_sdk_denied": True,
+            "model_budget_installed_sdk_pre_effect": True,
+            "model_budget_sdk_timeout_unknown_held": True,
+            "model_budget_host_admission_transport_fixture": True,
+            "model_budget_sdk_retry_profile_denied": True,
+            "work_tool_host_transport_fixture": True,
             "result_submission_one_inode_no_process": True,
             "granted_delegation_sdk_dispatch": True,
             "delegation_direct_handler_schema_guarded": True,

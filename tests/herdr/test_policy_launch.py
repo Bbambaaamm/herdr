@@ -170,7 +170,11 @@ def test_actual_bwrap_seals_same_inode_after_mount_and_denies_writes(tmp_path, m
     if shadow:
         unrelated=tmp_path/"unrelated-shadow.py"
         unrelated.write_text("unrelated = True")
-        index=args.index("--")
+        # Keep the required final HOME seals intact so this reaches the
+        # physical stacked-code attestation rather than an argv-order denial.
+        index=args.index("--") - 4
+        assert args[index:index + 4] == ["--remount-ro", "/home",
+                                        "--remount-ro", "/home/agentops"]
         args[index:index]=["--ro-bind",str(unrelated),str(CODE_TARGET/"module.py")]
     process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                stderr=subprocess.PIPE, env=env)
@@ -345,6 +349,9 @@ def test_root_session_cannot_select_policy_authority_from_task_fields(tmp_path,m
         return {"result":{"agent":{"kind":"hermes","pane_id":"coordinator","workspace_id":"workspace"}}}
     monkeypatch.setattr(worker,"_herdr_json",herdr)
     monkeypatch.setattr(worker,"HOST_POLICY_LAUNCH_FACTORY",None)
+    monkeypatch.setattr(worker,"_root_policy_factory",lambda:None)  # Explicitly test absent host authority.
+    monkeypatch.setattr(worker,"ROOT",tmp_path/"tasks")
+    monkeypatch.setattr(worker,"RUNNING",tmp_path/"tasks"/"running")
     task={"id":"root-task","repo":"Bbambaaamm/herdr","run_token":"root-run","fencing_token":1,
           "workspace":str(tmp_path),"policy_launch_factory":"model-selected",
           "security_grant":{"tools":["terminal"]}}

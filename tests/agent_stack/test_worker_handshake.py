@@ -53,7 +53,7 @@ def test_existing_herdr_task_gets_explicit_consumer_scope():
     worker.ensure_parent_scope(task)
     assert task["parent_role"] == "writer"
     assert task["worktree_root"] == "/home/agentops/workspaces/herdr/worktrees"
-    assert set(task["parent_tools"]) == {"read_file", "search_files", "patch", "write_file", "herdr_delegate_child", "herdr_submit_result"}
+    assert set(task["parent_tools"]) == {"read_file", "search_files", "patch", "write_file", "herdr_delegate_child", "herdr_verify_work", "herdr_submit_result"}
     assert task["parent_permissions"] == ["workspace-write"]
 
 
@@ -158,6 +158,7 @@ def evidence_task(snapshot_path):
         "parent_task_id": "runtime-canary-parent",
         "min_children": 2,
     }
+    worker.freeze_plan(worker.ROOT, task)
     return task
 
 
@@ -257,6 +258,9 @@ def test_block_task_preserves_nonregular_result_path(tmp_path):
 
 
 def test_finish_defers_terminal_move_until_task_pane_cleanup(tmp_path, monkeypatch):
+    # This suite isolates lifecycle cleanup; completion acceptance is tested separately.
+    monkeypatch.setattr(worker, "verify_completion", lambda *args:
+                        {"level":"verified_worker_result", "bundle_hash":"a"*64})
     configure_paths(tmp_path)
     task = base_task()
     worker.prepare_attempt(task)
@@ -284,6 +288,9 @@ def test_finish_defers_terminal_move_until_task_pane_cleanup(tmp_path, monkeypat
 
 
 def test_finish_cleans_task_pane_before_terminal_move(tmp_path, monkeypatch):
+    # This suite isolates lifecycle cleanup; completion acceptance is tested separately.
+    monkeypatch.setattr(worker, "verify_completion", lambda *args:
+                        {"level":"verified_worker_result", "bundle_hash":"a"*64})
     configure_paths(tmp_path)
     task = base_task()
     worker.prepare_attempt(task)
@@ -364,6 +371,9 @@ def test_exact_owned_session_observation_does_not_complete_attempt(tmp_path, mon
 
 
 def test_finish_reconciles_snapshot_over_zero_byte_result_placeholder(tmp_path, monkeypatch):
+    # This suite isolates lifecycle cleanup; completion acceptance is tested separately.
+    monkeypatch.setattr(worker, "verify_completion", lambda *args:
+                        {"level":"verified_worker_result", "bundle_hash":"a"*64})
     configure_paths(tmp_path)
     task = base_task()
     task["run_token"] = "snapshot-run"
@@ -411,31 +421,49 @@ def test_create_task_session_uses_fresh_owned_pane_and_named_chat(tmp_path, monk
     policy.write_text("policy", encoding="utf-8")
     monkeypatch.setattr(worker, "frozen_policy", lambda: policy)
     monkeypatch.setattr(worker, "sandbox_command", sandbox_command)
+    monkeypatch.setattr(worker, "_wait_for_task_pane_input", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker, "verify_sandbox", lambda *args, **kwargs: True)
     monkeypatch.setattr(worker, "inner_pid", lambda *args, **kwargs: 123)
     monkeypatch.setattr(worker, "_setup_pane_ids", lambda: {"persistent-pane"})
 
+    task_agent = {"name": None}
     def fake_herdr_json(args, *, timeout_seconds=30.0):
         calls.append(list(args))
         if args[:2] == ["agent", "get"]:
-            return {
-                "result": {
-                    "agent": {
-                        "agent": "hermes",
-                        "name": "quantlab-hermes",
-                        "pane_id": "persistent-pane",
-                        "workspace_id": "w2",
+            target = args[2]
+            if target == "quantlab-hermes":
+                return {
+                    "result": {
+                        "agent": {
+                            "agent": "hermes",
+                            "name": "quantlab-hermes",
+                            "pane_id": "persistent-pane",
+                            "workspace_id": "w2",
+                        }
                     }
                 }
-            }
+            if target == "owned-task-pane" or target == task_agent["name"]:
+                return {"result": {"agent": {
+                    "agent": "hermes",
+                    "name": task_agent["name"] or "manual-hermes",
+                    "pane_id": "owned-task-pane",
+                    "workspace_id": "w2",
+                    "agent_status": "idle",
+                }}}
+            raise RuntimeError('{"error":{"code":"agent_not_found"}}')
+        if args[:2] == ["agent", "rename"]:
+            assert args[2] == "owned-task-pane"
+            task_agent["name"] = args[3]
+            return {"result": {"agent": {
+                "agent": "hermes", "name": args[3],
+                "pane_id": "owned-task-pane", "agent_status": "idle",
+            }}}
         if args[:2] == ["pane", "split"]:
             return {"result": {"pane": {"pane_id": "owned-task-pane"}}}
         if args[:2] == ["pane", "run"]:
-            return {"result": {}}
+            return None
         if args[:2] == ["pane", "process-info"]:
             return {"result": {"process_info": {"shell_pid": 123}}}
-        if args[:2] == ["agent", "start"]:
-            return {"result": {"agent": {"name": args[2]}}}
         raise AssertionError(args)
 
     monkeypatch.setattr(worker, "_herdr_json", fake_herdr_json)
@@ -462,13 +490,16 @@ def test_create_task_session_uses_fresh_owned_pane_and_named_chat(tmp_path, monk
     assert f"HERDR_DURABLE_AGENT={session['agent_name']}" in split
     path_env = next(value for value in split if value.startswith(f"PATH={worker.POLICY_BIN}:"))
     assert str(worker.AGENT_BIN) in path_env
-    start = next(call for call in calls if call[:2] == ["agent", "start"])
-    assert start[2] == session["agent_name"]
-    assert "--continue" in start
-    assert start[start.index("--continue") + 1] == session["session_name"]
-    assert "--create-if-missing" in start
-    assert "--in" in start
-    assert start[start.index("--in") + 1] == task["workspace"]
+    hermes_runs = [call for call in calls
+                   if call[:2] == ["pane", "run"] and len(call) >= 4
+                   and "/run/herdr/policy-code/agent-stack/policy-bin/hermes " in call[3]]
+    assert len(hermes_runs) == 1
+    command = hermes_runs[0][3]
+    assert f"--continue {session['session_name']}" in command
+    assert "--create-if-missing" in command
+    assert f"--in {task['workspace']}" in command
+    assert not any(call[:2] == ["agent", "start"] for call in calls)
+    assert ["agent", "rename", "owned-task-pane", session["agent_name"]] in calls
 
 
 def test_run_prompt_targets_task_session_never_persistent_coordinator(tmp_path, monkeypatch):
@@ -1002,6 +1033,7 @@ def test_create_task_session_rejects_wrong_started_agent(tmp_path, monkeypatch):
     monkeypatch.setattr(worker, "start_bridge", lambda task, session: None)
     monkeypatch.setattr(worker, "frozen_policy", lambda: _policy_file(tmp_path))
     monkeypatch.setattr(worker, "sandbox_command", lambda *args, **kwargs: ["bwrap", "/bin/bash"])
+    monkeypatch.setattr(worker, "_wait_for_task_pane_input", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker, "verify_sandbox", lambda *args, **kwargs: True)
     monkeypatch.setattr(worker, "inner_pid", lambda *args, **kwargs: 123)
 
@@ -1059,6 +1091,7 @@ def test_setup_failure_cleanup_proves_pane_identity(
     monkeypatch.setattr(worker, "start_bridge", lambda *args: None)
     monkeypatch.setattr(worker, "frozen_policy", lambda: _policy_file(tmp_path))
     monkeypatch.setattr(worker, "sandbox_command", lambda *args, **kw: ["bwrap"])
+    monkeypatch.setattr(worker, "_wait_for_task_pane_input", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker, "verify_sandbox", lambda *args, **kw: True)
     monkeypatch.setattr(worker, "inner_pid", lambda *args, **kw: 123)
     monkeypatch.setattr(worker, "_pane_has_marker",
@@ -1070,9 +1103,11 @@ def test_setup_failure_cleanup_proves_pane_identity(
             if args[2] == "quantlab-hermes":
                 return {"result": {"agent": {"agent": "hermes", "pane_id": "coordinator",
                                               "workspace_id": "w2"}}}
-            return {"result": {"agent": {"name": "other-agent" if case == "wrong_agent"
+            return {"result": {"agent": {"agent": "hermes",
+                                              "name": "other-agent" if case == "wrong_agent"
                                               else args[2], "pane_id": "other-pane" if
-                                              case == "wrong_pane" else "owned-pane"}}}
+                                              case == "wrong_pane" else "owned-pane",
+                                              "agent_status": "idle"}}}
         if args[:2] == ["pane", "split"]:
             return {"result": {"pane": {"pane_id": "owned-pane"}}}
         if args[:2] == ["pane", "list"]:
@@ -1081,11 +1116,11 @@ def test_setup_failure_cleanup_proves_pane_identity(
                        if case == "reused_pane" else []) if len(lists) == 1 else
                        ([] if case == "absent" else [{"pane_id": "owned-pane"}])}}
         if args[:2] == ["pane", "run"]:
-            return {"result": {}}
+            if after_start and len(args) >= 4 and "/run/herdr/policy-code/agent-stack/policy-bin/hermes " in args[3]:
+                raise RuntimeError("start failed")
+            return None
         if args[:2] == ["pane", "process-info"]:
             return {"result": {"process_info": {"shell_pid": 123}}}
-        if args[:2] == ["agent", "start"]:
-            raise RuntimeError("start failed")
         raise AssertionError(args)
     lists = []
     monkeypatch.setattr(worker, "_herdr_json", fake_herdr_json)
@@ -1116,6 +1151,271 @@ def test_task_session_agent_name_respects_herdr_limit_for_all_coordinators(tmp_p
 
     assert names[0] != names[1]
 
+def verification_task(tmp_path, kind="coding"):
+    configure_paths(tmp_path)
+    task = base_task()
+    task["completion_kind"] = kind
+    worker.prepare_attempt(task)
+    path = worker.RUNNING / f"{task['id']}.json"
+    path.write_text(json.dumps(task))
+    result = {"task_id": task["id"], "run_token": task["run_token"],
+              "status": "completed", "summary": "worker claim only",
+              "next_action": "continue", "repo": task["repo"], "blocker": None,
+              "evidence": [{"producer": "trusted-ci", "passed": True}]}
+    worker.write_json(worker.result_path(task["id"]), result)
+    return task, path, result
+
+
+def test_completed_coding_without_host_proof_is_not_done_or_retried(tmp_path):
+    task, path, result = verification_task(tmp_path)
+    identity = (task["run_token"], task["idempotency_key"], task["attempts"])
+    worker.finish(path, task, "claims completed")
+    saved = json.loads((worker.BLOCKED / path.name).read_text())
+    assert saved["attempt_state"] == "blocked"
+    assert saved["verification_resolution"] == "needs_replan"
+    assert saved["verification_status"] == "evidence_invalid"
+    assert (saved["run_token"], saved["idempotency_key"], saved["attempts"]) == identity
+    assert not list(worker.DONE.iterdir())
+    assert json.loads(worker.result_path(task["id"]).read_text()) == result
+
+
+def test_missing_and_unavailable_evidence_keep_one_attempt(tmp_path, monkeypatch):
+    from herdr.evidence import EvidenceMissing, EvidenceUnavailable
+    for failure in (EvidenceMissing("review pending"), EvidenceUnavailable("CI unavailable")):
+        task, path, result = verification_task(tmp_path)
+        monkeypatch.setattr(worker, "verify_completion",
+                            lambda *a: (_ for _ in ()).throw(failure))
+        worker.finish(path, task, "")
+        saved = json.loads((worker.BLOCKED / path.name).read_text())
+        assert saved["verification_status"] == failure.code
+        assert saved["attempts"] == 0
+        assert saved["run_token"] == task["run_token"]
+        (worker.BLOCKED / path.name).unlink()
+
+
+def test_verified_worker_result_does_not_claim_integration_or_deployment(tmp_path, monkeypatch):
+    task, path, result = verification_task(tmp_path)
+    monkeypatch.setattr(worker, "verify_completion", lambda *a:
+                        {"level": "verified_worker_result", "bundle_hash": "a" * 64,
+                         "integration": None, "deployment": None})
+    worker.finish(path, task, "")
+    saved = json.loads((worker.DONE / path.name).read_text())
+    assert saved["completion_level"] == "verified_worker_result"
+    assert saved["completion_bundle_hash"] == "a" * 64
+    assert "deployed" not in saved and "merged" not in saved
+    assert saved["attempts"] == 0
+
+
+def test_control_cycle_is_labelled_and_never_promoted_to_verified_implementation(tmp_path):
+    task, path, result = verification_task(tmp_path)
+    task["kind"] = "github_root_orchestration"
+    worker.freeze_plan(worker.ROOT, task)
+    worker.finish(path, task, "")
+    saved = json.loads((worker.DONE / path.name).read_text())
+    assert saved["completion_level"] == "control_cycle"
+    assert saved["verification_status"] == "accepted"
+    assert "artifact" not in saved
+    assert saved["attempts"] == 0
+
+
+def test_unconfigured_research_criteria_fail_closed_without_fictitious_build(tmp_path):
+    task, path, result = verification_task(tmp_path, "research")
+    worker.finish(path, task, "")
+    saved = json.loads((worker.BLOCKED / path.name).read_text())
+    assert saved["verification_status"] == "evidence_invalid"
+    assert "research" in saved["last_error"]
+    assert saved["attempts"] == 0
+
+
+def test_pending_verification_main_reuses_publication_without_dispatch(tmp_path, monkeypatch):
+    task, path, result = verification_task(tmp_path)
+    task["attempt_state"] = "verification_pending"
+    path.write_text(json.dumps(task))
+    monkeypatch.setattr(worker, "LOCK", tmp_path / "worker.lock")
+    calls = []
+    monkeypatch.setattr(worker, "finish", lambda *args: calls.append(args))
+    monkeypatch.setattr(worker, "prepare_attempt",
+                        lambda *a: (_ for _ in ()).throw(AssertionError("duplicate attempt")))
+    assert worker.main(path) == 0
+    assert len(calls) == 1
+    assert calls[0][1]["run_token"] == task["run_token"]
+    assert json.loads(worker.result_path(task["id"]).read_text()) == result
+
+
+def test_absent_blocker_spellings_cannot_bypass_completion_evidence(tmp_path):
+    for blocker in (None, "", "none", " null ", "NONE"):
+        task, path, result = verification_task(tmp_path)
+        result["blocker"] = blocker
+        worker.write_json(worker.result_path(task["id"]), result)
+        worker.finish(path, task, "")
+        saved = json.loads((worker.BLOCKED / path.name).read_text())
+        assert saved["attempt_state"] == "blocked"
+        assert saved["verification_resolution"] == "needs_replan"
+        assert saved["verification_status"] == "evidence_invalid"
+        assert not list(worker.DONE.iterdir())
+        assert json.loads(worker.result_path(task["id"]).read_text()) == result
+        (worker.BLOCKED / path.name).unlink()
+
+def test_control_cycle_without_predispatch_plan_stays_unverified(tmp_path):
+    task, path, result = verification_task(tmp_path)
+    task["kind"] = "github_root_orchestration"
+    worker.finish(path, task, "")
+    saved = json.loads((worker.BLOCKED / path.name).read_text())
+    assert saved["verification_status"] == "evidence_invalid"
+    assert not list(worker.DONE.iterdir())
+
+
+def test_control_evidence_is_retained_and_restart_reuses_immutable_bundle(tmp_path):
+    task, path, result = verification_task(tmp_path)
+    task["kind"] = "github_root_orchestration"
+    worker.freeze_plan(worker.ROOT, task)
+    from agent_completion_evidence import verify_completion
+    first = verify_completion(worker.ROOT, task, result)
+    second = verify_completion(worker.ROOT, task, result)
+    assert first == second and first["level"] == "control_cycle"
+    assert len(list((worker.ROOT / "verification").glob("accepted-*"))) == 1
+    assert first["integration"] is None and first["deployment"] is None
+    task["prompt"] = "changed specification"
+    from herdr.evidence import EvidenceError
+    import pytest
+    with pytest.raises(EvidenceError, match="specification"):
+        verify_completion(worker.ROOT, task, result)
+
+def test_worker_prompt_exposes_frozen_criteria_and_limited_completion_level(tmp_path):
+    task, path, result = verification_task(tmp_path)
+    task["kind"] = "github_root_orchestration"
+    worker.freeze_plan(worker.ROOT, task)
+    prompt = worker.prompt_text(task)
+    assert "HOST COMPLETION VERIFICATION" in prompt
+    assert "does not satisfy an implementation" in prompt
+    assert task["completion_plan"]["kind"] == "control"
+    assert len(task["completion_plan"]["plan_hash"]) == 64
+
+
+def test_permanently_invalid_evidence_requires_replan_without_endless_reconciliation(tmp_path, monkeypatch):
+    from herdr.evidence import EvidenceError
+    task, path, result = verification_task(tmp_path)
+    monkeypatch.setattr(worker, "verify_completion",
+                        lambda *a: (_ for _ in ()).throw(EvidenceError("pinned workflow changed")))
+    worker.finish(path, task, "")
+    blocked = worker.BLOCKED / path.name
+    saved = json.loads(blocked.read_text())
+    assert saved["attempt_state"] == "blocked"
+    assert saved["verification_resolution"] == "needs_replan"
+    assert "Replan" in saved["verification_next_action"]
+    assert "not_before" not in saved
+    assert saved["run_token"] == task["run_token"]
+    monkeypatch.setattr(worker, "LOCK", tmp_path / "worker.lock")
+    monkeypatch.setattr(worker, "prepare_attempt",
+                        lambda *a: (_ for _ in ()).throw(AssertionError("economic redispatch")))
+    assert worker.main(blocked) == 0
+    assert json.loads(worker.result_path(task["id"]).read_text()) == result
+
+
+def test_control_cycle_cannot_publish_conflicting_outcomes_for_one_attempt(tmp_path):
+    from agent_completion_evidence import verify_completion
+    from herdr.evidence import EvidenceError
+    import pytest
+    task, path, result = verification_task(tmp_path)
+    task["kind"] = "github_root_orchestration"
+    worker.freeze_plan(worker.ROOT, task)
+    first = verify_completion(worker.ROOT, task, result)
+    result["summary"] = "contradictory second result"
+    with pytest.raises(EvidenceError, match="immutable"):
+        verify_completion(worker.ROOT, task, result)
+    assert len(list((worker.ROOT / "verification").glob("accepted-*"))) == 1
+
+
+def test_control_upgrade_preserves_legacy_outcome_and_rejects_rewrite(tmp_path):
+    from agent_completion_evidence import verify_completion
+    from herdr.evidence import EvidenceStore, binding, digest, EvidenceError
+    import pytest
+    task, path, result = verification_task(tmp_path)
+    task["kind"] = "github_root_orchestration"
+    worker.freeze_plan(worker.ROOT, task)
+    first = verify_completion(worker.ROOT, task, result)
+    store = EvidenceStore(worker.ROOT / "verification")
+    plan_hash = first["plan_hash"]
+    payload = {k: v for k, v in first.items() if k != "bundle_hash"}
+    old_key = digest({"identity": binding(task), "plan_hash": plan_hash, "result_hash": digest(result)})
+    new_key = digest({"identity": binding(task), "plan_hash": plan_hash})
+    store.publish("accepted", old_key, payload)
+    store._path("accepted", new_key).unlink()
+    assert verify_completion(worker.ROOT, task, result) == first
+    result["summary"] = "rewritten after upgrade"
+    with pytest.raises(EvidenceError, match="conflict"):
+        verify_completion(worker.ROOT, task, result)
+    assert store.read("accepted", old_key) == payload
+
+
+def test_incomplete_control_publication_is_replan_not_missing_late_evidence(tmp_path):
+    for field in ("summary", "next_action"):
+        task, path, result = verification_task(tmp_path)
+        task["kind"] = "github_root_orchestration"
+        worker.freeze_plan(worker.ROOT, task)
+        result.pop(field)
+        worker.write_json(worker.result_path(task["id"]), result)
+        worker.finish(path, task, "")
+        saved = json.loads((worker.BLOCKED / path.name).read_text())
+        assert saved["verification_status"] == "evidence_invalid"
+        assert saved["verification_resolution"] == "needs_replan"
+        assert saved["attempts"] == 0
+        (worker.BLOCKED / path.name).unlink()
+
+
+def test_predispatch_outage_retries_same_unexecuted_attempt(tmp_path, monkeypatch):
+    from herdr.evidence import EvidenceUnavailable
+    configure_paths(tmp_path)
+    monkeypatch.setattr(worker, "LOCK", tmp_path / "worker.lock")
+    task = base_task()
+    path = worker.RUNNING / "task-1.json"
+    worker.write_json(path, task)
+    calls = []
+    def unavailable(root, task):
+        calls.append((task["run_token"], task["idempotency_key"], task["attempt_id"]))
+        raise EvidenceUnavailable("baseline service offline")
+    monkeypatch.setattr(worker, "freeze_plan", unavailable)
+    monkeypatch.setattr(worker, "create_task_session",
+                        lambda *a: (_ for _ in ()).throw(AssertionError("economic dispatch")))
+    assert worker.main(path) == 0
+    pending = worker.PENDING / path.name
+    first = json.loads(pending.read_text())
+    assert first["completion_plan_pending"] and first["attempts"] == 0
+    assert first["attempt_state"] == "retry_scheduled"
+    assert not worker.result_path("task-1").exists()
+    assert worker.main(pending) == 0
+    second = json.loads(pending.read_text())
+    assert first["run_token"] == second["run_token"]
+    assert calls[0] == calls[1]
+    assert not list(worker.BLOCKED.iterdir())
+
+
+def test_worker_cleanup_failure_retains_completed_publication_for_recovery(tmp_path, monkeypatch):
+    task, path, result = verification_task(tmp_path)
+    task["execution_session"] = {"owned_pane": True, "pane_id": "pane"}
+    monkeypatch.setattr(worker, "verify_completion", lambda *a:
+                        {"level": "verified_worker_result", "bundle_hash": "a" * 64})
+    monkeypatch.setattr(worker, "cleanup_task_session", lambda *a: False)
+    worker.finish(path, task, "")
+    assert worker.cleanup_task_session_if_safe(task) is False
+    blocked = worker.BLOCKED / path.name
+    saved = json.loads(blocked.read_text())
+    assert saved["watchdog_blocker"] == "task_session_cleanup_failed"
+    assert saved["verification_status"] == "accepted"
+    assert json.loads(worker.result_path(task["id"]).read_text()) == result
+    assert not list(worker.RESULTS.glob("*.previous-*.json"))
+
+
+def test_other_consumer_completion_remains_explicitly_unverified(tmp_path):
+    task, path, result = verification_task(tmp_path)
+    task["repo"] = "Bbambaaamm/Autonomous-Quant-Lab"
+    worker.finish(path, task, "")
+    saved = json.loads((worker.DONE / path.name).read_text())
+    assert saved["completion_level"] == "legacy_unverified_result"
+    assert saved["completion_bundle_hash"] is None
+    assert saved["verification_status"] == "legacy_unverified"
+
+
 
 @pytest.mark.parametrize("phase", ["bridge", "sandbox", "agent"])
 def test_canonical_queue_owns_session_before_worker_crash(tmp_path, monkeypatch, phase):
@@ -1132,6 +1432,7 @@ def test_canonical_queue_owns_session_before_worker_crash(tmp_path, monkeypatch,
     policy = _policy_file(tmp_path)
     monkeypatch.setattr(worker, "frozen_policy", lambda: policy)
     monkeypatch.setattr(worker, "sandbox_command", lambda *a, **k: ["bwrap", "/bin/bash"])
+    monkeypatch.setattr(worker, "_wait_for_task_pane_input", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker, "verify_sandbox", lambda *a, **k: True)
     monkeypatch.setattr(worker, "inner_pid", lambda *a, **k: 123)
     monkeypatch.setattr(worker, "_setup_pane_ids", lambda: {"coordinator"})
@@ -1153,12 +1454,10 @@ def test_canonical_queue_owns_session_before_worker_crash(tmp_path, monkeypatch,
         if args[:2] == ["pane", "split"]:
             return {"result": {"pane": {"pane_id": "owned"}}}
         if args[:2] == ["pane", "run"]:
-            crash_if("sandbox")
-            return {"result": {}}
+            crash_if("agent" if len(args) >= 4 and "/run/herdr/policy-code/agent-stack/policy-bin/hermes " in args[3] else "sandbox")
+            return None
         if args[:2] == ["pane", "process-info"]:
             return {"result": {"process_info": {}}}
-        if args[:2] == ["agent", "start"]:
-            crash_if("agent")
         raise AssertionError(args)
     monkeypatch.setattr(worker, "start_bridge", bridge)
     monkeypatch.setattr(worker, "_herdr_json", herdr)
@@ -1232,6 +1531,13 @@ def explicit_host_policy_for_worker_lifecycle_tests(monkeypatch):
     monkeypatch.setattr(worker, "HOST_POLICY_LAUNCH_FACTORY", FakeHostPolicyLaunchFactory())
     monkeypatch.setattr(worker, "HOST_POLICY_LAUNCHES", {})
     monkeypatch.setattr(worker, "_preflight_root_provider", lambda profile: None)
+    # Lifecycle tests use an explicit native transport double. The guarded
+    # sandbox launch itself has separate namespace/TTY and native integration tests.
+    def transport(invoke, pane, marker, pid, name, args, **kwargs):
+        invoke(["pane", "run", pane, __import__("shlex").join(
+            ["/run/herdr/policy-code/agent-stack/policy-bin/hermes", *args])], timeout_seconds=15.0)
+        return {"result": {"agent": worker._wait_for_task_agent(pane, name)}}
+    monkeypatch.setattr(worker, "start_sandbox_agent", transport)
     original = worker.create_task_session
     def create(task, **kwargs):
         task.setdefault("fencing_token", 1)
@@ -1267,6 +1573,46 @@ def test_root_host_provider_preflight_precedes_pane_creation_and_failure_cleans_
     assert launch.events==[("closed",)]
     assert worker.HOST_POLICY_LAUNCHES=={}
     assert len(events)==1
+
+
+def test_private_root_missing_mount_approval_denies_before_pane_bridge_or_provider(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from tests.policy_launch_fakes import FakeHostPolicyLaunchFactory
+    from herdr.private_mount_plan import ApprovedPrivateMountPlan
+    from herdr.security import SecurityError
+    configure_paths(tmp_path);task=base_task();worker.prepare_attempt(task)
+    task["workspace"]=str(tmp_path)
+    calls=[];factory=FakeHostPolicyLaunchFactory()
+    original=factory.prepare
+    def prepare(**kwargs):
+        launch=original(**kwargs)
+        launch.private_profile_snapshot=SimpleNamespace(name=worker._task_hermes_profile(task))
+        from tests.herdr.test_security import grant as fixture_grant
+        launch.grant=fixture_grant(Path(task["workspace"]))
+        launch.mount=SimpleNamespace(private_mount_plan=None,private_mount_request=None)
+        launch.sealed=None
+        return launch
+    monkeypatch.setattr(factory,"prepare",prepare)
+    def native(args,**kwargs):
+        calls.append(args)
+        assert args[:2]==["agent","get"]
+        return {"result":{"agent":{"agent":"hermes","pane_id":"coordinator","workspace_id":"workspace"}}}
+    monkeypatch.setattr(worker,"_herdr_json",native)
+    monkeypatch.setattr(worker,"_preflight_root_provider",lambda *args:pytest.fail("private profile cannot refresh mutable credentials"))
+    monkeypatch.setattr(worker,"start_bridge",lambda *args:pytest.fail("approval must precede bridge"))
+    monkeypatch.setattr(worker,"frozen_policy",lambda:_policy_file(tmp_path))
+    def command(*args,**kwargs):
+        kwargs["policy_mount"].private_mount_request={"fixture":"exact-command"}
+        raise RuntimeError("durable_private_mount_plan_unapproved")
+    monkeypatch.setattr(worker,"sandbox_command",command)
+    def deny(cls,path,identity):raise SecurityError("root mount approval missing")
+    monkeypatch.setattr(ApprovedPrivateMountPlan,"read",classmethod(deny))
+    with pytest.raises(SecurityError,match="root mount approval missing"):
+        worker.create_task_session(task,policy_launch_factory=factory)
+    assert len(calls)==1 and not task["execution_session"]["pane_split_started"]
+    launch=factory.created[0]
+    assert launch.events[-1]==("closed",) and not worker.HOST_POLICY_LAUNCHES
+    assert not (tmp_path/"policy").exists()
 
 
 @pytest.mark.parametrize("reason",["workspace outside host policy","requested tools/permissions exceed host ceiling"])
@@ -1420,8 +1766,9 @@ def test_actual_root_setup_failure_passes_task_to_absent_agent_cleanup(tmp_path,
         if args[:2]==["pane","list"]:return {"result":{"panes":[{"pane_id":"coordinator"}]}}
         if args[:2]==["pane","split"]:return {"result":{"pane":{"pane_id":"owned"}}}
         if args[:2]==["pane","process-info"]:return {"result":{"process_info":{"shell_pid":123}}}
-        if args[:2]==["pane","run"]:return {"result":{}}
-        if args[:2]==["agent","start"]:raise RuntimeError("native start absent")
+        if args[:2]==["pane","run"]:
+            if len(args)>=4 and "/run/herdr/policy-code/agent-stack/policy-bin/hermes " in args[3]:raise RuntimeError("native start absent")
+            return None
         raise AssertionError(args)
     monkeypatch.setattr(worker,"_herdr_json",native)
     monkeypatch.setattr(worker,"start_bridge",lambda *args:None)
@@ -1429,6 +1776,7 @@ def test_actual_root_setup_failure_passes_task_to_absent_agent_cleanup(tmp_path,
     monkeypatch.setattr(worker,"frozen_policy",lambda:_policy_file(tmp_path))
     monkeypatch.setattr(worker,"sandbox_command",lambda *args,**kw:["/bin/true"])
     monkeypatch.setattr(worker,"inner_pid",lambda *args:123)
+    monkeypatch.setattr(worker, "_wait_for_task_pane_input", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker,"verify_sandbox",lambda *args,**kw:True)
     cleaned=[]
     def clean(*args,**kw):
@@ -1449,3 +1797,512 @@ def test_quantlab_completion_prompt_matches_closed_result_tool(tmp_path):
     assert "Supply only status, evidence and summary" in rendered
     assert "Include keys:" not in rendered
     assert "herdr_submit_result" in rendered
+
+def test_modern_work_contract_missing_host_authority_blocks_before_pane_creation(tmp_path,monkeypatch):
+    configure_paths(tmp_path)
+    task=base_task()
+    task.update(work_contract_version=1,run_token="modern-run",workspace=str(tmp_path/"workspace"))
+    monkeypatch.setattr(worker,"HOST_WORK_CONTRACT_FACTORY",None)
+    monkeypatch.setattr(worker,"_herdr_json",lambda *a,**kw:pytest.fail("no pane or agent may be created"))
+    with pytest.raises(RuntimeError,match="authority_missing"):
+        worker.create_task_session(task)
+    assert "execution_session" not in task
+
+@pytest.mark.parametrize("version",[True,"1",2,0])
+def test_unsupported_modern_contract_is_not_treated_as_legacy(tmp_path,monkeypatch,version):
+    configure_paths(tmp_path)
+    task=base_task()
+    task.update(work_contract_version=version,run_token="modern-run",execution_session={"agent_name":"worker"})
+    original_run=worker.subprocess.run
+    def no_dispatch(argv,*args,**kwargs):
+        if argv and str(argv[0])==str(worker.HERDR):
+            pytest.fail("must not dispatch")
+        return original_run(argv,*args,**kwargs)
+    monkeypatch.setattr(worker.subprocess,"run",no_dispatch)
+    with pytest.raises(RuntimeError,match="version_unsupported"):
+        worker.run_prompt(task)
+
+def test_modern_prompt_missing_or_finished_cycle_cannot_restart_implementation(tmp_path,monkeypatch):
+    from dataclasses import replace
+    from herdr.work_cycle import WorkCycle,WorkPhase
+    from tests.herdr.test_work_cycle import setup,trusted_git
+    configure_paths(tmp_path)
+    task=base_task()
+    task.update(work_contract_version=1,run_token="modern-run",execution_session={"agent_name":"worker"})
+    monkeypatch.setattr(worker,"HOST_WORK_CYCLES",{})
+    original_run=worker.subprocess.run
+    def no_dispatch(argv,*args,**kwargs):
+        if argv and str(argv[0])==str(worker.HERDR):
+            pytest.fail("must not dispatch")
+        return original_run(argv,*args,**kwargs)
+    monkeypatch.setattr(worker.subprocess,"run",no_dispatch)
+    with pytest.raises(RuntimeError,match="forbids_implementation"):
+        worker.run_prompt(task)
+    cycle,root,plan,log=setup(tmp_path/"contract")
+    cycle.phase=WorkPhase.HYGIENE
+    worker.HOST_WORK_CYCLES[(task["id"],task["run_token"])]=cycle
+    task["work_contract"]={"plan_sha256":plan.hash}
+    with pytest.raises(RuntimeError,match="forbids_implementation"):
+        worker.run_prompt(task)
+
+def test_legacy_completion_spec_digest_keeps_original_meaning():
+    import agent_completion_evidence as completion
+    from herdr.evidence import digest
+    task=base_task()
+    keys=("repo","issue","kind","prompt","completion_kind","spec_hash","completion_contract","completion_evidence","child_completion_contracts")
+    assert completion.spec_digest(task)==digest({key:task.get(key) for key in keys})
+    task["work_contract_version"]=1
+    assert completion.spec_digest(task)!=digest({key:task.get(key) for key in keys})
+
+def test_modern_root_missing_hygiene_profile_blocks_before_split(tmp_path,monkeypatch):
+    from tests.policy_launch_fakes import FakeHostPolicyLaunchFactory
+    from herdr.work_contract_host import HostWorkContractFactory
+    from herdr.evidence import digest,binding
+    from agent_completion_evidence import store_for
+    configure_paths(tmp_path);task=base_task();worker.prepare_attempt(task)
+    workspace=tmp_path/"worker";workspace.mkdir()
+    task.update(work_contract_version=1,workspace=str(workspace),fencing_token=19)
+    work=object.__new__(HostWorkContractFactory);work.local_commit_policy=None
+    monkeypatch.setattr(worker,"_root_work_factory",lambda current:work)
+    calls=[]
+    def native(args,**kw):
+        calls.append(args)
+        assert args[:2]==["agent","get"],"invalid profile cannot reach split or result allocation"
+        return {"result":{"agent":{"kind":"hermes","pane_id":"coordinator","workspace_id":"workspace"}}}
+    monkeypatch.setattr(worker,"_herdr_json",native)
+    store_for(tmp_path,task).publish("plan",digest(binding(task)),{"kind":"coding"})
+    from herdr.work_cycle import WorkContractError
+    with pytest.raises(WorkContractError,match="local commit profile"):
+        worker.create_task_session(task,policy_launch_factory=FakeHostPolicyLaunchFactory())
+    session=task["execution_session"]
+    assert not session["pane_split_started"] and not session["agent_start_attempted"]
+    assert len(calls)==1 and not worker.result_path(task["id"]).exists()
+
+def former_consumer_scope():
+    task=base_task()
+    task["safety_profile"]="herdr-core"
+    worker.ensure_parent_scope(task)
+    task["parent_tools"].remove("herdr_verify_work")
+    return task
+
+def test_persisted_former_consumer_scope_refreshes_only_the_new_root_request():
+    task=former_consumer_scope()
+    task.update(run_token="fresh",idempotency_key="original",fencing_token=9,
+        attempt_state="dispatching")
+    before={key:task[key] for key in ("run_token","idempotency_key","fencing_token")}
+    worker.ensure_parent_scope(task)
+    assert "herdr_verify_work" in task["parent_tools"]
+    assert {key:task[key] for key in before}==before
+
+@pytest.mark.parametrize("admitted", [
+    {"attempt_state":"delivery_uncertain"},
+    {"attempt_state":"blocked"},
+    {"parent_task_id":"parent"},
+    {"execution_session":{"owned_pane":True}},
+    {"execution_session":{"closed_at":"closed","invocation_policy":{"identity":{}}}},
+    {"work_contract":{"identity":{"run_token":"current"}}},
+])
+def test_former_scope_cannot_upgrade_an_existing_attempt_or_child(admitted):
+    task=former_consumer_scope()
+    task.update(run_token="current",**admitted)
+    before=list(task["parent_tools"])
+    with pytest.raises(RuntimeError,match="parent_scope_refresh_requires_new_admission"):
+        worker.ensure_parent_scope(task)
+    assert task["parent_tools"]==before
+
+def test_intentionally_narrowed_parent_request_is_preserved():
+    task=former_consumer_scope()
+    task["parent_tools"]=["read_file","herdr_submit_result"]
+    worker.ensure_parent_scope(task)
+    assert task["parent_tools"]==["read_file","herdr_submit_result"]
+
+@pytest.mark.parametrize("command", [["pane", "get", "owned"], ["agent", "get", "owned"]])
+def test_native_json_commands_still_require_json(monkeypatch, command):
+    monkeypatch.setattr(worker.subprocess, "run",
+        lambda args, **kwargs: worker.subprocess.CompletedProcess(args, 0, stdout="", stderr=""))
+    with pytest.raises(RuntimeError, match="no JSON response"):
+        worker._herdr_json(command)
+
+
+def test_native_pane_run_accepts_void_success_without_sandbox_claim(monkeypatch):
+    calls = []
+    def native(args, **kwargs):
+        calls.append(args)
+        return worker.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+    monkeypatch.setattr(worker.subprocess, "run", native)
+    assert worker._herdr_json(["pane", "run", "owned", "true"]) is None
+    assert calls == [[str(worker.HERDR), "pane", "run", "owned", "true"]]
+
+
+@pytest.mark.parametrize("code,stdout,stderr", [
+    (1, "", '{"error":{"code":"pane_not_found"}}'),
+    (0, "unexpected text", ""),
+    (0, "", "unexpected warning"),
+])
+def test_native_pane_run_rejects_failure_and_unexpected_output(monkeypatch, code, stdout, stderr):
+    monkeypatch.setattr(worker.subprocess, "run",
+        lambda args, **kwargs: worker.subprocess.CompletedProcess(args, code, stdout=stdout, stderr=stderr))
+    with pytest.raises(RuntimeError):
+        worker._herdr_json(["pane", "run", "owned", "true"])
+
+
+def test_task_sandbox_waits_for_native_process_and_full_mount_verification(tmp_path, monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(worker.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    candidates = iter([None, 733, 733])
+    checks = iter([False, True])
+    calls, verified = [], []
+    policy = _policy_file(tmp_path)
+    mount = object()
+
+    def process_info(args, *, timeout_seconds):
+        calls.append((args, timeout_seconds))
+        return {"result": {"process_info": {"shell_pid": 700}}}
+
+    def verify(pid, binary, marker, **kwargs):
+        verified.append((pid, binary, marker, kwargs))
+        return next(checks)
+
+    monkeypatch.setattr(worker, "_herdr_json", process_info)
+    monkeypatch.setattr(worker, "inner_pid", lambda info, marker: next(candidates))
+    monkeypatch.setattr(worker, "_wait_for_task_pane_input", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker, "verify_sandbox", verify)
+    assert worker._wait_for_task_sandbox("owned-pane", "owned-marker",
+        policy=policy, policy_mount=mount) == 733
+    assert len(calls) == 3
+    assert all(args == ["pane", "process-info", "--pane", "owned-pane"]
+               and 0 < timeout <= 10 for args, timeout in calls)
+    assert verified == [(733, worker.HERDR, "owned-marker",
+        {"policy": policy, "policy_mount": mount, "attempts": 1})] * 2
+
+
+def test_task_sandbox_wait_deadline_never_accepts_unverified_candidate(tmp_path, monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(worker.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    calls = []
+    monkeypatch.setattr(worker, "_herdr_json", lambda args, **kwargs:
+        calls.append(args) or {"result": {"process_info": {"shell_pid": 700}}})
+    monkeypatch.setattr(worker, "inner_pid", lambda info, marker: 733)
+    monkeypatch.setattr(worker, "_wait_for_task_pane_input", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker, "verify_sandbox", lambda *args, **kwargs: False)
+    with pytest.raises(RuntimeError, match="^durable_sandbox_unverified$"):
+        worker._wait_for_task_sandbox("owned-pane", "owned-marker",
+            policy=_policy_file(tmp_path), policy_mount=object(), timeout_seconds=0.2)
+    assert clock[0] == pytest.approx(0.2)
+    assert 1 <= len(calls) <= 5
+    assert all(args == ["pane", "process-info", "--pane", "owned-pane"] for args in calls)
+
+
+def test_task_sandbox_wait_propagates_native_error_without_resubmitting(monkeypatch, tmp_path):
+    calls = []
+    def missing(args, **kwargs):
+        calls.append(args)
+        raise RuntimeError("pane_not_found")
+    monkeypatch.setattr(worker, "_herdr_json", missing)
+    monkeypatch.setattr(worker, "_wait_for_task_pane_input", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker, "verify_sandbox", lambda *args, **kwargs:
+        pytest.fail("native error must prevent sandbox acceptance"))
+    with pytest.raises(RuntimeError, match="^pane_not_found$"):
+        worker._wait_for_task_sandbox("owned-pane", "owned-marker",
+            policy=_policy_file(tmp_path), policy_mount=object())
+    assert calls == [["pane", "process-info", "--pane", "owned-pane"]]
+
+
+@pytest.mark.parametrize("canonical,correct_marker,foreground_hook,expected", [
+    (True, True, False, False), (False, True, False, True),
+    (False, False, False, False), (False, True, True, False)])
+def test_native_pane_input_requires_owned_foreground_terminal(canonical, correct_marker, foreground_hook, expected):
+    import os
+    import subprocess
+    import termios
+    import agent_durable_sandbox as sandbox
+    master, slave = os.openpty()
+    process = None
+    code = """
+import fcntl,os,signal,subprocess,sys,termios,time
+fcntl.ioctl(0,termios.TIOCSCTTY,0)
+os.tcsetpgrp(0,os.getpid())
+hook=None
+def stopped(*args):raise SystemExit(0)
+signal.signal(signal.SIGTERM,stopped)
+try:
+    if sys.argv[1]=="hook":
+        hook=subprocess.Popen(["/usr/bin/python3","-I","-B","-c","import time;time.sleep(10)"],
+                              preexec_fn=lambda:os.setpgid(0,0))
+        os.tcsetpgrp(0,hook.pid)
+    print("ready",flush=True)
+    time.sleep(10)
+finally:
+    if hook is not None:
+        hook.terminate()
+        hook.wait(timeout=5)
+"""
+    try:
+        attributes = termios.tcgetattr(slave)
+        attributes[3] = (attributes[3] | termios.ICANON) if canonical else (attributes[3] & ~termios.ICANON)
+        termios.tcsetattr(slave, termios.TCSANOW, attributes)
+        process = subprocess.Popen(["/usr/bin/python3", "-I", "-B", "-c", code,
+            "hook" if foreground_hook else "shell"], stdin=slave, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True,
+            env={"HERDR_DURABLE_TASK_PANE": "owned-marker" if correct_marker else "foreign-marker"},
+            start_new_session=True)
+        assert process.stdout.readline().strip() == "ready"
+        assert sandbox.pane_input_ready({"shell_pid": process.pid}, "owned-marker") is expected
+    finally:
+        if process is not None:
+            process.terminate()
+            process.wait(timeout=5)
+        os.close(master)
+        os.close(slave)
+
+
+def test_task_pane_input_waits_without_sending_launch(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(worker.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    ready = iter([False, True])
+    calls = []
+    monkeypatch.setattr(worker, "_herdr_json", lambda args, **kwargs:
+        calls.append(args) or {"result": {"process_info": {"shell_pid": 733}}})
+    monkeypatch.setattr(worker, "pane_input_ready", lambda info, marker: next(ready))
+    prompt_checks = []
+    monkeypatch.setattr(worker, "verify_pane_prompt", lambda invoke, pane, marker, **kw:
+                        prompt_checks.append((pane, marker)))
+    worker._wait_for_task_pane_input("owned-pane", "owned-marker")
+    assert prompt_checks == [("owned-pane", "owned-marker")]
+    assert calls == [["pane", "process-info", "--pane", "owned-pane"]] * 2
+
+
+def test_task_pane_input_deadline_stops_without_sending_launch(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(worker.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    calls = []
+    monkeypatch.setattr(worker, "_herdr_json", lambda args, **kwargs:
+        calls.append(args) or {"result": {"process_info": {"shell_pid": 733}}})
+    monkeypatch.setattr(worker, "pane_input_ready", lambda info, marker: False)
+    with pytest.raises(RuntimeError, match="^durable_pane_input_unready$"):
+        worker._wait_for_task_pane_input("owned-pane", "owned-marker", timeout_seconds=0.1)
+    assert clock[0] == pytest.approx(0.1)
+    assert len(calls) <= 3
+    assert all(args == ["pane", "process-info", "--pane", "owned-pane"] for args in calls)
+
+
+@pytest.mark.parametrize("case", ["executed", "echo-only", "foreign-pane", "missing-line", "shell-replaced", "startup-reader"])
+def test_prompt_proof_requires_executed_nonce_and_same_owned_shell(monkeypatch, case):
+    import agent_durable_sandbox as sandbox
+    clock = [0.0]
+    monkeypatch.setattr(sandbox.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(sandbox.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr(sandbox, "_pane_shell_instance",
+                        lambda info, marker: (733, info["start"]))
+    calls = []
+    challenge = []
+    def invoke(args, **kwargs):
+        calls.append(args)
+        if args[:2] == ["pane", "process-info"]:
+            return {"result": {"process_info": {"start": 2 if case == "shell-replaced" and challenge else 1}}}
+        if args[:2] == ["pane", "run"]:
+            challenge.append(args[3])
+            return None
+        assert args[:2] == ["pane", "wait-output"]
+        nonce = args[args.index("--regex") + 1][1:-1]
+        assert nonce not in challenge[0] and len(challenge[0].encode()) < 4096
+        if case == "startup-reader":
+            raise RuntimeError("output_wait_timeout")
+        text = challenge[0] if case == "echo-only" else nonce
+        return {"result": {"type": "output_matched", "pane_id": "foreign" if case == "foreign-pane" else "owned",
+                "revision": 3, "matched_line": None if case == "missing-line" else nonce,
+                "read": {"pane_id": "owned", "text": text}}}
+    if case == "executed":
+        sandbox.verify_pane_prompt(invoke, "owned", "marker", timeout_seconds=0.1)
+    else:
+        with pytest.raises(RuntimeError):
+            sandbox.verify_pane_prompt(invoke, "owned", "marker", timeout_seconds=0.1)
+    assert len(challenge) == 1
+    assert all(args[3].startswith("builtin printf ") for args in calls if args[:2] == ["pane", "run"])
+
+
+def test_root_revalidates_handoff_after_readiness_before_native_run(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from tests.policy_launch_fakes import FakeHostPolicyLaunchFactory
+    from herdr.security import SecurityError
+    configure_paths(tmp_path); task=base_task(); worker.prepare_attempt(task)
+    task["workspace"]=str(tmp_path)
+    factory=FakeHostPolicyLaunchFactory(); original=factory.prepare
+    phase=["before-ready"]; commands=[]; builds=[]
+    def denied(launch):
+        assert phase[0]=="ready" and len(builds)==2
+        raise SecurityError("handoff expired during pane readiness")
+    def prepare(**kwargs):
+        launch=original(**kwargs)
+        launch.private_profile_snapshot=SimpleNamespace(name=worker._task_hermes_profile(task))
+        from tests.herdr.test_security import grant as fixture_grant
+        launch.grant=fixture_grant(Path(task["workspace"]))
+        launch.private_plan_handoff=SimpleNamespace(verify_bound=denied)
+        launch.prepare_private_command=lambda builder:builder()
+        return launch
+    monkeypatch.setattr(factory,"prepare",prepare)
+    def native(args,**kwargs):
+        commands.append(args)
+        if args[:2]==["agent","get"]:
+            return {"result":{"agent":{"kind":"hermes","pane_id":"coordinator","workspace_id":"workspace"}}}
+        if args[:2]==["pane","list"]:return {"result":{"panes":[{"pane_id":"coordinator"}]}}
+        if args[:2]==["pane","split"]:return {"result":{"pane":{"pane_id":"owned"}}}
+        if args[:2]==["pane","process-info"]:return {"result":{"process_info":{"shell_pid":123}}}
+        if args[:2]==["pane","run"]:pytest.fail("expired handoff reached native pane run")
+        raise AssertionError(args)
+    monkeypatch.setattr(worker,"_herdr_json",native)
+    monkeypatch.setattr(worker,"start_bridge",lambda *args:None)
+    monkeypatch.setattr(worker,"stop_bridge",lambda *args:None)
+    monkeypatch.setattr(worker,"_preflight_root_provider",lambda *args:pytest.fail("private credentials cannot refresh"))
+    monkeypatch.setattr(worker,"frozen_policy",lambda:_policy_file(tmp_path))
+    def build(*args, **kwargs):
+        assert kwargs["root_workspace_writable"] is False
+        builds.append("command")
+        return ["/bin/true"]
+    monkeypatch.setattr(worker,"sandbox_command",build)
+    monkeypatch.setattr(worker,"_wait_for_task_pane_input",lambda *args,**kwargs:phase.__setitem__(0,"ready"))
+    monkeypatch.setattr(worker,"_cleanup_setup_pane",lambda *args,**kwargs:True)
+    with pytest.raises(SecurityError,match="handoff expired during pane readiness"):
+        worker.create_task_session(task,policy_launch_factory=factory)
+    assert not any(args[:2]==["pane","run"] for args in commands)
+    assert factory.created[0].events[-1]==("closed",)
+
+
+@pytest.mark.parametrize("tool,root_kind,scoped,expected", [
+    ("read_file", "workspace", True, False),
+    ("write_file", "workspace", True, True),
+    ("patch", "workspace", True, True),
+    ("patch", "parent", True, None),
+    ("write_file", "nested", True, False),
+    ("write_file", "sibling", True, None),
+    ("write_file", "workspace", False, None),
+])
+def test_private_root_workspace_mount_uses_effective_grant(tmp_path, tool, root_kind, scoped, expected):
+    from dataclasses import replace
+    from tests.herdr.test_security import grant
+    from herdr.security import ToolRule, RiskClass
+    workspace = tmp_path / "workspace"
+    roots = {"workspace": workspace, "parent": tmp_path,
+             "nested": workspace / "nested", "sibling": tmp_path / "workspace-other"}
+    planned = grant(workspace)
+    rule = ToolRule(tool, RiskClass.READ if tool == "read_file" else RiskClass.WORKSPACE_WRITE,
+                    ("path",), path_fields=("path",), allowed_roots=(str(roots[root_kind]),))
+    if expected is None:
+        from herdr.security import SecurityError
+        with pytest.raises(SecurityError):
+            replace(planned, tool_rules=(rule,),
+                    scope=replace(planned.scope, tools=(tool,) if scoped else ("read_file",)))
+        return
+    planned = replace(planned, tool_rules=(rule,),
+                      scope=replace(planned.scope, tools=(tool,) if scoped else ("read_file",)))
+    assert worker._root_workspace_writable(planned, workspace) is expected
+
+
+def test_private_root_workspace_denies_an_untyped_grant(tmp_path):
+    with pytest.raises(RuntimeError, match="typed root workspace grant"):
+        worker._root_workspace_writable({}, tmp_path)
+
+
+def test_policy_failure_diagnostic_retains_root_cause_without_sensitive_text(monkeypatch):
+    from herdr import host_configuration
+    from herdr.security import SecurityError
+    secret = "credential-value-must-never-be-retained"
+    def fail():
+        raise SecurityError(secret)
+    monkeypatch.setattr(worker, "HOST_POLICY_LAUNCH_FACTORY", None)
+    monkeypatch.setattr(host_configuration, "build_host_policy_factory", fail)
+    with pytest.raises(RuntimeError) as captured:
+        worker._root_policy_factory()
+    report = worker._policy_failure_diagnostic(captured.value)
+    assert [item["error_type"] for item in report["chain"]] == ["RuntimeError", "SecurityError"]
+    assert any(frame["file"] == "agent-stack/bin/agent-task-worker"
+               for item in report["chain"] for frame in item["frames"])
+    assert secret not in json.dumps(report)
+    assert "task_invocation_policy_missing" not in json.dumps(report)
+    assert str(ROOT) not in json.dumps(report)
+
+
+def test_policy_failure_diagnostic_bounds_cycles_depth_and_unknown_type():
+    class SensitiveException(Exception):
+        pass
+    failures = [SensitiveException("secret") for _ in range(9)]
+    for before, after in zip(failures, failures[1:]):
+        before.__cause__ = after
+    failures[-1].__cause__ = failures[0]
+    report = worker._policy_failure_diagnostic(failures[0])
+    assert len(report["chain"]) == 4
+    assert all(row == {"error_type": "other", "frames": []} for row in report["chain"])
+    failures[0].__cause__ = failures[0]
+    assert len(worker._policy_failure_diagnostic(failures[0])["chain"]) == 1
+
+
+def test_policy_failure_diagnostic_excludes_external_source_paths():
+    namespace = {}
+    try:
+        exec(compile("raise RuntimeError('secret-message')", "/private/credential-name/auth.py", "exec"), namespace)
+    except RuntimeError as exc:
+        report = worker._policy_failure_diagnostic(exc)
+    assert report["chain"] == [{"error_type": "RuntimeError", "frames": []}]
+    assert "credential-name" not in json.dumps(report)
+
+
+def test_blocked_policy_diagnostic_survives_task_persistence_without_new_attempt(tmp_path):
+    configure_paths(tmp_path)
+    task = base_task()
+    worker.prepare_attempt(task)
+    original = (task["run_token"], task["idempotency_key"], task["attempts"])
+    path = worker.RUNNING / "task-1.json"
+    task["invocation_policy_diagnostic"] = worker._policy_failure_diagnostic(RuntimeError("secret"))
+    path.write_text(json.dumps(task))
+    worker.block_task(path, task, "task_invocation_policy_unavailable", "Host invocation policy must be supplied before execution.")
+    saved = json.loads((worker.BLOCKED / path.name).read_text())
+    assert saved["invocation_policy_diagnostic"] == task["invocation_policy_diagnostic"]
+    assert (saved["run_token"], saved["idempotency_key"], saved["attempts"]) == original
+    assert saved["attempt_state"] == "blocked"
+    assert not list(worker.PENDING.iterdir())
+    assert "secret" not in json.dumps(saved)
+
+
+@pytest.mark.parametrize("stage", ["configuration", "prepare"])
+def test_worker_policy_denial_keeps_safe_cause_and_never_runs_sdk(tmp_path, monkeypatch, stage):
+    from herdr import host_configuration
+    from herdr.security import SecurityError
+    configure_paths(tmp_path)
+    task = base_task()
+    worker.prepare_attempt(task)
+    admitted = []
+    original = (task["idempotency_key"], task["attempts"])
+    path = worker.RUNNING / "task-1.json"
+    path.write_text(json.dumps(task))
+    monkeypatch.setattr(worker, "freeze_plan", lambda *args: None)
+    monkeypatch.setattr(worker, "decide_model_route", lambda current: {"tier": "free", "model": "free-model"})
+    monkeypatch.setattr(worker, "record_model_route", lambda *args: None)
+    def fail():
+        raise SecurityError("sensitive-original-error")
+    monkeypatch.setattr(host_configuration, "build_host_policy_factory", fail)
+    monkeypatch.setattr(worker, "HOST_POLICY_LAUNCH_FACTORY", None)
+    def denied(current):
+        admitted.append(current["run_token"])
+        if stage == "configuration":
+            worker._root_policy_factory()
+        try:
+            fail()
+        except SecurityError as exc:
+            raise RuntimeError("task_invocation_policy_denied:" + str(exc)) from exc
+    monkeypatch.setattr(worker, "create_task_session", denied)
+    def forbidden(*args, **kwargs):
+        pytest.fail("policy denial cannot call or restart SDK")
+    monkeypatch.setattr(worker, "run_prompt", forbidden)
+    assert worker.main(path) == 1
+    saved = json.loads((worker.BLOCKED / path.name).read_text())
+    assert saved["attempt_state"] == "blocked"
+    assert saved["result_status"] == "blocked"
+    assert [row["error_type"] for row in saved["invocation_policy_diagnostic"]["chain"]] == ["RuntimeError", "SecurityError"]
+    assert (saved["idempotency_key"], saved["attempts"]) == original
+    assert admitted == [saved["run_token"]]
+    assert "sensitive-original-error" not in json.dumps(saved)
+    assert not list(worker.PENDING.iterdir())

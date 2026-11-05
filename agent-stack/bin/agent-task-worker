@@ -5,6 +5,7 @@ import os
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -15,8 +16,10 @@ from pathlib import Path
 from contextlib import contextmanager
 
 from agent_model_policy import decide as decide_model_route, record as record_model_route
+from agent_completion_evidence import EvidenceError, record_verification_failure, verification_applies, freeze_plan, verify_completion, completion_instructions
 from agent_durable_sandbox import (command as sandbox_command, frozen_policy, inner_pid,
-                                   shell_command, verify as verify_sandbox)
+                                   shell_command, pane_input_ready, verify_pane_prompt, start_sandbox_agent,
+                                   verify as verify_sandbox)
 from agent_durable_children import parent_attempt_guard
 
 HOME = Path("/home/agentops")
@@ -32,8 +35,12 @@ LOGS = ROOT / "logs"
 LOCK = ROOT / "worker.lock"
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
-from herdr.launch_environment import sanitize_environment
-ENV = sanitize_environment(os.environ)
+from herdr.launch_environment import sanitize_environment, IMMUTABLE_HOST_STARTUP_TIMEOUT_SECONDS
+from herdr.recovery_unknown import held as terminal_unknown_hold
+from herdr.host_configuration import host_entrypoint_command
+from herdr.policy_launch import process_start_ticks
+ENV = {key: value for key, value in sanitize_environment(os.environ).items()
+       if not key.startswith("PYTHON")}
 AGENT_BIN = Path(__file__).resolve().parent
 ENV["HOME"] = str(HOME)
 ENV["PATH"] = f"{AGENT_BIN}:{HOME}/.local/node24/bin:{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin"
@@ -75,6 +82,8 @@ def persist_execution_session(task: dict, *, startup=True) -> None:
         if startup and canonical.parent in (DONE, BLOCKED, FAILED):
             raise RuntimeError("task_session_canonical_already_terminal")
     current["execution_session"] = dict(task["execution_session"])
+    if task.get("work_contract") is not None:
+        current["work_contract"] = dict(task["work_contract"])
     current["task_file"] = str(sidecar)
     write_json(canonical, current)
     if sidecar != canonical:
@@ -105,7 +114,10 @@ def archive_previous_result(task_id: str, attempt: int) -> None:
 
 def prepare_attempt(task: dict) -> None:
     """Allocate one semantic execution attempt; reconciliation reuses it."""
-    if task.get("attempt_state") == "delivery_uncertain" and task.get("run_token"):
+    if terminal_unknown_hold(task):
+        raise EvidenceError("terminal_unknown_requires_operator_reconciliation")
+    if (task.get("attempt_state") == "delivery_uncertain"
+            or task.get("completion_plan_pending")) and task.get("run_token"):
         return
     if task.get("parent_task_id"):
         if not all(task.get(field) for field in ("run_token", "idempotency_key",
@@ -142,6 +154,10 @@ def prepare_attempt(task: dict) -> None:
     task["delivery_reconcile_count"] = 0
     task["attempt_state"] = "dispatching"
     task["attempt_started_at"] = utcnow().isoformat()
+    # Only a NEW host attempt gets this marker, before fsynced pane delivery.
+    # Reconciliation must never bless a pre-upgrade bridge with a new epoch.
+    task["ownership_epoch"] = {"version": 1, "run_token": task["run_token"],
+                               "fencing_token": task["fencing_token"]}
 
 def _parse_herdr_json(proc: subprocess.CompletedProcess[str], context: str) -> dict:
     if proc.returncode != 0:
@@ -159,7 +175,7 @@ def _parse_herdr_json(proc: subprocess.CompletedProcess[str], context: str) -> d
     raise RuntimeError(f"{context}: no JSON response")
 
 
-def _herdr_json(args: list[str], *, timeout_seconds: float = 30.0) -> dict:
+def _herdr_json(args: list[str], *, timeout_seconds: float = 30.0) -> dict | None:
     proc = subprocess.run(
         [str(HERDR), *args],
         text=True,
@@ -167,28 +183,72 @@ def _herdr_json(args: list[str], *, timeout_seconds: float = 30.0) -> dict:
         timeout=timeout_seconds,
         env=ENV,
     )
+    # Pinned native 0.9.1 pane.run uses send_ok_request: empty success,
+    # typed errors on stderr with a nonzero status. It is not sandbox proof.
+    if args[:2] == ["pane", "run"] and proc.returncode == 0:
+        if (proc.stdout or "").strip() or (proc.stderr or "").strip():
+            raise RuntimeError("herdr pane run: unexpected acknowledgement output")
+        return None
     return _parse_herdr_json(proc, "herdr " + " ".join(args[:2]))
 
 
-def _task_session_identity(task: dict) -> tuple[str, str]:
-    run_token = str(task.get("run_token") or "")
-    if not run_token:
-        raise RuntimeError("task session requires run_token")
-    routing = task.get("routing") if isinstance(task.get("routing"), dict) else {}
-    coordinator = str(
-        routing.get("selected_agent") or task.get("agent") or "quantlab-hermes"
-    )
-    digest = hashlib.sha256(
-        f"{coordinator}:{task['id']}:{run_token}".encode("utf-8")
-    ).hexdigest()
-    # Herdr agent names are capped at 32 characters. Keep a readable,
-    # coordinator-derived prefix and bind uniqueness to the full coordinator,
-    # task id and run token through a 64-bit digest suffix.
-    prefix = coordinator[:13].rstrip("-_") or "task"
-    agent_name = f"{prefix}-t-{digest[:16]}"
-    if len(agent_name) > 32:
-        raise RuntimeError("task session agent name exceeds Herdr limit")
-    return agent_name, f"durable-{digest[:20]}"
+def _agent_get_optional(target: str, *, timeout_seconds: float = 10.0) -> dict | None:
+    """Return one live agent, or None only for Herdr's typed agent_not_found."""
+    try:
+        payload = _herdr_json(["agent", "get", target], timeout_seconds=timeout_seconds)
+    except RuntimeError as exc:
+        try:
+            error_payload = json.loads(str(exc))
+        except json.JSONDecodeError:
+            raise
+        if (
+            isinstance(error_payload, dict)
+            and isinstance(error_payload.get("error"), dict)
+            and error_payload["error"].get("code") == "agent_not_found"
+        ):
+            return None
+        raise
+    agent = (payload.get("result") or {}).get("agent")
+    if not isinstance(agent, dict):
+        raise RuntimeError("task_session_agent_get_invalid")
+    return agent
+
+
+def _wait_for_task_agent(pane_id: str, agent_name: str, *, timeout_seconds: float = 60.0) -> dict:
+    """Wait for a manually launched Hermes agent, then bind its stable task name."""
+    deadline = time.monotonic() + timeout_seconds
+    renamed = False
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("task_session_agent_not_ready")
+        agent = _agent_get_optional(pane_id, timeout_seconds=min(10.0, remaining))
+        if agent is None:
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+            continue
+        if str(agent.get("pane_id") or "") != pane_id:
+            raise RuntimeError("task_session_agent_wrong_pane")
+        kind = str(agent.get("agent") or agent.get("kind") or "")
+        if kind != "hermes":
+            raise RuntimeError(f"task_session_agent_kind_mismatch:{kind or 'unknown'}")
+        if str(agent.get("name") or "") != agent_name:
+            if renamed:
+                raise RuntimeError("task_session_agent_rename_unstable")
+            _herdr_json(["agent", "rename", pane_id, agent_name],
+                        timeout_seconds=min(10.0, remaining))
+            renamed = True
+            continue
+        status = str(agent.get("agent_status") or agent.get("status") or "").lower()
+        if status == "blocked":
+            raise RuntimeError("task_session_agent_blocked")
+        if status in {"idle", "done", "unknown"}:
+            return agent
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+
+def _task_session_identity(task):
+    from herdr.canonical_case_claim import task_session_identity
+    return task_session_identity(task)
 
 
 def observe_task_execution(task: dict) -> str:
@@ -233,6 +293,7 @@ TASK_PANE_ENV = "HERDR_DURABLE_TASK_PANE"
 POLICY_BIN = Path(__file__).resolve().parents[1] / "policy-bin"
 CHILD_HELPER = Path(__file__).resolve().parent / "agent-durable-child"
 BRIDGE = Path(__file__).resolve().parent / "agent-durable-bridge"
+BRIDGE_STARTUP_TIMEOUT_SECONDS = IMMUTABLE_HOST_STARTUP_TIMEOUT_SECONDS
 
 
 def bridge_socket_name(task: dict) -> str:
@@ -252,8 +313,25 @@ def bridge_alive(session: dict) -> bool:
     try:
         args = [part.decode("utf-8", errors="replace") for part in
                 Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if part]
+        launch = session.get("bridge_launch")
+        if launch is None:
+            # Sessions from before launch identity persistence used the direct
+            # bridge path. Do not reinterpret them under today's issuer policy.
+            command_matches = str(BRIDGE) in args
+        else:
+            if (not isinstance(launch, dict)
+                    or set(launch) != {"schema_version", "argv", "process_start_ticks",
+                                      "host_policy_sha256", "code_source"}
+                    or launch["schema_version"] != "herdr-host-bridge-launch-1"
+                    or not isinstance(launch["argv"], list)
+                    or not all(isinstance(value, str) and "\0" not in value for value in launch["argv"])
+                    or type(launch["process_start_ticks"]) is not int
+                    or launch["process_start_ticks"] <= 0):
+                return False
+            command_matches = (args == launch["argv"]
+                               and process_start_ticks(pid) == launch["process_start_ticks"])
         return (
-            str(BRIDGE) in args
+            command_matches
             and "--task-id" in args
             and args[args.index("--task-id") + 1] == task_id
             and "--run-token" in args
@@ -264,17 +342,38 @@ def bridge_alive(session: dict) -> bool:
         return False
 
 
+def _bridge_process_live(pid: int) -> bool:
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return False
+    except (OSError, UnicodeError):
+        return True  # An unreadable live identity must be reconciled.
+    _, separator, fields = raw.rpartition(")")
+    columns = fields.split()
+    return not separator or not columns or columns[0] not in {"Z", "X", "x"}
+
+
 def start_bridge(task: dict, session: dict) -> None:
+    if terminal_unknown_hold(task):
+        raise EvidenceError("terminal_unknown_requires_operator_reconciliation")
     if bridge_alive(session):
         return
+    if int(session.get("bridge_pid") or 0) > 0 and _bridge_process_live(int(session["bridge_pid"])):
+        raise RuntimeError("durable_bridge_identity_unverified")
     name = bridge_socket_name(task)
     task_file = Path(str(task["task_file"])).resolve()
-    args = [sys.executable, str(BRIDGE), "--task-file", str(task_file),
+    arguments = ["--task-file", str(task_file),
             "--task-id", str(task["id"]), "--run-token", str(task["run_token"]),
             "--agent", session["agent_name"], "--pane", session["pane_id"],
             "--marker", session["pane_marker"], "--real-binary", str(HERDR)]
+    binding = {}
+    args = host_entrypoint_command("agent-stack/bin/agent-durable-bridge", arguments,
+                                  legacy_command=[sys.executable, str(BRIDGE), *arguments],
+                                  binding=binding)
     log_path = LOGS / f"{task['id']}.bridge.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + BRIDGE_STARTUP_TIMEOUT_SECONDS
     with log_path.open("a", encoding="utf-8") as output:
         process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=output,
                                    stderr=output, env=ENV, start_new_session=True)
@@ -282,39 +381,167 @@ def start_bridge(task: dict, session: dict) -> None:
     session["bridge_socket"] = name
     session["bridge_task_id"] = str(task["id"])
     session["bridge_run_token"] = str(task["run_token"])
-    persist_execution_session(task)
-    for _ in range(30):
-        if process.poll() is not None:
-            break
+    session["bridge_launch"] = {"schema_version": "herdr-host-bridge-launch-1",
+        "argv": list(args), "process_start_ticks": None,
+        "host_policy_sha256": binding.get("host_policy_sha256"),
+        "code_source": binding.get("code_source")}
+    try:
+        session["bridge_launch"]["process_start_ticks"] = process_start_ticks(process.pid)
+    finally:
+        # Keep the PID/command evidence even if startup exits before it can be
+        # attested; an unverified live PID requires reconciliation.
+        persist_execution_session(task)
+    # The pinned host wrapper verifies the complete code/Python/SDK inventory
+    # before binding. Its measured startup alone exceeds the former 3s loop.
+    while True:
+        status = process.poll()
+        if status is not None:
+            raise RuntimeError(f"durable_bridge_unavailable:process_exited:{status}")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("durable_bridge_unavailable:startup_timeout")
         try:
             with socket.socket(socket.AF_UNIX) as connection:
-                connection.settimeout(0.1)
+                connection.settimeout(min(0.1, remaining))
                 connection.connect("\0" + name[1:])
-            return
+                credentials = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
         except OSError:
-            time.sleep(0.1)
-    raise RuntimeError("durable_bridge_unavailable")
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+            continue
+        try:
+            peer_pid, peer_uid, _ = struct.unpack("3i", credentials)
+        except (struct.error, TypeError) as error:
+            raise RuntimeError("durable_bridge_identity_unverified") from error
+        if (peer_pid != process.pid or peer_uid != os.getuid()
+                or process_start_ticks(process.pid) != session["bridge_launch"]["process_start_ticks"]):
+            raise RuntimeError("durable_bridge_identity_unverified")
+        if process.poll() is not None:
+            raise RuntimeError("durable_bridge_unavailable:exited_during_readiness")
+        return
+
+
+def _bridge_exited(pidfd: int) -> bool:
+    import select
+    waiter = select.poll()
+    waiter.register(pidfd, select.POLLIN)
+    return any(fd == pidfd and events & select.POLLIN for fd, events in waiter.poll(5000))
 
 
 def stop_bridge(session: dict) -> None:
-    if bridge_alive(session):
-        os.kill(int(session["bridge_pid"]), signal.SIGTERM)
+    pid = int(session.get("bridge_pid") or 0)
+    if pid <= 0:
+        return
+    try:
+        # Open before inspecting /proc so PID reuse cannot redirect the signal.
+        pidfd = os.pidfd_open(pid, 0)
+    except ProcessLookupError:
+        return
+    except (AttributeError, OSError) as exc:
+        raise RuntimeError("durable_bridge_identity_unverified") from exc
+    try:
+        if not bridge_alive(session):
+            if not _bridge_process_live(pid):
+                return
+            raise RuntimeError("durable_bridge_identity_unverified")
+        try:
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        if not _bridge_exited(pidfd):
+            raise RuntimeError("durable_bridge_cleanup_unverified")
+    finally:
+        os.close(pidfd)
+
+
+def _cleanup_bridge(session: dict) -> bool:
+    try:
+        stop_bridge(session)
+    except (OSError, RuntimeError) as exc:
+        session.pop("closed_at", None)
+        session["cleanup_status"] = "bridge_cleanup_unproven"
+        session["cleanup_error"] = str(exc)[-1000:]
+        return False
+    return True
+
+
+def _root_workspace_writable(grant, workspace: Path) -> bool:
+    from herdr.security import SecurityGrant
+    if not isinstance(grant, SecurityGrant):
+        raise RuntimeError("typed root workspace grant required")
+    # Match the independent issuer ceiling using the effective host grant.
+    # A nested write rule never grants a writable ancestor workspace.
+    return any(rule.tool in {"write_file", "patch"} and rule.tool in grant.scope.tools
+        and any(workspace == Path(root) or Path(root) in workspace.parents
+                for root in rule.allowed_roots) for rule in grant.tool_rules)
+
+
+def _root_self_write_pins(work_factory, task, launch):
+    """Physical self-scope from the original host admission, not task tool data.
+
+    The broader logical grant stays intact as the child delegation ceiling.
+    Only finite existing files are supported in this managed-parent mode.
+    """
+    admitted = getattr(work_factory, "host_admission", None)
+    if not isinstance(admitted, dict) or "managed_children" not in admitted:
+        return None
+    from agent_completion_evidence import spec_digest
+    from herdr.evidence import binding
+    from herdr.claimed_child_contracts import retained
+    from herdr.work_cycle import FileScope
+    from herdr.child_ownership import ChildOwnership
+    from herdr.owned_write_mounts import OwnedWritePins
+    if admitted["identity"] != binding(task) or admitted["spec_sha256"] != spec_digest(task):
+        raise RuntimeError("root_original_self_scope_changed")
+    retained(admitted, task, identity=launch.identity)
+    if launch.private_profile_snapshot is None or launch.grant.process.enabled:
+        raise RuntimeError("root_finite_private_self_scope_required")
+    scopes = tuple(FileScope(**item) for item in admitted["definition"]["files"])
+    if not scopes or any(item.subtree for item in scopes):
+        raise RuntimeError("root_existing_file_self_scope_required")
+    workspace = Path(task["workspace"])
+    children = [Path(row["scope"]["worktree_identity"].rsplit("|", 1)[0])
+                for row in admitted["managed_children"]["children"].values()]
+    if any((workspace / item.path).is_relative_to(child) for child in children for item in scopes):
+        raise RuntimeError("root_self_scope_overlaps_child")
+    ownership = ChildOwnership.from_json({
+        "write_scope": [{"kind": "file", "key": item.path} for item in scopes],
+        "decision_scope": [], "hard_dependencies": [], "shared_dependencies": [],
+        "integration_owner": task["id"], "handoff_ref": "root-self-scope"})
+    return OwnedWritePins(ownership, launch.mount.private_workspace_pin)
 
 
 def ensure_parent_scope(task: dict) -> None:
-    """Copy only an explicit matching consumer scope into older queued tasks."""
+    """Request the current consumer scope only before a new root admission."""
     scope_fields = ("parent_role", "parent_tools", "parent_permissions", "worktree_root")
-    if all(field in task for field in scope_fields):
-        return
     config = Path(__file__).resolve().parents[1] / "config/github-intake-consumers.json"
     consumers = json.loads(config.read_text(encoding="utf-8"))["consumers"]
     matching = [entry for entry in consumers
-                if entry.get("repository") == task.get("repo")
+                if entry.get("enabled") and entry.get("repository") == task.get("repo")
                 and entry.get("safety_profile") == task.get("safety_profile")]
     if len(matching) != 1 or not all(field in matching[0] for field in scope_fields):
         return
+    current = matching[0]
+    if all(field in task for field in scope_fields):
+        # Upgrade only the former complete consumer request, never an
+        # intentionally narrower scope or an admitted child/attempt.
+        if (set(current["parent_tools"]) == set(task["parent_tools"]) | {"herdr_verify_work"}
+                and "herdr_verify_work" not in task["parent_tools"]
+                and all(task[field] == current[field] for field in
+                        ("parent_role", "parent_permissions", "worktree_root"))):
+            session = task.get("execution_session")
+            contract = task.get("work_contract")
+            bound_contract = (contract and (not isinstance(contract, dict)
+                or (contract.get("identity") or {}).get("run_token") == task.get("run_token")))
+            if (task.get("parent_task_id") or task.get("attempt_state") in {
+                    "accepted", "blocked", "delivery_uncertain", "verification_pending",
+                    "result_ready", "verifying"}
+                    or bound_contract or isinstance(session, dict) and (
+                        not session.get("closed_at") or session.get("invocation_policy"))):
+                raise RuntimeError("parent_scope_refresh_requires_new_admission")
+            task["parent_tools"] = list(current["parent_tools"])
+        return
     for field in scope_fields:
-        task.setdefault(field, matching[0][field])
+        task.setdefault(field, current[field])
 
 
 def _pane_has_marker(pane_id: str, marker: str) -> bool:
@@ -420,6 +647,132 @@ def _cleanup_setup_pane(pane_id: str, coordinator_pane: str, marker: str,
 # Host embedding supplies the accepted factory; queue/model fields never select it.
 HOST_POLICY_LAUNCH_FACTORY = None
 HOST_POLICY_LAUNCHES = {}
+HOST_ROOT_WRITE_PINS = {}
+HOST_WORK_CONTRACT_FACTORY = None
+HOST_WORK_CYCLES = {}
+HOST_WORK_FACTORIES = {}
+
+def modern_work_contract(task):
+    value=task.get("work_contract_version")
+    if "work_budget_version" in task:
+        budget=task["work_budget_version"]
+        if type(budget) is not int or budget!=1 or value is None:
+            raise EvidenceError("task_work_budget_version_unsupported")
+    if value is None:
+        return False
+    if type(value) is not int or value!=1:
+        raise EvidenceError("task_work_contract_version_unsupported")
+    return True
+
+def _root_work_factory(task, *, recovery=False):
+    from herdr.work_contract_host import HostWorkContractFactory
+    from herdr.evidence import binding, digest
+    cache_key = digest(binding(task))
+    factory = HOST_WORK_CONTRACT_FACTORY or HOST_WORK_FACTORIES.get(cache_key)
+    if factory is None:
+        from herdr.work_configuration import build_root_work_factory
+        try:
+            factory = build_root_work_factory(ROOT, task, recovery=recovery,
+                claimed_identity=None if recovery else _claimed_root_identity(task))
+        except (OSError, ValueError, KeyError, TypeError, EvidenceError) as exc:
+            raise EvidenceError("task_work_contract_authority_missing") from exc
+    if not isinstance(factory, HostWorkContractFactory):
+        raise EvidenceError("task_work_contract_authority_missing")
+    admission = getattr(factory, "host_admission", None)
+    if isinstance(admission, dict) and "managed_children" in admission:
+        from herdr.claimed_child_contracts import retained
+        retained(admission, task, identity=None if recovery else _claimed_root_identity(task))
+    HOST_WORK_FACTORIES[cache_key] = factory
+    return factory
+
+
+
+def _recover_root_work_cycle(task):
+    from herdr.security import InvocationIdentity
+    from herdr.evidence import digest
+    from agent_completion_evidence import spec_digest
+    factory = _root_work_factory(task, recovery=True)
+    reference = task.get("work_contract") or {}
+    identity = InvocationIdentity.from_dict(reference.get("identity"))
+    cycle = HOST_WORK_CYCLES.get((task["id"],task["run_token"]))
+    if cycle is None or digest(identity.to_json()) not in factory.cycles:
+        cycle = factory.recover(identity=identity,workspace=Path(task["workspace"]),
+            spec_sha256=spec_digest(task),
+            grant_sha256=(task["execution_session"].get("invocation_policy") or {}).get("grant_sha256"),
+            plan_sha256=reference.get("plan_sha256"))
+        HOST_WORK_CYCLES[(task["id"],task["run_token"])] = cycle
+    return factory, cycle
+
+
+
+def _verify_root_completion(task, result):
+    cycle=None
+    if modern_work_contract(task):
+        factory, cycle = _recover_root_work_cycle(task)
+        identity = cycle.plan.identity
+        cycle=factory.before_completion(identity,result)
+    invocation_verifier = None
+    if cycle is not None:
+        from agent_completion_evidence import store_for
+        from herdr.evidence import binding, digest
+        plan = store_for(ROOT, task).read("plan", digest(binding(task)))
+        invocation_verifier = factory.result_authority.verifier(
+            task, result, plan, work_plan_sha256=cycle.plan.hash)
+    accepted = ((verify_completion(ROOT, task, result, invocation_verifier=invocation_verifier)
+                 if invocation_verifier is not None else verify_completion(ROOT, task, result)) if verification_applies(task)
+                else {"level": "legacy_unverified_result"})
+    if cycle is not None:
+        if accepted["level"]!="verified_worker_result":
+            raise EvidenceError("modern coding contract needs verified worker artifact")
+        cycle.handed_off(accepted["bundle_hash"])
+        task["work_contract"]["phase"]=cycle.phase.value
+    return accepted
+
+
+def _recover_root_local_result(task):
+    from herdr.work_cycle import WorkPhase
+    from herdr.work_configuration import recover_host_handoff
+    from agent_completion_evidence import store_for
+    from herdr.evidence import binding, digest
+    factory, cycle = _recover_root_work_cycle(task)
+    if cycle.phase not in {WorkPhase.HYGIENE, WorkPhase.HANDOFF}:
+        return False
+    plan = store_for(ROOT, task).read("plan", digest(binding(task)))
+    port = recover_host_handoff(factory, task, cycle, plan)
+    if Path(port.slot.path) != result_path(str(task["id"])):
+        raise EvidenceError("original root result slot path changed")
+    requests = [key for key,value in cycle.verification_requests.items() if value is not None
+                and value["status"] == "pass" and value.get("tree_sha256") == cycle.verified_tree]
+    if not requests:
+        raise EvidenceError("original passed handoff request is missing")
+    port.deliver(cycle, requests[-1])
+    return True
+
+
+def _policy_failure_diagnostic(exc):
+    """Retain bounded source locations, never exception messages or locals."""
+    repository = Path(__file__).resolve().parents[2]
+    allowed_types = {"RuntimeError", "SecurityError", "ValueError", "KeyError",
+                     "TypeError", "OSError", "FileNotFoundError", "PermissionError"}
+    chain, seen = [], set()
+    while exc is not None and id(exc) not in seen and len(chain) < 4:
+        seen.add(id(exc))
+        frames = []
+        trace = exc.__traceback__
+        while trace is not None and len(frames) < 16:
+            try:
+                source = Path(trace.tb_frame.f_code.co_filename).absolute().relative_to(repository)
+            except ValueError:
+                source = None
+            if source is not None and (source.as_posix() == "agent-stack/bin/agent-task-worker"
+                    or (source.parts[0] == "herdr" and source.suffix == ".py")):
+                frames.append({"file": source.as_posix(), "line": trace.tb_lineno})
+            trace = trace.tb_next
+        name = type(exc).__name__
+        chain.append({"error_type": name if name in allowed_types else "other", "frames": frames})
+        exc = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+    return {"schema_version": "herdr-invocation-policy-diagnostic-1", "chain": chain}
+
 
 def _root_policy_factory():
     global HOST_POLICY_LAUNCH_FACTORY
@@ -442,15 +795,18 @@ def _preflight_root_provider(profile):
         executable=ENV.get("HERDR_HERMES_BINARY","/home/agentops/.local/bin/hermes"),env=ENV)
 
 
+def _claimed_root_identity(task):
+    from herdr.canonical_case_claim import claimed_root_identity
+    return claimed_root_identity(task)
+
+
 def _root_launch_identity(task):
     from herdr.security import InvocationIdentity
     session = task.get("execution_session") or {}
+    identity = _claimed_root_identity(task)
     routing = task.get("routing") if isinstance(task.get("routing"), dict) else {}
     coordinator = str(routing.get("selected_agent") or task.get("agent") or "quantlab-hermes")
     agent, marker = _task_session_identity(task)
-    identity = InvocationIdentity(consumer="github:"+str(task["repo"]), agent_id=agent,
-        parent_agent_id=coordinator, parent_task_id="coordinator:"+coordinator,
-        task_id=str(task["id"]), run_token=str(task["run_token"]), fencing_token=task["fencing_token"])
     if (session.get("agent_name") != agent or session.get("session_name") != marker
             or session.get("coordinator_agent") != coordinator or session.get("pane_marker") != marker):
         raise RuntimeError("task_launch_cleanup_identity_mismatch")
@@ -505,6 +861,9 @@ def _cleanup_prepared_root_launch(task):
     if launch is not None:
         launch.cleanup_after_pane_closed()
         del HOST_POLICY_LAUNCHES[key]
+        pins = HOST_ROOT_WRITE_PINS.pop(key, None)
+        if pins is not None:
+            pins.close()
     else:
         session=task.get("execution_session") or {}
         proof=session.get("invocation_policy") or {}
@@ -516,8 +875,51 @@ def _cleanup_prepared_root_launch(task):
 
 
 
+def _wait_for_task_pane_input(pane_id, pane_marker, *, timeout_seconds=10.0):
+    """Require terminal readiness and actual owned shell command execution."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("durable_pane_input_unready")
+        info = _herdr_json(["pane", "process-info", "--pane", pane_id],
+                           timeout_seconds=min(10.0, remaining))
+        process_info = (info.get("result") or {}).get("process_info")
+        if isinstance(process_info, dict) and pane_input_ready(process_info, pane_marker):
+            if time.monotonic() <= deadline:
+                verify_pane_prompt(_herdr_json, pane_id, pane_marker,
+                                   timeout_seconds=max(0.001, deadline - time.monotonic()))
+                return
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+
+def _wait_for_task_sandbox(pane_id, pane_marker, *, policy, policy_mount,
+                           private_profile_snapshot=None, owned_write_pins=None, timeout_seconds=10.0):
+    """Wait for native pane.run to become a fully verified physical sandbox."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("durable_sandbox_unverified")
+        info = _herdr_json(["pane", "process-info", "--pane", pane_id],
+                           timeout_seconds=min(10.0, remaining))
+        process_info = (info.get("result") or {}).get("process_info")
+        pid = inner_pid(process_info if isinstance(process_info, dict) else {}, pane_marker)
+        if pid and verify_sandbox(pid, HERDR, pane_marker, policy=policy,
+                                  policy_mount=policy_mount, attempts=1,
+                                  **({"owned_write_pins": owned_write_pins,
+                                      "pinned_worktree": owned_write_pins.worktree}
+                                     if owned_write_pins is not None else {}),
+                                  **({"private_profile_snapshot": private_profile_snapshot}
+                                     if private_profile_snapshot is not None else {})):
+            if time.monotonic() <= deadline:
+                return pid
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+
 def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
     """Create one fresh Hermes pane/session for exactly one durable attempt."""
+    work_factory = _root_work_factory(task) if modern_work_contract(task) else None
     routing = task.get("routing") if isinstance(task.get("routing"), dict) else {}
     coordinator = str(
         routing.get("selected_agent") or task.get("agent") or "quantlab-hermes"
@@ -562,6 +964,9 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
                                   parent_agent_id=coordinator, parent_task_id="coordinator:" + coordinator,
                                   task_id=str(task["id"]), run_token=str(task["run_token"]),
                                   fencing_token=task["fencing_token"])
+    approved_profile = getattr(factory, "approved_profile", None)
+    if approved_profile is not None and approved_profile.name != _task_hermes_profile(task):
+        raise RuntimeError("task_approved_profile_identity_mismatch")
     session = {
         "agent_name": agent_name, "session_name": session_name, "pane_id": "",
         "pane_marker": pane_marker, "coordinator_agent": coordinator,
@@ -586,9 +991,51 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
     preexisting_panes = set()
     HOST_POLICY_LAUNCHES[(task["id"],task["run_token"])]=launch
     try:
+        if modern_work_contract(task):
+            from herdr.work_configuration import preflight_handoff
+            from agent_completion_evidence import store_for
+            from herdr.evidence import binding,digest
+            preflight_handoff(work_factory,launch,store_for(ROOT,task).read("plan",digest(binding(task))),
+                              require_slot=False)
         task_env.update(launch.environment())
         profile = _task_hermes_profile(task)
-        _preflight_root_provider(profile)
+        private_snapshot = getattr(launch, "private_profile_snapshot", None)
+        if private_snapshot is not None and private_snapshot.name != profile:
+            raise RuntimeError("task_approved_profile_identity_mismatch")
+        from herdr.work_configuration import reviewed_root_model_arguments
+        root_model_args = reviewed_root_model_arguments(work_factory, private_snapshot)
+        # Approved profile was refreshed/validated *before* it was sealed by
+        # the trusted host factory. A late refresh here would leave the sealed
+        # snapshot stale; retain legacy preflight only for legacy launches.
+        if private_snapshot is None:
+            _preflight_root_provider(profile)
+        root_write_pins = _root_self_write_pins(work_factory, task, launch)
+        if work_factory is not None and private_snapshot is not None:
+            work_factory.workspace_pin = launch.mount.private_workspace_pin
+        root_verify_options = {}
+        if root_write_pins is not None:
+            HOST_ROOT_WRITE_PINS[(task["id"], task["run_token"])] = root_write_pins
+            root_verify_options = {"owned_write_pins": root_write_pins,
+                                   "pinned_worktree": root_write_pins.worktree}
+        root_mount_options = ({"root_workspace_writable":
+            _root_workspace_writable(launch.grant, Path(workspace))}
+            if private_snapshot is not None else {})
+        if root_write_pins is not None:
+            root_mount_options = {"root_workspace_writable": False, "owned_write_pins": root_write_pins}
+        if private_snapshot is not None:
+            # Bind and approve the exact slot/command before split or bridge.
+            policy = frozen_policy()
+            task_result = result_path(str(task["id"]))
+            task_result.parent.mkdir(parents=True, exist_ok=True)
+            from herdr.result_submission import reserve_empty_result
+            reserve_empty_result(task_result,identity,str(task["idempotency_key"]))
+            launch.bind_result_slot(task_result,str(task["idempotency_key"]))
+            session["policy_file"]=str(policy)
+            persist_execution_session(task)
+            launch.prepare_private_command(lambda:sandbox_command(
+                Path(workspace),HERDR,writable=(task_result,),policy=policy,
+                policy_mount=launch.mount,admission_root=ROOT,
+                private_profile_snapshot=private_snapshot,hermes_profile=profile,**root_mount_options))
         preexisting_panes = _setup_pane_ids()
         def inspect_startup_source():
             source = _herdr_json(["pane","process-info","--pane",coordinator_pane],
@@ -623,23 +1070,32 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         HOST_POLICY_LAUNCHES[(task["id"], task["run_token"])] = launch
         persist_execution_session(task)
         start_bridge(task, session)
-        policy = frozen_policy()
-        session["policy_file"] = str(policy)
-        persist_execution_session(task)
-        task_result = result_path(str(task["id"]))
-        task_result.parent.mkdir(parents=True, exist_ok=True)
-        if not task_result.exists():
-            task_result.touch(mode=0o600)
-        launch.bind_result_slot(task_result, str(task["idempotency_key"]))
+        if private_snapshot is None:
+            policy = frozen_policy()
+            session["policy_file"] = str(policy)
+            persist_execution_session(task)
+            task_result = result_path(str(task["id"]))
+            task_result.parent.mkdir(parents=True, exist_ok=True)
+            if not task_result.exists():
+                task_result.touch(mode=0o600)
+            launch.bind_result_slot(task_result, str(task["idempotency_key"]))
+        _wait_for_task_pane_input(pane_id, pane_marker)
+        # Resolve runtime mounts only after the terminal becomes ready; a
+        # profile/path may change during the bounded pane-readiness wait.
         command = sandbox_command(
-            Path(workspace), HERDR, writable=(task_result,), policy=policy, policy_mount=launch.mount
+            Path(workspace), HERDR, writable=(task_result,), policy=policy,
+            policy_mount=launch.mount, admission_root=ROOT, **root_mount_options,
+            **({"private_profile_snapshot": private_snapshot,
+                "hermes_profile": profile} if private_snapshot is not None else {}),
         )
-        _herdr_json(["pane", "run", pane_id, shell_command(command)], timeout_seconds=15.0)
-        info = _herdr_json(["pane", "process-info", "--pane", pane_id], timeout_seconds=10.0)
-        process_info = (info.get("result") or {}).get("process_info")
-        sandbox_pid = inner_pid(process_info if isinstance(process_info, dict) else {}, pane_marker)
-        if not sandbox_pid or not verify_sandbox(sandbox_pid, HERDR, pane_marker, policy=policy, policy_mount=launch.mount):
-            raise RuntimeError("durable_sandbox_unverified")
+        serialized_command = shell_command(command)
+        launch.verify_private_handoff()
+        _herdr_json(["pane", "run", pane_id, serialized_command], timeout_seconds=15.0)
+        sandbox_pid = _wait_for_task_sandbox(pane_id, pane_marker,
+                                             policy=policy, policy_mount=launch.mount,
+                                             **({"owned_write_pins": root_write_pins} if root_write_pins is not None else {}),
+                                             **({"private_profile_snapshot": private_snapshot}
+                                                if private_snapshot is not None else {}))
         session["sandbox_pid"] = sandbox_pid
         session["sandbox_attestation"] = {
             "authority": "agent-task-worker",
@@ -654,12 +1110,48 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
             "verified_at": utcnow().isoformat(),
         }
         session["sandbox_attestation"]["fencing_token"] = task["fencing_token"]
+        if private_snapshot is not None:
+            session["sandbox_attestation"]["approved_profile"] = private_snapshot.identity
         session["invocation_policy"] = launch.seal(
             sandbox_pid, session["sandbox_attestation"], tools=tuple(task.get("parent_tools") or ()),
             permissions=tuple(task.get("parent_permissions") or ()))
         session["sandbox_verified"] = True
         persist_execution_session(task)
+        if "herdr_external_knowledge" in tuple(task.get("parent_tools") or ()):
+            from herdr.external_knowledge_host import bind_external_knowledge_host
+            bind_external_knowledge_host(
+                launch.mount.bootstrap, launch.grant, external_knowledge_task_authority
+            )
+        if modern_work_contract(task):
+            from herdr.work_contract_host import HostWorkContractFactory
+            from agent_completion_evidence import spec_digest
+            require_factory = work_factory
+            if not isinstance(require_factory, HostWorkContractFactory):
+                raise EvidenceError("task_work_contract_authority_missing")
+            from herdr.work_configuration import preflight_handoff
+            from agent_completion_evidence import store_for
+            from herdr.evidence import binding, digest
+            preflight_handoff(work_factory, launch, store_for(ROOT,task).read("plan",digest(binding(task))))
+            from herdr.work_configuration import bind_reviewed_parent
+            bind_reviewed_parent(work_factory, task, launch)
+            cycle = work_factory.prepare(identity=identity, workspace=Path(workspace),
+                                         grant=launch.grant, spec_sha256=spec_digest(task))
+            task["work_contract"] = {"version":1,"plan_sha256":cycle.plan.hash,
+                                     "identity":identity.to_json(),"phase":cycle.phase.value,
+                                     "environment_sha256":cycle.plan.environment_sha256}
+            HOST_WORK_CYCLES[(task["id"],task["run_token"])] = cycle
+            from herdr.work_configuration import bind_root_handoff
+            bind_root_handoff(work_factory, task, launch, cycle)
+            launch.mount.bootstrap.work_authority = work_factory.authorize_invocation
+            launch.mount.bootstrap.work_verify = work_factory.verify_request
+            launch.mount.bootstrap.work_budget = work_factory.budget_effect
+            launch.mount.bootstrap.work_observe = work_factory.observe_sdk
+            persist_execution_session(task)
         def publish_continuation(evidence):
+            if work_factory is not None:
+                bind_reviewed_parent(work_factory, task, launch, evidence=evidence, recheck=True)
+                if reviewed_root_model_arguments(work_factory, private_snapshot) != root_model_args:
+                    raise RuntimeError("task_original_root_model_changed")
             session["invocation_policy"]=evidence
             persist_execution_session(task)
             return True
@@ -668,17 +1160,22 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         agent_start_attempted = True
         session["agent_start_attempted"] = True
         persist_execution_session(task)
-        started = _herdr_json(
-            [
-                "agent", "start", agent_name,
-                "--kind", "hermes", "--pane", pane_id, "--timeout", "60000",
-                "--", "-p", profile, "chat",
-                "--continue", session_name, "--create-if-missing",
-                "--in", workspace,
-                "--toolsets", __import__("herdr.runtime", fromlist=["_child_toolsets"])._child_toolsets(
-                    tuple(task.get("parent_tools") or ()), allow_delegation=True),
-            ],
-            timeout_seconds=75.0,
+        started = start_sandbox_agent(
+            _herdr_json, pane_id, pane_marker, sandbox_pid, agent_name,
+            ["-p", profile, "chat", *root_model_args, "--continue", session_name, "--create-if-missing",
+             "--in", workspace, "--toolsets",
+             __import__("herdr.runtime", fromlist=["_child_toolsets"])._child_toolsets(
+                 tuple(task.get("parent_tools") or ()), allow_delegation=True)],
+            verify_boundary=lambda: (
+                hashlib.sha256(policy.read_bytes()).hexdigest()
+                == session["sandbox_attestation"]["policy_sha256"]
+                and verify_sandbox(sandbox_pid, HERDR, pane_marker, policy=policy,
+                                   policy_mount=launch.mount, attempts=1, **root_verify_options,
+                                   **({"private_profile_snapshot": private_snapshot}
+                                      if private_snapshot is not None else {}))),
+            bootstrap_peer=lambda *, timeout_seconds: launch.mount.bootstrap.confirm(
+                timeout_seconds=timeout_seconds),
+            timeout_seconds=60.0,
         )
         started_agent = (started.get("result") or {}).get("agent")
         if (
@@ -695,7 +1192,17 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         return session
     except Exception as exc:
         if not split_attempted:
-            _cleanup_prepared_root_launch(task)
+            try:
+                _cleanup_prepared_root_launch(task)
+                if "policy" in locals():policy.unlink(missing_ok=True)
+            except Exception as cleanup_exc:
+                session["cleanup_status"] = "launch_cleanup_failed"
+                session["cleanup_error"] = str(cleanup_exc)[-1000:]
+                # Keep unresolved launch evidence and block before a new attempt.
+                # A cleanup failure must not turn the original denial into retry.
+                raise RuntimeError(
+                    "task_session_cleanup_failed:pre_split:" + type(exc).__name__
+                ) from cleanup_exc
             raise
         if pane_id and pane_id != coordinator_pane:
             candidates = (pane_id,)
@@ -730,16 +1237,20 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
                 session["cleanup_status"] = "close_failed"
                 session["cleanup_error"] = str(exc)[-1000:]
             elif candidates:
-                session["closed_at"] = utcnow().isoformat()
-                session["cleanup_status"] = "closed"
+                session["cleanup_status"] = "pane_closed"
         if cleanup_failed:
             raise RuntimeError("task_session_cleanup_failed") from exc
         _cleanup_prepared_root_launch(task)
         if isinstance(task.get("execution_session"), dict):
-            if task["execution_session"].get("closed_at"):
-                stop_bridge(task["execution_session"])
-                if task["execution_session"].get("policy_file"):
-                    Path(task["execution_session"]["policy_file"]).unlink(missing_ok=True)
+            session = task["execution_session"]
+            if candidates:
+                if not _cleanup_bridge(session):
+                    persist_execution_session(task, startup=False)
+                    raise RuntimeError("task_session_cleanup_failed:bridge_cleanup_unproven") from exc
+                if session.get("policy_file"):
+                    Path(session["policy_file"]).unlink(missing_ok=True)
+                session["closed_at"] = utcnow().isoformat()
+                session["cleanup_status"] = "closed"
             persist_execution_session(task, startup=False)
         raise
 
@@ -749,11 +1260,16 @@ def cleanup_task_session(task: dict) -> bool:
     if not isinstance(session, dict) or not session.get("owned_pane"):
         return True
     if session.get("closed_at"):
+        closed_at = session.pop("closed_at")
+        if not _cleanup_bridge(session):
+            return False
         try:
             _cleanup_prepared_root_launch(task)
         except Exception:
             session["cleanup_status"]="launch_cleanup_failed"
             return False
+        session["closed_at"] = closed_at
+        session["cleanup_status"] = "closed"
         return True
     pane_id = str(session.get("pane_id") or "")
     if not pane_id:
@@ -768,6 +1284,8 @@ def cleanup_task_session(task: dict) -> bool:
                 _cleanup_prepared_root_launch(task)
             except Exception:
                 session["cleanup_status"] = "launch_cleanup_failed"
+                return False
+            if not _cleanup_bridge(session):
                 return False
             session["closed_at"] = utcnow().isoformat()
             session["cleanup_status"] = "closed_before_split"
@@ -811,21 +1329,107 @@ def cleanup_task_session(task: dict) -> bool:
             session["cleanup_status"] = "close_unproven"
             return False
     if not present or _close_owned_pane(pane_id):
-        session["closed_at"] = utcnow().isoformat()
-        session["cleanup_status"] = "closed"
         try:
             _cleanup_prepared_root_launch(task)
         except Exception:
             session["cleanup_status"] = "launch_cleanup_failed"
             return False
-        stop_bridge(session)
+        if not _cleanup_bridge(session):
+            return False
         if session.get("policy_file"):
             Path(session["policy_file"]).unlink(missing_ok=True)
+        session["closed_at"] = utcnow().isoformat()
+        session["cleanup_status"] = "closed"
         return True
     session["cleanup_status"] = "close_failed"
     session["cleanup_error"] = "pane close failed"
     log(str(task.get("id") or "unknown"), f"task session cleanup failed pane={pane_id}")
     return False
+
+
+def external_knowledge_task_authority(identity, grant_sha256, _provider_id, _request) -> bool:
+    """Re-read the exact canonical RUNNING root attempt before/after retrieval."""
+    from herdr.security import InvocationIdentity
+    import re
+    if (not isinstance(identity, InvocationIdentity)
+            or not isinstance(grant_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", grant_sha256) is None
+            or re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", identity.task_id) is None):
+        return False
+    try:
+        directory = os.open(
+            RUNNING, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+    except OSError:
+        return False
+    try:
+        directory_info = os.fstat(directory)
+        if (not stat.S_ISDIR(directory_info.st_mode)
+                or directory_info.st_uid != os.geteuid()
+                or directory_info.st_mode & 0o022):
+            return False
+        try:
+            fd = os.open(
+                identity.task_id + ".json",
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=directory,
+            )
+        except OSError:
+            return False
+        try:
+            before = os.fstat(fd)
+            if (not stat.S_ISREG(before.st_mode)
+                    or before.st_uid != os.geteuid()
+                    or before.st_mode & 0o022
+                    or before.st_nlink != 1
+                    or not 0 < before.st_size <= 1_048_576):
+                return False
+            raw = bytearray()
+            while len(raw) <= 1_048_576:
+                chunk = os.read(fd, min(65_536, 1_048_577 - len(raw)))
+                if not chunk:
+                    break
+                raw.extend(chunk)
+            after = os.fstat(fd)
+            named = os.stat(
+                identity.task_id + ".json", dir_fd=directory, follow_symlinks=False
+            )
+            stamp = lambda item: (
+                item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns,
+                item.st_ctime_ns, item.st_mode, item.st_uid, item.st_nlink,
+            )
+            if (len(raw) > 1_048_576 or len(raw) != before.st_size
+                    or stamp(before) != stamp(after) or stamp(before) != stamp(named)):
+                return False
+        finally:
+            os.close(fd)
+    finally:
+        os.close(directory)
+    try:
+        current = json.loads(bytes(raw).decode("utf-8"))
+        if not isinstance(current, dict):
+            return False
+        session = current.get("execution_session")
+        policy = session.get("invocation_policy") if isinstance(session, dict) else None
+        launch_identity = session.get("launch_identity") if isinstance(session, dict) else None
+        return bool(
+            current.get("id") == identity.task_id
+            and current.get("run_token") == identity.run_token
+            and current.get("fencing_token") == identity.fencing_token
+            and "github:" + str(current.get("repo") or "") == identity.consumer
+            and isinstance(session, dict)
+            and not session.get("closed_at")
+            and session.get("agent_name") == identity.agent_id
+            and session.get("sandbox_verified") is True
+            and session.get("economic_delivery_attempted") is True
+            and type(session.get("sandbox_pid")) is int
+            and session["sandbox_pid"] > 0
+            and isinstance(policy, dict)
+            and policy.get("grant_sha256") == grant_sha256
+            and InvocationIdentity.from_dict(launch_identity) == identity
+        )
+    except (UnicodeError, ValueError, TypeError, KeyError):
+        return False
 
 
 def current_task_path(task: dict) -> Path | None:
@@ -845,16 +1449,22 @@ def persist_current_task(task: dict) -> None:
 
 def cleanup_task_session_if_safe(task: dict) -> bool:
     """Keep a task-owned pane alive while prompt delivery is still ambiguous."""
-    if task.get("attempt_state") == "delivery_uncertain" or task.get("watchdog_blocker") == "active_durable_children":
+    if terminal_unknown_hold(task):
+        return False
+    if (task.get("watchdog_blocker") == "active_durable_children"
+            or task.get("attempt_state") == "delivery_uncertain"
+            and task.get("verification_status") != "accepted"):
         return True
     cleaned = cleanup_task_session(task)
     if not cleaned:
         path = current_task_path(task)
         if path is not None:
             task["watchdog_blocker"] = "task_session_cleanup_failed"
-            archive_previous_result(
-                str(task["id"]), int(task.get("attempts") or 0)
-            )
+            # Retain the exact completed publication for host reconciliation.
+            # A cleanup failure cannot replace accepted/pending evidence.
+            if task.get("verification_status") not in {
+                    "accepted", "evidence_missing", "evidence_unavailable", "evidence_invalid"}:
+                archive_previous_result(str(task["id"]), int(task.get("attempts") or 0))
             block_task(
                 path,
                 task,
@@ -953,9 +1563,18 @@ TASK COMPLETION CONTRACT:
                  "key, role, objective, prompt, tool and permission arguments. Reuse the same key "
                  "for reconciliation. For write-capable children set cwd to the exact existing issue Git "
                  "worktree. Returned evidence still requires shared acceptance.\n")
-    return base + contract
+    if modern_work_contract(task):
+        from herdr.work_configuration import prompt_contract
+        cycle = HOST_WORK_CYCLES.get((task["id"],task["run_token"]))
+        if cycle is None:
+            raise RuntimeError("task_work_contract_unavailable")
+        contract += prompt_contract(cycle.plan)
+    return base + contract + completion_instructions(task)
+
 
 def run_prompt(task: dict) -> tuple[int, str]:
+    if terminal_unknown_hold(task):
+        raise EvidenceError("terminal_unknown_requires_operator_reconciliation")
     if task.get("parent_task_id") and (
         not task.get("run_token") or not task.get("idempotency_key")
         or not task.get("fencing_token") or not task.get("delegation_key")
@@ -964,9 +1583,22 @@ def run_prompt(task: dict) -> tuple[int, str]:
     session = task.get("execution_session")
     if not isinstance(session, dict) or not session.get("agent_name"):
         raise RuntimeError("task_session_isolation_missing")
+    if modern_work_contract(task):
+        from herdr.work_cycle import WorkCycle
+        cycle = HOST_WORK_CYCLES.get((task["id"],task["run_token"]))
+        if not isinstance(cycle,WorkCycle) or not cycle.implementation_allowed():
+            raise RuntimeError("task_work_contract_forbids_implementation")
+        if cycle.plan.hash != (task.get("work_contract") or {}).get("plan_sha256"):
+            raise RuntimeError("task_work_contract_changed")
     agent = str(session["agent_name"])
     timeout_seconds = int(task.get("timeout_seconds") or 1800)
     prompt = prompt_text(task)
+    if modern_work_contract(task):
+        # Herdr agent.prompt frames text according to the live terminal mode.
+        # Validate before recording intent; a second frame reaches the SDK as
+        # escaped paste content rather than one submitted prompt.
+        from herdr.hermes_terminal_transport import validate_native_prompt
+        prompt = validate_native_prompt(prompt)
     cmd = [
         str(HERDR), "agent", "prompt", agent, prompt,
         "--wait", "--timeout", str(timeout_seconds * 1000),
@@ -1127,6 +1759,8 @@ def _defer_delivery_reconciliation_locked(task_path: Path, task: dict, reason: s
 
 def retry(task_path: Path, task: dict, reason: str) -> None:
     """Start a new semantic execution attempt after the prior one is terminal."""
+    if terminal_unknown_hold(task):
+        return
     with parent_transition_guard(task) as all_terminal:
         _retry_locked(task_path, task, reason, all_terminal)
 
@@ -1149,6 +1783,8 @@ def clear_child_wait(task: dict) -> None:
 
 
 def _retry_locked(task_path: Path, task: dict, reason: str, all_terminal: bool) -> None:
+    if terminal_unknown_hold(task):
+        return
     if defer_for_active_children(task_path, task, reason=reason, all_terminal=all_terminal):
         return
     clear_child_wait(task)
@@ -1246,11 +1882,24 @@ def defer_for_active_children(task_path: Path, task: dict, *, reason: str = "",
     return True
 
 def finish(task_path: Path, task: dict, output: str) -> None:
+    if terminal_unknown_hold(task):
+        return
+    pending_cleanup = False
     with parent_transition_guard(task) as all_terminal:
         _finish_locked(task_path, task, output, all_terminal)
+        if modern_work_contract(task) and task.get("attempt_state") == "verification_pending":
+            pending_cleanup = not defer_for_active_children(
+                current_task_path(task) or task_path, task, all_terminal=all_terminal)
+    if pending_cleanup:
+        # The durable pending state rejects new delegation under the same lock.
+        # Failure recording takes that lock itself, so cleanup runs after release.
+        cleanup_task_session_if_safe(task)
+        persist_current_task(task)
 
 
 def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool) -> None:
+    if terminal_unknown_hold(task):
+        return
     task_id = str(task["id"])
     rp = result_path(task_id)
     task["attempt_state"] = "verifying"
@@ -1269,6 +1918,13 @@ def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool)
             )
             return
         result_payload_present = info.st_size > 0
+    if not result_payload_present and modern_work_contract(task) and task.get("work_contract"):
+        try:
+            result_payload_present = _recover_root_local_result(task)
+        except EvidenceError as exc:
+            _defer_delivery_reconciliation_locked(
+                task_path, task, f"original local handoff requires reconciliation: {exc.code}", all_terminal)
+            return
     if not result_payload_present:
         if reconcile_completion_evidence(task):
             rp = result_path(task_id)
@@ -1280,8 +1936,18 @@ def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool)
     try:
         result = json.loads(rp.read_text(encoding="utf-8"))
     except Exception as exc:
-        _defer_delivery_reconciliation_locked(task_path, task, f"invalid result JSON: {exc}", all_terminal)
-        return
+        if modern_work_contract(task) and task.get("work_contract"):
+            try:
+                if not _recover_root_local_result(task):
+                    raise EvidenceError("no proven committed local handoff")
+                result = json.loads(rp.read_text(encoding="utf-8"))
+            except (EvidenceError, OSError, ValueError) as recovery_error:
+                _defer_delivery_reconciliation_locked(task_path, task,
+                    f"original partial handoff requires reconciliation: {recovery_error}", all_terminal)
+                return
+        else:
+            _defer_delivery_reconciliation_locked(task_path, task, f"invalid result JSON: {exc}", all_terminal)
+            return
 
     if str(result.get("task_id") or "") != task_id:
         _defer_delivery_reconciliation_locked(
@@ -1308,6 +1974,33 @@ def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool)
     ):
         _defer_delivery_reconciliation_locked(task_path, task, "child result missing exact fence/idempotency/artifact evidence", all_terminal)
         return
+
+    blocker = str(result.get("blocker") or "").strip()
+    if str(result.get("status") or "") == "completed" and (not blocker or blocker.lower() in {"none", "null"}):
+        try:
+            accepted = _verify_root_completion(task, result)
+        except EvidenceError as exc:
+            waiting = record_verification_failure(task, exc)
+            if waiting:
+                task["verification_reconcile_count"] = int(task.get("verification_reconcile_count", 0)) + 1
+                task["not_before"] = (utcnow() + timedelta(seconds=60)).isoformat()
+            if not waiting:
+                if defer_for_active_children(task_path, task, all_terminal=all_terminal):
+                    task["verification_resolution"] = "needs_replan_cleanup_pending"
+                    write_json(task_path, task)
+                    return
+                if not cleanup_task_session(task):
+                    task["watchdog_cleanup_blocker"] = "task_session_cleanup_failed"
+                    task["verification_resolution"] = "needs_replan_cleanup_pending"
+                    task["attempt_state"] = "delivery_uncertain"
+                    task.pop("result_status", None)
+            write_json(task_path, task)
+            move(task_path, BLOCKED)
+            return
+        task["completion_level"] = accepted["level"]
+        task["completion_bundle_hash"] = accepted.get("bundle_hash", accepted.get("result_digest"))
+        task["verification_status"] = ("accepted" if verification_applies(task)
+                                       else "legacy_unverified")
 
     status = str(result.get("status") or "")
     blocker = str(result.get("blocker") or "").strip()
@@ -1346,8 +2039,46 @@ def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool)
     else:
         _retry_locked(task_path, task, blocker or "agent reported failed", all_terminal)
 
+
+def acknowledge_dispatch_admission(task_path: Path, task: dict) -> None:
+    nonce = task.get("dispatch_admission_nonce")
+    if nonce is None:
+        return  # Direct/legacy callers have no dispatcher startup handshake.
+    parent_pid = task.get("dispatch_admission_parent_pid")
+    if (not isinstance(nonce, str) or len(nonce) != 32
+            or any(c not in "0123456789abcdef" for c in nonce)
+            or type(parent_pid) is not int or parent_pid != os.getppid()):
+        raise RuntimeError("dispatch_admission_identity_invalid")
+    # Called only with this worker's own SH epoch and coordinator loop lock.
+    # Its own epoch now replaces the dispatcher's temporary parent-death fence.
+    import ctypes
+    if ctypes.CDLL(None, use_errno=True).prctl(1, 0, 0, 0, 0) != 0:
+        raise RuntimeError("dispatch_admission_parent_fence_clear_failed")
+    task["dispatch_admission"] = {"nonce": nonce, "pid": os.getpid(),
+        "start_ticks": process_start_ticks(os.getpid()), "parent_pid": parent_pid}
+    # Consume the startup challenge. Cold/direct reconciliation must not be
+    # mistaken for a child of a dispatcher that no longer exists.
+    task.pop("dispatch_admission_nonce")
+    task.pop("dispatch_admission_parent_pid")
+    write_json(task_path, task)
+
+
 def main(task_path: Path) -> int:
-    lock_fd = os.open(LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+    from herdr.ownership_epoch import legacy_admission_guard
+    try:
+        with legacy_admission_guard(ROOT):
+            return _main_with_epoch(task_path)
+    except Exception as exc:
+        if str(exc) == "ownership_legacy_worker_active":
+            return 0
+        raise
+
+
+def _main_with_epoch(task_path: Path) -> int:
+    # Legacy binaries keep using worker.lock EX; new coordinators use this
+    # separate loop lock while sharing worker.lock with namespace custodians.
+    lock_fd = os.open(ROOT / "worker.loop.lock", os.O_CREAT | os.O_RDWR |
+                      os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     try:
         import fcntl
         try:
@@ -1356,7 +2087,17 @@ def main(task_path: Path) -> int:
             return 0
 
         task = json.loads(task_path.read_text(encoding="utf-8"))
+        if terminal_unknown_hold(task):
+            return 0
+        acknowledge_dispatch_admission(task_path, task)
         task_id = str(task["id"])
+
+        if task.get("verification_resolution") == "needs_replan":
+            return 0
+
+        if task.get("attempt_state") == "verification_pending" and task.get("run_token"):
+            finish(task_path, task, "reconcile completion evidence without redispatch")
+            return 0
 
         if task.get("attempt_state") == "delivery_uncertain" and task.get("run_token"):
             log(
@@ -1381,7 +2122,6 @@ def main(task_path: Path) -> int:
         if (
             isinstance(previous_session, dict)
             and previous_session.get("owned_pane")
-            and not previous_session.get("closed_at")
         ):
             if not cleanup_task_session_if_safe(task):
                 persist_current_task(task)
@@ -1393,6 +2133,22 @@ def main(task_path: Path) -> int:
         attempt_dir = ROOT / "attempts"
         attempt_dir.mkdir(parents=True, exist_ok=True)
         task["task_file"] = str((attempt_dir / f"{task['id']}-{task['run_token']}.json").resolve())
+        try:
+            freeze_plan(ROOT, task)
+            task.pop("completion_plan_pending", None)
+        except EvidenceError as exc:
+            from herdr.evidence import EvidenceUnavailable
+            task["last_error"] = str(exc)
+            if isinstance(exc, EvidenceUnavailable):
+                task["completion_plan_pending"] = True
+                task["attempt_state"] = "retry_scheduled"
+                task["not_before"] = (utcnow() + timedelta(seconds=60)).isoformat()
+                write_json(task_path, task)
+                move(task_path, PENDING)
+            else:
+                task["verification_resolution"] = "needs_replan"
+                block_task(task_path, task, exc.code, "Trusted completion plan is invalid before dispatch.")
+            return 0
         attempt = int(task.get("attempts") or 0)
         decision = decide_model_route(task)
         task["routing"] = decision
@@ -1434,11 +2190,18 @@ def main(task_path: Path) -> int:
                 )
             except Exception as exc:
                 detail = str(exc)
+                from herdr.launch_plan_handoff import LaunchPlanReconciliationRequired
+                if isinstance(exc, LaunchPlanReconciliationRequired):
+                    block_task(task_path, task, "task_launch_plan_reconciliation_required",
+                               "Retained automatic launch evidence must be reconciled without redispatch.")
+                    return 1
                 if detail.startswith(
                     (
                         "task_session_cleanup_failed",
                         "task_session_pane_not_isolated",
                         "task_session_split_uncertain",
+                        "durable_bridge_identity_unverified",
+                        "durable_bridge_cleanup_unverified",
                     )
                 ):
                     block_task(
@@ -1448,7 +2211,14 @@ def main(task_path: Path) -> int:
                         f"Task pane ownership/cleanup could not be proven safe: {detail}",
                     )
                     return 1
-                if detail.startswith(("task_invocation_policy_", "host grant")):
+                from herdr.work_cycle import WorkContractError
+                if isinstance(exc, WorkContractError):
+                    task["verification_status"] = exc.code
+                    task["verification_next_action"] = ("resolve_material_intent" if exc.code == "info_required" else "host_work_replan_required")
+                    block_task(task_path, task, exc.code, detail[:1024])
+                    return 1
+                if detail.startswith(("task_invocation_policy_", "task_work_contract_", "host grant")):
+                    task["invocation_policy_diagnostic"] = _policy_failure_diagnostic(exc)
                     block_task(task_path, task, "task_invocation_policy_unavailable",
                                "Host invocation policy must be supplied before execution.")
                     return 1

@@ -2,6 +2,20 @@
 from herdr.policy_launch import HostPolicyLaunchFactory, PreparedPolicyLaunch, IDENTITY_ENV, CODE_TARGET, RUNTIME_TARGETS
 from herdr.security import InvocationIdentity
 
+def immutable_sources_fixture(proof):
+    from herdr.host_bootstrap import SHIM_SOURCE, STAGE1_SOURCE, STAGE2_SOURCE
+    import hashlib
+    from herdr.security import canonical_json_bytes
+    return {"schema_version": "herdr-immutable-sources-1", "authority": "root-published",
+        "mount_plan": {"schema_version": "herdr-private-mount-plan-1",
+                       "authority": "/etc/herdr/launch-plans/" + hashlib.sha256(canonical_json_bytes(proof["identity"])).hexdigest() + ".json",
+                       "sha256": "e" * 64, "device": 1, "inode": 5},
+        "trees": {target: {"source": "/opt/herdr/test-published/" + str(index),
+                          "manifest_sha256": proof["code_sha256"] if target == str(CODE_TARGET)
+                          else proof["runtime_sha256"][target]}
+                  for index, target in enumerate(proof["tree_identities"])},
+        "executables": dict.fromkeys((SHIM_SOURCE, STAGE1_SOURCE, STAGE2_SOURCE), "f" * 64)}
+
 def policy_fixture(identity, *, modern=False):
     proof={"schema_version":"herdr-policy-launch-2","grant_sha256":"a"*64,"bundle_sha256":"b"*64,
         "bundle_device":1,"bundle_inode":2,"code_sha256":"c"*64,
@@ -23,6 +37,9 @@ class FakePreparedPolicyLaunch(PreparedPolicyLaunch):
         self._identity = identity
         self.mount = None
         self.events = []
+        self.private_plan_handoff = None
+        self._private_handoff_verify = None
+        self._private_handoff_state = None
     @property
     def identity(self):
         return self._identity
@@ -76,3 +93,23 @@ def install_runtime_policy_fixture(monkeypatch, runtime_class):
                                         run_token=record.run_token,fencing_token=record.fencing_token)
             self._policy_launches[record.id]=FakePreparedPolicyLaunch(identity)
     monkeypatch.setattr(runtime_class,"__init__",init)
+
+def install_child_completion_fixture(monkeypatch):
+    from herdr.scheduler import DynamicChildScheduler
+    from herdr.child_evidence import ChildCompletionAuthority,AcceptedChildReceipt,child_identity,child_spec
+    from herdr.evidence import digest
+    class Authority(ChildCompletionAuthority):
+        def __init__(self):
+            self.work_contracts = None  # Explicit historical transport fixture.
+            self.work_factories = {}
+        def prepare(self,rec): pass
+        def instructions(self,rec): return ""
+        def accepted_handoff(self,rec,**kwargs): return None
+        def verify(self,rec,payload):
+            return AcceptedChildReceipt(2,child_identity(rec).to_json(),digest(payload),"a"*64,
+                "b"*64,child_spec(rec),"c"*64,"verified_worker_result")
+    original=DynamicChildScheduler.__init__
+    def init(self,*args,**kwargs):
+        if kwargs.get("completion_authority") is None: kwargs["completion_authority"]=Authority()
+        original(self,*args,**kwargs)
+    monkeypatch.setattr(DynamicChildScheduler,"__init__",init)

@@ -80,14 +80,21 @@ def _task(tmp_path):
     running.mkdir(parents=True)
     path = running / "parent.json"
     task = {"id": "parent", "run_token": "run-1", "idempotency_key": "attempt-1",
-            "attempt_state": "accepted", "task_file": str(path), "repo": "Bbambaaamm/herdr",
-            "issue": 82, "workspace": str(tmp_path), "safety_profile": "herdr-core",
+            "attempt_state": "accepted", "kind":"github_root_orchestration",
+            "task_file": str(path), "repo": "Bbambaaamm/herdr",
+            "fencing_token": 9,
+            "ownership_epoch": {"version": 1, "run_token": "run-1", "fencing_token": 9},
+            "issue": 82, "workspace": str(tmp_path/"workspace"), "safety_profile": "herdr-core",
             "worktree_root": "/home/agentops/workspaces/herdr/worktrees",
             "parent_role": "writer", "parent_tools": ["read_file", "search_files"],
             "parent_permissions": [], "execution_session": {
                 "agent_name": "parent-agent", "pane_id": "parent-pane",
                 "pane_marker": "marker", "session_name": "marker", "owned_pane": True}}
+    Path(task["workspace"]).mkdir()
+    from agent_completion_evidence import freeze_plan
+    freeze_plan(state, task)
     path.write_text(json.dumps(task), encoding="utf-8")
+    path.chmod(0o600)
     return task, path
 
 
@@ -279,7 +286,8 @@ def test_capacity_denial_releases_parent_gate_without_reprompt(tmp_path, monkeyp
     monkeypatch.setattr(recovery, "cleanup_task_owned_pane", lambda parent: True)
     recovery.terminalize_from_result(
         path, task, {"task_id": "parent", "run_token": "run-1",
-                     "status": "completed", "evidence": ["done"]}, 0)
+                     "status": "completed", "evidence": ["done"],
+                     "summary":"Control cycle completed", "next_action":"Await authorized work"}, 0)
     assert (recovery.DONE / path.name).exists()
 
 
@@ -543,7 +551,8 @@ def test_parent_transition_serializes_real_child_claim(tmp_path, monkeypatch, tr
         setattr(module, name, directory)
     if transition != "worker_retry":
         result = {"task_id": "parent", "run_token": "run-1", "status": "completed",
-                  "evidence": ["done"]}
+                  "evidence": ["done"], "summary":"Control cycle completed",
+                  "next_action":"Await authorized work"}
         (module.RESULTS / "parent.json").write_text(json.dumps(result))
     if transition == "recovery_result":
         monkeypatch.setattr(module, "cleanup_task_owned_pane", lambda task: True)
@@ -1008,6 +1017,11 @@ def explicit_host_policy_for_lifecycle_tests(monkeypatch):
     from herdr.runtime import HerdrChildRuntime
     install_runtime_policy_fixture(monkeypatch, HerdrChildRuntime)
 
+@pytest.fixture(autouse=True)
+def explicit_host_completion_port_for_lifecycle_only(monkeypatch):
+    from tests.policy_launch_fakes import install_child_completion_fixture
+    install_child_completion_fixture(monkeypatch)
+
 
 def test_standalone_bridge_supplies_deferred_verified_parent_factory(monkeypatch,tmp_path):
     from herdr import host_configuration
@@ -1019,4 +1033,146 @@ def test_standalone_bridge_supplies_deferred_verified_parent_factory(monkeypatch
         "--run-token","run","--agent","agent","--pane","pane","--marker","marker","--real-binary","/bin/true"]
     monkeypatch.setattr(sys,"argv",argv);server.main()
     assert captured["kwargs"]["policy_launch_factory_provider"] is factory_provider
+    from agent_completion_evidence import child_completion_for_root
+    assert captured["kwargs"]["completion_authority_provider"] is child_completion_for_root
     assert captured["args"][1]["task_id"]=="parent"
+
+
+def test_authenticated_bridge_carries_ownership_into_actual_claim_and_runtime(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from herdr.child_ownership import ChildOwnership,WriteScope,OwnershipRegistry
+    from herdr.security import InvocationIdentity
+    from herdr.policy_launch import HostPolicyLaunchFactory
+    task,path=_task(tmp_path)
+    task["parent_tools"]=["read_file","write_file"]
+    task["parent_permissions"]=["workspace-write"]
+    path.write_text(json.dumps(task))
+    _env(monkeypatch,path)
+    owner=InvocationIdentity("github:"+task["repo"],"parent-agent","coordinator","coordinator-task",
+        task["id"],task["run_token"],9)
+    # Typed host-factory transport fixture; physical signed-grant/mount behavior
+    # is proved by the installed SDK/bootstrap and Linux kernel tests separately.
+    factory=HostPolicyLaunchFactory.__new__(HostPolicyLaunchFactory)
+    factory.parent_grant=SimpleNamespace(identity=owner)
+    scope=ChildOwnership((WriteScope("file","own.py"),),(),(),(),"parent","artifact://handoff/owned")
+    captured={}
+    class Runtime:
+        def __init__(self,scheduler,runner,**kwargs):self.scheduler=scheduler
+        def run_managed_child(self,lease,prompt,**kwargs):
+            rec=self.scheduler._tasks[lease.task_id]
+            captured.update(ownership=rec.ownership,reservation=rec.ownership_reservation,
+                identity=InvocationIdentity(owner.consumer,rec.agent_id,owner.agent_id,owner.task_id,
+                    rec.id,rec.run_token,rec.fencing_token))
+    monkeypatch.setattr(bridge,"HerdrChildRuntime",Runtime)
+    args=argparse.Namespace(key="owned",role="writer",objective="Scoped change",prompt="Write owned file",
+        tool=["write_file"],permission=["workspace-write"],ownership=scope.to_json())
+    with _test_pin(tmp_path,tmp_path.parent) as held:
+        first=bridge._delegate_pinned(args,None,Path("/bin/true"),task,"parent-pane",
+            "parent-agent","marker",held,policy_launch_factory=factory)
+    assert captured["ownership"]==scope
+    store=OwnershipRegistry(path.parent.parent)
+    row=store.snapshot()["reservations"][captured["reservation"]]
+    assert row["ownership"]==scope.to_json()
+    assert store.require_current(captured["reservation"],captured["identity"])
+    assert first["task_id"]==captured["identity"].task_id
+
+
+def test_parent_without_frozen_child_contract_delivers_once_and_never_invents_verified_handoff(tmp_path,monkeypatch):
+    # Remove the lifecycle-only semantic-authority fixture: this exercises the
+    # actual policy-less production path. Process dispatch alone is a fixture.
+    monkeypatch.undo()
+    task,path=_task(tmp_path);_env(monkeypatch,path)
+    assert "child_completion_contracts" not in task
+    monkeypatch.setattr(bridge,"_parent_context",
+                        lambda runner:(task,"parent-pane","parent-agent","marker"))
+    deliveries=[];cleanups=[]
+    class Runtime:
+        def __init__(self,scheduler,runner,**kwargs):
+            self.scheduler=scheduler;self.directory=kwargs["snapshot_path"].parent
+        def run_managed_child(self,lease,prompt,*,run_token,idempotency_key):
+            assert self.scheduler.completion_authority is None
+            assert "HOST CHILD COMPLETION CONTRACT" not in prompt
+            assert self.scheduler.bind_execution_session(lease.task_id,run_token,lease.agent_id,
+                                                         "child-pane","child-"+run_token)
+            deliveries.append(lease.task_id)
+            evidence=[{"observation":"bounded candidate without semantic acceptance"}]
+            checksum=hashlib.sha256(json.dumps(evidence,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+            payload={"task_id":lease.task_id,"run_token":run_token,"fencing_token":lease.fencing_token,
+                     "idempotency_key":idempotency_key,"status":"completed",
+                     "evidence":evidence,"artifact_sha256":checksum}
+            result=self.directory/"results"/(lease.task_id+".result.json")
+            result.write_text(json.dumps(payload));result.chmod(0o600)
+            return "settled"
+        def cleanup_bound_child(self,task_id):cleanups.append(task_id)
+    monkeypatch.setattr(bridge,"HerdrChildRuntime",Runtime)
+    request=argparse.Namespace(key="no-contract",role="reader",objective="inspect",
+                              prompt="read files",tool=["read_file"],permission=[])
+    first=bridge.delegate(request,completion_authority=None)
+    second=bridge.delegate(request,completion_authority=None)
+    assert first["state"]==second["state"]=="blocked"
+    assert first["result_status"]==second["result_status"]=="blocked"
+    assert first["accepted_handoff"] is second["accepted_handoff"] is None
+    assert first["cleanup_complete"] and second["cleanup_complete"]
+    assert deliveries==[first["task_id"]] and cleanups==[first["task_id"]]
+    directory=attempt_directory(path.parent.parent,task["id"],task["run_token"])
+    restored=DynamicChildScheduler(audit_log=AuditLog(directory/"scheduler.jsonl"));restored.replay()
+    rec=restored._tasks[first["task_id"]]
+    assert rec.lease is None and rec.completion_receipt is None
+    assert rec.completion_failure["code"]=="evidence_invalid"
+
+@pytest.mark.parametrize("version,kind,parent_has_verify,expected", [
+    (2,"coding",True,True),(3,"coding",True,True),
+    (1,"coding",True,False),(3,"research",True,False),
+    (3,"coding",False,"denied"),(3,"coding",True,"role_denied"),
+])
+def test_actual_delegate_selects_only_protected_coding_verification_scope(
+        tmp_path,monkeypatch,version,kind,parent_has_verify,expected):
+    from herdr.child_evidence import ChildCompletionAuthority,child_scope_spec
+    from herdr.evidence import EvidenceStore,EvidenceError
+    from herdr.scheduler import ChildProposal
+
+    task,path=_task(tmp_path)
+    task["parent_tools"]=["read_file","search_files","herdr_submit_result"]
+    if parent_has_verify:task["parent_tools"].append("herdr_verify_work")
+    path.write_text(json.dumps(task))
+    _env(monkeypatch,path)
+    workspace=tmp_path/"child";workspace.mkdir()
+    args=argparse.Namespace(key="coding-scope",
+        role="writer" if kind=="coding" and expected!="role_denied" else "reader",objective="inspect",
+        prompt="read files",tool=["read_file"],permission=[])
+    authority=ChildCompletionAuthority(store=EvidenceStore(tmp_path/"completion"),
+        approve=lambda **kwargs:None,collector=lambda *args:None)
+    seen=[]
+    class ProposalCaptured(Exception):pass
+    def capture(self,parent_id,parent_token,key,proposal):
+        decision=self.consumer_policy.evaluate_child_proposal(proposal)
+        assert bool(decision)==(expected!="role_denied")
+        seen.append(proposal)
+        raise ProposalCaptured()
+    monkeypatch.setattr(DynamicChildScheduler,"delegate_child",capture)
+    with _test_pin(workspace) as pinned:
+        preview=ChildProposal(parent_role=task["parent_role"],
+            parent_tools=tuple(task["parent_tools"]),child_role=args.role,
+            child_tools=("herdr_submit_result","herdr_verify_work","read_file"),
+            child_task=args.objective,parent_permissions=(),child_permissions=(),
+            worktree_identity=pinned.identity)
+        document=dict(repo=task["repo"],issue=str(task["issue"]),
+            parent_task_id=task["id"],parent_agent_id="parent-agent",
+            objective=preview.child_task,role=preview.child_role,
+            tools=list(preview.child_tools),permissions=[],
+            worktree_identity=preview.worktree_identity)
+        authority.work_contracts={"version":version,"children":{
+            child_scope_spec(document):{"kind":kind,
+                "work_contract_version":1 if kind=="coding" else 0}}}
+        error=EvidenceError if expected=="denied" else ProposalCaptured
+        with pytest.raises(error):
+            bridge._delegate_pinned(args,None,Path("/bin/true"),task,
+                "parent-pane","parent-agent","marker",pinned,
+                completion_authority=authority)
+    if expected=="denied":
+        assert seen==[]
+    else:
+        assert len(seen)==1
+        assert ("herdr_verify_work" in seen[0].child_tools)==(expected is True or expected=="role_denied")
+        assert seen[0].child_role==args.role
+        assert set(seen[0].child_tools)<=set(task["parent_tools"])

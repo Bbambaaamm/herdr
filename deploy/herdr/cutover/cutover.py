@@ -36,7 +36,7 @@ from herdr.release import (  # noqa: E402
     ReleaseError,
     canonical_json,
     consumer_digest,
-    safe_extract,
+    extract_archive,
     sha256,
     verify_archive,
     verify_tree,
@@ -537,8 +537,7 @@ def compare_trees(candidate: Path, legacy: Path) -> dict[str, object]:
 
 
 def extract_candidate(archive: Path, destination: Path) -> Path:
-    with tarfile.open(archive, "r:gz") as bundle:
-        safe_extract(bundle, destination)
+    extract_archive(archive, destination)
     roots = list(destination.iterdir())
     need(len(roots) == 1 and roots[0].is_dir(), "invalid_release_archive_root")
     verify_tree(roots[0])

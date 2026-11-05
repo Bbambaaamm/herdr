@@ -78,6 +78,7 @@ class ModelReview:
     model: str
     verdict: ReviewVerdict
     review_sha256: str
+    spec_hash: str | None = None
 
     def __post_init__(self) -> None:
         for value, field_name in (
@@ -141,6 +142,7 @@ class ReviewerGate:
         )
     )
     protected_paths: tuple[str, ...] = ()
+    require_spec_binding: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -170,6 +172,7 @@ class ReviewerGate:
         model_review = inp.model_review
         evidence_digest = self.evidence_digest(inp.evidence)
         payload = {
+            "spec_hash": inp.spec_hash,
             "verdict": verdict.value,
             "reason": reason.value,
             "task_id": artifact.task_id,
@@ -280,6 +283,7 @@ class ReviewerGate:
         if (
             model_review.artifact_result_sha != inp.artifact.result_sha
             or model_review.evidence_digest != evidence_digest
+            or self.require_spec_binding and model_review.spec_hash != inp.spec_hash
         ):
             return self._record(
                 inp, ReviewVerdict.BLOCK, ReviewReason.MODEL_REVIEW_STALE
