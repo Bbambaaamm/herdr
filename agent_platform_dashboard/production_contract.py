@@ -203,8 +203,8 @@ def row(kind, value):
                  and task['attempt'] <= task['max_attempts'])
             attempt_state = task.get('attempt_state')
             need(attempt_state is None or attempt_state in (
-                'dispatching', 'accepted', 'working', 'delivery_uncertain', 'verifying',
-                'completed', 'done', 'blocked', 'failed', 'retry_scheduled'))
+                'dispatching', 'accepted', 'working', 'delivery_uncertain', 'terminal_unknown', 'verifying',
+                'completed', 'done', 'blocked', 'failed', 'retry_scheduled', 'verification_pending'))
             need(number(task.get('delivery_reconcile_count', 0)))
             need(task['blocker'] is None or identifier(task['blocker'], 128))
             need(number(task['fencing_token']))
@@ -372,22 +372,25 @@ def observability(model):
     keys(model, 'version lifecycle metrics inventory')
     need(type(model['version']) is int and model['version'] == 1)
     need(type(model['lifecycle']) is list and len(model['lifecycle']) == len(AXES)
+         and all(type(r) is dict for r in model['lifecycle'])
          and [r.get('id') for r in model['lifecycle']] == list(AXES))
     need(type(model['metrics']) is list and len(model['metrics']) <= 128)
     need(type(model['inventory']) is list and len(model['inventory']) == len(INVENTORY)
+         and all(type(r) is dict for r in model['inventory'])
          and [r.get('id') for r in model['inventory']] == list(INVENTORY))
     ids = set()
     for metric in model['lifecycle'] + model['metrics']:
         need(type(metric) is dict and set(metric) in (
             set('id value unit window source freshness source_age_seconds coverage reason'.split()),
             set('id value unit window source freshness source_age_seconds coverage reason evidence_hash'.split())))
-        need(identifier(metric['id'], 80) and metric['id'] not in ids)
+        need(type(metric['id']) is str and identifier(metric['id'], 80) and metric['id'] not in ids)
         ids.add(metric['id'])
         need(metric['value'] is None or type(metric['value']) in (int, bool)
              and (type(metric['value']) is bool or number(metric['value']))
              or type(metric['value']) is str and identifier(metric['value'], 80))
-        need(identifier(metric['unit'], 32) and identifier(metric['window'], 32)
-             and identifier(metric['source'], 80))
+        need(type(metric['unit']) is str and identifier(metric['unit'], 32)
+             and type(metric['window']) is str and identifier(metric['window'], 32)
+             and type(metric['source']) is str and identifier(metric['source'], 80))
         need(metric['freshness'] in ('fresh', 'stale', 'unavailable', 'unknown'))
         need(metric['source_age_seconds'] is None or number(metric['source_age_seconds']))
         keys(metric['coverage'], 'covered denominator')
@@ -400,7 +403,7 @@ def observability(model):
         keys(row, 'id status reason source freshness source_age_seconds coverage')
         need(row['id'] in INVENTORY and row['status'] in ('available', 'UNKNOWN'))
         need(row['reason'] is None or identifier(row['reason'], 64))
-        need(identifier(row['source'], 80))
+        need(type(row['source']) is str and identifier(row['source'], 80))
         need(row['freshness'] in ('fresh', 'stale', 'unavailable', 'unknown'))
         need(row['source_age_seconds'] is None or number(row['source_age_seconds']))
         keys(row['coverage'], 'covered denominator')
@@ -437,12 +440,12 @@ def project(value, profiles, now):
          and all(p in PROFILES for p in profiles) and number(now))
     result = parse(encode(value))
     result['sources'] = [source for source in result['sources'] if source['profile'] in profiles]
-    # Rebuild from the authorized source subset at request time. This both
-    # prevents cross-profile leakage and updates source_age/freshness instead
-    # of replaying the exporter-time freshness label.
+    for source in result['sources']:
+        if (not 0 <= now - source['observed_at'] <= 90
+                or source['data_at'] is not None and source['data_at'] > now):
+            source.update(status='unavailable', reason='stale', rows=[], data_at=None)
+    # Rebuild only after authorization and temporal invalidation. Values from
+    # a source removed above cannot survive as fresh/available observations.
     from .observability import build
     result['observability'] = build(result, now=now, visible_profiles=profiles)
-    for source in result['sources']:
-        if not 0 <= now - source['observed_at'] <= 90:
-            source.update(status='unavailable', reason='stale', rows=[], data_at=None)
     return result

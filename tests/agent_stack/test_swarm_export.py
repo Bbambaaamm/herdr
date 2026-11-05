@@ -86,6 +86,25 @@ class SwarmExportTests(unittest.TestCase):
         self.assertEqual(rows[0]["tasks"][0]["state"], "done")
         self.assertEqual(rows[0]["edges"], [])
 
+
+    def test_terminal_unknown_stays_blocked_through_snapshot_pipeline(self):
+        from agent_platform_dashboard import production_contract as contract
+        self.write_task("blocked", self.herdr_task(
+            "root", attempt_state="terminal_unknown", fencing_token=7,
+            watchdog_blocker="terminal_unknown_delivery", delivery_reconcile_count=20))
+        payload = self.exporter.materialize(self.exporter.load_records(), observed_at=100)
+        self.assertEqual(payload["tasks"][0]["state"], "blocked")
+        self.assertEqual(payload["tasks"][0]["attempt_state"], "terminal_unknown")
+        self.assertEqual(payload["tasks"][0]["blocker"], "terminal_unknown_delivery")
+        self.assertEqual(payload["agents"], [])
+        self.exporter.publish(payload)
+        with patch.object(sources, "SWARM_PATH", str(self.output)):
+            rows, stamp = sources.swarm(str(self.output), "quantlab")
+        self.assertEqual(stamp, 100)
+        contract.row("swarm", rows[0])
+        self.assertEqual(rows[0]["tasks"][0]["state"], "blocked")
+        self.assertIsNone(rows[0]["tasks"][0]["result_sha"])
+
     def test_runtime_projection_keeps_live_state_separate_from_durable_delivery_uncertain(self):
         self.write_task(
             "pending",
@@ -238,6 +257,35 @@ class SwarmExportTests(unittest.TestCase):
         self.assertEqual(command([sys.executable, "-c",
                          "import sys; sys.stderr.write('x'*1000000); print('ok')"],
                          limit=1024, timeout=2), b"ok\n")
+
+    def test_verification_wait_remains_same_blocked_attempt_in_valid_public_snapshot(self):
+        self.write_task("blocked", self.herdr_task(
+            attempt_state="verification_pending", verification_status="evidence_unavailable",
+            attempts=1, run_token="same-run"))
+        payload = self.exporter.materialize(self.exporter.load_records(), observed_at=100)
+        row = payload["tasks"][0]
+        self.assertEqual(row["state"], "blocked")
+        self.assertEqual(row["attempt_state"], "verification_pending")
+        self.assertEqual(row["blocker"], "evidence_unavailable")
+        self.assertEqual(row["attempts"], 1)
+        self.exporter.publish(payload)
+        previous = sources.SWARM_PATH
+        try:
+            sources.SWARM_PATH = str(self.output)
+            normalized, _ = sources.swarm(str(self.output), "quantlab")
+        finally:
+            sources.SWARM_PATH = previous
+        self.assertEqual(normalized[0]["tasks"][0]["attempt_state"], "verification_pending")
+
+    def test_permanent_verification_replan_exports_reason(self):
+        self.write_task("blocked", self.herdr_task(
+            attempt_state="blocked", verification_status="evidence_invalid",
+            verification_resolution="needs_replan", attempts=1, run_token="same-run"))
+        payload = self.exporter.materialize(self.exporter.load_records(), observed_at=100)
+        row = payload["tasks"][0]
+        self.assertEqual(row["state"], "blocked")
+        self.assertEqual(row["blocker"], "evidence_invalid")
+        self.assertEqual(row["attempts"], 1)
 
     def test_closed_issue_is_explicit_and_cannot_mask_open_work(self):
         self.exporter.INTAKE.write_text(

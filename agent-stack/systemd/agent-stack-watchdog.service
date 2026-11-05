@@ -10,7 +10,6 @@ Group=agentops
 WorkingDirectory=/opt/herdr/current
 Environment=HOME=/home/agentops
 Environment=PATH=/opt/herdr/current/agent-stack/bin:/home/agentops/.local/node24/bin:/home/agentops/.local/bin:/usr/local/bin:/usr/bin:/bin
-Environment=LD_LIBRARY_PATH=/home/agentops/.local/playwright-libs/root/usr/lib/x86_64-linux-gnu
 Environment=AGENT_BROWSER_ARGS=--no-sandbox,--disable-dev-shm-usage
 ExecStartPre=/opt/herdr/current/agent-stack/bin/agent-stack-ensure
 ExecStart=/opt/herdr/current/agent-stack/bin/agent-stack-watchdog

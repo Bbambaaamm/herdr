@@ -1,6 +1,10 @@
 """Host startup environment controls for trusted native/Python bootstrap."""
 from __future__ import annotations
-import os
+from .observed_proc import os
+
+# Existing measured allowance for verifying pinned code, Hermes and Python
+# before a host entrypoint can serve or acknowledge admission.
+IMMUTABLE_HOST_STARTUP_TIMEOUT_SECONDS = 60.0
 
 # Clear before the first native executable, including the pane shell and FD
 # launcher. Unsetting only in the shim would be too late for its /bin/sh loader.
@@ -23,7 +27,7 @@ def require_clean_environment(environment):
 
 def process_environment(pid):
     """Read a bounded exact process environment; duplicates are ambiguous."""
-    from pathlib import Path
+    from .observed_proc import Path
     if type(pid) is not int or pid <= 0:
         raise ValueError("invalid startup process")
     with Path(f"/proc/{pid}/environ").open("rb") as stream:
@@ -47,7 +51,7 @@ def require_clean_spawn_source(pane_shell_pid):
     loader directive in any ancestor blocks creating a managed pane; this
     function never edits a running server or restarts a service.
     """
-    from pathlib import Path
+    from .observed_proc import Path
     if type(pane_shell_pid) is not int or pane_shell_pid <= 0:
         raise ValueError("invalid pane startup source")
     shell=Path(f"/proc/{pane_shell_pid}/stat").read_text().rsplit(")",1)[1].split()

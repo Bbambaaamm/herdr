@@ -1,9 +1,10 @@
 """Portable skills: lazy context, immutable provenance and closed grants."""
+import ast
 import hashlib
 import json
 import os
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pytest
 
@@ -374,6 +375,36 @@ def test_legacy_tools_alias_normalizes_to_registry_tool_use(tmp_path, registry_f
         replace(item[2], features=("tools", "tool_use"))
 
 
+def _manifest_fixture_paths(source):
+    """Read the generator's static FILES declaration without running its code."""
+    tree = ast.parse(source)
+    declarations = [node for node in tree.body if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "FILES" for target in node.targets)]
+    if (len(declarations) != 1 or len(declarations[0].targets) != 1
+            or not isinstance(declarations[0].targets[0], ast.Name)
+            or not isinstance(declarations[0].value, (ast.Tuple, ast.List))
+            or sum(isinstance(node, ast.Name) and node.id == "FILES" and isinstance(node.ctx, ast.Store)
+                   for node in ast.walk(tree)) != 1):
+        raise ValueError("expected one static FILES declaration")
+    paths = []
+    for node in declarations[0].value.elts:
+        if (not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name) or node.func.id != "Path"
+                or len(node.args) != 1 or node.keywords or not isinstance(node.args[0], ast.Constant)
+                or type(node.args[0].value) is not str):
+            raise ValueError("required source must be a static Path literal")
+        value = node.args[0].value
+        if (not value or "\\" in value or ":" in value or "\0" in value
+                or PurePosixPath(value).is_absolute() or PureWindowsPath(value).drive
+                or any(part in {"", ".", ".."} for part in value.split("/"))):
+            raise ValueError("required fixture source must stay relative")
+        if value.casefold() in {path.casefold() for path in paths}:
+            raise ValueError("duplicate required fixture source")
+        paths.append(value)
+    if not paths:
+        raise ValueError("empty required source inventory")
+    return tuple(paths)
+
+
 @pytest.mark.parametrize("suffix,media_type,raw", [
     (".png", "image/png", b"\x89PNG\r\n\x1a\n"),
     (".jpg", "image/jpeg", b"\xff\xd8\xff"),
@@ -394,10 +425,7 @@ def test_source_manifest_accepts_declared_assets_and_preserves_exact_bytes(tmp_p
     manifest = replace(manifest, files=tuple(
         replace(x, media_type=media_type) if x.path.startswith("assets/") else x for x in manifest.files))
     (root / "manifest.json").write_bytes(canonical(manifest.to_json()))
-    for path in ("configs/consumers/herdr.yaml", "docs/CONSUMERS.md",
-                 "docs/architecture/AGENT_SKILLS.md", "docs/architecture/CONTEXT_MEMORY.md",
-                 "package.json", "package-lock.json", "requirements-mcp.txt",
-                 "docs/architecture/MCP_GATEWAY.md", "docs/architecture/INVOCATION_POLICY_LAUNCH.md"):
+    for path in _manifest_fixture_paths(script.read_text(encoding="utf-8")):
         target = workspace / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("{}\n")
@@ -408,6 +436,52 @@ def test_source_manifest_accepts_declared_assets_and_preserves_exact_bytes(tmp_p
     (root / "assets/unlisted").write_text("must not enter release")
     result = subprocess.run([sys.executable, str(script)], cwd=workspace, capture_output=True, text=True)
     assert result.returncode != 0
+
+
+
+def test_manifest_fixture_declarations_are_static_and_support_new_required_docs():
+    source = "raise RuntimeError('setup must not execute generator')\nFILES = (Path('package.json'), Path('docs/architecture/FUTURE_REQUIRED.md'))\n"
+    assert _manifest_fixture_paths(source) == ("package.json", "docs/architecture/FUTURE_REQUIRED.md")
+
+
+@pytest.mark.parametrize("value", ["/absolute", "../outside", "docs/../outside", "docs//alias", "./alias",
+    "C:/outside", "C:outside", "docs\\outside", "docs/file:stream", "\\\\server\\share", "\0", ""])
+def test_manifest_fixture_rejects_unsafe_required_source_paths(value):
+    with pytest.raises(ValueError, match="stay relative"):
+        _manifest_fixture_paths("FILES = (Path("+repr(value)+"),)\n")
+
+
+@pytest.mark.parametrize("source", [
+    "FILES = tuple(Path('docs/a.md') for _ in range(1))",
+    "FILES = (Path(dynamic_name),)", "FILES = (other('docs/a.md'),)",
+    "FILES = (Path('docs/a.md', 'nested'),)", "FILES = (Path(path='docs/a.md'),)",
+    "FILES = (Path('docs/a.md'),)\nFILES += (Path('docs/b.md'),)",
+    "FILES = (Path('docs/a.md'), Path('docs/a.md'))",
+    "FILES = (Path('docs/a.md'), Path('docs/A.md'))", "FILES = ()",
+])
+def test_manifest_fixture_rejects_dynamic_or_ambiguous_declarations(source):
+    with pytest.raises(ValueError):
+        _manifest_fixture_paths(source)
+
+
+def test_source_manifest_still_requires_every_declared_static_source(tmp_path):
+    import subprocess
+    import sys
+    script = Path(__file__).resolve().parents[2] / "scripts/refresh_source_manifest.py"
+    paths = _manifest_fixture_paths(script.read_text(encoding="utf-8"))
+    workspace = tmp_path / "missing-required-workspace"
+    workspace.mkdir()
+    missing = paths[0]
+    for path in paths[1:]:
+        target = workspace / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("{}\n")
+    # Run the actual generator as the oracle only after constructing the fixture.
+    # Missing required files must fail, rather than being filtered out of FILES.
+    result = subprocess.run([sys.executable, str(script)], cwd=workspace, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert Path(missing).name in result.stderr
+    assert not (workspace / "provenance/CANONICAL_SOURCE_MANIFEST.sha256").exists()
 
 
 def test_declared_capability_must_be_implemented_by_selected_executor(tmp_path, registry_factory):
@@ -523,10 +597,8 @@ def test_source_manifest_rejects_nonregular_skill_tree_entries(tmp_path, kind):
     skill_root = workspace / "skills"
     skill_root.mkdir()
     item = package(skill_root)
-    for path in ("configs/consumers/herdr.yaml", "docs/CONSUMERS.md",
-                 "docs/architecture/AGENT_SKILLS.md", "docs/architecture/CONTEXT_MEMORY.md",
-                 "package.json", "package-lock.json", "requirements-mcp.txt",
-                 "docs/architecture/MCP_GATEWAY.md", "docs/architecture/INVOCATION_POLICY_LAUNCH.md"):
+    script = Path(__file__).resolve().parents[2] / "scripts/refresh_source_manifest.py"
+    for path in _manifest_fixture_paths(script.read_text(encoding="utf-8")):
         target = workspace / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("{}\n")
@@ -542,7 +614,6 @@ def test_source_manifest_rejects_nonregular_skill_tree_entries(tmp_path, kind):
     else:
         skill_root.rename(workspace / "real-skills")
         skill_root.symlink_to(workspace / "real-skills", target_is_directory=True)
-    script = Path(__file__).resolve().parents[2] / "scripts/refresh_source_manifest.py"
     result = subprocess.run([sys.executable, str(script)], cwd=workspace,
                             capture_output=True, text=True, timeout=3)
     assert result.returncode != 0 and ("Nonregular skill" in result.stderr or "Non-directory skill" in result.stderr)

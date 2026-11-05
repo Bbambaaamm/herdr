@@ -73,8 +73,38 @@ def _profile_scoped_item(id, unit='state'):
     return item(id, unit=unit, reason='profile_scoped')
 
 
+def _time_bounded_source(source, now):
+    # A clock rollback or future data timestamp cannot become fresh via age=0.
+    # Return a view only; preserve the caller's immutable source snapshot.
+    if (source['status'] == 'available'
+            and (source['observed_at'] > now
+                 or source['data_at'] is not None and source['data_at'] > now)):
+        return {**source, 'status': 'unavailable', 'reason': 'stale',
+                'rows': [], 'data_at': None}
+    return source
+
+
+def _routing_state(source, now):
+    """The embedded router is a separate producer from enclosing Codex usage."""
+    freshness, age, reason = _state(source, now)
+    if source is None or source['status'] != 'available':
+        return None, freshness, age, reason
+    row = source['rows'][0] if len(source['rows']) == 1 else None
+    if row is None or row.get('routing_status') != 'available':
+        return None, 'unavailable', None, 'routing_unavailable'
+    stamp = row.get('routing_observed_at')
+    stamps = (source['observed_at'], stamp)
+    if source['data_at'] is not None:
+        stamps += (source['data_at'],)
+    if any(type(value) is not int or not 0 <= value <= now for value in stamps):
+        return None, 'unavailable', None, 'routing_time_invalid'
+    age = max(int(now - value) for value in stamps)
+    return row, ('stale' if age > FRESH_SECONDS else 'fresh'), age, None
+
+
 def _inventory(snapshot, now, visible_profiles):
-    sources = {(row['profile'], row['kind']): row for row in snapshot['sources']}
+    sources = {(row['profile'], row['kind']): _time_bounded_source(row, now)
+               for row in snapshot['sources']}
     rows = []
     for id, binding in INVENTORY.items():
         if binding is None:
@@ -116,11 +146,10 @@ def _inventory(snapshot, now, visible_profiles):
         elif len(available) < denominator:
             reason = 'partial_source_coverage'
         if id == 'model_routing' and available:
-            routing = available[0]['rows'][0] if len(available[0]['rows']) == 1 else None
-            if routing is None or routing.get('routing_status') != 'available':
-                reason = 'routing_unavailable'
+            routing, freshness, routing_age, reason = _routing_state(available[0], now)
+            ages = [] if routing_age is None else [routing_age]
+            if routing is None:
                 available = []
-                freshness = 'unavailable'
         rows.append(dict(
             id=id, status='available' if available else 'UNKNOWN',
             reason=reason, source=source_name, freshness=freshness,
@@ -260,7 +289,8 @@ def build(snapshot, *, now=None, visible_profiles=None):
         visible_profiles if visible_profiles is not None
         else sorted({row['profile'] for row in snapshot['sources']})
     )
-    sources = {(row['profile'], row['kind']): row for row in snapshot['sources']}
+    sources = {(row['profile'], row['kind']): _time_bounded_source(row, now)
+               for row in snapshot['sources']}
 
     if 'quantlab' in visible_profiles:
         swarm = sources.get(('quantlab', 'swarm'))
@@ -362,13 +392,7 @@ def build(snapshot, *, now=None, visible_profiles=None):
 
     if 'majak' in visible_profiles:
         codex = sources.get(('majak', 'codex'))
-        freshness, age, source_reason = _state(codex, now)
-        routing = (
-            codex['rows'][0]
-            if codex and codex['status'] == 'available' and len(codex['rows']) == 1
-            and codex['rows'][0].get('routing_status') == 'available'
-            else None
-        )
+        routing, freshness, age, source_reason = _routing_state(codex, now)
         decisions = routing['routing_decisions'] if routing else 0
         for field, unit in (
             ('routing_decisions', 'decisions'),
@@ -387,14 +411,17 @@ def build(snapshot, *, now=None, visible_profiles=None):
                 'no_decisions' if routing and decisions == 0
                 else source_reason if routing is None else None,
             ))
+        route_reason = routing['last_route_reason'] if routing else None
+        reason_over_bound = bool(route_reason and len(route_reason) > 80)
         metrics.append(item(
             'majak.model_routing.last_route_reason',
-            routing['last_route_reason'] if routing and routing['last_route_reason'] else None,
+            route_reason if route_reason and not reason_over_bound else None,
             'reason', 'latest', 'majak/codex',
             freshness if routing else 'unavailable', age,
-            1 if routing and routing['last_route_reason'] else 0,
+            1 if route_reason and not reason_over_bound else 0,
             1 if routing else 0,
-            'reason_unavailable' if routing and not routing['last_route_reason']
+            'reason_over_bound' if reason_over_bound
+            else 'reason_unavailable' if routing and not route_reason
             else source_reason if routing is None else None,
         ))
         metrics.append(item(

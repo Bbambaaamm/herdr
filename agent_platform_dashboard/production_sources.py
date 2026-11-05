@@ -32,11 +32,11 @@ class StaleSource(ValueError):
     pass
 
 
-def command(argv, *, env=None, limit=65536, timeout=3):
+def command(argv, *, env=None, limit=65536, timeout=3, pass_fds=()):
     """Bound bytes while draining; no communicate() allocation of unlimited output."""
     process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, env=SAFE_ENV if env is None else env,
-                               start_new_session=True, close_fds=True)
+                               start_new_session=True, close_fds=True, pass_fds=pass_fds)
     deadline = time.monotonic() + timeout
     result = bytearray()
     try:
@@ -44,7 +44,8 @@ def command(argv, *, env=None, limit=65536, timeout=3):
             selector.register(process.stdout, selectors.EVENT_READ)
             while True:
                 left = deadline - time.monotonic()
-                c.need(left > 0)
+                if left <= 0:
+                    raise ValueError("source_timeout")
                 if not selector.select(left):
                     raise ValueError('source_timeout')
                 chunk = os.read(process.stdout.fileno(), min(8192, limit + 1 - len(result)))
@@ -205,9 +206,17 @@ SEARCH_COLUMNS = {
 }
 SEARCH_SQL = '''SELECT route_mode,actual_provider,fallback_provider,count(*),
 sum(CASE WHEN success=1 THEN 1 ELSE 0 END),
-sum(duration_ms),max(duration_ms),sum(coalesce(fallback_used,0)),
+CASE WHEN count(duration_ms)=count(*) THEN sum(duration_ms) END,
+CASE WHEN count(duration_ms)=count(*) THEN max(duration_ms) END,
+sum(coalesce(fallback_used,0)),
 CASE WHEN count(cost_usd)=count(*) THEN sum(cost_usd) END,
-sum(result_count),sum(extract_count),max(coalesce(ended_at,started_at)) FROM
+CASE WHEN count(result_count)=count(*) THEN sum(result_count) END,
+CASE WHEN count(extract_count)=count(*) THEN sum(extract_count) END,
+sum(CASE WHEN cost_usd IS NOT NULL
+          AND (typeof(cost_usd) NOT IN ('real','integer')
+               OR NOT (cost_usd >= 0 AND cost_usd < 100000000))
+         THEN 1 ELSE 0 END) AS invalid_cost,
+max(coalesce(ended_at,started_at)) FROM
 (SELECT id,started_at,ended_at,route_mode,actual_provider,fallback_provider,
         fallback_used,duration_ms,result_count,extract_count,success,cost_usd
  FROM searches ORDER BY id DESC LIMIT 1000)
@@ -219,9 +228,10 @@ def search(path, profile):
         records = db.execute(SEARCH_SQL).fetchall()
     c.need(len(records) <= 50)
     rows, timestamps = [], []
-    for mode, provider, fallback_provider, count, successes, duration, maximum, fallbacks, cost, results, extracts, stamp in records:
+    for mode, provider, fallback_provider, count, successes, duration, maximum, fallbacks, cost, results, extracts, invalid_cost, stamp in records:
         c.need(type(duration) in (int, float) and 0 <= duration < 10**12)
         c.need(type(maximum) in (int, float) and 0 <= maximum <= duration)
+        c.need(invalid_cost == 0)
         c.need(cost is None or type(cost) in (int, float) and 0 <= cost < 10**8)
         c.need(type(stamp) in (int, float) and 0 <= stamp < 2**53)
         last_used_at = stamp
@@ -406,8 +416,8 @@ def swarm(path, profile):
             'result_sha': result_sha,
         }
         c.need(task['attempt_state'] is None or task['attempt_state'] in (
-            'dispatching', 'accepted', 'working', 'delivery_uncertain', 'verifying',
-            'completed', 'done', 'blocked', 'failed', 'retry_scheduled'))
+            'dispatching', 'accepted', 'working', 'delivery_uncertain', 'terminal_unknown', 'verifying',
+            'completed', 'done', 'blocked', 'failed', 'retry_scheduled', 'verification_pending'))
         c.need(c.number(task['delivery_reconcile_count']))
         tasks.append(task)
     c.need(len({task['task_id'] for task in tasks}) == len(tasks))

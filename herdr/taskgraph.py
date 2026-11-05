@@ -162,7 +162,7 @@ def _freeze_json(value: Any) -> Any:
 def _thaw_json(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {key: _thaw_json(item) for key, item in value.items()}
-    if isinstance(value, tuple):
+    if isinstance(value, (list, tuple)):
         return [_thaw_json(item) for item in value]
     return value
 

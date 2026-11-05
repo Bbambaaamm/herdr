@@ -252,6 +252,28 @@ test('search layer shows bounded real telemetry without query text', async t => 
   assert.doesNotMatch(html, /query_hash|official OpenAI|prompt/i);
 });
 
+test('bounded routing reason UNKNOWN retains its reason and never renders as measured zero', async t => {
+  const h = await harness(t);
+  const snapshot = h.snapshot();
+  snapshot.observability.metrics.push({ id: 'majak.model_routing.last_route_reason', value: null,
+    unit: 'reason', window: 'latest', source: 'majak/codex', freshness: 'fresh',
+    source_age_seconds: 2, coverage: { covered: 0, denominator: 1 }, reason: 'reason_over_bound' });
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().freshSnapshot, true);
+  let html = h.get('#observability-truth').innerHTML;
+  assert.match(html, /last_route_reason[^]*?UNKNOWN reason[^]*?coverage 0\/1[^]*?reason_over_bound/);
+  assert.doesNotMatch(html, /last_route_reason[^]*?<strong>0 reason/);
+  snapshot.observability.metrics[0].value = 'r'.repeat(80);
+  snapshot.observability.metrics[0].coverage.covered = 1;
+  snapshot.observability.metrics[0].reason = null;
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().freshSnapshot, true);
+  assert.match(h.get('#observability-truth').innerHTML, new RegExp('r'.repeat(80)));
+  snapshot.observability.metrics[0].value = 'r'.repeat(81);
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().freshSnapshot, false);
+});
+
 test('model and search provider history cannot replace the most recent provider', async t => {
   const h = await harness(t);
   const now = Math.floor(Date.now() / 1000);
@@ -1642,4 +1664,47 @@ test('legacy charts never turn missing sources into zero or complete coverage', 
   assert.match(html, /Legacy Search Router route mix/);
   assert.match(html, /Legacy Search Router není v autorizovaném snapshotu dostupný/);
   assert.match(html, /UNKNOWN/);
+});
+
+test('verification pending preserves a valid blocked task and does not imply new runtime work', async t => {
+  const h = await harness(t);
+  const task = { ...reviewPending(), state: 'blocked', attempt_state: 'verification_pending',
+    blocker: 'evidence_unavailable', attempt: 1 };
+  reviewSwarm(h, [], [task]);
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().freshSnapshot, true);
+  assert.doesNotMatch(h.get('#face-task').textContent, /live práce probíhá/);
+  assert.equal(h.calls.activity.at(-1).workingAgents, 0);
+});
+
+test('terminal UNKNOWN remains visible as blocked without successful work', async t => {
+  const h = await harness(t);
+  const now = Math.floor(Date.now() / 1000);
+  const queue = h.snapshot().sources.find(item => item.kind === 'queue' && item.profile === 'quantlab');
+  queue.rows = [];
+  h.snapshot().sources.push({
+    profile: 'quantlab', kind: 'swarm', status: 'available', reason: 'ok',
+    observed_at: now, data_at: now,
+    rows: [{
+      version: 1, repo: 'Bbambaaamm/herdr', issue: '53', issue_state: 'open',
+      paper_only: false, policy_profiles: ['herdr-core'],
+      runtime_status: 'unavailable', runtime_agents: [], agents: [],
+      tasks: [{
+        task_id: 'root-unknown', parent_task_id: null, parent_agent_id: null,
+        agent_id: null, state: 'blocked', role: 'github_root_orchestration',
+        model: 'profile-router', fallback_model: null, attempt: 1, max_attempts: 4,
+        attempt_state: 'terminal_unknown', delivery_reconcile_count: 20,
+        blocker: 'terminal_unknown_delivery', fencing_token: 7,
+        dependencies: [], result_sha: null,
+      }],
+      edges: [],
+    }],
+  });
+  await h.refresh();
+  assert.equal(h.ui.diagnostics().freshSnapshot, true);
+  const html = h.get('#swarm-kpis').innerHTML;
+  assert.match(html, /<span>Blocked \/ Failed<\/span><b>1 \/ 0<\/b>/);
+  assert.match(h.get('#coordinator-current').textContent, /root-unknown/);
+  assert.notEqual(h.ui.diagnostics().state, 'complete');
+  assert.equal(h.calls.activity.at(-1).running, 0);
 });

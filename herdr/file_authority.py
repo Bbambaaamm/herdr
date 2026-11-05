@@ -82,32 +82,45 @@ def _rename_noreplace(
 
 
 class RootFDWorkspace:
-    """Pin allowed directory inodes and perform I/O relative to held FDs."""
+    """Pin allowed directory or exact-file inodes; perform I/O relative to held FDs."""
 
     def __init__(self, roots: Iterable[str]) -> None:
         unique = sorted({str(Path(root)) for root in roots}, key=len, reverse=True)
         if not unique:
             raise FileAuthorityError("no file roots granted")
         self._roots: list[tuple[Path, int]] = []
+        self._files: list[tuple[Path, int, int, int, int]] = []
         try:
             for raw in unique:
                 root = Path(raw)
                 if not root.is_absolute():
                     raise FileAuthorityError("file root must be absolute")
-                fd = os.open(
-                    root,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                )
+                fd = os.open(root,os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
                 info = os.fstat(fd)
-                if not stat.S_ISDIR(info.st_mode):
+                if stat.S_ISREG(info.st_mode) and info.st_nlink==1:
+                    try:
+                        parent = os.open(root.parent,os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                    except BaseException:
+                        os.close(fd)
+                        raise
+                    self._files.append((root,parent,fd,info.st_dev,info.st_ino))
+                elif stat.S_ISDIR(info.st_mode):
                     os.close(fd)
-                    raise FileAuthorityError("file root must be directory")
-                self._roots.append((root, fd))
+                    fd=os.open(root,os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                    self._roots.append((root, fd))
+                else:
+                    os.close(fd)
+                    raise FileAuthorityError("file root must be a directory or single-link regular file")
         except BaseException:
             self.close()
             raise
 
     def close(self) -> None:
+        files, self._files = self._files, []
+        for _root,parent,target,_device,_inode in files:
+            for fd in (parent,target):
+                try:os.close(fd)
+                except OSError:pass
         roots, self._roots = self._roots, []
         for _root, fd in roots:
             try:
@@ -119,6 +132,16 @@ class RootFDWorkspace:
         candidate = Path(path)
         if not candidate.is_absolute():
             raise FileAuthorityError("authorized file path must be absolute")
+        for root,parent,target,device,inode in self._files:
+            if candidate != root:
+                continue
+            named=os.stat(root.name,dir_fd=parent,follow_symlinks=False)
+            held=os.fstat(target)
+            if ((named.st_dev,named.st_ino)!=(held.st_dev,held.st_ino)
+                    or (held.st_dev,held.st_ino)!=(device,inode)
+                    or not stat.S_ISREG(held.st_mode) or held.st_nlink!=1):
+                raise FileAuthorityError("exact file root binding changed")
+            return parent,(root.name,)
         for root, fd in self._roots:
             try:
                 relative = candidate.relative_to(root)
@@ -130,8 +153,13 @@ class RootFDWorkspace:
             return fd, parts
         raise FileAuthorityError("file path outside pinned roots")
 
-    def _parent(self, path: str, *, create: bool = False) -> tuple[int, str]:
+    def _parent(self, path: str, *, create: bool = False, mutating: bool = False) -> tuple[int, str]:
         root_fd, parts = self._select(path)
+        if mutating and any(part in {".git", ".herdr"} or part.startswith(".herdr-")
+                            for part in parts):
+            # Validate the whole relative path before mkdir or any file effect.
+            # Absolute ancestors can legitimately name a host-created worktree.
+            raise FileAuthorityError("workspace control path is not writable")
         current = os.dup(root_fd)
         try:
             for part in parts[:-1]:
@@ -177,6 +205,9 @@ class RootFDWorkspace:
         candidate=Path(path)
         if not candidate.is_absolute() or ".." in candidate.parts:
             raise FileAuthorityError("exact search path required")
+        if any(candidate==root for root,*_ in self._files):
+            self._select(str(candidate))
+            return [str(candidate)]
         selected=None
         for root,fd in self._roots:
             try: parts=candidate.relative_to(root).parts
@@ -304,7 +335,7 @@ class RootFDWorkspace:
         """Atomically create one regular file without overwriting a raced-in target."""
         if len(content) > MAX_FILE_BYTES:
             raise FileAuthorityError("write exceeds policy-mode bound")
-        parent, name = self._parent(path, create=True)
+        parent, name = self._parent(path, create=True, mutating=True)
         temp = f".herdr-policy-{os.getpid()}-{os.urandom(12).hex()}"
         temp_fd = -1
         writer=_writer_locks(parent)
@@ -351,6 +382,35 @@ class RootFDWorkspace:
             raise FileAuthorityError("policy-mode text is not UTF-8 encodable") from exc
         return self.create_bytes(path, raw)
 
+    def _write_exact_file(self,path,content):
+        candidate=Path(path)
+        entry=next((item for item in self._files if item[0]==candidate),None)
+        if entry is None:
+            raise FileAuthorityError("exact file root required")
+        _root,_parent,_target,device,inode=entry
+        parent,name=self._parent(path, mutating=True)
+        try:
+            with _writer_locks(parent):
+                fd=os.open(name,os.O_WRONLY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=parent)
+                try:
+                    held=os.fstat(fd)
+                    if ((held.st_dev,held.st_ino)!=(device,inode)
+                            or not stat.S_ISREG(held.st_mode) or held.st_nlink!=1):
+                        raise FileAuthorityError("exact file root binding changed")
+                    # A file bind forbids parent rename/tempfile writes. Keep
+                    # this one authorized inode; partial I/O never reports PASS.
+                    os.ftruncate(fd,0)
+                    view=memoryview(content)
+                    while view:
+                        written=os.write(fd,view)
+                        if written<=0:raise FileAuthorityError("short exact-file write")
+                        view=view[written:]
+                    os.fsync(fd)
+                    self._select(path)
+                    return len(content),hashlib.sha256(content).hexdigest()
+                finally:os.close(fd)
+        finally:os.close(parent)
+
     def write_bytes(self, path: str, content: bytes, *, expected_content: bytes|None=None) -> tuple[int, str]:
         if len(content) > MAX_FILE_BYTES:
             raise FileAuthorityError("write exceeds policy-mode bound")
@@ -359,7 +419,9 @@ class RootFDWorkspace:
             # file preimage. Advisory locks do not establish exclusivity.
             # Do not report a successful conditional replacement with a race.
             raise FileAuthorityError("conditional replacement unavailable on shared workspace")
-        parent, name = self._parent(path, create=True)
+        if any(Path(path)==root for root,*_ in self._files):
+            return self._write_exact_file(path,content)
+        parent, name = self._parent(path, create=True, mutating=True)
         temp = f".herdr-policy-{os.getpid()}-{os.urandom(12).hex()}"
         temp_fd = -1
         writer=_writer_locks(parent)
@@ -417,7 +479,7 @@ class RootFDWorkspace:
         return self.write_bytes(path, raw, expected_content=expected)
 
     def delete_file(self, path: str) -> None:
-        parent, name = self._parent(path)
+        parent, name = self._parent(path, mutating=True)
         writer=_writer_locks(parent)
         try:
             writer.__enter__()
@@ -431,8 +493,17 @@ class RootFDWorkspace:
             os.close(parent)
 
     def move_file(self, source: str, destination: str) -> None:
-        src_parent, src_name = self._parent(source)
-        dst_parent, dst_name = self._parent(destination, create=True)
+        # Validate both complete relative paths before creating destination parents.
+        for candidate in (source, destination):
+            _root, parts = self._select(candidate)
+            if any(part in {".git", ".herdr"} or part.startswith(".herdr-") for part in parts):
+                raise FileAuthorityError("workspace control path is not writable")
+        src_parent, src_name = self._parent(source, mutating=True)
+        try:
+            dst_parent, dst_name = self._parent(destination, create=True, mutating=True)
+        except BaseException:
+            os.close(src_parent)
+            raise
         writer=_writer_locks(src_parent,dst_parent)
         try:
             writer.__enter__()

@@ -85,6 +85,8 @@ def policy_for_profile(profile: str) -> ConsumerPolicyHook:
         "quantlab": quantlab_paper_policy,
         "quantlab-paper": quantlab_paper_policy,
         "majak": base_consumer_policy,
+        "dotacni-majak": base_consumer_policy,
         "heating": base_consumer_policy,
+        "herdr-core": base_consumer_policy,
     }
     return policies.get(profile, _unknown_policy(profile))

@@ -18,6 +18,9 @@ DC_BOOT_LOG = STATE / "desktop-commander-autostart.log"
 CHECKOUT_CLONE_TIMEOUT_SECONDS = 60
 AGENT_START_TIMEOUT_SECONDS = 70
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from herdr.launch_environment import sanitize_environment
+
 ENV = os.environ.copy()
 ENV["HOME"] = str(HOME)
 ENV["PATH"] = f"{HOME}/.local/node24/bin:{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin"
@@ -219,7 +222,7 @@ def ensure_herdr_server():
             [str(HERDR), "server"],
             stdout=fh,
             stderr=subprocess.STDOUT,
-            env=ENV,
+            env=sanitize_environment(ENV),
             start_new_session=True,
         )
     for _ in range(30):

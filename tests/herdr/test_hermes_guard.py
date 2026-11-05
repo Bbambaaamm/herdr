@@ -195,9 +195,14 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
     middleware = types.ModuleType("hermes_cli.middleware")
     callbacks = []
     middleware.run_llm_execution_middleware = lambda request, next_call, **context: (callbacks.append("callback"), next_call(request))[1]
+    network_requests = []
     def perform(agent, **kwargs):
         from hermes_cli.middleware import run_llm_execution_middleware
-        return run_llm_execution_middleware({}, lambda request: callbacks.append("network"), provider=agent.provider)
+        def transport(request):
+            network_requests.append(dict(request))
+            callbacks.append("network")
+        return run_llm_execution_middleware(getattr(agent, "_test_model_request", {}), transport,
+                                            provider=agent.provider, api_request_id="sdk:fixture")
     turn.perform_api_call = perform
     loop.perform_api_call = perform
     agent_pkg = types.ModuleType("agent")
@@ -267,9 +272,13 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
     class Guard:
         aliases = {}
         checks = []
+        sdk_observations = []
+        def observe_sdk(self, row):
+            self.sdk_observations.append(row)
+            return True
         approval_required = False
         approval_used = False
-        grant = types.SimpleNamespace(identity=types.SimpleNamespace(task_id="task"), scope=types.SimpleNamespace(data_classes=(DataClass.INTERNAL,)), provider_routes=(types.SimpleNamespace(provider="provider-a", base_url="https://provider-a.example.invalid/v1", api_mode="openai", regions=("eu-central",), data_classes=("internal",), max_egress="region_bound", max_retention="limited", training="excluded", credential_refs=()),))
+        grant = types.SimpleNamespace(hash="a"*64, identity=types.SimpleNamespace(task_id="task"), scope=types.SimpleNamespace(tools=(), data_classes=(DataClass.INTERNAL,)), provider_routes=(types.SimpleNamespace(provider="provider-a", base_url="https://provider-a.example.invalid/v1", api_mode="openai", regions=("eu-central",), data_classes=("internal",), max_egress="region_bound", max_retention="limited", training="excluded", credential_refs=()),))
 
         def authorize_provider(self, request):
             if request.provider != "provider-a":
@@ -401,6 +410,8 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
         with pytest.raises(PolicyDenied, match="provider_not_granted"):
             loop.perform_api_call(agent)
         assert callbacks == []
+        assert {row["phase"] for row in policy.sdk_observations} == {"sdk_provider_check", "sdk_api_call"}
+        assert all(row["error_type"] == "PolicyDenied" for row in policy.sdk_observations)
         agent.provider = "provider-a"
         agent.base_url = "https://unexpected.example.invalid/v1"
         with pytest.raises(PolicyDenied, match="provider_endpoint_denied"):
@@ -409,6 +420,143 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
         agent.base_url = "https://provider-a.example.invalid/v1"
         loop.perform_api_call(agent)
         assert callbacks == ["callback", "network"]
+        assert network_requests == [{}]  # Unbudgeted calls keep their original request.
+        from herdr.evidence import canonical, digest
+        from herdr.work_cycle import WorkContractError
+        effects = []
+        policy.budget_required = lambda: True
+        policy.model_request_ceiling = lambda route: {"output_token_field": "max_tokens", "max_output_tokens": 100}
+        policy.start_model_effect = lambda request: effects.append(("start", dict(request))) or {
+            "operation_id": "a"*64, "quote_sha256": "b"*64, "max_work_ms": 1000}
+        policy.returned_model_effect = lambda receipt: effects.append(("returned", dict(receipt)))
+        policy.grant.provider_routes[0].api_mode = "chat_completions"
+        agent.api_mode = "chat_completions"
+        agent.model = "quoted-text-model"
+        agent.client = types.SimpleNamespace(max_retries=0)
+        original = {"model": agent.model, "messages": [{"role": "user", "content": "bounded text"}]}
+        from herdr.work_budget_configuration import model_request_ceiling
+        for cap, quoted_field, quoted_limit in (({}, "max_tokens", 100), ({"max_tokens": 17}, "max_tokens", 100),
+                                                ({"max_completion_tokens": 18}, "max_completion_tokens", 100),
+                                                ({}, "max_tokens", 32768)):
+            policy.model_request_ceiling = lambda route, field=quoted_field, limit=quoted_limit: model_request_ceiling({
+                **route, "output_token_field": field, "max_output_tokens": limit})
+            request = {**original, **cap}
+            agent._test_model_request = request
+            loop.perform_api_call(agent)
+            sent = network_requests[-1]
+            expected = next(iter(cap.values()), quoted_limit)
+            assert next(sent[key] for key in ("max_tokens", "max_completion_tokens") if key in sent) == expected
+            assert request == {**original, **cap}  # The middleware's request was not mutated.
+            start, returned = effects[-2:]
+            assert start[0] == "start" and returned[0] == "returned"
+            assert start[1]["request_sha256"] == digest(sent)
+            assert start[1]["request_bytes"] == len(canonical(sent))
+            assert start[1]["output_tokens"] == expected
+            assert agent._disable_streaming is False
+        before = (len(effects), len(network_requests))
+        for invalid in ({"max_tokens": None}, {"max_tokens": True}, {"max_tokens": 0},
+                        {"max_tokens": 1, "max_completion_tokens": 2}, {"max_output_tokens": 1},
+                        {"stream": True}):
+            agent._test_model_request = {**original, **invalid}
+            with pytest.raises(WorkContractError):
+                loop.perform_api_call(agent)
+            assert (len(effects), len(network_requests)) == before
+        assert any(row["phase"] == "sdk_middleware" for row in policy.sdk_observations)
+        # A preexisting incompatible cap must stop before either reservation or transport.
+        from herdr.work_budget_configuration import model_request_ceiling
+        policy.model_request_ceiling = lambda route: model_request_ceiling({**route, "max_output_tokens": 100})
+        for model_name, wrong_cap in (("openai/o3-2025-04-16", {"max_tokens": 17}),
+                                      ("quoted-text-model", {"max_completion_tokens": 18})):
+            agent.model = model_name
+            request = {**original, "model": model_name, **wrong_cap}
+            agent._test_model_request = request
+            before = (len(effects), len(network_requests))
+            with pytest.raises(PolicyDenied, match="model_quote_token_field_mismatch"):
+                loop.perform_api_call(agent)
+            assert (len(effects), len(network_requests)) == before
+            assert request == {**original, "model": model_name, **wrong_cap}
+            assert agent._disable_streaming is False
+        # A NoNet SDK uses the host for its exact reserved request, including
+        # known HTTP errors. It never invokes the original direct transport.
+        saved_route = policy.grant.provider_routes
+        saved_authorize = policy.authorize_provider
+        saved_agent = (agent.provider, agent.base_url, agent.api_mode, agent.model,
+                       getattr(agent, "_credential_pool", None), getattr(agent, "api_key", None))
+        policy.grant.runtime_assurance = types.SimpleNamespace(
+            network_access=types.SimpleNamespace(value="none"))
+        route = types.SimpleNamespace(**vars(saved_route[0]))
+        route.provider = "nous"; route.base_url = "https://inference-api.nousresearch.com/v1"
+        route.credential_refs = ("pool:nous:entry-1",)
+        policy.grant.provider_routes = (route,)
+        policy.authorize_provider = lambda request: None
+        agent.provider = "nous"; agent.base_url = route.base_url
+        agent.model = "test-model:free"; agent.api_key = "private-test-key"
+        agent._credential_pool = types.SimpleNamespace(provider="nous", entries=lambda: [
+            types.SimpleNamespace(id="entry-1", runtime_api_key="private-test-key")])
+        agent._test_model_request = {"model": agent.model,
+            "messages": [{"role": "user", "content": "bounded host request"}]}
+        converted = []
+        chat_module = types.ModuleType("openai.types.chat")
+        class Completion:
+            @staticmethod
+            def model_validate(value):
+                converted.append(value)
+                return types.SimpleNamespace(choices=value["choices"])
+        chat_module.ChatCompletion = Completion
+        monkeypatch.setitem(sys.modules, "openai.types.chat", chat_module)
+        host_calls = []
+        answer = {"kind": "http_response", "http_status": 200,
+                  "body": {"choices": [{"message": {"content": "ACK"}}]}}
+        def execute(receipt, request_id, payload):
+            host_calls.append((receipt, request_id, payload))
+            return answer
+        policy.execute_model_effect = execute
+        network_before = len(network_requests)
+        response = loop.perform_api_call(agent)
+        assert response.choices and converted == [answer["body"]]
+        assert len(host_calls) == 1 and host_calls[0][1] == "sdk:fixture"
+        assert host_calls[0][2]["max_tokens"] == 100
+        assert [row[0] for row in effects[-2:]] == ["start", "returned"]
+        assert len(network_requests) == network_before
+        answer = {"kind": "unknown", "http_status": None, "error_type": "TimeoutError"}
+        effects_before = len(effects)
+        with pytest.raises(PolicyDenied, match="delivery_unknown"):
+            loop.perform_api_call(agent)
+        assert [row[0] for row in effects[effects_before:]] == ["start"]
+        assert len(network_requests) == network_before
+        answer = {"kind": "http_response", "http_status": 429, "body": {"error": "limited"}}
+        with pytest.raises(PolicyDenied, match="provider_http_error"):
+            loop.perform_api_call(agent)
+        assert [row[0] for row in effects[-2:]] == ["start", "returned"]
+        assert len(network_requests) == network_before
+        # Actual ordinary launches currently attest a shared network namespace.
+        # The authenticated host port must still win over the SDK's direct client.
+        policy.grant.runtime_assurance.network_access.value = "global"
+        answer = {"kind": "http_response", "http_status": 200,
+                  "body": {"choices": [{"message": {"content": "HOST ACK"}}]}}
+        before_global = (len(host_calls), len(network_requests))
+        response = loop.perform_api_call(agent)
+        assert response.choices
+        assert len(host_calls) == before_global[0] + 1
+        assert len(network_requests) == before_global[1]
+        assert [row[0] for row in effects[-2:]] == ["start", "returned"]
+        # NoNet routes continue to reject an unsupported provider profile.
+        policy.grant.runtime_assurance.network_access.value = "none"
+        agent.model = "paid-model"
+        effects_before = len(effects)
+        with pytest.raises(PolicyDenied, match="profile_unsupported"):
+            loop.perform_api_call(agent)
+        assert len(effects) == effects_before
+        policy.grant.provider_routes = saved_route
+        policy.authorize_provider = saved_authorize
+        del policy.grant.runtime_assurance
+        (agent.provider, agent.base_url, agent.api_mode, agent.model,
+         agent._credential_pool, agent.api_key) = saved_agent
+        agent.model = original["model"]
+        policy.budget_required = lambda: False
+        policy.grant.provider_routes[0].api_mode = "openai"
+        agent.api_mode = "openai"
+        del agent._test_model_request
         callbacks.clear()
         def switch(request, next_call, **context):
             callbacks.append("switch_callback")
@@ -620,3 +768,260 @@ def test_v4a_update_denies_before_earlier_add_can_mutate(tmp_path):
         assert "conditional replacement unavailable" in result.error
         assert applied==[] and target.read_text()=="original" and not (root/"new").exists()
     finally:authority.close()
+
+
+
+def _read_hash_ops(root, gate):
+    """Small result double; the pinned SDK JSON contract is tested separately."""
+    from dataclasses import dataclass
+    from herdr.file_authority import RootFDWorkspace
+
+    @dataclass
+    class ReadResult:
+        content: str = ""
+        total_lines: int = 0
+        file_size: int = 0
+        truncated: bool = False
+        error: str | None = None
+        base64_content: str | None = None
+        is_binary: bool = False
+
+        def to_dict(self):
+            return {key: value for key, value in vars(self).items()
+                    if not key.startswith("_") and value is not None}
+
+    authority = RootFDWorkspace((str(root),))
+    delegate = types.SimpleNamespace(_add_line_numbers=lambda value, offset:
+        "\n".join(f"{offset+i}|{line}" for i, line in enumerate(value.splitlines())))
+    return authority, hermes_guard._PolicyFileOps(authority, delegate,
+        types.SimpleNamespace(ReadResult=ReadResult), types.SimpleNamespace(),
+        redaction_gate=gate)
+
+
+@pytest.mark.parametrize("raw", [
+    b"alpha\nbeta\n", b"alpha\r\nbeta\r\n", b"\xef\xbb\xbfalpha\r\n",
+    b"alpha\rbeta\r", "Příliš žluťoučký \u212b A\u030a\n".encode(),
+    b"alpha", b"alpha\n\n", b"",
+], ids=["lf", "crlf", "bom", "lone-cr", "unicode", "no-final-newline", "trailing-blank", "empty"])
+def test_policy_read_public_hashes_bind_exact_utf8_buffer(tmp_path, raw):
+    import hashlib
+    target = tmp_path / "source.py"; target.write_bytes(raw)
+    seen = []
+    def gate(path, text):
+        seen.append((path, text))
+        return text
+    authority, ops = _read_hash_ops(tmp_path, gate)
+    try:
+        result = ops.read_file(str(target), offset=1, limit=1).to_dict()
+        assert result["raw_sha256"] == hashlib.sha256(raw).hexdigest()
+        assert result["sha256_crlf_to_lf"] == hashlib.sha256(raw.replace(b"\r\n", b"\n")).hexdigest()
+        assert result["hash_scope"] == "entire-read-buffer"
+        assert seen == [(str(target), raw.decode("utf-8"))]
+        assert result["file_size"] == len(raw)
+    finally:
+        authority.close()
+
+
+def test_policy_read_hashes_do_not_reread_or_hash_only_the_visible_page(tmp_path, monkeypatch):
+    import hashlib
+    target = tmp_path / "large.py"
+    raw = b"visible\n" + b"hidden-but-public\n" * 3000
+    target.write_bytes(raw)
+    authority, ops = _read_hash_ops(tmp_path, lambda path, text: text)
+    original = authority.read_bytes
+    reads = []
+    def counted(path, **kwargs):
+        reads.append(path)
+        value = original(path, **kwargs)
+        # A later replacement must not make metadata describe different bytes
+        # from those used to produce this page.
+        target.write_bytes(b"replacement-after-the-read\n")
+        return value
+    monkeypatch.setattr(authority, "read_bytes", counted)
+    try:
+        result = ops.read_file(str(target), limit=1).to_dict()
+        assert reads == [str(target)]
+        assert result["content"] == "1|visible" and result["truncated"] is True
+        assert result["raw_sha256"] == hashlib.sha256(raw).hexdigest()
+        assert result["raw_sha256"] != hashlib.sha256(target.read_bytes()).hexdigest()
+    finally:
+        authority.close()
+
+
+@pytest.mark.parametrize("failure", ["absent", "not-callable", "raises", "none", "number", "changed"])
+def test_policy_read_optional_hash_gate_fails_closed_without_breaking_content(tmp_path, failure):
+    target = tmp_path / "source.py"; target.write_text("visible\n")
+    def raises(path, text):
+        raise RuntimeError("unit-only unavailable redactor")
+    gates = {"absent": None, "not-callable": 1, "raises": raises,
+             "none": lambda path, text: None, "number": lambda path, text: 1,
+             "changed": lambda path, text: "redacted"}
+    authority, ops = _read_hash_ops(tmp_path, gates[failure])
+    try:
+        result = ops.read_file(str(target), limit=1).to_dict()
+        assert result["content"] == "1|visible" and not result.get("error")
+        assert not {"raw_sha256", "sha256_crlf_to_lf", "hash_scope"} & result.keys()
+    finally:
+        authority.close()
+
+
+def test_policy_read_hidden_redacted_text_never_discloses_a_whole_file_hash(tmp_path):
+    target = tmp_path / "source.py"; target.write_text("visible\nunit-secret-on-hidden-line\n")
+    seen = []
+    def gate(path, text):
+        seen.append(text)
+        return text.replace("unit-secret-on-hidden-line", "<redacted>")
+    authority, ops = _read_hash_ops(tmp_path, gate)
+    try:
+        result = ops.read_file(str(target), limit=1).to_dict()
+        assert seen == ["visible\nunit-secret-on-hidden-line\n"]
+        assert result["content"] == "1|visible"
+        assert not {"raw_sha256", "sha256_crlf_to_lf", "hash_scope"} & result.keys()
+    finally:
+        authority.close()
+
+
+@pytest.mark.parametrize("failure", ["outside", "symlink", "non-utf8", "pagination"])
+def test_policy_read_errors_never_return_public_hashes(tmp_path, failure):
+    root = tmp_path / "root"; root.mkdir()
+    target = root / "source.py"; target.write_bytes(b"public\n")
+    outside = tmp_path / "outside.py"; outside.write_bytes(b"outside\n")
+    selected = str(target)
+    if failure == "outside": selected = str(outside)
+    elif failure == "symlink": target.unlink(); target.symlink_to(outside)
+    elif failure == "non-utf8": target.write_bytes(b"\xff\xfe")
+    authority, ops = _read_hash_ops(root, lambda path, text: text)
+    try:
+        result = ops.read_file(selected, offset=0 if failure == "pagination" else 1).to_dict()
+        assert result["error"]
+        assert not {"raw_sha256", "sha256_crlf_to_lf", "hash_scope"} & result.keys()
+    finally:
+        authority.close()
+
+
+def test_policy_binary_read_and_nul_text_never_return_public_hashes(tmp_path):
+    target = tmp_path / "data.bin"; target.write_bytes(b"binary\x00payload")
+    authority, ops = _read_hash_ops(tmp_path, lambda path, text: text)
+    try:
+        for result in (ops.read_file_bytes(str(target)).to_dict(),
+                       ops.read_file(str(target)).to_dict()):
+            assert not {"raw_sha256", "sha256_crlf_to_lf", "hash_scope"} & result.keys()
+    finally:
+        authority.close()
+
+
+def test_pinned_sdk_formatter_preserves_safe_whole_read_hashes(tmp_path):
+    """Actual guard, file formatter and redactor; no CLI/agent/auth/provider call."""
+    import os
+    from pathlib import Path
+    import subprocess
+
+    sdk = Path("/opt/herdr/releases/p0-5035d92-test/hermes")
+    python = Path("/opt/herdr/releases/p0-5035d92-test/python/bin/python3.11")
+    if not sdk.is_dir() or not python.is_file():
+        pytest.skip("pinned SDK formatter component unavailable")
+    repo = Path(__file__).resolve().parents[2]
+    script = r'''
+import hashlib,json,os,socket,subprocess,sys,types
+from pathlib import Path
+repo,sdk,scratch=map(Path,sys.argv[1:4])
+sys.path[:0]=[str(repo),str(sdk),str(sdk/"venv/lib/python3.11/site-packages")]
+def denied(*args,**kwargs):raise AssertionError("component attempted external effect")
+socket.socket.connect=denied;socket.socket.connect_ex=denied;socket.getaddrinfo=denied
+subprocess.Popen=denied;os.system=denied
+pins={
+"tools/file_tools.py":"e1c5dec811b68b59d0926b1d9fa5aab3e89aef4d47a492b22aa03bc162acc095",
+"tools/file_operations_common.py":"dc0a3d7c46376694eaa918a2c9239dbbc0d77234ffe6010582c8c112e835cae8",
+"tools/file_operations.py":"f0089dae05fd7695aaafbea55e5ce17eb8f4b07e3d8d83a17989a005e682f804",
+"agent/redact.py":"85f6bcf8577697713dbf12992a75ec4f269f90e52523475a8d84a9d287b81c5b"}
+for name,digest in pins.items():assert hashlib.sha256((sdk/name).read_bytes()).hexdigest()==digest
+home=scratch/"home";home.mkdir()
+profile=home/".hermes";profile.mkdir();(profile/"config.yaml").write_text("{}\n")
+os.environ.update(HOME=str(home),HERMES_HOME=str(profile),HERMES_SAFE_MODE="1",
+                  HERMES_ENABLE_PROJECT_PLUGINS="0",HERMES_REDACT_SECRETS="true")
+from tools import file_tools,terminal_tool
+from tools.file_operations import ShellFileOperations
+from herdr.hermes_guard import install_hermes_guard
+from herdr.security import InvocationGuard,SecurityGrant
+unit_grant=SecurityGrant.from_dict(json.loads(sys.argv[4]))
+work=scratch/"work";work.mkdir()
+delegate=ShellFileOperations(None,cwd=str(work))
+# This is the lower environment acquisition seam only: formatting, redaction,
+# authority reads/writes, guard installation and to_dict below remain actual.
+file_tools._get_file_ops=lambda task_id="default":delegate
+terminal_tool._get_env_config=lambda:{"env_type":"local"}
+installation=install_hermes_guard(InvocationGuard(unit_grant))
+try:
+ original=file_tools.redact_sensitive_text
+ seen=[]
+ def observe(text,**kwargs):
+  seen.append(text)
+  return original(text,**kwargs)
+ file_tools.redact_sensitive_text=observe
+ target=work/"source.py";raw=b"visible\r\n"+b"public hidden line\r\n"*3000;target.write_bytes(raw)
+ first=json.loads(file_tools.read_file_tool(str(target),offset=1,limit=1,task_id="child-task"))
+ assert first.get("raw_sha256")==hashlib.sha256(raw).hexdigest(),first
+ assert first["sha256_crlf_to_lf"]==hashlib.sha256(raw.replace(b"\r\n",b"\n")).hexdigest()
+ assert first["hash_scope"]=="entire-read-buffer" and first["truncated"] is True
+ assert raw.decode() in seen and len(first["content"])<100
+ proxy=file_tools._get_file_ops("child-task")
+ patched=proxy.patch_replace(str(target),"visible","edited")
+ assert not patched.success and "conditional replacement unavailable" in patched.error
+ assert target.read_bytes()==raw  # Preserve the existing shared-writer barrier.
+ written=proxy.write_file(str(target),"edited\npublic replacement\n")
+ assert written.verified is True and not written.error
+ changed=target.read_bytes()
+ second=json.loads(file_tools.read_file_tool(str(target),offset=1,limit=1,task_id="child-task"))
+ assert second["raw_sha256"]==hashlib.sha256(changed).hexdigest()!=first["raw_sha256"]
+ created=work/"created.py"
+ added=proxy.patch_v4a("*** Begin Patch\n*** Add File: "+str(created)+"\n+public addition\n*** End Patch\n")
+ assert added.success and not added.error, added.error
+ created_read=json.loads(file_tools.read_file_tool(str(created),limit=1,task_id="child-task"))
+ assert created_read["raw_sha256"]==hashlib.sha256(created.read_bytes()).hexdigest()
+ secret=work/"hidden.py";secret.write_text("visible\n"+"sk-"+"A"*40+"\n")
+ secret_result=json.loads(file_tools.read_file_tool(str(secret),limit=1,task_id="child-task"))
+ assert "error" not in secret_result and secret_result["content"].startswith("1|visible")
+ assert not {"raw_sha256","sha256_crlf_to_lf","hash_scope"}&secret_result.keys()
+ # A replaced/unavailable current display redactor cannot reuse an older gate.
+ file_tools.redact_sensitive_text=None
+ unavailable=proxy.read_file(str(target),limit=1).to_dict()
+ assert not {"raw_sha256","sha256_crlf_to_lf","hash_scope"}&unavailable.keys()
+ print(json.dumps({"actual_sdk_formatter_json":True,"actual_install_gate":True,
+  "public_hashes_before_pagination":True,"patch_update_denied":True,
+  "v4a_add_then_read_hash":True,"write_then_new_hash":True,
+  "hidden_secret_digest_suppressed":True,"current_redactor_lookup":True,
+  "cli_model_auth_or_provider_calls":0}))
+finally:
+ installation.uninstall()
+'''
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path / "launch-home"),
+           "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": str(tmp_path)}
+    from tests.herdr.test_security import grant as unit_grant
+    grant_json = json.dumps(unit_grant(tmp_path / "work", tools=("read_file", "write_file", "patch")).to_json())
+    result = subprocess.run([str(python), "-I", "-B", "-c", script, str(repo), str(sdk), str(tmp_path), grant_json],
+                            env=env, capture_output=True, text=True, timeout=45)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout.strip().splitlines()[-1])["actual_sdk_formatter_json"] is True
+
+
+def test_runtime_file_roots_add_only_attested_write_leaves_without_narrowing_delegation():
+    from pathlib import Path
+    parent = '/work/parent'
+    rules = {name: types.SimpleNamespace(allowed_roots=(parent,))
+             for name in ('read_file', 'write_file', 'patch', 'search_files')}
+    assurance = types.SimpleNamespace(sandbox_verified=True, writable_roots=(
+        parent + '/own.py', '/work/parent-other/foreign.py', '/run/cache'))
+    grant = types.SimpleNamespace(runtime_assurance=assurance)
+    roots = hermes_guard._runtime_file_roots(grant, rules)
+    assert roots == {parent, parent + '/own.py'}
+    assert rules['write_file'].allowed_roots == (parent,)
+    assurance.sandbox_verified = False
+    assert hermes_guard._runtime_file_roots(grant, rules) == {parent}
+    assert hermes_guard._runtime_file_roots(types.SimpleNamespace(), rules) == {parent}
+
+
+def test_read_only_logical_rule_cannot_acquire_an_attested_write_root():
+    rules = {'read_file': types.SimpleNamespace(allowed_roots=('/work',))}
+    grant = types.SimpleNamespace(runtime_assurance=types.SimpleNamespace(
+        sandbox_verified=True, writable_roots=('/work/child/result.py',)))
+    assert hermes_guard._runtime_file_roots(grant, rules) == {'/work'}

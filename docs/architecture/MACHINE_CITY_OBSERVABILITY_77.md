@@ -64,6 +64,21 @@ Freshness is recomputed at authorized projection time from both source observati
 time. Profile projection rebuilds observability from the authorized source subset, preventing
 cross-profile values from leaking through a precomputed aggregate.
 
+Request-time source authorization and temporal invalidation happen before rebuilding the read
+model. Cleared source rows cannot survive as available metrics or inventory. Standalone builds
+also suppress source observations or data timestamps from the future rather than clamping their
+age to zero. Historical data behind a current source remains explicitly stale when its age warrants it.
+
+The embedded model router has its own `routing_observed_at`. Both routing metrics and inventory
+use the oldest relevant Codex-source or routing timestamp. A future or invalid routing timestamp
+produces UNKNOWN with `routing_time_invalid`; healthy Codex usage does not make missing routing
+available. That case retains `routing_unavailable` on every routing metric and the inventory row.
+
+Metric strings retain their strict 80-character bound. A valid source routing reason of 81–128
+characters stays intact in its sanitized source row, while its metric is UNKNOWN with
+`reason_over_bound` and coverage `0/1`. It is neither silently truncated nor allowed to suppress
+the entire snapshot. The source's existing 128-character bound remains unchanged.
+
 Legacy charts remain available under a clearly labeled legacy detail section. Missing legacy router
 or search sources render UNKNOWN/unavailable, not zero routes or 100% coverage.
 

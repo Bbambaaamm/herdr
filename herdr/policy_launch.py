@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
+from .observed_proc import os
 import re
 import shutil
 import stat
 import tempfile
 from dataclasses import dataclass, replace
-from pathlib import Path
+from .observed_proc import Path
 from typing import Mapping
 
 from .security import (
@@ -44,6 +44,19 @@ def _require(ok, code):
         raise SecurityError(code)
 
 
+def _finish_cleanup(actions):
+    """Attempt every independent release while retaining the first failure."""
+    first = None
+    for action in actions:
+        try:
+            action()
+        except BaseException as error:
+            if first is None:
+                first = (error, error.__traceback__)
+    if first is not None:
+        raise first[0].with_traceback(first[1])
+
+
 def _open_relative(root_fd, name):
     parts = name.split("/")
     _require(parts and all(x not in {"", ".", ".."} for x in parts) and "\\" not in name,
@@ -59,9 +72,34 @@ def _open_relative(root_fd, name):
         os.close(directory)
 
 
+def _verify_root_owned_ancestry(path: Path) -> None:
+    """Require every source ancestor to be a non-alias root-controlled inode.
+
+    A readonly bwrap mount of a same-UID-writable directory is NOT immutable:
+    the host user can rename or rewrite children after bwrap starts. Trusted
+    release trees must therefore live under a root-owned, non-writable chain.
+    """
+    path = Path(path)
+    _require(path.is_absolute() and str(path) == os.path.normpath(str(path))
+             and ".." not in path.parts, "immutable root path invalid")
+    current = Path("/")
+    for component in ("", *path.parts[1:]):
+        if component:
+            current /= component
+        info = os.lstat(current)
+        _require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0
+                 and not stat.S_IMODE(info.st_mode) & 0o022,
+                 "immutable source ancestor not root protected")
+
+
+def _verify_immutable_entry(info: os.stat_result) -> None:
+    _require(info.st_uid == 0 and not stat.S_IMODE(info.st_mode) & 0o022,
+             "immutable source entry writable by host user")
+
+
 @dataclass
 class FrozenTree:
-    """A private copy, not a read-only alias of a mutable worker checkout."""
+    """An approved code tree, either transient or root-owned and immutable."""
     path: Path
     target: Path
     fd: int
@@ -70,12 +108,16 @@ class FrozenTree:
     source_digest: str
     files: tuple[tuple[str, str], ...]
     max_file_bytes: int = 4_194_304
+    immutable_host_source: bool = False
+    executable_files: tuple[str, ...] | None = None
 
     @property
     def source(self):
         return f"/proc/{os.getpid()}/fd/{self.fd}"
 
     def verify(self):
+        if self.immutable_host_source:
+            _verify_root_owned_ancestry(self.path)
         expected_files = {name for name, _ in self.files}
         expected_dirs = {"/".join(name.split("/")[:i]) for name in expected_files
                          for i in range(1, len(name.split("/")))}
@@ -84,6 +126,8 @@ class FrozenTree:
             for child in os.listdir(directory_fd):
                 name = prefix + child
                 info = os.stat(child, dir_fd=directory_fd, follow_symlinks=False)
+                if self.immutable_host_source:
+                    _verify_immutable_entry(info)
                 if stat.S_ISDIR(info.st_mode):
                     _require(name in expected_dirs, "unexpected frozen directory")
                     found_dirs.add(name)
@@ -95,11 +139,17 @@ class FrozenTree:
                 else:
                     _require(stat.S_ISREG(info.st_mode) and name in expected_files,
                              "unexpected frozen file")
+                    if self.executable_files is not None:
+                        _require(info.st_mode&0o111==(0o111 if name in self.executable_files else 0),
+                                 "immutable executable mode differs from approval")
                     found_files.add(name)
         walk(self.fd)
         _require(found_files == expected_files and found_dirs == expected_dirs,
                  "frozen inventory differs from approved manifest")
         held, named = os.fstat(self.fd), os.lstat(self.path)
+        if self.immutable_host_source:
+            _verify_immutable_entry(held)
+            _verify_immutable_entry(named)
         _require(stat.S_ISDIR(held.st_mode) and stat.S_ISDIR(named.st_mode)
                  and (held.st_dev, held.st_ino) == (self.device, self.inode)
                  and (named.st_dev, named.st_ino) == (self.device, self.inode),
@@ -110,6 +160,11 @@ class FrozenTree:
                 info = os.fstat(fd)
                 _require(stat.S_ISREG(info.st_mode) and info.st_size <= self.max_file_bytes,
                          "frozen source shape changed")
+                if self.executable_files is not None:
+                    _require(info.st_mode&0o111==(0o111 if name in self.executable_files else 0),
+                             "immutable executable mode differs from approval")
+                if self.immutable_host_source:
+                    _verify_immutable_entry(info)
                 digest, remaining = hashlib.sha256(), info.st_size
                 while remaining:
                     chunk = os.read(fd, min(1_048_576, remaining))
@@ -195,21 +250,87 @@ class FrozenTree:
         finally:
             os.close(root_fd)
 
+    @classmethod
+    def attach_immutable(cls, source: Path, *, target: Path,
+                         files: Mapping[str, str], max_bytes=33_554_432,
+                         max_file_bytes=4_194_304):
+        """Pin an operator-published root-owned tree, never a user-writable copy.
+
+        The complete manifest is already approved by the trusted host policy.
+        This method verifies bytes/ownership without creating or modifying
+        *any* host file; source directory FD remains live until pane cleanup.
+        """
+        _require(isinstance(files, Mapping) and 0 < len(files) <= 65536
+                 and all(isinstance(name, str) and 0 < len(name) <= 1024
+                         and isinstance(digest, str) and _SHA.fullmatch(digest)
+                         for name, digest in files.items()),
+                 "immutable approved manifest invalid")
+        _require(type(max_bytes) is int and 0 < max_bytes <= 2_147_483_648
+                 and type(max_file_bytes) is int and 0 < max_file_bytes <= 268_435_456,
+                 "immutable source bounds invalid")
+        source, target = Path(source), Path(target)
+        _require(target.is_absolute() and ".." not in target.parts,
+                 "immutable mount target invalid")
+        _verify_root_owned_ancestry(source)
+        fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(fd)
+            _verify_immutable_entry(info)
+            # Bound the approved published asset before walking or hashing.
+            # An unlisted file/dir is rejected by verify(), never ignored.
+            total = 0
+            for name in sorted(files):
+                item_fd = _open_relative(fd, name)
+                try:
+                    entry = os.fstat(item_fd)
+                    _require(stat.S_ISREG(entry.st_mode)
+                             and entry.st_size <= max_file_bytes,
+                             "immutable published asset file invalid")
+                    _verify_immutable_entry(entry)
+                    total += entry.st_size
+                    _require(total <= max_bytes,
+                             "immutable published asset exceeds bound")
+                finally:
+                    os.close(item_fd)
+            result = cls(
+                source, target, fd, info.st_dev, info.st_ino,
+                hashlib.sha256(canonical_json_bytes(dict(sorted(files.items())))).hexdigest(),
+                tuple(sorted(files.items())), max_file_bytes, True,
+            )
+            result.verify()
+            return result
+        except BaseException:
+            os.close(fd)
+            raise
+
     def close(self):
         if self.fd >= 0:
             os.close(self.fd)
             self.fd = -1
 
     def cleanup_after_pane_closed(self):
-        self.verify()
-        # Refuse cleanup if the named storage directory was replaced. This
-        # method may only be called after the caller proves its pane is closed.
-        for directory in self.path.rglob("*"):
-            if directory.is_dir():
-                directory.chmod(0o700)
-        self.path.chmod(0o700)
-        self.close()
-        shutil.rmtree(self.path)
+        if self.fd < 0:
+            return
+        if self.immutable_host_source:
+            # Never chmod, unlink or delete an operator-published immutable
+            # release tree. The host controller owns publication/retention;
+            # the worker only closes its held read-only directory descriptor,
+            # even if the independent verification reported root-side drift.
+            try:
+                self.verify()
+            finally:
+                self.close()
+            return
+        try:
+            self.verify()
+            # Refuse deletion if the named storage directory was replaced.
+            for directory in self.path.rglob("*"):
+                if directory.is_dir():
+                    directory.chmod(0o700)
+            self.path.chmod(0o700)
+            shutil.rmtree(self.path)
+        finally:
+            self.close()
 
 
 def mount_rows(pid):
@@ -232,6 +353,19 @@ def mount_rows(pid):
     return rows
 
 
+def _executable_inventory(names):
+    ordered = sorted(set(names))
+    return {"sha256": hashlib.sha256(canonical_json_bytes(ordered)).hexdigest(),
+            "count": len(ordered)}
+
+
+def _validate_executable_inventory(value):
+    _require(isinstance(value, dict) and set(value) == {"sha256", "count"}
+             and isinstance(value["sha256"], str) and _SHA.fullmatch(value["sha256"])
+             and type(value["count"]) is int and 0 <= value["count"] <= 65536,
+             "immutable executable inventory malformed")
+
+
 class PolicyMount:
     """Pinned grant file and independently frozen code/runtime mount objects."""
     def __init__(self, stage: PolicyBundleStage, code: FrozenTree, runtime=()):
@@ -242,8 +376,54 @@ class PolicyMount:
                  "exact immutable Hermes/Python snapshots required")
         self.stage, self.code, self.runtime = stage, code, tuple(runtime)
         self.bootstrap = None
+        self.private_workspace_pin = None
+        self.private_result_pin = None
+        self.private_mount_plan = None
+        self.private_mount_request = None
+        self.private_mount_argv = None
+        self.private_identity = None
+        self.private_cli_pins = {}
+        self.private_fd_handoff = False
+        self.resolver_snapshot = None
+        self.private_profile_snapshot = None
         targets = [str(BUNDLE_TARGET), str(code.target), *(str(x.target) for x in runtime)]
         _require(len(targets) == len(set(targets)), "duplicate policy mount target")
+
+    def require_immutable_runtime(self) -> None:
+        """Hard activation gate, separate from one-time SHA attestation."""
+        _require(all(tree.immutable_host_source for tree in
+                     (self.code, *self.runtime)),
+                 "private profile requires root-protected runtime sources")
+        # Do not trust only a boolean asserted by a caller. Recheck the held
+        # read-only inodes and all roots before any sandbox spawn.
+        for tree in (self.code, *self.runtime):
+            tree.verify()
+    def immutable_source_evidence(self):
+        self.require_immutable_runtime()
+        from .host_bootstrap import read_frozen_file, SHIM_SOURCE, STAGE1_SOURCE, STAGE2_SOURCE
+        for artifact in (SHIM_SOURCE, STAGE1_SOURCE, STAGE2_SOURCE):
+            read_frozen_file(self.code, artifact)
+        from .private_mount_plan import ApprovedPrivateMountPlan
+        _require(isinstance(self.private_mount_plan, ApprovedPrivateMountPlan)
+                 and ApprovedPrivateMountPlan.read(self.private_mount_plan.path, self.private_identity)
+                     == self.private_mount_plan, "private mount approval unavailable or changed")
+        trees = (self.code, *self.runtime)
+        compact = all(tree.executable_files is not None for tree in trees)
+        def inventory(tree):
+            if tree.executable_files is None:
+                return {}
+            return ({"executable_inventory": _executable_inventory(tree.executable_files)}
+                    if compact else {"executable_files": sorted(set(tree.executable_files))})
+        return {
+            "schema_version": "herdr-immutable-sources-2" if compact else "herdr-immutable-sources-1",
+            "authority": "root-published",
+            "trees": {str(tree.target): {"source": str(tree.path),
+                      "manifest_sha256": tree.source_digest, **inventory(tree)}
+                      for tree in trees},
+            "executables": {name: dict(self.code.files)[name]
+                            for name in (SHIM_SOURCE, STAGE1_SOURCE, STAGE2_SOURCE)},
+            "mount_plan": self.private_mount_plan.evidence(),
+        }
 
     def descriptors(self):
         self.stage._same_inode()
@@ -259,12 +439,25 @@ class PolicyMount:
             from .host_bootstrap import HostBootstrap
             _require(isinstance(self.bootstrap,HostBootstrap),"typed host bootstrap required")
             result.extend(self.bootstrap.descriptors())
+        if self.resolver_snapshot is not None:
+            from .resolver_namespace import ResolverSnapshot
+            _require(isinstance(self.resolver_snapshot, ResolverSnapshot), "typed resolver snapshot required")
+            result.append(self.resolver_snapshot.descriptor())
         return result
 
     def verify_mounted(self, pid, sealed: SealedPolicyBundle | None = None):
         rows = mount_rows(pid)
+        if self.private_workspace_pin is not None:
+            from .private_mount_plan import ApprovedPrivateMountPlan
+            _require(isinstance(self.private_mount_plan, ApprovedPrivateMountPlan),
+                     "private mount plan unavailable")
+            self.private_mount_plan.verify_mounted(pid, rows)
         root = Path(f"/proc/{pid}/root")
         for entry in self.descriptors():
+            if entry["kind"] == "sealed-resolver-data":
+                from .resolver_namespace import verify_mounted
+                verify_mounted(entry, pid, rows)
+                continue
             if entry["kind"] == "directory":
                 target = Path(entry["target"])
                 _require(not any(target in Path(path).parents for path in rows),
@@ -287,21 +480,30 @@ class PolicyMount:
                      "sealed policy mount digest mismatch")
         return rows
 
-    def observed_assurance(self, pid, attestation):
+    def observed_assurance(self, pid, attestation, *, admitted_workspace=None):
         rows = self.verify_mounted(pid)
         _require("ro" in rows.get("/", set()), "host root is not read-only")
         _require(os.readlink(f"/proc/{pid}/ns/mnt") != os.readlink("/proc/self/ns/mnt")
                  and os.readlink(f"/proc/{pid}/ns/pid") != os.readlink("/proc/self/ns/pid"),
                  "policy process lacks sandbox namespaces")
         same_network = os.readlink(f"/proc/{pid}/ns/net") == os.readlink("/proc/self/ns/net")
-        # This launch keeps provider credentials available to Hermes. It never
-        # claims isolation from tool-spawned processes or a provider-only firewall.
+        isolated = False
+        if self.private_profile_snapshot is not None:
+            from .credential_isolation import observe_sdk_credentials, _approved_confinement
+            approval = _approved_confinement()
+            isolated = observe_sdk_credentials(pid, self.private_profile_snapshot.identity,
+                                                rows, admitted_workspace)
+            _require(approval == _approved_confinement(),
+                     "worker confinement changed during seal observation")
+            self.worker_confinement_sha256 = hashlib.sha256(
+                canonical_json_bytes(approval)).hexdigest()
         return RuntimeAssurance(True, hashlib.sha256(canonical_json_bytes(attestation)).hexdigest(),
                                 NetworkAccess.GLOBAL if same_network else NetworkAccess.NONE,
-                                tuple(sorted(path for path, modes in rows.items() if "rw" in modes)), False)
+                                tuple(sorted(path for path, modes in rows.items() if "rw" in modes)), isolated)
 
     def seal(self, pid, grant: SecurityGrant, *, identity: InvocationIdentity, attestation,
-             tools, permissions, private_key, key_id, parent: SecurityGrant | None = None):
+             tools, permissions, private_key, key_id, parent: SecurityGrant | None = None,
+             delegated_writes=None):
         _require(isinstance(grant, SecurityGrant) and grant.identity == identity,
                  "grant differs from admitted identity")
         _require(set(grant.scope.tools) == set(tools) and set(grant.scope.permissions) <= set(permissions),
@@ -324,15 +526,24 @@ class PolicyMount:
                  and attestation.get("run_token") == identity.run_token
                  and attestation.get("sandbox_pid") == pid,
                  "policy sandbox attestation binding")
-        assurance = self.observed_assurance(pid, attestation)
+        assurance = self.observed_assurance(pid, attestation,
+                                           admitted_workspace=grant.workspace_root)
         bound = replace(grant, runtime_assurance=assurance)
         if parent is not None:
-            bound.require_subset_of(parent)
-        if bound.process.enabled:
+            if delegated_writes is None:
+                bound.require_subset_of(parent)
+            else:
+                bound.require_delegated_subset_of(parent, delegated_writes)
+        else:
+            _require(delegated_writes is None, "root cannot use child delegated authority")
+        if bound.process.enabled or self.private_profile_snapshot is not None:
             _require(assurance.credentials_isolated, "process credential isolation unavailable")
         sealed = self.stage.seal(bound, private_key, key_id=key_id, expected_identity=identity,
                                  expected_attestation_sha256=assurance.sandbox_attestation_sha256)
         self.verify_mounted(pid, sealed)
+        if delegated_writes is not None:
+            delegated_writes.validated_roots(bound, parent)
+            delegated_writes.record_sealed(bound, parent)
         return bound, sealed
 
 def validate_policy_evidence(evidence, *, identity: InvocationIdentity):
@@ -341,6 +552,10 @@ def validate_policy_evidence(evidence, *, identity: InvocationIdentity):
             "tree_identities", "process_start_ticks"}
     modern=isinstance(evidence,dict) and evidence.get("schema_version")=="herdr-policy-launch-3"
     if modern: keys.add("bootstrap")
+    if isinstance(evidence, dict) and "approved_profile" in evidence:
+        keys.add("approved_profile")
+        keys.add("immutable_sources")
+        keys.add("worker_confinement_sha256")
     _require(isinstance(evidence, dict) and set(evidence) == keys
              and len(canonical_json_bytes(evidence)) <= 16384, "bounded policy evidence required")
     _require(evidence["schema_version"] in {"herdr-policy-launch-2","herdr-policy-launch-3"}
@@ -365,11 +580,76 @@ def validate_policy_evidence(evidence, *, identity: InvocationIdentity):
                  and tree["inode"] > 0, "policy tree inode malformed")
     _require(type(evidence["process_start_ticks"]) is int
              and 0 < evidence["process_start_ticks"] < 2**64, "policy process identity malformed")
+    if "approved_profile" in evidence:
+        _require(isinstance(evidence["worker_confinement_sha256"], str)
+                 and _SHA.fullmatch(evidence["worker_confinement_sha256"]),
+                 "worker confinement proof malformed")
+        from .private_profile_namespace import profile_identity, PrivateProfileError
+        profile = evidence["approved_profile"]
+        _require(isinstance(profile, dict)
+                 and set(profile) == {"name", "files", "manifest_sha256"}
+                 and isinstance(profile["files"], dict),
+                 "approved profile evidence malformed")
+        try:
+            canonical = profile_identity(profile["name"], profile["files"])
+        except (PrivateProfileError, TypeError, ValueError) as exc:
+            raise SecurityError("approved profile evidence malformed") from exc
+        _require(profile == canonical, "approved profile evidence digest mismatch")
+        sources = evidence["immutable_sources"]
+        from .host_bootstrap import SHIM_SOURCE, STAGE1_SOURCE, STAGE2_SOURCE
+        _require(isinstance(sources, dict)
+                 and set(sources) == {"schema_version", "authority", "trees", "executables", "mount_plan"}
+                 and sources["schema_version"] in {"herdr-immutable-sources-1", "herdr-immutable-sources-2"}
+                 and sources["authority"] == "root-published"
+                 and isinstance(sources["trees"], dict)
+                 and set(sources["trees"]) == set(trees)
+                 and isinstance(sources["executables"], dict)
+                 and set(sources["executables"]) == {SHIM_SOURCE, STAGE1_SOURCE, STAGE2_SOURCE}
+                 and all(isinstance(v, str) and _SHA.fullmatch(v)
+                         for v in sources["executables"].values()),
+                 "immutable source evidence malformed")
+        plan = sources["mount_plan"]
+        from .private_mount_plan import AUTHORITY_ROOT, VERSION
+        _require(isinstance(plan, dict)
+                 and set(plan) == {"schema_version", "authority", "sha256", "device", "inode"}
+                 and plan["schema_version"] == VERSION
+                 and isinstance(plan["authority"], str)
+                 and Path(plan["authority"]).parent == AUTHORITY_ROOT
+                 and Path(plan["authority"]).name == hashlib.sha256(canonical_json_bytes(identity.to_json())).hexdigest() + ".json"
+                 and isinstance(plan["sha256"], str) and _SHA.fullmatch(plan["sha256"])
+                 and all(type(plan[k]) is int and 0 < plan[k] < 2**64 for k in ("device", "inode")),
+                 "immutable mount plan evidence malformed")
+        for target, source in sources["trees"].items():
+            digest = evidence["code_sha256"] if target == str(CODE_TARGET) else runtime[target]
+            inventory_field = ("executable_files" if sources["schema_version"] == "herdr-immutable-sources-1"
+                               else "executable_inventory")
+            base_fields = {"source", "manifest_sha256"}
+            shapes = ((base_fields, base_fields | {inventory_field})
+                      if sources["schema_version"] == "herdr-immutable-sources-1"
+                      else (base_fields | {inventory_field},))
+            _require(isinstance(source, dict)
+                     and set(source) in shapes
+                     and isinstance(source["source"], str)
+                     and Path(source["source"]).is_absolute()
+                     and os.path.normpath(source["source"]) == source["source"]
+                     and source["manifest_sha256"] == digest,
+                     "immutable source evidence binding mismatch")
+            if "executable_files" in source:
+                names=source["executable_files"]
+                _require(isinstance(names,list) and len(names)<=65536
+                         and all(isinstance(name,str) and 0<len(name)<=1024 for name in names)
+                         and names==sorted(set(names)),"immutable executable evidence malformed")
+            if "executable_inventory" in source:
+                _validate_executable_inventory(source["executable_inventory"])
     if modern:
         from .host_bootstrap import validate_continuation
         bootstrap=evidence["bootstrap"]
-        _require(isinstance(bootstrap,dict) and set(bootstrap)=={"continuation","bootstrap_tree"},
+        _require(isinstance(bootstrap,dict) and set(bootstrap) in ({"continuation","bootstrap_tree"},
+                 {"continuation","bootstrap_tree","self_observation"}),
                  "bootstrap proof incomplete")
+        if "self_observation" in bootstrap:
+            from .bootstrap_self_observation import validate_mode
+            validate_mode(bootstrap["self_observation"])
         validate_continuation(bootstrap["continuation"],identity=identity,
                               bundle_sha256=evidence["bundle_sha256"])
         tree=bootstrap["bootstrap_tree"]
@@ -378,6 +658,94 @@ def validate_policy_evidence(evidence, *, identity: InvocationIdentity):
                  and isinstance(tree["source_digest"],str) and _SHA.fullmatch(tree["source_digest"]),
                  "bootstrap tree evidence malformed")
     return json.loads(canonical_json_bytes(evidence))
+
+
+def verify_retained_immutable_sources(proof):
+    """Re-establish root publication after restart using the signed manifest hash.
+
+    Reconstructing the manifest here is safe only because its digest and exact
+    source inode are already authenticated by the retained launch bundle.
+    """
+    from .private_mount_plan import ApprovedPrivateMountPlan
+    expected = proof["immutable_sources"]["mount_plan"]
+    approval = ApprovedPrivateMountPlan.read(Path(expected["authority"]), InvocationIdentity.from_dict(proof["identity"]))
+    _require(approval.evidence() == expected, "retained private mount approval changed")
+    for target, source in proof["immutable_sources"]["trees"].items():
+        path = Path(source["source"])
+        approved_executable=source.get("executable_files")
+        compact_inventory = source.get("executable_inventory")
+        if proof["immutable_sources"].get("schema_version") == "herdr-immutable-sources-2":
+            _require("executable_inventory" in source, "immutable executable inventory missing")
+        if "executable_inventory" in source:
+            _validate_executable_inventory(compact_inventory)
+            _require("executable_files" not in source, "mixed immutable executable inventory")
+        discovered_executables = []
+        _require(approved_executable is None or (isinstance(approved_executable,list)
+                 and len(approved_executable)<=65536 and all(isinstance(name,str) for name in approved_executable)),
+                 "retained immutable executable inventory invalid")
+        _verify_root_owned_ancestry(path)
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        files, total, entries = {}, [0], [0]
+        def walk(directory, prefix="", depth=0):
+            _require(depth <= 32, "retained immutable source depth exceeds bound")
+            for name in os.listdir(directory):
+                entries[0] += 1
+                _require(entries[0] <= 131072, "retained immutable inventory exceeds bound")
+                relative = prefix + name
+                info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                _verify_immutable_entry(info)
+                if stat.S_ISDIR(info.st_mode):
+                    child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                    dir_fd=directory)
+                    try:
+                        walk(child, relative + "/", depth + 1)
+                    finally:
+                        os.close(child)
+                else:
+                    _require(stat.S_ISREG(info.st_mode) and len(files) < 65536
+                             and info.st_size <= 268435456,
+                             "retained immutable source shape changed")
+                    if compact_inventory is not None:
+                        mode = info.st_mode & 0o111
+                        _require(mode in (0, 0o111), "retained immutable executable mode changed")
+                        if mode:
+                            discovered_executables.append(relative)
+                    elif approved_executable is not None:
+                        _require(info.st_mode&0o111==(0o111 if relative in approved_executable else 0),
+                                 "retained immutable executable mode changed")
+                    total[0] += info.st_size
+                    _require(total[0] <= 2147483648, "retained immutable source exceeds bound")
+                    item = _open_relative(fd, relative)
+                    try:
+                        digest = hashlib.sha256()
+                        remaining = info.st_size
+                        while remaining:
+                            chunk = os.read(item, min(1048576, remaining))
+                            _require(bool(chunk), "retained immutable source shortened")
+                            digest.update(chunk)
+                            remaining -= len(chunk)
+                        _require(not os.read(item, 1), "retained immutable source grew")
+                        files[relative] = digest.hexdigest()
+                    finally:
+                        os.close(item)
+        try:
+            held = os.fstat(fd)
+            _require({"device": held.st_dev, "inode": held.st_ino} == proof["tree_identities"][target],
+                     "retained immutable source inode changed")
+            walk(fd)
+            if compact_inventory is not None:
+                _require(_executable_inventory(discovered_executables) == compact_inventory,
+                         "retained immutable executable inventory changed")
+            _require(approved_executable is None or set(approved_executable)<=set(files),
+                     "retained immutable executable inventory changed")
+            _require(hashlib.sha256(canonical_json_bytes(dict(sorted(files.items())))).hexdigest()
+                     == source["manifest_sha256"], "retained immutable source manifest changed")
+            if target == str(CODE_TARGET):
+                _require(all(files.get(name) == digest for name, digest in
+                             proof["immutable_sources"]["executables"].items()),
+                         "retained immutable bootstrap executable changed")
+        finally:
+            os.close(fd)
 
 
 def process_start_ticks(pid):
@@ -400,7 +768,22 @@ def verify_retained_policy_evidence(evidence, *, identity, pid, attestation, now
              and attestation.get("sandbox_pid") == pid
              and hashlib.sha256(canonical_json_bytes(attestation)).hexdigest()
                  == proof["sandbox_attestation_sha256"], "retained attestation mismatch")
+    _require(attestation.get("approved_profile") == proof.get("approved_profile"),
+             "retained approved profile differs from signed attestation")
+    _require(attestation.get("immutable_sources") == proof.get("immutable_sources"),
+             "retained immutable sources differ from signed attestation")
+    if "approved_profile" in proof:
+        from .credential_isolation import _approved_confinement
+        _require(hashlib.sha256(canonical_json_bytes(_approved_confinement())).hexdigest()
+                 == proof["worker_confinement_sha256"],
+                 "retained worker confinement approval changed")
+    if "approved_profile" in proof:
+        verify_retained_immutable_sources(proof)
     rows = mount_rows(pid)
+    if "approved_profile" in proof:
+        from .private_mount_plan import ApprovedPrivateMountPlan
+        ApprovedPrivateMountPlan.read(
+            Path(proof["immutable_sources"]["mount_plan"]["authority"]), identity).verify_mounted(pid, rows)
     _require("ro" in rows.get("/", set()), "host root is not read-only")
     _require(os.readlink(f"/proc/{pid}/ns/mnt") != os.readlink("/proc/self/ns/mnt")
              and os.readlink(f"/proc/{pid}/ns/pid") != os.readlink("/proc/self/ns/pid"),
@@ -451,10 +834,42 @@ def verify_retained_policy_evidence(evidence, *, identity, pid, attestation, now
     assurance = grant.runtime_assurance
     network = (NetworkAccess.GLOBAL if os.readlink(f"/proc/{pid}/ns/net") == os.readlink("/proc/self/ns/net")
                else NetworkAccess.NONE)
-    _require(assurance.network_access == network and not assurance.credentials_isolated
+    isolated = False
+    if "approved_profile" in proof:
+        from .credential_isolation import observe_sdk_credentials
+        isolated = observe_sdk_credentials(pid, proof["approved_profile"], rows,
+                                            grant.workspace_root)
+    _require(assurance.network_access == network and assurance.credentials_isolated == isolated
              and set(assurance.writable_roots) == {name for name,modes in rows.items() if "rw" in modes},
              "retained runtime assurance mismatch")
     _require(process_start_ticks(pid) == proof["process_start_ticks"], "policy process changed during verification")
+    if "approved_profile" in proof:
+        approved = proof["approved_profile"]
+        profile_root = root / "home/agentops/.hermes/profiles" / approved["name"]
+        _require("ro" in rows.get("/home/agentops", set())
+                 and "ro" in rows.get("/home/agentops/.hermes/profiles/"
+                                      + approved["name"] + "/config.yaml", set()),
+                 "retained approved profile mount unverified")
+        for relative, digest in approved["files"].items():
+            if relative == "auth.json":
+                _require(not (profile_root / relative).exists(),
+                         "retained host credential exposed to SDK")
+                continue
+            target = "/home/agentops/.hermes/profiles/" + approved["name"] + "/" + relative
+            _require("ro" in rows.get(target, set()),
+                     "retained approved profile file is not readonly")
+            file = profile_root / relative
+            fd = os.open(file, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                info = os.fstat(fd)
+                _require(stat.S_ISREG(info.st_mode) and info.st_size <= 131072,
+                         "retained approved profile file shape changed")
+                raw = os.read(fd, 131073)
+                _require(len(raw) == info.st_size
+                         and hashlib.sha256(raw).hexdigest() == digest,
+                         "retained approved profile bytes changed")
+            finally:
+                os.close(fd)
     if require_bootstrap:
         _require(proof["schema_version"]=="herdr-policy-launch-3",
                  "authenticated agent bootstrap proof required")
@@ -487,16 +902,132 @@ class ApprovedTree:
                                  max_file_bytes=self.max_file_bytes)
 
 
+@dataclass(frozen=True)
+class ApprovedImmutableTree:
+    """Reviewed root-published Hermes/Python code, immutable against host UID.
+
+    This deliberately does not copy source files into agentops-owned storage.
+    The host release operator must first publish the complete approved tree
+    under a root-owned, non-writable ancestry. No runtime chmod/chown or sudo.
+    """
+    source: Path
+    target: Path
+    files: Mapping[str, str]
+    max_bytes: int = 33_554_432
+    max_file_bytes: int = 4_194_304
+    executable_files: tuple[str, ...] | None = None
+
+    def __post_init__(self):
+        from types import MappingProxyType
+        _require(isinstance(self.source, Path) and self.source.is_absolute(),
+                 "immutable approved tree source invalid")
+        _require(isinstance(self.target, Path) and self.target.is_absolute(),
+                 "immutable approved tree target invalid")
+        _require(isinstance(self.files, Mapping) and len(self.files) > 0,
+                 "immutable approved tree manifest required")
+        object.__setattr__(self, "files", MappingProxyType(dict(self.files)))
+        if self.executable_files is not None:
+            _require(all(isinstance(name,str) for name in self.executable_files)
+                     and set(self.executable_files)<=set(self.files),"immutable executable inventory invalid")
+            object.__setattr__(self,"executable_files",tuple(self.executable_files))
+
+    def freeze(self, storage, writable_roots):
+        # Avoid path aliases via worker writable roots even when a temporary
+        # directory happens to have root ownership. This is a separate
+        # root-owned publisher, never a child-created copy.
+        path = self.source
+        for raw in writable_roots:
+            root = Path(raw).absolute()
+            _require(not (path == root or root in path.parents),
+                     "immutable source overlaps writable workspace")
+        tree = FrozenTree.attach_immutable(
+            path, target=self.target, files=self.files,
+            max_bytes=self.max_bytes, max_file_bytes=self.max_file_bytes,
+        )
+        try:
+            tree.executable_files=self.executable_files
+            tree.verify()
+            return tree
+        except BaseException:
+            tree.close()
+            raise
+
+
+@dataclass(frozen=True)
+class ApprovedProfile:
+    """Host-owned, review-bound profile digests (never sourced from a task).
+
+    Only the host launch factory can supply this object. The untrusted agent
+    receives neither the authority to approve file hashes nor raw credentials.
+    """
+    name: str
+    source: Path
+    files: Mapping[str, str]
+
+    def __post_init__(self):
+        from types import MappingProxyType
+        from .private_profile_namespace import _PROFILE, _relative, _HEX, _MAX_FILES
+        _require(isinstance(self.name, str) and bool(_PROFILE.fullmatch(self.name)),
+                 "approved profile name invalid")
+        _require(isinstance(self.source, Path) and self.source.is_absolute()
+                 and self.source.name == self.name,
+                 "approved profile source invalid")
+        _require(isinstance(self.files, Mapping)
+                 and 2 <= len(self.files) <= _MAX_FILES
+                 and {"config.yaml", ".env"} <= set(self.files),
+                 "approved profile manifest required")
+        for relative, digest in self.files.items():
+            _relative(relative)
+            _require(isinstance(digest, str) and bool(_HEX.fullmatch(digest)),
+                     "approved profile digest invalid")
+        object.__setattr__(self, "files", MappingProxyType(dict(self.files)))
+
+    @property
+    def identity(self) -> dict[str, object]:
+        from .private_profile_namespace import profile_identity
+        return profile_identity(self.name, self.files)
+
+    def freeze(self):
+        from .private_profile_namespace import PrivateProfileSnapshot
+        return PrivateProfileSnapshot.from_approved(
+            self.source, name=self.name, approved_sha256=self.files,
+        )
+
+
+_LIVE_PREPARED_LAUNCHES = {}
+
+
+def _launch_key(identity):
+    return canonical_json_bytes(identity.to_json())
+
+
 class PreparedPolicyLaunch:
     """Private host object retained until the exact owned pane closes."""
-    def __init__(self, mount, grant, private_key, key_id, parent=None):
+    def __init__(self, mount, grant, private_key, key_id, parent=None,
+                 private_profile_snapshot=None):
+        from .private_profile_namespace import PrivateProfileSnapshot
+        _require(private_profile_snapshot is None
+                 or isinstance(private_profile_snapshot, PrivateProfileSnapshot),
+                 "typed host profile snapshot required")
         self.mount, self.grant = mount, grant
+        self.private_profile_snapshot = private_profile_snapshot
         self._private_key, self._key_id, self._parent = private_key, key_id, parent
         self.sealed = None
         self._process_start_ticks = None
         self._bootstrap_receipt = None
         self._published_bootstrap_receipt = None
         self._continuation_sink = None
+        self.bootstrap_self_observation = None
+        self._ownership = None
+        self._delegated_writes = None
+        self.private_plan_handoff = None
+        self._private_handoff_verify = None
+        self._private_handoff_state = None
+        if private_profile_snapshot is not None and isinstance(mount, PolicyMount):
+            from .private_mount_plan import PinnedLaunchPath
+            mount.private_workspace_pin = PinnedLaunchPath(Path(grant.workspace_root), directory=True)
+            mount.private_identity = grant.identity
+            mount.private_profile_snapshot = private_profile_snapshot
 
     @property
     def identity(self):
@@ -507,15 +1038,105 @@ class PreparedPolicyLaunch:
         require_clean_environment(os.environ)
         return {key: str(getattr(self.identity, field)) for field, key in IDENTITY_ENV.items()}
 
-    def verify_spawn_source(self, inspect_source):
+    def verify_spawn_source(self, inspect_source, *, observation=None):
         from .launch_environment import require_clean_spawn_source
         _require(callable(inspect_source),"host startup source inspector required")
-        require_clean_spawn_source(inspect_source())
+        if observation is None:
+            require_clean_spawn_source(inspect_source())
+        else:
+            from .canonical_startup_observation import AuthenticatedStartupObservation
+            _require(type(observation) is AuthenticatedStartupObservation,"typed root startup observation required")
+            observation.verify(self.grant, inspect_source())
+
+    def bind_result_slot(self, path, idempotency_key):
+        from dataclasses import replace
+        from .result_submission import ResultSlot, TOOL, reservation_binding
+        _require(self._private_key is not None, "result slot must bind before seal")
+        rule = next((rule for rule in self.grant.tool_rules if rule.tool == TOOL), None)
+        _require(rule is not None and rule.result_slot is None, "result submission authority required")
+        slot = ResultSlot.bind(path, self.identity, idempotency_key)
+        if self.private_profile_snapshot is not None:
+            from .private_mount_plan import PinnedLaunchPath
+            self.mount.private_result_pin = PinnedLaunchPath(
+                Path(slot.path), directory=False, expected=(slot.device, slot.inode),
+                reservation=reservation_binding(slot))
+            self.mount.private_result_pin.verify_reservation()
+        self.grant = replace(self.grant, tool_rules=tuple(
+            replace(rule,result_slot=slot) if rule.tool == TOOL else rule for rule in self.grant.tool_rules))
+        if self._parent is not None:
+            self.grant.require_logical_subset_of(self._parent)
+
+    def bind_delegated_writes(self, authority):
+        from .security import DelegatedWriteAuthority
+        _require(self.sealed is None and self._private_key is not None
+                 and self._parent is not None and self._delegated_writes is None
+                 and isinstance(authority, DelegatedWriteAuthority),
+                 "one original host child delegation binding required")
+        authority.validated_roots(self.grant, self._parent)
+        self._delegated_writes = authority
+
+    def bind_private_mount_plan(self, path):
+        from .private_mount_plan import ApprovedPrivateMountPlan
+        _require(self.private_profile_snapshot is not None and self.sealed is None,
+                 "private mount plan must bind before seal")
+        _require(self.mount.private_mount_plan is None, "private mount plan is one-shot")
+        self.mount.private_mount_plan = ApprovedPrivateMountPlan.read(path, self.identity)
+
+    def prepare_private_command(self, builder):
+        """Validate the exact approved command while descriptors are still held.
+
+        The caller must do this before creating any pane. Root records remain
+        outside worker control; a missing issuer/record is an explicit denial.
+        """
+        from .private_mount_plan import AUTHORITY_ROOT
+        _require(self.private_profile_snapshot is not None and self.sealed is None,
+                 "private command must approve before pane creation")
+        if self.mount.private_mount_plan is None:
+            # Building records a bounded request without starting bwrap. Only
+            # its missing-approval denial can lead to reading a root record.
+            try:builder()
+            except RuntimeError as exc:
+                if str(exc)!="durable_private_mount_plan_unapproved":raise
+            _require(self.mount.private_mount_request is not None,
+                     "exact private mount request unavailable")
+            name=hashlib.sha256(canonical_json_bytes(self.identity.to_json())).hexdigest()+".json"
+            selected = AUTHORITY_ROOT/name
+            if self.private_plan_handoff is not None:
+                selected = self.private_plan_handoff.await_approval(self, builder)
+            self.bind_private_mount_plan(selected)
+        self.mount.private_fd_handoff = (self.private_plan_handoff is not None
+                                        and self.private_plan_handoff.automatic_issuer is not None)
+        result = builder()
+        if self.private_plan_handoff is not None:
+            self.private_plan_handoff.verify_bound(self)
+        return result
+
+    def verify_private_handoff(self):
+        if self.private_plan_handoff is not None:
+            self.private_plan_handoff.verify_bound(self)
 
     def seal(self, pid, attestation, *, tools, permissions):
+        approved = (self.private_profile_snapshot.identity
+                    if self.private_profile_snapshot is not None else None)
+        _require(isinstance(attestation, dict)
+                 and attestation.get("approved_profile") == approved,
+                 "approved profile must match signed sandbox attestation")
+        if approved is not None:
+            _require(self.mount.private_result_pin is not None,"private result reservation unavailable")
+            self.mount.private_result_pin.verify_reservation()
+            # Identity-consistent profile is not sufficient if the live host
+            # can rewrite imported Hermes/Python code after first attestation.
+            self.mount.require_immutable_runtime()
+            sources = self.mount.immutable_source_evidence()
+            _require("immutable_sources" not in attestation
+                     or attestation["immutable_sources"] == sources,
+                     "immutable source attestation mismatch")
+            attestation["immutable_sources"] = sources
         bound, sealed = self.mount.seal(pid, self.grant, identity=self.identity, attestation=attestation,
                                        tools=tools, permissions=permissions, private_key=self._private_key,
-                                       key_id=self._key_id, parent=self._parent)
+                                       key_id=self._key_id, parent=self._parent,
+                                       **({"delegated_writes": self._delegated_writes}
+                                          if self._delegated_writes is not None else {}))
         self.grant, self.sealed = bound, sealed
         self._process_start_ticks = process_start_ticks(pid)
         self._private_key = None
@@ -546,6 +1167,8 @@ class PreparedPolicyLaunch:
     def confirm_bootstrap(self):
         _require(self.mount.bootstrap is not None,"immutable host bootstrap unavailable")
         self._bootstrap_receipt=self.mount.bootstrap.confirm()
+        if self.private_profile_snapshot is not None:
+            self.mount.private_result_pin.verify_reservation()
         return self.evidence()
 
     def verify_bootstrap(self):
@@ -564,22 +1187,54 @@ class PreparedPolicyLaunch:
                 "process_start_ticks": self._process_start_ticks,
                 "identity": self.identity.to_json(),
                 "sandbox_attestation_sha256": self.grant.runtime_assurance.sandbox_attestation_sha256}
+        if self.private_profile_snapshot is not None:
+            proof["approved_profile"] = self.private_profile_snapshot.identity
+            proof["immutable_sources"] = self.mount.immutable_source_evidence()
+            proof["worker_confinement_sha256"] = self.mount.worker_confinement_sha256
         if self._bootstrap_receipt is not None:
             proof["schema_version"]="herdr-policy-launch-3"
             proof["bootstrap"]=self.mount.bootstrap.evidence(self._bootstrap_receipt)
         return proof
 
     def cleanup_after_pane_closed(self):
-        # No invocation data, model argument or environment variable selects
-        # these paths. The factory created every retained object itself.
-        self.mount.stage._same_inode()
-        if self.mount.bootstrap is not None:
-            self.mount.bootstrap.cleanup_after_pane_closed()
-        self.mount.stage.close()
-        self.mount.stage.path.unlink()
-        for tree in (self.mount.code, *self.mount.runtime):
-            tree.cleanup_after_pane_closed()
-        self._private_key = None
+        actions = []
+        if not getattr(self, "_resources_closed", False):
+            for pin in (getattr(self.mount, "private_workspace_pin", None),
+                        getattr(self.mount, "private_result_pin", None)):
+                if pin is not None:
+                    actions.append(pin.close)
+            actions.extend(lambda fd=fd: os.close(fd)
+                           for fd in getattr(self.mount, "private_cli_pins", {}).values())
+            if hasattr(self.mount, "private_cli_pins"):
+                self.mount.private_cli_pins = {}
+            resolver = getattr(self.mount, "resolver_snapshot", None)
+            if resolver is not None:
+                actions.append(resolver.close)
+            def release_stage():
+                try:
+                    self.mount.stage._same_inode()
+                    self.mount.stage.path.unlink()
+                finally:
+                    self.mount.stage.close()
+            actions.append(release_stage)
+            if self.mount.bootstrap is not None:
+                actions.append(self.mount.bootstrap.cleanup_after_pane_closed)
+            actions.extend(tree.cleanup_after_pane_closed
+                           for tree in (self.mount.code, *self.mount.runtime))
+        if self.private_profile_snapshot is not None:
+            actions.append(self.private_profile_snapshot.close)
+        if self._ownership is not None:
+            def release_ownership():
+                self._ownership.cleanup_after_pane_closed()
+                self._ownership = None
+            actions.append(release_ownership)
+        try:
+            _finish_cleanup(actions)
+        finally:
+            self._private_key = None
+            self._resources_closed = True
+            if _LIVE_PREPARED_LAUNCHES.get(_launch_key(self.identity)) is self:
+                del _LIVE_PREPARED_LAUNCHES[_launch_key(self.identity)]
 
 
 class HostPolicyLaunchFactory:
@@ -589,28 +1244,107 @@ class HostPolicyLaunchFactory:
     a TaskGraph, prompt or queue record. It must return the grant accepted by the
     consumer/provider policy. Missing grants deny before a pane is created.
     """
-    def __init__(self, *, code: ApprovedTree, runtime: tuple[ApprovedTree, ...],
-                 storage: Path, authorize, writable_roots=(), parent_grant=None):
-        _require(isinstance(code, ApprovedTree) and code.target == CODE_TARGET,
+    def __init__(self, *, code: ApprovedTree | ApprovedImmutableTree,
+                 runtime: tuple[ApprovedTree | ApprovedImmutableTree, ...],
+                 storage: Path, authorize, writable_roots=(), parent_grant=None,
+                 approved_profile: ApprovedProfile | None = None,
+                 profile_preflight=None,
+                 parent_approved_profile: ApprovedProfile | None = None,
+                 parent_launch: PreparedPolicyLaunch | None = None,
+                 retained_parent_verify=None, private_plan_handoff=None, bootstrap_self_observation=None):
+        approved_types = (ApprovedTree, ApprovedImmutableTree)
+        _require(isinstance(code, approved_types) and code.target == CODE_TARGET,
                  "approved policy code required")
-        _require(len(runtime) == 2 and all(isinstance(x, ApprovedTree) for x in runtime)
-                 and {x.target for x in runtime} == RUNTIME_TARGETS, "approved exact runtime required")
+        _require(len(runtime) == 2 and all(isinstance(x, approved_types) for x in runtime)
+                 and {x.target for x in runtime} == RUNTIME_TARGETS,
+                 "approved exact runtime required")
         _require(callable(authorize), "host policy authority required")
         _require(parent_grant is None or isinstance(parent_grant, SecurityGrant),
                  "typed parent grant required")
+        _require(approved_profile is None or isinstance(approved_profile, ApprovedProfile),
+                 "typed host approved profile required")
+        _require(profile_preflight is None or callable(profile_preflight),
+                 "typed host profile preflight required")
+        _require(parent_approved_profile is None
+                 or isinstance(parent_approved_profile, ApprovedProfile),
+                 "typed parent host profile approval required")
+        _require(parent_launch is None or isinstance(parent_launch, PreparedPolicyLaunch),
+                 "typed live parent launch required")
+        _require(retained_parent_verify is None or callable(retained_parent_verify),
+                 "host retained parent verifier required")
+        writable_roots = tuple(writable_roots)
+        from .launch_plan_handoff import LaunchPlanHandoff
+        _require(private_plan_handoff is None or isinstance(private_plan_handoff, LaunchPlanHandoff),
+                 "typed host launch-plan handoff required")
+        _require(private_plan_handoff is None or approved_profile is not None,
+                 "launch-plan handoff requires private host profile")
+        if private_plan_handoff is not None:
+            _require(all(Path(root) != private_plan_handoff.directory
+                         and Path(root) not in private_plan_handoff.directory.parents
+                         for root in writable_roots), "launch proposals cannot live in admitted write roots")
+        _require(bootstrap_self_observation in (None, "authenticated-root-kernel-v1")
+                 and (bootstrap_self_observation is None or approved_profile is not None),
+                 "explicit private bootstrap observation mode required")
+        self.bootstrap_self_observation = bootstrap_self_observation
+        self.private_plan_handoff = private_plan_handoff
+        self.approved_profile = approved_profile
+        self.parent_approved_profile = parent_approved_profile
+        self.parent_launch = parent_launch
+        self.retained_parent_verify = retained_parent_verify
+        self.profile_preflight = profile_preflight
         self.code, self.runtime, self.storage = code, tuple(runtime), Path(storage)
         self.authorize, self.writable_roots, self.parent_grant = authorize, tuple(writable_roots), parent_grant
 
-    def prepare_child(self, *, identity: InvocationIdentity, workspace: Path, tools, permissions):
+    def prepare_child(self, *, identity: InvocationIdentity, workspace: Path, tools, permissions,
+                      owned_write_roots=None):
+        tools = tuple(tools)
+        _require("herdr_delegate_child" not in tools, "child-bound delegation transport unavailable")
         _require(isinstance(self.parent_grant, SecurityGrant), "accepted host parent grant required")
-        return self.prepare(identity=identity, workspace=workspace, tools=tools, permissions=permissions)
+        if self.approved_profile is not None:
+            _require(isinstance(self.parent_approved_profile, ApprovedProfile)
+                     and self.parent_approved_profile.identity == self.approved_profile.identity,
+                     "child approved profile differs from host parent approval")
+            if self.retained_parent_verify is not None:
+                parent,profile=self.retained_parent_verify()
+                _require(isinstance(parent,SecurityGrant)
+                         and parent==self.parent_grant
+                         and profile==self.approved_profile.identity,
+                         "child approved profile differs from verified retained parent")
+            else:
+                _require(isinstance(self.parent_launch, PreparedPolicyLaunch)
+                     and self.parent_launch.sealed is not None
+                     and self.parent_launch.identity == self.parent_grant.identity
+                     and self.parent_launch.grant.hash == self.parent_grant.hash
+                     and self.parent_launch.private_profile_snapshot is not None,
+                         "child approved profile requires accepted live parent launch")
+                _require(self.parent_launch.evidence().get("approved_profile")
+                     == self.approved_profile.identity,
+                         "child approved profile differs from signed parent evidence")
+        return self.prepare(identity=identity,workspace=workspace,tools=tools,permissions=permissions,
+                            owned_write_roots=owned_write_roots)
 
-    def prepare(self, *, identity: InvocationIdentity, workspace: Path, tools, permissions):
+    def prepare(self, *, identity: InvocationIdentity, workspace: Path, tools, permissions,
+                owned_write_roots=None):
         _require(isinstance(identity, InvocationIdentity), "typed invocation identity required")
         tools, permissions = tuple(tools), tuple(permissions)
         grant = self.authorize(identity=identity, workspace=Path(workspace), tools=tools, permissions=permissions)
         _require(isinstance(grant, SecurityGrant) and grant.identity == identity,
                  "host grant unavailable or mismatched")
+        if owned_write_roots is not None:
+            from dataclasses import replace
+            _require(isinstance(owned_write_roots,tuple) and len(owned_write_roots)<=64
+                     and len(set(owned_write_roots))==len(owned_write_roots),"finite owned write roots required")
+            roots=tuple(Path(item).absolute() for item in owned_write_roots)
+            workspace_root=Path(grant.workspace_root).absolute()
+            _require(all(root!=workspace_root and workspace_root in root.parents
+                         and root.resolve(strict=True)==root for root in roots),"owned write root outside workspace")
+            write_rules=tuple(rule for rule in grant.tool_rules if rule.tool in {"write_file","patch"})
+            _require(not write_rules or bool(roots),"file writer has no owned write mount")
+            _require(all(any(root==Path(limit) or Path(limit) in root.parents for limit in rule.allowed_roots)
+                         for rule in write_rules for root in roots),"owned write root exceeds host rule")
+            grant=replace(grant,tool_rules=tuple(
+                replace(rule,allowed_roots=tuple(str(root) for root in roots))
+                if rule.tool in {"write_file","patch"} else rule for rule in grant.tool_rules))
         _require(set(grant.scope.tools) == set(tools) and set(grant.scope.permissions) <= set(permissions),
                  "host grant exceeds admitted scope")
         path = Path(workspace).absolute()
@@ -622,22 +1356,82 @@ class HostPolicyLaunchFactory:
                      "host parent grant identity mismatch")
             grant.require_logical_subset_of(self.parent_grant)
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-        snapshots, stage = [], None
+        from .launch_ownership import LaunchOwnership
+        ownership = LaunchOwnership.create(self.storage, identity)
+        snapshots, stage, profile_snapshot = [], None, None
         try:
             for definition in (self.code, *self.runtime):
-                snapshots.append(definition.freeze(self.storage, (*self.writable_roots, path)))
+                snapshots.append(definition.freeze(ownership.directory, (*self.writable_roots, path)))
+            # A trusted host-owned manifest is the only way to enable the new
+            # profile. Bind it after the existing grant/parent admission, never
+            # to model-supplied profile hashes or task routing metadata.
+            # Credential preflight (including optional refresh) must precede
+            # sealing, otherwise a subsequent refresh updates only the live
+            # host profile and leaves the immutable child snapshot expired.
+            if self.approved_profile is not None:
+                _require(callable(self.profile_preflight),
+                         "approved profile preflight authority missing")
+                _require(self.profile_preflight(self.approved_profile.name) is True,
+                         "approved profile preflight denied")
+                profile_snapshot = self.approved_profile.freeze()
             import uuid
-            stage = stage_policy_bundle(self.storage / ("grant-" + uuid.uuid4().hex + ".json"))
+            stage = stage_policy_bundle(ownership.directory / ("grant-" + uuid.uuid4().hex + ".json"))
             prepared=PreparedPolicyLaunch(PolicyMount(stage, snapshots[0], snapshots[1:]),
-                                          grant, Ed25519PrivateKey.generate(), "host-launch", self.parent_grant)
+                                          grant, Ed25519PrivateKey.generate(), "host-launch", self.parent_grant,
+                                          private_profile_snapshot=profile_snapshot)
+            prepared._ownership = ownership
+            prepared.bootstrap_self_observation = self.bootstrap_self_observation
+            prepared.private_plan_handoff = self.private_plan_handoff
+            if self.private_plan_handoff is not None:
+                def verify_handoff():
+                    _require(self.profile_preflight(self.approved_profile.name) is True,
+                             "current host profile approval unavailable")
+                    if self.parent_grant is not None:
+                        if self.retained_parent_verify is not None:
+                            parent, profile = self.retained_parent_verify()
+                            _require(parent == self.parent_grant
+                                     and profile == self.approved_profile.identity,
+                                     "retained parent changed during launch handoff")
+                        else:
+                            _require(self.parent_launch is not None,
+                                     "live parent unavailable during launch handoff")
+                            self.parent_launch.verify_bootstrap()
+                            _require(self.parent_launch.grant == self.parent_grant
+                                     and self.parent_grant.is_active(),
+                                     "live parent changed during launch handoff")
+                    return True
+                prepared._private_handoff_verify = verify_handoff
             from .host_bootstrap import HostBootstrap
             prepared.mount.bootstrap=HostBootstrap.create(
-                prepared,storage=self.storage,writable_roots=(*self.writable_roots,path))
+                prepared,storage=ownership.directory,writable_roots=(*self.writable_roots,path))
+            _LIVE_PREPARED_LAUNCHES[_launch_key(identity)] = prepared
             return prepared
         except BaseException:
+            actions = []
+            if "prepared" in locals():
+                for pin in (prepared.mount.private_workspace_pin, prepared.mount.private_result_pin):
+                    if pin is not None:
+                        actions.append(pin.close)
             if stage is not None:
-                stage.close()
-                stage.path.unlink(missing_ok=True)
-            for snapshot in snapshots:
-                snapshot.cleanup_after_pane_closed()
+                actions.extend((stage.close, lambda: stage.path.unlink(missing_ok=True)))
+            actions.extend(snapshot.cleanup_after_pane_closed for snapshot in snapshots)
+            if profile_snapshot is not None:
+                actions.append(profile_snapshot.close)
+            actions.append(ownership.cleanup_after_pane_closed)
+            try:
+                _finish_cleanup(actions)
+            except BaseException:
+                # The preparation failure remains primary; all closes ran.
+                pass
             raise
+
+
+    def cleanup_orphan(self, identity):
+        prepared = _LIVE_PREPARED_LAUNCHES.get(_launch_key(identity))
+        if prepared is not None:
+            _require(prepared.identity == identity and prepared._ownership.storage == self.storage,
+                     "live policy ownership changed")
+            prepared.cleanup_after_pane_closed()
+            return True
+        from .launch_ownership import cleanup_orphan
+        return cleanup_orphan(self.storage, identity)
