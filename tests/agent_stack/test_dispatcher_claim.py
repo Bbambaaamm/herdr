@@ -20,6 +20,21 @@ dispatcher = importlib.util.module_from_spec(spec)
 loader.exec_module(dispatcher)
 
 
+def test_due_tasks_dispatch_lower_priority_number_first(tmp_path, monkeypatch):
+    pending = tmp_path / "pending"
+    pending.mkdir()
+    monkeypatch.setattr(dispatcher, "PENDING", pending)
+    monkeypatch.setattr(dispatcher, "disk_headroom_blocker", lambda *_: False)
+    for name, priority in (("ordinary", 60), ("p1", 20), ("p0", 10)):
+        (pending / f"{name}.json").write_text(json.dumps({
+            "id": name,
+            "priority": priority,
+            "not_before": "2000-01-01T00:00:00+00:00",
+        }))
+
+    assert [path.stem for path in dispatcher.due_tasks()] == ["p0", "p1", "ordinary"]
+
+
 def test_launch_stamps_fresh_dispatch_claim_before_running(tmp_path, monkeypatch):
     dispatcher.ROOT = tmp_path
     dispatcher.PENDING = tmp_path / "pending"

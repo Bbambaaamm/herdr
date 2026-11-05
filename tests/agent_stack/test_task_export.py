@@ -29,6 +29,13 @@ class TaskExportTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_loxxess_repository_has_a_closed_coordinator_mapping(self):
+        self.assertEqual(
+            self.exporter.REPO_PROFILES["Bbambaaamm/loxxess-technical-ai-assistant"],
+            "loxxess",
+        )
+        self.assertEqual(self.exporter.PROFILE_AGENTS["loxxess"], "loxxess-hermes")
+
     def test_intake_state_reads_legacy_and_repo_scoped_keys(self):
         self.exporter.INTAKE.write_text(
             json.dumps(

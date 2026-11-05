@@ -66,6 +66,18 @@ DESIRED = [
             {"tab": "Hermes", "name": "herdr-hermes", "kind": "hermes", "args": ["-p", "quantlab", "chat"]},
         ],
     },
+    {
+        "label": "LoxxessTechnicalAI",
+        "cwd": str(HOME / "workspaces/loxxess-technical-ai-assistant"),
+        "repository": "Bbambaaamm/loxxess-technical-ai-assistant",
+        "repo_url": "https://github.com/Bbambaaamm/loxxess-technical-ai-assistant.git",
+        "agents": [
+            {"tab": "Codex", "name": "loxxess-codex", "kind": "codex", "args": []},
+            # Reuse deployed Hermes model/tool wiring. Repository authority and
+            # safety are supplied separately by the loxxess-technical contract.
+            {"tab": "Hermes", "name": "loxxess-hermes", "kind": "hermes", "args": ["-p", "quantlab", "chat"]},
+        ],
+    },
 ]
 
 def log(message):

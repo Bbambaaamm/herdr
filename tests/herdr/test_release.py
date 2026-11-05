@@ -54,6 +54,7 @@ def minimal_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path,
 
 def test_release_consumer_contract_includes_herdr():
     assert "herdr" in release.CONSUMERS
+    assert "loxxess" in release.CONSUMERS
 
 
 def test_consumer_contract_is_closed_and_permission_monotonic():

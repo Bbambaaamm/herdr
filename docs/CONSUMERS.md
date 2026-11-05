@@ -48,6 +48,27 @@ A gated leaf does not stop unrelated AUTO work. Human/credential/external/privil
 become a root blocker only when no dependency-ready AUTO work remains. Elapsed acceptance gates
 such as the #9 soak are re-checked after cooldown and may never be fabricated.
 
+## LOXXESS Technical AI Assistant
+
+Repository: Bbambaaamm/loxxess-technical-ai-assistant
+
+Primary roles: repository engineering, offline validation, documentation, configuration review and
+safe preparation of the existing Microsoft Teams / Microsoft 365 / Power Platform solution.
+
+GitHub intake is issue-scoped (`all_open`) and requires a fresh trusted maintainer acknowledgement
+for each admitted issue episode. The stable `loxxess-hermes` coordinator reuses the deployed
+`quantlab` Hermes profile only for model/tool transport. Repository authority and safety come from
+the separate `loxxess-technical` task contract.
+
+Hard boundaries include no DLP/ACP bypass, no unapproved billing/licensing/Gateway or production
+publication, no exposure of raw private evidence or local configuration, and no claim of live
+Teams/Microsoft 365 acceptance from offline tests or templates. Unknown stock is not zero, an
+access failure is not an unavailable part, and owner-only success is not evidence for another user.
+
+Runtime workspace: `/home/agentops/workspaces/loxxess-technical-ai-assistant`.
+Task worktrees: `/home/agentops/workspaces/loxxess-technical-ai-assistant/worktrees/`.
+Repository policy profile: `loxxess-technical`.
+
 ## Heating
 
 Repository: Bbambaaamm/heating

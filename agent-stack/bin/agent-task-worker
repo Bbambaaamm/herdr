@@ -1531,6 +1531,28 @@ TASK COMPLETION CONTRACT:
 - Include concrete artifacts/checks in evidence. Put any blocker and next action in summary. The host binds repository "{repo}".
 - status must be one of completed, blocked, failed.
 """
+    elif profile == "loxxess-technical":
+        contract = f"""
+
+TASK COMPLETION CONTRACT:
+- You are running in isolated durable-task session {task_agent}, derived from coordinator {agent}, under Herdr for GitHub repository {repo}. The persistent coordinator chat is control-plane only and must not receive this task payload.
+- Work from {workspace} and use only an isolated clean issue worktree under {str(task.get('worktree_root') or Path(workspace) / 'worktrees').rstrip('/')} for code changes. Never modify the persistent checkout or another issue's worktree.
+- Before changing code, read AGENTS.md, README.md, docs/current-state.md, docs/roadmap.md, relevant module documentation and evals/scenarios.json, then inspect the live issue, current main, open PRs and prior durable evidence.
+- Economic implementation, research, testing or review by a child requires an admitted durable Herdr TaskGraph child before its prompt is sent. No child may widen the parent tools or permissions.
+- Never expose raw evidence/private files, config/*.local.json, credentials, personal communications or protected operational data in prompts, logs, issues, commits or external services.
+- Treat DLP/ACP and permission failures as policy gates. Do not bypass them through another connector, HTTP path, account, environment or proxy.
+- Do not activate billing, licenses, paid services, Gateway, production publication, access changes or irreversible Microsoft 365 / Power Platform actions without explicit separate authorization.
+- Offline tests and configuration templates prove only their bounded local claims; they are not evidence of a live Teams, Copilot Studio, Power BI or Power Platform deployment.
+- Preserve truthful uncertainty: unknown stock is not zero, an access failure is not an unavailable part, and an owner-only result is not proof of colleague or unauthorized-user behavior.
+- Preserve working photo labels/OCR and general matching behavior; do not hard-code individual LX corrections.
+- Continue autonomously through ordinary code, test and documentation decisions inside the admitted issue scope, but never fabricate live-user, security, accessibility or deployment evidence.
+- Completion flow for mergeable code is tests -> PR -> exact-head green CI -> independent exact-head review with no unresolved applicable finding -> unchanged-head verification -> merge only when repository protection permits it.
+- If a real authorized-account test, new credential, policy-owner action, production publication, billing decision or other human/external gate remains, complete safe preparatory work and report the precise blocker.
+- Before finishing, use herdr_submit_result with status, a nonempty evidence list and summary. The host publishes to the exact attempt-owned result inode.
+- The host binds task_id="{task_id}", run_token="{run_token}", the fence and idempotency key; do not supply a path or identity arguments.
+- Include concrete artifacts/checks in evidence. Put any blocker and next action in summary. The host binds repository "{repo}".
+- status must be one of completed, blocked, failed.
+"""
     else:
         route_rule = {
             "free": f"- Keep {agent} as the root coordinator. Eligible child nodes may use the FREE route via {executor_agent}; do not replace the parent identity.",
