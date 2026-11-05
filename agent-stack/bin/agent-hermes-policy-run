@@ -15,26 +15,30 @@ import json
 import os
 import re
 import socket
+import secrets
 import stat
 import subprocess
 import sys
 from pathlib import Path
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 BUNDLE_PATH = Path("/run/herdr-policy/grant.bundle.json")
 BOOTSTRAP_ROOT = Path("/run/herdr-bootstrap")
-BOOTSTRAP_STAGE1 = BOOTSTRAP_ROOT / "agent-hermes-policy-stage1"
 BOOTSTRAP_PROOF = BOOTSTRAP_ROOT / "immutable-trees.json"
 STAGE1_PROOF_ENV = "HERDR_POLICY_STAGE1_PROOF_SHA256"
 STAGE2_FD_ENV = "HERDR_VERIFIED_STAGE2_FD"
 BOOTSTRAP_AUTH_FD_ENV = "HERDR_BOOTSTRAP_AUTH_FD"
-MAX_AUTH_RESPONSE = 128
+MAX_AUTH_RESPONSE = 32768
 MAX_BUNDLE = 2 * 1024 * 1024
 POLICY_CODE_ROOT = Path("/run/herdr/policy-code")
+BOOTSTRAP_STAGE1 = POLICY_CODE_ROOT / "agent-stack/bin/agent-hermes-policy-stage1"
 HERMES_ROOT = Path("/home/agentops/.hermes/hermes-agent")
-HERMES_HEAD = "ee5ee84a345204a3b1d6ef6ba1ab747e602867b9"
-HERMES_SOURCE_SHA256 = "525219e866137f43c8c8b068488e07d97f14529d2d67497cd52fbfd1197da4f4"
+HERMES_HEAD = "candidate-b54a131be69f0918690847fb345a491c1c437317"
+HERMES_SOURCE_SHA256 = "b54a131be69f0918690847fb345a491c1c4373176b02beb64ed803b17ad103d6"
+HERMES_INVENTORY_PATH = POLICY_CODE_ROOT / "herdr/hermes_source_inventory.json"
+HERMES_INVENTORY_SHA256 = "784ba1664a432ac0b2f8392dee4a95d14ead2b37053dc2f4de3dff3604a80756"
+MAX_HERMES_INVENTORY = 1_048_576
 PYTHON_PATH = Path("/home/agentops/.local/share/uv/python/cpython-3.11.16-linux-x86_64-gnu/bin/python3.11")
 PYTHON_ROOT = PYTHON_PATH.parents[1]
 PYTHON_SHA256 = "1e761eb19d6f2594ab8dc64bd99ad4e1753589f3bf1ec199e4eef3aaa21e3930"
@@ -148,6 +152,8 @@ def _require_production_mount(path: Path, *, exact: bool = False) -> None:
 
 
 def _load_stage1_module() -> Any:
+    _require_production_mount(POLICY_CODE_ROOT, exact=True)
+    _require_startup_pycache_prefix()
     if BOOTSTRAP_STAGE1.is_symlink() or not BOOTSTRAP_STAGE1.is_file():
         raise SystemExit("immutable stage-one unavailable")
     loader = importlib.machinery.SourceFileLoader("herdr_policy_stage1_verified", str(BOOTSTRAP_STAGE1))
@@ -156,17 +162,13 @@ def _load_stage1_module() -> Any:
         raise SystemExit("immutable stage-one import unavailable")
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
-    _require_module_origin(module, BOOTSTRAP_ROOT, "policy stage-one")
+    _require_module_origin(module, POLICY_CODE_ROOT, "policy stage-one")
     return module
 
 
 def _require_held_stage2_source(source_path: str | None = None) -> None:
     """Prove this trusted stage-two source was held open by verified stage one."""
-    raw = os.environ.get(STAGE2_FD_ENV, "")
-    try:
-        fd = int(raw)
-    except (TypeError, ValueError):
-        raise SystemExit("verified stage-two source FD is required")
+    fd = _startup_descriptor(STAGE2_FD_ENV)
     actual_source = source_path if source_path is not None else __file__
     if source_path is None and not str(actual_source).startswith("/proc/self/fd/"):
         raise SystemExit("stage-two must execute from the held source FD")
@@ -195,6 +197,16 @@ def _require_stage1_continuity() -> None:
     rows = stage1._mount_rows()
     stage1._require_exact_ro_tree(BOOTSTRAP_ROOT, rows)
     stage1._verify_trees(proof, rows)
+    # Stage one passes this held source FD solely for the continuity check.
+    # It must not survive into policy imports, SDK startup, or credential
+    # observation.  Removing its environment handle also prevents a descendant
+    # from rediscovering the descriptor by name.
+    fd = _startup_descriptor(STAGE2_FD_ENV, retire=True)
+    try:
+        os.close(fd)
+    except (OSError, ValueError) as exc:
+        raise SystemExit("verified stage-two FD could not be retired") from exc
+    return proof
 
 
 def _raw_identity_from_env() -> dict[str, object]:
@@ -251,7 +263,7 @@ def _canonical_bootstrap(value: object) -> bytes:
     return raw
 
 
-def _recv_bootstrap_status(connection: socket.socket, expected: bytes) -> None:
+def _recv_bootstrap_status(connection: socket.socket, expected: bytes):
     data = bytearray()
     while len(data) < MAX_AUTH_RESPONSE:
         chunk = connection.recv(min(64, MAX_AUTH_RESPONSE - len(data)))
@@ -260,32 +272,122 @@ def _recv_bootstrap_status(connection: socket.socket, expected: bytes) -> None:
         data.extend(chunk)
         if b"\n" in data:
             line, tail = bytes(data).split(b"\n", 1)
-            if tail or line + b"\n" != expected:
+            if tail:
                 raise SystemExit("host bootstrap authority denied stage two")
-            return
+            if line + b"\n" == expected:
+                return None
+            if expected == b"stage2-ok\n" and line.startswith(b"stage2-ok "):
+                raw = line[len(b"stage2-ok "):]
+                try:
+                    value = json.loads(raw)
+                    if (type(value) is not dict or json.dumps(value, sort_keys=True,
+                            separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode() != raw):
+                        raise ValueError()
+                except (UnicodeError, ValueError, TypeError) as exc:
+                    raise SystemExit("host reference bootstrap response invalid") from exc
+                return value
+            raise SystemExit("host bootstrap authority denied stage two")
     raise SystemExit("host bootstrap authority response incomplete")
 
 
-def _require_host_bootstrap_authority() -> None:
-    raw_fd = os.environ.pop(BOOTSTRAP_AUTH_FD_ENV, "")
+_BOOTSTRAP_REPLY_TOKEN = object()
+
+
+class _AuthenticatedKernelReply:
+    """Local one-shot input receipt, NEVER authority for a host effect."""
+    __slots__ = ("_raw", "challenge", "_used")
+    def __init__(self, value, challenge, token):
+        if token is not _BOOTSTRAP_REPLY_TOKEN:
+            raise SystemExit("inherited bootstrap transport required")
+        self._raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
+        if len(self._raw) > MAX_AUTH_RESPONSE:
+            raise SystemExit("bounded bootstrap receipt required")
+        self.challenge, self._used = challenge, False
+    def consume(self):
+        if self._used:
+            raise SystemExit("bootstrap input receipt already consumed")
+        self._used = True
+        return json.loads(self._raw), self.challenge
+
+
+def _requested_self_observation(proof_digest):
+    if not re.fullmatch(r"[0-9a-f]{64}", proof_digest):
+        raise SystemExit("bootstrap authority requires verified stage-one proof")
     try:
-        fd = int(raw_fd)
+        with BOOTSTRAP_PROOF.open("rb") as source:
+            raw = source.read(65537)
+    except OSError as exc:
+        raise SystemExit("bootstrap authority proof unavailable") from exc
+    if len(raw) > 65536 or hashlib.sha256(raw).hexdigest() != proof_digest:
+        raise SystemExit("immutable bootstrap proof changed")
+    try:
+        proof = json.loads(raw)
+        if proof.get("schema_version") == "herdr-policy-bootstrap-3":
+            if proof["self_observation"]["mode"] != "authenticated-root-kernel-v1":
+                raise ValueError("mode")
+            return "authenticated-root-kernel-v1"
+        return None
+    except (ValueError, TypeError, KeyError) as exc:
+        raise SystemExit("bootstrap observation mode invalid") from exc
+
+
+_FIXED_STARTUP_DESCRIPTORS = {
+    _INTERPRETER_FD_ENV: 197,
+    STAGE2_FD_ENV: 198,
+    BOOTSTRAP_AUTH_FD_ENV: 199,
+}
+_RETIRED_STARTUP_DESCRIPTORS = set()
+
+
+def _startup_descriptor(name, *, retire=False):
+    """Versioned handle selection is integrity plumbing, never authority.
+
+    V3 source/proof authenticates fixed roles and NEVER puts descriptor hints
+    in exec's environment. Actual source inode/interpreter and inherited host
+    socket checks still independently authenticate every handle.
+    """
+    if name not in _FIXED_STARTUP_DESCRIPTORS:
+        raise SystemExit("unknown startup descriptor role")
+    mode = _requested_self_observation(os.environ.get(STAGE1_PROOF_ENV, ""))
+    if mode is not None:
+        if any(key in os.environ for key in _FIXED_STARTUP_DESCRIPTORS):
+            raise SystemExit("v3 startup descriptor environment forbidden")
+        if name in _RETIRED_STARTUP_DESCRIPTORS:
+            raise SystemExit("startup descriptor already retired")
+        if retire:
+            _RETIRED_STARTUP_DESCRIPTORS.add(name)
+        return _FIXED_STARTUP_DESCRIPTORS[name]
+    raw = os.environ.pop(name, "") if retire else os.environ.get(name, "")
+    try:
+        fd = int(raw)
     except (TypeError, ValueError) as exc:
-        raise SystemExit("host bootstrap authority session required") from exc
+        raise SystemExit("verified legacy startup descriptor required") from exc
+    if fd <= 2:
+        raise SystemExit("startup descriptor cannot replace standard IO")
+    return fd
+
+
+def _require_host_bootstrap_authority():
+    fd = _startup_descriptor(BOOTSTRAP_AUTH_FD_ENV, retire=True)
     proof_digest = os.environ.get(STAGE1_PROOF_ENV, "")
     if not re.fullmatch(r"[0-9a-f]{64}", proof_digest):
         raise SystemExit("verified stage-one proof is required")
-    request = _canonical_bootstrap({
-        "op": "stage2",
-        "identity": _raw_identity_from_env(),
-        "proof_sha256": proof_digest,
-        "bundle_sha256": _sha256_regular_path(BUNDLE_PATH, MAX_BUNDLE),
-    }) + b"\n"
+    mode = _requested_self_observation(proof_digest)
+    fields = {"op": "stage2", "identity": _raw_identity_from_env(),
+              "proof_sha256": proof_digest, "bundle_sha256": _sha256_regular_path(BUNDLE_PATH, MAX_BUNDLE)}
+    challenge = None
+    if mode is not None:
+        challenge = secrets.token_hex(32)
+        fields.update(self_observation_mode=mode, challenge=challenge)
+    request = _canonical_bootstrap(fields) + b"\n"
     try:
         connection = socket.socket(fileno=fd)
         connection.settimeout(5)
         connection.sendall(request)
-        _recv_bootstrap_status(connection, b"stage2-ok\n")
+        response = _recv_bootstrap_status(connection, b"stage2-ok\n")
+        if mode is not None:
+            return _AuthenticatedKernelReply(response, challenge, _BOOTSTRAP_REPLY_TOKEN)
+        return response
     except (OSError, TimeoutError) as exc:
         raise SystemExit("host bootstrap authority unavailable") from exc
     finally:
@@ -341,14 +443,14 @@ def _verified_interpreter_fd() -> int:
 
 
 def _fresh_startup_pycache_prefix() -> str:
-    prefix = BOOTSTRAP_ROOT / "no-bytecode-cache"
+    prefix = POLICY_CODE_ROOT / "no-bytecode-cache"
     if os.path.lexists(prefix):
         raise SystemExit("immutable startup cache prefix must remain absent")
     return str(prefix)
 
 
 def _require_startup_pycache_prefix() -> None:
-    prefix = str(BOOTSTRAP_ROOT / "no-bytecode-cache")
+    prefix = str(POLICY_CODE_ROOT / "no-bytecode-cache")
     if sys.pycache_prefix != prefix:
         raise SystemExit("immutable startup pycache prefix is required")
     if os.path.lexists(prefix):
@@ -361,7 +463,7 @@ def _verify_runtime(hermes_root: Path) -> None:
     if not sys.flags.isolated or not sys.flags.no_site or sys.version_info[:2] != (3, 11):
         raise SystemExit("audited Python requires isolated no-site startup")
     try:
-        fd = int(os.environ.pop(_INTERPRETER_FD_ENV))
+        fd = _startup_descriptor(_INTERPRETER_FD_ENV, retire=True)
         inherited = os.fstat(fd)
         active = os.stat("/proc/self/exe")
         if (inherited.st_dev, inherited.st_ino) != (active.st_dev, active.st_ino):
@@ -419,43 +521,79 @@ def _require_module_origin(module: Any, root: Path, label: str) -> None:
         raise SystemExit(f"{label} import escaped trusted root")
 
 
-def _verify_hermes_build(root: Path) -> str:
-    """Verify actual tracked source against the pinned clean Git build before import."""
+def _hermes_source_inventory() -> dict[str, Any]:
+    """Read only the exact reviewed inventory from the immutable policy code."""
+    fd = os.open(HERMES_INVENTORY_PATH, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     try:
-        project = (root / "pyproject.toml").read_text(encoding="utf-8")
-        version = re.search(r'(?m)^version = "([^"]+)"$', project).group(1)
-        env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent",
-               "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
-               "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_OPTIONAL_LOCKS": "0",
-               "GIT_NO_REPLACE_OBJECTS": "1", "GIT_ATTR_NOSYSTEM": "1"}
-        command = ["/usr/bin/git", "-c", "core.fsmonitor=false",
-                   "-c", "core.untrackedCache=false", "-c", "core.hooksPath=/dev/null",
-                   "-C", str(root)]
-        def git(*args: str) -> str:
-            return subprocess.run([*command, *args],
-                                  env=env, capture_output=True, text=True,
-                                  check=True, timeout=30).stdout.strip()
-        head = git("rev-parse", "HEAD")
-        if head != HERMES_HEAD:
-            raise ValueError("Hermes revision changed")
-        names = subprocess.run([*command, "ls-files", "-z"],
-                               env=env, capture_output=True, check=True, timeout=30).stdout
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= MAX_HERMES_INVENTORY:
+            raise ValueError("Hermes source inventory file invalid")
+        raw = bytearray()
+        while len(raw) <= MAX_HERMES_INVENTORY:
+            chunk = os.read(fd, min(65536, MAX_HERMES_INVENTORY + 1 - len(raw)))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        if len(raw) > MAX_HERMES_INVENTORY or hashlib.sha256(raw).hexdigest() != HERMES_INVENTORY_SHA256:
+            raise ValueError("Hermes source inventory differs from reviewed pin")
+    finally:
+        os.close(fd)
+    data = json.loads(raw)
+    if (not isinstance(data, dict)
+            or set(data) != {"schema_version", "revision", "version", "source_sha256", "files"}
+            or data["schema_version"] != "herdr-hermes-source-inventory-1"
+            or data["revision"] != HERMES_HEAD
+            or f"hermes:{data['version']}:sha256:{data['source_sha256']}" != _SOURCE_EXECUTOR):
+        raise ValueError("Hermes source inventory identity invalid")
+    names = data["files"]
+    if not isinstance(names, list) or not 2 <= len(names) <= 20000:
+        raise ValueError("Hermes source inventory count invalid")
+    excluded = {"venv", ".git", "__pycache__", "node_modules"}
+    for name in names:
+        if (not isinstance(name, str) or not 0 < len(name) <= 1024
+                or name.startswith("/") or "\\" in name
+                or any(ord(char) < 32 or ord(char) == 127 for char in name)
+                or len(name.split("/")) > 32
+                or any(part in {"", ".", ".."} | excluded for part in name.split("/"))):
+            raise ValueError("Hermes source inventory path invalid")
+    if names != sorted(set(names), key=os.fsencode) or "pyproject.toml" not in names:
+        raise ValueError("Hermes source inventory order or uniqueness invalid")
+    return data
+
+
+def _verify_hermes_build(root: Path) -> str:
+    """Verify pinned source bytes without executable Git metadata in the runtime."""
+    try:
+        inventory = _hermes_source_inventory()
+        if root.resolve(strict=True) != root or not root.is_dir():
+            raise ValueError("Hermes source root alias denied")
         digest = hashlib.sha256()
-        tracked = set()
-        for name in names.split(b"\0"):
-            if name:
-                tracked.add(os.fsdecode(name))
-                digest.update(name + b"\0")
-                digest.update(hashlib.sha256((root / os.fsdecode(name)).read_bytes()).digest())
-        if git("status", "--porcelain", "--untracked-files=all"):
-            raise ValueError("Hermes source tree is not clean")
-        for path in root.rglob("*"):
-            relative = path.relative_to(root)
-            if any(part in {"venv", ".git", "__pycache__", "node_modules"} for part in relative.parts):
-                continue
-            if path.suffix in {".py", ".pyc", ".so", ".pth"} and relative.as_posix() not in tracked:
-                raise ValueError("untracked importable Hermes file")
-    except (OSError, AttributeError, ValueError, subprocess.SubprocessError) as exc:
+        tracked = set(inventory["files"])
+        for name in inventory["files"]:
+            path = root / name
+            if path.parent.resolve(strict=True) != path.parent:
+                raise ValueError("Hermes tracked source parent alias denied")
+            digest.update(os.fsencode(name) + b"\0")
+            digest.update(bytes.fromhex(_sha256_regular_path(path, 128 * 1024 * 1024)))
+        project = (root / "pyproject.toml").read_text(encoding="utf-8")
+        version = re.search(r'(?m)^version = "([^\"]+)"$', project).group(1)
+        if version != inventory["version"]:
+            raise ValueError("Hermes source version changed")
+        # The separately pinned site-packages/stdlib and private pycache policy
+        # retain their existing checks. No repository hooks/config are executed.
+        excluded = {"venv", ".git", "__pycache__", "node_modules"}
+        for directory, dirs, files in os.walk(root, followlinks=False):
+            parent = Path(directory)
+            dirs[:] = [name for name in dirs if name not in excluded]
+            for name in dirs:
+                if (parent / name).is_symlink():
+                    raise ValueError("untracked Hermes directory alias denied")
+            for name in files:
+                path = parent / name
+                relative = path.relative_to(root)
+                if path.suffix in {".py", ".pyc", ".so", ".pth"} and relative.as_posix() not in tracked:
+                    raise ValueError("untracked importable Hermes file")
+    except (OSError, AttributeError, TypeError, ValueError, UnicodeError) as exc:
         raise SystemExit("cannot verify audited Hermes build") from exc
     actual = f"hermes:{version}:sha256:{digest.hexdigest()}"
     if actual != _SOURCE_EXECUTOR:
@@ -516,6 +654,28 @@ def _configure_ephemeral_sdk_state(hermes_root: Path) -> None:
         raise SystemExit("SDK state must be inside the private temporary mount")
     state = importlib.import_module("hermes_state")
     _require_module_origin(state, hermes_root, "hermes_state")
+    # Import after profile consumption so configuration and credentials are still
+    # loaded from the approved read-only home. The pinned CLI uses _hermes_home
+    # for paste files and interactive history, independently of SessionDB.
+    cli = importlib.import_module("cli")
+    _require_module_origin(cli, hermes_root, "cli")
+    # Native paste/history writes need a private home, but the SDK resolves
+    # prefill files later, after constructing HermesCLI. Anchor those reads to
+    # the already consumed approved profile before relocating the UI home.
+    approved_home = cli._hermes_home
+    original_prefill_resolver = cli._resolve_prefill_messages_file
+    if not isinstance(approved_home, Path) or not callable(original_prefill_resolver):
+        raise SystemExit("approved Hermes prefill root unavailable")
+
+    def approved_prefill_resolver(config):
+        raw = original_prefill_resolver(config)
+        if not raw:
+            return raw
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = approved_home / path
+        return str(path)
+
     try:
         directory.mkdir(mode=0o700)
         actual = directory.lstat()
@@ -528,6 +688,8 @@ def _configure_ephemeral_sdk_state(hermes_root: Path) -> None:
     # The pinned SDK resolves this override at each SessionDB acquisition.
     # Configuration, credentials and the host's session database stay read-only.
     state.DEFAULT_DB_PATH = directory / "state.db"
+    cli._resolve_prefill_messages_file = approved_prefill_resolver
+    cli._hermes_home = directory
 
 
 @contextmanager
@@ -563,11 +725,95 @@ def _native_hermes_process_label():
             checked(15, old)
 
 
+def _verified_private_sdk_policy(proof, hermes_args):
+    """Only an authenticated v2/v3 manifest enables private SDK configuration."""
+    if not isinstance(proof, dict):
+        raise SystemExit("verified bootstrap proof unavailable")
+    if proof.get("schema_version") == "herdr-policy-bootstrap-1":
+        return None  # Historical private/legacy proof cannot opt in by file presence.
+    if proof.get("schema_version") not in ("herdr-policy-bootstrap-2", "herdr-policy-bootstrap-3"):
+        raise SystemExit("verified bootstrap proof version unsupported")
+    from herdr.private_profile_namespace import (
+        _HOME, _MAX_FILE_BYTES, _open_beneath, SDK_POLICY_MEMBER,
+        PrivateProfileError, verified_profile_identity, private_sdk_policy,
+    )
+    _require_module_origin(sys.modules["herdr.private_profile_namespace"], POLICY_CODE_ROOT,
+                           "herdr.private_profile_namespace")
+    try:
+        approved = verified_profile_identity(proof["approved_profile"])
+        if SDK_POLICY_MEMBER not in approved["files"]:
+            return None
+        selected = []
+        for index, arg in enumerate(hermes_args):
+            if arg in ("-p", "--profile"):
+                if index + 1 >= len(hermes_args):
+                    raise PrivateProfileError("private_sdk_profile_argument_invalid")
+                selected.append(hermes_args[index + 1])
+            elif arg.startswith("--profile="):
+                selected.append(arg.split("=", 1)[1])
+        if selected != [approved["name"]]:
+            raise PrivateProfileError("private_sdk_profile_argument_changed")
+        mount, modes = _covering_mount(_HOME)
+        if mount != _HOME or "ro" not in modes or _mountpoint_count(_HOME) != 1:
+            raise PrivateProfileError("private_sdk_home_not_private_readonly")
+        base = _HOME / ".hermes/profiles" / approved["name"]
+        values = {}
+        fd = os.open(_HOME, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            for name in (SDK_POLICY_MEMBER, "config.yaml"):
+                path = base / name
+                _require_production_mount(path, exact=True)
+                member = _open_beneath(fd, ".hermes/profiles/" + approved["name"] + "/" + name)
+                try:
+                    info = os.fstat(member)
+                    limit = 4096 if name == SDK_POLICY_MEMBER else _MAX_FILE_BYTES
+                    if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= limit:
+                        raise PrivateProfileError("private_sdk_member_invalid")
+                    values[name] = os.pread(member, info.st_size + 1, 0)
+                    if len(values[name]) != info.st_size:
+                        raise PrivateProfileError("private_sdk_member_changed")
+                finally:
+                    os.close(member)
+        finally:
+            os.close(fd)
+        policy = private_sdk_policy(approved, values[SDK_POLICY_MEMBER], values["config.yaml"],
+                                    credentialless=True)
+        _require_production_mount(POLICY_CODE_ROOT, exact=True)
+        policy.reassert()  # Sentinel is absent below the verified, nonshadowable RO code tree.
+        return policy
+    except (PrivateProfileError, KeyError, OSError, TypeError, ValueError):
+        raise SystemExit("authenticated private SDK configuration rejected") from None
+
+
+def _verified_bootstrap_reference(authenticated, proof, grant, observation_module, policy_launch_module):
+    """Combines authenticated root data with local facts; grants no host authority."""
+    if proof.get("schema_version") == "herdr-policy-bootstrap-3":
+        if not isinstance(authenticated, _AuthenticatedKernelReply):
+            raise SystemExit("inherited authenticated v3 bootstrap response required")
+        payload, challenge = authenticated.consume()
+        if (type(payload) is not dict or set(payload) != {"schema_version", "reference", "self_observation"}
+                or payload["schema_version"] != "herdr-stage2-authenticated-envelope-1"
+                or type(payload["reference"]) is not dict):
+            raise SystemExit("closed bootstrap self-observation envelope required")
+        self_module = importlib.import_module("herdr.bootstrap_self_observation")
+        _require_module_origin(self_module, POLICY_CODE_ROOT, "herdr.bootstrap_self_observation")
+        if not self_module.observe_self_from_bootstrap(payload["self_observation"], challenge=challenge, grant=grant,
+                bootstrap_proof=proof, bundle_sha256=_sha256_regular_path(BUNDLE_PATH, MAX_BUNDLE)):
+            raise SystemExit("stage-two local and root observation denied")
+        return payload["reference"]
+    if isinstance(authenticated, _AuthenticatedKernelReply):
+        raise SystemExit("unexpected v3 bootstrap response in legacy mode")
+    if not observation_module.observe_sdk_credentials(os.getpid(), proof["approved_profile"],
+            policy_launch_module.mount_rows(os.getpid()), grant.workspace_root):
+        raise SystemExit("stage-two credential isolation observation denied")
+    return authenticated
+
+
 def bootstrap(hermes_args: list[str]) -> int:
     """Every entry uses the fixed authenticated production path."""
     bundle_path,policy_code_root,hermes_root=BUNDLE_PATH,POLICY_CODE_ROOT,HERMES_ROOT
-    _require_host_bootstrap_authority()
-    _require_stage1_continuity()
+    authenticated_reference = _require_host_bootstrap_authority()
+    bootstrap_proof = _require_stage1_continuity()
     _require_production_mount(bundle_path, exact=True)
     _require_production_mount(policy_code_root, exact=True)
     _require_production_mount(hermes_root, exact=True)
@@ -578,6 +824,7 @@ def bootstrap(hermes_args: list[str]) -> int:
     executor = _verify_hermes_build(hermes_root)
 
     _reset_import_path(policy_code_root, hermes_root)
+    private_sdk_policy = _verified_private_sdk_policy(bootstrap_proof, hermes_args)
 
     # Policy mode executes only the hashed Hermes core/import surface. Disable
     # directory, project and entry-point plugin discovery before importing any
@@ -608,15 +855,76 @@ def bootstrap(hermes_args: list[str]) -> int:
     except (security_module.SecurityError, KeyError, TypeError, ValueError) as exc:
         raise SystemExit(f"signed Herdr grant rejected: {exc}") from exc
 
-    guard_module.install_hermes_guard(guard)
+    reference_binding = None
+    if private_sdk_policy is not None:
+        observation_module = importlib.import_module("herdr.credential_isolation")
+        policy_launch_module = importlib.import_module("herdr.policy_launch")
+        _require_module_origin(observation_module, policy_code_root, "herdr.credential_isolation")
+        _require_module_origin(policy_launch_module, policy_code_root, "herdr.policy_launch")
+        authenticated_reference = _verified_bootstrap_reference(authenticated_reference, bootstrap_proof, grant,
+            observation_module, policy_launch_module)
+        if type(authenticated_reference) is not dict:
+            raise SystemExit("authenticated host reference required")
+        reference_module = importlib.import_module("agent.host_reference")
+        _require_module_origin(reference_module, hermes_root, "agent.host_reference")
+        try:
+            reference_binding = reference_module.HostCredentialReference(**authenticated_reference)
+            route = next((route for route in grant.provider_routes if route.provider == "nous"), None)
+            if (not grant.is_active() or grant.runtime_assurance.credentials_isolated is not True
+                    or route is None or reference_binding.grant_hash != grant.hash
+                    or reference_binding.profile_sha256 != private_sdk_policy.profile_sha256
+                    or reference_binding.projection_sha256 != private_sdk_policy.projection_sha256
+                    or reference_binding.workspace != grant.workspace_root
+                    or reference_binding.fence != str(grant.identity.fencing_token)
+                    or reference_binding.lineage != grant.identity.parent_task_id
+                    or reference_binding.endpoint != route.base_url
+                    or reference_binding.api_mode != route.api_mode
+                    or tuple(route.credential_refs) != (reference_binding.credential_ref,)
+                    or tuple(grant.credential_refs) != (reference_binding.credential_ref,)):
+                raise ValueError("authenticated host reference mismatches signed grant")
+        except (TypeError, ValueError, reference_module.HostReferenceDenied) as exc:
+            raise SystemExit("authenticated host reference invalid") from exc
+        guard._admitted_host_reference = reference_binding
+    elif authenticated_reference is not None:
+        raise SystemExit("unexpected host reference bootstrap response")
+
+    cli_binding = None
+    use_cli_identity = (private_sdk_policy is not None and len(hermes_args) >= 3
+                        and hermes_args[0] in ("-p", "--profile") and hermes_args[2] == "chat")
+    if reference_binding is not None and not use_cli_identity:
+        raise SystemExit("host reference requires canonical guarded CLI entry")
+    if use_cli_identity:
+        binding_module = importlib.import_module("herdr.hermes_cli_identity")
+        _require_module_origin(binding_module, policy_code_root, "herdr.hermes_cli_identity")
+        cli_binding = binding_module.CLIInvocationBinding(guard)
+        guard_module.install_hermes_guard(
+            guard, private_sdk_policy=private_sdk_policy, cli_invocation_binding=cli_binding)
+    elif private_sdk_policy is None:
+        guard_module.install_hermes_guard(guard)
+    else:
+        guard_module.install_hermes_guard(guard, private_sdk_policy=private_sdk_policy)
 
     # Hermes consumes profile flags while its CLI module is imported.
     # Set the approved argv first and retain the module's consumed argv.
     sys.argv = [str(hermes_root / "hermes"), *hermes_args]
     hermes_main_module = importlib.import_module("hermes_cli.main")
     _require_module_origin(hermes_main_module, hermes_root, "hermes_cli.main")
+    native_transport = nullcontext()
+    if private_sdk_policy is not None:
+        transport_module = importlib.import_module("herdr.hermes_terminal_transport")
+        _require_module_origin(transport_module, policy_code_root, "herdr.hermes_terminal_transport")
+        cli_module = importlib.import_module("cli")
+        _require_module_origin(cli_module, hermes_root, "cli")
+        native_transport = transport_module.native_cli_transport_factory(
+            cli_module.HermesCLI, guard, private_sdk_policy=private_sdk_policy)
+    identity_transport = nullcontext()
+    if cli_binding is not None:
+        agent_module = importlib.import_module("run_agent")
+        _require_module_origin(agent_module, hermes_root, "run_agent")
+        identity_transport = cli_binding.factory(cli_module.HermesCLI, agent_module.AIAgent,
+                                                 host_reference=reference_binding)
     _configure_ephemeral_sdk_state(hermes_root)
-    with _native_hermes_process_label():
+    with _native_hermes_process_label(), native_transport, identity_transport:
         result = hermes_main_module.main()
     return 0 if result is None else int(result)
 
@@ -624,13 +932,13 @@ def bootstrap(hermes_args: list[str]) -> int:
 def main() -> int:
     # Production stage two is reachable only through the independently frozen
     # stage-one bootstrap. Direct execution of policy-code is never authority.
-    if (
-        _INTERPRETER_FD_ENV not in os.environ
-        or STAGE1_PROOF_ENV not in os.environ
-        or STAGE2_FD_ENV not in os.environ
-        or BOOTSTRAP_AUTH_FD_ENV not in os.environ
-    ):
+    if STAGE1_PROOF_ENV not in os.environ:
         raise SystemExit("verified immutable stage-one bootstrap required")
+    mode = _requested_self_observation(os.environ[STAGE1_PROOF_ENV])
+    if mode is None and any(name not in os.environ for name in _FIXED_STARTUP_DESCRIPTORS):
+        raise SystemExit("verified immutable stage-one bootstrap required")
+    if mode is not None and any(name in os.environ for name in _FIXED_STARTUP_DESCRIPTORS):
+        raise SystemExit("v3 startup descriptors must not enter exec environment")
     return bootstrap(sys.argv[1:])
 
 

@@ -24,6 +24,7 @@ Machine City is an observability surface over durable state; it is not merge or 
 ## Platform modules
 
 - herdr/ — canonical orchestration core: durable TaskGraph, dependency scheduler, real child runtime and fail-closed admission control. Runtime admission executes before any child pane/process creation; denied spawns are durably audited.
+- external knowledge providers — vendor-neutral host contract in herdr/external_knowledge.py; concrete enterprise/domain integrations remain in separate repositories and require explicit runtime authority.
 - agent_platform_dashboard/ — current dashboard, production adapters and Machine City source.
 - deploy/ — production deployment templates/runbook.
 - ops/runtime-observed/ — captured operational runtime for provenance and migration; not the long-term source location.

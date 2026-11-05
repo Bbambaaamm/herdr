@@ -22,7 +22,7 @@ def start_namespace():
     assert select.select([process.stdout], [], [], 5)[0]
     assert process.stdout.readline().strip() == "READY"
     todo = [process.pid]
-    init = None
+    init = payload = None
     while todo:
         pid = todo.pop()
         try:
@@ -30,12 +30,13 @@ def start_namespace():
                        if line.startswith("NSpid:"))
             if len(ids) >= 2 and ids[-1] == "1":
                 init = pid
-                break
+            elif len(ids) >= 2 and ids[-1] == "2":
+                payload = pid
             todo.extend(int(x) for x in Path(f"/proc/{pid}/task/{pid}/children").read_text().split())
         except FileNotFoundError:
             continue
-    assert init is not None
-    return process, init
+    assert init is not None and payload is not None
+    return process, payload
 
 
 def await_namespace_exit(proof):
@@ -46,9 +47,11 @@ def await_namespace_exit(proof):
 
 
 def test_actual_namespace_lifetime_is_not_released_while_init_is_alive():
-    process, init = start_namespace()
+    process, payload = start_namespace()
     try:
-        proof = capture_namespace_lifetime(init)
+        proof = capture_namespace_lifetime(payload)
+        assert proof["version"] == 2 and proof["pid"] == payload
+        assert proof["init_pid"] != payload
         assert not namespace_exited(proof)
         process.terminate()
         process.wait(timeout=5)
@@ -60,8 +63,36 @@ def test_actual_namespace_lifetime_is_not_released_while_init_is_alive():
 
 
 def test_host_process_cannot_claim_namespace_init_proof():
-    with pytest.raises(OwnershipError, match="namespace_init"):
+    with pytest.raises(OwnershipError, match="namespace_payload"):
         capture_namespace_lifetime(os.getpid())
+
+
+def test_actual_scheduler_replays_historical_v1_namespace_event(tmp_path):
+    # Synthetic historical ledger data only: actual scheduler/event APIs and
+    # run/fence/key replay binding, without any new namespace or admission.
+    from herdr.scheduler import AuditLog, DynamicChildScheduler
+    owner = parent()
+    store = registry(tmp_path)
+    item = scheduler(tmp_path, owner, store)
+    node = item.delegate_child(owner.task_id, owner.run_token, "historical-v1",
+                               proposal(owner, None, writing=False))
+    item.dispatch(task_ids={node.id}, managed_start=True)
+    rec = item._tasks[node.id]
+    marker = "child-" + rec.run_token
+    assert item.record_child_pane_intent(rec.id, rec.run_token, rec.agent_id,
+        rec.fencing_token, rec.idempotency_key, marker)
+    assert item.bind_pre_delivery_pane(rec.id, rec.run_token, rec.agent_id, "old-pane", marker)
+    proof = {"version": 1, "pid": 12345, "start_ticks": 67890, "namespace": "pid:[123456]"}
+    item.record_namespace_lifetime(rec.id, proof)
+    item.audit_log.flush()
+    restored = DynamicChildScheduler(audit_log=AuditLog(tmp_path / "graph.jsonl"),
+        ownership_registry=store, ownership_parent=owner)
+    restored.replay()
+    previous = restored._tasks[rec.id]
+    assert previous.namespace_lifetime == proof
+    assert (previous.run_token, previous.fencing_token, previous.idempotency_key) == (
+        rec.run_token, rec.fencing_token, rec.idempotency_key)
+    assert restored.dispatch(task_ids={rec.id}, managed_start=True) == []
 
 
 def test_actual_writer_release_waits_for_kernel_namespace_exit(tmp_path):
@@ -81,7 +112,7 @@ def test_actual_writer_release_waits_for_kernel_namespace_exit(tmp_path):
     fd = os.open(workspace, os.O_PATH | os.O_DIRECTORY)
     held = os.fstat(fd)
     pin = PinnedWorktree(workspace, fd, held.st_dev, held.st_ino)
-    process, init = start_namespace()
+    process, payload = start_namespace()
     try:
         from dataclasses import replace
         node = item.delegate_child(owner.task_id, owner.run_token, "writer-exit",
@@ -94,9 +125,9 @@ def test_actual_writer_release_waits_for_kernel_namespace_exit(tmp_path):
         assert item.bind_pre_delivery_pane(rec.id, rec.run_token, rec.agent_id, "child-pane", marker)
         with OwnedWritePins(rec.ownership, pin) as pins:
             item.bind_owned_write_mounts(rec.id, pins)
-        item.record_namespace_lifetime(rec.id, capture_namespace_lifetime(init))
+        item.record_namespace_lifetime(rec.id, capture_namespace_lifetime(payload))
         assert item.attest_execution_sandbox(rec.id, rec.run_token, rec.agent_id, "child-pane", marker,
-            sandbox_pid=init, policy_sha256="a"*64)
+            sandbox_pid=payload, policy_sha256="a"*64)
         (directory / "graph.jsonl").rename(directory / "scheduler.jsonl")
         item.audit_log._path = directory / "scheduler.jsonl"
         mark_ledger_required(directory)
@@ -112,6 +143,24 @@ def test_actual_writer_release_waits_for_kernel_namespace_exit(tmp_path):
         process.terminate()
         process.wait(timeout=5)
         await_namespace_exit(rec.namespace_lifetime)
+        # A different payload attached to the same real retired init is not
+        # this child's sealed sandbox. Exercise the actual canonical reader.
+        from herdr.security import InvocationIdentity
+        child_identity = InvocationIdentity("github:" + rec.repo, rec.agent_id,
+            rec.parent_agent_id, rec.parent_task_id, rec.id, rec.run_token, rec.fencing_token)
+        item.audit_log.flush()
+        ledger = directory / "scheduler.jsonl"
+        original = ledger.read_bytes()
+        events = [json.loads(line) for line in original.splitlines()]
+        for event in events:
+            if event.get("event") == "child_namespace_lifetime" and event.get("task_id") == rec.id:
+                event["proof"]["pid"] += 100000
+        try:
+            ledger.write_text("".join(json.dumps(event) + "\n" for event in events))
+            assert not HostOwnershipRelease(tmp_path)(child_identity, {"parent": owner.to_json()})
+        finally:
+            ledger.write_bytes(original)
+        assert ledger.read_bytes() == original
         assert item.release_child_ownership(rec.id)
         assert all_children_terminal(tmp_path,owner.task_id,owner.run_token)
         item._require_current_ownership(rec, result=True)

@@ -61,7 +61,10 @@ def _child_toolsets(tools: Iterable[str], *, allow_delegation: bool = False) -> 
     selected = frozenset(tools)
     if "herdr_delegate_child" in selected and not allow_delegation:
         raise HerdrRuntimeError("child_nested_delegation_unavailable", "child-bound transport required")
-    if selected - (_CHILD_FILE_TOOLS | {"herdr_delegate_child", "herdr_submit_result", "herdr_verify_work"}):
+    if selected - (_CHILD_FILE_TOOLS | {
+            "herdr_delegate_child", "herdr_submit_result", "herdr_verify_work",
+            "herdr_external_knowledge",
+    }):
         raise HerdrRuntimeError("child_toolset_unmapped", ",".join(sorted(selected)))
     # Hermes has toolset-level (not per-tool) filtering. The file bundle is
     # constrained further by the OS workspace mount below. Empty legacy canary
@@ -70,6 +73,7 @@ def _child_toolsets(tools: Iterable[str], *, allow_delegation: bool = False) -> 
     if "herdr_delegate_child" in selected: groups.append("herdr_delegation")
     if "herdr_submit_result" in selected: groups.append("herdr_result")
     if "herdr_verify_work" in selected: groups.append("herdr_work")
+    if "herdr_external_knowledge" in selected: groups.append("herdr_external_knowledge")
     return ",".join(groups) if groups else "bot_room"
 
 
@@ -206,6 +210,23 @@ def _trusted_hermes_profile_preflight(profile: str, *, executable: str, env: Map
 
 
 MAX_PROMPT_CHARS = 1200
+
+
+def _managed_prompt_transport(prompt: str, *, modern: bool) -> str:
+    """Keep legacy prompts unchanged; frame modern host-composed delivery once.
+
+    The untrusted business prompt remains capped separately by the delegation
+    client. Frozen host instructions use the existing ordinary-worker UTF-8
+    channel bound, including bracketed-paste overhead and control validation.
+    """
+    if type(modern) is not bool:
+        raise HerdrRuntimeError("invalid_child_prompt", "typed transport mode required")
+    if modern:
+        from .hermes_terminal_transport import encode_native_prompt
+        return encode_native_prompt(prompt)
+    if not isinstance(prompt, str) or not prompt or len(prompt) > MAX_PROMPT_CHARS:
+        raise HerdrRuntimeError("invalid_child_prompt", "legacy prompt exceeds bound")
+    return prompt
 
 
 @dataclass(frozen=True)
@@ -528,6 +549,11 @@ class AdmissionRegistry:
         fd = self._lock_fd()
         try:
             entries = self._read()
+            from .canonical_case_recovery import require_case_admission_release
+            for entry in entries:
+                if (entry["agent_id"] == agent_id and (task_id is None or
+                        (entry["task_id"], entry["fencing_token"]) == (task_id, fencing_token))):
+                    require_case_admission_release(entry)
             entries = [entry for entry in entries if not (
                 entry["agent_id"] == agent_id and
                 (task_id is None or
@@ -572,6 +598,7 @@ class HerdrChildRuntime:
         self.pinned_worktree = pinned_worktree
         self.policy_launch_factory = policy_launch_factory
         self._policy_launches: dict[str, PreparedPolicyLaunch] = {}
+        self._private_sandbox_commands = {}
         self._managed_launch_panes: set[str] = set()
         self._owned_write_pins = {}
         self._policy_panes: dict[str, PreparedPolicyLaunch] = {}
@@ -761,6 +788,42 @@ class HerdrChildRuntime:
                 return
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
+    def _external_knowledge_child_authority(
+        self, identity: InvocationIdentity, grant_sha256: str,
+        _provider_id: str, _request: object,
+    ) -> bool:
+        """Require the exact still-running durable child attempt."""
+        rec = self.scheduler._tasks.get(identity.task_id)
+        if rec is None or rec.state is not LifecycleState.RUNNING:
+            return False
+        lease = rec.lease
+        launch = self._policy_launches.get(identity.task_id)
+        pane = rec.execution_pane
+        proof = self._sandbox_proofs.get(pane) if pane else None
+        if (lease is None or launch is None or not isinstance(proof, dict)
+                or self.scheduler.current_time() >= lease.lease_until):
+            return False
+        if (rec.run_token != identity.run_token
+                or rec.fencing_token != identity.fencing_token
+                or rec.agent_id != identity.agent_id
+                or rec.execution_agent != identity.agent_id
+                or lease.fencing_token != identity.fencing_token
+                or lease.agent_id != identity.agent_id
+                or rec.execution_sandbox_verified is not True
+                or rec.economic_delivery_attempted is not True
+                or not rec.execution_pane or not rec.execution_marker
+                or launch.grant.hash != grant_sha256
+                or launch.grant.identity != identity):
+            return False
+        invocation = proof.get("invocation_policy")
+        if not isinstance(invocation, dict) or invocation.get("grant_sha256") != grant_sha256:
+            return False
+        try:
+            self.scheduler._require_current_ownership(rec)
+        except Exception:
+            return False
+        return True
+
     def _start_agent(self, lease: _Lease, pane_id: str) -> None:
         self._assert_prepared()
         node = self.scheduler.task_node(lease.task_id)
@@ -807,7 +870,10 @@ class HerdrChildRuntime:
                             record.execution_marker, policy=proof["policy_file"],
                             attempts=1, pinned_worktree=self.pinned_worktree,
                             child_workspace_writable=self._child_workspace_writable(lease.task_id),
-                            policy_mount=launch.mount)),
+                            policy_mount=launch.mount,
+                            **({"private_profile_snapshot": launch.private_profile_snapshot}
+                               if getattr(launch, "private_profile_snapshot", None)
+                               is not None else {}))),
                     bootstrap_peer=lambda *, timeout_seconds: launch.mount.bootstrap.confirm(
                         timeout_seconds=timeout_seconds),
                     timeout_seconds=60.0)
@@ -920,7 +986,7 @@ class HerdrChildRuntime:
                 task_id=rec.id,run_token=rec.run_token,fencing_token=rec.fencing_token)
             original={key:proof[key] for key in ("authority","task_id","run_token","sandbox_pid",
                       "fencing_token","agent_name","pane_id","marker","worktree_identity",
-                      "ownership_sha256","owned_write_mounts")
+                      "ownership_sha256","owned_write_mounts","approved_profile","immutable_sources")
                       if key in proof}
             try:
                 verify_retained_policy_evidence(proof.get("invocation_policy"),identity=identity,
@@ -968,6 +1034,34 @@ class HerdrChildRuntime:
             os.close(directory_fd)
         return (target,)
 
+    def _prepare_private_child_command(self, task_id, real):
+        """Approve held sources/result/argv before a native pane can exist."""
+        import importlib.machinery,importlib.util
+        source=Path(__file__).resolve().parents[1]/"agent-stack/bin/agent_durable_sandbox.py"
+        loader=importlib.machinery.SourceFileLoader("private_child_command",str(source))
+        spec=importlib.util.spec_from_loader(loader.name,loader)
+        sandbox=importlib.util.module_from_spec(spec);loader.exec_module(sandbox)
+        launch=self._policy_launches[task_id]
+        profile=launch.private_profile_snapshot
+        policy=sandbox.frozen_policy()
+        self._private_sandbox_commands[task_id]=(policy,())
+        from .result_submission import reserve_empty_result
+        result_dir=self.snapshot_path.parent/"results"
+        result_dir.mkdir(parents=True,exist_ok=True)
+        writable=(reserve_empty_result(result_dir/f"{task_id}.result.json",launch.identity,
+                      self.scheduler._tasks[task_id].idempotency_key),)
+        launch.bind_result_slot(writable[0],self.scheduler._tasks[task_id].idempotency_key)
+        launch.prepare_private_command(lambda:sandbox.command(
+            self.cwd,Path(real),writable=writable,policy=policy,
+            child_workspace_writable=self._child_workspace_writable(task_id),
+            pinned_worktree=self.pinned_worktree,policy_mount=launch.mount,
+            owned_write_pins=self._owned_write_pins.get(task_id),
+            admission_root=(self.scheduler.ownership_registry.root
+                            if self.scheduler.ownership_registry is not None else None),
+            private_profile_snapshot=profile,
+            hermes_profile=self.env.get("HERDR_HERMES_PROFILE",DEFAULT_PROFILE)))
+        self._private_sandbox_commands[task_id]=(policy,writable)
+
     def _sandbox_child_pane(self, pane_id: str, marker: str, real: str,
                             task_id: str) -> Path:
         import importlib.util
@@ -980,23 +1074,21 @@ class HerdrChildRuntime:
         launch = self._policy_launches.get(task_id)
         if not isinstance(launch, PreparedPolicyLaunch):
             raise HerdrRuntimeError("child_invocation_policy_missing", task_id)
+        private_snapshot = getattr(launch, "private_profile_snapshot", None)
+        approved_name = self.env.get("HERDR_HERMES_PROFILE", DEFAULT_PROFILE)
+        if private_snapshot is not None and private_snapshot.name != approved_name:
+            raise HerdrRuntimeError("child_approved_profile_identity_mismatch", task_id)
         self._policy_panes[pane_id] = launch
-        policy = sandbox.frozen_policy()
+        cached = self._private_sandbox_commands.get(task_id)
+        policy = cached[0] if cached is not None else sandbox.frozen_policy()
         try:
-            writable = self._child_result_writable(task_id)
-            launch.bind_result_slot(writable[0],self.scheduler._tasks[task_id].idempotency_key)
-            sandbox_args = sandbox.command(
-                self.cwd,
-                Path(real),
-                writable=writable,
-                policy=policy,
-                child_workspace_writable=self._child_workspace_writable(task_id),
-                pinned_worktree=self.pinned_worktree,
-                policy_mount=launch.mount,
-                owned_write_pins=self._owned_write_pins.get(task_id),
-                admission_root=(self.scheduler.ownership_registry.root
-                                if getattr(self.scheduler, "ownership_registry", None) is not None else None),
-            )
+            if cached is not None:
+                writable=cached[1]
+            else:
+                if private_snapshot is not None:
+                    raise HerdrRuntimeError("child_private_command_not_approved",task_id)
+                writable = self._child_result_writable(task_id)
+                launch.bind_result_slot(writable[0],self.scheduler._tasks[task_id].idempotency_key)
             deadline = time.monotonic() + 10.0
             while True:
                 remaining = deadline - time.monotonic()
@@ -1023,7 +1115,26 @@ class HerdrChildRuntime:
                                           timeout_seconds=max(0.001, deadline - time.monotonic()))
             except RuntimeError as exc:
                 raise HerdrRuntimeError("child_pane_prompt_unverified", pane_id) from exc
-            invoke(["pane", "run", pane_id, sandbox.shell_command(sandbox_args)],
+            # Do not carry profile path checks across the pane-readiness wait.
+            # The sealed launcher revalidates the runtime targets once more
+            # immediately before the bwrap exec, and verify() attests mounts.
+            sandbox_args = sandbox.command(
+                self.cwd,
+                Path(real),
+                writable=writable,
+                policy=policy,
+                child_workspace_writable=self._child_workspace_writable(task_id),
+                pinned_worktree=self.pinned_worktree,
+                policy_mount=launch.mount,
+                owned_write_pins=self._owned_write_pins.get(task_id),
+                admission_root=(self.scheduler.ownership_registry.root
+                                if getattr(self.scheduler, "ownership_registry", None) is not None else None),
+                **({"private_profile_snapshot": private_snapshot,
+                    "hermes_profile": approved_name} if private_snapshot is not None else {}),
+            )
+            serialized_command = sandbox.shell_command(sandbox_args)
+            launch.verify_private_handoff()
+            invoke(["pane", "run", pane_id, serialized_command],
                    timeout_seconds=15.0)
             deadline = time.monotonic() + 10.0
             while True:
@@ -1040,7 +1151,9 @@ class HerdrChildRuntime:
                         sandbox_pid, Path(real), marker, policy=policy, attempts=1,
                         pinned_worktree=self.pinned_worktree,
                         child_workspace_writable=self._child_workspace_writable(task_id),
-                        policy_mount=launch.mount, owned_write_pins=self._owned_write_pins.get(task_id)):
+                        policy_mount=launch.mount, owned_write_pins=self._owned_write_pins.get(task_id),
+                        **({"private_profile_snapshot": private_snapshot}
+                           if private_snapshot is not None else {})):
                     if time.monotonic() <= deadline:
                         break
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
@@ -1051,6 +1164,8 @@ class HerdrChildRuntime:
                            "fencing_token": record.fencing_token, "agent_name": record.agent_id,
                            "pane_id": pane_id, "marker": marker,
                            "worktree_identity": record.worktree_identity}
+            if private_snapshot is not None:
+                attestation["approved_profile"] = private_snapshot.identity
             if record.ownership is not None:
                 if record.owned_write_mounts is None:
                     raise HerdrRuntimeError("child_owned_mount_proof_missing",task_id)
@@ -1127,16 +1242,27 @@ class HerdrChildRuntime:
                 task_id=rec.id, fencing_token=rec.fencing_token)
 
     def _cleanup_policy_launch(self, task_id, pane_id=None):
+        cached=self._private_sandbox_commands.get(task_id)
         self._managed_launch_panes.discard(pane_id)
-        pins=self._owned_write_pins.pop(task_id,None)
-        if pins is not None:pins.close()
+        pins=self._owned_write_pins.get(task_id)
         record = self.scheduler._tasks.get(task_id)
         launch = self._policy_launches.get(task_id) or self._policy_panes.get(pane_id)
         if launch is not None:
-            launch.cleanup_after_pane_closed()
+            from .policy_launch import _finish_cleanup
+            actions=[]
+            if pins is not None:actions.append(pins.close)
+            actions.append(launch.cleanup_after_pane_closed)
+            if cached is not None:actions.append(lambda:cached[0].unlink(missing_ok=True))
+            _finish_cleanup(actions)
+            self._owned_write_pins.pop(task_id,None)
+            self._private_sandbox_commands.pop(task_id,None)
             self._policy_launches.pop(task_id, None)
             self._policy_panes.pop(pane_id, None)
         elif record is not None:
+            if cached is not None:cached[0].unlink(missing_ok=True)
+            self._private_sandbox_commands.pop(task_id,None)
+            if pins is not None:pins.close()
+            self._owned_write_pins.pop(task_id,None)
             factory=self.policy_launch_factory
             if factory is None:
                 from .host_configuration import build_host_policy_factory
@@ -1299,6 +1425,11 @@ class HerdrChildRuntime:
         pane_id = None
         try:
             record = self.scheduler._tasks.get(lease.task_id)
+            from .child_evidence import ChildCompletionAuthority
+            authority = self.scheduler.completion_authority
+            modern = (record is not None and isinstance(authority, ChildCompletionAuthority)
+                      and authority.modern_work(record))
+            transport_prompt = _managed_prompt_transport(prompt, modern=modern)
             if (record is not None and record.worktree_identity and
                     (self.pinned_worktree is None or
                      self.pinned_worktree.identity != record.worktree_identity)):
@@ -1307,6 +1438,10 @@ class HerdrChildRuntime:
                 raise HerdrRuntimeError("real_herdr_required", "managed child needs real binary")
             if not isinstance(self.policy_launch_factory, HostPolicyLaunchFactory):
                 raise HerdrRuntimeError("child_invocation_policy_missing", lease.task_id)
+            approved_profile = getattr(self.policy_launch_factory, "approved_profile", None)
+            if (approved_profile is not None
+                    and approved_profile.name != self.env.get("HERDR_HERMES_PROFILE", DEFAULT_PROFILE)):
+                raise HerdrRuntimeError("child_approved_profile_identity_mismatch", lease.task_id)
             record = self.scheduler._tasks[lease.task_id]
             node = self.scheduler.task_node(lease.task_id)
             context = self.scheduler.task_context(lease.task_id)
@@ -1337,6 +1472,10 @@ class HerdrChildRuntime:
                 tools=node.tools,permissions=node.permissions,**launch_arguments)
             if not isinstance(launch, PreparedPolicyLaunch) or launch.identity != identity:
                 raise HerdrRuntimeError("child_invocation_policy_identity_mismatch", lease.task_id)
+            approved_snapshot = getattr(launch, "private_profile_snapshot", None)
+            if (approved_snapshot is not None
+                    and approved_snapshot.name != self.env.get("HERDR_HERMES_PROFILE", DEFAULT_PROFILE)):
+                raise HerdrRuntimeError("child_approved_profile_identity_mismatch", lease.task_id)
             from .child_evidence import ChildCompletionAuthority
             authority=self.scheduler.completion_authority
             if not isinstance(authority,ChildCompletionAuthority):
@@ -1345,7 +1484,12 @@ class HerdrChildRuntime:
             authority.preflight_work(record,launch)
             self._policy_launches[lease.task_id] = launch
             policy_env.update(launch.environment())
-            self._preflight_child_provider()
+            if approved_snapshot is not None:
+                self._prepare_private_child_command(lease.task_id,real)
+            # Host-approved profiles completed credential preflight inside
+            # HostPolicyLaunchFactory.prepare_child() BEFORE their memfd seal.
+            if getattr(launch, "private_profile_snapshot", None) is None:
+                self._preflight_child_provider()
             def inspect_startup_source():
                 source = _json_result(self.runner.run(["pane","process-info","--current"]),
                                       "pane startup source")
@@ -1380,6 +1524,12 @@ class HerdrChildRuntime:
                 )
             ):
                 raise HerdrRuntimeError("child_sandbox_attestation_denied", lease.task_id)
+            if "herdr_external_knowledge" in node.tools:
+                from .external_knowledge_host import bind_external_knowledge_host
+                bind_external_knowledge_host(
+                    launch.mount.bootstrap, launch.grant,
+                    self._external_knowledge_child_authority,
+                )
             work_port = authority.prepare_work(record, launch)
             def publish_continuation(evidence):
                 accepted = self.scheduler.attest_execution_sandbox(
@@ -1407,14 +1557,12 @@ class HerdrChildRuntime:
             self.scheduler.execution_verifier = (
                 lambda agent, pane, bound_marker: self._verify_live_child(
                     agent, pane, bound_marker, require_sandbox=True))
-            if not prompt or len(prompt) > MAX_PROMPT_CHARS:
-                raise HerdrRuntimeError("invalid_child_prompt", lease.task_id)
             timeout = int(min(3600.0, max(1.0, self.scheduler.budget.claim_ttl_seconds - 30.0)))
             if not self.scheduler.mark_child_delivery_started(
                     lease.task_id,run_token,lease.agent_id,lease.fencing_token,idempotency_key):
                 raise HerdrRuntimeError("child_delivery_already_started",lease.task_id)
             delivery_started = True
-            result = self.runner.run(["agent", "prompt", lease.agent_id, prompt,
+            result = self.runner.run(["agent", "prompt", lease.agent_id, transport_prompt,
                                       "--wait", "--timeout", str(timeout * 1000)],
                                      timeout_seconds=timeout + 5.0)
             _json_result(result, "agent prompt")

@@ -492,7 +492,7 @@ def test_create_task_session_uses_fresh_owned_pane_and_named_chat(tmp_path, monk
     assert str(worker.AGENT_BIN) in path_env
     hermes_runs = [call for call in calls
                    if call[:2] == ["pane", "run"] and len(call) >= 4
-                   and "/run/herdr-bootstrap/hermes " in call[3]]
+                   and "/run/herdr/policy-code/agent-stack/policy-bin/hermes " in call[3]]
     assert len(hermes_runs) == 1
     command = hermes_runs[0][3]
     assert f"--continue {session['session_name']}" in command
@@ -1116,7 +1116,7 @@ def test_setup_failure_cleanup_proves_pane_identity(
                        if case == "reused_pane" else []) if len(lists) == 1 else
                        ([] if case == "absent" else [{"pane_id": "owned-pane"}])}}
         if args[:2] == ["pane", "run"]:
-            if after_start and len(args) >= 4 and "/run/herdr-bootstrap/hermes " in args[3]:
+            if after_start and len(args) >= 4 and "/run/herdr/policy-code/agent-stack/policy-bin/hermes " in args[3]:
                 raise RuntimeError("start failed")
             return None
         if args[:2] == ["pane", "process-info"]:
@@ -1454,7 +1454,7 @@ def test_canonical_queue_owns_session_before_worker_crash(tmp_path, monkeypatch,
         if args[:2] == ["pane", "split"]:
             return {"result": {"pane": {"pane_id": "owned"}}}
         if args[:2] == ["pane", "run"]:
-            crash_if("agent" if len(args) >= 4 and "/run/herdr-bootstrap/hermes " in args[3] else "sandbox")
+            crash_if("agent" if len(args) >= 4 and "/run/herdr/policy-code/agent-stack/policy-bin/hermes " in args[3] else "sandbox")
             return None
         if args[:2] == ["pane", "process-info"]:
             return {"result": {"process_info": {}}}
@@ -1535,7 +1535,7 @@ def explicit_host_policy_for_worker_lifecycle_tests(monkeypatch):
     # sandbox launch itself has separate namespace/TTY and native integration tests.
     def transport(invoke, pane, marker, pid, name, args, **kwargs):
         invoke(["pane", "run", pane, __import__("shlex").join(
-            ["/run/herdr-bootstrap/hermes", *args])], timeout_seconds=15.0)
+            ["/run/herdr/policy-code/agent-stack/policy-bin/hermes", *args])], timeout_seconds=15.0)
         return {"result": {"agent": worker._wait_for_task_agent(pane, name)}}
     monkeypatch.setattr(worker, "start_sandbox_agent", transport)
     original = worker.create_task_session
@@ -1573,6 +1573,46 @@ def test_root_host_provider_preflight_precedes_pane_creation_and_failure_cleans_
     assert launch.events==[("closed",)]
     assert worker.HOST_POLICY_LAUNCHES=={}
     assert len(events)==1
+
+
+def test_private_root_missing_mount_approval_denies_before_pane_bridge_or_provider(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from tests.policy_launch_fakes import FakeHostPolicyLaunchFactory
+    from herdr.private_mount_plan import ApprovedPrivateMountPlan
+    from herdr.security import SecurityError
+    configure_paths(tmp_path);task=base_task();worker.prepare_attempt(task)
+    task["workspace"]=str(tmp_path)
+    calls=[];factory=FakeHostPolicyLaunchFactory()
+    original=factory.prepare
+    def prepare(**kwargs):
+        launch=original(**kwargs)
+        launch.private_profile_snapshot=SimpleNamespace(name=worker._task_hermes_profile(task))
+        from tests.herdr.test_security import grant as fixture_grant
+        launch.grant=fixture_grant(Path(task["workspace"]))
+        launch.mount=SimpleNamespace(private_mount_plan=None,private_mount_request=None)
+        launch.sealed=None
+        return launch
+    monkeypatch.setattr(factory,"prepare",prepare)
+    def native(args,**kwargs):
+        calls.append(args)
+        assert args[:2]==["agent","get"]
+        return {"result":{"agent":{"agent":"hermes","pane_id":"coordinator","workspace_id":"workspace"}}}
+    monkeypatch.setattr(worker,"_herdr_json",native)
+    monkeypatch.setattr(worker,"_preflight_root_provider",lambda *args:pytest.fail("private profile cannot refresh mutable credentials"))
+    monkeypatch.setattr(worker,"start_bridge",lambda *args:pytest.fail("approval must precede bridge"))
+    monkeypatch.setattr(worker,"frozen_policy",lambda:_policy_file(tmp_path))
+    def command(*args,**kwargs):
+        kwargs["policy_mount"].private_mount_request={"fixture":"exact-command"}
+        raise RuntimeError("durable_private_mount_plan_unapproved")
+    monkeypatch.setattr(worker,"sandbox_command",command)
+    def deny(cls,path,identity):raise SecurityError("root mount approval missing")
+    monkeypatch.setattr(ApprovedPrivateMountPlan,"read",classmethod(deny))
+    with pytest.raises(SecurityError,match="root mount approval missing"):
+        worker.create_task_session(task,policy_launch_factory=factory)
+    assert len(calls)==1 and not task["execution_session"]["pane_split_started"]
+    launch=factory.created[0]
+    assert launch.events[-1]==("closed",) and not worker.HOST_POLICY_LAUNCHES
+    assert not (tmp_path/"policy").exists()
 
 
 @pytest.mark.parametrize("reason",["workspace outside host policy","requested tools/permissions exceed host ceiling"])
@@ -1727,7 +1767,7 @@ def test_actual_root_setup_failure_passes_task_to_absent_agent_cleanup(tmp_path,
         if args[:2]==["pane","split"]:return {"result":{"pane":{"pane_id":"owned"}}}
         if args[:2]==["pane","process-info"]:return {"result":{"process_info":{"shell_pid":123}}}
         if args[:2]==["pane","run"]:
-            if len(args)>=4 and "/run/herdr-bootstrap/hermes " in args[3]:raise RuntimeError("native start absent")
+            if len(args)>=4 and "/run/herdr/policy-code/agent-stack/policy-bin/hermes " in args[3]:raise RuntimeError("native start absent")
             return None
         raise AssertionError(args)
     monkeypatch.setattr(worker,"_herdr_json",native)
@@ -2083,3 +2123,186 @@ def test_prompt_proof_requires_executed_nonce_and_same_owned_shell(monkeypatch, 
             sandbox.verify_pane_prompt(invoke, "owned", "marker", timeout_seconds=0.1)
     assert len(challenge) == 1
     assert all(args[3].startswith("builtin printf ") for args in calls if args[:2] == ["pane", "run"])
+
+
+def test_root_revalidates_handoff_after_readiness_before_native_run(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from tests.policy_launch_fakes import FakeHostPolicyLaunchFactory
+    from herdr.security import SecurityError
+    configure_paths(tmp_path); task=base_task(); worker.prepare_attempt(task)
+    task["workspace"]=str(tmp_path)
+    factory=FakeHostPolicyLaunchFactory(); original=factory.prepare
+    phase=["before-ready"]; commands=[]; builds=[]
+    def denied(launch):
+        assert phase[0]=="ready" and len(builds)==2
+        raise SecurityError("handoff expired during pane readiness")
+    def prepare(**kwargs):
+        launch=original(**kwargs)
+        launch.private_profile_snapshot=SimpleNamespace(name=worker._task_hermes_profile(task))
+        from tests.herdr.test_security import grant as fixture_grant
+        launch.grant=fixture_grant(Path(task["workspace"]))
+        launch.private_plan_handoff=SimpleNamespace(verify_bound=denied)
+        launch.prepare_private_command=lambda builder:builder()
+        return launch
+    monkeypatch.setattr(factory,"prepare",prepare)
+    def native(args,**kwargs):
+        commands.append(args)
+        if args[:2]==["agent","get"]:
+            return {"result":{"agent":{"kind":"hermes","pane_id":"coordinator","workspace_id":"workspace"}}}
+        if args[:2]==["pane","list"]:return {"result":{"panes":[{"pane_id":"coordinator"}]}}
+        if args[:2]==["pane","split"]:return {"result":{"pane":{"pane_id":"owned"}}}
+        if args[:2]==["pane","process-info"]:return {"result":{"process_info":{"shell_pid":123}}}
+        if args[:2]==["pane","run"]:pytest.fail("expired handoff reached native pane run")
+        raise AssertionError(args)
+    monkeypatch.setattr(worker,"_herdr_json",native)
+    monkeypatch.setattr(worker,"start_bridge",lambda *args:None)
+    monkeypatch.setattr(worker,"stop_bridge",lambda *args:None)
+    monkeypatch.setattr(worker,"_preflight_root_provider",lambda *args:pytest.fail("private credentials cannot refresh"))
+    monkeypatch.setattr(worker,"frozen_policy",lambda:_policy_file(tmp_path))
+    def build(*args, **kwargs):
+        assert kwargs["root_workspace_writable"] is False
+        builds.append("command")
+        return ["/bin/true"]
+    monkeypatch.setattr(worker,"sandbox_command",build)
+    monkeypatch.setattr(worker,"_wait_for_task_pane_input",lambda *args,**kwargs:phase.__setitem__(0,"ready"))
+    monkeypatch.setattr(worker,"_cleanup_setup_pane",lambda *args,**kwargs:True)
+    with pytest.raises(SecurityError,match="handoff expired during pane readiness"):
+        worker.create_task_session(task,policy_launch_factory=factory)
+    assert not any(args[:2]==["pane","run"] for args in commands)
+    assert factory.created[0].events[-1]==("closed",)
+
+
+@pytest.mark.parametrize("tool,root_kind,scoped,expected", [
+    ("read_file", "workspace", True, False),
+    ("write_file", "workspace", True, True),
+    ("patch", "workspace", True, True),
+    ("patch", "parent", True, None),
+    ("write_file", "nested", True, False),
+    ("write_file", "sibling", True, None),
+    ("write_file", "workspace", False, None),
+])
+def test_private_root_workspace_mount_uses_effective_grant(tmp_path, tool, root_kind, scoped, expected):
+    from dataclasses import replace
+    from tests.herdr.test_security import grant
+    from herdr.security import ToolRule, RiskClass
+    workspace = tmp_path / "workspace"
+    roots = {"workspace": workspace, "parent": tmp_path,
+             "nested": workspace / "nested", "sibling": tmp_path / "workspace-other"}
+    planned = grant(workspace)
+    rule = ToolRule(tool, RiskClass.READ if tool == "read_file" else RiskClass.WORKSPACE_WRITE,
+                    ("path",), path_fields=("path",), allowed_roots=(str(roots[root_kind]),))
+    if expected is None:
+        from herdr.security import SecurityError
+        with pytest.raises(SecurityError):
+            replace(planned, tool_rules=(rule,),
+                    scope=replace(planned.scope, tools=(tool,) if scoped else ("read_file",)))
+        return
+    planned = replace(planned, tool_rules=(rule,),
+                      scope=replace(planned.scope, tools=(tool,) if scoped else ("read_file",)))
+    assert worker._root_workspace_writable(planned, workspace) is expected
+
+
+def test_private_root_workspace_denies_an_untyped_grant(tmp_path):
+    with pytest.raises(RuntimeError, match="typed root workspace grant"):
+        worker._root_workspace_writable({}, tmp_path)
+
+
+def test_policy_failure_diagnostic_retains_root_cause_without_sensitive_text(monkeypatch):
+    from herdr import host_configuration
+    from herdr.security import SecurityError
+    secret = "credential-value-must-never-be-retained"
+    def fail():
+        raise SecurityError(secret)
+    monkeypatch.setattr(worker, "HOST_POLICY_LAUNCH_FACTORY", None)
+    monkeypatch.setattr(host_configuration, "build_host_policy_factory", fail)
+    with pytest.raises(RuntimeError) as captured:
+        worker._root_policy_factory()
+    report = worker._policy_failure_diagnostic(captured.value)
+    assert [item["error_type"] for item in report["chain"]] == ["RuntimeError", "SecurityError"]
+    assert any(frame["file"] == "agent-stack/bin/agent-task-worker"
+               for item in report["chain"] for frame in item["frames"])
+    assert secret not in json.dumps(report)
+    assert "task_invocation_policy_missing" not in json.dumps(report)
+    assert str(ROOT) not in json.dumps(report)
+
+
+def test_policy_failure_diagnostic_bounds_cycles_depth_and_unknown_type():
+    class SensitiveException(Exception):
+        pass
+    failures = [SensitiveException("secret") for _ in range(9)]
+    for before, after in zip(failures, failures[1:]):
+        before.__cause__ = after
+    failures[-1].__cause__ = failures[0]
+    report = worker._policy_failure_diagnostic(failures[0])
+    assert len(report["chain"]) == 4
+    assert all(row == {"error_type": "other", "frames": []} for row in report["chain"])
+    failures[0].__cause__ = failures[0]
+    assert len(worker._policy_failure_diagnostic(failures[0])["chain"]) == 1
+
+
+def test_policy_failure_diagnostic_excludes_external_source_paths():
+    namespace = {}
+    try:
+        exec(compile("raise RuntimeError('secret-message')", "/private/credential-name/auth.py", "exec"), namespace)
+    except RuntimeError as exc:
+        report = worker._policy_failure_diagnostic(exc)
+    assert report["chain"] == [{"error_type": "RuntimeError", "frames": []}]
+    assert "credential-name" not in json.dumps(report)
+
+
+def test_blocked_policy_diagnostic_survives_task_persistence_without_new_attempt(tmp_path):
+    configure_paths(tmp_path)
+    task = base_task()
+    worker.prepare_attempt(task)
+    original = (task["run_token"], task["idempotency_key"], task["attempts"])
+    path = worker.RUNNING / "task-1.json"
+    task["invocation_policy_diagnostic"] = worker._policy_failure_diagnostic(RuntimeError("secret"))
+    path.write_text(json.dumps(task))
+    worker.block_task(path, task, "task_invocation_policy_unavailable", "Host invocation policy must be supplied before execution.")
+    saved = json.loads((worker.BLOCKED / path.name).read_text())
+    assert saved["invocation_policy_diagnostic"] == task["invocation_policy_diagnostic"]
+    assert (saved["run_token"], saved["idempotency_key"], saved["attempts"]) == original
+    assert saved["attempt_state"] == "blocked"
+    assert not list(worker.PENDING.iterdir())
+    assert "secret" not in json.dumps(saved)
+
+
+@pytest.mark.parametrize("stage", ["configuration", "prepare"])
+def test_worker_policy_denial_keeps_safe_cause_and_never_runs_sdk(tmp_path, monkeypatch, stage):
+    from herdr import host_configuration
+    from herdr.security import SecurityError
+    configure_paths(tmp_path)
+    task = base_task()
+    worker.prepare_attempt(task)
+    admitted = []
+    original = (task["idempotency_key"], task["attempts"])
+    path = worker.RUNNING / "task-1.json"
+    path.write_text(json.dumps(task))
+    monkeypatch.setattr(worker, "freeze_plan", lambda *args: None)
+    monkeypatch.setattr(worker, "decide_model_route", lambda current: {"tier": "free", "model": "free-model"})
+    monkeypatch.setattr(worker, "record_model_route", lambda *args: None)
+    def fail():
+        raise SecurityError("sensitive-original-error")
+    monkeypatch.setattr(host_configuration, "build_host_policy_factory", fail)
+    monkeypatch.setattr(worker, "HOST_POLICY_LAUNCH_FACTORY", None)
+    def denied(current):
+        admitted.append(current["run_token"])
+        if stage == "configuration":
+            worker._root_policy_factory()
+        try:
+            fail()
+        except SecurityError as exc:
+            raise RuntimeError("task_invocation_policy_denied:" + str(exc)) from exc
+    monkeypatch.setattr(worker, "create_task_session", denied)
+    def forbidden(*args, **kwargs):
+        pytest.fail("policy denial cannot call or restart SDK")
+    monkeypatch.setattr(worker, "run_prompt", forbidden)
+    assert worker.main(path) == 1
+    saved = json.loads((worker.BLOCKED / path.name).read_text())
+    assert saved["attempt_state"] == "blocked"
+    assert saved["result_status"] == "blocked"
+    assert [row["error_type"] for row in saved["invocation_policy_diagnostic"]["chain"]] == ["RuntimeError", "SecurityError"]
+    assert (saved["idempotency_key"], saved["attempts"]) == original
+    assert admitted == [saved["run_token"]]
+    assert "sensitive-original-error" not in json.dumps(saved)
+    assert not list(worker.PENDING.iterdir())

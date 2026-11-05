@@ -1,0 +1,101 @@
+# SOURCE-ONLY proposed worker confinement. No include/attachment or activation.
+# The existing host must approve this exact byte profile before a physical case.
+abi <abi/5.0>,
+profile herdr189-reference-lifetime flags=(attach_disconnected,mediate_deleted) {
+  audit deny capability,
+  audit deny mount,
+  audit deny umount,
+  audit deny pivot_root,
+  audit deny userns,
+  audit deny ptrace (read, trace, tracedby),
+  # Only the separately root-approved, non-delegated metadata observer can
+  # inspect this worker. The worker gains no read/trace authority over peers.
+  ptrace (readby) peer=herdr-offline-observer-03414499dd0d1986,
+  # Exact root cleanup measures metadata only; no SDK host effect follows.
+  ptrace (readby) peer=herdr-offline-operator-03414499dd0d1986,
+  audit deny change_profile,
+
+  # Default file denial is deliberate. There is no /** file or exec grant.
+  # Exact host runtime files require root-approved hashes at admission and
+  # seal. An unlisted binary, library, package or data file is unreadable.
+  # Actual self runtime inventory enumerates only these closed private directories.
+  /{bin,lib,lib/x86_64-linux-gnu,lib64,usr,usr/bin,usr/lib,usr/lib/x86_64-linux-gnu,etc}/ r,
+  /bin/bash rix,
+  /usr/bin/python3 rix,
+  /usr/bin/python3.14 rix,
+  /lib64/ld-linux-x86-64.so.2 rmix,
+  /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 rmix,
+  /usr/lib/x86_64-linux-gnu/{libc.so.6,libm.so.6,libz.so.1,libexpat.so.1,libtinfo.so.6,libtinfo.so.6.6,libpthread.so.0,libdl.so.2,libutil.so.1,librt.so.1,libssl.so.3,libcrypto.so.3} rm,
+  /etc/ld.so.cache r,
+  /etc/localtime r,
+  /etc/hosts r,
+  /etc/hostname r,
+  /etc/resolv.conf r,
+  /etc/nsswitch.conf r,
+  /etc/passwd r,
+  /etc/group r,
+
+  # All writable paths below are private mounts or root-approved pinned
+  # work/result mounts in the closed native launch plan. The launch verifier
+  # checks their exact inode, target, mode, and root-owned approval.
+  /home/agentops/.hermes/profiles/*/{config.yaml,.env,herdr-sdk-policy.json} r,
+  /home/agentops/.hermes/profiles/*/{sessions,cache,logs,pastes}/** rwk,
+  # Bare directories are actual cold-import / private-home open roots.
+  /home/agentops/ r,
+  /home/agentops/.hermes/ r,
+  /home/agentops/.hermes/profiles/ r,
+  /home/agentops/.hermes/profiles/*/ r,
+  /home/agentops/.config/ r,
+  /home/agentops/.config/herdr/ r,
+  /home/agentops/.hermes/hermes-agent/ r,
+  /home/agentops/.hermes/hermes-agent/venv/lib/python3.11/site-packages/ r,
+  /home/agentops/.local/share/uv/python/cpython-3.11.16-linux-x86_64-gnu/lib/python3.11/ r,
+  /home/agentops/.local/share/uv/python/cpython-3.11.16-linux-x86_64-gnu/lib/python3.11/lib-dynload/ r,
+  /home/agentops/.hermes/hermes-agent/** rix,
+  /home/agentops/.hermes/hermes-agent/**.so{,.*} mr,
+  /home/agentops/.local/share/uv/python/cpython-3.11.16-linux-x86_64-gnu/** rmix,
+  /home/agentops/.local/bin/{herdr,hermes} rix,
+  /home/agentops/tmp/hermes-*/workspace/** rwkix,
+  /home/agentops/tmp/hermes-*/results/*.result.json rwk,
+  /run/herdr/policy-code/ r,
+  /run/herdr/policy-code/** rix,
+  /run/herdr-bootstrap/** r,
+  /run/herdr-policy/grant.bundle.json r,
+  /run/systemd/resolve/{stub-resolv.conf,resolv.conf} r,
+  /tmp/** rwk,
+  /opt/agent-platform/** rwk,
+  /dev/null rw,
+  /dev/tty rw,
+  /dev/pts/[0-9]* rw,
+  /dev/ptmx rw,
+  /dev/pts/ptmx rw,
+
+  # Bounded observer metadata in the private PID namespace. Credential FD
+  # acquisition is blocked by the inherited seccomp filter and no host proc
+  # tree is mounted at any other path in the approved launch plan.
+  /proc/[0-9]*/{status,environ,mountinfo,attr/current} r,
+  /proc/[0-9]*/task/[0-9]*/children r,
+  /proc/[0-9]*/task/ r,
+  /proc/[0-9]*/fd/ r,
+  /proc/[0-9]*/fd/[0-9]* r,
+  # Local self checks use only the private proc namespace, never host proc.
+  /proc/[0-9]*/stat r,
+  /proc/[0-9]*/ns/{pid,mnt,net,user} r,
+  /proc/[0-9]*/root/{bin,lib,lib/x86_64-linux-gnu,lib64,usr,usr/bin,usr/lib,usr/lib/x86_64-linux-gnu,etc}/ r,
+  /proc/[0-9]*/root/home/agentops/.hermes/profiles/*/{config.yaml,.env,herdr-sdk-policy.json} r,
+  /proc/[0-9]*/root/home/agentops/.hermes/ r,
+  /proc/[0-9]*/root/home/agentops/.hermes/profiles/ r,
+  /proc/[0-9]*/root/home/agentops/.hermes/profiles/*/ r,
+  /proc/[0-9]*/root/home/agentops/.hermes/hermes-agent/ r,
+  /proc/[0-9]*/root/home/agentops/.config/ r,
+  /proc/[0-9]*/root/home/agentops/.config/herdr/ r,
+
+  # The host authority pathname is explicit. Other private pathname sockets
+  # depend on the closed mount plan and authenticated peers, not this rule alone.
+  # Anonymous sockets carry no authority; inherited seccomp denies descriptor
+  # transfer, pidfd_getfd, ptrace and io_uring ingress.
+  /run/herdr-policy/bootstrap-authority.sock rw,
+  unix (create) type=stream addr=none,
+  unix (connect, send, receive) type=stream addr=none peer=(addr=none),
+  allow signal,
+}

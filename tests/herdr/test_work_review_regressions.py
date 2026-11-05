@@ -46,11 +46,46 @@ def test_runtime_arguments_bind_only_declared_copies(tmp_path):
 
 @pytest.mark.parametrize("key",["hooks.contractFlag","commit.signoff","core.attributesFile"])
 def test_unknown_repository_policy_blocks_before_hook_or_ref_effect(boundary_workspace,key):
-    committer,cycle,work,log=fixture(boundary_workspace,repository_config={key:"required"})
+    # Establish a clean real baseline before exercising the later commit boundary.
+    committer,cycle,work,log=fixture(boundary_workspace)
+    git(work,"config","--local",key,"required")
+    committer.policy=replace(committer.policy,
+        config_sha256=hashlib.sha256((work/".git/config").read_bytes()).hexdigest())
+    cycle.plan=replace(cycle.plan,hygiene_sha256=committer.policy.hash)
     before=log._path.read_bytes()
     with pytest.raises(WorkContractError,match="approved richer profile"):committer(cycle)
     assert git(work,"rev-parse","HEAD")==cycle.plan.base_sha
     assert log._path.read_bytes()==before and list(committer.storage.iterdir())==[]
+
+@pytest.mark.parametrize("key",["hooks.contractFlag","commit.signoff","core.attributesFile"])
+def test_unknown_repository_policy_blocks_at_fresh_preflight(boundary_workspace,monkeypatch,key):
+    import herdr.work_contract_host as host
+    import shlex
+    from types import SimpleNamespace
+    from herdr.work_hygiene import LocalCommitPolicy
+    factory,work,plan,grant,log=factory_fixture(boundary_workspace)
+    git(work,"branch","-m","herdr/review-preflight")
+    git(work,"config","--local",key,"required")
+    hook=work/".git/hooks/pre-commit"
+    marker=boundary_workspace/"hook-ran"
+    hook.write_text("#!/bin/sh\nprintf ran > "+shlex.quote(str(marker))+"\n");hook.chmod(0o700)
+    profile=replace(factory.environment,executables=(*factory.environment.executables,"/usr/bin/git"))
+    policy=LocalCommitPolicy("review-preflight",profile,
+        hashlib.sha256((work/".git/config").read_bytes()).hexdigest(),str(hook.parent),
+        (("pre-commit",hashlib.sha256(hook.read_bytes()).hexdigest()),))
+    plan=replace(plan,environment_sha256=profile.hash,hygiene_sha256=policy.hash)
+    factory.environment=profile;factory.local_commit_policy=policy
+    factory.approve=lambda **kwargs:plan
+    factory.budget_authority=SimpleNamespace(open=lambda **kw:pytest.fail("preflight must precede budget open"))
+    monkeypatch.setattr(host,"HostCheckRunner",lambda *a,**kw:pytest.fail("preflight must precede baseline runner"))
+    monkeypatch.setattr(host,"WorkCycle",lambda *a,**kw:pytest.fail("preflight must precede cycle publication"))
+    before_config=(work/".git/config").read_bytes();before_head=git(work,"rev-parse","HEAD")
+    before_audit=log.replay();assert before_audit==[] and not log._path.exists()
+    with pytest.raises(WorkContractError,match="approved richer profile"):
+        factory.prepare(identity=plan.identity,workspace=work,grant=grant,spec_sha256=plan.spec_sha256)
+    assert (work/".git/config").read_bytes()==before_config and git(work,"rev-parse","HEAD")==before_head
+    assert log.replay()==before_audit and not log._path.exists() and not marker.exists()
+    assert not factory.check_storage.exists() and not (boundary_workspace/"host/commits").exists()
 
 def test_work_cannot_pin_completion_slot_before_host_handoff(tmp_path):
     factory,root,plan,grant,log=factory_fixture(tmp_path)

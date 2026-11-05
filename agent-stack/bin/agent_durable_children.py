@@ -3,6 +3,7 @@
 import hashlib
 import fcntl
 import json
+import re
 import os
 import stat
 import sys
@@ -11,7 +12,9 @@ from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from herdr.scheduler import AuditLog, DynamicChildScheduler, SchedulerError
+from herdr.scheduler import (AuditLog, DynamicChildScheduler, SchedulerError,
+    CanonicalParentAdmission, _LEGACY_PARENT, _canonical_payload_parent,
+    validate_canonical_parent_initialization)
 from herdr.taskgraph import LifecycleState
 from herdr.runtime import AdmissionRegistry, HerdrChildRuntime, SubprocessHerdrRunner
 
@@ -103,6 +106,26 @@ def _read_control_file(path: Path) -> bytes:
             os.close(fd)
 
 
+def _canonical_initial_prefix(directory: Path) -> bytes:
+    """Only the immutable initialization prefix, not a growing child journal."""
+    fd = os.open(directory / "scheduler.jsonl", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise SchedulerError("invalid canonical initialization ledger")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            raw = b""
+            for _ in range(4):
+                line = handle.readline(MAX_INITIALIZATION_BYTES - len(raw) + 1)
+                raw += line
+                if len(raw) > MAX_INITIALIZATION_BYTES or not line.endswith(b"\n"):
+                    raise SchedulerError("invalid canonical initialization prefix")
+            return raw
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def _initialization(directory: Path, parent_task_id: str, run_token: str):
     try:
         document = json.loads(_read_control_file(directory / INITIALIZATION))
@@ -113,6 +136,15 @@ def _initialization(directory: Path, parent_task_id: str, run_token: str):
             or document.get("state") not in {"pending", "committed"}):
         raise SchedulerError("scheduler initialization identity mismatch")
     expected = {"schema", "parent_task_id", "run_token", "state", "ledger_sha256"}
+    if "canonical_parent" in document:
+        if (type(document["schema"]) is not int
+                or not isinstance(document.get("ledger_sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", document["ledger_sha256"])):
+            raise SchedulerError("invalid canonical initialization envelope")
+        expected.add("canonical_parent")
+        parent = _canonical_payload_parent(document["canonical_parent"])
+        if (parent.identity.task_id, parent.identity.run_token) != (parent_task_id, run_token):
+            raise SchedulerError("canonical initialization identity mismatch")
     if document["state"] == "pending":
         expected.add("ledger")
     if set(document) != expected or not isinstance(document["ledger_sha256"], str):
@@ -124,16 +156,26 @@ def _initialization(directory: Path, parent_task_id: str, run_token: str):
         if hashlib.sha256(raw).hexdigest() != document["ledger_sha256"]:
             raise SchedulerError("scheduler initialization digest mismatch")
         events = [json.loads(line) for line in raw.splitlines()]
-        if (len(events) != 3 or [event.get("event") for event in events] !=
-                ["submit", "claim", "execution_session_bound"]
-                or any(event.get("task_id") != parent_task_id for event in events)
-                or events[1].get("run_token") != run_token or events[2].get("run_token") != run_token
-                or events[1].get("attempt_state") != "accepted"
-                or not events[1].get("idempotency_key")
-                or not all(events[2].get(key) for key in ("agent_name", "pane_id", "marker"))
-                or events[0].get("agent_id") != events[1].get("agent_id")
-                or events[1].get("agent_id") != events[2].get("agent_name")):
-            raise SchedulerError("invalid scheduler parent initialization events")
+        if "canonical_parent" in document:
+            validate_canonical_parent_initialization(document["canonical_parent"], events)
+        else:
+            if (len(events) != 3 or [event.get("event") for event in events] !=
+                    ["submit", "claim", "execution_session_bound"]
+                    or any(event.get("task_id") != parent_task_id for event in events)
+                    or events[1].get("run_token") != run_token or events[2].get("run_token") != run_token
+                    or events[1].get("attempt_state") != "accepted"
+                    or not events[1].get("idempotency_key")
+                    or not all(events[2].get(key) for key in ("agent_name", "pane_id", "marker"))
+                    or events[0].get("agent_id") != events[1].get("agent_id")
+                    or events[1].get("agent_id") != events[2].get("agent_name")):
+                raise SchedulerError("invalid scheduler parent initialization events")
+    if ("canonical_parent" in document and document["state"] == "committed"
+            and os.path.lexists(directory / "scheduler.jsonl")):
+        raw = _canonical_initial_prefix(directory)
+        if hashlib.sha256(raw).hexdigest() != document["ledger_sha256"]:
+            raise SchedulerError("committed canonical initialization prefix changed")
+        validate_canonical_parent_initialization(document["canonical_parent"],
+            [json.loads(line) for line in raw.splitlines()])
     return document
 
 
@@ -165,7 +207,7 @@ def repair_initialization(directory: Path, parent_task_id: str, run_token: str) 
                          json.dumps(committed, sort_keys=True, allow_nan=False).encode("utf-8"))
 
 
-def initialize_parent_scheduler(directory: Path, *, completion_authority=None, ownership_registry=None, ownership_parent=None, **binding) -> DynamicChildScheduler:
+def initialize_parent_scheduler(directory: Path, *, completion_authority=None, ownership_registry=None, ownership_parent=None, canonical_parent=_LEGACY_PARENT, **binding) -> DynamicChildScheduler:
     """Stage the whole parent registration before publishing either required artifact."""
     ledger = directory / "scheduler.jsonl"
     if os.path.lexists(ledger) or ledger_required(directory) or os.path.lexists(directory / INITIALIZATION):
@@ -176,11 +218,23 @@ def initialize_parent_scheduler(directory: Path, *, completion_authority=None, o
     try:
         scheduler = DynamicChildScheduler(audit_log=AuditLog(stage),completion_authority=completion_authority,
             ownership_registry=ownership_registry, ownership_parent=ownership_parent)
-        scheduler.register_external_parent_attempt(**binding)
+        if canonical_parent is _LEGACY_PARENT:
+            scheduler.register_external_parent_attempt(**binding)
+        else:
+            if not isinstance(canonical_parent, CanonicalParentAdmission):
+                raise SchedulerError("typed canonical parent data required")
+            canonical_parent.to_json()  # Validate root-only mode before staging submits.
+            scheduler.submit(canonical_parent.graph, repo=canonical_parent.repo, issue=canonical_parent.issue)
+            parent_record = scheduler.register_external_parent_attempt(
+                canonical_parent=canonical_parent, **binding)
         raw = _read_control_file(stage)
         document = {"schema": 1, "parent_task_id": binding["task_id"], "run_token": binding["run_token"],
                     "state": "pending", "ledger_sha256": hashlib.sha256(raw).hexdigest(),
                     "ledger": raw.decode("utf-8")}
+        if canonical_parent is not _LEGACY_PARENT:
+            document["canonical_parent"] = parent_record.canonical_parent
+            validate_canonical_parent_initialization(document["canonical_parent"],
+                [json.loads(line) for line in raw.splitlines()])
         _atomic_control_file(directory / INITIALIZATION,
                              json.dumps(document, sort_keys=True, allow_nan=False).encode("utf-8"))
         repair_initialization(directory, binding["task_id"], binding["run_token"])

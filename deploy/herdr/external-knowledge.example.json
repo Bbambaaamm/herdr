@@ -1,0 +1,31 @@
+{
+  "version": 2,
+  "consumers": {
+    "github:Example/project": {
+      "providers": {
+        "example-provider": [
+          "mail",
+          "chat",
+          "documents"
+        ]
+      }
+    }
+  },
+  "provider_capabilities": [
+    {
+      "provider": "example-provider",
+      "base_url": "https://knowledge.example.invalid/v1",
+      "api_mode": "external_knowledge",
+      "regions": [
+        "eu-central"
+      ],
+      "data_classes": [
+        "sensitive"
+      ],
+      "max_egress": "region_bound",
+      "max_retention": "limited",
+      "training": "excluded",
+      "credential_refs": []
+    }
+  ]
+}

@@ -407,7 +407,7 @@ def swarm(path, profile):
             'result_sha': result_sha,
         }
         c.need(task['attempt_state'] is None or task['attempt_state'] in (
-            'dispatching', 'accepted', 'working', 'delivery_uncertain', 'verifying',
+            'dispatching', 'accepted', 'working', 'delivery_uncertain', 'terminal_unknown', 'verifying',
             'completed', 'done', 'blocked', 'failed', 'retry_scheduled', 'verification_pending'))
         c.need(c.number(task['delivery_reconcile_count']))
         tasks.append(task)
