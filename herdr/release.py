@@ -30,6 +30,7 @@ PAYLOAD_PATHS = (
     "docs/architecture/GITHUB_INTAKE_ADMISSION.md",
     "agent-stack",
     "agent_platform_dashboard/__init__.py",
+    "agent_platform_dashboard/observability.py",
     "agent_platform_dashboard/production_auth.py",
     "agent_platform_dashboard/production_contract.py",
     "agent_platform_dashboard/production_credentials.py",
