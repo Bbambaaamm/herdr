@@ -7,6 +7,7 @@ import subprocess
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
+from types import SimpleNamespace
 import sys
 import tempfile
 import time
@@ -27,6 +28,11 @@ def load_module():
 class GitHubIntakeTests(unittest.TestCase):
     def setUp(self):
         self.intake = load_module()
+        # Explicit ample-capacity IO fixture, never the test host disk.
+        self.capacity = SimpleNamespace(f_frsize=1, f_bavail=10 * 1024**3)
+        capacity = patch("herdr.autonomy_gate.os.statvfs", lambda _: self.capacity, create=True)
+        capacity.start()
+        self.addCleanup(capacity.stop)
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name) / "tasks"
         for name in ("pending", "running", "blocked", "done", "failed", "results", "logs"):
@@ -509,11 +515,22 @@ class GitHubIntakeTests(unittest.TestCase):
             "attempt_state": "verification_pending", "verification_status": "evidence_unavailable",
             "run_token": "stable-run", "attempts": 1,
         }))
-        self.assertEqual(self._run_main_with_majak(), 0)
+        before = path.read_bytes()
+        with patch.object(self.intake, "queue_issue") as queue:
+            self.assertEqual(self._run_main_with_majak(), 0)
+        queue.assert_not_called()
         self.assertEqual(list(self.intake.PENDING.glob("*.json")), [])
+        self.assertEqual(path.read_bytes(), before)
         state = json.loads(self.intake.STATE.read_text())
-        self.assertEqual(state["Bbambaaamm/dotacni-majak#662"]["scheduler_state"], "active")
+        row = state["Bbambaaamm/dotacni-majak#662"]
+        self.assertEqual(row["scheduler_state"], "blocked")
+        self.assertEqual(row["task_id"], "verification-pending")
+        self.assertEqual(row["task_ids"], ["verification-pending"])
+        self.assertEqual(row["blocker"], "durable_task_requires_reconciliation")
+        self.assertEqual(row["used_approvals"], {})
+        self.assertNotIn("admission_intent", row)
         records = self.intake.task_index()["Bbambaaamm/dotacni-majak#662"]
+        self.assertEqual(records[0]["task"], json.loads(before))
         self.assertEqual(self.intake.intervention_blocker(records, allow_failed_replan=True),
                          ("verification-pending", "evidence_unavailable"))
 
@@ -727,6 +744,148 @@ class GitHubIntakeTests(unittest.TestCase):
         payload = comment["body"][len(self.intake.APPROVAL_MARKER):]
         comment["body"] = self.intake.APPROVAL_MARKER + payload[:-1] + ', "action": "approve"}'
         self.assert_no_authorized_queue()
+    def test_low_or_unknown_capacity_scan_withholds_new_intake_and_preserves_history(self):
+        consumer = self.herdr_consumer()
+        key = self.intake.state_key(consumer["repository"], 53)
+        previous = {"used_approvals": {"41": "github-herdr-issue-53-approval-41"}}
+        self.intake.STATE.write_text(json.dumps({key: previous}))
+        before = self.intake.STATE.read_bytes()
+        for available, reason in [(10737418239, "autonomy_disk_headroom_insufficient"),
+                                  (None, "autonomy_disk_capacity_unavailable")]:
+            with self.subTest(available=available), patch.object(self.intake, "queue_issue") as queue:
+                self.capacity.f_bavail = available
+                _, row = self.intake._scan_issue(consumer, self.issue_rows[consumer["repository"]], {}, previous)
+                self.assertEqual(row["scheduler_state"], "blocked")
+                self.assertEqual(row["blocker"], reason)
+                self.assertEqual(row["used_approvals"], previous["used_approvals"])
+                queue.assert_not_called()
+                self.assertEqual(self.api_calls, [])
+                self.assertEqual(self.intake.STATE.read_bytes(), before)
+                self.assertEqual(list(self.intake.PENDING.iterdir()), [])
+
+    def test_direct_queue_capacity_denial_precedes_consume_and_preserves_task_and_history_bytes(self):
+        consumer = self.herdr_consumer()
+        key = self.intake.state_key(consumer["repository"], 53)
+        self.intake.STATE.write_text(json.dumps({key: {"used_approvals": {
+            "41": "github-herdr-issue-53-approval-41"}}}))
+        retained = self.intake.ROOT / "done" / "retained.json"
+        retained.write_text(json.dumps({"id": "retained", "run_token": "original-run", "attempts": 6,
+            "fencing_token": 7, "ownership_epoch": {"version": 1}, "max_model_calls": 40}))
+        before = {path: path.read_bytes() for path in (retained, self.intake.STATE)}
+        for available in (10737418239, None):
+            with self.subTest(available=available), patch.object(self.intake, "_consume_admission") as consume, \
+                    patch.object(self.intake, "publish_task") as publish:
+                self.capacity.f_bavail = available
+                with self.assertRaises(self.intake.CapacityBlocked):
+                    self.intake.queue_issue(consumer, {"number": 53}, [])
+                consume.assert_not_called();publish.assert_not_called()
+                self.assertEqual({path: path.read_bytes() for path in before}, before)
+                self.assertEqual(list(self.intake.PENDING.iterdir()), [])
+
+    def test_capacity_drop_during_approval_is_blocked_before_durable_consumption(self):
+        consumer = self.herdr_consumer()
+        original = self.intake.fetch_json
+        def drop(url):
+            value = original(url)
+            if url.endswith("/collaborators/maintainer/permission"):
+                self.capacity.f_bavail = 0
+            return value
+        self.intake.fetch_json = drop
+        with patch.object(self.intake, "_consume_admission") as consume, patch.object(self.intake, "publish_task") as publish:
+            _, row = self.intake._scan_issue(consumer, self.issue_rows[consumer["repository"]], {}, {})
+            self.assertEqual(row["scheduler_state"], "blocked")
+            self.assertEqual(row["blocker"], "autonomy_disk_headroom_insufficient")
+            self.assertEqual(row["used_approvals"], {})
+            consume.assert_not_called();publish.assert_not_called()
+            self.assertFalse(self.intake.STATE.exists())
+            self.assertEqual(list(self.intake.PENDING.iterdir()), [])
+
+    def test_capacity_withheld_full_scan_reports_blocked_without_consuming_approval(self):
+        consumer = self.herdr_consumer();self.write_config([consumer])
+        self.intake.fetch_issues = lambda _: [self.issue_rows[consumer["repository"]]]
+        key = self.intake.state_key(consumer["repository"], 53)
+        history = {"41": "github-herdr-issue-53-approval-41"}
+        self.intake.STATE.write_text(json.dumps({key: {"used_approvals": history}}))
+        self.capacity.f_bavail = 0
+        with patch.object(self.intake.sys, "argv", ["agent-github-intake", "--force"]):
+            self.assertEqual(self.intake.main(), 0)
+        row = self.intake.load_state()[key]
+        self.assertEqual(row["scheduler_state"], "blocked")
+        self.assertEqual(row["blocker"], "autonomy_disk_headroom_insufficient")
+        self.assertEqual(row["used_approvals"], history)
+        self.assertNotIn("admission_intent", row)
+        self.assertEqual(list(self.intake.PENDING.iterdir()), [])
+
+    def test_already_consumed_approval_replay_does_not_need_headroom_or_change_history(self):
+        consumer = self.herdr_consumer()
+        first = self.intake.queue_issue(consumer, {"number": 53}, [])
+        path = self.intake.PENDING / (first + ".json")
+        before = (path.read_bytes(), self.intake.STATE.read_bytes())
+        self.capacity.f_bavail = 0
+        self.assertEqual(self.intake.queue_issue(consumer, {"number": 53}, []), first)
+        self.assertEqual((path.read_bytes(), self.intake.STATE.read_bytes()), before)
+
+    def test_blocked_only_rows_report_existing_bounded_reason_without_touching_task_or_history(self):
+        consumer = self.herdr_consumer();key = self.intake.state_key(consumer["repository"], 53)
+        for reason, expected in [("delivery_uncertain_requires_recovery", "delivery_uncertain_requires_recovery"),
+                ("worker_startup_denied", "worker_startup_denied"), ("x" * 81, "durable_task_requires_reconciliation"),
+                ("secret body with spaces", "durable_task_requires_reconciliation"), (True, "durable_task_requires_reconciliation"),
+                ("ghp_abcdefgh", "durable_task_requires_reconciliation"),
+                ("github_pat_abcdefgh", "durable_task_requires_reconciliation"),
+                ("sk-abcdefgh", "durable_task_requires_reconciliation")]:
+            with self.subTest(reason=reason):
+                task = {"id": "retained", "repo": consumer["repository"], "issue": 53, "attempts": 6,
+                    "fencing_token": 7, "run_token": "original-run", "watchdog_blocker": reason}
+                path = self.intake.ROOT / "blocked" / "retained.json";path.write_text(json.dumps(task))
+                before = path.read_bytes();previous = {"used_approvals": {"41": "github-herdr-issue-53-approval-41"}}
+                with patch.object(self.intake, "queue_issue") as queue, \
+                        patch.object(self.intake, "disk_headroom_blocker", side_effect=AssertionError("retained blocker precedes new eligibility")):
+                    _, row = self.intake._scan_issue(consumer, {"number": 53}, self.intake.task_index(), previous)
+                self.assertEqual(row["scheduler_state"], "blocked");self.assertEqual(row["task_id"], "retained")
+                self.assertEqual(row["task_ids"], ["retained"]);self.assertEqual(row["blocker"], expected)
+                self.assertEqual(row["used_approvals"], previous["used_approvals"])
+                self.assertEqual(path.read_bytes(), before);queue.assert_not_called()
+
+    def test_mixed_blocked_and_pending_or_running_remains_active_without_requeue(self):
+        consumer = self.herdr_consumer();key = self.intake.state_key(consumer["repository"], 53)
+        for working in ("pending", "running"):
+            with self.subTest(working=working):
+                records = [{"state": state, "task": {"id": state+"-task"}} for state in ("blocked", working)]
+                with patch.object(self.intake, "queue_issue") as queue:
+                    _, row = self.intake._scan_issue(consumer, {"number": 53}, {key: records}, {})
+                self.assertEqual(row["scheduler_state"], "active")
+                self.assertEqual(row["task_ids"], ["blocked-task", working+"-task"])
+                self.assertNotIn("blocker", row);queue.assert_not_called()
+
+    def test_terminal_unknown_and_pending_intent_precede_capacity_without_reconciliation(self):
+        consumer = self.herdr_consumer();key = self.intake.state_key(consumer["repository"], 53)
+        held = {"id": "synthetic-held", "attempt_state": "terminal_unknown", "automatic_retry_allowed": False}
+        with patch.object(self.intake, "disk_headroom_blocker", side_effect=AssertionError("UNKNOWN must remain held")):
+            with self.assertRaisesRegex(self.intake.AdmissionDenied, "terminal_unknown_requires_operator_reconciliation"):
+                self.intake.queue_issue(consumer, {"number": 53}, [{"task": held}])
+        previous = {"used_approvals": {"42": "github-herdr-issue-53-approval-42"},
+            "admission_intent": {"version": 1, "approval_id": 42, "task_id": "github-herdr-issue-53-approval-42",
+                "content_sha256": "a"*64, "state": "publication_pending"}}
+        self.intake.STATE.write_text(json.dumps({key: previous}));before = self.intake.STATE.read_bytes()
+        self.capacity.f_bavail = 0
+        with self.assertRaisesRegex(self.intake.AdmissionDenied, "reconciliation-required"):
+            self.intake.queue_issue(consumer, {"number": 53}, [])
+        self.assertEqual(self.intake.STATE.read_bytes(), before)
+
+    def test_unsafe_blocked_identity_is_not_coerced_or_published_and_remains_a_dedup_barrier(self):
+        consumer = self.herdr_consumer();key = self.intake.state_key(consumer["repository"], 53)
+        for identity in (None, True, {"secret": "do-not-publish"}, "x"*129, "credential\nsecret", "../foreign",
+                "ghp_abcdefgh", "github_pat_abcdefgh", "sk-abcdefgh", "AKIA1234567890ABCDEF"):
+            with self.subTest(identity=identity):
+                record = {"state": "blocked", "task": {"id": identity, "watchdog_blocker": "held"}}
+                with patch.object(self.intake, "queue_issue") as queue:
+                    _, row = self.intake._scan_issue(consumer, {"number": 53}, {key: [record]}, {})
+                self.assertEqual(row["scheduler_state"], "blocked")
+                self.assertEqual(row["task_ids"], [])
+                self.assertNotIn("task_id", row)
+                self.assertEqual(row["blocker"], "durable_task_requires_reconciliation")
+                self.assertNotIn("secret", json.dumps(row));queue.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
