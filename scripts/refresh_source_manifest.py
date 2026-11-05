@@ -16,6 +16,7 @@ ROOTS = (
     Path("scripts"),
 )
 FILES = (
+    Path("docs/architecture/MEMORY_PROPOSALS_105.md"),
     Path("docs/architecture/TOOL_SELECTION_96.md"),
     Path("docs/architecture/MACHINE_CITY_OBSERVABILITY_77.md"),
     Path("docs/architecture/CONTEXT_MEMORY_MARKET_DECISION_2026-10-05.md"),

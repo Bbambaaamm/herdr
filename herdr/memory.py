@@ -10,12 +10,12 @@ import fcntl
 import secrets
 import threading
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Callable
 
-from .context import (ContextError, SecretRedactor, SourceRef, SourceState, bounded_text,
+from .context import (ContextError, ContextItem, MemoryClass, SecretRedactor, SourceRef, SourceState, bounded_text,
                       canonical, digest, hash_value, require, token)
 from .capability import DataClass
 
@@ -157,6 +157,16 @@ class ExperienceMemory:
         require(len({x.id for x in records}) == len(records), "duplicate_experience")
         self.records = tuple(sorted(records, key=lambda x: x.id))
 
+    @staticmethod
+    def propose(**inputs):
+        """Project a host-accepted outcome into unverified proposal data only."""
+        return build_memory_proposal(**inputs)
+
+    @staticmethod
+    def recall_proposals(proposals, **inputs):
+        """Recall bounded proposals against separately supplied current host pins."""
+        return recall_memory_proposals(proposals, **inputs)
+
     def retrieve(self, *, project, task_class, conditions: Conditions, allowed_classes,
                  source_available: Callable[[SourceRef], bool], role="worker", series=None, limit=4):
         token(project)
@@ -208,6 +218,234 @@ class ExperienceMemory:
                                       x.applicability != Applicability.REVIEW_CHANGED,
                                       len(x.changed_conditions), x.record.id))
         return tuple(candidates[:limit])
+
+
+MAX_PROPOSAL_BYTES = 16_384
+MAX_PROPOSAL_CATALOG_BYTES = 262_144
+MAX_ACCEPTED_MEMORY_BYTES = 2_000_000
+
+
+class ProposalKind(StrEnum):
+    SEMANTIC = "semantic"
+    PROCEDURAL = "procedural"
+
+
+@dataclass(frozen=True)
+class AcceptedMemoryBinding:
+    """Host input from independently established acceptance, not a worker claim.
+
+    Construction and hashes do not authenticate an outcome. The trusted caller
+    supplies these pins independently of the candidate and accepted-record bytes.
+    This API never looks up, publishes or changes an EvidenceStore record.
+    """
+    project: str
+    repo: str
+    task_id: str
+    run_token: str
+    idempotency_key: str
+    attempt: int
+    fencing_token: int
+    plan_hash: str
+    result_sha256: str
+    commit_sha: str
+    bundle_hash: str
+
+    def __post_init__(self):
+        for name in ("project", "repo", "task_id", "run_token", "idempotency_key"):
+            token(getattr(self, name))
+        for name in ("attempt", "fencing_token"):
+            value = getattr(self, name)
+            require(type(value) is int and 0 <= value <= 2**31, "memory_acceptance_identity")
+        for name in ("plan_hash", "result_sha256", "bundle_hash"):
+            hash_value(getattr(self, name))
+        require(isinstance(self.commit_sha, str) and len(self.commit_sha) == 40
+                and all(x in "0123456789abcdef" for x in self.commit_sha), "memory_acceptance_commit")
+
+    def identity(self):
+        return {"id": self.task_id, "run_token": self.run_token,
+                "idempotency_key": self.idempotency_key, "attempt": self.attempt,
+                "fencing_token": self.fencing_token}
+
+
+def _proposal_sources(sources, project):
+    # Reserve one of ContextItem's sixteen refs for the unverified derived body.
+    require(isinstance(sources, (list, tuple)) and 0 < len(sources) <= 15
+            and all(type(x) is SourceRef for x in sources), "memory_proposal_sources")
+    require(len({x.uri for x in sources}) == len(sources), "duplicate_memory_source")
+    require(all(x.project == project and x.data_class == DataClass.PUBLIC
+                and x.holdout_series is None and x.state == SourceState.VERIFIED for x in sources),
+            "memory_proposal_source_not_public_current")
+    return tuple(sorted(sources, key=lambda x: x.uri))
+
+
+@dataclass(frozen=True)
+class MemoryProposal:
+    """Bounded derived lesson. It grants neither verified truth nor promotion."""
+    id: str
+    kind: ProposalKind
+    task_class: str
+    origin: AcceptedMemoryBinding
+    sources: tuple[SourceRef, ...]
+    summary: str
+    state: SourceState = field(default=SourceState.UNVERIFIED, init=False)
+    authority: str = field(default="derived_context_data", init=False)
+
+    def __post_init__(self):
+        token(self.id)
+        token(self.task_class)
+        require(type(self.origin) is AcceptedMemoryBinding, "host_memory_acceptance_binding")
+        try:
+            object.__setattr__(self, "kind", ProposalKind(self.kind))
+        except (TypeError, ValueError) as exc:
+            raise ContextError("memory_proposal_kind") from exc
+        object.__setattr__(self, "sources", _proposal_sources(self.sources, self.origin.project))
+        require(any(x.sha256 == self.origin.result_sha256
+                    and x.revision == self.origin.commit_sha for x in self.sources),
+                "memory_proposal_result_source")
+        bounded_text(self.summary, 8192)
+        require(len(canonical(self.to_json())) <= MAX_PROPOSAL_BYTES, "memory_proposal_bytes")
+
+    def to_json(self):
+        return asdict(self)
+
+    @property
+    def hash(self):
+        return digest(self.to_json())
+
+    def derived(self, redactor):
+        require(isinstance(redactor, SecretRedactor), "host_redactor")
+        raw = self.to_json()
+        raw.pop("summary")
+        require(canonical(redactor.tree(raw)) == canonical(raw), "secret_memory_proposal_metadata")
+        return replace(self, summary=redactor.redact(self.summary))
+
+
+def build_memory_proposal(*, accepted_record, binding, sources, id, kind, task_class,
+                          summary, redactor):
+    """Pure projection of a bounded immutable host snapshot; no acceptance gate.
+
+    The bytes are the canonical stored accepted payload, without the returned
+    bundle_hash wrapper. Their digest must match the independently supplied host
+    binding. No raw record/proof bytes are retained in the proposal or exposed.
+    """
+    require(type(binding) is AcceptedMemoryBinding, "host_memory_acceptance_binding")
+    require(type(accepted_record) is bytes and 0 < len(accepted_record) <= MAX_ACCEPTED_MEMORY_BYTES,
+            "memory_accepted_record_bound")
+    require(hashlib.sha256(accepted_record).hexdigest() == binding.bundle_hash,
+            "memory_accepted_record_digest")
+    try:
+        raw = json.loads(accepted_record)
+        require(type(raw) is dict and canonical(raw) == accepted_record,
+                "memory_accepted_record_canonical")
+    except (ValueError, TypeError, UnicodeError, RecursionError) as exc:
+        raise ContextError("memory_accepted_record_encoding") from exc
+    artifact = raw.get("artifact")
+    require(type(raw.get("version")) is int and raw["version"] == 2
+            and raw.get("level") == "verified_worker_result" and raw.get("repo") == binding.repo
+            and canonical(raw.get("identity")) == canonical(binding.identity())
+            and raw.get("plan_hash") == binding.plan_hash,
+            "memory_accepted_record_binding")
+    require(type(artifact) is dict and artifact.get("task_id") == binding.task_id
+            and type(artifact.get("attempt")) is int and artifact["attempt"] == binding.attempt
+            and artifact.get("result_sha") == binding.result_sha256
+            and artifact.get("commit_sha") == binding.commit_sha,
+            "memory_accepted_artifact_binding")
+    return MemoryProposal(id, kind, task_class, binding, sources, summary).derived(redactor)
+
+
+@dataclass(frozen=True)
+class ProposalRecall:
+    proposal_hash: str
+    sources: tuple[SourceRef, ...]
+    applicability: Applicability
+    reason: str
+    proposal: MemoryProposal | None
+    authority: str = field(default="derived_context_data", init=False)
+
+    def to_json(self):
+        return asdict(self)
+
+    def context_item(self, redactor):
+        """Use the existing optional derived-context path, never host controls."""
+        require(self.proposal is not None
+                and self.reason == "memory_proposal_requires_independent_admission",
+                "memory_proposal_unavailable")
+        proposal = self.proposal.derived(redactor)
+        raw = canonical(proposal.to_json())
+        sha = hashlib.sha256(raw).hexdigest()
+        summary = replace(proposal.sources[0], uri="herdr://derived/" + sha,
+                          sha256=sha, state=SourceState.UNVERIFIED)
+        item = ContextItem("memory-proposal-" + sha, MemoryClass.EPISODIC,
+                           (summary, *proposal.sources), len(raw), "optional_memory_proposal",
+                           derived_summary=True)
+        return item, raw
+
+
+def recall_memory_proposals(proposals, *, project, task_class, current_bindings,
+                            current_sources, redactor, limit=4, byte_budget=65_536):
+    """Pure optional recall with no loader, writes, promotion or policy mutation.
+
+    Current bindings and sources are host snapshots, not candidate-selected data.
+    Missing, retracted (omitted), stale, conflicting or private support returns
+    provenance with no lesson body. A valid lesson remains UNVERIFIED.
+    """
+    token(project)
+    token(task_class)
+    require(isinstance(redactor, SecretRedactor), "host_redactor")
+    require(type(limit) is int and 0 < limit <= 8 and type(byte_budget) is int
+            and 2 <= byte_budget <= MAX_PROPOSAL_CATALOG_BYTES, "memory_proposal_recall_limit")
+    require(isinstance(proposals, (list, tuple)) and len(proposals) <= MAX_RECORDS
+            and all(type(x) is MemoryProposal for x in proposals), "memory_proposal_catalog")
+    require(len({(x.origin.project, x.id) for x in proposals}) == len(proposals),
+            "duplicate_memory_proposal")
+    require(len(canonical([x.to_json() for x in proposals])) <= MAX_PROPOSAL_CATALOG_BYTES,
+            "memory_proposal_catalog_bytes")
+    require(isinstance(current_bindings, (list, tuple)) and len(current_bindings) <= MAX_RECORDS
+            and all(type(x) is AcceptedMemoryBinding for x in current_bindings),
+            "host_memory_acceptance_catalog")
+    bindings = {(x.project, x.task_id): x for x in current_bindings}
+    require(len(bindings) == len(current_bindings), "duplicate_memory_acceptance")
+    require(isinstance(current_sources, (list, tuple)) and len(current_sources) <= MAX_RECORDS
+            and all(type(x) is SourceRef for x in current_sources), "host_memory_source_catalog")
+    sources = {(x.project, x.uri): x for x in current_sources}
+    require(len(sources) == len(current_sources), "duplicate_current_memory_source")
+    output = []
+    used = 2  # Canonical output array brackets, plus commas between rows below.
+    for original in sorted(proposals, key=lambda x: (x.id, x.hash)):
+        if original.origin.project != project or original.task_class != task_class:
+            continue
+        proposal = original.derived(redactor)
+        state, reason = Applicability.UNVERIFIED, "memory_proposal_requires_independent_admission"
+        if bindings.get((project, proposal.origin.task_id)) != proposal.origin:
+            state, reason = Applicability.UNAVAILABLE, "accepted_outcome_not_current"
+        else:
+            for source in proposal.sources:
+                current = sources.get((project, source.uri))
+                if current is None:
+                    state, reason = Applicability.UNAVAILABLE, "memory_source_unavailable"
+                elif current.data_class != DataClass.PUBLIC or current.holdout_series is not None:
+                    state, reason = Applicability.UNAVAILABLE, "memory_source_private"
+                elif (current.sha256, current.revision) != (source.sha256, source.revision):
+                    state, reason = Applicability.STALE, "memory_source_changed"
+                elif current.state != SourceState.VERIFIED:
+                    state, reason = {
+                        SourceState.STALE: (Applicability.STALE, "memory_source_stale"),
+                        SourceState.CONFLICT: (Applicability.CONFLICT, "memory_source_conflict"),
+                        SourceState.UNAVAILABLE: (Applicability.UNAVAILABLE, "memory_source_unavailable"),
+                        SourceState.UNVERIFIED: (Applicability.UNVERIFIED, "memory_source_unverified"),
+                    }[current.state]
+                if reason != "memory_proposal_requires_independent_admission":
+                    break
+        row = ProposalRecall(original.hash, proposal.sources, state, reason,
+                             proposal if reason == "memory_proposal_requires_independent_admission" else None)
+        size = len(canonical(row.to_json())) + bool(output)
+        if used + size > byte_budget:
+            continue
+        output.append(row)
+        used += size
+        if len(output) == limit:
+            break
+    return tuple(output)
 
 
 class ExperienceStore:
