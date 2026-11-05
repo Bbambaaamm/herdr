@@ -595,24 +595,35 @@ def test_queue_projection_is_bounded_sanitized_and_quantlab_only(tmp_path, monke
         sources.queue(str(path), 'quantlab')
 
 
-def test_queue_v3_accepts_loxxess_without_hiding_existing_consumers():
-    def task(task_id, repo, agent):
-        return dict(task_id=task_id, repo=repo, issue=1, issue_title='Issue',
-                    issue_open=True, scheduler_state='active', status='pending',
-                    attempts=0, max_attempts=3, not_before=None, updated_at=100,
-                    agent=agent, kind='github_root_orchestration', blocker=None,
-                    pr_number=None)
+def test_queue_v3_accepts_full_exporter_capacity_without_hiding_consumers():
+    rows = []
+    selected = {}
+    consumers = (
+        ('quantlab', 'Bbambaaamm/Autonomous-Quant-Lab', 'quantlab-hermes'),
+        ('majak', 'Bbambaaamm/dotacni-majak', 'dotacni-majak-hermes'),
+        ('herdr', 'Bbambaaamm/herdr', 'herdr-hermes'),
+        ('loxxess', 'Bbambaaamm/loxxess-technical-ai-assistant', 'loxxess-hermes'),
+    )
+    for profile, repo, agent in consumers:
+        selected[profile] = []
+        for index in range(50):
+            row = dict(task_id=(f'{profile}-{index}-' + 'x' * 128)[:128],
+                       repo=repo, issue=index + 1, issue_title='T' * 160,
+                       issue_open=True, scheduler_state='s' * 64, status='failed',
+                       attempts=3, max_attempts=3, not_before=None, updated_at=100,
+                       agent=agent, kind='k' * 64, blocker='b' * 128,
+                       pr_number=None)
+            selected[profile].append(row)
+            rows.append(row)
+    payload = dict(version=3, observed_at=100, tasks=rows)
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                         separators=(',', ':')).encode()
 
-    quantlab = task('quantlab-1', 'Bbambaaamm/Autonomous-Quant-Lab',
-                    'quantlab-hermes')
-    majak = task('majak-1', 'Bbambaaamm/dotacni-majak',
-                 'dotacni-majak-hermes')
-    loxxess = task('loxxess-1', 'Bbambaaamm/loxxess-technical-ai-assistant',
-                   'loxxess-hermes')
-    payload = dict(version=3, observed_at=100, tasks=[quantlab, majak, loxxess])
-
-    assert sources.queue_from_payload(payload, 'quantlab') == ([quantlab], 100)
-    assert sources.queue_from_payload(payload, 'majak') == ([majak], 100)
+    assert len(rows) == 200
+    assert c.MAX_BYTES < len(encoded) <= sources.QUEUE_MAX_BYTES
+    decoded = c.parse(encoded, sources.QUEUE_MAX_BYTES)
+    assert sources.queue_from_payload(decoded, 'quantlab') == (selected['quantlab'], 100)
+    assert sources.queue_from_payload(decoded, 'majak') == (selected['majak'], 100)
 
 
 def test_queue_collect_and_staleness_are_fail_closed(tmp_path, monkeypatch):

@@ -19,6 +19,7 @@ SAFE_ENV = {'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
             'HOME': '/nonexistent', 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null',
             'GIT_OPTIONAL_LOCKS': '0', 'GIT_TERMINAL_PROMPT': '0'}
 QUEUE_PATH = '/var/lib/agent-platform-herdr/queue.json'
+QUEUE_MAX_BYTES = 262144
 CODEX_USAGE_PATH = '/var/lib/agent-platform-herdr/codex-usage.json'
 MODEL_ROUTING_PATH = '/var/lib/agent-platform-herdr/model-routing.json'
 ADMISSION_PATH = '/var/lib/agent-platform-herdr/admission.jsonl'
@@ -285,7 +286,7 @@ def tests(path, profile):
 
 def queue_payload(path):
     c.need(path == QUEUE_PATH)
-    return c.parse(read(path, c.MAX_BYTES), c.MAX_BYTES)
+    return c.parse(read(path, QUEUE_MAX_BYTES), QUEUE_MAX_BYTES)
 
 
 def queue_from_payload(raw, profile):
@@ -300,7 +301,7 @@ def queue_from_payload(raw, profile):
     elif version == 3:
         c.keys(raw, 'version observed_at tasks')
         c.need(c.number(raw['observed_at']) and type(raw['tasks']) is list
-               and len(raw['tasks']) <= 100)
+               and len(raw['tasks']) <= 200)
         target_repo = {
             'quantlab': 'Bbambaaamm/Autonomous-Quant-Lab',
             'majak': 'Bbambaaamm/dotacni-majak',

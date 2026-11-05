@@ -143,6 +143,7 @@ def row(kind, value):
             None: 'quantlab-hermes',
             'Bbambaaamm/Autonomous-Quant-Lab': 'quantlab-hermes',
             'Bbambaaamm/dotacni-majak': 'dotacni-majak-hermes',
+            'Bbambaaamm/herdr': 'herdr-hermes',
             'Bbambaaamm/loxxess-technical-ai-assistant': 'loxxess-hermes',
         }.get(repo)
         need(expected_agent is not None)
