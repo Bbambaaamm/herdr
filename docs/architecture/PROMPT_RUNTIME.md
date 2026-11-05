@@ -96,3 +96,48 @@ Prompt plans require the active host SecretRedactor before construction and pers
 The returned bundle retains the exact compiled context payload and context trace, and pins the trace digest in its prompt audit. Already-redacted context is used directly, preserving exact provenance even when a known secret overlaps the redaction marker. Context selection/rejection reasons and source digests are available separately from instruction and demonstration audits.
 
 Compilation requires measured finite executor ceilings and enough output allowance for a bounded schema-valid response witness containing the exact task identity and prompt digest. Unknown ceilings and schemas without a bounded legal witness fail before source loading. Numeric schema bounds must be finite numbers of the declared JSON type. Project authority binds both ContextPlan.project and its pinned project map. The selected host provider route restricts source classes, actual region, retention, egress, training and credential reference before loading; optional disallowed sources receive a rejection trace. Region selection must be explicit when the approved intersection is ambiguous.
+
+## Read-only active reasoning binding (#99 / #95)
+
+An optional `PromptPlan.reasoning_state_binding` consumes the validated
+`ReasoningProjection` contract. It adds no reasoning engine or state writer.
+The host constructs `ReasoningStateBinding.from_projection` with its expected
+InvocationIdentity, exact full-projection digest, current ContextPlan authority
+hash and active SecretRedactor. The binding revalidates the complete support
+graph and pins version 1; recognizable or host-known secrets block construction
+and every export instead of silently rewriting a statement or its digest.
+
+The dynamic `reasoning_state` section carries every ACTIVE evidence entry and
+its exact SourceRefs, current claims and open gaps. Retired evidence appears
+only as SUPERSEDED/RETRACTED counts; its statements, refs and historical event
+payloads are not rendered. Working support remains `working_context_only`,
+including when its source refs are VERIFIED; it cannot grant permission or
+satisfy final completion. All rendered refs must be verified, in the current
+project and allowed source/provider data classes, and outside private holdouts.
+An unusable mandatory ref blocks the whole compile before any source loader.
+
+The binding wire contains the projected current data and exact hashes, not a
+new trusted projection producer. Therefore `PromptPlan.from_json` and
+`PromptRuntime.compile` require the caller's current host-owned
+`reasoning_projection` whenever this optional binding is present. Changed
+identity/fence, projection digest, source refs, spec/policy/base/control
+ContextPlan authority, version, redaction policy or serialized current content
+fail closed. The host remains responsible for authenticating the supplied
+snapshot's origin and freshness; a digest or model-supplied VERIFIED label is
+not authentication. No event-store or live producer is connected by this slice.
+
+The current projection is reserved as mandatory dynamic input before the
+existing ContextCompiler selects optional context, instructions or examples.
+Nothing in it may be dropped to obtain a fitting prompt: mandatory byte/token
+overflow blocks. Its current serialized binding is capped at 65,536 UTF-8
+bytes; the complete provider envelope is still measured against all existing
+byte and exact host-tokenizer ceilings. The trace carries only binding and
+projection hashes, version and counts, excluding statements and raw refs.
+The stable host/consumer/authority prefix is unchanged. With the binding absent,
+legacy plan serialization/hash, compiler behavior and output contracts remain
+unchanged; no new wire key is emitted.
+
+This source consumer does not add structured state-delta application, durable
+persistence, freshness production, provider/SDK execution, physical delivery or
+#78 acceptance. Broader #99 and #95 remain open; PR152's coding guidance is not
+part of this implementation.
