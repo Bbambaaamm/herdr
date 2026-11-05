@@ -15,6 +15,7 @@ def private_evidence(proof):
     from herdr.private_profile_namespace import profile_identity
     result = json.loads(json.dumps(proof))
     result["approved_profile"] = profile_identity("quantlab", {"config.yaml": "a" * 64, ".env": "b" * 64})
+    result["worker_confinement_sha256"] = "f" * 64
     from tests.policy_launch_fakes import immutable_sources_fixture
     result["immutable_sources"] = immutable_sources_fixture(result)
     return result

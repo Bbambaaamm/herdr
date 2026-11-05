@@ -8,14 +8,14 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime
 import json
-import os
+from .observed_proc import os
 import shutil
 import socket
 import stat
 import tempfile
 import threading
 import time
-from pathlib import Path
+from .observed_proc import Path
 
 from .bootstrap_authority import (
     BootstrapAuthority, BootstrapAuthorityError, BootstrapExpectation,
@@ -92,14 +92,46 @@ class _DurableBootstrapAuthority(BootstrapAuthority):
         except Exception as exc:
             raise BootstrapAuthorityError("durable bootstrap publication failed") from exc
 
+    def _before_continuation(self, key, session, request, peer):
+        if session.expectation.self_observation_mode is None:
+            return super()._before_continuation(key, session, request, peer)
+        from .bootstrap_self_observation import MODE, produce_for_bootstrap
+        if (session.expectation.self_observation_mode != MODE or
+                self._owner.launch.bootstrap_self_observation != MODE):
+            raise BootstrapAuthorityError("explicit root observation mode required")
+        session.self_observation = produce_for_bootstrap(self._owner, session, peer, request["challenge"])
 
-def bootstrap_proof(identity, trees, *, approved_profile=None):
+    def _stage2_response(self, session=None):
+        launch = self._owner.launch
+        if launch.private_profile_snapshot is None:
+            return b"stage2-ok\n"
+        from .host_reference_binding import derive_host_reference
+        reference = derive_host_reference(launch.grant, launch.private_profile_snapshot)
+        if getattr(launch, "bootstrap_self_observation", None) is not None:
+            from .bootstrap_self_observation import MODE, ENVELOPE, validate_facts, MAX_RESPONSE
+            if launch.bootstrap_self_observation != MODE or session is None or not session.continued:
+                raise BootstrapAuthorityError("verified kernel bootstrap session required")
+            payload = {"schema_version": ENVELOPE, "reference": reference,
+                       "self_observation": validate_facts(session.self_observation)}
+            answer = b"stage2-ok " + canonical_json_bytes(payload) + b"\n"
+            if len(answer) > MAX_RESPONSE:
+                raise BootstrapAuthorityError("bounded bootstrap envelope required")
+            return answer
+        return b"stage2-ok " + canonical_json_bytes(reference) + b"\n"
+
+
+def bootstrap_proof(identity, trees, *, approved_profile=None, self_observation=None):
     value = {"schema_version": "herdr-policy-bootstrap-1", "authority": "herdr-host-frozen-tree",
              "identity": identity.to_json(), "trees": trees}
     if approved_profile is not None:
         from .private_profile_namespace import verified_profile_identity
         value["schema_version"] = "herdr-policy-bootstrap-2"
         value["approved_profile"] = verified_profile_identity(approved_profile)
+    if self_observation is not None:
+        from .bootstrap_self_observation import validate_mode
+        _require(approved_profile is not None, "private observation requires approved profile")
+        value["schema_version"] = "herdr-policy-bootstrap-3"
+        value["self_observation"] = validate_mode(self_observation)
     return json.loads(canonical_json_bytes(value))
 
 
@@ -123,6 +155,7 @@ class HostBootstrap:
         self.work_authority = None
         self.work_verify = None
         self.work_budget = None
+        self.work_observe = None
         self.external_knowledge_authority = None
         self.external_knowledge_query = None
 
@@ -142,11 +175,17 @@ class HostBootstrap:
         if profile is not None:
             profile.verify()
             profile.sdk_policy()
+        observation_mode = None
+        if getattr(launch, "bootstrap_self_observation", None) is not None:
+            from .bootstrap_self_observation import MODE, mode_for_launch
+            _require(launch.bootstrap_self_observation == MODE, "unsupported bootstrap observation mode")
+            observation_mode = mode_for_launch(launch)
         proof = bootstrap_proof(launch.identity,
             {str(tree.target): {"device": tree.device, "inode": tree.inode,
              "source_digest": tree.source_digest, "snapshot_kind": "host-frozen-copy"}
              for tree in (code, *runtime)},
-            approved_profile=profile.identity if profile is not None else None)
+            approved_profile=profile.identity if profile is not None else None,
+            self_observation=observation_mode)
         source = Path(tempfile.mkdtemp(prefix="bootstrap-source-", dir=storage))
         tree = listener = socket_fd = socket_dir = None
         try:
@@ -234,7 +273,8 @@ class HostBootstrap:
             bundle_sha256=self.launch.sealed.sha256, parent_pid=shell_pid,
             parent_start_ticks=self._shell_ticks, stage1_device=dev, stage1_inode=ino,
             python_device=pydev, python_inode=pyino,
-            valid_until=min(time.time()+59,datetime.fromisoformat(self.launch.grant.expires_at.replace('Z','+00:00')).timestamp()))
+            valid_until=min(time.time()+59,datetime.fromisoformat(self.launch.grant.expires_at.replace('Z','+00:00')).timestamp()),
+            self_observation_mode=(self.proof["self_observation"]["mode"] if self.proof["schema_version"] == "herdr-policy-bootstrap-3" else None))
         self.authority.register(expectation)
         self._thread = threading.Thread(target=self._serve, name="herdr-host-bootstrap", daemon=True)
         self._thread.start()
@@ -312,9 +352,13 @@ class HostBootstrap:
                  and (self.launch._published_bootstrap_receipt is receipt
                       or self.authority.continuation(self.launch.identity) is receipt),
                  "host-authenticated continuation receipt required")
-        return {"continuation": receipt.to_json(),
+        result = {"continuation": receipt.to_json(),
                 "bootstrap_tree": {"device": self.tree.device, "inode": self.tree.inode,
                                    "source_digest": self.tree.source_digest}}
+        if self.proof["schema_version"] == "herdr-policy-bootstrap-3":
+            from .bootstrap_self_observation import validate_mode
+            result["self_observation"] = validate_mode(self.proof["self_observation"])
+        return json.loads(canonical_json_bytes(result))
 
     def cleanup_after_pane_closed(self):
         from .policy_launch import _finish_cleanup
@@ -368,16 +412,19 @@ def retained_bootstrap_proof(evidence, identity, raw):
     from .policy_launch import CODE_TARGET
     actual=json.loads(raw)
     version=actual.get("schema_version") if isinstance(actual,dict) else None
-    _require(version in {"herdr-policy-bootstrap-1","herdr-policy-bootstrap-2"},
+    _require(version in {"herdr-policy-bootstrap-1","herdr-policy-bootstrap-2","herdr-policy-bootstrap-3"},
              "retained bootstrap version unsupported")
-    approved=evidence.get("approved_profile") if version=="herdr-policy-bootstrap-2" else None
-    _require(version!="herdr-policy-bootstrap-2" or approved is not None,
+    approved=evidence.get("approved_profile") if version in {"herdr-policy-bootstrap-2","herdr-policy-bootstrap-3"} else None
+    observation=evidence.get("bootstrap", {}).get("self_observation")
+    _require((version == "herdr-policy-bootstrap-3") == (observation is not None),
+             "retained bootstrap observation mode changed")
+    _require(version=="herdr-policy-bootstrap-1" or approved is not None,
              "retained bootstrap profile unavailable")
     # Historical private v1 remains readable, but cannot authorize the new SDK policy.
     expected_proof=bootstrap_proof(identity,{
         path:{**node,"source_digest":evidence["code_sha256"] if path==str(CODE_TARGET)
               else evidence["runtime_sha256"][path],"snapshot_kind":"host-frozen-copy"}
-        for path,node in evidence["tree_identities"].items()},approved_profile=approved)
+        for path,node in evidence["tree_identities"].items()},approved_profile=approved, self_observation=observation)
     _require(raw==canonical_json_bytes(expected_proof), "retained bootstrap profile/identity mismatch")
     return expected_proof
 

@@ -253,3 +253,25 @@ def test_runtime_mutation_denies_control_entries_added_after_bootstrap(tmp_path,
         assert not (tmp_path / "escaped").exists()
     finally:
         authority.close()
+
+
+def test_exact_file_pin_writes_in_place_while_parent_directory_is_not_writable(tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip('unprivileged directory permission component test')
+    root = tmp_path / 'root'; root.mkdir()
+    own = root / 'own.py'; own.write_text('before'); own.chmod(0o600)
+    child = root / 'child'; child.mkdir(); child.chmod(0o500)
+    authority = RootFDWorkspace((str(root), str(own)))
+    original = own.stat().st_ino
+    root.chmod(0o500)
+    try:
+        authority.write_text(str(own), 'after')
+        assert own.read_text() == 'after' and own.stat().st_ino == original
+        assert authority.read_text(str(own)) == 'after'
+        with pytest.raises((OSError, FileAuthorityError)):
+            authority.write_text(str(root / 'foreign.py'), 'denied')
+        with pytest.raises((OSError, FileAuthorityError)):
+            authority.write_text(str(child / 'foreign.py'), 'denied')
+        assert not (root / 'foreign.py').exists() and not (child / 'foreign.py').exists()
+    finally:
+        authority.close(); root.chmod(0o700); child.chmod(0o700)

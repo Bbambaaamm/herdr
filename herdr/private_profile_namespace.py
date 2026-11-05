@@ -160,11 +160,17 @@ class PrivateSDKPolicy:
     profile_name: str
     profile_sha256: str
     config_sha256: str
+    auth_sha256: str | None = None
+    projection_sha256: str | None = None
 
     def __post_init__(self):
         _need(isinstance(self.profile_name, str) and bool(_PROFILE.fullmatch(self.profile_name))
               and all(isinstance(x, str) and bool(_HEX.fullmatch(x))
                       for x in (self.profile_sha256, self.config_sha256)), "private_sdk_policy_invalid")
+        _need(self.auth_sha256 is None or (type(self.auth_sha256) is str and bool(_HEX.fullmatch(self.auth_sha256))),
+              "private_sdk_auth_hash_invalid")
+        _need(self.projection_sha256 is None or (type(self.projection_sha256) is str
+              and bool(_HEX.fullmatch(self.projection_sha256))), "private_sdk_projection_hash_invalid")
 
     @property
     def profile_home(self):
@@ -198,7 +204,35 @@ class PrivateSDKPolicy:
             os.close(fd)
 
 
-def private_sdk_policy(approved_profile, policy_raw: bytes, config_raw: bytes) -> PrivateSDKPolicy:
+    def read_auth_store(self):
+        """Return only bytes bound to this profile's authenticated auth member."""
+        _need(self.auth_sha256 is not None, "private_sdk_auth_manifest_required")
+        self.reassert()
+        self.verify_config_path(self.profile_home / "config.yaml")
+        fd = os.open(_HOME, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            member = _open_beneath(fd, ".hermes/profiles/" + self.profile_name + "/auth.json")
+            try:
+                before = os.fstat(member)
+                _need(stat.S_ISREG(before.st_mode) and 0 < before.st_size <= _MAX_FILE_BYTES,
+                      "private_sdk_auth_invalid")
+                raw = os.pread(member, before.st_size + 1, 0)
+                after = os.fstat(member)
+                fields = ("st_dev", "st_ino", "st_uid", "st_gid", "st_mode", "st_nlink",
+                          "st_size", "st_mtime_ns", "st_ctime_ns")
+                _need(all(getattr(before, key) == getattr(after, key) for key in fields)
+                      and len(raw) == before.st_size
+                      and hashlib.sha256(raw).hexdigest() == self.auth_sha256,
+                      "private_sdk_auth_changed")
+            finally:
+                os.close(member)
+        finally:
+            os.close(fd)
+        return _closed_json(raw, "private_sdk_auth_invalid")
+
+
+def private_sdk_policy(approved_profile, policy_raw: bytes, config_raw: bytes, *,
+                       credentialless: bool = False) -> PrivateSDKPolicy:
     approved = verified_profile_identity(approved_profile)
     files = approved["files"]
     _need(SDK_POLICY_MEMBER in files and "config.yaml" in files
@@ -213,7 +247,11 @@ def private_sdk_policy(approved_profile, policy_raw: bytes, config_raw: bytes) -
     config = _closed_json(config_raw, "private_sdk_config_json_required")
     _need(all(key in config and type(config[key]) is list and not config[key]
               for key in ("fallback_providers", "fallback_model")), "private_sdk_fallback_not_empty")
-    return PrivateSDKPolicy(approved["name"], approved["manifest_sha256"], files["config.yaml"])
+    projected = profile_identity(approved["name"],
+                                 {name: digest for name, digest in files.items() if name != "auth.json"})
+    return PrivateSDKPolicy(approved["name"], approved["manifest_sha256"], files["config.yaml"],
+                            None if credentialless else files.get("auth.json"),
+                            projected["manifest_sha256"] if credentialless else None)
 
 
 @dataclass
@@ -312,6 +350,52 @@ class PrivateProfileSnapshot:
     def destination(self) -> Path:
         return self.home / ".hermes/profiles" / self.name
 
+    @property
+    def sdk_files(self) -> tuple[SealedProfileInput, ...]:
+        """Only the reviewed credentialless projection may cross the FD launcher.
+
+        The complete sealed snapshot, including auth.json, stays on the host for
+        host_model_transport.  An .env or an unclassified extra member cannot be
+        treated as harmless merely because its mount would be read only.
+        """
+        self.verify()
+        by_name = {item.relative: item for item in self.files}
+        _need("auth.json" in by_name, "host_credential_snapshot_required")
+        _need(set(by_name) <= {"auth.json", "config.yaml", ".env", SDK_POLICY_MEMBER},
+              "unclassified_sdk_profile_member")
+        _need(by_name[".env"].size == 0, "credential_bearing_sdk_environment_denied")
+        config = os.pread(by_name["config.yaml"].fd, by_name["config.yaml"].size, 0)
+        try:
+            parsed = _closed_json(config, "credential_bearing_sdk_config_denied")
+            auth = by_name["auth.json"]
+            secret_store = _closed_json(os.pread(auth.fd, auth.size, 0),
+                                        "host_credential_snapshot_invalid")
+            keys = {"api_key", "access_token", "refresh_token", "agent_key", "password",
+                    "secret", "client_secret", "authorization", "bearer", "token"}
+            secrets = set()
+            def inspect(value, *, protected=False):
+                if type(value) is dict:
+                    for key, member in value.items():
+                        _need(type(key) is str, "credential_bearing_sdk_config_denied")
+                        normalized = key.lower().replace("-", "_")
+                        selected = (normalized in keys or normalized.endswith(("_api_key", "_access_token",
+                            "_refresh_token", "_agent_key", "_password", "_secret", "_authorization")))
+                        if protected and selected:
+                            _need(member in (None, ""), "credential_bearing_sdk_config_denied")
+                        if not protected and selected and type(member) is str and member:
+                            secrets.add(member)
+                        inspect(member, protected=protected)
+                elif type(value) is list:
+                    for member in value:
+                        inspect(member, protected=protected)
+            inspect(parsed, protected=True)
+            inspect(secret_store)
+            _need(all(secret.encode() not in config for secret in secrets),
+                  "host_secret_repeated_in_sdk_config")
+        except (UnicodeError, ValueError, TypeError):
+            raise PrivateProfileError("credential_bearing_sdk_config_denied") from None
+        return tuple(item for item in self.files if item.relative != "auth.json")
+
     def fd_descriptors(self) -> list[dict[str, str | int]]:
         """Typed descriptor metadata for the host-pinned bwrap FD launcher.
 
@@ -320,7 +404,7 @@ class PrivateProfileSnapshot:
         """
         self.verify()
         result: list[dict[str, str | int]] = []
-        for record in self.files:
+        for record in self.sdk_files:
             info = os.fstat(record.fd)
             result.append({
                 "source": f"/proc/{os.getpid()}/fd/{record.fd}",
@@ -352,7 +436,7 @@ class PrivateProfileSnapshot:
             self.destination,
         ]
         dirs = [*roots, *(self.destination / name for name in _INITIALIZATION)]
-        for file in self.files:
+        for file in self.sdk_files:
             parts = _relative(file.relative)
             for index in range(1, len(parts)):
                 folder = self.destination.joinpath(*parts[:index])
@@ -361,7 +445,7 @@ class PrivateProfileSnapshot:
         args = ["--tmpfs", str(self.home)]
         for path in dirs:
             args.extend(["--dir", str(path)])
-        for file in self.files:
+        for file in self.sdk_files:
             args.extend([
                 "--ro-bind-data", str(file.fd), str(self.destination/file.relative),
             ])

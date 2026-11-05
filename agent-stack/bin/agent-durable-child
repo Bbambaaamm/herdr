@@ -14,7 +14,7 @@ from contextlib import closing
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from herdr.runtime import (MAX_PROMPT_CHARS, AdmissionRegistry, HerdrChildRuntime, HerdrRuntimeError,
                            PreDeliveryFailure,
-                           SubprocessHerdrRunner, _json_result)
+                           SubprocessHerdrRunner, _json_result, _managed_prompt_transport)
 from herdr.scheduler import (AuditLog, ChildProposal, DenyDecision,
                              DynamicChildScheduler, SchedulerError)
 from herdr.taskgraph import LifecycleState
@@ -38,13 +38,16 @@ def _delivery_prompt(prompt, result_path, child_id, run_token, fencing_token,
             "Submission is candidate evidence; the shared host gate decides acceptance.")
 
 
-def _validate_delivery_prompt(prompt, directory, child_id, *, parent_task_id="", run_token=""):
+def _validate_delivery_prompt(prompt, directory, child_id, *, parent_task_id="", run_token="",
+                              modern=False):
     """Bound the complete prompt before the attempt directory can be created.
 
     A replayed ledger may start at a higher fencing token. At most 256 nodes
     can be admitted, so account for every remaining claim before taking the
     parent lock; another bridge request may claim while this one waits.
     """
+    if not isinstance(prompt, str) or not prompt or len(prompt) > MAX_PROMPT_CHARS:
+        raise ValueError("managed child business prompt exceeds maximum length")
     ledger = directory / "scheduler.jsonl"
     scheduler = DynamicChildScheduler(audit_log=AuditLog(ledger))
     pending = (bool(parent_task_id and run_token) and
@@ -68,7 +71,9 @@ def _validate_delivery_prompt(prompt, directory, child_id, *, parent_task_id="",
         fence = scheduler._next_fencing_token_value + scheduler.budget.max_dag_nodes
     result_path = directory / "results" / f"{child_id}.result.json"
     preview = _delivery_prompt(prompt, result_path, child_id, token, fence, key)
-    if len(preview) > MAX_PROMPT_CHARS:
+    if modern:
+        _managed_prompt_transport(preview, modern=True)
+    elif len(preview) > MAX_PROMPT_CHARS:
         raise ValueError("managed child prompt exceeds maximum length")
 
 
@@ -244,6 +249,12 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
         raise ValueError("invalid delegation key")
     if not args.objective.strip() or not args.prompt.strip():
         raise ValueError("objective and prompt required")
+    if len(args.prompt) > MAX_PROMPT_CHARS:
+        raise ValueError("managed child business prompt exceeds maximum length")
+    from herdr.child_evidence import ChildCompletionAuthority
+    modern_catalogue = (isinstance(completion_authority, ChildCompletionAuthority)
+        and isinstance(completion_authority.work_contracts, dict)
+        and completion_authority.work_contracts.get("version") in (2, 3))
     state_root = Path(_required_env("HERDR_DURABLE_TASK_FILE")).resolve(strict=True).parent.parent
     directory = attempt_directory(state_root, parent_id, token)
     predicted_id = (f"{parent_id}-child-"
@@ -266,7 +277,8 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
         from herdr.ownership_release import HostOwnershipRelease
         ownership_registry = OwnershipRegistry(state_root, verify_legacy=LegacyOwnershipInventory(state_root),
                                                 verify_release=HostOwnershipRelease(state_root))
-    _validate_delivery_prompt(args.prompt, directory, predicted_id, parent_task_id=parent_id, run_token=token)
+    _validate_delivery_prompt(args.prompt, directory, predicted_id, parent_task_id=parent_id,
+                              run_token=token, modern=modern_catalogue)
     with parent_attempt_guard(state_root, parent_id, token):
         # Recheck while holding the same lock as parent terminalization.
         current = json.loads(Path(_required_env("HERDR_DURABLE_TASK_FILE")).read_text(
@@ -295,8 +307,11 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
                  scheduler._next_fencing_token_value + (parent_id not in scheduler._tasks))
         token_preview = (existing.run_token if existing is not None else None) or "x" * 32
         key_preview = (existing.idempotency_key if existing is not None else None) or "x" * 64
-        if len(_delivery_prompt(args.prompt, result_path, predicted_id,
-                                token_preview, fence, key_preview)) > MAX_PROMPT_CHARS:
+        preview = _delivery_prompt(args.prompt, result_path, predicted_id,
+                                   token_preview, fence, key_preview)
+        if modern_catalogue:
+            _managed_prompt_transport(preview, modern=True)
+        elif len(preview) > MAX_PROMPT_CHARS:
             raise ValueError("managed child prompt exceeds maximum length")
         parent_result = state_root / "results" / f"{parent_id}.json"
         published = False
@@ -385,7 +400,9 @@ def _delegate_pinned(args, runner, real, task, pane, agent, marker, pinned, poli
                 raise SchedulerError("host child completion authority invalid")
             authority.prepare(rec)
             delivery_prompt+=authority.instructions(rec)
-        if len(delivery_prompt) > MAX_PROMPT_CHARS:
+        if isinstance(authority, ChildCompletionAuthority) and authority.modern_work(rec):
+            _managed_prompt_transport(delivery_prompt, modern=True)
+        elif len(delivery_prompt) > MAX_PROMPT_CHARS:
             raise ValueError("managed child prompt exceeds maximum length")
         scheduler.bind_child_prompt(child.id, delivery_prompt)
         # Only the call that made the durable claim may deliver. A replayed

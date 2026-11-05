@@ -17,6 +17,7 @@ from .work_contract_host import HostWorkContractFactory
 from .work_cycle import FileScope, ValidationCheck, WorkPlan, WorkMode, require, tree_snapshot, relative, python_symbols
 from .policy_launch import _open_relative
 from .work_planning import DiscoveryRecord, PlanArtifact, bounded, closed, sha, strings
+from .taskgraph import _thaw_json
 
 
 def definition_target(spec_sha256, definition):
@@ -52,6 +53,40 @@ def _private_directory(path, *, base=None):
             validate(fd)
     finally:
         os.close(fd)
+
+
+def _runtime_scratch(raw, workspace, writable_roots):
+    """Host-only physical copy roots; never authority, task or model data."""
+    catalogue = raw.get("work_contracts")
+    if not isinstance(catalogue, dict) or "runtime_scratch" not in catalogue:
+        return {}
+    scratch = closed(catalogue["runtime_scratch"], ("check_storage", "commit_storage"), "host runtime scratch")
+    result = {}
+    for name, value in scratch.items():
+        require(isinstance(value, str) and value, "absolute host runtime scratch required")
+        path = Path(value)
+        _private_directory(path)
+        require(not path.is_relative_to(workspace) and not any(
+            path.is_relative_to(Path(root).resolve()) for root in writable_roots),
+            "work runtime scratch is worker writable")
+        result[name] = path
+    return result
+
+
+def _admitted_scratch(admitted):
+    names = {"version", "identity", "spec_sha256", "definition", "environment"}
+    if isinstance(admitted, dict) and "runtime_scratch" in admitted:
+        names.add("runtime_scratch")
+    if isinstance(admitted,dict) and "derived_parent_admission_sha256" in admitted:
+        names.add("derived_parent_admission_sha256")
+        sha(admitted["derived_parent_admission_sha256"],"original derived parent admission")
+    closed(admitted, (names) | ({"managed_children"} if "managed_children" in admitted else set()), "work admission")
+    if "runtime_scratch" not in admitted:
+        return {}
+    scratch = closed(admitted["runtime_scratch"], ("check_storage", "commit_storage"), "original host runtime scratch")
+    require(all(isinstance(value, str) and Path(value).is_absolute() for value in scratch.values()),
+            "original host runtime scratch invalid")
+    return scratch
 
 
 def _audit(path):
@@ -169,6 +204,62 @@ def inspect_discovery(workspace, paths, snapshot):
         return {"symbols": symbols, "facts": facts, "unknowns": unknowns}
     finally:
         os.close(directory)
+
+
+def _work_catalogue(raw):
+    """Keep catalogue field inventory shared across selection and admission."""
+    catalogue = raw.get("work_contracts")
+    names = {"version", "environment", "plans", "review_records"}
+    if isinstance(catalogue, dict) and "runtime_scratch" in catalogue:
+        names.add("runtime_scratch")
+    return closed(catalogue, names, "host work catalogue")
+
+
+def _completion_base_selection(root, task, raw, definition):
+    """Validate a protected base choice; task data never supplies its ref or hash."""
+    import re
+    require(all(type(task.get(key)) is int and task[key] == 1 for key in
+                ("completion_base_version", "work_contract_version", "work_budget_version")),
+            "reviewed completion base requires versioned work and budget contracts")
+    root = Path(root)
+    require(root.is_absolute() and root.resolve(strict=True) == root
+            and Path(raw["task_store_root"]) == root,
+            "reviewed completion task store differs from host configuration")
+    require(isinstance(definition, dict), "approved completion definition required")
+    selected = closed(definition.get("completion_base"), ("version", "remote_ref"),
+                      "approved completion base")
+    require(type(selected["version"]) is int and selected["version"] == 1,
+            "approved completion base version unsupported")
+    ref = selected["remote_ref"]
+    prefix = "refs/remotes/origin/"
+    require(isinstance(ref, str) and ref.startswith(prefix) and len(ref) <= 512,
+            "canonical reviewed origin ref required")
+    branch = ref[len(prefix):]
+    from .evidence import valid_completion_base_branch
+    require(valid_completion_base_branch(branch), "canonical reviewed origin ref required")
+    base = definition.get("base_sha")
+    require(isinstance(base, str) and re.fullmatch(r"[0-9a-f]{40}", base) is not None,
+            "exact reviewed completion commit required")
+    return ref, base
+
+
+def approved_completion_base(root, task, *, configuration_path=HOST_POLICY_CONFIG):
+    """Select an explicitly approved base from the protected exact-spec catalogue."""
+    from agent_completion_evidence import spec_digest
+    raw = _read_configuration(configuration_path)
+    catalogue = _work_catalogue(raw)
+    require(type(catalogue["version"]) is int and catalogue["version"] == 1,
+            "host work catalogue version unsupported")
+    plans = catalogue["plans"]
+    require(isinstance(plans, dict) and 1 <= len(plans) <= 16,
+            "bounded approved work plans required")
+    definition = plans.get(spec_digest(task))
+    require(isinstance(definition, dict), "exact work spec is not host approved")
+    selected = _completion_base_selection(root, task, raw, definition)
+    # Completion preparation must validate the same graph as work admission.
+    # A model change also changes its reviewed hash; never repair it here.
+    _reviewed_graph(definition, task)
+    return selected
 
 
 def _reviewed_graph(definition, task):
@@ -307,12 +398,64 @@ def _original_work_admission(root, task, configuration_path):
     require(not storage.is_relative_to(workspace), "work authority is worker writable")
     store = EvidenceStore(storage / "admission"); store.protect_from((workspace,))
     admitted = store.read("plan", digest(binding(task)))
-    closed(admitted, ("version", "identity", "spec_sha256", "definition", "environment"), "work admission")
+    _admitted_scratch(admitted)
     require(type(admitted["version"]) is int and admitted["version"] == 1
             and admitted["identity"] == binding(task) and admitted["spec_sha256"] == spec_digest(task),
             "original work admission binding changed")
+    if "managed_children" in admitted or "managed_children" in admitted["definition"]:
+        from .claimed_child_contracts import retained
+        retained(admitted,task)
     require(raw == _read_configuration(configuration_path), "host configuration changed during graph read")
     return storage, admitted
+
+
+def original_derived_children(root, task, *, identity=None, configuration_path=HOST_POLICY_CONFIG):
+    """Read only the original protected per-claim parent admission."""
+    _, admitted = _original_work_admission(root, task, configuration_path)
+    if admitted is None:return None
+    from .claimed_child_contracts import retained
+    return retained(admitted,task,identity=identity)
+
+
+def _derived_child_definition(root, task, spec_hash, configuration_path, *, optional=False, recovery=False):
+    from .host_configuration import read_canonical_parent
+    from .child_ownership import ChildOwnership
+    from .child_evidence import child_scope_spec
+    marker_name="derived_parent_admission_sha256"
+    marker_present=marker_name in task
+    marker=task.get(marker_name)
+    require(not marker_present or isinstance(marker,str) and len(marker)==64
+            and set(marker)<=set("0123456789abcdef"), "derived parent binding malformed")
+    parent_id, parent_run = task.get("parent_task_id"), task.get("parent_run_token")
+    if not isinstance(parent_id,str) or not isinstance(parent_run,str):
+        require(optional and not marker_present,"original derived child parent unavailable")
+        return None,None
+    if recovery:
+        from .canonical_case_claim import read_replay_task
+        parent=read_replay_task(root,parent_id,parent_run)
+    else:
+        parent=read_canonical_parent(root,parent_id,parent_run)
+    if parent is None:
+        require(optional and not marker_present,"original derived child parent unavailable")
+        return None,None
+    _, admitted=_original_work_admission(root,parent,configuration_path)
+    if admitted is None:
+        require(optional and not marker_present,"original derived child admission unavailable")
+        return None,None
+    from .claimed_child_contracts import retained
+    original=retained(admitted,parent)
+    if original is None:
+        require(optional and not marker_present,"original derived child admission unavailable")
+        return None,None
+    require(marker_present and marker==digest(original),"original derived parent binding missing or changed")
+    require(spec_hash in original["children"], "child definition is not in the original parent admission")
+    row=original["children"][spec_hash]
+    ownership=ChildOwnership.from_json(task.get("ownership"))
+    require(child_scope_spec(task,ownership)==spec_hash and ownership.hash==row["ownership_sha256"]
+            and task.get("delegation_key")==row["key"] and task.get("model_policy")==row["model_policy"]
+            and task.get("workspace")==row["scope"]["worktree_identity"].rsplit("|",1)[0],
+            "child work differs from original derived declaration")
+    return copy.deepcopy(row["work_definition"]),copy.deepcopy(admitted["environment"])
 
 
 def reviewed_parent_admission(root, task, *, grant, evidence=None, configuration_path=HOST_POLICY_CONFIG):
@@ -398,7 +541,7 @@ def bind_reviewed_parent(factory, task, launch, *, evidence=None, recheck=False)
         return parent
 
 
-def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG, git=None, recovery=False, spec_sha256=None):
+def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG, git=None, recovery=False, spec_sha256=None, claimed_identity=None):
     """Only standalone host code selects the protected configuration path."""
     from agent_completion_evidence import spec_digest
     if "work_budget_version" in task:
@@ -414,6 +557,7 @@ def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG
     sha(spec_hash, "exact host work specification")
     workspace = Path(task.get("workspace", ""))
     require(workspace.is_absolute() and workspace.resolve() == workspace, "canonical worktree required")
+    scratch = _runtime_scratch(raw, workspace, policy_factory.writable_roots)
     storage = Path(raw["storage"]) / "work-contracts" / digest(binding(task))
     for writable in policy_factory.writable_roots:
         require(not storage.is_relative_to(Path(writable).resolve()), "work authority is worker writable")
@@ -426,35 +570,62 @@ def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG
     store = EvidenceStore(storage / "admission"); store.protect_from((workspace,))
     if recovery:
         admitted = store.read("plan", digest(binding(task)))
-        closed(admitted, ("version", "identity", "spec_sha256", "definition", "environment"), "work admission")
+        original_scratch = _admitted_scratch(admitted)
+        require(original_scratch == {name: str(path) for name, path in scratch.items()},
+                "original work runtime scratch changed")
         require(type(admitted["version"]) is int and admitted["version"] == 1
                 and admitted["identity"] == binding(task) and admitted["spec_sha256"] == spec_hash,
                 "original work admission binding changed")
         definition = admitted["definition"]
+        marker="derived_parent_admission_sha256"
+        if marker in admitted:
+            require(task.get(marker)==admitted[marker],"original derived child binding missing or changed")
+        if task.get("parent_task_id") is not None or marker in task or marker in admitted:
+            original_definition, original_environment = _derived_child_definition(
+                root,task,spec_hash,configuration_path,optional=marker not in admitted,recovery=True)
+            require(original_definition is None or marker in admitted
+                    and definition==original_definition and admitted["environment"]==original_environment,
+                    "recovered child differs from original parent admission")
         environment = CheckEnvironment(**admitted["environment"])
         catalogue = None
     else:
         require(workspace.resolve(strict=True) == workspace, "canonical worktree required")
-        catalogue = closed(raw.get("work_contracts"), ("version", "environment", "plans", "review_records"), "host work catalogue")
+        catalogue = _work_catalogue(raw)
         require(type(catalogue["version"]) is int and catalogue["version"] == 1,
                 "host work catalogue version unsupported")
         plans = catalogue["plans"]
         require(isinstance(plans, dict) and 1 <= len(plans) <= 16
                 and all(isinstance(key, str) and len(key) == 64 for key in plans)
-                and spec_hash in plans, "exact work spec is not host approved")
-        bounded(plans[spec_hash])
-        definition = copy.deepcopy(plans[spec_hash])
+                , "exact work catalogue is not host approved")
+        definition=selected_environment=None
+        if task.get("parent_task_id") is not None or "derived_parent_admission_sha256" in task:
+            definition, selected_environment = _derived_child_definition(
+                root,task,spec_hash,configuration_path,optional=True)
+        if definition is not None:
+            require(spec_hash not in plans,"original derived child collides with current static catalogue")
+        else:
+            require(spec_hash in plans,"exact work spec is not host approved")
+            definition = copy.deepcopy(plans[spec_hash])
+        bounded(definition)
         require(isinstance(catalogue["environment"], dict), "approved check environment required")
+        require(selected_environment is None or catalogue["environment"]==selected_environment,
+                "derived child check environment changed")
         environment = CheckEnvironment(**catalogue["environment"])
         require(isinstance(catalogue["review_records"], dict) and len(catalogue["review_records"]) <= 64,
                 "bounded prebuild review sources required")
         admitted = {"version": 1, "identity": binding(task), "spec_sha256": spec_hash,
                     "definition": definition, "environment": catalogue["environment"]}
+        if selected_environment is not None:
+            admitted["derived_parent_admission_sha256"]=task["derived_parent_admission_sha256"]
+        if scratch:
+            admitted["runtime_scratch"] = {name: str(path) for name, path in scratch.items()}
     bounded(definition)
+    if "completion_base" in definition or "completion_base_version" in task:
+        _completion_base_selection(root, task, raw, definition)
     names = {"spec_version", "policy_version", "base_sha", "files", "criteria", "checks",
              "budget_reference", "mode", "baseline_omission_reason", "phases", "prerequisite_commits",
              "purpose", "baseline_policy", "discovery_files", "planning"}
-    closed(definition, names | ({"hygiene"} if "hygiene" in definition else set()) | ({"budget"} if "budget" in definition else set()) | ({"reviewed_graph"} if "reviewed_graph" in definition else set()), "approved work definition")
+    closed(definition, (names | ({"hygiene"} if "hygiene" in definition else set()) | ({"budget"} if "budget" in definition else set()) | ({"reviewed_graph"} if "reviewed_graph" in definition else set()) | ({"managed_children"} if "managed_children" in definition else set())) | ({"completion_base"} if "completion_base" in definition else set()), "approved work definition")
     hygiene = None
     if "hygiene" in definition:
         from .work_hygiene import LocalCommitPolicy
@@ -464,8 +635,18 @@ def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG
     base = (task.get("completion_plan") or {}).get("base_sha")
     require(base == definition["base_sha"], "work base differs from frozen completion plan")
     graph = _reviewed_graph(definition, task)
+    from .claimed_child_contracts import derive, retained
+    if recovery:
+        retained(admitted,task)
+    elif "managed_children" in definition:
+        admitted["managed_children"]=derive(definition,task,claimed_identity)
+        require(not set(admitted["managed_children"]["children"]) & set(catalogue["plans"]),
+                "derived child namespace overlaps a static host work specification")
     if not recovery:
         store.publish("plan", digest(binding(task)), admitted)
+    if not recovery and "managed_children" in admitted:
+        from agent_completion_evidence import freeze_derived_child_contracts
+        freeze_derived_child_contracts(root,task,admitted)
     if graph is not None:
         _graph_admission(storage, graph, create=not recovery)
 
@@ -474,11 +655,18 @@ def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG
         require(spec_sha256 == spec_hash and identity.task_id == task["id"]
                 and identity.run_token == task["run_token"] and identity.fencing_token == task["fencing_token"],
                 "work identity differs from approved parent")
+        _runtime_scratch(raw, workspace, grant.runtime_assurance.writable_roots)
+        if "managed_children" in admitted:
+            retained(admitted,task,identity=identity)
         require_prebuild_review(catalogue, definition, spec_sha256,
                                 tuple(Path(path) for path in grant.runtime_assurance.writable_roots), identity)
         inspected = strings(definition["discovery_files"], "targeted discovery files",
                             maximum=128, width=1024, empty=False)
-        snapshot = tree_snapshot(workspace, git=git)
+        from .work_cycle import SnapshotPartition
+        partition = None
+        if "managed_children" in admitted:
+            partition = SnapshotPartition.capture(admitted, task, identity, factory.workspace_pin, grant)
+        snapshot = tree_snapshot(workspace, git=git, **({"partition": partition} if partition is not None else {}))
         require(set(inspected) <= set(snapshot), "required discovery source is missing")
         observed = inspect_discovery(workspace, inspected, snapshot)
         discovery = DiscoveryRecord({
@@ -493,18 +681,28 @@ def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG
                 "host fills actual planning identity and discovery")
         planning.update(version=1, identity=identity.to_json(), spec_sha256=spec_sha256,
                         base_sha=definition["base_sha"], discovery=discovery.to_json())
-        data = {key: value for key, value in definition.items() if key not in {"discovery_files", "planning", "hygiene", "budget", "reviewed_graph"}}
+        data = {key: value for key, value in definition.items() if key not in {'discovery_files', 'planning', 'hygiene', 'budget', 'reviewed_graph', 'managed_children', 'completion_base'}}
         data["mode"] = WorkMode(data["mode"])
         data["files"] = tuple(FileScope(**item) for item in data["files"])
         data["checks"] = tuple(ValidationCheck(**item) for item in data["checks"])
+        seal_hash = None
+        if "derived_parent_admission_sha256" in task:
+            seals = [e for e in factory.audit_log.replay() if e.get("event") == "host_delegated_write_sealed"
+                     and e.get("identity") == identity.to_json()]
+            require(len(seals) == 1 and seals[0]["grant_sha256"] == grant.hash
+                    and seals[0]["spec_sha256"] == spec_sha256, "original delegated seal audit missing or changed")
+            seal_hash = digest(seals[0])
         plan = WorkPlan(**data, identity=identity, spec_sha256=spec_sha256,
             grant_sha256=grant.hash, environment_sha256=environment.hash, planning=PlanArtifact(planning),
-            hygiene_sha256=None if hygiene is None else hygiene.hash)
+            hygiene_sha256=None if hygiene is None else hygiene.hash, delegated_seal_sha256=seal_hash,
+            snapshot_partition=partition)
         plan.planning.require_binding(plan, grant)
         return plan
 
     factory = HostWorkContractFactory(approve=approve, environment=environment,
-                                      storage=storage / "checks", audit_log=_audit(storage / "events.jsonl"), git=git)
+                                      storage=storage / "checks", audit_log=_audit(storage / "events.jsonl"), git=git,
+                                      check_storage=scratch.get("check_storage"),
+                                      commit_runtime_storage=scratch.get("commit_storage"))
     if "budget" in definition:
         from .work_budget_configuration import bind_budget
         bind_budget(factory,definition["budget"],storage=Path(raw["storage"]),
@@ -512,6 +710,10 @@ def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG
     require(task.get("work_budget_version") != 1 or factory.budget_authority is not None,
             "new coding work has no cumulative host budget")
     factory.host_admission = admitted
+    # Canonical child tasks can contain recursively frozen graph fields.  The
+    # host stores a detached JSON value for replay; deepcopy cannot serialize
+    # MappingProxyType and must not mutate the graph's immutable originals.
+    factory.host_task = _thaw_json(task)
     factory.local_commit_policy = hygiene
     checks=tuple(ValidationCheck(**item) for item in definition["checks"])
     factory.baseline_wall_seconds=sum(check.timeout_seconds+13 for check in checks)+120
@@ -571,7 +773,8 @@ def bind_root_handoff(factory, task, launch, cycle):
     commit_storage = factory.storage.parent / "commits"
     _private_directory(commit_storage, base=factory.storage.parent)
     committer = HostLocalCommitter(policy, commit_storage, draft, completion_plan=plan,
-                                  workspace_identity=workspace_identity)
+                                  workspace_identity=workspace_identity,
+                                  runtime_storage=getattr(factory, "commit_runtime_storage", None))
     port = HostWorkHandoff(identity=cycle.plan.identity, task=task, completion_plan=plan,
                           store=factory.result_authority.store, slot=rule.result_slot, committer=committer)
     factory.result_authority.store.publish("plan", digest({"type":"work-handoff-binding", "identity":cycle.plan.identity.to_json()}),
@@ -599,7 +802,8 @@ def recover_host_handoff(factory, task, cycle, completion_plan):
             and record["completion_plan_hash"] == completion_plan["plan_hash"],
             "original handoff binding changed")
     committer = HostLocalCommitter(factory.local_commit_policy, factory.storage.parent/"commits",
-        ArtifactRef(**record["draft"]), completion_plan=completion_plan, workspace_identity=record["workspace_identity"])
+        ArtifactRef(**record["draft"]), completion_plan=completion_plan, workspace_identity=record["workspace_identity"],
+        runtime_storage=getattr(factory, "commit_runtime_storage", None))
     port = HostWorkHandoff(identity=cycle.plan.identity, task=task, completion_plan=completion_plan,
         store=factory.result_authority.store, slot=ResultSlot.from_dict(record["slot"]), committer=committer)
     port.budget_authority=factory.budget_authority
@@ -610,6 +814,7 @@ def recover_host_handoff(factory, task, cycle, completion_plan):
 
 def preflight_handoff(factory, launch, completion_plan, *, require_slot=True):
     from .work_hygiene import LocalCommitPolicy
+    _bind_original_delegated_writes(factory, launch)
     require(completion_plan.get("kind") == "coding"
             and isinstance(getattr(factory, "local_commit_policy", None), LocalCommitPolicy),
             "modern coding needs an approved local commit profile")
@@ -623,3 +828,94 @@ def preflight_handoff(factory, launch, completion_plan, *, require_slot=True):
             and set(rules["herdr_verify_work"].allowed_arg_keys) == {"request_id","handoff"}
             and (not require_slot or rules["herdr_submit_result"].result_slot is not None),
             "closed verification and immutable result capabilities required before baseline")
+
+
+def _bind_original_delegated_writes(factory, launch):
+    """Only original managed children opt into a separate host physical ceiling."""
+    task = getattr(factory, "host_task", {})
+    if "derived_parent_admission_sha256" not in task or launch._delegated_writes is not None:
+        return
+    from .security import DelegatedWriteAuthority
+    from .child_evidence import child_identity, child_spec, child_task
+    from .host_configuration import read_canonical_parent
+    from .private_mount_plan import PinnedLaunchPath
+    from .owned_write_mounts import OwnedWritePins, _mount_id
+    from agent_durable_children import attempt_directory, replay_host_scheduler
+    root, config = factory.task_store_root, factory.host_configuration_path
+    admitted = copy.deepcopy(factory.host_admission)
+    parent = read_canonical_parent(root, task["parent_task_id"], task["parent_run_token"])
+    require(parent is not None and launch._parent is not None, "live delegating parent required")
+    _, original = _original_work_admission(root, parent, config)
+    from .claimed_child_contracts import retained
+    derived = retained(original, parent, identity=launch._parent.identity)
+    spec = admitted["spec_sha256"]
+    require(derived is not None and task["derived_parent_admission_sha256"] == digest(derived)
+            and spec in derived["children"], "original delegated physical admission missing")
+    row = derived["children"][spec]
+    expected_mount = _mount_id(launch.mount.private_workspace_pin.fd)
+    evidence = {}
+    def revalidate(child, parent_grant):
+        from .taskgraph import LifecycleState
+        current = read_canonical_parent(root, task["parent_task_id"], task["parent_run_token"])
+        require(current is not None and not current["execution_session"].get("closed_at"),
+                "delegating parent is no longer live")
+        from .policy_launch import verify_retained_policy_evidence
+        session = current["execution_session"]
+        verified = verify_retained_policy_evidence(session["invocation_policy"],
+            identity=parent_grant.identity, pid=int(session["sandbox_pid"]),
+            attestation=session["sandbox_attestation"], require_bootstrap=True)
+        require(verified == parent_grant and parent_grant.is_active(), "delegating parent grant changed")
+        _, fresh = _original_work_admission(root, current, config)
+        require(canonical(fresh) == canonical(original), "original physical admission changed")
+        definition, environment = _derived_child_definition(root, task, spec, config)
+        require(definition == admitted["definition"] and environment == admitted["environment"],
+                "original delegated work definition changed")
+        ledger = attempt_directory(root, task["parent_task_id"], task["parent_run_token"]) / "scheduler.jsonl"
+        require((Path(root) / "child-ownership").is_dir(), "original ownership store unavailable")
+        scheduler = replay_host_scheduler(root, ledger)
+        rec = scheduler._tasks.get(child.identity.task_id)
+        require(rec is not None and rec.state is LifecycleState.RUNNING
+                and child_identity(rec) == child.identity and child_spec(rec) == spec
+                and binding(child_task(rec)) == binding(task)
+                and rec.delegation_key == row["key"] and rec.node.model_policy == row["model_policy"]
+                and rec.lease is not None and rec.lease.task_id == child.identity.task_id
+                and rec.lease.agent_id == child.identity.agent_id and rec.lease.fencing_token == child.identity.fencing_token
+                and rec.lease.lease_until > scheduler.current_time()
+                and rec.parent_run_token == task["parent_run_token"]
+                and rec.ownership.hash == row["ownership_sha256"], "delegated current claim changed")
+        scheduler._require_current_ownership(rec)
+        files = tuple(FileScope(**item) for item in definition["files"])
+        require(not child.process.enabled and files and not any(item.subtree for item in files)
+                and rec.ownership.write_scope and all(item.kind == "file" for item in rec.ownership.write_scope)
+                and {item.path for item in files} == {item.key for item in rec.ownership.write_scope},
+                "delegated finite existing file profile required")
+        logical, stamp = rec.worktree_identity.rsplit("|", 1)
+        require(logical == child.workspace_root, "delegated workspace changed")
+        with_pin = PinnedLaunchPath(Path(logical), directory=True, expected=tuple(map(int, stamp.split(":"))))
+        try:
+            require(_mount_id(with_pin.fd) == expected_mount, "delegated mount alias changed")
+            with OwnedWritePins(rec.ownership, with_pin) as pins:
+                require(canonical(pins.evidence()) == canonical(rec.owned_write_mounts),
+                        "delegated owned file inodes changed")
+                roots = pins.roots
+                rules = [rule for rule in child.tool_rules if rule.tool in {"write_file", "patch"}]
+                require(rules and all(set(rule.allowed_roots) == set(roots) for rule in rules),
+                        "delegated logical write scope changed")
+                evidence.update(worktree_identity=rec.worktree_identity,
+                                mount_id=expected_mount, owned_write_mounts=pins.evidence())
+                return roots
+        finally:
+            with_pin.close()
+    def record(child, parent_grant):
+        event = {"event": "host_delegated_write_sealed", "identity": child.identity.to_json(),
+                 "parent_grant_sha256": parent_grant.hash, "grant_sha256": child.hash,
+                 "admission_sha256": digest(original), "spec_sha256": spec,
+                 "ownership_sha256": row["ownership_sha256"], **evidence}
+        prior = [e for e in factory.audit_log.replay()
+                 if e.get("event") == event["event"] and e.get("identity") == event["identity"]]
+        require(not prior or prior == [event], "delegated seal audit changed")
+        if not prior:
+            factory.audit_log.append(event); factory.audit_log.flush()
+    roots = revalidate(launch.grant, launch._parent)
+    launch.bind_delegated_writes(DelegatedWriteAuthority(launch._parent.hash, launch.identity,
+        digest(original), spec, row["ownership_sha256"], roots, revalidate, record))

@@ -15,6 +15,12 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from herdr.recovery_unknown import held as terminal_unknown_hold, task_name
+from herdr.evidence import EvidenceError
+from herdr.context import SecretRedactor
+from herdr.autonomy_gate import disk_headroom_blocker
+
 HOME = Path("/home/agentops")
 ROOT = HOME / ".local/state/agent-stack/tasks"
 PENDING = ROOT / "pending"
@@ -46,6 +52,10 @@ _INTAKE_LOCK_OWNER = None
 
 class AdmissionDenied(RuntimeError):
     """Redacted denial; issue content never supplies execution authority."""
+
+
+class CapacityBlocked(AdmissionDenied):
+    """Capacity withholds admission without consuming its approval."""
 
 
 class ScanExpired(AdmissionDenied):
@@ -393,6 +403,8 @@ def _rename_exclusive(directory_fd, source, target):
 
 def publish_task(path, task, admission):
     # The dispatcher only sees a complete fsynced JSON, published without replace.
+    if terminal_unknown_hold(task):
+        raise AdmissionDenied("terminal_unknown_requires_operator_reconciliation")
     directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     temporary = None
     try:
@@ -435,6 +447,13 @@ def _scan_cursor(consumers):
     value["after_issue"] = {repo: issue for repo, issue in value["after_issue"].items() if repo in selected}
     return path, value
 
+def _reported_task_id(value):
+    identity = task_name(value)
+    if SecretRedactor().redact(identity, maximum=128) != identity:
+        raise EvidenceError("unsafe intake report identity")
+    return identity
+
+
 def _scan_issue(consumer, issue, indexed, previous):
     number = int(issue["number"])
     repo = consumer["repository"]
@@ -451,7 +470,26 @@ def _scan_issue(consumer, issue, indexed, previous):
         current.update(scheduler_state='blocked', blocker='intake-admission-reconciliation-required')
         return key, current
     if active:
-        current.update(scheduler_state="active", task_ids=[str(r["task"].get("id") or "") for r in active])
+        current["task_ids"] = []
+        for record in active:
+            try:
+                current["task_ids"].append(_reported_task_id(record["task"].get("id")))
+            except EvidenceError:
+                pass  # Retain the dedup barrier without publishing unsafe data.
+        if any(record["state"] in {"pending", "running"} for record in active):
+            current["scheduler_state"] = "active"
+        else:
+            # blocked/ remains a dedup barrier, not a working coordinator. Only
+            # publish bounded code-shaped reasons after common-secret checks.
+            task = active[0]["task"]
+            reason = task.get("watchdog_blocker") or task.get("blocker")
+            current["scheduler_state"] = "blocked"
+            try:
+                current["task_id"] = _reported_task_id(task.get("id"))
+            except EvidenceError:
+                reason = None
+            current["blocker"] = (reason if isinstance(reason, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,79}", reason)
+                and SecretRedactor().redact(reason, maximum=80) == reason else "durable_task_requires_reconciliation")
         return key, current
     blocker = intervention_blocker(records, allow_failed_replan=consumer.get("mode") == "root_only")
     if blocker:
@@ -461,10 +499,17 @@ def _scan_issue(consumer, issue, indexed, previous):
     if terminal and time.time() - terminal["mtime"] < COOLDOWN_SECONDS:
         current.update(scheduler_state="cooldown", task_id=str(terminal["task"].get("id") or ""))
         return key, current
+    capacity = disk_headroom_blocker(repo, consumer["consumer"])
+    if capacity:
+        current.update(scheduler_state="blocked", blocker=capacity)
+        return key, current
     try:
         task_id = queue_issue(consumer, issue, records)
     except ScanExpired:
         raise
+    except CapacityBlocked as exc:
+        current.update(scheduler_state="blocked", blocker=str(exc))
+        return key, current
     except AdmissionDenied as exc:
         current.update(scheduler_state="unauthorized", blocker=str(exc))
         return key, current
@@ -891,6 +936,8 @@ Operating rules:
 
 
 def _queue_issue_locked(consumer: dict, issue: dict, records: list[dict]) -> str:
+    if any(terminal_unknown_hold(record["task"]) for record in records):
+        raise AdmissionDenied("terminal_unknown_requires_operator_reconciliation")
     issue, admission = approved_revision(consumer, issue)
     number = issue["number"]
     task_id = f"github-{consumer['consumer']}-issue-{number}-approval-{admission['approval_id']}"
@@ -941,6 +988,11 @@ def _queue_issue_locked(consumer: dict, issue: dict, records: list[dict]) -> str
             task[field] = consumer[field]
     path = PENDING / f"{task_id}.json"
     scan_remaining()
+    # Also guard direct callers, after replay/reconciliation and immediately
+    # before the original durable consume-before-publication operation.
+    capacity = disk_headroom_blocker(consumer["repository"], consumer["consumer"])
+    if capacity:
+        raise CapacityBlocked(capacity)
     _consume_admission(consumer, issue, task_id, admission)
     # Once consumed, finish local durability; the scan deadline bounds admission/network work.
     publish_task(path, task, admission)
@@ -955,6 +1007,9 @@ def _queue_issue_locked(consumer: dict, issue: dict, records: list[dict]) -> str
 def intervention_blocker(
     records: list[dict], *, allow_failed_replan: bool = False
 ) -> tuple[str, str] | None:
+    for record in records:
+        if terminal_unknown_hold(record["task"]):
+            return str(record["task"].get("id") or ""), "terminal_unknown_requires_operator_reconciliation"
     if not records:
         return None
     latest = records[0]

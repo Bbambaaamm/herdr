@@ -35,7 +35,8 @@ LOGS = ROOT / "logs"
 LOCK = ROOT / "worker.lock"
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
-from herdr.launch_environment import sanitize_environment
+from herdr.launch_environment import sanitize_environment, IMMUTABLE_HOST_STARTUP_TIMEOUT_SECONDS
+from herdr.recovery_unknown import held as terminal_unknown_hold
 from herdr.host_configuration import host_entrypoint_command
 from herdr.policy_launch import process_start_ticks
 ENV = {key: value for key, value in sanitize_environment(os.environ).items()
@@ -113,6 +114,8 @@ def archive_previous_result(task_id: str, attempt: int) -> None:
 
 def prepare_attempt(task: dict) -> None:
     """Allocate one semantic execution attempt; reconciliation reuses it."""
+    if terminal_unknown_hold(task):
+        raise EvidenceError("terminal_unknown_requires_operator_reconciliation")
     if (task.get("attempt_state") == "delivery_uncertain"
             or task.get("completion_plan_pending")) and task.get("run_token"):
         return
@@ -243,25 +246,9 @@ def _wait_for_task_agent(pane_id: str, agent_name: str, *, timeout_seconds: floa
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 
-def _task_session_identity(task: dict) -> tuple[str, str]:
-    run_token = str(task.get("run_token") or "")
-    if not run_token:
-        raise RuntimeError("task session requires run_token")
-    routing = task.get("routing") if isinstance(task.get("routing"), dict) else {}
-    coordinator = str(
-        routing.get("selected_agent") or task.get("agent") or "quantlab-hermes"
-    )
-    digest = hashlib.sha256(
-        f"{coordinator}:{task['id']}:{run_token}".encode("utf-8")
-    ).hexdigest()
-    # Herdr agent names are capped at 32 characters. Keep a readable,
-    # coordinator-derived prefix and bind uniqueness to the full coordinator,
-    # task id and run token through a 64-bit digest suffix.
-    prefix = coordinator[:13].rstrip("-_") or "task"
-    agent_name = f"{prefix}-t-{digest[:16]}"
-    if len(agent_name) > 32:
-        raise RuntimeError("task session agent name exceeds Herdr limit")
-    return agent_name, f"durable-{digest[:20]}"
+def _task_session_identity(task):
+    from herdr.canonical_case_claim import task_session_identity
+    return task_session_identity(task)
 
 
 def observe_task_execution(task: dict) -> str:
@@ -306,7 +293,7 @@ TASK_PANE_ENV = "HERDR_DURABLE_TASK_PANE"
 POLICY_BIN = Path(__file__).resolve().parents[1] / "policy-bin"
 CHILD_HELPER = Path(__file__).resolve().parent / "agent-durable-child"
 BRIDGE = Path(__file__).resolve().parent / "agent-durable-bridge"
-BRIDGE_STARTUP_TIMEOUT_SECONDS = 60.0
+BRIDGE_STARTUP_TIMEOUT_SECONDS = IMMUTABLE_HOST_STARTUP_TIMEOUT_SECONDS
 
 
 def bridge_socket_name(task: dict) -> str:
@@ -368,6 +355,8 @@ def _bridge_process_live(pid: int) -> bool:
 
 
 def start_bridge(task: dict, session: dict) -> None:
+    if terminal_unknown_hold(task):
+        raise EvidenceError("terminal_unknown_requires_operator_reconciliation")
     if bridge_alive(session):
         return
     if int(session.get("bridge_pid") or 0) > 0 and _bridge_process_live(int(session["bridge_pid"])):
@@ -484,6 +473,41 @@ def _root_workspace_writable(grant, workspace: Path) -> bool:
     return any(rule.tool in {"write_file", "patch"} and rule.tool in grant.scope.tools
         and any(workspace == Path(root) or Path(root) in workspace.parents
                 for root in rule.allowed_roots) for rule in grant.tool_rules)
+
+
+def _root_self_write_pins(work_factory, task, launch):
+    """Physical self-scope from the original host admission, not task tool data.
+
+    The broader logical grant stays intact as the child delegation ceiling.
+    Only finite existing files are supported in this managed-parent mode.
+    """
+    admitted = getattr(work_factory, "host_admission", None)
+    if not isinstance(admitted, dict) or "managed_children" not in admitted:
+        return None
+    from agent_completion_evidence import spec_digest
+    from herdr.evidence import binding
+    from herdr.claimed_child_contracts import retained
+    from herdr.work_cycle import FileScope
+    from herdr.child_ownership import ChildOwnership
+    from herdr.owned_write_mounts import OwnedWritePins
+    if admitted["identity"] != binding(task) or admitted["spec_sha256"] != spec_digest(task):
+        raise RuntimeError("root_original_self_scope_changed")
+    retained(admitted, task, identity=launch.identity)
+    if launch.private_profile_snapshot is None or launch.grant.process.enabled:
+        raise RuntimeError("root_finite_private_self_scope_required")
+    scopes = tuple(FileScope(**item) for item in admitted["definition"]["files"])
+    if not scopes or any(item.subtree for item in scopes):
+        raise RuntimeError("root_existing_file_self_scope_required")
+    workspace = Path(task["workspace"])
+    children = [Path(row["scope"]["worktree_identity"].rsplit("|", 1)[0])
+                for row in admitted["managed_children"]["children"].values()]
+    if any((workspace / item.path).is_relative_to(child) for child in children for item in scopes):
+        raise RuntimeError("root_self_scope_overlaps_child")
+    ownership = ChildOwnership.from_json({
+        "write_scope": [{"kind": "file", "key": item.path} for item in scopes],
+        "decision_scope": [], "hard_dependencies": [], "shared_dependencies": [],
+        "integration_owner": task["id"], "handoff_ref": "root-self-scope"})
+    return OwnedWritePins(ownership, launch.mount.private_workspace_pin)
 
 
 def ensure_parent_scope(task: dict) -> None:
@@ -623,6 +647,7 @@ def _cleanup_setup_pane(pane_id: str, coordinator_pane: str, marker: str,
 # Host embedding supplies the accepted factory; queue/model fields never select it.
 HOST_POLICY_LAUNCH_FACTORY = None
 HOST_POLICY_LAUNCHES = {}
+HOST_ROOT_WRITE_PINS = {}
 HOST_WORK_CONTRACT_FACTORY = None
 HOST_WORK_CYCLES = {}
 HOST_WORK_FACTORIES = {}
@@ -647,11 +672,16 @@ def _root_work_factory(task, *, recovery=False):
     if factory is None:
         from herdr.work_configuration import build_root_work_factory
         try:
-            factory = build_root_work_factory(ROOT, task, recovery=recovery)
+            factory = build_root_work_factory(ROOT, task, recovery=recovery,
+                claimed_identity=None if recovery else _claimed_root_identity(task))
         except (OSError, ValueError, KeyError, TypeError, EvidenceError) as exc:
             raise EvidenceError("task_work_contract_authority_missing") from exc
     if not isinstance(factory, HostWorkContractFactory):
         raise EvidenceError("task_work_contract_authority_missing")
+    admission = getattr(factory, "host_admission", None)
+    if isinstance(admission, dict) and "managed_children" in admission:
+        from herdr.claimed_child_contracts import retained
+        retained(admission, task, identity=None if recovery else _claimed_root_identity(task))
     HOST_WORK_FACTORIES[cache_key] = factory
     return factory
 
@@ -719,6 +749,31 @@ def _recover_root_local_result(task):
     return True
 
 
+def _policy_failure_diagnostic(exc):
+    """Retain bounded source locations, never exception messages or locals."""
+    repository = Path(__file__).resolve().parents[2]
+    allowed_types = {"RuntimeError", "SecurityError", "ValueError", "KeyError",
+                     "TypeError", "OSError", "FileNotFoundError", "PermissionError"}
+    chain, seen = [], set()
+    while exc is not None and id(exc) not in seen and len(chain) < 4:
+        seen.add(id(exc))
+        frames = []
+        trace = exc.__traceback__
+        while trace is not None and len(frames) < 16:
+            try:
+                source = Path(trace.tb_frame.f_code.co_filename).absolute().relative_to(repository)
+            except ValueError:
+                source = None
+            if source is not None and (source.as_posix() == "agent-stack/bin/agent-task-worker"
+                    or (source.parts[0] == "herdr" and source.suffix == ".py")):
+                frames.append({"file": source.as_posix(), "line": trace.tb_lineno})
+            trace = trace.tb_next
+        name = type(exc).__name__
+        chain.append({"error_type": name if name in allowed_types else "other", "frames": frames})
+        exc = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+    return {"schema_version": "herdr-invocation-policy-diagnostic-1", "chain": chain}
+
+
 def _root_policy_factory():
     global HOST_POLICY_LAUNCH_FACTORY
     from herdr.policy_launch import HostPolicyLaunchFactory
@@ -740,15 +795,18 @@ def _preflight_root_provider(profile):
         executable=ENV.get("HERDR_HERMES_BINARY","/home/agentops/.local/bin/hermes"),env=ENV)
 
 
+def _claimed_root_identity(task):
+    from herdr.canonical_case_claim import claimed_root_identity
+    return claimed_root_identity(task)
+
+
 def _root_launch_identity(task):
     from herdr.security import InvocationIdentity
     session = task.get("execution_session") or {}
+    identity = _claimed_root_identity(task)
     routing = task.get("routing") if isinstance(task.get("routing"), dict) else {}
     coordinator = str(routing.get("selected_agent") or task.get("agent") or "quantlab-hermes")
     agent, marker = _task_session_identity(task)
-    identity = InvocationIdentity(consumer="github:"+str(task["repo"]), agent_id=agent,
-        parent_agent_id=coordinator, parent_task_id="coordinator:"+coordinator,
-        task_id=str(task["id"]), run_token=str(task["run_token"]), fencing_token=task["fencing_token"])
     if (session.get("agent_name") != agent or session.get("session_name") != marker
             or session.get("coordinator_agent") != coordinator or session.get("pane_marker") != marker):
         raise RuntimeError("task_launch_cleanup_identity_mismatch")
@@ -803,6 +861,9 @@ def _cleanup_prepared_root_launch(task):
     if launch is not None:
         launch.cleanup_after_pane_closed()
         del HOST_POLICY_LAUNCHES[key]
+        pins = HOST_ROOT_WRITE_PINS.pop(key, None)
+        if pins is not None:
+            pins.close()
     else:
         session=task.get("execution_session") or {}
         proof=session.get("invocation_policy") or {}
@@ -833,7 +894,7 @@ def _wait_for_task_pane_input(pane_id, pane_marker, *, timeout_seconds=10.0):
 
 
 def _wait_for_task_sandbox(pane_id, pane_marker, *, policy, policy_mount,
-                           private_profile_snapshot=None, timeout_seconds=10.0):
+                           private_profile_snapshot=None, owned_write_pins=None, timeout_seconds=10.0):
     """Wait for native pane.run to become a fully verified physical sandbox."""
     deadline = time.monotonic() + timeout_seconds
     while True:
@@ -846,6 +907,9 @@ def _wait_for_task_sandbox(pane_id, pane_marker, *, policy, policy_mount,
         pid = inner_pid(process_info if isinstance(process_info, dict) else {}, pane_marker)
         if pid and verify_sandbox(pid, HERDR, pane_marker, policy=policy,
                                   policy_mount=policy_mount, attempts=1,
+                                  **({"owned_write_pins": owned_write_pins,
+                                      "pinned_worktree": owned_write_pins.worktree}
+                                     if owned_write_pins is not None else {}),
                                   **({"private_profile_snapshot": private_profile_snapshot}
                                      if private_profile_snapshot is not None else {})):
             if time.monotonic() <= deadline:
@@ -945,9 +1009,19 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         # snapshot stale; retain legacy preflight only for legacy launches.
         if private_snapshot is None:
             _preflight_root_provider(profile)
+        root_write_pins = _root_self_write_pins(work_factory, task, launch)
+        if work_factory is not None and private_snapshot is not None:
+            work_factory.workspace_pin = launch.mount.private_workspace_pin
+        root_verify_options = {}
+        if root_write_pins is not None:
+            HOST_ROOT_WRITE_PINS[(task["id"], task["run_token"])] = root_write_pins
+            root_verify_options = {"owned_write_pins": root_write_pins,
+                                   "pinned_worktree": root_write_pins.worktree}
         root_mount_options = ({"root_workspace_writable":
             _root_workspace_writable(launch.grant, Path(workspace))}
             if private_snapshot is not None else {})
+        if root_write_pins is not None:
+            root_mount_options = {"root_workspace_writable": False, "owned_write_pins": root_write_pins}
         if private_snapshot is not None:
             # Bind and approve the exact slot/command before split or bridge.
             policy = frozen_policy()
@@ -1019,6 +1093,7 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         _herdr_json(["pane", "run", pane_id, serialized_command], timeout_seconds=15.0)
         sandbox_pid = _wait_for_task_sandbox(pane_id, pane_marker,
                                              policy=policy, policy_mount=launch.mount,
+                                             **({"owned_write_pins": root_write_pins} if root_write_pins is not None else {}),
                                              **({"private_profile_snapshot": private_snapshot}
                                                 if private_snapshot is not None else {}))
         session["sandbox_pid"] = sandbox_pid
@@ -1070,6 +1145,7 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
             launch.mount.bootstrap.work_authority = work_factory.authorize_invocation
             launch.mount.bootstrap.work_verify = work_factory.verify_request
             launch.mount.bootstrap.work_budget = work_factory.budget_effect
+            launch.mount.bootstrap.work_observe = work_factory.observe_sdk
             persist_execution_session(task)
         def publish_continuation(evidence):
             if work_factory is not None:
@@ -1094,7 +1170,7 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
                 hashlib.sha256(policy.read_bytes()).hexdigest()
                 == session["sandbox_attestation"]["policy_sha256"]
                 and verify_sandbox(sandbox_pid, HERDR, pane_marker, policy=policy,
-                                   policy_mount=launch.mount, attempts=1,
+                                   policy_mount=launch.mount, attempts=1, **root_verify_options,
                                    **({"private_profile_snapshot": private_snapshot}
                                       if private_snapshot is not None else {}))),
             bootstrap_peer=lambda *, timeout_seconds: launch.mount.bootstrap.confirm(
@@ -1373,6 +1449,8 @@ def persist_current_task(task: dict) -> None:
 
 def cleanup_task_session_if_safe(task: dict) -> bool:
     """Keep a task-owned pane alive while prompt delivery is still ambiguous."""
+    if terminal_unknown_hold(task):
+        return False
     if (task.get("watchdog_blocker") == "active_durable_children"
             or task.get("attempt_state") == "delivery_uncertain"
             and task.get("verification_status") != "accepted"):
@@ -1495,6 +1573,8 @@ TASK COMPLETION CONTRACT:
 
 
 def run_prompt(task: dict) -> tuple[int, str]:
+    if terminal_unknown_hold(task):
+        raise EvidenceError("terminal_unknown_requires_operator_reconciliation")
     if task.get("parent_task_id") and (
         not task.get("run_token") or not task.get("idempotency_key")
         or not task.get("fencing_token") or not task.get("delegation_key")
@@ -1513,6 +1593,12 @@ def run_prompt(task: dict) -> tuple[int, str]:
     agent = str(session["agent_name"])
     timeout_seconds = int(task.get("timeout_seconds") or 1800)
     prompt = prompt_text(task)
+    if modern_work_contract(task):
+        # Herdr agent.prompt frames text according to the live terminal mode.
+        # Validate before recording intent; a second frame reaches the SDK as
+        # escaped paste content rather than one submitted prompt.
+        from herdr.hermes_terminal_transport import validate_native_prompt
+        prompt = validate_native_prompt(prompt)
     cmd = [
         str(HERDR), "agent", "prompt", agent, prompt,
         "--wait", "--timeout", str(timeout_seconds * 1000),
@@ -1673,6 +1759,8 @@ def _defer_delivery_reconciliation_locked(task_path: Path, task: dict, reason: s
 
 def retry(task_path: Path, task: dict, reason: str) -> None:
     """Start a new semantic execution attempt after the prior one is terminal."""
+    if terminal_unknown_hold(task):
+        return
     with parent_transition_guard(task) as all_terminal:
         _retry_locked(task_path, task, reason, all_terminal)
 
@@ -1695,6 +1783,8 @@ def clear_child_wait(task: dict) -> None:
 
 
 def _retry_locked(task_path: Path, task: dict, reason: str, all_terminal: bool) -> None:
+    if terminal_unknown_hold(task):
+        return
     if defer_for_active_children(task_path, task, reason=reason, all_terminal=all_terminal):
         return
     clear_child_wait(task)
@@ -1792,11 +1882,24 @@ def defer_for_active_children(task_path: Path, task: dict, *, reason: str = "",
     return True
 
 def finish(task_path: Path, task: dict, output: str) -> None:
+    if terminal_unknown_hold(task):
+        return
+    pending_cleanup = False
     with parent_transition_guard(task) as all_terminal:
         _finish_locked(task_path, task, output, all_terminal)
+        if modern_work_contract(task) and task.get("attempt_state") == "verification_pending":
+            pending_cleanup = not defer_for_active_children(
+                current_task_path(task) or task_path, task, all_terminal=all_terminal)
+    if pending_cleanup:
+        # The durable pending state rejects new delegation under the same lock.
+        # Failure recording takes that lock itself, so cleanup runs after release.
+        cleanup_task_session_if_safe(task)
+        persist_current_task(task)
 
 
 def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool) -> None:
+    if terminal_unknown_hold(task):
+        return
     task_id = str(task["id"])
     rp = result_path(task_id)
     task["attempt_state"] = "verifying"
@@ -1984,6 +2087,8 @@ def _main_with_epoch(task_path: Path) -> int:
             return 0
 
         task = json.loads(task_path.read_text(encoding="utf-8"))
+        if terminal_unknown_hold(task):
+            return 0
         acknowledge_dispatch_admission(task_path, task)
         task_id = str(task["id"])
 
@@ -2113,6 +2218,7 @@ def _main_with_epoch(task_path: Path) -> int:
                     block_task(task_path, task, exc.code, detail[:1024])
                     return 1
                 if detail.startswith(("task_invocation_policy_", "task_work_contract_", "host grant")):
+                    task["invocation_policy_diagnostic"] = _policy_failure_diagnostic(exc)
                     block_task(task_path, task, "task_invocation_policy_unavailable",
                                "Host invocation policy must be supplied before execution.")
                     return 1

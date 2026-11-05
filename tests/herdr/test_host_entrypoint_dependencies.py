@@ -37,7 +37,7 @@ observed = []
 def tree(definition, *, immutable):
     assert immutable
     def freeze(*args):
-        assert "pinned_host_dependency" not in sys.modules
+        assert "pinned_host_dependency" not in sys.modules and "hermes_cli" not in sys.modules
         observed.append(definition["source"])
         if fault == "withdrawal" and definition is runtime[-1]:
             raise RuntimeError("fixture runtime verification denied")
@@ -60,10 +60,13 @@ def fixture(tmp_path):
     site = tmp_path / "hermes/venv/lib/python3.11/site-packages"
     site.mkdir(parents=True)
     (site / "pinned_host_dependency.py").write_text("value = 'approved-dependency'\n")
+    sdk = tmp_path / "hermes/hermes_cli"; sdk.mkdir()
+    (sdk / "__init__.py").write_text("value = 'approved-sdk-source'\n")
     # -I still retains interpreter-level site-packages. A duplicate there must
     # lose to the explicitly selected immutable Hermes dependency inventory.
     default_site = tmp_path / "default-site"; default_site.mkdir()
     (default_site / "pinned_host_dependency.py").write_text("raise RuntimeError('unapproved default dependency')\n")
+    (default_site / "hermes_cli.py").write_text("raise RuntimeError('unapproved SDK source')\n")
     (site / "sibling_helper.py").write_text("raise RuntimeError('SDK shadowed approved sibling')\n")
     (site / "root_host_helper.py").write_text("raise RuntimeError('SDK shadowed approved code')\n")
     (root / "root_host_helper.py").write_text("value = 'approved-root'\n")
@@ -75,11 +78,11 @@ def fixture(tmp_path):
         entry = root / directory / "probe.py"
         entry.parent.mkdir(parents=True, exist_ok=True)
         entry.write_text(
-            "import json, sys, pinned_host_dependency\n"
+            "import json, sys, pinned_host_dependency, hermes_cli\n"
             "from sibling_helper import value\n"
             "from root_host_helper import value as root_value\n"
             "assert root_value == 'approved-root'\n"
-            "print(json.dumps([pinned_host_dependency.value, value, sys.argv]))\n")
+            "print(json.dumps([pinned_host_dependency.value, hermes_cli.value, value, sys.argv]))\n")
         (entry.parent / "sibling_helper.py").write_text("value = 'approved-sibling'\n")
     return repository, root, site, marker
 
@@ -94,7 +97,7 @@ def test_isolated_host_imports_only_verified_runtime_dependencies(tmp_path, dire
                             capture_output=True, text=True, timeout=15,
                             env={**os.environ, "PYTHONPATH": str(poison)})
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == ["approved-dependency", "approved-sibling",
+    assert json.loads(result.stdout) == ["approved-dependency", "approved-sdk-source", "approved-sibling",
                                         [str(root / directory / "probe.py"), "caller-argument"]]
     assert not marker.exists(), ".pth/sitecustomize must not be executed"
 

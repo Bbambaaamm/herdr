@@ -87,7 +87,7 @@ def packet(p):
             'plan_sha256': issuer._digest(p.proposal['plan'])}
 
 
-def exchange(p, request=None, incoming=()):
+def exchange(p, request=None, incoming=(), after_redeem=lambda: None):
     sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     sender.settimeout(3); receiver.settimeout(3)
     sender.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
@@ -96,6 +96,7 @@ def exchange(p, request=None, incoming=()):
     sender.sendmsg([canonical_json_bytes(request or packet(p))], rights)
     try:
         p.custody.redeem(receiver)
+        after_redeem()
         return issuer._receive(sender, p.row['peer'])
     finally:
         sender.close(); receiver.close()
@@ -104,7 +105,11 @@ def exchange(p, request=None, incoming=()):
 def test_root_custody_transfers_exact_fds_once_and_keeps_originals(prepared):
     p = prepared
     copies = list(p.row['fds'])
-    answer, received = exchange(p)
+    def closed_before_receive():
+        for fd in copies:
+            with pytest.raises(OSError) as error: os.fstat(fd)
+            assert error.value.errno == errno.EBADF
+    answer, received = exchange(p, after_redeem=closed_before_receive)
     try:
         assert answer == {**packet(p), 'descriptor_count': len(received)}
         assert len(received) == len(p.proposal['plan']['descriptors'])
@@ -113,12 +118,40 @@ def test_root_custody_transfers_exact_fds_once_and_keeps_originals(prepared):
             assert (st.st_dev, st.st_ino) == (entry['device'], entry['inode'])
             assert not os.get_inheritable(fd)
         assert not p.custody.pending
-        for fd in copies:
-            with pytest.raises(OSError): os.fstat(fd)
         for entry in p.proposal['plan']['descriptors']: os.fstat(entry['fd'])
         with pytest.raises(SecurityError, match='unavailable'): exchange(p)
     finally:
         for fd in received: os.close(fd)
+
+
+def test_exact_custody_oracle_survives_received_fd_number_reuse(prepared, monkeypatch):
+    """Exercise real redeem/recvmsg; only root and peer authority are doubled."""
+    copies = set(prepared.row['fds'])
+    receive = issuer._receive
+    observations = []
+    def force_reuse(connection, peer, *, minimum_fds=1):
+        if minimum_fds == 0:
+            return receive(connection, peer, minimum_fds=minimum_fds)
+        # redeem has returned: no receive-side FD exists yet. Check the old
+        # lifetimes before deliberately opening new lifetimes at those numbers.
+        for fd in copies:
+            with pytest.raises(OSError) as error: os.fstat(fd)
+            assert error.value.errno == errno.EBADF
+        pads = set()
+        try:
+            while not pads or max(pads) <= max(copies):
+                pads.add(os.dup(prepared.proposal['plan']['descriptors'][0]['fd']))
+            assert copies <= pads
+            for fd in copies:
+                pads.remove(fd); os.close(fd)
+            answer, received = receive(connection, peer, minimum_fds=minimum_fds)
+            observations.append(copies <= set(received))
+            return answer, received
+        finally:
+            for fd in pads: os.close(fd)
+    monkeypatch.setattr(issuer, '_receive', force_reuse)
+    test_root_custody_transfers_exact_fds_once_and_keeps_originals(prepared)
+    assert observations == [True]
 
 
 @pytest.mark.parametrize('fault', ['plan', 'identity', 'extra-field', 'version', 'role', 'argv', 'owner', 'policy', 'root-plan', 'expiry', 'environment'])

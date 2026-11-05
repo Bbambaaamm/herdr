@@ -136,7 +136,16 @@ class ChildCompletionAuthority:
             raise EvidenceError("approved coding child needs verification in the parent scope")
         return candidate
 
+    def _require_admitted_child(self,rec):
+        admitted=getattr(self,"admitted_children",None)
+        if admitted is None:return
+        row=admitted["children"].get(child_spec(rec))
+        if (row is None or rec.parent_run_token!=admitted["parent"]["run_token"]
+                or rec.delegation_key!=row["key"] or rec.node.model_policy!=row["model_policy"]):
+            raise EvidenceError("child differs from original derived declaration or model policy")
+
     def prepare(self,rec):
+        self._require_admitted_child(rec)
         task=child_task(rec)
         key=digest(binding(task))
         try:
@@ -157,6 +166,7 @@ class ChildCompletionAuthority:
                 raise EvidenceError("child plan changed across restart")
 
     def modern_work(self, rec):
+        self._require_admitted_child(rec)
         contracts = self.work_contracts
         if contracts is None or contracts["version"] == 1:
             return False
@@ -167,10 +177,15 @@ class ChildCompletionAuthority:
 
     def _work_task(self, rec, plan):
         task = child_task(rec)
+        task.update(delegation_key=rec.delegation_key,model_policy=rec.node.model_policy)
+        admitted=getattr(self,"admitted_children",None)
+        if admitted is not None:task["derived_parent_admission_sha256"]=digest(admitted)
         if self.work_contracts["version"]==3:task["work_budget_version"]=1
         task.update(workspace=str(child_workspace(rec)[0]), work_contract_version=1,
                     completion_plan={"base_sha":plan["base_sha"]},
                     work_workspace_identity=f"{child_workspace(rec)[1]}:{child_workspace(rec)[2]}")
+        if "base_branch" in plan:
+            task["completion_plan"]["base_branch"] = plan["base_branch"]
         return task
 
     def preflight_work(self,rec,launch):
@@ -198,6 +213,7 @@ class ChildCompletionAuthority:
         launch.mount.bootstrap.work_authority = factory.authorize_invocation
         launch.mount.bootstrap.work_verify = factory.verify_request
         launch.mount.bootstrap.work_budget = factory.budget_effect
+        launch.mount.bootstrap.work_observe = factory.observe_sdk
         return port
 
     def recover_work(self, rec, plan):

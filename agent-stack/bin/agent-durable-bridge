@@ -74,6 +74,7 @@ def validate_request(request: object, identity: dict) -> argparse.Namespace:
 
 
 def _current_task_file(root: Path, task_id: str, run_token: str) -> Path:
+    from herdr.recovery_unknown import held
     matches: list[Path] = []
     terminal: list[Path] = []
     for state in (*ACTIVE_STATES, *TERMINAL_STATES):
@@ -86,6 +87,8 @@ def _current_task_file(root: Path, task_id: str, run_token: str) -> Path:
             continue
         if payload.get("id") != task_id or payload.get("run_token") != run_token:
             continue
+        if held(payload):
+            raise ValueError("terminal_unknown_requires_operator_reconciliation")
         (terminal if state in TERMINAL_STATES else matches).append(path.resolve())
     if terminal:
         raise ValueError("parent task is terminal")
@@ -140,6 +143,9 @@ def serve(task_file: Path, identity: dict, real_binary: Path, *, policy_launch_f
     startup_path = task_file.resolve(strict=True)
     root = startup_path.parent.parent.resolve()
     startup_task = json.loads(startup_path.read_text(encoding="utf-8"))
+    from herdr.recovery_unknown import held
+    if held(startup_task):
+        raise ValueError("terminal_unknown_requires_operator_reconciliation")
     pinned = {
         field: startup_task.get(field)
         for field in (

@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
+from .observed_proc import os
 import re
 import shutil
 import stat
 import tempfile
 from dataclasses import dataclass, replace
-from pathlib import Path
+from .observed_proc import Path
 from typing import Mapping
 
 from .security import (
@@ -385,6 +385,7 @@ class PolicyMount:
         self.private_cli_pins = {}
         self.private_fd_handoff = False
         self.resolver_snapshot = None
+        self.private_profile_snapshot = None
         targets = [str(BUNDLE_TARGET), str(code.target), *(str(x.target) for x in runtime)]
         _require(len(targets) == len(set(targets)), "duplicate policy mount target")
 
@@ -479,21 +480,30 @@ class PolicyMount:
                      "sealed policy mount digest mismatch")
         return rows
 
-    def observed_assurance(self, pid, attestation):
+    def observed_assurance(self, pid, attestation, *, admitted_workspace=None):
         rows = self.verify_mounted(pid)
         _require("ro" in rows.get("/", set()), "host root is not read-only")
         _require(os.readlink(f"/proc/{pid}/ns/mnt") != os.readlink("/proc/self/ns/mnt")
                  and os.readlink(f"/proc/{pid}/ns/pid") != os.readlink("/proc/self/ns/pid"),
                  "policy process lacks sandbox namespaces")
         same_network = os.readlink(f"/proc/{pid}/ns/net") == os.readlink("/proc/self/ns/net")
-        # This launch keeps provider credentials available to Hermes. It never
-        # claims isolation from tool-spawned processes or a provider-only firewall.
+        isolated = False
+        if self.private_profile_snapshot is not None:
+            from .credential_isolation import observe_sdk_credentials, _approved_confinement
+            approval = _approved_confinement()
+            isolated = observe_sdk_credentials(pid, self.private_profile_snapshot.identity,
+                                                rows, admitted_workspace)
+            _require(approval == _approved_confinement(),
+                     "worker confinement changed during seal observation")
+            self.worker_confinement_sha256 = hashlib.sha256(
+                canonical_json_bytes(approval)).hexdigest()
         return RuntimeAssurance(True, hashlib.sha256(canonical_json_bytes(attestation)).hexdigest(),
                                 NetworkAccess.GLOBAL if same_network else NetworkAccess.NONE,
-                                tuple(sorted(path for path, modes in rows.items() if "rw" in modes)), False)
+                                tuple(sorted(path for path, modes in rows.items() if "rw" in modes)), isolated)
 
     def seal(self, pid, grant: SecurityGrant, *, identity: InvocationIdentity, attestation,
-             tools, permissions, private_key, key_id, parent: SecurityGrant | None = None):
+             tools, permissions, private_key, key_id, parent: SecurityGrant | None = None,
+             delegated_writes=None):
         _require(isinstance(grant, SecurityGrant) and grant.identity == identity,
                  "grant differs from admitted identity")
         _require(set(grant.scope.tools) == set(tools) and set(grant.scope.permissions) <= set(permissions),
@@ -516,15 +526,24 @@ class PolicyMount:
                  and attestation.get("run_token") == identity.run_token
                  and attestation.get("sandbox_pid") == pid,
                  "policy sandbox attestation binding")
-        assurance = self.observed_assurance(pid, attestation)
+        assurance = self.observed_assurance(pid, attestation,
+                                           admitted_workspace=grant.workspace_root)
         bound = replace(grant, runtime_assurance=assurance)
         if parent is not None:
-            bound.require_subset_of(parent)
-        if bound.process.enabled:
+            if delegated_writes is None:
+                bound.require_subset_of(parent)
+            else:
+                bound.require_delegated_subset_of(parent, delegated_writes)
+        else:
+            _require(delegated_writes is None, "root cannot use child delegated authority")
+        if bound.process.enabled or self.private_profile_snapshot is not None:
             _require(assurance.credentials_isolated, "process credential isolation unavailable")
         sealed = self.stage.seal(bound, private_key, key_id=key_id, expected_identity=identity,
                                  expected_attestation_sha256=assurance.sandbox_attestation_sha256)
         self.verify_mounted(pid, sealed)
+        if delegated_writes is not None:
+            delegated_writes.validated_roots(bound, parent)
+            delegated_writes.record_sealed(bound, parent)
         return bound, sealed
 
 def validate_policy_evidence(evidence, *, identity: InvocationIdentity):
@@ -536,6 +555,7 @@ def validate_policy_evidence(evidence, *, identity: InvocationIdentity):
     if isinstance(evidence, dict) and "approved_profile" in evidence:
         keys.add("approved_profile")
         keys.add("immutable_sources")
+        keys.add("worker_confinement_sha256")
     _require(isinstance(evidence, dict) and set(evidence) == keys
              and len(canonical_json_bytes(evidence)) <= 16384, "bounded policy evidence required")
     _require(evidence["schema_version"] in {"herdr-policy-launch-2","herdr-policy-launch-3"}
@@ -561,6 +581,9 @@ def validate_policy_evidence(evidence, *, identity: InvocationIdentity):
     _require(type(evidence["process_start_ticks"]) is int
              and 0 < evidence["process_start_ticks"] < 2**64, "policy process identity malformed")
     if "approved_profile" in evidence:
+        _require(isinstance(evidence["worker_confinement_sha256"], str)
+                 and _SHA.fullmatch(evidence["worker_confinement_sha256"]),
+                 "worker confinement proof malformed")
         from .private_profile_namespace import profile_identity, PrivateProfileError
         profile = evidence["approved_profile"]
         _require(isinstance(profile, dict)
@@ -621,8 +644,12 @@ def validate_policy_evidence(evidence, *, identity: InvocationIdentity):
     if modern:
         from .host_bootstrap import validate_continuation
         bootstrap=evidence["bootstrap"]
-        _require(isinstance(bootstrap,dict) and set(bootstrap)=={"continuation","bootstrap_tree"},
+        _require(isinstance(bootstrap,dict) and set(bootstrap) in ({"continuation","bootstrap_tree"},
+                 {"continuation","bootstrap_tree","self_observation"}),
                  "bootstrap proof incomplete")
+        if "self_observation" in bootstrap:
+            from .bootstrap_self_observation import validate_mode
+            validate_mode(bootstrap["self_observation"])
         validate_continuation(bootstrap["continuation"],identity=identity,
                               bundle_sha256=evidence["bundle_sha256"])
         tree=bootstrap["bootstrap_tree"]
@@ -746,6 +773,11 @@ def verify_retained_policy_evidence(evidence, *, identity, pid, attestation, now
     _require(attestation.get("immutable_sources") == proof.get("immutable_sources"),
              "retained immutable sources differ from signed attestation")
     if "approved_profile" in proof:
+        from .credential_isolation import _approved_confinement
+        _require(hashlib.sha256(canonical_json_bytes(_approved_confinement())).hexdigest()
+                 == proof["worker_confinement_sha256"],
+                 "retained worker confinement approval changed")
+    if "approved_profile" in proof:
         verify_retained_immutable_sources(proof)
     rows = mount_rows(pid)
     if "approved_profile" in proof:
@@ -802,7 +834,12 @@ def verify_retained_policy_evidence(evidence, *, identity, pid, attestation, now
     assurance = grant.runtime_assurance
     network = (NetworkAccess.GLOBAL if os.readlink(f"/proc/{pid}/ns/net") == os.readlink("/proc/self/ns/net")
                else NetworkAccess.NONE)
-    _require(assurance.network_access == network and not assurance.credentials_isolated
+    isolated = False
+    if "approved_profile" in proof:
+        from .credential_isolation import observe_sdk_credentials
+        isolated = observe_sdk_credentials(pid, proof["approved_profile"], rows,
+                                            grant.workspace_root)
+    _require(assurance.network_access == network and assurance.credentials_isolated == isolated
              and set(assurance.writable_roots) == {name for name,modes in rows.items() if "rw" in modes},
              "retained runtime assurance mismatch")
     _require(process_start_ticks(pid) == proof["process_start_ticks"], "policy process changed during verification")
@@ -814,6 +851,10 @@ def verify_retained_policy_evidence(evidence, *, identity, pid, attestation, now
                                       + approved["name"] + "/config.yaml", set()),
                  "retained approved profile mount unverified")
         for relative, digest in approved["files"].items():
+            if relative == "auth.json":
+                _require(not (profile_root / relative).exists(),
+                         "retained host credential exposed to SDK")
+                continue
             target = "/home/agentops/.hermes/profiles/" + approved["name"] + "/" + relative
             _require("ro" in rows.get(target, set()),
                      "retained approved profile file is not readonly")
@@ -976,7 +1017,9 @@ class PreparedPolicyLaunch:
         self._bootstrap_receipt = None
         self._published_bootstrap_receipt = None
         self._continuation_sink = None
+        self.bootstrap_self_observation = None
         self._ownership = None
+        self._delegated_writes = None
         self.private_plan_handoff = None
         self._private_handoff_verify = None
         self._private_handoff_state = None
@@ -984,6 +1027,7 @@ class PreparedPolicyLaunch:
             from .private_mount_plan import PinnedLaunchPath
             mount.private_workspace_pin = PinnedLaunchPath(Path(grant.workspace_root), directory=True)
             mount.private_identity = grant.identity
+            mount.private_profile_snapshot = private_profile_snapshot
 
     @property
     def identity(self):
@@ -994,10 +1038,15 @@ class PreparedPolicyLaunch:
         require_clean_environment(os.environ)
         return {key: str(getattr(self.identity, field)) for field, key in IDENTITY_ENV.items()}
 
-    def verify_spawn_source(self, inspect_source):
+    def verify_spawn_source(self, inspect_source, *, observation=None):
         from .launch_environment import require_clean_spawn_source
         _require(callable(inspect_source),"host startup source inspector required")
-        require_clean_spawn_source(inspect_source())
+        if observation is None:
+            require_clean_spawn_source(inspect_source())
+        else:
+            from .canonical_startup_observation import AuthenticatedStartupObservation
+            _require(type(observation) is AuthenticatedStartupObservation,"typed root startup observation required")
+            observation.verify(self.grant, inspect_source())
 
     def bind_result_slot(self, path, idempotency_key):
         from dataclasses import replace
@@ -1016,6 +1065,15 @@ class PreparedPolicyLaunch:
             replace(rule,result_slot=slot) if rule.tool == TOOL else rule for rule in self.grant.tool_rules))
         if self._parent is not None:
             self.grant.require_logical_subset_of(self._parent)
+
+    def bind_delegated_writes(self, authority):
+        from .security import DelegatedWriteAuthority
+        _require(self.sealed is None and self._private_key is not None
+                 and self._parent is not None and self._delegated_writes is None
+                 and isinstance(authority, DelegatedWriteAuthority),
+                 "one original host child delegation binding required")
+        authority.validated_roots(self.grant, self._parent)
+        self._delegated_writes = authority
 
     def bind_private_mount_plan(self, path):
         from .private_mount_plan import ApprovedPrivateMountPlan
@@ -1076,7 +1134,9 @@ class PreparedPolicyLaunch:
             attestation["immutable_sources"] = sources
         bound, sealed = self.mount.seal(pid, self.grant, identity=self.identity, attestation=attestation,
                                        tools=tools, permissions=permissions, private_key=self._private_key,
-                                       key_id=self._key_id, parent=self._parent)
+                                       key_id=self._key_id, parent=self._parent,
+                                       **({"delegated_writes": self._delegated_writes}
+                                          if self._delegated_writes is not None else {}))
         self.grant, self.sealed = bound, sealed
         self._process_start_ticks = process_start_ticks(pid)
         self._private_key = None
@@ -1130,6 +1190,7 @@ class PreparedPolicyLaunch:
         if self.private_profile_snapshot is not None:
             proof["approved_profile"] = self.private_profile_snapshot.identity
             proof["immutable_sources"] = self.mount.immutable_source_evidence()
+            proof["worker_confinement_sha256"] = self.mount.worker_confinement_sha256
         if self._bootstrap_receipt is not None:
             proof["schema_version"]="herdr-policy-launch-3"
             proof["bootstrap"]=self.mount.bootstrap.evidence(self._bootstrap_receipt)
@@ -1190,7 +1251,7 @@ class HostPolicyLaunchFactory:
                  profile_preflight=None,
                  parent_approved_profile: ApprovedProfile | None = None,
                  parent_launch: PreparedPolicyLaunch | None = None,
-                 retained_parent_verify=None, private_plan_handoff=None):
+                 retained_parent_verify=None, private_plan_handoff=None, bootstrap_self_observation=None):
         approved_types = (ApprovedTree, ApprovedImmutableTree)
         _require(isinstance(code, approved_types) and code.target == CODE_TARGET,
                  "approved policy code required")
@@ -1221,6 +1282,10 @@ class HostPolicyLaunchFactory:
             _require(all(Path(root) != private_plan_handoff.directory
                          and Path(root) not in private_plan_handoff.directory.parents
                          for root in writable_roots), "launch proposals cannot live in admitted write roots")
+        _require(bootstrap_self_observation in (None, "authenticated-root-kernel-v1")
+                 and (bootstrap_self_observation is None or approved_profile is not None),
+                 "explicit private bootstrap observation mode required")
+        self.bootstrap_self_observation = bootstrap_self_observation
         self.private_plan_handoff = private_plan_handoff
         self.approved_profile = approved_profile
         self.parent_approved_profile = parent_approved_profile
@@ -1315,6 +1380,7 @@ class HostPolicyLaunchFactory:
                                           grant, Ed25519PrivateKey.generate(), "host-launch", self.parent_grant,
                                           private_profile_snapshot=profile_snapshot)
             prepared._ownership = ownership
+            prepared.bootstrap_self_observation = self.bootstrap_self_observation
             prepared.private_plan_handoff = self.private_plan_handoff
             if self.private_plan_handoff is not None:
                 def verify_handoff():

@@ -185,9 +185,20 @@ from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 from herdr.ownership_epoch import legacy_admission_guard
 root=Path(sys.argv[2]); task=root/'running/one.json'
+# Match the actual worker: polling must observe old or new JSON, never a
+# truncation window introduced only by this test subprocess.
+def persist(data):
+    import tempfile
+    fd,name=tempfile.mkstemp(prefix=task.name+'.',suffix='.tmp',dir=task.parent)
+    try:
+        with os.fdopen(fd,'w') as handle:
+            json.dump(data,handle);handle.flush();os.fsync(handle.fileno())
+        os.replace(name,task)
+    finally:
+        if os.path.exists(name):os.unlink(name)
 if sys.argv[3]=='allocated':
     data=json.loads(task.read_text());data.update(run_token='retain-me',fencing_token=1)
-    task.write_text(json.dumps(data));raise SystemExit(3)
+    persist(data);raise SystemExit(3)
 # The dispatcher must still own the existing epoch, without inheriting its FD.
 inherited=[os.readlink('/proc/self/fd/'+fd) for fd in os.listdir('/proc/self/fd')
     if fd not in {'0','1','2'} and os.path.exists('/proc/self/fd/'+fd)]
@@ -206,7 +217,7 @@ with legacy_admission_guard(root):
     data.update(run_token='real-child-admitted',fencing_token=1,ownership_epoch={'version':1})
     data['dispatch_admission']={'nonce':data['dispatch_admission_nonce'],'pid':os.getpid(),
         'start_ticks':process_start_ticks(os.getpid()),'parent_pid':os.getppid()}
-    task.write_text(json.dumps(data))
+    persist(data)
 """
     monkeypatch.setattr(dispatcher, 'host_entrypoint_command',
         lambda *a, **kw: [sys.executable, '-I', '-B', '-c', program, str(SOURCE),

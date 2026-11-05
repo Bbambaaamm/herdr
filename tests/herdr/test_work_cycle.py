@@ -339,3 +339,23 @@ def test_serialized_plan_roundtrip_keeps_mode_and_exact_hash(tmp_path):
     raw["mode"]="experiment"
     with pytest.raises(WorkContractError,match="experiment"):
         WorkPlan.from_json(raw)
+
+
+def test_original_delegated_seal_is_bound_to_plan_and_cold_recovery(tmp_path):
+    _, root, old, log = setup(tmp_path)
+    original = old.to_json()
+    assert original['version'] == 1 and 'delegated_seal_sha256' not in original
+    assert WorkPlan.from_json(original).hash == old.hash
+    event = {'event': 'host_delegated_write_sealed', 'identity': old.identity.to_json(),
+             'grant_sha256': old.grant_sha256, 'spec_sha256': old.spec_sha256, 'parent_grant_sha256': 'a'*64}
+    plan = replace(old, delegated_seal_sha256=digest(event))
+    assert plan.to_json()['version'] == 4 and WorkPlan.from_json(plan.to_json()).hash == plan.hash
+    with pytest.raises(WorkContractError, match='original delegated seal'):
+        WorkCycle(plan, root, log, git=trusted_git(root))
+    log.append(event); log.flush()
+    restored = WorkCycle(WorkPlan.from_json(plan.to_json()), root, log, git=trusted_git(root))
+    assert restored.phase is WorkPhase.PREPARE
+    # A preserved duplicate or changed context is never a new execution authority.
+    log.append(event); log.flush()
+    with pytest.raises(WorkContractError, match='original delegated seal'):
+        WorkCycle(plan, root, log, git=trusted_git(root))

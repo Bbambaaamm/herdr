@@ -1,0 +1,27 @@
+[Unit]
+Description=Finite offline root operator
+Requires=herdr-offline-cleanup-03414499dd0d1986.timer
+After=herdr-offline-cleanup-03414499dd0d1986.timer
+[Service]
+Type=oneshot
+User=root
+Group=root
+AppArmorProfile=herdr-offline-operator-03414499dd0d1986
+RuntimeMaxSec=1800
+TimeoutStartSec=1800
+TimeoutStopSec=30
+Restart=no
+Delegate=no
+KillMode=control-group
+CapabilityBoundingSet=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_CHOWN
+AmbientCapabilities=
+NoNewPrivileges=yes
+RestrictNamespaces=yes
+PrivateNetwork=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/herdr-offline-03414499dd0d1986 /var/lib/herdr-offline-observer-03414499dd0d1986/contexts /etc/herdr/offline-03414499dd0d1986 /run/systemd/system -/sys/fs/cgroup/system.slice/herdr-offline-03414499dd0d1986.service -/sys/fs/cgroup/system.slice/herdr-offline-root-03414499dd0d1986.service -/sys/fs/cgroup/system.slice/herdr-offline-child-03414499dd0d1986.service
+SystemCallArchitectures=native
+ExecStart=/usr/bin/python3.14 -I -B -c 'import sys; sys.path.insert(0,"/opt/agent-platform/herdr-offline-03414499dd0d1986"); from offline_case.driver import main; main(["--execute"])'

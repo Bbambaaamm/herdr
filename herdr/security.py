@@ -470,6 +470,35 @@ class ApprovalEvidence:
 
 
 @dataclass(frozen=True)
+class DelegatedWriteAuthority:
+    """Host-only context, never deserialized from grants or SDK arguments.
+
+    The validator must re-read protected original admission and current claim;
+    a typed object or a path tuple alone is not evidence of authority.
+    """
+    parent_sha256: str
+    identity: InvocationIdentity
+    admission_sha256: str
+    spec_sha256: str
+    ownership_sha256: str
+    roots: tuple[str, ...]
+    revalidate: Callable
+    record_sealed: Callable
+
+    def validated_roots(self, child, parent):
+        if (parent.hash != self.parent_sha256 or child.identity != self.identity
+                or not callable(self.revalidate) or not callable(self.record_sealed)
+                or not isinstance(self.roots, tuple) or not 1 <= len(self.roots) <= 64
+                or len(set(self.roots)) != len(self.roots)):
+            raise SecurityError("delegated physical binding invalid")
+        for value in (self.parent_sha256, self.admission_sha256, self.spec_sha256, self.ownership_sha256):
+            _sha256(value, "delegated physical reference")
+        if self.revalidate(child, parent) != self.roots:
+            raise SecurityError("delegated physical admission changed")
+        return self.roots
+
+
+@dataclass(frozen=True)
 class SecurityGrant:
     grant_id: str
     workspace_root: str
@@ -595,6 +624,15 @@ class SecurityGrant:
 
     def require_subset_of(self, parent: "SecurityGrant") -> None:
         self.require_logical_subset_of(parent)
+        self._require_physical_subset(parent)
+
+    def require_delegated_subset_of(self, parent, authority):
+        self.require_logical_subset_of(parent)
+        if not isinstance(authority, DelegatedWriteAuthority):
+            raise SecurityError("host delegated physical authority required")
+        self._require_physical_subset(parent, authority.validated_roots(self, parent))
+
+    def _require_physical_subset(self, parent, delegated_roots=()):
         observed,ceiling=self.runtime_assurance,parent.runtime_assurance
         network_order={NetworkAccess.NONE:0,NetworkAccess.PROVIDER_ONLY:1,NetworkAccess.GLOBAL:2}
         parent_result = next((rule for rule in parent.tool_rules
@@ -607,7 +645,7 @@ class SecurityGrant:
                 and _roots_subset((rule.result_slot.path,), parent_result.allowed_roots))
         # This exception names only a host-bound result inode, never its directory.
         # Normal path/process writes still obey the parent's physical ceiling.
-        allowed_writes = (*ceiling.writable_roots, *delegated_slots)
+        allowed_writes = (*ceiling.writable_roots, *delegated_slots, *delegated_roots)
         if (network_order[observed.network_access]>network_order[ceiling.network_access]
                 or not _roots_subset(observed.writable_roots,allowed_writes)
                 or ceiling.credentials_isolated and not observed.credentials_isolated

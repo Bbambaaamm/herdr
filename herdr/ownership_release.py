@@ -67,6 +67,10 @@ def _open_trusted_bwrap():
 
 def capture_namespace_lifetime(pid):
     """Bind an already-verified payload to its actual trusted bwrap PID1."""
+    from .observed_proc import native_scope_enabled
+    if native_scope_enabled():
+        from .native_lifetime import capture_namespace_lifetime as native_capture
+        return native_capture(pid)
     require(type(pid) is int and pid > 0, "ownership_namespace_pid")
     payload = _process_snapshot(pid)
     require(2 <= len(payload["ids"]) <= 32 and payload["ids"][-1] > 1,
@@ -106,6 +110,13 @@ def capture_namespace_lifetime(pid):
 
 
 def validate_namespace_lifetime(value):
+    if isinstance(value, dict) and value.get('version') == 3:
+        from .native_lifetime import validate_namespace_lifetime as native_validate
+        from .case_roster import Denied
+        try:
+            return native_validate(value)
+        except Denied as error:
+            raise OwnershipError(str(error)) from error
     require(isinstance(value, dict) and type(value.get("version")) is int
             and value["version"] in (1, 2), "ownership_namespace_proof")
     keys = {"version", "pid", "start_ticks", "namespace"}
@@ -123,7 +134,59 @@ def validate_namespace_lifetime(value):
     return dict(value)
 
 
-def namespace_exited(value):
+def required_namespace_kind(scheduler, rec):
+    """Select the proof contract from the admitted parent, never from a proof.
+
+    The original case's root task identifier is fixed by the issuer. A task
+    claiming that identifier without its canonical parent admission is denied;
+    it cannot borrow the generic proof contract during record or replay.
+    """
+    from .case_roster import NONCE
+    if not (isinstance(rec.parent_task_id, str) and rec.parent_task_id.endswith(NONCE)):
+        return "generic"
+    from .scheduler import _canonical_payload_parent, _validate_canonical_record
+    root = scheduler._tasks.get(rec.parent_task_id)
+    require(root is not None and root.canonical_parent is not None and
+            rec.delegation_key is not None, "native_parent_admission_required")
+    admitted = _canonical_payload_parent(root.canonical_parent)
+    _validate_canonical_record(root, admitted, bound=True)
+    identity = admitted.identity
+    require(identity.task_id == rec.parent_task_id and
+            identity.run_token == rec.parent_run_token and
+            identity.agent_id == rec.parent_agent_id and
+            identity.consumer == "github:" + rec.repo and
+            rec.id.startswith(identity.task_id + "-child-"),
+            "native_child_admission_required")
+    return "native"
+
+
+def validate_recorded_namespace_lifetime(scheduler, rec, proof):
+    kind = required_namespace_kind(scheduler, rec)
+    require(isinstance(proof, dict), "namespace_proof_kind_mismatch")
+    if kind == "native":
+        require(type(proof.get("version")) is int and proof["version"] == 3,
+                "namespace_proof_kind_mismatch")
+        from .native_lifetime import validate_namespace_lifetime as native_validate
+        from .case_roster import Denied
+        try:
+            value = native_validate(proof)
+        except Denied as error:
+            raise OwnershipError(str(error)) from error
+        require(value.get("role") == "child", "native_child_namespace_required")
+        return value
+    require(type(proof.get("version")) is int and proof["version"] in (1, 2),
+            "namespace_proof_kind_mismatch")
+    return validate_namespace_lifetime(proof)
+
+
+def namespace_exited(value, *, expected_kind=None):
+    require(expected_kind in (None, "generic", "native"), "namespace_proof_kind_mismatch")
+    if expected_kind == "native" or expected_kind is None and isinstance(value, dict) and value.get('version') == 3:
+        from .native_lifetime import namespace_exited as native_exited
+        return native_exited(value)
+    if expected_kind == "generic":
+        require(isinstance(value, dict) and type(value.get("version")) is int
+                and value["version"] in (1, 2), "namespace_proof_kind_mismatch")
     value = validate_namespace_lifetime(value)
     pid = value["init_pid"] if value["version"] == 2 else value["pid"]
     start_ticks = value["init_start_ticks"] if value["version"] == 2 else value["start_ticks"]
@@ -174,13 +237,22 @@ class HostOwnershipRelease:
             require(actual == identity and any(e.get("event") == "child_ownership_reserved"
                     and e.get("parent") == parent.to_json() and e.get("task_id") == rec.id
                     for e in events), "ownership_release_binding")
+            kind = required_namespace_kind(scheduler, rec)
+            retired = [event for event in events if event.get("event") == "case_execution_retired"
+                       and event.get("identity", {}).get("task_id") == rec.id]
+            require(len(retired) <= 1 and (kind == "native" or not retired),
+                    "ambiguous native case retirement")
+            if kind == "native":
+                from .canonical_case_recovery import require_root_release
+                require_root_release(self.root, parent, rec, retired[0] if retired else None)
             if rec.namespace_lifetime is not None:
+                validate_recorded_namespace_lifetime(scheduler, rec, rec.namespace_lifetime)
                 # V2 keeps pid bound to the attested payload; only its separately
                 # captured trusted init determines whole-namespace retirement.
                 return (rec.execution_sandbox_verified and
                         (rec.execution_sandbox_attestation or {}).get("sandbox_pid") ==
                             rec.namespace_lifetime["pid"]
-                        and namespace_exited(rec.namespace_lifetime))
+                        and namespace_exited(rec.namespace_lifetime, expected_kind=kind))
             if scheduler._ownership_read_only(rec):
                 return True
             # Versioned pre-effect/no-split state proves there was no namespace

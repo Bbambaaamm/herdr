@@ -134,6 +134,159 @@ def test_fd_launcher_rejects_ambiguous_or_changed_mounts(tmp_path, mutation):
     finally:
         cleanup(item)
 
+
+def test_generic_policy_mount_prepares_readonly_home_before_runtime_targets(tmp_path, monkeypatch):
+    """The admitted generic pane can construct pinned HOME targets under a RO root."""
+    sandbox = sandbox_module()
+    for name in ("bwrap", "policy", "herdr"):
+        (tmp_path / name).write_text("fixture")
+    for name in ("config", "releases", "workspace"):
+        (tmp_path / name).mkdir()
+    monkeypatch.setattr(sandbox, "BWRAP", tmp_path / "bwrap")
+    monkeypatch.setattr(sandbox, "HERDR_CONFIG", tmp_path / "config")
+    monkeypatch.setattr(sandbox, "HERDR_RELEASES", tmp_path / "releases")
+    monkeypatch.setattr(sandbox, "DEFAULT_WRITABLE", ())
+    item = mount(tmp_path)
+    try:
+        command = sandbox.command(tmp_path / "workspace", tmp_path / "herdr",
+                                  writable=(), policy=tmp_path / "policy", policy_mount=item)
+        args = command[command.index(str(tmp_path / "bwrap")):]
+        home = [i for i in range(len(args) - 1)
+                if args[i:i + 2] == ["--tmpfs", "/home/agentops"]]
+        runtime = [args.index(str(target)) for target in RUNTIME_TARGETS]
+        assert args[:8] == [str(tmp_path / "bwrap"), "--ro-bind", "/", "/",
+                            "--tmpfs", "/home", "--tmpfs", "/home/agentops"]
+        assert len(home) == 1 and home[0] < min(runtime)
+        assert args[args.index("--") - 4:args.index("--")] == [
+            "--remount-ro", "/home", "--remount-ro", "/home/agentops"]
+        home_env = [args[i + 1:i + 3] for i, token in enumerate(args[:-2])
+                    if token == "--setenv" and args[i + 1] == "HOME"]
+        assert home_env == [["HOME", "/home/agentops"]]
+        # Parent setup uses tmpfs, never an RW or RO bind of host credentials.
+        assert not any(args[i:i + 3] == [option, "/home", "/home"]
+                       for i in range(len(args) - 2)
+                       for option in ("--bind", "--ro-bind"))
+    finally:
+        cleanup(item)
+
+@pytest.mark.parametrize("mutation", [
+    "valid", "missing-parent", "duplicate-parent", "missing-home",
+    "missing-parent-seal", "missing-home-seal", "early-home-seal",
+    "foreign-home-env", "missing-home-env", "unset-home-env", "trailing-mount",
+])
+def test_generic_home_launcher_accepts_only_final_sealed_bases_without_exec(tmp_path, monkeypatch, mutation):
+    """Exercise the real FD grammar with an intercepted final exec, never bwrap."""
+    sandbox = sandbox_module()
+    home = tmp_path / "account-base" / "agentops"
+    home.mkdir(parents=True)
+    source = tmp_path / "source"
+    source.mkdir()
+    fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY)
+    opened = []
+    try:
+        info = os.fstat(fd)
+        entry = {"source": f"/proc/{os.getpid()}/fd/{fd}", "fd": fd,
+                 "device": info.st_dev, "inode": info.st_ino,
+                 "kind": "directory", "target": "/run/herdr/test-fixture"}
+        args = ["/usr/bin/bwrap", "--ro-bind", "/", "/",
+                "--tmpfs", str(home.parent), "--tmpfs", str(home),
+                "--ro-bind-fd", str(fd), entry["target"],
+                "--setenv", "HOME", str(home),
+                "--remount-ro", str(home.parent), "--remount-ro", str(home),
+                "--", "/bin/true"]
+        error = "policy_fd_runtime_home_not_readonly"
+        if mutation == "missing-parent":
+            del args[4:6]
+        elif mutation == "duplicate-parent":
+            args[8:8] = ["--tmpfs", str(home.parent)]
+        elif mutation == "missing-home":
+            del args[6:8]
+        elif mutation == "missing-parent-seal":
+            index = args.index("--remount-ro"); del args[index:index + 2]
+        elif mutation == "missing-home-seal":
+            index = args.index("--") - 2; del args[index:index + 2]
+        elif mutation == "early-home-seal":
+            index = args.index("--") - 2; del args[index:index + 2]
+            args[8:8] = ["--remount-ro", str(home)]
+        elif mutation == "trailing-mount":
+            index = args.index("--"); args[index:index] = ["--tmpfs", "/unexpected"]
+        elif mutation == "foreign-home-env":
+            args[args.index("--setenv") + 2] = "/home/runner"
+            error = "policy_fd_runtime_home_env_invalid"
+        elif mutation == "missing-home-env":
+            index = args.index("--setenv"); del args[index:index + 3]
+            error = "policy_fd_runtime_home_env_invalid"
+        elif mutation == "unset-home-env":
+            args[8:8] = ["--unsetenv", "HOME"]
+            error = "policy_fd_runtime_home_env_invalid"
+
+        def pinned_open(path, flags):
+            # No /proc read is required by this portable descriptor fixture.
+            assert path == entry["source"]
+            held = os.dup(fd); opened.append(held); return held
+
+        class ExecIntercepted(Exception):
+            pass
+
+        def no_exec(binary, argv):
+            assert mutation == "valid"
+            assert binary == "/usr/bin/bwrap"
+            assert argv[argv.index("--") - 4:argv.index("--")] == [
+                "--remount-ro", str(home.parent), "--remount-ro", str(home)]
+            raise ExecIntercepted
+
+        monkeypatch.setattr(os, "open", pinned_open)
+        monkeypatch.setattr(os, "execv", no_exec)
+        monkeypatch.setattr(sys, "argv", ["fixture", json.dumps([entry]), *args])
+        code = sandbox._POLICY_FD_LAUNCHER.replace(
+            'home = Path("/home/agentops")', "home = Path(" + repr(str(home)) + ")")
+        assert code != sandbox._POLICY_FD_LAUNCHER
+        if mutation == "valid":
+            with pytest.raises(ExecIntercepted):
+                exec(compile(code, "<portable-fd-launcher>", "exec"), {})
+        else:
+            with pytest.raises(SystemExit, match=error):
+                exec(compile(code, "<portable-fd-launcher>", "exec"), {})
+    finally:
+        for held in opened:
+            os.close(held)
+        os.close(fd)
+
+
+@pytest.mark.parametrize("mutation", [
+    "valid", "missing-parent", "missing-home", "rw-parent", "rw-home",
+    "ambiguous-home-mode", "host-parent", "host-home", "stacked-parent",
+    "stacked-home", "malformed",
+])
+def test_generic_home_mountinfo_requires_unique_readonly_tmpfs_bases(mutation):
+    sandbox = sandbox_module()
+    rows = ["10 1 0:10 / /home ro,nosuid - tmpfs tmpfs rw",
+            "11 10 0:11 / /home/agentops ro,nosuid - tmpfs tmpfs rw",
+            # Independent child runtimes remain writable after parent sealing.
+            "12 11 0:12 / /home/agentops/.cache rw,nosuid - tmpfs tmpfs rw"]
+    if mutation == "missing-parent":
+        del rows[0]
+    elif mutation == "missing-home":
+        del rows[1]
+    elif mutation == "rw-parent":
+        rows[0] = rows[0].replace("ro,nosuid", "rw,nosuid")
+    elif mutation == "rw-home":
+        rows[1] = rows[1].replace("ro,nosuid", "rw,nosuid")
+    elif mutation == "ambiguous-home-mode":
+        rows[1] = rows[1].replace("ro,nosuid", "ro,rw,nosuid")
+    elif mutation == "host-parent":
+        rows[0] = rows[0].replace("- tmpfs", "- ext4")
+    elif mutation == "host-home":
+        rows[1] = rows[1].replace("- tmpfs", "- ext4")
+    elif mutation == "stacked-parent":
+        rows.append(rows[0])
+    elif mutation == "stacked-home":
+        rows.append(rows[1])
+    elif mutation == "malformed":
+        rows.append("invalid kernel record")
+    assert sandbox._runtime_home_mounts_verified("\n".join(rows)) is (mutation == "valid")
+
+
 @pytest.mark.parametrize("shadow",[False,True])
 def test_actual_bwrap_seals_same_inode_after_mount_and_denies_writes(tmp_path, monkeypatch,shadow):
     sandbox = sandbox_module()
@@ -170,7 +323,11 @@ def test_actual_bwrap_seals_same_inode_after_mount_and_denies_writes(tmp_path, m
     if shadow:
         unrelated=tmp_path/"unrelated-shadow.py"
         unrelated.write_text("unrelated = True")
-        index=args.index("--")
+        # Keep the required final HOME seals intact so this reaches the
+        # physical stacked-code attestation rather than an argv-order denial.
+        index=args.index("--") - 4
+        assert args[index:index + 4] == ["--remount-ro", "/home",
+                                        "--remount-ro", "/home/agentops"]
         args[index:index]=["--ro-bind",str(unrelated),str(CODE_TARGET/"module.py")]
     process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                stderr=subprocess.PIPE, env=env)
@@ -415,8 +572,11 @@ def test_actual_parent_child_seal_accepts_only_bound_delegated_result_inode(tmp_
         args=sandbox.command(workspace,cli,writable=(destination,),policy=policy,
             child_workspace_writable=root_writable,pinned_worktree=pin,policy_mount=item,owned_write_pins=pins)
         for forbidden in extra:
-            # Deliberately create an unexpected physical mount for rejection.
-            index=args.index("--")
+            # Preserve final HOME seals so the intended physical ownership
+            # check observes and rejects this unexpected writable mount.
+            index=args.index("--") - 4
+            assert args[index:index + 4] == ["--remount-ro", "/home",
+                                            "--remount-ro", "/home/agentops"]
             args[index:index]=["--bind",str(forbidden),str(forbidden)]
         proc=subprocess.Popen(args,stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,env=env)
         resources.append((proc,pin,item,pins))
@@ -532,3 +692,22 @@ def test_owned_write_roots_narrow_the_host_grant_and_deny_scope_escape(tmp_path,
     finally:
         if prepared is not None:prepared.cleanup_after_pane_closed()
         cleanup(item)
+
+
+def test_delegated_binding_is_one_shot_and_never_comes_from_serialized_grant(tmp_path):
+    from herdr.policy_launch import PreparedPolicyLaunch
+    from herdr.security import DelegatedWriteAuthority
+    from tests.herdr.test_security import _parent_and_disjoint_child
+    parent, child = _parent_and_disjoint_child(tmp_path)
+    item = object.__new__(PreparedPolicyLaunch)
+    item.sealed = None; item._private_key = object(); item._parent = parent
+    item._delegated_writes = None; item.grant = child
+    checked = []
+    authority = DelegatedWriteAuthority(parent.hash, child.identity, 'c' * 64, 'd' * 64, 'e' * 64,
+        child.runtime_assurance.writable_roots,
+        lambda actual, ceiling: checked.append(actual.hash) or child.runtime_assurance.writable_roots,
+        lambda *a: None)
+    item.bind_delegated_writes(authority)
+    assert checked == [child.hash] and item._delegated_writes is authority
+    with pytest.raises(SecurityError, match='one original'):
+        item.bind_delegated_writes(authority)

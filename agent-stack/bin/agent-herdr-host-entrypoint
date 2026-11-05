@@ -42,6 +42,9 @@ require(site.is_dir() and site.resolve(strict=True) == site,
 # interpreter's default site-packages. The sibling script path is added first
 # below; neither -I nor runtime verification chooses between duplicate packages.
 sys.path.insert(1, str(site))
+# SDK auth helpers live beside the venv; this source tree was verified above.
+# Explicit paths preserve -I and never execute editable-install .pth hooks.
+sys.path.insert(2, str(Path(hermes["source"])))
 target = root / sys.argv[1]
 # Existing worker scripts import helpers beside their entrypoint. Restore that
 # script import directory only after its complete immutable release is verified.

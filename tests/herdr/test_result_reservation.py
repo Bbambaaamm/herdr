@@ -117,63 +117,36 @@ def test_reservation_checker_rejects_mutation_during_metadata_read(tmp_path,monk
     finally:os.close(fd)
 
 
-def test_complete_reserved_result_launcher_reaches_exec_with_exact_plan(tmp_path,monkeypatch):
-    """Actual full launcher grammar; only root-record ownership and exec are doubles."""
-    import hashlib,json,stat,sys
-    from types import SimpleNamespace
-    from herdr.result_submission import ResultSlot,reservation_binding
-    from herdr.private_mount_plan import PinnedLaunchPath,request_for,VERSION,AUTHORITY_ROOT
-    from herdr.policy_launch import IDENTITY_ENV
-    from tests.herdr.test_private_profile_fd_bridge import bridge_module,fixture_snapshot
-    sandbox=bridge_module();_,_,profile=fixture_snapshot(tmp_path)
-    work=tmp_path/"workspace";work.mkdir()
-    result=reserve_empty_result(tmp_path/"result.json",identity(),"key")
-    slot=ResultSlot.bind(result,identity(),"key")
-    workspace=PinnedLaunchPath(work,directory=True)
-    pinned=PinnedLaunchPath(result,directory=False,reservation=reservation_binding(slot))
-    raw_open,raw_close,raw_stat,raw_fstat=os.open,os.close,os.lstat,os.fstat
-    opened=set();authority_fds=set();calls=[]
+def test_complete_reserved_result_launcher_reaches_exec_with_exact_plan(tmp_path):
+    """A root-approved full grammar preserves the exact reserved result FD."""
+    from herdr.result_submission import ResultSlot, reservation_binding
+    from herdr.private_mount_plan import PinnedLaunchPath
+    from tests.herdr.test_private_profile_fd_bridge import (
+        bridge_module, fixture_snapshot, fixture_mount_arguments,
+        command_for, run_approved_command,
+    )
+    sandbox = bridge_module()
+    _, _, profile = fixture_snapshot(tmp_path)
+    work = tmp_path / "workspace"; work.mkdir()
+    result = reserve_empty_result(tmp_path / "result.json", identity(), "key")
+    slot = ResultSlot.bind(result, identity(), "key")
+    workspace = PinnedLaunchPath(work, directory=True)
+    pinned = PinnedLaunchPath(result, directory=False, reservation=reservation_binding(slot))
     try:
-        entries=[workspace.descriptor(),pinned.descriptor(),*profile.fd_descriptors()]
-        mounts=profile.mount_arguments()
-        argv=["/usr/bin/bwrap","--ro-bind","/","/","--unshare-pid","--unshare-net",
-            "--proc","/proc","--tmpfs","/tmp",*mounts[:-2],
-            "--dir",str(work),"--chdir",str(work),"--bind-fd",str(workspace.fd),str(work),
-            "--bind-fd",str(pinned.fd),str(result),*mounts[-2:],"--","/bin/true"]
-        canonical=lambda value:json.dumps(value,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()
-        plan=request_for(identity(),entries,argv);record=tmp_path/"approved-record";record.write_bytes(canonical(plan))
-        authority=AUTHORITY_ROOT/(hashlib.sha256(canonical(identity().to_json())).hexdigest()+".json")
-        envelope={"schema_version":VERSION,"authority":str(authority),
-                  "authority_sha256":hashlib.sha256(canonical(plan)).hexdigest(),"entries":entries}
-        fields=("st_dev","st_ino","st_size","st_mtime_ns","st_ctime_ns","st_uid","st_mode")
-        def root_info(info,kind):
-            value=SimpleNamespace(**{key:getattr(info,key) for key in fields})
-            value.st_uid=0;value.st_mode=kind|(0o444 if kind==stat.S_IFREG else 0o755)
-            return value
-        def named(path,*args,**kwargs):
-            if Path(path)==authority:return root_info(raw_stat(record),stat.S_IFREG)
-            if str(path) in (str(AUTHORITY_ROOT),str(AUTHORITY_ROOT.parent)):
-                return root_info(raw_stat(tmp_path),stat.S_IFDIR)
-            return raw_stat(path,*args,**kwargs)
-        def open_fd(path,*args,**kwargs):
-            approved=Path(path)==authority if isinstance(path,(str,Path)) else False
-            fd=raw_open(record if approved else path,*args,**kwargs);opened.add(fd)
-            if approved:authority_fds.add(fd)
-            return fd
-        def close_fd(fd):opened.discard(fd);authority_fds.discard(fd);return raw_close(fd)
-        def held(fd):
-            info=raw_fstat(fd)
-            return root_info(info,stat.S_IFREG) if fd in authority_fds else info
-        with monkeypatch.context() as patch:
-            patch.setattr(os,"open",open_fd);patch.setattr(os,"close",close_fd)
-            patch.setattr(os,"lstat",named);patch.setattr(os,"fstat",held)
-            patch.setattr(os,"execv",lambda file,args:calls.append((file,args)))
-            patch.setattr(sys,"argv",["launcher",json.dumps(envelope),*argv])
-            for field,key in IDENTITY_ENV.items():patch.setenv(key,str(getattr(identity(),field)))
-            exec(sandbox._POLICY_FD_LAUNCHER,{})
-        assert len(calls)==1 and calls[0][0]=="/usr/bin/bwrap"
-        assert "--unshare-net" in calls[0][1] and calls[0][1][-1]=="/bin/true"
-        assert result.read_bytes()==b""
+        entries = [workspace.descriptor(), pinned.descriptor(), *profile.fd_descriptors()]
+        mounts = fixture_mount_arguments(profile)
+        command = command_for(sandbox, profile, descriptors=entries, opts=mounts)
+        argv = command[6:]
+        at = argv.index("--unshare-pid") + 1
+        argv[at:at] = ["--unshare-net"]
+        at = argv.index("--remount-ro")
+        argv[at:at] = ["--dir", str(work), "--chdir", str(work),
+                       "--bind-fd", str(workspace.fd), str(work),
+                       "--bind-fd", str(pinned.fd), str(result)]
+        argv[argv.index("--"):] = ["--", "/bin/true"]
+        completed = run_approved_command(tmp_path, [*command[:6], *argv], entries)
+        assert completed.returncode == 0, completed.stderr
+        assert b"APPROVED_GRAMMAR_REACHED_EXEC" in completed.stdout
+        assert result.read_bytes() == b""
     finally:
-        for fd in opened:raw_close(fd)
-        workspace.close();pinned.close();profile.close()
+        workspace.close(); pinned.close(); profile.close()

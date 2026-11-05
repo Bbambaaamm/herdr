@@ -122,7 +122,7 @@ def register_external_knowledge_tool(
             _, checked = guard.authorize_tool_call(
                 TOOL,
                 supplied,
-                caller_task_id=task_id,
+                caller_task_id=installation.resolve_caller_task_id(task_id),
                 consume_approval=authorized_call.get() != (
                     guard.grant.hash, TOOL, call_digest(TOOL, supplied)
                 ),

@@ -18,7 +18,8 @@ PYTHON = Path('/opt/herdr/releases/p0-5035d92-test/python/bin/python3.11')
 def test_sdk_skeleton_adds_no_writable_profile_mounts(tmp_path):
     source = tmp_path/'approved'
     source.mkdir()
-    values = {'config.yaml':b'fixture: true\n','.env':b'# no credentials\n'}
+    values = {'config.yaml':b'{"fixture":true}\n','.env':b'',
+              'auth.json':b'{"fixture_credential":"inert"}\n'}
     for name, value in values.items(): (source/name).write_bytes(value)
     with PrivateProfileSnapshot.from_approved(source,name='quantlab',approved_sha256={
             name:hashlib.sha256(value).hexdigest() for name,value in values.items()}) as snapshot:
@@ -36,8 +37,8 @@ def test_pinned_sdk_initializes_without_writing_approved_profile(tmp_path):
         pytest.skip('fixed pinned Hermes SDK and Linux staging home required')
     source = tmp_path / 'approved'
     source.mkdir()
-    values = {'config.yaml': b'model:\n  provider: none\n  default: fixture\n',
-              '.env': b'# isolated compatibility fixture\n', 'SOUL.md': b'You are the isolated profile compatibility fixture.\n'}
+    values = {'config.yaml': b'{"model":{"provider":"none","default":"fixture"}}\n',
+              '.env': b'', 'auth.json': b'{"fixture_credential":"inert"}\n'}
     for name, value in values.items(): (source / name).write_bytes(value)
     before = {name: hashlib.sha256(value).hexdigest() for name, value in values.items()}
     profile = '/home/agentops/.hermes/profiles/quantlab'

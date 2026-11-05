@@ -16,6 +16,7 @@ from tests.herdr.test_policy_launch import proof_scheduler
 def test_exact_root_plan_binds_argv_descriptors_and_attempt(tmp_path, monkeypatch):
     from herdr.security import InvocationIdentity
     import herdr.host_configuration as configuration
+    import herdr.private_mount_plan as mount_plan
     _, _, _, proof = proof_scheduler(tmp_path)
     identity = InvocationIdentity.from_dict(proof["identity"])
     argv = ["/usr/bin/bwrap", "--bind-fd", "7", "/tmp/work", "--", "/bin/true"]
@@ -27,7 +28,7 @@ def test_exact_root_plan_binds_argv_descriptors_and_attempt(tmp_path, monkeypatc
     real_lstat = Path.lstat
     fixture = tmp_path / "record"
     fixture.write_text("fixture")
-    monkeypatch.setattr(Path, "lstat", lambda selected: real_lstat(fixture if selected == path else selected))
+    monkeypatch.setattr(mount_plan.Path, "lstat", lambda selected: real_lstat(fixture if selected == path else selected))
     approved = ApprovedPrivateMountPlan.read(path, identity)
     envelope = approved.authorize(descriptors, argv)
     assert envelope["entries"] == descriptors

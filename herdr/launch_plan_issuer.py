@@ -218,12 +218,18 @@ def _grant(request, raw, profile):
 def _argv(plan, argv, workspace, profile):
     """Closed native pane grammar; no literal host writes or arbitrary command."""
     publication._shape(plan, argv, InvocationIdentity.from_dict(plan["identity"]))
+    from .credential_isolation import (SYSTEM_RUNTIME_FILES,
+                                       _approved_confinement, _loaded_profile_sha256)
+    confinement = _approved_confinement()
+    require(_loaded_profile_sha256() == confinement["loaded_sha256"],
+            "approved worker confinement differs from loaded kernel policy")
     end = argv.index("--")
     require(argv[end + 1:] == ["/bin/bash", "--noprofile", "--norc", "-i"], "native pane command required")
     arities = {"--ro-bind": 2, "--bind-fd": 2, "--ro-bind-fd": 2, "--ro-bind-data": 2,
                "--tmpfs": 1, "--dev": 1, "--proc": 1, "--dir": 1, "--chdir": 1,
                "--remount-ro": 1, "--setenv": 2, "--unsetenv": 1,
-               "--unshare-pid": 0, "--die-with-parent": 0}
+               "--unshare-pid": 0, "--die-with-parent": 0,
+               "--disable-userns": 0, "--cap-drop": 1}
     public = {"HOME": "/home/agentops", "PATH": "/run/herdr/policy-code/agent-stack/policy-bin:/usr/bin:/bin",
               "HERDR_DURABLE_SANDBOX": "1"}
     from .launch_environment import STARTUP_CONTROLS
@@ -235,24 +241,35 @@ def _argv(plan, argv, workspace, profile):
         op = argv[index]
         require(op in arities and index + arities[op] < end, "unsupported automatic mount operation")
         values = tuple(argv[index + 1:index + 1 + arities[op]])
-        if op == "--ro-bind": require(values == ("/", "/"), "unexpected literal mount")
+        if op == "--ro-bind":
+            require(values[0] == values[1] and values[0] in SYSTEM_RUNTIME_FILES,
+                    "unexpected literal mount")
         if op == "--setenv": require(len(values) == 2 and public.get(values[0]) == values[1], "non-public launch environment")
+        if op == "--cap-drop": require(values == ("ALL",), "complete capability drop required")
         if op == "--unsetenv":
             require(values[0] not in public, "required public environment cannot be unset")
             require(values[0] in cleanup_keys or re.fullmatch(r"LD_[A-Za-z0-9_]+", values[0]),
                     "only approved startup cleanup may unset inherited environment")
         if op == "--chdir": require(values == (workspace,), "launch workspace differs")
-        if op in {"--dir", "--tmpfs", "--remount-ro"}: require(publication._target(values[0]), "non-canonical mount target")
+        if op in {"--dir", "--tmpfs", "--remount-ro"}:
+            require(publication._target(values[0]) or
+                    (values == ("/",) and op in {"--tmpfs", "--remount-ro"}),
+                    "non-canonical mount target")
         operations.append((op, values)); index += 1 + arities[op]
-    required = {("--ro-bind", ("/", "/")), ("--dev", ("/dev",)), ("--proc", ("/proc",)),
+    required = {("--tmpfs", ("/",)), ("--remount-ro", ("/",)),
+                *(("--ro-bind", (name, name)) for name in SYSTEM_RUNTIME_FILES),
+                ("--dev", ("/dev",)), ("--proc", ("/proc",)),
                 ("--unshare-pid", ()), ("--die-with-parent", ()),
+                ("--disable-userns", ()), ("--cap-drop", ("ALL",)),
                 ("--chdir", (workspace,)), ("--tmpfs", ("/tmp",)),
                 ("--tmpfs", ("/run",)), ("--tmpfs", ("/home/agentops",)),
                 ("--tmpfs", ("/home/agentops/.config/herdr",)), ("--tmpfs", ("/opt/agent-platform",))}
-    require(required <= set(operations) and operations[:3] == [
-                ("--ro-bind", ("/", "/")), ("--dev", ("/dev",)), ("--unshare-pid", ())]
-            and sum(op == "--ro-bind" for op, _ in operations) == 1
-            and operations[-1] == ("--remount-ro", ("/home/agentops",))
+    runtime_mounts = [("--ro-bind", (name, name)) for name in sorted(SYSTEM_RUNTIME_FILES)]
+    require(required <= set(operations) and operations[:1 + len(runtime_mounts)] == [
+                ("--tmpfs", ("/",)), *runtime_mounts]
+            and sum(op == "--ro-bind" for op, _ in operations) == len(runtime_mounts)
+            and operations[-2:] == [("--remount-ro", ("/home/agentops",)),
+                                     ("--remount-ro", ("/",))]
             and all(op != "--dev" or values == ("/dev",) for op, values in operations)
             and all(op != "--proc" or values == ("/proc",) for op, values in operations),
             "complete native private namespace required")
@@ -265,7 +282,8 @@ def _argv(plan, argv, workspace, profile):
         if entry["kind"] == "reserved-result": anchors.add(isolated_destination_anchor(entry["target"]))
     for op, values in operations:
         if op in {"--dir", "--tmpfs", "--remount-ro"}:
-            require(any(Path(values[0]) == root or root in Path(values[0]).parents for root in anchors),
+            require((values == ("/",) and op in {"--tmpfs", "--remount-ro"})
+                    or any(Path(values[0]) == root or root in Path(values[0]).parents for root in anchors),
                     "namespace construction outside private anchors")
     for index, (op, values) in enumerate(operations):
         if op not in {"--bind-fd", "--ro-bind-fd", "--ro-bind-data"}: continue
@@ -412,7 +430,8 @@ def _physical(plan, argv, grant, profile, fds, raw):
                     require(any(rule.tool in {"write_file", "patch"} and any(
                         Path(target) == Path(root) or Path(root) in Path(target).parents for root in rule.allowed_roots)
                         for rule in grant.tool_rules), "write mount exceeds host grant")
-        require(seen == set(known) and profiles == set(profile["files"]) and result_count == 1
+        require(seen == set(known) and "auth.json" in profile["files"]
+                and profiles == set(profile["files"]) - {"auth.json"} and result_count == 1
                 and workspace_count == 1 and resolver_count == 1 and special == {str(BUNDLE_TARGET), "/run/herdr-bootstrap",
                     "/run/herdr-policy/bootstrap-authority.sock", "/home/agentops/.local/bin/herdr"},
                 "incomplete approved launch sources")
@@ -649,7 +668,8 @@ def _serve_connections(listener, fd_listener, custody, *, stop=None):
             with connection:
                 try:
                     if role == 'fds':
-                        custody.redeem(connection)
+                        from .native_preparation_transport import dispatch_existing_custody
+                        dispatch_existing_custody(custody, connection)
                         return
                     result = issue_request(connection, custody=custody)
                 except (SecurityError, PrivateProfileError, OSError, ValueError, KeyError, TypeError, StopIteration):

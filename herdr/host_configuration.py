@@ -119,8 +119,9 @@ def _private_profile(raw):
     credentials or self-approve changed file hashes. Native/provider validation
     is a separate acceptance gate, not implied by this offline preflight.
     """
-    require(isinstance(raw,dict) and set(raw) in ({"profile","credential_approval"},
-            {"profile","credential_approval","plan_handoff"}),
+    require(isinstance(raw,dict) and set(raw)-{"self_observation"} in ({"profile","credential_approval"},
+            {"profile","credential_approval","plan_handoff"}) and ("self_observation" not in raw or
+            raw["self_observation"] == "authenticated-root-kernel-v1"),
             "closed private host policy required")
     definition=raw["profile"]
     require(isinstance(definition,dict) and set(definition)=={"name","source","files"},
@@ -228,6 +229,17 @@ def build_host_policy_factory(*,parent_grant=None,configuration_path=HOST_POLICY
     if private:
         profile,_,_=_private_profile(raw["private_launch"])
         def preflight(name):
+            from .credential_isolation import _approved_confinement, _loaded_profile_sha256
+            if raw["private_launch"].get("self_observation") == "authenticated-root-kernel-v1":
+                from .bootstrap_self_observation import host_preflight
+                measured = host_preflight()
+                confinement = measured["approval"]
+                require(measured["observed_loaded_sha256"] == confinement["loaded_sha256"],
+                        "root measured worker policy differs from approval")
+            else:
+                confinement = _approved_confinement()
+                require(_loaded_profile_sha256() == confinement["loaded_sha256"],
+                        "host worker confinement differs from approved loaded policy")
             current=_read_configuration(configuration_path)
             require(current==raw,"host private policy changed before profile seal")
             approved,expiry,floor=_private_profile(current["private_launch"])
@@ -257,7 +269,8 @@ def build_host_policy_factory(*,parent_grant=None,configuration_path=HOST_POLICY
                                       automatic_issuer=issuer)
         options=dict(approved_profile=profile,profile_preflight=preflight,private_plan_handoff=handoff,
                      parent_approved_profile=profile if parent_grant is not None else None,
-                     retained_parent_verify=retained_parent_verify)
+                     retained_parent_verify=retained_parent_verify,
+                     bootstrap_self_observation=raw["private_launch"].get("self_observation"))
     factory=HostPolicyLaunchFactory(code=code,runtime=runtime,storage=storage,authorize=authorize,
         writable_roots=tuple(x.workspace_root for x in grants.values()),parent_grant=parent_grant,
         **options)
@@ -283,6 +296,8 @@ def _verified_parent(task_file,identity):
         stamp=lambda x:(x.st_dev,x.st_ino,x.st_size,x.st_mtime_ns,x.st_ctime_ns,x.st_mode,x.st_uid)
         require(stamp(info)==stamp(after)==stamp(named),"canonical task changed during grant read")
     finally:os.close(fd)
+    from .canonical_case_claim import require_case_births
+    require_case_births(expected_root, task)
     session=task.get("execution_session")
     require(isinstance(session,dict) and task["id"]==identity["task_id"]
             and task["run_token"]==identity["run_token"]
@@ -365,6 +380,8 @@ def read_canonical_parent(root, task_id, run_token):
                     task=json.loads(raw,object_pairs_hook=unique)
                     require(isinstance(task,dict) and task.get("id")==task_id,"canonical parent identity invalid")
                     if task.get("run_token")==run_token:
+                        from .recovery_unknown import held
+                        require(not held(task), "terminal_unknown_requires_operator_reconciliation")
                         found.append(task)
                 finally:
                     os.close(fd)

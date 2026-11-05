@@ -272,6 +272,10 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
     class Guard:
         aliases = {}
         checks = []
+        sdk_observations = []
+        def observe_sdk(self, row):
+            self.sdk_observations.append(row)
+            return True
         approval_required = False
         approval_used = False
         grant = types.SimpleNamespace(hash="a"*64, identity=types.SimpleNamespace(task_id="task"), scope=types.SimpleNamespace(tools=(), data_classes=(DataClass.INTERNAL,)), provider_routes=(types.SimpleNamespace(provider="provider-a", base_url="https://provider-a.example.invalid/v1", api_mode="openai", regions=("eu-central",), data_classes=("internal",), max_egress="region_bound", max_retention="limited", training="excluded", credential_refs=()),))
@@ -406,6 +410,8 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
         with pytest.raises(PolicyDenied, match="provider_not_granted"):
             loop.perform_api_call(agent)
         assert callbacks == []
+        assert {row["phase"] for row in policy.sdk_observations} == {"sdk_provider_check", "sdk_api_call"}
+        assert all(row["error_type"] == "PolicyDenied" for row in policy.sdk_observations)
         agent.provider = "provider-a"
         agent.base_url = "https://unexpected.example.invalid/v1"
         with pytest.raises(PolicyDenied, match="provider_endpoint_denied"):
@@ -455,6 +461,7 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
             with pytest.raises(WorkContractError):
                 loop.perform_api_call(agent)
             assert (len(effects), len(network_requests)) == before
+        assert any(row["phase"] == "sdk_middleware" for row in policy.sdk_observations)
         # A preexisting incompatible cap must stop before either reservation or transport.
         from herdr.work_budget_configuration import model_request_ceiling
         policy.model_request_ceiling = lambda route: model_request_ceiling({**route, "max_output_tokens": 100})
@@ -469,6 +476,82 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
             assert (len(effects), len(network_requests)) == before
             assert request == {**original, "model": model_name, **wrong_cap}
             assert agent._disable_streaming is False
+        # A NoNet SDK uses the host for its exact reserved request, including
+        # known HTTP errors. It never invokes the original direct transport.
+        saved_route = policy.grant.provider_routes
+        saved_authorize = policy.authorize_provider
+        saved_agent = (agent.provider, agent.base_url, agent.api_mode, agent.model,
+                       getattr(agent, "_credential_pool", None), getattr(agent, "api_key", None))
+        policy.grant.runtime_assurance = types.SimpleNamespace(
+            network_access=types.SimpleNamespace(value="none"))
+        route = types.SimpleNamespace(**vars(saved_route[0]))
+        route.provider = "nous"; route.base_url = "https://inference-api.nousresearch.com/v1"
+        route.credential_refs = ("pool:nous:entry-1",)
+        policy.grant.provider_routes = (route,)
+        policy.authorize_provider = lambda request: None
+        agent.provider = "nous"; agent.base_url = route.base_url
+        agent.model = "test-model:free"; agent.api_key = "private-test-key"
+        agent._credential_pool = types.SimpleNamespace(provider="nous", entries=lambda: [
+            types.SimpleNamespace(id="entry-1", runtime_api_key="private-test-key")])
+        agent._test_model_request = {"model": agent.model,
+            "messages": [{"role": "user", "content": "bounded host request"}]}
+        converted = []
+        chat_module = types.ModuleType("openai.types.chat")
+        class Completion:
+            @staticmethod
+            def model_validate(value):
+                converted.append(value)
+                return types.SimpleNamespace(choices=value["choices"])
+        chat_module.ChatCompletion = Completion
+        monkeypatch.setitem(sys.modules, "openai.types.chat", chat_module)
+        host_calls = []
+        answer = {"kind": "http_response", "http_status": 200,
+                  "body": {"choices": [{"message": {"content": "ACK"}}]}}
+        def execute(receipt, request_id, payload):
+            host_calls.append((receipt, request_id, payload))
+            return answer
+        policy.execute_model_effect = execute
+        network_before = len(network_requests)
+        response = loop.perform_api_call(agent)
+        assert response.choices and converted == [answer["body"]]
+        assert len(host_calls) == 1 and host_calls[0][1] == "sdk:fixture"
+        assert host_calls[0][2]["max_tokens"] == 100
+        assert [row[0] for row in effects[-2:]] == ["start", "returned"]
+        assert len(network_requests) == network_before
+        answer = {"kind": "unknown", "http_status": None, "error_type": "TimeoutError"}
+        effects_before = len(effects)
+        with pytest.raises(PolicyDenied, match="delivery_unknown"):
+            loop.perform_api_call(agent)
+        assert [row[0] for row in effects[effects_before:]] == ["start"]
+        assert len(network_requests) == network_before
+        answer = {"kind": "http_response", "http_status": 429, "body": {"error": "limited"}}
+        with pytest.raises(PolicyDenied, match="provider_http_error"):
+            loop.perform_api_call(agent)
+        assert [row[0] for row in effects[-2:]] == ["start", "returned"]
+        assert len(network_requests) == network_before
+        # Actual ordinary launches currently attest a shared network namespace.
+        # The authenticated host port must still win over the SDK's direct client.
+        policy.grant.runtime_assurance.network_access.value = "global"
+        answer = {"kind": "http_response", "http_status": 200,
+                  "body": {"choices": [{"message": {"content": "HOST ACK"}}]}}
+        before_global = (len(host_calls), len(network_requests))
+        response = loop.perform_api_call(agent)
+        assert response.choices
+        assert len(host_calls) == before_global[0] + 1
+        assert len(network_requests) == before_global[1]
+        assert [row[0] for row in effects[-2:]] == ["start", "returned"]
+        # NoNet routes continue to reject an unsupported provider profile.
+        policy.grant.runtime_assurance.network_access.value = "none"
+        agent.model = "paid-model"
+        effects_before = len(effects)
+        with pytest.raises(PolicyDenied, match="profile_unsupported"):
+            loop.perform_api_call(agent)
+        assert len(effects) == effects_before
+        policy.grant.provider_routes = saved_route
+        policy.authorize_provider = saved_authorize
+        del policy.grant.runtime_assurance
+        (agent.provider, agent.base_url, agent.api_mode, agent.model,
+         agent._credential_pool, agent.api_key) = saved_agent
         agent.model = original["model"]
         policy.budget_required = lambda: False
         policy.grant.provider_routes[0].api_mode = "openai"
@@ -919,3 +1002,26 @@ finally:
                             env=env, capture_output=True, text=True, timeout=45)
     assert result.returncode == 0, result.stdout + result.stderr
     assert json.loads(result.stdout.strip().splitlines()[-1])["actual_sdk_formatter_json"] is True
+
+
+def test_runtime_file_roots_add_only_attested_write_leaves_without_narrowing_delegation():
+    from pathlib import Path
+    parent = '/work/parent'
+    rules = {name: types.SimpleNamespace(allowed_roots=(parent,))
+             for name in ('read_file', 'write_file', 'patch', 'search_files')}
+    assurance = types.SimpleNamespace(sandbox_verified=True, writable_roots=(
+        parent + '/own.py', '/work/parent-other/foreign.py', '/run/cache'))
+    grant = types.SimpleNamespace(runtime_assurance=assurance)
+    roots = hermes_guard._runtime_file_roots(grant, rules)
+    assert roots == {parent, parent + '/own.py'}
+    assert rules['write_file'].allowed_roots == (parent,)
+    assurance.sandbox_verified = False
+    assert hermes_guard._runtime_file_roots(grant, rules) == {parent}
+    assert hermes_guard._runtime_file_roots(types.SimpleNamespace(), rules) == {parent}
+
+
+def test_read_only_logical_rule_cannot_acquire_an_attested_write_root():
+    rules = {'read_file': types.SimpleNamespace(allowed_roots=('/work',))}
+    grant = types.SimpleNamespace(runtime_assurance=types.SimpleNamespace(
+        sandbox_verified=True, writable_roots=('/work/child/result.py',)))
+    assert hermes_guard._runtime_file_roots(grant, rules) == {'/work'}

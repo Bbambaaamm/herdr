@@ -2205,3 +2205,104 @@ def test_private_root_workspace_mount_uses_effective_grant(tmp_path, tool, root_
 def test_private_root_workspace_denies_an_untyped_grant(tmp_path):
     with pytest.raises(RuntimeError, match="typed root workspace grant"):
         worker._root_workspace_writable({}, tmp_path)
+
+
+def test_policy_failure_diagnostic_retains_root_cause_without_sensitive_text(monkeypatch):
+    from herdr import host_configuration
+    from herdr.security import SecurityError
+    secret = "credential-value-must-never-be-retained"
+    def fail():
+        raise SecurityError(secret)
+    monkeypatch.setattr(worker, "HOST_POLICY_LAUNCH_FACTORY", None)
+    monkeypatch.setattr(host_configuration, "build_host_policy_factory", fail)
+    with pytest.raises(RuntimeError) as captured:
+        worker._root_policy_factory()
+    report = worker._policy_failure_diagnostic(captured.value)
+    assert [item["error_type"] for item in report["chain"]] == ["RuntimeError", "SecurityError"]
+    assert any(frame["file"] == "agent-stack/bin/agent-task-worker"
+               for item in report["chain"] for frame in item["frames"])
+    assert secret not in json.dumps(report)
+    assert "task_invocation_policy_missing" not in json.dumps(report)
+    assert str(ROOT) not in json.dumps(report)
+
+
+def test_policy_failure_diagnostic_bounds_cycles_depth_and_unknown_type():
+    class SensitiveException(Exception):
+        pass
+    failures = [SensitiveException("secret") for _ in range(9)]
+    for before, after in zip(failures, failures[1:]):
+        before.__cause__ = after
+    failures[-1].__cause__ = failures[0]
+    report = worker._policy_failure_diagnostic(failures[0])
+    assert len(report["chain"]) == 4
+    assert all(row == {"error_type": "other", "frames": []} for row in report["chain"])
+    failures[0].__cause__ = failures[0]
+    assert len(worker._policy_failure_diagnostic(failures[0])["chain"]) == 1
+
+
+def test_policy_failure_diagnostic_excludes_external_source_paths():
+    namespace = {}
+    try:
+        exec(compile("raise RuntimeError('secret-message')", "/private/credential-name/auth.py", "exec"), namespace)
+    except RuntimeError as exc:
+        report = worker._policy_failure_diagnostic(exc)
+    assert report["chain"] == [{"error_type": "RuntimeError", "frames": []}]
+    assert "credential-name" not in json.dumps(report)
+
+
+def test_blocked_policy_diagnostic_survives_task_persistence_without_new_attempt(tmp_path):
+    configure_paths(tmp_path)
+    task = base_task()
+    worker.prepare_attempt(task)
+    original = (task["run_token"], task["idempotency_key"], task["attempts"])
+    path = worker.RUNNING / "task-1.json"
+    task["invocation_policy_diagnostic"] = worker._policy_failure_diagnostic(RuntimeError("secret"))
+    path.write_text(json.dumps(task))
+    worker.block_task(path, task, "task_invocation_policy_unavailable", "Host invocation policy must be supplied before execution.")
+    saved = json.loads((worker.BLOCKED / path.name).read_text())
+    assert saved["invocation_policy_diagnostic"] == task["invocation_policy_diagnostic"]
+    assert (saved["run_token"], saved["idempotency_key"], saved["attempts"]) == original
+    assert saved["attempt_state"] == "blocked"
+    assert not list(worker.PENDING.iterdir())
+    assert "secret" not in json.dumps(saved)
+
+
+@pytest.mark.parametrize("stage", ["configuration", "prepare"])
+def test_worker_policy_denial_keeps_safe_cause_and_never_runs_sdk(tmp_path, monkeypatch, stage):
+    from herdr import host_configuration
+    from herdr.security import SecurityError
+    configure_paths(tmp_path)
+    task = base_task()
+    worker.prepare_attempt(task)
+    admitted = []
+    original = (task["idempotency_key"], task["attempts"])
+    path = worker.RUNNING / "task-1.json"
+    path.write_text(json.dumps(task))
+    monkeypatch.setattr(worker, "freeze_plan", lambda *args: None)
+    monkeypatch.setattr(worker, "decide_model_route", lambda current: {"tier": "free", "model": "free-model"})
+    monkeypatch.setattr(worker, "record_model_route", lambda *args: None)
+    def fail():
+        raise SecurityError("sensitive-original-error")
+    monkeypatch.setattr(host_configuration, "build_host_policy_factory", fail)
+    monkeypatch.setattr(worker, "HOST_POLICY_LAUNCH_FACTORY", None)
+    def denied(current):
+        admitted.append(current["run_token"])
+        if stage == "configuration":
+            worker._root_policy_factory()
+        try:
+            fail()
+        except SecurityError as exc:
+            raise RuntimeError("task_invocation_policy_denied:" + str(exc)) from exc
+    monkeypatch.setattr(worker, "create_task_session", denied)
+    def forbidden(*args, **kwargs):
+        pytest.fail("policy denial cannot call or restart SDK")
+    monkeypatch.setattr(worker, "run_prompt", forbidden)
+    assert worker.main(path) == 1
+    saved = json.loads((worker.BLOCKED / path.name).read_text())
+    assert saved["attempt_state"] == "blocked"
+    assert saved["result_status"] == "blocked"
+    assert [row["error_type"] for row in saved["invocation_policy_diagnostic"]["chain"]] == ["RuntimeError", "SecurityError"]
+    assert (saved["idempotency_key"], saved["attempts"]) == original
+    assert admitted == [saved["run_token"]]
+    assert "sensitive-original-error" not in json.dumps(saved)
+    assert not list(worker.PENDING.iterdir())

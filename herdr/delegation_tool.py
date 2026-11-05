@@ -134,7 +134,7 @@ def register_delegation_tool(installation, registry, authorized_call, call_diges
             _arguments(arguments)
             supplied = dict(arguments)
             _, checked = guard.authorize_tool_call(
-                TOOL, supplied, caller_task_id=task_id,
+                TOOL, supplied, caller_task_id=installation.resolve_caller_task_id(task_id),
                 consume_approval=authorized_call.get() != (
                     guard.grant.hash, TOOL, call_digest(TOOL, supplied)))
             admitted = _arguments(checked)

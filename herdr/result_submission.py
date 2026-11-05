@@ -269,7 +269,7 @@ def register_result_tool(installation, registry, authorized_call, call_digest):
             if (os.environ.get("HERDR_DURABLE_SANDBOX") != "1" or
                     any(os.environ.get(key) != str(getattr(guard.grant.identity,field)) for field,key in IDENTITY_ENV.items())):
                 raise PolicyDenied("result_identity_mismatch")
-            guard.authorize_tool_call(TOOL, raw, caller_task_id=task_id,
+            guard.authorize_tool_call(TOOL, raw, caller_task_id=installation.resolve_caller_task_id(task_id),
                 consume_approval=authorized_call.get() != (guard.grant.hash,TOOL,call_digest(TOOL,raw)))
             return json.dumps(submit(guard,raw,consume_approval=False),sort_keys=True)
         except PolicyDenied as exc:

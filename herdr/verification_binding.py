@@ -14,8 +14,15 @@ def commit_footer(plan):
 def verify_commit_binding(plan, artifact, document):
     if not isinstance(document, dict) or document.get("sha") != artifact.commit_sha:
         raise EvidenceError("reviewed commit origin differs from artifact")
-    message = document.get("commit", {}).get("message")
-    if not isinstance(message, str) or len(message.encode("utf-8")) > 65536:
+    commit = document.get("commit")
+    message = commit.get("message") if isinstance(commit, dict) else None
+    if not isinstance(message, str):
+        raise EvidenceError("reviewed commit has no bounded specification binding")
+    try:
+        encoded = message.encode("utf-8")
+    except UnicodeError as exc:
+        raise EvidenceError("reviewed commit has no bounded specification binding") from exc
+    if len(encoded) > 65536:
         raise EvidenceError("reviewed commit has no bounded specification binding")
     rows = [line[len(PREFIX):] for line in message.splitlines() if line.startswith(PREFIX)]
     if len(rows) != 1:

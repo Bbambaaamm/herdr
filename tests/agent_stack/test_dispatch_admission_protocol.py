@@ -241,3 +241,45 @@ def test_real_parent_death_fence_hands_over_only_after_actual_worker_ack(tmp_pat
             os.kill(child_pid, signal.SIGKILL)
             wait_dead(child_pid)
         coordinator.stderr.close()
+
+
+@pytest.mark.parametrize('wrapper_seconds', [45.0,60.0])
+def test_slow_immutable_wrapper_can_acknowledge_without_losing_its_claim(tmp_path,monkeypatch,wrapper_seconds):
+    dispatcher=load_dispatcher(tmp_path);pending=task_file(tmp_path,run_token='retained-run',fencing_token=7)
+    running=dispatcher.RUNNING/'one.json';os.replace(pending,running);claimed=running.read_bytes()
+    clock={'now':0.0,'stopped':False,'ack':False};pid=os.getpid();ticks=dispatcher.process_start_ticks(pid);parent=os.getppid();nonce='fresh-admission'
+    def poll():
+        if clock['now']>=wrapper_seconds and not clock['ack']:
+            task=json.loads(running.read_bytes());task['dispatch_admission']={'nonce':nonce,'pid':pid,'start_ticks':ticks,'parent_pid':parent}
+            running.write_text(json.dumps(task));clock['ack']=True
+        return None
+    monkeypatch.setattr(dispatcher,'time',SimpleNamespace(monotonic=lambda:clock['now'],sleep=lambda n:clock.__setitem__('now',clock['now']+n)))
+    monkeypatch.setattr(dispatcher,'stop_unadmitted_child',lambda p:clock.__setitem__('stopped',True))
+    result=dispatcher.await_dispatch_admission(SimpleNamespace(pid=pid,poll=poll),running,claimed,nonce,parent)
+    assert result==0,'dispatcher timed out before the immutable wrapper could finish'
+    assert clock['ack'] and not clock['stopped'] and not list((tmp_path/'blocked').iterdir())
+    kept=json.loads(running.read_bytes());assert kept['run_token']=='retained-run' and kept['fencing_token']==7
+
+
+def test_default_startup_allowance_still_stops_an_unacknowledged_worker(tmp_path,monkeypatch):
+    dispatcher=load_dispatcher(tmp_path);pending=task_file(tmp_path);running=dispatcher.RUNNING/'one.json';os.replace(pending,running);claimed=running.read_bytes()
+    clock={'now':0.0,'stopped':False}
+    monkeypatch.setattr(dispatcher,'time',SimpleNamespace(monotonic=lambda:clock['now'],sleep=lambda n:clock.__setitem__('now',clock['now']+n)))
+    monkeypatch.setattr(dispatcher,'stop_unadmitted_child',lambda p:clock.__setitem__('stopped',True))
+    assert dispatcher.await_dispatch_admission(SimpleNamespace(pid=os.getpid(),poll=lambda:None),running,claimed,'nonce',os.getppid())==1
+    assert clock['stopped'] and 60.0<clock['now']<90.0
+    retained=json.loads((tmp_path/'blocked/one.json').read_bytes())
+    assert retained['automatic_retry_allowed'] is False and retained['fencing_token']==0
+
+
+def test_slow_start_does_not_accept_an_acknowledgement_for_another_nonce(tmp_path,monkeypatch):
+    dispatcher=load_dispatcher(tmp_path);pending=task_file(tmp_path,run_token='keep',fencing_token=7);running=dispatcher.RUNNING/'one.json';os.replace(pending,running);claimed=running.read_bytes()
+    clock={'now':0.0,'stopped':False};pid=os.getpid();ticks=dispatcher.process_start_ticks(pid);parent=os.getppid()
+    def poll():
+        if clock['now']>=45.0:
+            task=json.loads(running.read_bytes());task['dispatch_admission']={'nonce':'wrong','pid':pid,'start_ticks':ticks,'parent_pid':parent};running.write_text(json.dumps(task))
+        return None
+    monkeypatch.setattr(dispatcher,'time',SimpleNamespace(monotonic=lambda:clock['now'],sleep=lambda n:clock.__setitem__('now',clock['now']+n)))
+    monkeypatch.setattr(dispatcher,'stop_unadmitted_child',lambda p:clock.__setitem__('stopped',True))
+    assert dispatcher.await_dispatch_admission(SimpleNamespace(pid=pid,poll=poll),running,claimed,'correct',parent)==1
+    assert clock['stopped'] and json.loads(running.read_bytes())['run_token']=='keep'

@@ -6,8 +6,8 @@ or sources: admission requires a stable root-published record outside the repo.
 from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
-import os
-from pathlib import Path
+from .observed_proc import os
+from .observed_proc import Path
 import stat
 
 from .security import SecurityError, InvocationIdentity, canonical_json_bytes
@@ -22,7 +22,7 @@ def coherent_result_fd(path, expected):
     require(path.is_absolute() and str(path)==os.path.normpath(str(path)),"private result path invalid")
     class OpenHow(ctypes.Structure):
         _fields_=[("flags",ctypes.c_uint64),("mode",ctypes.c_uint64),("resolve",ctypes.c_uint64)]
-    root=os.open("/",os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+    root=os.open("/",os.O_PATH | os.O_DIRECTORY|os.O_CLOEXEC)
     fd=-1
     try:
         libc=ctypes.CDLL(None,use_errno=True);libc.syscall.restype=ctypes.c_long
@@ -134,14 +134,14 @@ class PinnedLaunchPath:
         self.logical, self.root, self.directory = path, path.parent, directory
         self.reservation=reservation
         isolated_destination_anchor(path)
-        parent = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        parent = os.open("/", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
         from .owned_write_mounts import _mount_id
         anchor_mount_id = _mount_id(parent)
         protected_chain = True
         self.fd = -1
         try:
             for part in path.parts[1:-1]:
-                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                child = os.open(part, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
                                 dir_fd=parent)
                 os.close(parent)
                 parent = child

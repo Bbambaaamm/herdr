@@ -21,10 +21,9 @@ def fixture_profile(tmp_path):
     root = tmp_path / "approved-profile"
     root.mkdir()
     content = {
-        "config.yaml": b"model: fixture-free-only\n",
-        ".env": b"DUMMY_TOKEN_FOR_TESTS=not-a-secret\n",
+        "config.yaml": b'{"model":"fixture-free-only","api_key":null}\n',
+        ".env": b"",
         "auth.json": b'{"fake_credential":"fixture"}\n',
-        "prefill.json": b'["approved fixture"]\n',
     }
     for name, raw in content.items():
         (root / name).write_bytes(raw)
@@ -39,7 +38,7 @@ def test_freezes_approved_inputs_and_cannot_mutate_sealed_memfd(tmp_path):
     ) as profile:
         profile.verify()
         assert profile.destination == HOME / ".hermes/profiles/quantlab"
-        assert len(profile.files) == 4
+        assert len(profile.files) == 3
         before = {record.relative: os.pread(record.fd, record.size, 0)
                   for record in profile.files}
         assert before == values

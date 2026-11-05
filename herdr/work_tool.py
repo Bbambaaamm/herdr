@@ -33,7 +33,7 @@ def register_work_tool(installation, registry, authorized_call, call_digest):
                     or not isinstance(raw["request_id"], str)
                     or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", raw["request_id"])):
                 raise PolicyDenied("work_request_invalid")
-            guard.authorize_tool_call(TOOL, raw, caller_task_id=task_id,
+            guard.authorize_tool_call(TOOL, raw, caller_task_id=installation.resolve_caller_task_id(task_id),
                 consume_approval=authorized_call.get() != (guard.grant.hash, TOOL, call_digest(TOOL, raw)))
             outcome = guard.verify_work(raw["request_id"], handoff=raw.get("handoff"), consume_approval=False)
             if outcome.get("submission") is not None:

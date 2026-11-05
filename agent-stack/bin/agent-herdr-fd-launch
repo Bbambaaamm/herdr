@@ -6,6 +6,10 @@ from pathlib import Path
 import sys
 
 source = Path(__file__).with_name('agent_durable_sandbox.py')
+# The approved entrypoint and sibling sandbox are loaded from the same
+# immutable policy tree.  Isolated Python omits that tree from sys.path;
+# admit its package directory explicitly before the sandbox imports it.
+sys.path.insert(0, str(source.resolve().parents[2]))
 loader = SourceFileLoader('approved_native_fd_sandbox', str(source))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 module = importlib.util.module_from_spec(spec)

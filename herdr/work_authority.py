@@ -18,8 +18,12 @@ from .evidence import canonical
 _WORK_REQUEST_TIMEOUT_SECONDS = 60
 
 
-def _work_response(payload, *, max_bytes):
-    deadline = time.monotonic() + _WORK_REQUEST_TIMEOUT_SECONDS
+_SDK_OBSERVATION_TIMEOUT_SECONDS = 0.5
+
+
+def _work_response(payload, *, max_bytes, timeout_seconds=None):
+    seconds = _WORK_REQUEST_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+    deadline = time.monotonic() + seconds
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         def bounded(operation, *args):
             remaining = deadline - time.monotonic()
@@ -77,6 +81,68 @@ class WorkAuthorityClient:
         except PolicyDenied:raise
         except (EvidenceError,OSError,ValueError,TypeError) as exc:
             raise PolicyDenied("work_budget_unavailable") from exc
+
+    def model_transport(self, identity, grant_sha256, request_id, receipt, payload):
+        """Two bounded frames; the authenticated header precedes the large body."""
+        from .host_model_transport import MAX_BODY, MAX_RESPONSE
+        import hashlib
+        body = canonical(payload)
+        require(0 < len(body) <= MAX_BODY, "bounded host model body required")
+        header = canonical({"op": "work-model", "identity": identity.to_json(),
+            "grant_sha256": grant_sha256, "operation_id": receipt["operation_id"],
+            "request_id": request_id, "body_bytes": len(body),
+            "body_sha256": hashlib.sha256(body).hexdigest()}) + b"\n"
+        require(len(header) <= 8192, "bounded host model header required")
+        deadline = time.monotonic() + receipt["max_work_ms"] / 1000
+        def remaining(connection):
+            seconds = deadline - time.monotonic()
+            require(seconds > 0, "host model exchange deadline exhausted")
+            connection.settimeout(seconds)
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                remaining(connection); connection.connect(str(SOCKET_PATH))
+                remaining(connection); connection.sendall(header)
+                ack = bytearray()
+                while len(ack) < 32 and not ack.endswith(b"\n"):
+                    remaining(connection)
+                    part = connection.recv(1)
+                    if not part: break
+                    ack.extend(part)
+                require(bytes(ack) == b"model-body-ready\n", "host model header denied")
+                remaining(connection); connection.sendall(body)
+                result = bytearray()
+                while len(result) <= MAX_RESPONSE:
+                    remaining(connection)
+                    part = connection.recv(min(65536, MAX_RESPONSE + 1 - len(result)))
+                    if not part: break
+                    result.extend(part)
+                    if b"\n" in result: break
+            require(len(result) <= MAX_RESPONSE and result.endswith(b"\n")
+                    and result.count(b"\n") == 1, "bounded host model result required")
+            value = json.loads(result)
+            require(type(value) is dict and value.get("kind") in
+                    {"http_response", "invalid_response", "unknown"}, "host model result invalid")
+            return value
+        except PolicyDenied:
+            raise
+        except Exception as error:
+            raise PolicyDenied("host_model_transport_unavailable") from error
+
+    def observe(self, identity, grant_sha256, observation):
+        # No retry: a lost ACK may follow a durable observation. This transport
+        # does not authorize any effect and cannot change budget delivery state.
+        from .sdk_observation import validate_observation
+        try:
+            require(isinstance(identity, InvocationIdentity), "SDK observation identity required")
+            request = {"op": "work-sdk-observation", "identity": identity.to_json(),
+                       "grant_sha256": grant_sha256,
+                       "observation": validate_observation(observation)}
+            payload = canonical(request) + b"\n"
+            require(len(payload) <= 8192, "bounded SDK observation required")
+            return _work_response(payload, max_bytes=128,
+                timeout_seconds=_SDK_OBSERVATION_TIMEOUT_SECONDS) == b"observation-ok\n"
+        except Exception:
+            return False
 
     def external_knowledge(self, identity, grant_sha256, provider_id, request):
         from .external_knowledge import KnowledgeContractError, KnowledgeRequest, KnowledgeResponse
@@ -175,6 +241,29 @@ def dispatch_work_connection(owner, connection):
         # Context-exit expiry must never kill the authority listener.
         return True
 
+def _observe_authenticated_denial(owner, peer, binding, operation, error):
+    """Host-only best effort; historical ports keep their original denial."""
+    try:
+        from types import MethodType
+        from .work_contract_host import HostWorkContractFactory
+        from .host_work_denial import describe_denial
+        from .work_lifetime import require_work_time
+        callback = getattr(owner, "work_authority", None)
+        if (type(callback) is not MethodType
+                or type(callback.__self__) is not HostWorkContractFactory
+                or callback.__func__ is not HostWorkContractFactory.authorize_invocation):
+            return False
+        identity, grant_sha256 = binding
+        require_work_time()
+        # This reports the request's earlier verified binding, not live authority
+        # now: an exiting peer/expired grant must not erase its host failure.
+        return callback.__self__.observe_host_denial(
+            identity, grant_sha256, describe_denial(operation, error, peer)) is True
+    except BaseException:
+        # No observer failure, including failed fsync, may replace the denial.
+        return False
+
+
 def _dispatch_work_connection(owner, connection):
     """Only the exact observed stage-two process can ask about its phase.
 
@@ -185,6 +274,7 @@ def _dispatch_work_connection(owner, connection):
     if receipt is None:
         return False
     accepted_peer = False
+    authenticated_binding, operation = None, None
     try:
         pid, uid, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
         if pid != receipt.peer_pid or uid != os.geteuid():
@@ -204,10 +294,64 @@ def _dispatch_work_connection(owner, connection):
         require_work_time()
         require(request.get("identity") == owner.launch.identity.to_json()
                 and request.get("grant_sha256") == owner.launch.grant.hash, "work authority binding invalid")
-        if request.get("op") == "work-budget":
+        authenticated_binding = (owner.launch.identity, owner.launch.grant.hash)
+        case_guard = getattr(owner, "case_live_guard", None)
+        if case_guard is not None:
+            require(callable(case_guard), "canonical case guard invalid")
+            case_guard()
+        if request.get("op") == "work-sdk-observation":
+            from .sdk_observation import validate_observation
+            require(set(request) == {"op", "identity", "grant_sha256", "observation"},
+                    "closed SDK observation request required")
+            observation = validate_observation(request["observation"])
+            operation = "work-sdk-observation"
+            callback = getattr(owner, "work_observe", None)
+            require(callable(callback), "host SDK observation unavailable")
+            require(callback(owner.launch.identity, owner.launch.grant.hash, observation) is True,
+                    "host SDK observation denied")
+            require_work_time()
+            after = inspect_peer(pid)
+            require(after == peer and owner.launch.grant.is_active(),
+                    "SDK observation peer or grant changed")
+            owner.launch.mount.verify_mounted(pid, owner.launch.sealed)
+            require_work_time()
+            connection.sendall(b"observation-ok\n")
+        elif request.get("op") == "work-model":
+            from .host_model_transport import MAX_BODY, MAX_RESPONSE, execute_host_model
+            import re
+            require(set(request) == {"op", "identity", "grant_sha256", "operation_id",
+                    "request_id", "body_bytes", "body_sha256"}
+                    and type(request["body_bytes"]) is int and 0 < request["body_bytes"] <= MAX_BODY
+                    and isinstance(request["request_id"], str)
+                    and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request["request_id"])
+                    and all(isinstance(request[key], str) and
+                        re.fullmatch(r"[0-9a-f]{64}", request[key])
+                        for key in ("operation_id", "body_sha256")),
+                    "closed host model header required")
+            operation = "work-model"
+            connection.sendall(b"model-body-ready\n")
+            body = bytearray(); body_deadline = time.monotonic() + 5
+            while len(body) < request["body_bytes"]:
+                seconds = min(body_deadline - time.monotonic(), remaining_work_seconds(5))
+                require(seconds > 0, "host model body deadline exhausted")
+                connection.settimeout(seconds)
+                part = connection.recv(min(65536, request["body_bytes"] - len(body)))
+                require(bool(part), "host model body shortened")
+                body.extend(part)
+            result = execute_host_model(owner, request, bytes(body))
+            require_work_time()
+            after = inspect_peer(pid)
+            require(after == peer and owner.launch.grant.is_active(), "host model peer changed")
+            owner.launch.mount.verify_mounted(pid, owner.launch.sealed)
+            encoded = canonical(result) + b"\n"
+            require(len(encoded) <= MAX_RESPONSE, "host model response exceeds bound")
+            connection.settimeout(remaining_work_seconds(5))
+            connection.sendall(encoded)
+        elif request.get("op") == "work-budget":
             require(set(request)=={"op","identity","grant_sha256","action","payload"}
                     and request["action"] in {"status","ceiling","start","returned"} and isinstance(request["payload"],dict),
                     "closed budget request required")
+            operation = "work-budget"
             callback=getattr(owner,"work_budget",None)
             if callback is None:
                 require(request["action"]=="status" and request["payload"]=={},"budget authority missing")
@@ -225,6 +369,7 @@ def _dispatch_work_connection(owner, connection):
                         "op", "identity", "grant_sha256", "provider_id", "request"
                     } and "herdr_external_knowledge" in owner.launch.grant.scope.tools,
                     "external knowledge tool is not granted")
+            operation = "external-knowledge-query"
             callback = getattr(owner, "external_knowledge_query", None)
             durable_authority = getattr(owner, "external_knowledge_authority", None)
             require(callable(callback) and callable(durable_authority),
@@ -280,6 +425,7 @@ def _dispatch_work_connection(owner, connection):
             require(set(request) in ({"op", "identity", "grant_sha256", "request_id"}, {"op", "identity", "grant_sha256", "request_id", "handoff"})
                     and "herdr_verify_work" in owner.launch.grant.scope.tools,
                     "verification tool is not granted")
+            operation = "work-verify"
             callback = getattr(owner, "work_verify", None)
             require(callable(callback), "host verification authority unavailable")
             from .work_lifetime import check_wall_seconds, require_grant_lifetime
@@ -312,13 +458,16 @@ def _dispatch_work_connection(owner, connection):
                     and ((request["kind"] == "provider" and request["tool"] is None)
                          or (request["kind"] == "tool" and isinstance(request["tool"], str)
                              and 0 < len(request["tool"]) <= 128)), "work authority binding invalid")
+            operation = "work-authorize"
             callback = owner.work_authority
             if callback is not None:
                 require(callback(owner.launch.identity, owner.launch.grant.hash,
                                  kind=request["kind"], tool=request["tool"]) is True,
                         "work authority denied")
             connection.sendall(b"work-ok\n")
-    except Exception:
+    except Exception as error:
+        if authenticated_binding is not None and operation is not None:
+            _observe_authenticated_denial(owner, peer, authenticated_binding, operation, error)
         try:
             connection.sendall(b"denied\n")
         except OSError:

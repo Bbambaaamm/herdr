@@ -17,15 +17,20 @@ BIN = Path(__file__).resolve().parent
 WORKER = BIN / "agent-task-worker"
 sys.path.insert(0, str(BIN.parents[1]))
 from herdr.host_configuration import host_entrypoint_command
-from herdr.launch_environment import sanitize_environment
+from herdr.launch_environment import sanitize_environment, IMMUTABLE_HOST_STARTUP_TIMEOUT_SECONDS
 from herdr.policy_launch import process_start_ticks
+from herdr.recovery_unknown import held as terminal_unknown_hold
+from herdr.autonomy_gate import disk_headroom_blocker
 ROOT = HOME / ".local/state/agent-stack/tasks"
 PENDING = ROOT / "pending"
 RUNNING = ROOT / "running"
 LOG = HOME / ".local/state/agent-stack/task-dispatch.log"
 DISPATCH_LOCK = ROOT / "dispatcher.lock"
 
-ADMISSION_TIMEOUT = 15.0
+# The worker cannot acknowledge until its immutable host wrapper has finished.
+# Keep a separate bounded handshake allowance after that shared startup budget.
+DISPATCH_ACK_TIMEOUT_SECONDS = 15.0
+ADMISSION_TIMEOUT = IMMUTABLE_HOST_STARTUP_TIMEOUT_SECONDS + DISPATCH_ACK_TIMEOUT_SECONDS
 LIBC = ctypes.CDLL(None, use_errno=True)
 
 ENV = os.environ.copy()
@@ -105,12 +110,16 @@ def due_tasks() -> list[Path]:
     for path in sorted(PENDING.glob("*.json")):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
+            if terminal_unknown_hold(data):
+                continue
             when = parse_time(data.get("not_before"))
             priority = int(data.get("priority", 50))
         except Exception as exc:
             log(f"invalid task {path.name}: {exc}")
             continue
         if when <= current:
+            if disk_headroom_blocker(data.get("repo"), data.get("consumer")):
+                continue
             due.append((priority, when, path))
     return [path for _, _, path in sorted(due, key=lambda item: (item[0], item[1], item[2].name))]
 
@@ -218,6 +227,14 @@ def await_dispatch_admission(proc, running, claimed, nonce, parent_pid) -> int:
 
 def _launch_with_epoch(path: Path) -> int:
     task = json.loads(path.read_text(encoding="utf-8"))
+    if terminal_unknown_hold(task):
+        return 1
+    # Recheck inside the existing ownership epoch: selection is not a capacity
+    # claim. Withhold without changing identity, attempts, fences or task bytes.
+    capacity = disk_headroom_blocker(task.get("repo"), task.get("consumer"))
+    if capacity:
+        log(f"withhold Herdr dispatch: {capacity}")
+        return 0
     task_id = str(task["id"])
     running = RUNNING / f"{task_id}.json"
     if running.exists():
@@ -229,6 +246,13 @@ def _launch_with_epoch(path: Path) -> int:
                                       legacy_command=[str(WORKER), str(running)])
     worker_env = {key: value for key, value in sanitize_environment(ENV).items()
                   if not key.startswith("PYTHON")}
+
+    # Host command/environment resolution can take time. Recheck after it,
+    # immediately before the FIRST claim mutation, under the same epoch.
+    capacity = disk_headroom_blocker(task.get("repo"), task.get("consumer"))
+    if capacity:
+        log(f"withhold Herdr dispatch: {capacity}")
+        return 0
 
     # Refresh ownership time before entering running/. Old attempt timestamps
     # must never make a freshly claimed task look orphaned to the watchdog.
