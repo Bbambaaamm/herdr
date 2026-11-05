@@ -146,7 +146,7 @@
       ],
       "hermes_profile": "quantlab",
       "priority_default": 60,
-      "priority_architecture": 50,
+      "priority_architecture": 60,
       "worktree_root": "/home/agentops/workspaces/heating/worktrees",
       "admission": {
         "signal": "maintainer-comment-v1",

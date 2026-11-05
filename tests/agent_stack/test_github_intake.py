@@ -196,7 +196,7 @@ class GitHubIntakeTests(unittest.TestCase):
             "safety_profile": "heating-safe-engineering",
             "hermes_profile": "quantlab",
             "priority_default": 60,
-            "priority_architecture": 50,
+            "priority_architecture": 60,
             "parent_role": "writer",
             "parent_tools": ["read_file", "search_files", "patch", "write_file",
                              "herdr_verify_work", "herdr_submit_result"],
