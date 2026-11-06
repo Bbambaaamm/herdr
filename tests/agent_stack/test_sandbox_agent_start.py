@@ -282,3 +282,20 @@ def test_native_host_argv_keeps_its_exact_proc_byte_limit():
     assert module._bounded_host_command(["x" * (module.MAX_HOST_LAUNCH_ARGV_BYTES - 1)])
     with pytest.raises(RuntimeError, match="host_argv_too_large"):
         module._bounded_host_command(["x" * module.MAX_HOST_LAUNCH_ARGV_BYTES])
+
+
+
+def test_runtime_alias_swap_is_rejected_on_lifetime_revalidation(tmp_path):
+    module = sandbox_module()
+    profile = tmp_path / ".hermes" / "profiles" / "quantlab"
+    for name in ("sessions", "cache", "logs"):
+        (profile / name).mkdir(parents=True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    first = module._ephemeral_sdk_runtime_dirs(tmp_path)
+    assert first
+    target = profile / "logs"
+    target.rmdir()
+    target.symlink_to(workspace, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="runtime_alias_unverified"):
+        module._ephemeral_sdk_runtime_dirs(tmp_path)
