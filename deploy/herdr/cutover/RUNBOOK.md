@@ -83,6 +83,32 @@ services, and restores the exact prior Nginx fragment. The route remains fail-cl
 during the operation. No database, credential, consumer state, shared vhost, or
 legacy release is deleted.
 
+## Heating repository-only consumer activation
+
+Cutover intentionally does not enable a consumer. After a release containing the
+reviewed Heating intake, coordinator and `heating-safe-engineering` contract is
+current, activate its host ceiling separately:
+
+```sh
+python3 deploy/herdr/cutover/activate_heating.py preflight \
+  --release /opt/herdr/releases/<tag>-<sha12>
+
+sudo /usr/bin/python3 -I -B deploy/herdr/cutover/activate_heating.py apply \
+  --release /opt/herdr/releases/<tag>-<sha12> \
+  --confirm <exact-confirmation-printed-by-preflight>
+```
+
+The activation is limited to repository file tools plus protected verification
+and result submission. It grants no process, delegation, Home Assistant, SSH,
+MQTT, device, boiler, reload, restart or deployment capability. Apply holds the
+dispatcher and worker locks, backs up the exact prior root-owned policy, binds the
+complete immutable current release inventory, installs a seven-day Heating
+ceiling, verifies that the `agentops` runtime can compose it, and restores the
+backup on any failure. It also shares the cutover lock, preserves schema-2 private
+launch settings, and can renew an existing matching Heating ceiling without
+accepting capability drift. A fresh maintainer admission is still required
+afterward.
+
 ## Evidence and soak
 
 The deployed tag, full commit, exact consumer-config digest, archive digest,
