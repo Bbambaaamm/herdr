@@ -111,8 +111,9 @@ afterward.
 
 The activation removes mutable `.git/**` metadata from approved runtime
 inventories only after verifying every retained runtime byte against the existing
-root-owned policy. Apply then prepares and cleans up a complete `agentops` launch
-snapshot before reporting success, so code or runtime drift remains fail-closed.
+root-owned policy. Apply publishes an exact metadata-free, root-owned runtime
+asset and then prepares and cleans up a complete `agentops` launch snapshot before
+reporting success, so code or runtime drift remains fail-closed.
 
 ## Evidence and soak
 

@@ -163,6 +163,9 @@ def test_plan_adds_only_repository_tools_and_complete_release_inventory(tmp_path
     assert planned["code"]["executable_files"] == ([] if os.name == "nt" else ["agent-entry"])
     assert total == sum(map(len, bodies.values()))
     assert ".git/FETCH_HEAD" not in planned["runtime"][0]["files"]
+    assert planned["runtime"][0]["source"].startswith(
+        "/var/lib/herdr/runtime-assets/")
+    assert planned["runtime"][0]["source"] != raw["runtime"][0]["source"]
     assert planned["runtime"][0]["executable_files"] == ["runtime.bin"]
     assert set(planned["runtime"][1]["files"]) == {"runtime.bin"}
     for name, body in bodies.items():
@@ -235,6 +238,38 @@ def test_runtime_sanitization_rejects_non_vcs_drift(tmp_path, monkeypatch):
             raw, release, {"tag": "v0.3.0-rc.30", "commit": "2" * 40},
             datetime(2026, 11, 6, tzinfo=UTC),
         )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="publisher uses Linux no-follow descriptors")
+def test_runtime_publisher_creates_exact_metadata_free_tree(tmp_path, monkeypatch):
+    monkeypatch.setattr(activation, "RUNTIME_ASSETS", tmp_path / "assets")
+    monkeypatch.setattr(activation.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(activation.os, "chown", lambda *args, **kwargs: None)
+    monkeypatch.setattr(activation, "_require_root_protected_directory", lambda _: None)
+    verified = []
+
+    def verify(definition):
+        source = Path(definition["source"])
+        found = {
+            str(path.relative_to(source)).replace(os.sep, "/")
+            for path in source.rglob("*") if path.is_file()
+        }
+        assert found == set(definition["files"])
+        verified.append(str(source))
+
+    monkeypatch.setattr(activation, "_verify_runtime_asset", verify)
+    raw = policy(tmp_path, monkeypatch)
+    planned, removed = activation.sanitized_runtime_inventory(raw["runtime"])
+
+    activation.publish_runtime_assets(raw["runtime"], planned)
+
+    assert removed == 1
+    assert len(verified) == 4
+    for definition in planned:
+        source = Path(definition["source"])
+        assert source.is_dir()
+        assert not (source / ".git").exists()
+        assert (source / "runtime.bin").read_bytes().startswith(b"runtime-")
 
 
 def test_release_inventory_rejects_writable_files(tmp_path):

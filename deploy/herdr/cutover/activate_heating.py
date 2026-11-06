@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import stat
 import sys
 import time
@@ -57,6 +58,7 @@ MAX_POLICY_BYTES = 4 * 1024 * 1024
 MAX_CODE_BYTES = 16 * 1024 * 1024
 MAX_CODE_FILE_BYTES = 4 * 1024 * 1024
 MAX_RUNTIME_FILES = 65536
+RUNTIME_ASSETS = PurePosixPath("/var/lib/herdr/runtime-assets")
 RELEASE_OWNER_UID = 0
 
 
@@ -236,15 +238,142 @@ def sanitized_runtime_inventory(definitions: object) -> tuple[list[dict], int]:
             if root_fd is not None:
                 os.close(root_fd)
         need(bool(retained), "runtime_inventory_empty_after_sanitization")
+        retained_executable = sorted(
+            name for name in executable if name in retained)
+        asset_digest = digest(canonical_json({
+            "files": retained,
+            "executable_files": retained_executable,
+        }))
         proposal.append({
             **definition,
-            "source": str(source),
+            "source": str(RUNTIME_ASSETS / asset_digest),
             "target": str(target),
             "files": retained,
-            "executable_files": sorted(
-                name for name in executable if name in retained),
+            "executable_files": retained_executable,
         })
     return proposal, removed
+
+
+def _require_root_protected_directory(path: Path) -> None:
+    need(path.is_absolute() and str(path) == os.path.normpath(str(path)),
+         "runtime_asset_path_invalid")
+    current = Path("/")
+    for component in path.parts[1:]:
+        current /= component
+        info = os.lstat(current)
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == 0
+             and not stat.S_IMODE(info.st_mode) & 0o022,
+             "runtime_asset_ancestry_not_root_protected")
+
+
+def _verify_runtime_asset(definition: dict) -> None:
+    from herdr.policy_launch import ApprovedImmutableTree
+    approved = ApprovedImmutableTree(
+        Path(definition["source"]), Path(definition["target"]),
+        definition["files"], definition["max_bytes"],
+        definition["max_file_bytes"],
+        executable_files=tuple(definition["executable_files"]),
+    )
+    frozen = approved.freeze(Path(str(RUNTIME_ASSETS)), ())
+    frozen.close()
+
+
+def publish_runtime_assets(current: object, planned: object) -> None:
+    """Publish exact root-owned runtime trees that match sanitized manifests."""
+    need(os.geteuid() == 0, "root_required")
+    need(isinstance(current, list) and isinstance(planned, list)
+         and len(current) == len(planned) == 2,
+         "runtime_asset_inventory_invalid")
+    root = Path(str(RUNTIME_ASSETS))
+    _require_root_protected_directory(root.parent)
+    try:
+        os.mkdir(root, 0o755)
+        os.chown(root, 0, 0, follow_symlinks=False)
+        os.chmod(root, 0o755, follow_symlinks=False)
+    except FileExistsError:
+        pass
+    root_info = os.lstat(root)
+    need(stat.S_ISDIR(root_info.st_mode) and root_info.st_uid == 0
+         and stat.S_IMODE(root_info.st_mode) == 0o755,
+         "runtime_asset_root_invalid")
+    _require_root_protected_directory(root)
+    for before, after in zip(current, planned, strict=True):
+        need(isinstance(before, dict) and isinstance(after, dict)
+             and before.get("target") == after.get("target"),
+             "runtime_asset_inventory_invalid")
+        source = Path(str(before.get("source")))
+        destination = Path(str(after.get("source")))
+        need(destination.parent == root and len(destination.name) == 64
+             and all(character in "0123456789abcdef" for character in destination.name),
+             "runtime_asset_destination_invalid")
+        if destination.exists() or destination.is_symlink():
+            _verify_runtime_asset(after)
+            continue
+        temporary = root / f".{destination.name}-{os.getpid()}-{time.time_ns()}"
+        os.mkdir(temporary, 0o700)
+        source_fd = None
+        try:
+            source_fd = os.open(
+                source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            total = 0
+            executable = set(after["executable_files"])
+            for name, expected in sorted(after["files"].items()):
+                fd = _open_runtime_file(source_fd, name)
+                try:
+                    info = os.fstat(fd)
+                    need(stat.S_ISREG(info.st_mode)
+                         and info.st_size <= after["max_file_bytes"],
+                         "runtime_source_not_bounded_regular_file")
+                    total += info.st_size
+                    need(total <= after["max_bytes"], "runtime_source_byte_limit")
+                    target = temporary.joinpath(*name.split("/"))
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    runtime_digest = hashlib.sha256()
+                    remaining = info.st_size
+                    with target.open("xb") as output:
+                        while remaining:
+                            chunk = os.read(fd, min(remaining, 1_048_576))
+                            need(bool(chunk), "runtime_source_shortened")
+                            runtime_digest.update(chunk)
+                            output.write(chunk)
+                            remaining -= len(chunk)
+                        need(not os.read(fd, 1)
+                             and runtime_digest.hexdigest() == expected,
+                             "runtime_source_differs_from_approved_bytes")
+                        output.flush()
+                        os.fsync(output.fileno())
+                    os.chown(target, 0, 0, follow_symlinks=False)
+                    os.chmod(
+                        target, 0o555 if name in executable else 0o444,
+                        follow_symlinks=False,
+                    )
+                finally:
+                    os.close(fd)
+            for directory in sorted(
+                    (entry for entry in temporary.rglob("*") if entry.is_dir()),
+                    key=lambda entry: len(entry.parts), reverse=True):
+                os.chown(directory, 0, 0, follow_symlinks=False)
+                os.chmod(directory, 0o555, follow_symlinks=False)
+            os.chown(temporary, 0, 0, follow_symlinks=False)
+            os.chmod(temporary, 0o555, follow_symlinks=False)
+            candidate = {**after, "source": str(temporary)}
+            _verify_runtime_asset(candidate)
+            os.rename(temporary, destination)
+            directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            _verify_runtime_asset(after)
+        finally:
+            if source_fd is not None:
+                os.close(source_fd)
+            if temporary.exists():
+                for directory in temporary.rglob("*"):
+                    if directory.is_dir():
+                        directory.chmod(0o700)
+                temporary.chmod(0o700)
+                shutil.rmtree(temporary)
 
 
 def _heating_template(source: SecurityGrant, release: dict, issued: datetime) -> SecurityGrant:
@@ -487,7 +616,10 @@ def apply(release_root: Path, confirmation: str) -> dict:
             TASK_ROOT / "worker.lock", owner=agentops.pw_uid))
         report, proposal = preflight(release_root)
         need(confirmation == report["confirmation"], "confirmation_mismatch")
-        _, before = safe_json(HOST_POLICY)
+        retained_policy, before = safe_json(HOST_POLICY)
+        need(digest(before) == report["current_policy_sha256"],
+             "host_policy_changed_during_activation")
+        publish_runtime_assets(retained_policy["runtime"], proposal["runtime"])
         BACKUPS.mkdir(parents=True, exist_ok=True, mode=0o700)
         need(not BACKUPS.is_symlink(), "activation_backup_directory_is_symlink")
         os.chown(BACKUPS, 0, 0)
