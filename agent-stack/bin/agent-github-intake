@@ -16,7 +16,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from herdr.recovery_unknown import held as terminal_unknown_hold, task_name
+from herdr.recovery_unknown import (
+    blocks_intake as terminal_unknown_blocks_intake,
+    held as terminal_unknown_hold,
+    task_name,
+)
 from herdr.evidence import EvidenceError
 from herdr.context import SecretRedactor
 from herdr.autonomy_gate import disk_headroom_blocker
@@ -1007,7 +1011,7 @@ Operating rules:
 
 
 def _queue_issue_locked(consumer: dict, issue: dict, records: list[dict]) -> str:
-    if any(terminal_unknown_hold(record["task"]) for record in records):
+    if any(terminal_unknown_blocks_intake(ROOT, record["task"]) for record in records):
         raise AdmissionDenied("terminal_unknown_requires_operator_reconciliation")
     issue, admission = approved_revision(consumer, issue)
     number = issue["number"]
@@ -1079,7 +1083,7 @@ def intervention_blocker(
     records: list[dict], *, allow_failed_replan: bool = False
 ) -> tuple[str, str] | None:
     for record in records:
-        if terminal_unknown_hold(record["task"]):
+        if terminal_unknown_blocks_intake(ROOT, record["task"]):
             return str(record["task"].get("id") or ""), "terminal_unknown_requires_operator_reconciliation"
     if not records:
         return None
