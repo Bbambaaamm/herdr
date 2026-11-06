@@ -261,7 +261,7 @@ def _require_root_protected_directory(path: Path) -> None:
     for component in path.parts[1:]:
         current /= component
         info = os.lstat(current)
-        need(stat.S_ISDIR(info.st_mode) and info.st_uid == 0
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == RELEASE_OWNER_UID
              and not stat.S_IMODE(info.st_mode) & 0o022,
              "runtime_asset_ancestry_not_root_protected")
 
@@ -293,7 +293,7 @@ def publish_runtime_assets(current: object, planned: object) -> None:
     except FileExistsError:
         pass
     root_info = os.lstat(root)
-    need(stat.S_ISDIR(root_info.st_mode) and root_info.st_uid == 0
+    need(stat.S_ISDIR(root_info.st_mode) and root_info.st_uid == RELEASE_OWNER_UID
          and stat.S_IMODE(root_info.st_mode) == 0o755,
          "runtime_asset_root_invalid")
     _require_root_protected_directory(root)
