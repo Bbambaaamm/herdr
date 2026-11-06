@@ -15,7 +15,13 @@ from agent_durable_children import parent_attempt_guard
 
 from agent_completion_evidence import EvidenceError, record_verification_failure, verification_applies, verify_completion
 from herdr.recovery_unknown import held as terminal_unknown_hold
+from herdr.recovery_unknown import retired as terminal_unknown_retired
+from herdr.recovery_unknown import (
+    retirement_inspection as terminal_unknown_retirement_inspection,
+    late_work_events_sha256 as terminal_unknown_late_work_events_sha256,
+)
 from herdr.recovery_unknown import queue_lock as terminal_unknown_queue_lock
+from herdr.evidence import digest
 
 HOME = Path("/home/agentops")
 HERDR = HOME / ".local/bin/herdr"
@@ -448,7 +454,7 @@ def ensure_live_task_bridge(path: Path, task: dict) -> bool:
     write_json(path, task)
     return True
 @contextmanager
-def parent_transition_guard(task: dict):
+def parent_transition_guard(task: dict, *, retirement: dict | None = None):
     if task.get("parent_task_id") or not task.get("run_token"):
         yield True
     else:
@@ -458,7 +464,9 @@ def parent_transition_guard(task: dict):
                                       task.get("watchdog_blocker") == "active_durable_children"
                                       or task.get("attempt_state") in {
                                           "result_ready", "delivery_uncertain"
-                                      })) as terminal:
+                                      }
+                                      or retirement is not None
+                                      or terminal_unknown_retired(ROOT, task))) as terminal:
             yield terminal
 
 
@@ -512,10 +520,19 @@ def terminalize_from_result(
     result: dict,
     age_seconds: int,
 ) -> None:
+    retirement = None
     if terminal_unknown_hold(task):
-        return False
-    with parent_transition_guard(task) as all_terminal:
-        _terminalize_from_result_locked(path, task, result, age_seconds, all_terminal)
+        try:
+            retirement = terminal_unknown_retirement_inspection(
+                ROOT, task, late_result=result)
+        except (EvidenceError, OSError, TypeError, ValueError):
+            return False
+        if retirement is None:
+            return False
+    with parent_transition_guard(task, retirement=retirement) as all_terminal:
+        _terminalize_from_result_locked(
+            path, task, result, age_seconds, all_terminal,
+            retirement=retirement)
     if all_terminal and task.get("attempt_state") == "verification_pending":
         worker = _worker_bridge()
         if worker.modern_work_contract(task):
@@ -526,8 +543,9 @@ def terminalize_from_result(
 
 def _terminalize_from_result_locked(
     path: Path, task: dict, result: dict, age_seconds: int, all_terminal: bool,
+    *, retirement: dict | None = None,
 ) -> None:
-    if terminal_unknown_hold(task):
+    if terminal_unknown_hold(task) and retirement is None:
         return False
     status = str(result.get("status") or "")
     blocker = str(result.get("blocker") or "").strip()
@@ -548,6 +566,8 @@ def _terminalize_from_result_locked(
         return
 
     if not all_terminal:
+        if retirement is not None:
+            return False
         task["watchdog_blocker"] = "active_durable_children"
         task["recovery_action"] = "await_terminal_durable_children"
         task["attempt_state"] = "result_ready"
@@ -560,13 +580,16 @@ def _terminalize_from_result_locked(
     if status == "completed" and (not blocker or blocker.lower() in {"none", "null"}):
         try:
             worker = _worker_bridge()
-            if worker.modern_work_contract(task):
+            modern_contract = worker.modern_work_contract(task)
+            if modern_contract:
                 worker.ROOT = ROOT
                 accepted = worker._verify_root_completion(task, result)
             else:
                 accepted = (verify_completion(ROOT, task, result) if verification_applies(task)
                             else {"level": "legacy_unverified_result"})
         except EvidenceError as exc:
+            if retirement is not None:
+                return False
             waiting = record_verification_failure(task, exc)
             if waiting:
                 task["not_before"] = (utcnow() + timedelta(seconds=60)).isoformat()
@@ -581,10 +604,13 @@ def _terminalize_from_result_locked(
             return
         task["completion_level"] = accepted["level"]
         task["completion_bundle_hash"] = accepted.get("bundle_hash", accepted.get("result_digest"))
-        task["verification_status"] = ("accepted" if verification_applies(task)
-                                       else "legacy_unverified")
+        task["verification_status"] = (
+            "accepted" if modern_contract or verification_applies(task)
+            else "legacy_unverified")
 
     if not cleanup_task_owned_pane(task):
+        if retirement is not None:
+            return False
         task["watchdog_cleanup_blocker"] = (
             "task_session_cleanup_failed"
         )
@@ -619,23 +645,33 @@ def _terminalize_from_result_locked(
 
     if blocker and blocker.lower() not in {"none", "null"}:
         task["attempt_state"] = "blocked"
-        move_task(path, BLOCKED, task)
-        destination = "blocked"
+        target, destination = BLOCKED, "blocked"
 
     elif status == "completed":
         task["attempt_state"] = "done"
-        move_task(path, DONE, task)
-        destination = "done"
+        target, destination = DONE, "done"
 
     elif status == "blocked":
         task["attempt_state"] = "blocked"
-        move_task(path, BLOCKED, task)
-        destination = "blocked"
+        target, destination = BLOCKED, "blocked"
 
     elif status == "failed":
         task["attempt_state"] = "failed"
-        move_task(path, FAILED, task)
-        destination = "failed"
+        target, destination = FAILED, "failed"
+
+    if retirement is not None:
+        task["terminal_unknown_late_evidence"] = {
+            "schema_version": "herdr-terminal-unknown-late-evidence-1",
+            "retirement_event_sha256": retirement["event_sha256"],
+            "result_sha256": digest(result),
+            "result_status": status,
+            "reconciled_at": task["watchdog_resolved_at"],
+            "verification_status": task.get("verification_status"),
+            "completion_bundle_hash": task.get("completion_bundle_hash"),
+            "work_events_sha256":
+                terminal_unknown_late_work_events_sha256(ROOT, task),
+        }
+    move_task(path, target, task)
 
     print(
         f"orphan_terminalized task={task.get('id')} "
@@ -727,6 +763,10 @@ def reconcile_watchdog_blocked_tasks() -> None:
         except Exception:
             continue
         if terminal_unknown_hold(task):
+            if "terminal_unknown_retirement" in task:
+                result, _ = matching_result(task)
+                if result is not None:
+                    terminalize_from_result(path, task, result, 0)
             continue
         ensure_live_task_bridge(path, task)
         cleanup_quarantine = (task.get("watchdog_cleanup_blocker")
@@ -773,6 +813,10 @@ def reconcile_verification_pending() -> None:
         try:
             task = json.loads(path.read_text(encoding="utf-8"))
             if terminal_unknown_hold(task):
+                if "terminal_unknown_retirement" in task:
+                    result, _ = matching_result(task)
+                    if result is not None:
+                        terminalize_from_result(path, task, result, 0)
                 continue
             due = task.get("not_before")
             waiting = (task.get("attempt_state") == "verification_pending"
@@ -859,15 +903,20 @@ def main(argv=None) -> int:
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--inspect-terminal-unknown", metavar="TASK_ID")
     modes.add_argument("--apply-terminal-unknown", metavar="TASK_ID")
+    modes.add_argument("--retire-terminal-unknown", metavar="TASK_ID")
     args = parser.parse_args([] if argv is None else argv)
-    if args.inspect_terminal_unknown or args.apply_terminal_unknown:
+    if (args.inspect_terminal_unknown or args.apply_terminal_unknown
+            or args.retire_terminal_unknown):
         from herdr import recovery_unknown
         try:
             if args.inspect_terminal_unknown:
                 report = recovery_unknown.inspect(ROOT, args.inspect_terminal_unknown)
-            else:
+            elif args.apply_terminal_unknown:
                 report = recovery_unknown.apply(ROOT, args.apply_terminal_unknown,
                                                 active_workers=active_worker_tasks)
+            else:
+                report = recovery_unknown.retire(ROOT, args.retire_terminal_unknown,
+                                                 active_workers=active_worker_tasks)
             print(json.dumps(report, sort_keys=True))
             return 0
         except (EvidenceError, recovery_unknown.SecurityError, OSError, ValueError, KeyError, TypeError):
