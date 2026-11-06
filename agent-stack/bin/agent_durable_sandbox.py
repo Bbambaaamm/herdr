@@ -25,6 +25,22 @@ DEFAULT_WRITABLE = (
     HOME / "worktrees",
 )
 
+# Root launch authorities read the exact native argv from /proc.  Keep that
+# independently bounded from the shell text carried by pane.run: shell quoting
+# can expand a safe argv substantially without changing the launched process.
+MAX_HOST_LAUNCH_ARGV_BYTES = 32768
+MAX_PANE_SHELL_COMMAND_BYTES = 65536
+
+
+def _argv_bytes(args: list[str]) -> int:
+    return sum(len(value.encode("utf-8")) + 1 for value in args)
+
+
+def _bounded_host_command(args: list[str]) -> list[str]:
+    if _argv_bytes(args) > MAX_HOST_LAUNCH_ARGV_BYTES:
+        raise RuntimeError("durable_sandbox_host_argv_too_large")
+    return args
+
 
 # Duplicate the bridge's held directory BEFORE bwrap enters a user namespace.
 # Reopening its /proc FD refers to the held inode, never the mutable logical path.
@@ -985,9 +1001,9 @@ def command(
                 raise RuntimeError("native_descriptor_entrypoint_unapproved")
             descriptors = {**descriptors, "transport": VERSION}
             python = next(tree for tree in policy_mount.runtime if tree.target == PYTHON_TARGET)
-            result_command = [str(python.path / PYTHON_EXECUTABLE), "-I", "-B",
+            result_command = _bounded_host_command([str(python.path / PYTHON_EXECUTABLE), "-I", "-B",
                 str(policy_mount.code.path / HOST_ENTRYPOINT), ENTRYPOINT,
-                json.dumps(descriptors, separators=(",", ":")), *args]
+                json.dumps(descriptors, separators=(",", ":")), *args])
         else:
             result_command = ["/usr/bin/python3", "-I", "-S", "-c", _POLICY_FD_LAUNCHER,
                               json.dumps(descriptors, separators=(",", ":")), *args]
@@ -1003,16 +1019,14 @@ def command(
     return args
 
 
-MAX_PANE_SHELL_COMMAND_BYTES = 32768
-
-
 def shell_command(args: list[str]) -> str:
     from herdr.launch_environment import STARTUP_CONTROLS
     controls=sorted(set(STARTUP_CONTROLS)|{key for key in os.environ
                     if key.startswith("LD_") and key.replace("_","").isalnum()})
     rendered = "unset " + " ".join(map(shlex.quote,controls)) + "; exec " + shlex.join(args)
-    # Herdr pane.run carries this as ONE argv element. Reject a huge profile
-    # inventory instead of hitting Linux MAX_ARG_STRLEN / E2BIG ambiguously.
+    # Herdr pane.run carries the rendered shell text as one argv element. Its
+    # byte bound is deliberately separate from the native host argv bound:
+    # shlex quoting is transport syntax and can be much larger than /proc argv.
     if len(rendered.encode("utf-8")) > MAX_PANE_SHELL_COMMAND_BYTES:
         raise RuntimeError("durable_sandbox_shell_command_too_large")
     return rendered
