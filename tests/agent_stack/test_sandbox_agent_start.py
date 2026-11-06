@@ -260,10 +260,25 @@ def test_named_profile_runtime_requires_preprovisioned_mountpoint(tmp_path, miss
         module._ephemeral_sdk_runtime_dirs(tmp_path)
 
 
-def test_shell_command_has_fixed_byte_limit_before_pane_delivery():
+def test_shell_command_accounts_for_shell_transport_separately_from_native_argv():
     module = sandbox_module()
     minimal = module.shell_command(["/usr/bin/bwrap", "--", "/bin/true"])
     assert "exec /usr/bin/bwrap" in minimal
-    oversized = ["/usr/bin/bwrap", "--setenv", "MANY_PROFILES", "x" * 40000]
+
+    # Apostrophes expand fivefold under shlex quoting. The original argv is
+    # small enough for the host observer even though its shell transport is
+    # larger than the old, incorrectly shared 32 KiB limit.
+    quoted = module.shell_command(["/usr/bin/python3", "-c", "'" * 7000])
+    assert len(quoted.encode("utf-8")) > module.MAX_HOST_LAUNCH_ARGV_BYTES
+
+    oversized = ["/usr/bin/python3", "-c", "'" * 14000]
     with pytest.raises(RuntimeError, match="shell_command_too_large"):
         module.shell_command(oversized)
+
+
+def test_native_host_argv_keeps_its_exact_proc_byte_limit():
+    module = sandbox_module()
+    assert module._argv_bytes(["a", "é"]) == 5
+    assert module._bounded_host_command(["x" * (module.MAX_HOST_LAUNCH_ARGV_BYTES - 1)])
+    with pytest.raises(RuntimeError, match="host_argv_too_large"):
+        module._bounded_host_command(["x" * module.MAX_HOST_LAUNCH_ARGV_BYTES])
