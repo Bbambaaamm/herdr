@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import stat
 import sys
 import time
@@ -56,6 +56,7 @@ VALIDITY_HOURS = 168
 MAX_POLICY_BYTES = 4 * 1024 * 1024
 MAX_CODE_BYTES = 16 * 1024 * 1024
 MAX_CODE_FILE_BYTES = 4 * 1024 * 1024
+MAX_RUNTIME_FILES = 65536
 RELEASE_OWNER_UID = 0
 
 
@@ -132,6 +133,118 @@ def release_inventory(release: Path) -> tuple[dict[str, str], tuple[str, ...], i
     need(bool(files) and "RELEASE.json" in files and "MANIFEST.sha256" in files,
          "release_inventory_incomplete")
     return files, tuple(executable), total
+
+
+def _open_runtime_file(root_fd: int, name: str) -> int:
+    directory = os.dup(root_fd)
+    try:
+        parts = name.split("/")
+        for part in parts[:-1]:
+            child = os.open(
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=directory,
+            )
+            os.close(directory)
+            directory = child
+        return os.open(
+            parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            dir_fd=directory,
+        )
+    finally:
+        os.close(directory)
+
+
+def sanitized_runtime_inventory(definitions: object) -> tuple[list[dict], int]:
+    """Drop mutable VCS metadata while proving every retained runtime byte."""
+    fields = {
+        "source", "target", "files", "executable_files", "max_bytes",
+        "max_file_bytes",
+    }
+    need(isinstance(definitions, list) and len(definitions) == 2,
+         "host_policy_runtime_inventory_invalid")
+    proposal: list[dict] = []
+    removed = 0
+    for definition in definitions:
+        need(isinstance(definition, dict) and set(definition) == fields,
+             "host_policy_runtime_inventory_invalid")
+        source = Path(str(definition["source"]))
+        target = PurePosixPath(str(definition["target"]))
+        files = definition["files"]
+        executable = definition["executable_files"]
+        max_bytes = definition["max_bytes"]
+        max_file_bytes = definition["max_file_bytes"]
+        need(source.is_absolute() and source.resolve(strict=True) == source
+             and source.is_dir() and not source.is_symlink()
+             and target.is_absolute(), "host_policy_runtime_path_invalid")
+        need(isinstance(files, dict) and 0 < len(files) <= MAX_RUNTIME_FILES
+             and isinstance(executable, list)
+             and all(isinstance(name, str) for name in executable)
+             and set(executable) <= set(files)
+             and type(max_bytes) is int and 0 < max_bytes <= 2_147_483_648
+             and type(max_file_bytes) is int
+             and 0 < max_file_bytes <= 268_435_456,
+             "host_policy_runtime_inventory_invalid")
+        root_fd = None
+        if os.name != "nt":
+            root_fd = os.open(
+                source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        retained: dict[str, str] = {}
+        total = 0
+        try:
+            for name, expected in sorted(files.items()):
+                need(isinstance(name, str) and name
+                     and len(name.encode("utf-8")) <= 1024
+                     and all(part not in {"", ".", ".."} for part in name.split("/"))
+                     and "\\" not in name
+                     and isinstance(expected, str) and len(expected) == 64
+                     and all(character in "0123456789abcdef" for character in expected),
+                     "host_policy_runtime_inventory_invalid")
+                if name == ".git" or name.startswith(".git/"):
+                    removed += 1
+                    continue
+                if os.name == "nt":
+                    path = source.joinpath(*name.split("/"))
+                    info = path.lstat()
+                    need(path.is_file() and not path.is_symlink()
+                         and info.st_size <= max_file_bytes,
+                         "runtime_source_not_bounded_regular_file")
+                    body = path.read_bytes()
+                    need(len(body) == info.st_size and digest(body) == expected,
+                         "runtime_source_differs_from_approved_bytes")
+                else:
+                    fd = _open_runtime_file(root_fd, name)
+                    try:
+                        info = os.fstat(fd)
+                        need(stat.S_ISREG(info.st_mode) and info.st_size <= max_file_bytes,
+                             "runtime_source_not_bounded_regular_file")
+                        remaining = info.st_size
+                        runtime_digest = hashlib.sha256()
+                        while remaining:
+                            chunk = os.read(fd, min(remaining, 1_048_576))
+                            need(bool(chunk), "runtime_source_shortened")
+                            runtime_digest.update(chunk)
+                            remaining -= len(chunk)
+                        need(not os.read(fd, 1)
+                             and runtime_digest.hexdigest() == expected,
+                             "runtime_source_differs_from_approved_bytes")
+                    finally:
+                        os.close(fd)
+                total += info.st_size
+                need(total <= max_bytes, "runtime_source_byte_limit")
+                retained[name] = expected
+        finally:
+            if root_fd is not None:
+                os.close(root_fd)
+        need(bool(retained), "runtime_inventory_empty_after_sanitization")
+        proposal.append({
+            **definition,
+            "source": str(source),
+            "target": str(target),
+            "files": retained,
+            "executable_files": sorted(
+                name for name in executable if name in retained),
+        })
+    return proposal, removed
 
 
 def _heating_template(source: SecurityGrant, release: dict, issued: datetime) -> SecurityGrant:
@@ -217,6 +330,7 @@ def planned_policy(raw: dict, release_root: Path, release: dict,
     code = raw.get("code")
     need(isinstance(code, dict) and code.get("target") == "/run/herdr/policy-code",
          "host_policy_code_target_mismatch")
+    runtime, _ = sanitized_runtime_inventory(raw.get("runtime"))
     proposal = json.loads(json.dumps(raw))
     proposal["code"] = {
         "source": str(release_root),
@@ -226,6 +340,7 @@ def planned_policy(raw: dict, release_root: Path, release: dict,
         "max_bytes": MAX_CODE_BYTES,
         "max_file_bytes": MAX_CODE_FILE_BYTES,
     }
+    proposal["runtime"] = runtime
     proposal["templates"][CONSUMER] = desired.to_json()
     need(len(canonical_json(proposal)) <= MAX_POLICY_BYTES, "planned_host_policy_too_large")
     return proposal, desired, total
@@ -261,6 +376,11 @@ def preflight(release_root: Path, *, issued: datetime | None = None) -> tuple[di
         "planned_policy_sha256": planned_digest,
         "code_files": len(proposal["code"]["files"]),
         "code_bytes": total,
+        "runtime_vcs_files_removed": sum(
+            len(before_runtime["files"]) - len(after_runtime["files"])
+            for before_runtime, after_runtime
+            in zip(raw["runtime"], proposal["runtime"], strict=True)
+        ),
         "tools": list(desired.scope.tools),
         "permissions": list(desired.scope.permissions),
         "workspace": desired.workspace_root,
@@ -330,17 +450,21 @@ def verify_as_agentops() -> None:
                 parent_agent_id="heating-hermes",
                 parent_task_id="coordinator:heating-hermes",
                 task_id="heating-activation-probe",
-                run_token="heating-activation-probe",
+                run_token=f"heating-activation-probe-{os.getpid()}-{time.time_ns()}",
                 fencing_token=1,
             )
-            grant = factory.authorize(
+            launch = factory.prepare(
                 identity=identity,
                 workspace=WORKSPACE,
                 tools=TOOLS,
                 permissions=("workspace-write",),
             )
-            need(grant.identity == identity and set(grant.scope.tools) == set(TOOLS),
-                 "heating_consumer_not_loaded")
+            try:
+                need(launch.identity == identity
+                     and set(launch.grant.scope.tools) == set(TOOLS),
+                     "heating_consumer_not_loaded")
+            finally:
+                launch.cleanup_after_pane_closed()
         except BaseException:
             os._exit(1)
         os._exit(0)

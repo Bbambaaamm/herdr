@@ -109,6 +109,11 @@ launch settings, and can renew an existing matching Heating ceiling without
 accepting capability drift. A fresh maintainer admission is still required
 afterward.
 
+The activation removes mutable `.git/**` metadata from approved runtime
+inventories only after verifying every retained runtime byte against the existing
+root-owned policy. Apply then prepares and cleans up a complete `agentops` launch
+snapshot before reporting success, so code or runtime drift remains fail-closed.
+
 ## Evidence and soak
 
 The deployed tag, full commit, exact consumer-config digest, archive digest,

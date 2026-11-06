@@ -90,13 +90,31 @@ def policy(tmp_path, monkeypatch):
     workspace.mkdir()
     grant = source_grant(workspace)
     monkeypatch.setattr(activation.pwd, "getpwnam", lambda _: type("P", (), {"pw_uid": 1001})())
+    runtime = []
+    for index, target in enumerate(("/runtime/hermes", "/runtime/python")):
+        source = tmp_path / f"runtime-{index}"
+        source.mkdir()
+        bodies = {"runtime.bin": f"runtime-{index}\n".encode()}
+        if index == 0:
+            bodies[".git/FETCH_HEAD"] = b"mutable metadata\n"
+        files = {}
+        for name, body in bodies.items():
+            path = source / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(body)
+            files[name] = hashlib.sha256(body).hexdigest()
+        runtime.append({
+            "source": str(source), "target": target, "files": files,
+            "executable_files": ["runtime.bin"], "max_bytes": 1024,
+            "max_file_bytes": 1024,
+        })
     return {
         "schema_version": 1,
         "host_uid": 1001,
         "code": {"source": "/old", "target": "/run/herdr/policy-code", "files": {},
                  "executable_files": [], "max_bytes": activation.MAX_CODE_BYTES,
                  "max_file_bytes": activation.MAX_CODE_FILE_BYTES},
-        "runtime": [{}, {}],
+        "runtime": runtime,
         "storage": str(tmp_path / "storage"),
         "templates": {activation.SOURCE_CONSUMER: grant.to_json()},
         "grant_ttl_seconds": 900,
@@ -144,6 +162,9 @@ def test_plan_adds_only_repository_tools_and_complete_release_inventory(tmp_path
     assert set(planned["code"]["files"]) == set(bodies)
     assert planned["code"]["executable_files"] == ([] if os.name == "nt" else ["agent-entry"])
     assert total == sum(map(len, bodies.values()))
+    assert ".git/FETCH_HEAD" not in planned["runtime"][0]["files"]
+    assert planned["runtime"][0]["executable_files"] == ["runtime.bin"]
+    assert set(planned["runtime"][1]["files"]) == {"runtime.bin"}
     for name, body in bodies.items():
         assert planned["code"]["files"][name] == hashlib.sha256(body).hexdigest()
     for item in desired.tool_rules:
@@ -197,6 +218,23 @@ def test_private_host_policy_is_preserved(tmp_path, monkeypatch):
 
     assert planned["schema_version"] == 2
     assert planned["private_launch"] == raw["private_launch"]
+
+
+def test_runtime_sanitization_rejects_non_vcs_drift(tmp_path, monkeypatch):
+    raw = policy(tmp_path, monkeypatch)
+    release, _ = immutable_release(tmp_path)
+    source = Path(raw["runtime"][0]["source"])
+    (source / "runtime.bin").write_bytes(b"changed\n")
+    monkeypatch.setattr(activation, "WORKSPACE", tmp_path / "heating")
+    monkeypatch.setattr(activation, "RESULTS", tmp_path / "tasks" / "results")
+
+    with pytest.raises(
+            activation.ActivationError,
+            match="runtime_source_differs_from_approved_bytes"):
+        activation.planned_policy(
+            raw, release, {"tag": "v0.3.0-rc.30", "commit": "2" * 40},
+            datetime(2026, 11, 6, tzinfo=UTC),
+        )
 
 
 def test_release_inventory_rejects_writable_files(tmp_path):
