@@ -52,13 +52,14 @@ LATE_EVIDENCE_FIELDS = {
     "completion_bundle_hash", "work_events_sha256",
 }
 LATE_EVIDENCE_MUTABLE_FIELDS = {
-    "attempt_state", "watchdog_blocker", "recovery_action",
-    "delivery_reconcile_pending", "watchdog_resolution",
-    "watchdog_resolved_at", "result_status", "finished_at",
-    "completion_level", "completion_bundle_hash", "verification_status",
-    "verification_failures", "verification_resolution",
-    "verification_next_action", "not_before", "watchdog_cleanup_blocker",
-    "last_error", "terminal_unknown_late_evidence",
+    "attempt_state", "watchdog_resolution", "watchdog_resolved_at",
+    "result_status", "finished_at", "completion_level",
+    "completion_bundle_hash", "verification_status",
+    "terminal_unknown_late_evidence",
+}
+LATE_EVIDENCE_REMOVED_FIELDS = {
+    "watchdog_blocker", "recovery_action", "delivery_reconcile_pending",
+    "watchdog_cleanup_blocker", "last_error",
 }
 
 
@@ -636,17 +637,27 @@ def _timestamp(value):
 
 
 def _late_execution_session_transition(before, after):
+    if type(before) is not dict or type(after) is not dict:
+        return False
     if before == after:
-        return True
-    if (type(before) is not dict or type(after) is not dict
-            or before.get("owned_pane") is not True
-            or before.get("closed_at")):
+        return before.get("owned_pane") is not True or bool(before.get("closed_at"))
+    if before.get("owned_pane") is not True:
+        expected = copy.deepcopy(before)
+        status = after.get("cleanup_status")
+        closed_at = after.get("closed_at")
+        if status in {"already_absent", "closed"} and _timestamp(closed_at):
+            expected["closed_at"] = closed_at
+            expected["cleanup_status"] = status
+            expected.pop("cleanup_error", None)
+            return after == expected
+        return False
+    if before.get("closed_at"):
         return False
     expected = copy.deepcopy(before)
-    expected.pop("cleanup_error", None)
     status = after.get("cleanup_status")
     closed_at = after.get("closed_at")
     if status in {"already_absent", "closed"} and _timestamp(closed_at):
+        expected.pop("cleanup_error", None)
         expected["closed_at"] = closed_at
         expected["cleanup_status"] = status
     elif status == "superseded_identity_proven" and _timestamp(closed_at):
@@ -666,6 +677,7 @@ def _late_execution_session_transition(before, after):
                 or type(evidence["shell_started_after_session_seconds"]) is not int
                 or evidence["shell_started_after_session_seconds"] < 0):
             return False
+        expected.pop("cleanup_error", None)
         expected["superseded_at"] = closed_at
         expected["closed_at"] = closed_at
         expected["cleanup_status"] = status
@@ -675,7 +687,7 @@ def _late_execution_session_transition(before, after):
     return after == expected
 
 
-def _late_task_history_transition(retired_task, task, expected_state):
+def _late_task_history_transition(retired_task, task, expected_state, status):
     before, after = copy.deepcopy(retired_task), copy.deepcopy(task)
     before_contract = before.pop("work_contract", None)
     after_contract = after.pop("work_contract", None)
@@ -684,6 +696,22 @@ def _late_task_history_transition(retired_task, task, expected_state):
     for field in LATE_EVIDENCE_MUTABLE_FIELDS:
         before.pop(field, None)
         after.pop(field, None)
+    for field in LATE_EVIDENCE_REMOVED_FIELDS:
+        if field in before:
+            if field == "recovery_action" and before[field] not in {
+                    "await_exact_result_from_live_session",
+                    "await_verified_late_evidence",
+                    "terminal_unknown_retired_await_verified_late_evidence"}:
+                return False
+            if field == "delivery_reconcile_pending" and type(before[field]) is not bool:
+                return False
+            if field == "watchdog_blocker" and before[field] not in {
+                    "delivery_uncertain_requires_recovery",
+                    "terminal_unknown_delivery"}:
+                return False
+        if field in after:
+            return False
+        before.pop(field, None)
     if before != after:
         return False
     if before_contract != after_contract:
@@ -693,6 +721,23 @@ def _late_task_history_transition(retired_task, task, expected_state):
         expected_contract["phase"] = "finished"
         if after_contract != expected_contract:
             return False
+    if expected_state == "done":
+        if task.get("completion_level") not in {"root_verified", "verified"}:
+            return False
+        if type(task.get("completion_bundle_hash")) is not str or not re.fullmatch("[0-9a-f]{64}", task["completion_bundle_hash"]):
+            return False
+        if task.get("verification_status") != "accepted":
+            return False
+    else:
+        for field in ("completion_level", "completion_bundle_hash", "verification_status"):
+            if field in task and field not in retired_task:
+                return False
+    if task.get("result_status") != status or task.get("watchdog_resolution") != "exact_durable_result":
+        return False
+    if not _timestamp(task.get("watchdog_resolved_at")):
+        return False
+    if expected_state == "done" and not _timestamp(task.get("finished_at")):
+        return False
     return _late_execution_session_transition(before_session, after_session)
 
 
@@ -871,7 +916,7 @@ def _late_evidence_inspection(root, task):
              "late_evidence_unexpected_work_completion")
 
     need(_late_task_history_transition(
-             retired_task, task, expected_state)
+             retired_task, task, expected_state, status)
          and task.get("terminal_unknown_retirement") ==
              retired_task.get("terminal_unknown_retirement")
          and task.get("delivery_terminal_unknown") ==
