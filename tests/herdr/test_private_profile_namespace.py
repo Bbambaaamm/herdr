@@ -184,7 +184,10 @@ def test_same_uid_host_cannot_replace_profile_view_through_private_home(tmp_path
                 inside = Path(f"/proc/{child}/root") / str(
                     frozen.destination / item.relative
                 ).lstrip("/")
-                assert inside.read_bytes() == values[item.relative]
+                if item.relative == "auth.json":
+                    assert not inside.exists()
+                else:
+                    assert inside.read_bytes() == values[item.relative]
             # Replace all original source paths after sandbox and mounts exist.
             source.rename(tmp_path / "profile-old")
             hostile = tmp_path / "attacker"
@@ -196,7 +199,10 @@ def test_same_uid_host_cannot_replace_profile_view_through_private_home(tmp_path
                 inside = Path(f"/proc/{child}/root") / str(
                     frozen.destination / item.relative
                 ).lstrip("/")
-                assert inside.read_bytes() == values[item.relative]
-                assert inside.read_bytes() != b"attacker controlled"
+                if item.relative == "auth.json":
+                    assert not inside.exists()
+                else:
+                    assert inside.read_bytes() == values[item.relative]
+                    assert inside.read_bytes() != b"attacker controlled"
             proc.terminate()
             proc.wait(timeout=2)
