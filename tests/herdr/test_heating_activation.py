@@ -164,7 +164,7 @@ def test_plan_adds_only_repository_tools_and_complete_release_inventory(tmp_path
     assert total == sum(map(len, bodies.values()))
     assert ".git/FETCH_HEAD" not in planned["runtime"][0]["files"]
     assert planned["runtime"][0]["source"].startswith(
-        "/var/lib/herdr/runtime-assets/")
+        "/opt/herdr/runtime-assets/")
     assert planned["runtime"][0]["source"] != raw["runtime"][0]["source"]
     assert planned["runtime"][0]["executable_files"] == ["runtime.bin"]
     assert set(planned["runtime"][1]["files"]) == {"runtime.bin"}

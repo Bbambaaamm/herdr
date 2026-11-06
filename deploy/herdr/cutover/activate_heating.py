@@ -58,7 +58,7 @@ MAX_POLICY_BYTES = 4 * 1024 * 1024
 MAX_CODE_BYTES = 16 * 1024 * 1024
 MAX_CODE_FILE_BYTES = 4 * 1024 * 1024
 MAX_RUNTIME_FILES = 65536
-RUNTIME_ASSETS = PurePosixPath("/var/lib/herdr/runtime-assets")
+RUNTIME_ASSETS = PurePosixPath("/opt/herdr/runtime-assets")
 RELEASE_OWNER_UID = 0
 
 
@@ -262,7 +262,8 @@ def _require_root_protected_directory(path: Path) -> None:
         current /= component
         info = os.lstat(current)
         need(stat.S_ISDIR(info.st_mode) and info.st_uid == RELEASE_OWNER_UID
-             and not stat.S_IMODE(info.st_mode) & 0o022,
+             and not stat.S_IMODE(info.st_mode) & 0o022
+             and stat.S_IMODE(info.st_mode) & stat.S_IXOTH,
              "runtime_asset_ancestry_not_root_protected")
 
 
