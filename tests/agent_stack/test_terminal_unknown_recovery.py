@@ -49,7 +49,9 @@ def prepared(tmp_path, monkeypatch):
             "delivery_reconcile_pending": True,
             "watchdog_blocker": "delivery_uncertain_requires_recovery",
             "recovery_action": "await_exact_result_from_live_session",
-            "work_contract_version": 1, "work_contract": {"phase": "work", "identity": identity},
+            "work_contract_version": 1,
+            "work_contract": {"phase": "work", "identity": identity,
+                              "plan_sha256": "1" * 64},
             "execution_session": {"bridge_pid": 0, "sandbox_pid": 123,
                                   "pane_marker": "retained-marker"},
             "max_model_calls": 40, "max_cost_microusd": 10000000,
@@ -814,9 +816,15 @@ def test_verified_late_evidence_has_separate_exact_state_and_history(
     retired_bytes = p["path"].read_bytes()
     ledger_bytes, events_bytes = p["ledger"].read_bytes(), p["events"].read_bytes()
     task = json.loads(retired_bytes)
+    artifact = {
+        "task_id": task["id"], "attempt": task["attempt_id"],
+        "base_sha": "a" * 40, "commit_sha": "b" * 40,
+        "result_sha": "c" * 64, "changed_files": ["reviewed.py"],
+        "branch": "codex/synthetic-185",
+    }
     exact = {
         "task_id": task["id"], "run_token": task["run_token"],
-        "status": "completed", "blocker": None,
+        "status": "completed", "blocker": None, "artifact": artifact,
     }
     original_inode = p["result"].stat().st_ino
     put(p["result"], exact)
@@ -839,6 +847,28 @@ def test_verified_late_evidence_has_separate_exact_state_and_history(
         @staticmethod
         def _verify_root_completion(value, result):
             assert result == exact
+            identity = value["work_contract"]["identity"]
+            plan = value["work_contract"]["plan_sha256"]
+            tree = "d" * 64
+            rows = [
+                {"event": "work_check", "work_cycle": identity,
+                 "plan_sha256": plan, "check": {
+                     "check_id": "reviewed-check", "plan_sha256": plan,
+                     "environment_sha256": "e" * 64,
+                     "tree_sha256": tree, "exit_code": 0,
+                     "output_sha256": "f" * 64, "truncated": False,
+                     "duration_ms": 12, "isolation_sha256": "0" * 64}},
+                {"event": "work_pass", "work_cycle": identity,
+                 "plan_sha256": plan, "tree_sha256": tree},
+                {"event": "work_commit", "work_cycle": identity,
+                 "plan_sha256": plan, "commit_sha": artifact["commit_sha"],
+                 "artifact": artifact},
+                {"event": "work_handoff", "work_cycle": identity,
+                 "plan_sha256": plan, "bundle_sha256": "b" * 64},
+            ]
+            put(p["events"], p["events"].read_bytes() +
+                b"".join(canonical(row) + b"\n" for row in rows))
+            value["work_contract"]["phase"] = "finished"
             return {"level": "root_verified", "bundle_hash": "b" * 64}
     monkeypatch.setattr(recovery, "parent_attempt_guard", guard)
     monkeypatch.setattr(recovery, "_worker_bridge", lambda: Worker())
@@ -861,12 +891,75 @@ def test_verified_late_evidence_has_separate_exact_state_and_history(
     assert unknown.late_evidence_reconciled(p["root"], final) is True
     assert unknown.blocks_intake(p["root"], final) is False
     assert p["ledger"].read_bytes() == ledger_bytes
-    assert p["events"].read_bytes() == events_bytes
+    assert p["events"].read_bytes().startswith(events_bytes)
+    assert p["events"].read_bytes() != events_bytes
+
+    tampered_events = p["events"].read_bytes().replace(
+        b'"bundle_sha256":"' + b"b" * 64 + b'"',
+        b'"bundle_sha256":"' + b"c" * 64 + b'"')
+    put(p["events"], tampered_events)
+    assert unknown.late_evidence_reconciled(p["root"], final) is False
+    put(p["events"], events_bytes + p["events"].read_bytes()[len(events_bytes):].replace(
+        b'"bundle_sha256":"' + b"c" * 64 + b'"',
+        b'"bundle_sha256":"' + b"b" * 64 + b'"'))
 
     tampered = copy.deepcopy(final)
     tampered["permission_grant"]["tools"].append("write_file")
     assert unknown.late_evidence_reconciled(p["root"], tampered) is False
     assert unknown.blocks_intake(p["root"], tampered) is True
+
+
+def test_actual_absent_pane_cleanup_is_the_only_accepted_session_delta(
+        monkeypatch):
+    recovery = script("agent-stack-recovery")
+    before = {
+        "owned_pane": True, "pane_id": "%177", "pane_marker": "owned-marker",
+        "coordinator_pane_id": "%1", "bridge_pid": 0,
+        "cleanup_error": "old observation",
+    }
+    after = copy.deepcopy(before)
+    monkeypatch.setattr(recovery, "_pane_presence", lambda pane_id: False)
+    assert recovery.cleanup_task_owned_pane({"execution_session": after}) is True
+    assert after["cleanup_status"] == "already_absent"
+    assert unknown._late_execution_session_transition(before, after) is True
+    tampered = copy.deepcopy(after)
+    tampered["sandbox_pid"] = 999
+    assert unknown._late_execution_session_transition(before, tampered) is False
+
+
+def test_failed_result_with_blocker_uses_blocked_precedence_and_reconciles(
+        prepared, monkeypatch):
+    p = prepared
+    apply(p)
+    authorize_retirement(p)
+    retire(p)
+    task = json.loads(p["path"].read_bytes())
+    exact = {
+        "task_id": task["id"], "run_token": task["run_token"],
+        "status": "failed", "blocker": "user_action_required",
+    }
+    put(p["result"], exact)
+    recovery = script("agent-stack-recovery")
+    for name in ("ROOT", "BLOCKED", "DONE", "FAILED", "RESULTS"):
+        target = p["root"] if name == "ROOT" else p["root"] / name.lower()
+        monkeypatch.setattr(recovery, name, target)
+
+    @contextmanager
+    def guard(*args, **kwargs):
+        yield True
+
+    monkeypatch.setattr(recovery, "parent_attempt_guard", guard)
+    monkeypatch.setattr(
+        recovery, "_worker_bridge",
+        lambda: pytest.fail("blocked failed result cannot invoke verifier"))
+    monkeypatch.setattr(recovery, "cleanup_task_owned_pane", lambda value: True)
+    recovery.terminalize_from_result(p["path"], task, exact, 0)
+
+    final = json.loads((p["root"] / "blocked" / p["path"].name).read_bytes())
+    assert final["result_status"] == "failed"
+    assert final["attempt_state"] == "blocked"
+    assert unknown.late_evidence_reconciled(p["root"], final) is True
+    assert unknown.blocks_intake(p["root"], final) is False
 
 
 def test_failed_late_verifier_preserves_exact_retired_state(

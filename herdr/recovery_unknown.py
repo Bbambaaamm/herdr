@@ -16,6 +16,7 @@ import re
 import stat
 import time
 import uuid
+from datetime import datetime
 
 from .evidence import EvidenceError, binding, canonical, digest
 from .security import SecurityError
@@ -48,7 +49,7 @@ RETIREMENT_RECEIPT_FIELDS = {
 LATE_EVIDENCE_FIELDS = {
     "schema_version", "retirement_event_sha256", "result_sha256",
     "result_status", "reconciled_at", "verification_status",
-    "completion_bundle_hash",
+    "completion_bundle_hash", "work_events_sha256",
 }
 LATE_EVIDENCE_MUTABLE_FIELDS = {
     "attempt_state", "watchdog_blocker", "recovery_action",
@@ -489,6 +490,212 @@ def _validate_terminal_receipt(
     return raw, receipt, original
 
 
+def _work_events_raw(root, task):
+    storage = _policy(Path(root))
+    path = (storage / "work-contracts" / digest(binding(task)) / "events.jsonl")
+    raw, _ = snapshot(path)
+    return raw
+
+
+def late_work_events_sha256(root, task):
+    """Hash the exact current work log for a protected late-evidence marker."""
+    return hashlib.sha256(_work_events_raw(root, task)).hexdigest()
+
+
+def _event_rows(raw):
+    rows = []
+    for line in raw.splitlines(keepends=True):
+        need(line.endswith(b"\n"), "late_work_event_line")
+        row = _json(line[:-1])
+        need(type(row) is dict and canonical(row) + b"\n" == line,
+             "late_work_event_encoding")
+        rows.append(row)
+    return rows
+
+
+def _late_work_event_inspection(raw, baseline_sha256, task, result):
+    boundaries, position = [0], 0
+    for line in raw.splitlines(keepends=True):
+        need(line.endswith(b"\n"), "late_work_event_line")
+        position += len(line)
+        boundaries.append(position)
+    matches = [offset for offset in boundaries
+               if hashlib.sha256(raw[:offset]).hexdigest() == baseline_sha256]
+    need(len(matches) == 1, "late_work_event_baseline")
+    prefix, suffix = raw[:matches[0]], raw[matches[0]:]
+    current_sha256 = hashlib.sha256(raw).hexdigest()
+    contract = task.get("work_contract")
+    need(type(contract) is dict
+         and type(contract.get("identity")) is dict
+         and type(contract.get("plan_sha256")) is str
+         and re.fullmatch("[0-9a-f]{64}", contract["plan_sha256"]),
+         "late_work_contract_identity")
+    identity, plan_sha256 = contract["identity"], contract["plan_sha256"]
+
+    if not suffix:
+        bundle = None
+        if contract.get("phase") == "finished":
+            prefix_rows = _event_rows(prefix)
+            need(bool(prefix_rows), "late_work_handoff_missing")
+            last = prefix_rows[-1]
+            need(set(last) == {"event", "work_cycle", "plan_sha256",
+                               "bundle_sha256"}
+                 and last["event"] == "work_handoff"
+                 and last["work_cycle"] == identity
+                 and last["plan_sha256"] == plan_sha256
+                 and type(last["bundle_sha256"]) is str
+                 and re.fullmatch("[0-9a-f]{64}", last["bundle_sha256"]),
+                 "late_work_handoff_changed")
+            bundle = last["bundle_sha256"]
+        return {"work_events_sha256": current_sha256,
+                "appended_event_count": 0,
+                "completion_bundle_hash": bundle,
+                "completion_complete": bundle is not None}
+
+    rows = _event_rows(suffix)
+    for row in rows:
+        need(row.get("work_cycle") == identity
+             and row.get("plan_sha256") == plan_sha256,
+             "late_work_event_identity")
+
+    index, checks, tree_sha256, passed = 0, set(), None, False
+    while index < len(rows) and rows[index].get("event") == "work_check":
+        row = rows[index]
+        need(set(row) == {"event", "work_cycle", "plan_sha256", "check"},
+             "late_work_check_schema")
+        from .work_cycle import CheckResult
+        proof = CheckResult(**row["check"])
+        need(type(proof.check_id) is str and 0 < len(proof.check_id) <= 128
+             and proof.check_id not in checks
+             and proof.plan_sha256 == plan_sha256
+             and (contract.get("environment_sha256") is None
+                  or proof.environment_sha256 ==
+                     contract["environment_sha256"])
+             and not proof.truncated,
+             "late_work_check_changed")
+        if tree_sha256 is None:
+            tree_sha256 = proof.tree_sha256
+        need(proof.tree_sha256 == tree_sha256, "late_work_check_tree_changed")
+        checks.add(proof.check_id)
+        index += 1
+
+    if index < len(rows) and rows[index].get("event") == "work_pass":
+        row = rows[index]
+        need(set(row) == {"event", "work_cycle", "plan_sha256", "tree_sha256"}
+             and type(row["tree_sha256"]) is str
+             and re.fullmatch("[0-9a-f]{64}", row["tree_sha256"])
+             and (tree_sha256 is None or tree_sha256 == row["tree_sha256"]),
+             "late_work_pass_changed")
+        tree_sha256 = row["tree_sha256"]
+        passed = True
+        index += 1
+    need(not checks or passed, "late_work_pass_missing")
+
+    need(index < len(rows) and rows[index].get("event") == "work_commit",
+         "late_work_commit_missing")
+    commit = rows[index]
+    need(set(commit) == {"event", "work_cycle", "plan_sha256",
+                         "commit_sha", "artifact"},
+         "late_work_commit_schema")
+    from .evidence import parse_artifact
+    artifact = parse_artifact(commit["artifact"])
+    attempt = task.get("attempt_id", task.get("attempts", 0))
+    need(artifact.task_id == task.get("id")
+         and artifact.attempt == attempt
+         and artifact.commit_sha == commit["commit_sha"],
+         "late_work_commit_changed")
+    from .result_candidate import completion_candidate
+    candidate = completion_candidate(result)
+    need(candidate.get("artifact") == commit["artifact"],
+         "late_work_result_artifact_changed")
+    index += 1
+
+    need(index == len(rows) - 1
+         and rows[index].get("event") == "work_handoff",
+         "late_work_handoff_missing")
+    handoff = rows[index]
+    need(set(handoff) == {"event", "work_cycle", "plan_sha256",
+                          "bundle_sha256"}
+         and type(handoff["bundle_sha256"]) is str
+         and re.fullmatch("[0-9a-f]{64}", handoff["bundle_sha256"]),
+         "late_work_handoff_changed")
+    return {"work_events_sha256": current_sha256,
+            "appended_event_count": len(rows),
+            "completion_bundle_hash": handoff["bundle_sha256"],
+            "completion_complete": True}
+
+
+def _timestamp(value):
+    if type(value) is not str or not value or len(value) > 128:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
+def _late_execution_session_transition(before, after):
+    if before == after:
+        return True
+    if (type(before) is not dict or type(after) is not dict
+            or before.get("owned_pane") is not True
+            or before.get("closed_at")):
+        return False
+    expected = copy.deepcopy(before)
+    expected.pop("cleanup_error", None)
+    status = after.get("cleanup_status")
+    closed_at = after.get("closed_at")
+    if status in {"already_absent", "closed"} and _timestamp(closed_at):
+        expected["closed_at"] = closed_at
+        expected["cleanup_status"] = status
+    elif status == "superseded_identity_proven" and _timestamp(closed_at):
+        evidence = after.get("cleanup_evidence")
+        if (after.get("superseded_at") != closed_at
+                or type(evidence) is not dict
+                or set(evidence) != {"version", "expected_agent_absent",
+                                     "current_pane_unbound",
+                                     "ownership_marker_absent",
+                                     "shell_started_after_session_seconds",
+                                     "current_pane_close_performed"}
+                or evidence["version"] != 1
+                or evidence["expected_agent_absent"] is not True
+                or evidence["current_pane_unbound"] is not True
+                or evidence["ownership_marker_absent"] is not True
+                or evidence["current_pane_close_performed"] is not False
+                or type(evidence["shell_started_after_session_seconds"]) is not int
+                or evidence["shell_started_after_session_seconds"] < 0):
+            return False
+        expected["superseded_at"] = closed_at
+        expected["closed_at"] = closed_at
+        expected["cleanup_status"] = status
+        expected["cleanup_evidence"] = evidence
+    else:
+        return False
+    return after == expected
+
+
+def _late_task_history_transition(retired_task, task, expected_state):
+    before, after = copy.deepcopy(retired_task), copy.deepcopy(task)
+    before_contract = before.pop("work_contract", None)
+    after_contract = after.pop("work_contract", None)
+    before_session = before.pop("execution_session", None)
+    after_session = after.pop("execution_session", None)
+    for field in LATE_EVIDENCE_MUTABLE_FIELDS:
+        before.pop(field, None)
+        after.pop(field, None)
+    if before != after:
+        return False
+    if before_contract != after_contract:
+        if expected_state != "done" or type(before_contract) is not dict:
+            return False
+        expected_contract = copy.deepcopy(before_contract)
+        expected_contract["phase"] = "finished"
+        if after_contract != expected_contract:
+            return False
+    return _late_execution_session_transition(before_session, after_session)
+
+
 def _retirement_inspection(root, task_id, task, *, late_result=None):
     root = Path(root)
     marker = _authorized_retirement_marker(task)
@@ -541,9 +748,16 @@ def _retirement_inspection(root, task_id, task, *, late_result=None):
     _terminal_state_invariants(original_task, terminal_sha, retired_state=False)
 
     storage = _policy(root)
+    baseline_events = terminal["work_events_sha256"]
+    late_work = {"work_events_sha256": baseline_events,
+                 "appended_event_count": 0,
+                 "completion_bundle_hash": None,
+                 "completion_complete": False}
     if late_result is None:
         result, ledgers, events = _observations(root, storage, task)
-        need(result == terminal["result"], "retirement_result_slot_changed")
+        need(result == terminal["result"]
+             and events == baseline_events,
+             "retirement_result_slot_changed")
     else:
         result_path = root / "results" / (task_id + ".json")
         result_raw, result_info = snapshot(result_path, maximum=1048576)
@@ -554,24 +768,23 @@ def _retirement_inspection(root, task_id, task, *, late_result=None):
              and len(result_raw) > 0,
              "retirement_late_result_slot_changed")
         ledgers = _ledgers(storage, task)
-        event_path = (storage / "work-contracts" /
-                      digest(binding(task)) / "events.jsonl")
-        event_raw, _ = snapshot(event_path)
-        events = hashlib.sha256(event_raw).hexdigest()
+        event_raw = _work_events_raw(root, task)
+        late_work = _late_work_event_inspection(
+            event_raw, baseline_events, task, late_result)
     need(ledgers == terminal["budget_ledgers"]
-         and events == terminal["work_events_sha256"]
          and receipt["result"] == terminal["result"]
          and receipt["budget_ledgers"] == ledgers
-         and receipt["work_events_sha256"] == events,
+         and receipt["work_events_sha256"] == baseline_events,
          "retirement_evidence_chain_changed")
 
     terminal_raw, _, _ = _validate_terminal_receipt(
-        root, task_id, terminal, terminal_sha, original_task, ledgers, events)
+        root, task_id, terminal, terminal_sha, original_task, ledgers,
+        baseline_events)
     need(hashlib.sha256(terminal_raw).hexdigest() ==
          receipt["terminal_receipt_sha256"],
          "retirement_terminal_receipt_changed")
 
-    return {
+    outcome = {
         "operationally_retired": True,
         "retirement_decision_sha256": retirement_sha,
         "terminal_decision_sha256": terminal_sha,
@@ -583,6 +796,15 @@ def _retirement_inspection(root, task_id, task, *, late_result=None):
         "event_commitment_sha256":
             retirement["expected_event_commitment_sha256"],
     }
+    if late_result is not None:
+        outcome.update({
+            "work_events_sha256": late_work["work_events_sha256"],
+            "appended_work_event_count": late_work["appended_event_count"],
+            "work_completion_bundle_hash":
+                late_work["completion_bundle_hash"],
+            "work_completion_complete": late_work["completion_complete"],
+        })
+    return outcome
 
 
 def retirement_inspection(root, task, *, late_result=None):
@@ -602,6 +824,8 @@ def _late_evidence_inspection(root, task):
          and re.fullmatch("[0-9a-f]{64}", late["retirement_event_sha256"])
          and type(late["result_sha256"]) is str
          and re.fullmatch("[0-9a-f]{64}", late["result_sha256"])
+         and type(late["work_events_sha256"]) is str
+         and re.fullmatch("[0-9a-f]{64}", late["work_events_sha256"])
          and type(late["result_status"]) is str
          and type(late["reconciled_at"]) is str,
          "late_evidence_marker_schema")
@@ -620,18 +844,34 @@ def _late_evidence_inspection(root, task):
     result_path = root / "results" / (task_id + ".json")
     result_raw, _ = snapshot(result_path, maximum=1048576)
     result = _json(result_raw)
+    status = result.get("status")
+    blocker = str(result.get("blocker") or "").strip().lower()
+    expected_state = (
+        "blocked" if blocker not in {"", "none", "null"}
+        else "done" if status == "completed"
+        else "failed" if status == "failed"
+        else "blocked")
+
     history = _retirement_inspection(
         root, task_id, retired_task, late_result=result)
     need(history is not None
          and late["retirement_event_sha256"] == history["event_sha256"]
-         and late["result_sha256"] == digest(result),
+         and late["result_sha256"] == digest(result)
+         and late["work_events_sha256"] ==
+             history["work_events_sha256"],
          "late_evidence_history_changed")
+    if expected_state == "done":
+        need(history["work_completion_complete"] is True
+             and history["work_completion_bundle_hash"] ==
+                 task.get("completion_bundle_hash"),
+             "late_evidence_work_completion_changed")
+    else:
+        need(history["appended_work_event_count"] == 0
+             and history["work_completion_complete"] is False,
+             "late_evidence_unexpected_work_completion")
 
-    before, after = copy.deepcopy(retired_task), copy.deepcopy(task)
-    for field in LATE_EVIDENCE_MUTABLE_FIELDS:
-        before.pop(field, None)
-        after.pop(field, None)
-    need(before == after
+    need(_late_task_history_transition(
+             retired_task, task, expected_state)
          and task.get("terminal_unknown_retirement") ==
              retired_task.get("terminal_unknown_retirement")
          and task.get("delivery_terminal_unknown") ==
@@ -639,8 +879,6 @@ def _late_evidence_inspection(root, task):
          and task.get("automatic_retry_allowed") is False,
          "late_evidence_task_history_changed")
 
-    status = result.get("status")
-    blocker = str(result.get("blocker") or "").strip().lower()
     need(result.get("task_id") == task_id
          and result.get("run_token") == task.get("run_token")
          and status in {"completed", "blocked", "failed"}
@@ -652,10 +890,6 @@ def _late_evidence_inspection(root, task):
          and "delivery_reconcile_pending" not in task
          and "recovery_action" not in task,
          "late_evidence_transition_changed")
-    expected_state = (
-        "done" if status == "completed" and blocker in {"", "none", "null"}
-        else "failed" if status == "failed"
-        else "blocked")
     need(task.get("attempt_state") == expected_state,
          "late_evidence_terminal_state_changed")
     if expected_state == "done":

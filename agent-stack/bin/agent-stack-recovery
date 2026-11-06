@@ -18,6 +18,7 @@ from herdr.recovery_unknown import held as terminal_unknown_hold
 from herdr.recovery_unknown import retired as terminal_unknown_retired
 from herdr.recovery_unknown import (
     retirement_inspection as terminal_unknown_retirement_inspection,
+    late_work_events_sha256 as terminal_unknown_late_work_events_sha256,
 )
 from herdr.recovery_unknown import queue_lock as terminal_unknown_queue_lock
 from herdr.evidence import digest
@@ -667,6 +668,8 @@ def _terminalize_from_result_locked(
             "reconciled_at": task["watchdog_resolved_at"],
             "verification_status": task.get("verification_status"),
             "completion_bundle_hash": task.get("completion_bundle_hash"),
+            "work_events_sha256":
+                terminal_unknown_late_work_events_sha256(ROOT, task),
         }
     move_task(path, target, task)
 
