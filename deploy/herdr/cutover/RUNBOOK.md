@@ -104,7 +104,10 @@ MQTT, device, boiler, reload, restart or deployment capability. Apply holds the
 dispatcher and worker locks, backs up the exact prior root-owned policy, binds the
 complete immutable current release inventory, installs a seven-day Heating
 ceiling, verifies that the `agentops` runtime can compose it, and restores the
-backup on any failure. A fresh maintainer admission is still required afterward.
+backup on any failure. It also shares the cutover lock, preserves schema-2 private
+launch settings, and can renew an existing matching Heating ceiling without
+accepting capability drift. A fresh maintainer admission is still required
+afterward.
 
 ## Evidence and soak
 

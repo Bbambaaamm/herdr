@@ -162,6 +162,43 @@ def test_conflicting_existing_heating_policy_is_rejected(tmp_path, monkeypatch):
         activation.planned_policy(raw, release, identity, datetime(2026, 11, 6, tzinfo=UTC))
 
 
+def test_reviewed_existing_heating_policy_can_be_renewed(tmp_path, monkeypatch):
+    raw = policy(tmp_path, monkeypatch)
+    release, _ = immutable_release(tmp_path)
+    monkeypatch.setattr(activation, "WORKSPACE", tmp_path / "heating")
+    monkeypatch.setattr(activation, "RESULTS", tmp_path / "tasks" / "results")
+    first = datetime(2026, 11, 6, tzinfo=UTC)
+    identity = {"tag": "v0.3.0-rc.29", "commit": "0" * 40}
+    _, installed, _ = activation.planned_policy(raw, release, identity, first)
+    raw["templates"][activation.CONSUMER] = installed.to_json()
+
+    renewed_policy, renewed, _ = activation.planned_policy(
+        raw, release, {"tag": "v0.3.0-rc.30", "commit": "1" * 40},
+        first + timedelta(hours=1),
+    )
+
+    assert renewed.grant_id != installed.grant_id
+    assert renewed.expires_at != installed.expires_at
+    assert renewed_policy["templates"][activation.CONSUMER] == renewed.to_json()
+
+
+def test_private_host_policy_is_preserved(tmp_path, monkeypatch):
+    raw = policy(tmp_path, monkeypatch)
+    raw["schema_version"] = 2
+    raw["private_launch"] = {"reviewed": {"opaque": True}}
+    release, _ = immutable_release(tmp_path)
+    monkeypatch.setattr(activation, "WORKSPACE", tmp_path / "heating")
+    monkeypatch.setattr(activation, "RESULTS", tmp_path / "tasks" / "results")
+
+    planned, _, _ = activation.planned_policy(
+        raw, release, {"tag": "v0.3.0-rc.29", "commit": "0" * 40},
+        datetime(2026, 11, 6, tzinfo=UTC),
+    )
+
+    assert planned["schema_version"] == 2
+    assert planned["private_launch"] == raw["private_launch"]
+
+
 def test_release_inventory_rejects_writable_files(tmp_path):
     release, _ = immutable_release(tmp_path)
     (release / "herdr/new_runtime.py").chmod(0o644)

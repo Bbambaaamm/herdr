@@ -32,6 +32,7 @@ sys.path.insert(0, str(ROOT))
 
 from herdr.release import canonical_json, verify_tree  # noqa: E402
 from herdr.security import InvocationIdentity, SecurityGrant  # noqa: E402
+from deploy.herdr.cutover.cutover import deployment_lock  # noqa: E402
 
 
 HOST_POLICY = Path("/etc/herdr/host-policy.json")
@@ -175,14 +176,30 @@ def _heating_template(source: SecurityGrant, release: dict, issued: datetime) ->
     )
 
 
+def _same_security_ceiling(retained: SecurityGrant, desired: SecurityGrant) -> bool:
+    """Ignore only release/hour metadata when validating a reviewed renewal."""
+    normalized = replace(
+        retained,
+        grant_id=desired.grant_id,
+        identity=replace(retained.identity, run_token=desired.identity.run_token),
+        issued_at=desired.issued_at,
+        expires_at=desired.expires_at,
+    )
+    return normalized.to_json() == desired.to_json()
+
+
 def planned_policy(raw: dict, release_root: Path, release: dict,
                    issued: datetime) -> tuple[dict, SecurityGrant, int]:
     required = {
         "schema_version", "host_uid", "code", "runtime", "storage",
         "templates", "grant_ttl_seconds", "task_store_root",
     }
+    version = raw.get("schema_version")
+    if type(version) is int and version == 2:
+        required |= {"private_launch"}
     need(set(raw) in (required, required | {"work_contracts"})
-         and raw.get("schema_version") == 1, "unsupported_host_policy_schema")
+         and type(version) is int and version in (1, 2),
+         "unsupported_host_policy_schema")
     agentops = pwd.getpwnam("agentops")
     need(raw.get("host_uid") == agentops.pw_uid, "host_policy_uid_mismatch")
     need(Path(str(raw.get("task_store_root"))) == TASK_ROOT,
@@ -195,7 +212,7 @@ def planned_policy(raw: dict, release_root: Path, release: dict,
     existing = templates.get(CONSUMER)
     if existing is not None:
         retained = SecurityGrant.from_dict(existing)
-        need(retained.to_json() == desired.to_json(), "heating_policy_drift")
+        need(_same_security_ceiling(retained, desired), "heating_policy_drift")
     files, executable, total = release_inventory(release_root)
     code = raw.get("code")
     need(isinstance(code, dict) and code.get("target") == "/run/herdr/policy-code",
@@ -334,11 +351,11 @@ def verify_as_agentops() -> None:
 
 def apply(release_root: Path, confirmation: str) -> dict:
     need(os.geteuid() == 0, "root_required")
-    release_root = release_root.resolve(strict=True)
-    release = validate_environment(release_root)
-    ACTIVATION_LOCK.parent.mkdir(parents=True, exist_ok=True)
     agentops = pwd.getpwnam("agentops")
     with ExitStack() as locks:
+        locks.enter_context(deployment_lock())
+        release_root = release_root.resolve(strict=True)
+        validate_environment(release_root)
         locks.enter_context(exclusive_file_lock(ACTIVATION_LOCK, owner=0, create=True))
         locks.enter_context(exclusive_file_lock(
             TASK_ROOT / "dispatcher.lock", owner=agentops.pw_uid))
