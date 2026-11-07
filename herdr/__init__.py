@@ -21,6 +21,15 @@ from .scheduler import (
     SchedulerError,
     Lease,
 )
+from .routing import (
+    FailureKind,
+    RejectedCandidate,
+    RoutingDecision,
+    RoutingError,
+    bounded_fallback,
+    classify_failure,
+    select_route,
+)
 
 __all__ = [
     "GRAPH_VERSION",
@@ -40,6 +49,13 @@ __all__ = [
     "SchedulerBudget",
     "SchedulerError",
     "Lease",
+    "FailureKind",
+    "RejectedCandidate",
+    "RoutingDecision",
+    "RoutingError",
+    "bounded_fallback",
+    "classify_failure",
+    "select_route",
 ]
 __version__ = "0.2.0"
 from .workspace import (

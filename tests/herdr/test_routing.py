@@ -1,0 +1,107 @@
+"""Focused Router v5 contract regressions (offline only)."""
+from dataclasses import replace
+
+from herdr.capability import Health
+from herdr.routing import FailureKind, RoutingDecision, bounded_fallback, classify_failure, select_route
+from tests.herdr.test_capability import NOW, fixture
+
+
+def test_deterministic_decision_and_versioned_payload():
+    registry, scope, requirement, states = fixture()
+    decision = select_route(
+        registry, requirement, scope, states, at=NOW, policy_version="router-v5-policy-1"
+    )
+    assert decision.selected_provider == "a"
+    assert decision.selected_model == "logical-spec"
+    assert decision.selected_executor == "a-runtime"
+    assert decision.schema_version == "1.0.0"
+    assert RoutingDecision.from_json(decision.to_json()).digest == decision.digest
+
+    reversed_states = tuple(reversed(states))
+    again = select_route(
+        registry, requirement, scope, reversed_states, at=NOW, policy_version="router-v5-policy-1"
+    )
+    assert again.to_json() == decision.to_json()
+
+
+def test_bounded_fallback_keeps_registry_constraints_and_stops():
+    registry, scope, requirement, states = fixture()
+    decision = bounded_fallback(
+        registry, requirement, scope, states, at=NOW,
+        policy_version="router-v5-policy-1",
+        failed_executors={"a-runtime": FailureKind.PROVIDER_UNAVAILABLE},
+        max_attempts=2,
+    )
+    assert decision.selected_provider == "b"
+    assert decision.selected_executor == "b-runtime"
+    assert "bounded_fallback" in decision.reasons
+    assert decision.rejected_candidates[-1].failure is FailureKind.PROVIDER_UNAVAILABLE
+
+    exhausted = bounded_fallback(
+        registry, requirement, scope, states, at=NOW,
+        policy_version="router-v5-policy-1",
+        failed_executors={
+            "a-runtime": FailureKind.PROVIDER_UNAVAILABLE,
+            "b-runtime": FailureKind.RATE_LIMITED,
+        },
+        max_attempts=2,
+    )
+    assert exhausted.selected_executor is None
+    assert exhausted.attempts == 2
+
+    denied_scope = replace(scope, providers=("a",), executors=("a-runtime",))
+    denied = bounded_fallback(
+        registry, requirement, denied_scope, states, at=NOW,
+        policy_version="router-v5-policy-1",
+        failed_executors={"a-runtime": FailureKind.PROVIDER_UNAVAILABLE},
+        max_attempts=2,
+    )
+    assert denied.selected_executor is None
+    assert denied.failure is FailureKind.POLICY_DENIED
+
+
+def test_failure_taxonomy_laguna_and_claude_credit_cases():
+    assert classify_failure(
+        status_code=404, message="model not found: laguna-s-2.1:free", model_known=False
+    ) is FailureKind.MODEL_NOT_FOUND
+    assert classify_failure(
+        status_code=404, message="insufficient credits for Claude Opus 5.5", model_known=True
+    ) is FailureKind.INSUFFICIENT_CREDITS
+    assert classify_failure(status_code=429, message="rate limit") is FailureKind.RATE_LIMITED
+    assert classify_failure(status_code=503, message="upstream unavailable") is FailureKind.PROVIDER_UNAVAILABLE
+    assert classify_failure(message="policy denied") is FailureKind.POLICY_DENIED
+    assert classify_failure(message="budget exceeded") is FailureKind.BUDGET_EXCEEDED
+    assert classify_failure(status_code=418, message="opaque") is FailureKind.UNKNOWN
+
+
+def test_telemetry_projection_contains_audit_digest_and_rejections():
+    registry, scope, requirement, states = fixture()
+    decision = select_route(
+        registry, requirement, scope, states, at=NOW, policy_version="router-v5-policy-1",
+        failed_executors={"a-runtime": FailureKind.RATE_LIMITED}, max_attempts=2,
+    )
+    event = decision.to_telemetry_event(
+        sequence=1, timestamp="2026-10-02T10:00:10+00:00", issue="79",
+        task_id="router-test", attempt=1, agent_id="hermes", role="router",
+    )
+    assert event.router_decision == decision.digest
+    assert event.event_type.value == "model_fallback"
+    assert event.fallback_chain == ("a-runtime",)
+    assert event.blocker is None
+
+
+def test_no_candidate_is_fail_closed_for_provider_unavailable():
+    registry, scope, requirement, states = fixture()
+    changed_states = tuple(
+        replace(state, health=Health.UNAVAILABLE, reason_code="maintenance")
+        for state in states
+    )
+    decision = select_route(
+        registry, requirement, scope, changed_states, at=NOW, policy_version="router-v5-policy-1"
+    )
+    assert decision.selected_executor is None
+    assert decision.failure is FailureKind.PROVIDER_UNAVAILABLE
+    assert all(
+        item.failure is FailureKind.PROVIDER_UNAVAILABLE
+        for item in decision.rejected_candidates
+    )
