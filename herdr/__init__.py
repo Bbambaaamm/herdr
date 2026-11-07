@@ -24,6 +24,7 @@ from .scheduler import (
 from .routing import (
     FailureKind,
     FailureScope,
+    ScopeAttestation,
     RejectedCandidate,
     RoutingDecision,
     RoutingError,
@@ -53,6 +54,7 @@ __all__ = [
     "Lease",
     "FailureKind",
     "FailureScope",
+    "ScopeAttestation",
     "RejectedCandidate",
     "RoutingDecision",
     "RoutingError",

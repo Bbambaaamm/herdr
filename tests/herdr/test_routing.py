@@ -7,6 +7,7 @@ from herdr.capability import Health
 from herdr.routing import (
     FailureKind,
     FailureScope,
+    ScopeAttestation,
     RoutingDecision,
     RoutingError,
     bounded_fallback,
@@ -15,6 +16,10 @@ from herdr.routing import (
     select_route,
 )
 from tests.herdr.test_capability import NOW, fixture
+
+
+def attestation(executor_id, scope):
+    return {executor_id: ScopeAttestation(executor_id, scope, "policy_evaluator", "a" * 64)}
 
 
 def test_scope_wide_denial_blocks_fallback_but_candidate_local_can_fallback():
@@ -51,11 +56,20 @@ def test_scope_wide_denial_blocks_fallback_but_candidate_local_can_fallback():
             failed_scopes={"a-runtime": ambiguous},
             max_attempts=2,
         )
-    with pytest.raises(RoutingError, match="terminal or unknown"):
+    with pytest.raises(RoutingError, match="unknown failure"):
         bounded_fallback(
             registry, requirement, scope, states, at=NOW,
             policy_version="router-v5-policy-1",
             failed_executors={"a-runtime": FailureKind.UNKNOWN},
+            max_attempts=2,
+        )
+
+    with pytest.raises(RoutingError, match="trusted scope attestation"):
+        bounded_fallback(
+            registry, requirement, scope, states, at=NOW,
+            policy_version="router-v5-policy-1",
+            failed_executors={"a-runtime": FailureKind.POLICY_DENIED},
+            failed_scopes={"a-runtime": FailureScope.CANDIDATE_LOCAL},
             max_attempts=2,
         )
 
@@ -64,6 +78,7 @@ def test_scope_wide_denial_blocks_fallback_but_candidate_local_can_fallback():
         policy_version="router-v5-policy-1",
         failed_executors={"a-runtime": FailureKind.POLICY_DENIED},
         failed_scopes={"a-runtime": FailureScope.CANDIDATE_LOCAL},
+        scope_attestations=attestation("a-runtime", FailureScope.CANDIDATE_LOCAL),
         max_attempts=2,
     )
     assert local.selected_executor == "b-runtime"
@@ -74,6 +89,7 @@ def test_scope_wide_denial_blocks_fallback_but_candidate_local_can_fallback():
         policy_version="router-v5-policy-1",
         failed_executors={"a-runtime": FailureKind.POLICY_DENIED},
         failed_scopes={"a-runtime": FailureScope.ROUTING_WIDE},
+        scope_attestations=attestation("a-runtime", FailureScope.ROUTING_WIDE),
         max_attempts=2,
     )
     assert wide.selected_executor is None
@@ -86,6 +102,7 @@ def test_scope_wide_denial_blocks_fallback_but_candidate_local_can_fallback():
         policy_version="router-v5-policy-1",
         failed_executors={"a-runtime": FailureKind.BUDGET_EXCEEDED},
         failed_scopes={"a-runtime": FailureScope.ROUTING_WIDE},
+        scope_attestations=attestation("a-runtime", FailureScope.ROUTING_WIDE),
         max_attempts=2,
     )
     assert budget_wide.selected_executor is None

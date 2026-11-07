@@ -47,6 +47,25 @@ class FailureScope(StrEnum):
     UNKNOWN = "unknown"
 
 
+@dataclass(frozen=True)
+class ScopeAttestation:
+    """Trusted scope origin supplied by an existing policy/budget boundary."""
+
+    executor_id: str
+    scope: FailureScope
+    source: str
+    evidence_sha256: str
+
+    def __post_init__(self) -> None:
+        _token(self.executor_id, "executor_id")
+        object.__setattr__(self, "scope", FailureScope(self.scope))
+        _token(self.source, "scope source")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.evidence_sha256):
+            raise RoutingError("scope evidence must be lowercase sha256")
+        if self.scope is FailureScope.UNKNOWN:
+            raise RoutingError("unknown scope cannot be attested")
+
+
 # Mapping input order is not an execution trace. Terminal failures therefore
 # use this explicit stable precedence; attempted_fallbacks is a sorted set.
 _FAILURE_PRECEDENCE = {
@@ -308,16 +327,26 @@ def _reason_failure(reason: Reason) -> FailureKind:
 
 
 def _scope_for_failure(
-    executor_id: str, failure: FailureKind, scopes: Mapping[str, FailureScope]
+    executor_id: str,
+    failure: FailureKind,
+    scopes: Mapping[str, FailureScope],
+    attestations: Mapping[str, ScopeAttestation],
 ) -> FailureScope:
+    if failure is FailureKind.UNKNOWN:
+        raise RoutingError("unknown failure cannot authorize fallback: " + executor_id)
     explicit = scopes.get(executor_id)
-    if explicit is not None:
+    attestation = attestations.get(executor_id)
+    if failure in (FailureKind.POLICY_DENIED, FailureKind.BUDGET_EXCEEDED):
+        if explicit is None:
+            raise RoutingError("explicit failure scope required for terminal or unknown failure: " + executor_id)
         if explicit is FailureScope.UNKNOWN:
             raise RoutingError("failure scope is uncertain and cannot authorize fallback: " + executor_id)
+        if attestation is None or attestation.executor_id != executor_id or attestation.scope is not explicit:
+            raise RoutingError("trusted scope attestation required for terminal failure: " + executor_id)
         return explicit
-    if failure in (FailureKind.POLICY_DENIED, FailureKind.BUDGET_EXCEEDED, FailureKind.UNKNOWN):
-        raise RoutingError("explicit failure scope required for terminal or unknown failure: " + executor_id)
-    return FailureScope.CANDIDATE_LOCAL
+    if explicit is FailureScope.UNKNOWN:
+        raise RoutingError("failure scope is uncertain and cannot authorize fallback: " + executor_id)
+    return explicit or FailureScope.CANDIDATE_LOCAL
 
 
 def _terminal_failure(
@@ -374,16 +403,20 @@ def select_route(
     max_attempts: int = 1,
     failed_executors: Mapping[str, FailureKind] | None = None,
     failed_scopes: Mapping[str, FailureScope] | None = None,
+    scope_attestations: Mapping[str, ScopeAttestation] | None = None,
 ) -> RoutingDecision:
     """Select a route from the existing registry, deterministically and offline."""
     if max_attempts < 1 or max_attempts > 16:
         raise RoutingError("max_attempts must be between 1 and 16")
     failed = {key: FailureKind(value) for key, value in (failed_executors or {}).items()}
     scopes = {key: FailureScope(value) for key, value in (failed_scopes or {}).items()}
-    if set(scopes) - set(failed):
-        raise RoutingError("failed_scopes contains an executor without a failure")
+    attestations = dict(scope_attestations or {})
+    if set(scopes) - set(failed) or set(attestations) - set(failed):
+        raise RoutingError("scope metadata contains an executor without a failure")
+    if any(not isinstance(item, ScopeAttestation) for item in attestations.values()):
+        raise RoutingError("scope_attestations must be typed")
     resolved_scopes = {
-        executor_id: _scope_for_failure(executor_id, failure, scopes)
+        executor_id: _scope_for_failure(executor_id, failure, scopes, attestations)
         for executor_id, failure in failed.items()
     }
     result = registry.candidates(requirement, policy, tuple(runtime_state), at=at)
@@ -491,6 +524,7 @@ def bounded_fallback(
     policy_version: str,
     failed_executors: Mapping[str, FailureKind],
     failed_scopes: Mapping[str, FailureScope] | None = None,
+    scope_attestations: Mapping[str, ScopeAttestation] | None = None,
     max_attempts: int = 3,
 ) -> RoutingDecision:
     """Retry only compatible registry candidates and stop at a fixed bound."""
@@ -499,9 +533,11 @@ def bounded_fallback(
             registry, requirement, policy, runtime_state, at=at,
             policy_version=policy_version, max_attempts=max_attempts,
             failed_executors=failed_executors, failed_scopes=failed_scopes,
+            scope_attestations=scope_attestations,
         )
     return select_route(
         registry, requirement, policy, runtime_state, at=at,
         policy_version=policy_version, max_attempts=max_attempts,
         failed_executors=failed_executors, failed_scopes=failed_scopes,
+            scope_attestations=scope_attestations,
     )
