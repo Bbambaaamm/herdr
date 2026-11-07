@@ -884,6 +884,53 @@ class DynamicChildScheduler:
             "policy_profile": record.policy_profile,
         }
 
+    def select_managed_route(
+        self,
+        task_id: str,
+        *,
+        registry,
+        requirement,
+        policy,
+        runtime_state,
+        at: str,
+        policy_version: str,
+        budget_gate,
+        budget_allocation_id: str,
+        identity,
+        expected_registry_hash: str,
+        expected_requirement_hash: str,
+        failed_executors=None,
+        failed_scopes=None,
+        attempt: int = 1,
+    ):
+        """Read-only P1-A routing decision before worker dispatch.
+
+        The adapter reuses the existing capability and budget authorities. It
+        does not claim a lease, reserve a model operation, or grant execution.
+        """
+        rec = self.record_for(task_id)
+        from .scheduler_routing import RoutingIntegrationError, select_managed_task_route
+        if getattr(identity, "consumer", None) != "github:" + rec.repo:
+            raise RoutingIntegrationError("routing identity consumer differs from task repository")
+        return select_managed_task_route(
+            task=rec.node,
+            registry=registry,
+            requirement=requirement,
+            policy=policy,
+            runtime_state=runtime_state,
+            at=at,
+            policy_version=policy_version,
+            policy_profile=rec.policy_profile,
+            budget_gate=budget_gate,
+            budget_allocation_id=budget_allocation_id,
+            identity=identity,
+            expected_registry_hash=expected_registry_hash,
+            expected_requirement_hash=expected_requirement_hash,
+            failed_executors=failed_executors,
+            failed_scopes=failed_scopes,
+            attempt=attempt,
+        )
+
     def graph_dimensions(self) -> tuple[int, int, int]:
         if not self._tasks:
             return (0, 0, 0)
