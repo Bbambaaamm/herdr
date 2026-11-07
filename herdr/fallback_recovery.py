@@ -21,6 +21,7 @@ from .routing import (
     classify_failure,
 )
 from .scheduler_routing import ManagedExecutionHandoff, ManagedRoute, RoutingIntegrationError
+from .security import InvocationIdentity
 
 
 class RecoveryAction(StrEnum):
@@ -104,6 +105,19 @@ class FallbackTransition:
             raise RoutingIntegrationError("non-fallback transition cannot carry a handoff")
 
     def audit_event(self) -> dict[str, Any]:
+        handoff = None
+        if self.handoff is not None:
+            handoff = {
+                name: getattr(self.handoff, name)
+                for name in (
+                    "version", "task_id", "run_token", "attempt", "fencing_token",
+                    "consumer", "agent_id", "parent_task_id", "parent_agent_id",
+                    "policy_profile", "policy_version", "decision_sha256",
+                    "selected_executor", "selected_provider", "selected_model",
+                    "registry_hash", "requirement_hash", "parent_scope_hash",
+                    "policy_hash", "budget_allocation_id",
+                )
+            }
         return {
             "event": "managed_fallback_transition",
             "version": self.version,
@@ -120,7 +134,29 @@ class FallbackTransition:
             "reconciliation_required": self.reconciliation_required,
             "source_decision_sha256": self.source_decision_sha256,
             "next_decision_sha256": self.next_decision_sha256,
+            "handoff": handoff,
         }
+
+    @classmethod
+    def from_audit_event(cls, event: dict[str, Any]) -> "FallbackTransition":
+        if event.get("event") != "managed_fallback_transition":
+            raise RoutingIntegrationError("not a fallback transition event")
+        handoff_payload = event.get("handoff")
+        handoff = None
+        if handoff_payload is not None:
+            if not isinstance(handoff_payload, dict):
+                raise RoutingIntegrationError("fallback replay handoff malformed")
+            handoff = ManagedExecutionHandoff(**handoff_payload)
+        return cls(
+            version=event["version"], action=event["action"], task_id=event["task_id"],
+            run_token=event["run_token"], attempt=event["attempt"],
+            fencing_token=event["fencing_token"], failed_executor=event["failed_executor"],
+            failure=event["failure"], failure_scope=event["failure_scope"],
+            fallback_count=event["fallback_count"], max_fallbacks=event["max_fallbacks"],
+            reconciliation_required=event["reconciliation_required"],
+            source_decision_sha256=event["source_decision_sha256"],
+            next_decision_sha256=event.get("next_decision_sha256"), handoff=handoff,
+        )
 
 
 def _trusted_candidate_scope(
@@ -136,6 +172,62 @@ def _trusted_candidate_scope(
         and observation.scope_attestation.scope is FailureScope.CANDIDATE_LOCAL
         and observation.scope_attestation.verifies(registry_hash, requirement_hash)
     )
+
+
+def _validate_source_route(
+    scheduler: Any,
+    *,
+    task_id: str,
+    route: ManagedRoute,
+    identity: InvocationIdentity,
+    registry: Any,
+    requirement: Any,
+    policy: Any,
+    budget_gate: Any,
+    budget_allocation_id: str,
+    expected_registry_hash: str,
+    expected_requirement_hash: str,
+    policy_version: str,
+) -> Any:
+    record = scheduler.record_for(task_id)
+    if route.routing_input.task_id != task_id:
+        raise RoutingIntegrationError("stale routing decision task binding")
+    if not isinstance(identity, InvocationIdentity):
+        raise RoutingIntegrationError("typed recovery identity required")
+    if identity.task_id != task_id or identity.consumer != "github:" + record.repo:
+        raise RoutingIntegrationError("recovery consumer/task binding is stale")
+    if record.run_token is None or identity.run_token != record.run_token:
+        raise RoutingIntegrationError("recovery run binding is stale")
+    fence = record.lease.fencing_token if record.lease is not None else record.fencing_token
+    if fence is None or identity.fencing_token != fence:
+        raise RoutingIntegrationError("recovery fence is stale")
+    if record.agent_id is None or identity.agent_id != record.agent_id:
+        raise RoutingIntegrationError("recovery agent binding is stale")
+    if record.parent_task_id != identity.parent_task_id or record.parent_agent_id != identity.parent_agent_id:
+        raise RoutingIntegrationError("recovery parent binding is stale")
+    if route.routing_input.attempt != record.attempts + 1:
+        raise RoutingIntegrationError("stale routing decision attempt")
+    if route.routing_input.registry_hash != expected_registry_hash or registry.snapshot.hash != expected_registry_hash:
+        raise RoutingIntegrationError("stale routing decision registry")
+    if route.routing_input.requirement_hash != expected_requirement_hash or requirement.hash != expected_requirement_hash:
+        raise RoutingIntegrationError("stale routing decision requirement")
+    if route.routing_input.parent_scope_hash != policy.hash:
+        raise RoutingIntegrationError("stale routing decision policy")
+    if route.routing_input.policy_version != policy_version:
+        raise RoutingIntegrationError("stale routing decision policy version")
+    if route.routing_input.budget_allocation_id != budget_allocation_id:
+        raise RoutingIntegrationError("stale routing decision budget")
+    # This reuses the existing authoritative TaskNode/registry/policy/model
+    # binding and WorkBudgetAuthority gate without issuing execution.
+    scheduler.prepare_managed_execution_handoff(
+        route,
+        identity=identity,
+        registry=registry,
+        requirement=requirement,
+        policy=policy,
+        budget_gate=budget_gate,
+    )
+    return record
 
 
 def decide_managed_fallback(
@@ -164,16 +256,29 @@ def decide_managed_fallback(
     failures and untrusted scopes are fail-closed.  Only an explicitly
     attested candidate-local, retryable failure may select another route.
     """
+    if route.decision.selected_executor is None:
+        raise RoutingIntegrationError("fallback source route has no authorized executor")
+    if observation.executor_id != route.decision.selected_executor:
+        raise RoutingIntegrationError("failure executor differs from authorized route")
     failure = classify_failure(
         status_code=observation.status_code,
         message=observation.message,
         model_known=observation.model_known,
     )
-    record = scheduler.record_for(task_id)
-    if identity.task_id != task_id or record.run_token != identity.run_token:
-        raise RoutingIntegrationError("recovery identity is not bound to task record")
-    if record.lease is None or record.lease.fencing_token != identity.fencing_token:
-        raise RoutingIntegrationError("recovery fence is stale")
+    record = _validate_source_route(
+        scheduler,
+        task_id=task_id,
+        route=route,
+        identity=identity,
+        registry=registry,
+        requirement=requirement,
+        policy=policy,
+        budget_gate=budget_gate,
+        budget_allocation_id=budget_allocation_id,
+        expected_registry_hash=expected_registry_hash,
+        expected_requirement_hash=expected_requirement_hash,
+        policy_version=policy_version,
+    )
     source_digest = route.decision_sha256
     if observation.delivery_uncertain:
         transition = FallbackTransition(
@@ -238,11 +343,19 @@ def decide_managed_fallback(
             fallback_count + 1, max_fallbacks, False, source_digest,
             next_route.decision_sha256, handoff,
         )
-    scheduler.audit_log.append_if_absent(
-        transition.audit_event(),
-        identity_fields=(
-            "event", "task_id", "run_token", "attempt",
-            "failed_executor", "source_decision_sha256",
-        ),
-    )
+    event = transition.audit_event()
+    try:
+        authoritative_event = scheduler.audit_log.append_or_get_strict(
+            event,
+            identity_fields=(
+                "event", "task_id", "run_token", "attempt",
+                "failed_executor", "source_decision_sha256",
+            ),
+        )
+    except Exception as exc:
+        raise RoutingIntegrationError("fallback replay conflict") from exc
+    if authoritative_event != event:
+        # A concurrent/restarted caller receives only the durable authoritative
+        # result; it cannot publish a newly computed conflicting transition.
+        return FallbackTransition.from_audit_event(authoritative_event)
     return transition

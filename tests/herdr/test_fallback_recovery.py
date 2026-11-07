@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from herdr.fallback_recovery import (
 )
 from herdr.routing import FailureKind, FailureScope, ScopeAttestation
 from herdr.scheduler import AuditLog, DynamicChildScheduler
-from herdr.scheduler_routing import select_managed_task_route
+from herdr.scheduler_routing import RoutingIntegrationError, select_managed_task_route
 from herdr.security import InvocationIdentity
 from herdr.taskgraph import GRAPH_VERSION, TaskGraph, TaskGraphEnvelope
 from tests.herdr.test_capability import NOW, fixture
@@ -245,13 +246,143 @@ def test_duplicate_recovery_replay_is_idempotent_in_existing_audit_log(tmp_path)
     assert len(events) == 1
 
 
-
-def test_terminal_budget_or_policy_denial_cannot_fallback_even_if_scope_claimed(tmp_path):
+def test_foreign_executor_observation_is_rejected(tmp_path):
     scheduler, node, ident, kwargs, route = _scheduled(tmp_path)
+    with pytest.raises(RoutingIntegrationError, match="failure executor"):
+        decide_managed_fallback(
+            scheduler,
+            task_id=node.id,
+            route=route,
+            observation=ProviderFailureObservation(
+                executor_id="b-runtime",
+                status_code=503,
+                message="provider unavailable",
+                delivery_uncertain=True,
+            ),
+            identity=ident,
+            registry=kwargs["registry"],
+            requirement=kwargs["requirement"],
+            policy=kwargs["policy"],
+            runtime_state=kwargs["runtime_state"],
+            at=kwargs["at"],
+            policy_version=kwargs["policy_version"],
+            budget_gate=kwargs["budget_gate"],
+            budget_allocation_id=ALLOCATION,
+            expected_registry_hash=kwargs["expected_registry_hash"],
+            expected_requirement_hash=kwargs["expected_requirement_hash"],
+            fallback_count=0,
+            max_fallbacks=1,
+        )
+
+
+def test_stale_source_routing_attempt_is_fail_closed(tmp_path):
+    scheduler, node, ident, kwargs, route = _scheduled(tmp_path)
+    stale = replace(route, routing_input=replace(route.routing_input, attempt=2))
+    with pytest.raises(RoutingIntegrationError, match="stale routing decision attempt"):
+        decide_managed_fallback(
+            scheduler,
+            task_id=node.id,
+            route=stale,
+            observation=ProviderFailureObservation(
+                executor_id="a-runtime",
+                status_code=503,
+                message="provider unavailable",
+                delivery_uncertain=True,
+            ),
+            identity=ident,
+            registry=kwargs["registry"],
+            requirement=kwargs["requirement"],
+            policy=kwargs["policy"],
+            runtime_state=kwargs["runtime_state"],
+            at=kwargs["at"],
+            policy_version=kwargs["policy_version"],
+            budget_gate=kwargs["budget_gate"],
+            budget_allocation_id=ALLOCATION,
+            expected_registry_hash=kwargs["expected_registry_hash"],
+            expected_requirement_hash=kwargs["expected_requirement_hash"],
+            fallback_count=0,
+            max_fallbacks=1,
+        )
+
+
+def _fallback_args(scheduler, node, ident, kwargs, route, *, max_fallbacks=1):
     attestation = _attestation(
         "a-runtime", kwargs["registry"].snapshot.hash, kwargs["requirement"].hash
     )
-    for message in ("budget exceeded", "policy denied"):
+    return dict(
+        scheduler=scheduler,
+        task_id=node.id,
+        route=route,
+        observation=ProviderFailureObservation(
+            executor_id="a-runtime",
+            status_code=503,
+            message="provider unavailable",
+            scope=FailureScope.CANDIDATE_LOCAL,
+            scope_attestation=attestation,
+        ),
+        identity=ident,
+        registry=kwargs["registry"],
+        requirement=kwargs["requirement"],
+        policy=kwargs["policy"],
+        runtime_state=kwargs["runtime_state"],
+        at=kwargs["at"],
+        policy_version=kwargs["policy_version"],
+        budget_gate=kwargs["budget_gate"],
+        budget_allocation_id=ALLOCATION,
+        expected_registry_hash=kwargs["expected_registry_hash"],
+        expected_requirement_hash=kwargs["expected_requirement_hash"],
+        fallback_count=0,
+        max_fallbacks=max_fallbacks,
+    )
+
+
+def test_duplicate_fallback_replay_returns_original_authoritative_result(tmp_path):
+    scheduler, node, ident, kwargs, route = _scheduled(tmp_path)
+    args = _fallback_args(scheduler, node, ident, kwargs, route)
+    first = decide_managed_fallback(**args)
+    second = decide_managed_fallback(**args)
+    events = [
+        row for row in scheduler.audit_log.replay()
+        if row.get("event") == "managed_fallback_transition"
+    ]
+    assert first.action is RecoveryAction.FALLBACK
+    assert second.action is RecoveryAction.FALLBACK
+    assert second.next_decision_sha256 == first.next_decision_sha256
+    assert second.handoff.selected_executor == first.handoff.selected_executor
+    assert len(events) == 1
+
+
+def test_conflicting_fallback_replay_fails_closed(tmp_path):
+    scheduler, node, ident, kwargs, route = _scheduled(tmp_path)
+    decide_managed_fallback(**_fallback_args(scheduler, node, ident, kwargs, route))
+    with pytest.raises(RoutingIntegrationError, match="replay conflict"):
+        decide_managed_fallback(
+            **_fallback_args(
+                scheduler, node, ident, kwargs, route, max_fallbacks=2
+            )
+        )
+
+
+def test_concurrent_fallback_requests_share_one_authoritative_transition(tmp_path):
+    scheduler, node, ident, kwargs, route = _scheduled(tmp_path)
+    args = _fallback_args(scheduler, node, ident, kwargs, route)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _: decide_managed_fallback(**args), range(4)))
+    assert {item.action for item in results} == {RecoveryAction.FALLBACK}
+    assert {item.next_decision_sha256 for item in results} == {results[0].next_decision_sha256}
+    events = [
+        row for row in scheduler.audit_log.replay()
+        if row.get("event") == "managed_fallback_transition"
+    ]
+    assert len(events) == 1
+
+
+def test_terminal_budget_or_policy_denial_cannot_fallback_even_if_scope_claimed(tmp_path):
+    for index, message in enumerate(("budget exceeded", "policy denied")):
+        scheduler, node, ident, kwargs, route = _scheduled(tmp_path / str(index))
+        attestation = _attestation(
+            "a-runtime", kwargs["registry"].snapshot.hash, kwargs["requirement"].hash
+        )
         transition = decide_managed_fallback(
             scheduler,
             task_id=node.id,
