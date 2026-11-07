@@ -909,7 +909,9 @@ class DynamicChildScheduler:
         does not claim a lease, reserve a model operation, or grant execution.
         """
         rec = self.record_for(task_id)
-        from .scheduler_routing import select_managed_task_route
+        from .scheduler_routing import RoutingIntegrationError, select_managed_task_route
+        if getattr(identity, "consumer", None) != "github:" + rec.repo:
+            raise RoutingIntegrationError("routing identity consumer differs from task repository")
         return select_managed_task_route(
             task=rec.node,
             registry=registry,

@@ -151,7 +151,7 @@ def build_routing_input(
     if capability_id != requirement.capability_id:
         raise RoutingIntegrationError("routing capability does not match requirement")
     declared_policy_version = routing_policy.get("policy_version")
-    if declared_policy_version is not None and declared_policy_version != policy_version:
+    if not isinstance(declared_policy_version, str) or declared_policy_version != policy_version:
         raise RoutingIntegrationError("routing policy version mismatch")
     if registry.snapshot.hash != expected_registry_hash:
         raise RoutingIntegrationError("stale registry snapshot")

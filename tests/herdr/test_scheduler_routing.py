@@ -218,6 +218,48 @@ def test_recording_route_is_idempotent_and_does_not_grant_execution(tmp_path: Pa
     assert events[0]["decision_sha256"] == route.decision_sha256
 
 
+
+
+def test_scheduler_wrapper_rejects_consumer_scope_drift(tmp_path: Path):
+    node = task_node()
+    scheduler = DynamicChildScheduler(audit_log=AuditLog(tmp_path / "events.jsonl"))
+    graph = TaskGraph(
+        envelope=TaskGraphEnvelope(
+            issue="Bbambaaamm/herdr#79",
+            spec_hash="sha256:" + "c" * 64,
+            graph_version=GRAPH_VERSION,
+            created_at=NOW,
+            planner="router-test@1",
+            policy_profile="default",
+        ),
+        nodes=(node,),
+    )
+    scheduler.submit(graph, repo="Bbambaaamm/herdr", issue="79")
+    kwargs = route_kwargs(identity=InvocationIdentity(
+        consumer="github:other/repo",
+        agent_id="agent-router",
+        parent_agent_id="agent-parent",
+        parent_task_id="parent-task",
+        task_id=node.id,
+        run_token="run-router-1",
+        fencing_token=1,
+    ))
+    with pytest.raises(RoutingIntegrationError, match="consumer"):
+        scheduler.select_managed_route(
+            node.id,
+            registry=kwargs["registry"],
+            requirement=kwargs["requirement"],
+            policy=kwargs["policy"],
+            runtime_state=kwargs["runtime_state"],
+            at=kwargs["at"],
+            policy_version=kwargs["policy_version"],
+            budget_gate=kwargs["budget_gate"],
+            budget_allocation_id=kwargs["budget_allocation_id"],
+            identity=kwargs["identity"],
+            expected_registry_hash=kwargs["expected_registry_hash"],
+            expected_requirement_hash=kwargs["expected_requirement_hash"],
+        )
+
 def test_routing_input_rejects_identity_drift():
     kwargs = route_kwargs(identity=identity("other-task"))
     with pytest.raises(RoutingIntegrationError, match="bind to task"):
