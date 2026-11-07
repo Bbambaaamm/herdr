@@ -516,6 +516,49 @@ def test_execution_handoff_rejects_provider_or_model_switch(tmp_path: Path):
 
 
 
+def test_execution_handoff_rejects_agent_identity_drift(tmp_path: Path):
+    node = task_node()
+    scheduler = DynamicChildScheduler(audit_log=AuditLog(tmp_path / "events.jsonl"))
+    scheduler.submit(
+        TaskGraph(
+            envelope=TaskGraphEnvelope(
+                issue="Bbambaaamm/herdr#79",
+                spec_hash="sha256:" + "f" * 64,
+                graph_version=GRAPH_VERSION,
+                created_at=NOW,
+                planner="router-test@1",
+                policy_profile="default",
+            ),
+            nodes=(node,),
+        ),
+        repo="Bbambaaamm/herdr",
+        issue="79",
+    )
+    scheduler.dispatch(task_ids={node.id})
+    record = scheduler.record_for(node.id)
+    record.parent_agent_id = "agent-parent"
+    record.parent_task_id = "parent-task"
+    valid = InvocationIdentity(
+        consumer="github:Bbambaaamm/herdr",
+        agent_id=record.agent_id,
+        parent_agent_id="agent-parent",
+        parent_task_id="parent-task",
+        task_id=node.id,
+        run_token=record.run_token,
+        fencing_token=record.lease.fencing_token,
+    )
+    kwargs = route_kwargs(identity=valid)
+    route = select_managed_task_route(**kwargs)
+    drifted = replace(valid, agent_id="different-agent")
+    with pytest.raises(RoutingIntegrationError, match="agent identity"):
+        build_execution_handoff(
+            scheduler=scheduler, route=route, identity=drifted,
+            registry=kwargs["registry"], requirement=kwargs["requirement"],
+            policy=kwargs["policy"], budget_gate=kwargs["budget_gate"],
+        )
+
+
+
 def test_host_guard_rejects_attribute_only_handoff():
     guard = object.__new__(WorkInvocationGuard)
     guard.grant = SimpleNamespace(identity=identity())

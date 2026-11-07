@@ -473,6 +473,39 @@ class AuditLog:
         with open(self._path, "r", encoding="utf-8") as fh:
             return [json.loads(line) for line in fh if line.strip()]
 
+    def append_or_get_strict(
+        self,
+        event: dict[str, object],
+        *,
+        identity_fields: tuple[str, ...],
+    ) -> dict[str, object]:
+        """Atomically append or return the exact durable event.
+
+        A matching identity with a different payload is a conflict and fails
+        closed. This is used by recovery replay; ordinary callers retain the
+        historical append_if_absent semantics below.
+        """
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            with self._lock:
+                def same(candidate: dict[str, object]) -> bool:
+                    return all(candidate.get(field) == event.get(field) for field in identity_fields)
+
+                matches = [candidate for candidate in self._disk_events_unlocked() if same(candidate)]
+                matches.extend(candidate for candidate in self._buffer if same(candidate))
+                if matches:
+                    if any(candidate != matches[0] for candidate in matches[1:]) or matches[0] != event:
+                        raise SchedulerError("audit identity conflict")
+                    return dict(matches[0])
+                self._buffer.append(event)
+                self._flush_unlocked()
+                return dict(event)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
     def append_if_absent(
         self,
         event: dict[str, object],
@@ -943,6 +976,7 @@ class DynamicChildScheduler:
         expected_requirement_hash: str,
         failed_executors=None,
         failed_scopes=None,
+        scope_attestations=None,
         attempt: int = 1,
     ):
         """Read-only P1-A routing decision before worker dispatch.
@@ -970,6 +1004,7 @@ class DynamicChildScheduler:
             expected_requirement_hash=expected_requirement_hash,
             failed_executors=failed_executors,
             failed_scopes=failed_scopes,
+            scope_attestations=scope_attestations,
             attempt=attempt,
         )
 
