@@ -17,7 +17,7 @@ from .capability import (
     RuntimeStateSnapshot,
 )
 from .evidence import digest
-from .routing import FailureKind, FailureScope, RoutingDecision, RoutingError, select_route
+from .routing import FailureKind, FailureScope, RoutingDecision, select_route
 from .security import InvocationIdentity
 from .taskgraph import LifecycleState, TaskNode
 
@@ -42,14 +42,17 @@ class RoutingInput:
     attempt: int
     policy_profile: str
     policy_version: str
+    capability_id: str
     parent_scope_hash: str
+    task_tools_sha256: str
+    task_permissions_sha256: str
     registry_hash: str
     requirement_hash: str
     budget_allocation_id: str
     budget_snapshot_sha256: str
 
     def __post_init__(self) -> None:
-        for name in ("task_id", "policy_profile", "policy_version"):
+        for name in ("task_id", "policy_profile", "policy_version", "capability_id"):
             value = getattr(self, name)
             if not isinstance(value, str) or not _TOKEN.fullmatch(value):
                 raise RoutingIntegrationError(f"{name} must be a safe token")
@@ -57,6 +60,8 @@ class RoutingInput:
             raise RoutingIntegrationError("attempt must be bounded")
         for name in (
             "parent_scope_hash",
+            "task_tools_sha256",
+            "task_permissions_sha256",
             "registry_hash",
             "requirement_hash",
             "budget_allocation_id",
@@ -91,7 +96,10 @@ class ManagedRoute:
             "attempt": self.routing_input.attempt,
             "policy_profile": self.routing_input.policy_profile,
             "policy_version": self.routing_input.policy_version,
+            "capability_id": self.routing_input.capability_id,
             "parent_scope_hash": self.routing_input.parent_scope_hash,
+            "task_tools_sha256": self.routing_input.task_tools_sha256,
+            "task_permissions_sha256": self.routing_input.task_permissions_sha256,
             "registry_hash": self.routing_input.registry_hash,
             "requirement_hash": self.routing_input.requirement_hash,
             "budget_allocation_id": self.routing_input.budget_allocation_id,
@@ -147,28 +155,63 @@ def build_routing_input(
     routing_policy = task.model_policy.get("routing_v5")
     if not isinstance(routing_policy, Mapping) or routing_policy.get("enabled") is not True:
         raise RoutingIntegrationError("dynamic routing is not enabled for this task")
+    declared_profile = routing_policy.get("policy_profile")
+    if not isinstance(declared_profile, str) or declared_profile != policy_profile:
+        raise RoutingIntegrationError("routing policy profile mismatch")
+    declared_registry_hash = routing_policy.get("registry_hash")
+    if not isinstance(declared_registry_hash, str) or not _SHA.fullmatch(declared_registry_hash):
+        raise RoutingIntegrationError("authoritative registry hash missing")
+    declared_scope_hash = routing_policy.get("scope_hash")
+    declared_requirement_hash = routing_policy.get("requirement_hash")
+    declared_tools_hash = routing_policy.get("requirement_tools_sha256")
+    declared_permissions_hash = routing_policy.get("requirement_permissions_sha256")
+    for name, value in (
+        ("scope_hash", declared_scope_hash),
+        ("requirement_hash", declared_requirement_hash),
+        ("requirement_tools_sha256", declared_tools_hash),
+        ("requirement_permissions_sha256", declared_permissions_hash),
+    ):
+        if not isinstance(value, str) or not _SHA.fullmatch(value):
+            raise RoutingIntegrationError(f"authoritative {name} missing")
     capability_id = routing_policy.get("capability_id")
     if capability_id != requirement.capability_id:
-        raise RoutingIntegrationError("routing capability does not match requirement")
+        raise RoutingIntegrationError("routing capability does not match authoritative requirement")
+    if declared_requirement_hash != requirement.hash:
+        raise RoutingIntegrationError("requirement is not bound to authoritative TaskNode")
+    if declared_scope_hash != policy.hash:
+        raise RoutingIntegrationError("scope is not bound to authoritative TaskNode")
+    if declared_tools_hash != digest(sorted(requirement.tools)):
+        raise RoutingIntegrationError("requirement tools are not bound to authoritative TaskNode")
+    if declared_permissions_hash != digest(sorted(requirement.permissions)):
+        raise RoutingIntegrationError("requirement permissions are not bound to authoritative TaskNode")
     declared_policy_version = routing_policy.get("policy_version")
     if not isinstance(declared_policy_version, str) or declared_policy_version != policy_version:
         raise RoutingIntegrationError("routing policy version mismatch")
-    if registry.snapshot.hash != expected_registry_hash:
+    if registry.snapshot.hash != expected_registry_hash or registry.snapshot.hash != declared_registry_hash:
         raise RoutingIntegrationError("stale registry snapshot")
     if requirement.hash != expected_requirement_hash:
         raise RoutingIntegrationError("changed requirement hash")
     if not isinstance(policy, CapabilityScope):
         raise RoutingIntegrationError("typed parent scope required")
+    if not set(requirement.tools) <= set(task.tools):
+        raise RoutingIntegrationError("requirement tools exceed TaskNode tools")
+    if not set(requirement.permissions) <= set(task.permissions):
+        raise RoutingIntegrationError("requirement permissions exceed TaskNode permissions")
+    if not set(requirement.tools) <= set(policy.tools) or not set(requirement.permissions) <= set(policy.permissions):
+        raise RoutingIntegrationError("requirement exceeds parent consumer policy")
     if not isinstance(identity, InvocationIdentity) or identity.task_id != task.id:
         raise RoutingIntegrationError("routing identity must bind to task node")
-    snapshot, snapshot_sha256 = _validate_budget_snapshot(budget_gate, budget_allocation_id)
+    _snapshot, snapshot_sha256 = _validate_budget_snapshot(budget_gate, budget_allocation_id)
     _require_active_budget(budget_gate, budget_allocation_id, identity)
     return RoutingInput(
         task_id=task.id,
         attempt=attempt,
         policy_profile=policy_profile,
         policy_version=policy_version,
+        capability_id=requirement.capability_id,
         parent_scope_hash=policy.hash,
+        task_tools_sha256=digest(sorted(task.tools)),
+        task_permissions_sha256=digest(sorted(task.permissions)),
         registry_hash=registry.snapshot.hash,
         requirement_hash=requirement.hash,
         budget_allocation_id=budget_allocation_id,
@@ -240,15 +283,7 @@ def record_managed_route(scheduler: Any, route: ManagedRoute) -> bool:
         raise RoutingIntegrationError("scheduler policy profile mismatch")
     if record.state is not LifecycleState.PENDING:
         raise RoutingIntegrationError("routing selection must precede dispatch")
-    events = scheduler.audit_log.replay()
-    if any(
-        event.get("event") == "routing_decision"
-        and event.get("decision_sha256") == route.decision_sha256
-        and event.get("task_id") == route.routing_input.task_id
-        and event.get("attempt") == route.routing_input.attempt
-        for event in events
-    ):
-        return False
-    scheduler.audit_log.append(route.audit_event())
-    scheduler.audit_log.flush()
-    return True
+    return scheduler.audit_log.append_if_absent(
+        route.audit_event(),
+        identity_fields=("event", "task_id", "attempt", "decision_sha256"),
+    )

@@ -1,10 +1,12 @@
 """Offline P1-A managed scheduler routing integration tests."""
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from herdr.capability import Health
+from herdr.evidence import digest
 from herdr.routing import FailureKind, FailureScope
 from herdr.scheduler import AuditLog, DynamicChildScheduler
 from herdr.scheduler_routing import (
@@ -55,10 +57,17 @@ class FakeBudgetGate:
 
 
 def task_node(*, enabled=True, task_id="task-router-1"):
+    registry, scope, requirement, _ = fixture()
     routing = {
         "enabled": enabled,
-        "capability_id": "reason",
+        "capability_id": requirement.capability_id,
         "policy_version": "router-v5-policy-1",
+        "policy_profile": "default",
+        "registry_hash": registry.snapshot.hash,
+        "scope_hash": scope.hash,
+        "requirement_hash": requirement.hash,
+        "requirement_tools_sha256": digest(sorted(requirement.tools)),
+        "requirement_permissions_sha256": digest(sorted(requirement.permissions)),
     }
     return TaskNode(
         id=task_id,
@@ -138,6 +147,11 @@ def test_missing_capability_and_unauthorized_provider_are_fail_closed():
     registry, scope, requirement, states = inputs()
     budget = FakeBudgetGate()
     kwargs = route_kwargs(budget=budget, policy=replace(scope, providers=("ghost-provider",)))
+    task_policy = dict(kwargs["task"].model_policy)
+    routing = dict(task_policy["routing_v5"])
+    routing["scope_hash"] = kwargs["policy"].hash
+    task_policy["routing_v5"] = routing
+    kwargs["task"] = replace(kwargs["task"], model_policy=task_policy)
     route = select_managed_task_route(**kwargs)
     assert route.decision.selected_executor is None
     assert route.decision.failure is FailureKind.POLICY_DENIED
@@ -178,7 +192,46 @@ def test_explicit_candidate_local_scope_only_applies_to_retryable_failure():
     assert budget.calls == [None, "b"]
 
 
-def test_recording_route_is_idempotent_and_does_not_grant_execution(tmp_path: Path):
+@pytest.mark.parametrize(
+    ("field", "mutated"),
+    [
+        ("tools", ("search", "write")),
+        ("permissions", ("repo:read", "repo:write")),
+    ],
+)
+def test_requirement_cannot_exceed_authoritative_task_or_parent_policy(field, mutated):
+    kwargs = route_kwargs()
+    kwargs["requirement"] = replace(kwargs["requirement"], **{field: mutated})
+    with pytest.raises(RoutingIntegrationError, match="not bound|authoritative requirement|exceed"):
+        select_managed_task_route(**kwargs)
+
+
+def test_requirement_identity_must_match_task_payload():
+    kwargs = route_kwargs()
+    kwargs["requirement"] = replace(kwargs["requirement"], capability_id="other")
+    with pytest.raises(RoutingIntegrationError, match="authoritative requirement"):
+        select_managed_task_route(**kwargs)
+
+
+def test_scope_must_match_authoritative_task_payload():
+    kwargs = route_kwargs()
+    kwargs["policy"] = replace(kwargs["policy"], providers=("b",))
+    with pytest.raises(RoutingIntegrationError, match="scope is not bound"):
+        select_managed_task_route(**kwargs)
+
+
+def test_task_requirement_binding_cannot_be_replaced_by_caller():
+    kwargs = route_kwargs()
+    task_policy = dict(kwargs["task"].model_policy)
+    routing = dict(task_policy["routing_v5"])
+    routing["requirement_hash"] = "c" * 64
+    task_policy["routing_v5"] = routing
+    kwargs["task"] = replace(kwargs["task"], model_policy=task_policy)
+    with pytest.raises(RoutingIntegrationError, match="requirement is not bound"):
+        select_managed_task_route(**kwargs)
+
+
+def _scheduled_route(tmp_path: Path):
     node = task_node()
     scheduler = DynamicChildScheduler(audit_log=AuditLog(tmp_path / "events.jsonl"))
     graph = TaskGraph(
@@ -208,14 +261,50 @@ def test_recording_route_is_idempotent_and_does_not_grant_execution(tmp_path: Pa
         expected_registry_hash=kwargs["expected_registry_hash"],
         expected_requirement_hash=kwargs["expected_requirement_hash"],
     )
-    assert scheduler.record_for(node.id).state.value == "pending"
+    return scheduler, route
+
+
+def test_recording_route_is_idempotent_and_does_not_grant_execution(tmp_path: Path):
+    scheduler, route = _scheduled_route(tmp_path)
+    assert scheduler.record_for(route.routing_input.task_id).state.value == "pending"
     assert record_managed_route(scheduler, route) is True
     assert record_managed_route(scheduler, route) is False
-    assert scheduler.record_for(node.id).state.value == "pending"
+    assert scheduler.record_for(route.routing_input.task_id).state.value == "pending"
     events = [x for x in scheduler.audit_log.replay() if x.get("event") == "routing_decision"]
     assert len(events) == 1
-    assert events[0]["task_id"] == node.id
+    assert events[0]["task_id"] == route.routing_input.task_id
     assert events[0]["decision_sha256"] == route.decision_sha256
+
+
+def test_recording_route_is_atomic_under_concurrency(tmp_path: Path):
+    scheduler, route = _scheduled_route(tmp_path)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: record_managed_route(scheduler, route), range(32)))
+    assert sum(results) == 1
+    events = [x for x in scheduler.audit_log.replay() if x.get("event") == "routing_decision"]
+    assert len(events) == 1
+
+
+def test_recording_route_is_idempotent_after_replay(tmp_path: Path):
+    scheduler, route = _scheduled_route(tmp_path)
+    assert record_managed_route(scheduler, route) is True
+    replayed = DynamicChildScheduler(audit_log=AuditLog(tmp_path / "events.jsonl"))
+    replayed.submit(
+        TaskGraph(
+            envelope=TaskGraphEnvelope(
+                issue="Bbambaaamm/herdr#79",
+                spec_hash="sha256:" + "b" * 64,
+                graph_version=GRAPH_VERSION,
+                created_at=NOW,
+                planner="router-test@1",
+                policy_profile="default",
+            ),
+            nodes=(task_node(),),
+        ),
+        repo="Bbambaaamm/herdr",
+        issue="79",
+    )
+    assert record_managed_route(replayed, route) is False
 
 
 
