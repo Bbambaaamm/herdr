@@ -24,40 +24,76 @@ def attestation(executor_id, scope, registry, requirement):
     )}
 
 
-def test_scope_wide_denial_blocks_fallback_but_candidate_local_can_fallback():
+def test_terminal_denials_fail_closed_and_retryable_local_scope_can_fallback():
     registry, scope, requirement, states = fixture()
-    with pytest.raises(RoutingError, match="explicit failure scope required"):
+
+    # Missing and uncertain scope metadata never authorizes a terminal denial.
+    for failure in (FailureKind.POLICY_DENIED, FailureKind.BUDGET_EXCEEDED):
+        with pytest.raises(RoutingError, match="terminal policy or budget denial"):
+            bounded_fallback(
+                registry, requirement, scope, states, at=NOW,
+                policy_version="router-v5-policy-1",
+                failed_executors={"a-runtime": failure},
+                max_attempts=2,
+            )
+        with pytest.raises(RoutingError, match="terminal policy or budget denial"):
+            bounded_fallback(
+                registry, requirement, scope, states, at=NOW,
+                policy_version="router-v5-policy-1",
+                failed_executors={"a-runtime": failure},
+                failed_scopes={"a-runtime": FailureScope.UNKNOWN},
+                max_attempts=2,
+            )
+
+        # Caller-constructible scope metadata and attestations are descriptive;
+        # they cannot turn a terminal denial into a fallback authorization.
+        with pytest.raises(RoutingError, match="terminal policy or budget denial"):
+            bounded_fallback(
+                registry, requirement, scope, states, at=NOW,
+                policy_version="router-v5-policy-1",
+                failed_executors={"a-runtime": failure},
+                failed_scopes={"a-runtime": FailureScope.CANDIDATE_LOCAL},
+                scope_attestations=attestation(
+                    "a-runtime", FailureScope.CANDIDATE_LOCAL, registry, requirement
+                ),
+                max_attempts=2,
+            )
+
+    assert classify_failure_scope("policy denied") is FailureScope.UNKNOWN
+    with pytest.raises(RoutingError, match="terminal policy or budget denial"):
         bounded_fallback(
             registry, requirement, scope, states, at=NOW,
             policy_version="router-v5-policy-1",
             failed_executors={"a-runtime": FailureKind.POLICY_DENIED},
+            failed_scopes={"a-runtime": classify_failure_scope("policy denied")},
             max_attempts=2,
         )
-    with pytest.raises(RoutingError, match="explicit failure scope required"):
-        bounded_fallback(
-            registry, requirement, scope, states, at=NOW,
-            policy_version="router-v5-policy-1",
-            failed_executors={"a-runtime": FailureKind.BUDGET_EXCEEDED},
-            max_attempts=2,
-        )
-    with pytest.raises(ValueError):
-        bounded_fallback(
-            registry, requirement, scope, states, at=NOW,
-            policy_version="router-v5-policy-1",
-            failed_executors={"a-runtime": FailureKind.PROVIDER_UNAVAILABLE},
-            failed_scopes={"a-runtime": "uncertain"},
-            max_attempts=2,
-        )
-    ambiguous = classify_failure_scope("policy denied")
-    assert ambiguous is FailureScope.UNKNOWN
-    with pytest.raises(RoutingError, match="uncertain"):
-        bounded_fallback(
-            registry, requirement, scope, states, at=NOW,
-            policy_version="router-v5-policy-1",
-            failed_executors={"a-runtime": FailureKind.POLICY_DENIED},
-            failed_scopes={"a-runtime": ambiguous},
-            max_attempts=2,
-        )
+
+    # Explicit candidate-local scope remains available for retryable failures.
+    local = bounded_fallback(
+        registry, requirement, scope, states, at=NOW,
+        policy_version="router-v5-policy-1",
+        failed_executors={"a-runtime": FailureKind.PROVIDER_UNAVAILABLE},
+        failed_scopes={"a-runtime": FailureScope.CANDIDATE_LOCAL},
+        max_attempts=2,
+    )
+    assert local.selected_executor == "b-runtime"
+    assert local.failure is None
+
+    # Routing-wide scope is still represented for an already-established
+    # terminal decision, but cannot be supplied to authorize a retry.
+    wide = select_route(
+        registry, requirement, scope, states, at=NOW,
+        policy_version="router-v5-policy-1",
+        failed_executors={"a-runtime": FailureKind.PROVIDER_UNAVAILABLE},
+        failed_scopes={"a-runtime": FailureScope.ROUTING_WIDE},
+        max_attempts=2,
+    )
+    assert wide.selected_executor is None
+    assert wide.failure is FailureKind.PROVIDER_UNAVAILABLE
+    assert wide.failure_scope is FailureScope.ROUTING_WIDE
+    assert wide.attempted_fallbacks == ("a-runtime",)
+
     with pytest.raises(RoutingError, match="unknown failure"):
         bounded_fallback(
             registry, requirement, scope, states, at=NOW,
@@ -65,62 +101,6 @@ def test_scope_wide_denial_blocks_fallback_but_candidate_local_can_fallback():
             failed_executors={"a-runtime": FailureKind.UNKNOWN},
             max_attempts=2,
         )
-
-    with pytest.raises(RoutingError, match="trusted scope attestation"):
-        bounded_fallback(
-            registry, requirement, scope, states, at=NOW,
-            policy_version="router-v5-policy-1",
-            failed_executors={"a-runtime": FailureKind.POLICY_DENIED},
-            failed_scopes={"a-runtime": FailureScope.CANDIDATE_LOCAL},
-            max_attempts=2,
-        )
-    forged = {"a-runtime": ScopeAttestation("a-runtime", FailureScope.CANDIDATE_LOCAL, "policy_evaluator", "a" * 64)}
-    with pytest.raises(RoutingError, match="does not bind"):
-        bounded_fallback(
-            registry, requirement, scope, states, at=NOW,
-            policy_version="router-v5-policy-1",
-            failed_executors={"a-runtime": FailureKind.POLICY_DENIED},
-            failed_scopes={"a-runtime": FailureScope.CANDIDATE_LOCAL},
-            scope_attestations=forged,
-            max_attempts=2,
-        )
-
-    local = bounded_fallback(
-        registry, requirement, scope, states, at=NOW,
-        policy_version="router-v5-policy-1",
-        failed_executors={"a-runtime": FailureKind.POLICY_DENIED},
-        failed_scopes={"a-runtime": FailureScope.CANDIDATE_LOCAL},
-        scope_attestations=attestation("a-runtime", FailureScope.CANDIDATE_LOCAL, registry, requirement),
-        max_attempts=2,
-    )
-    assert local.selected_executor == "b-runtime"
-    assert local.failure is None
-
-    wide = bounded_fallback(
-        registry, requirement, scope, states, at=NOW,
-        policy_version="router-v5-policy-1",
-        failed_executors={"a-runtime": FailureKind.POLICY_DENIED},
-        failed_scopes={"a-runtime": FailureScope.ROUTING_WIDE},
-        scope_attestations=attestation("a-runtime", FailureScope.ROUTING_WIDE, registry, requirement),
-        max_attempts=2,
-    )
-    assert wide.selected_executor is None
-    assert wide.failure is FailureKind.POLICY_DENIED
-    assert wide.failure_scope is FailureScope.ROUTING_WIDE
-    assert wide.attempted_fallbacks == ("a-runtime",)
-
-    budget_wide = bounded_fallback(
-        registry, requirement, scope, states, at=NOW,
-        policy_version="router-v5-policy-1",
-        failed_executors={"a-runtime": FailureKind.BUDGET_EXCEEDED},
-        failed_scopes={"a-runtime": FailureScope.ROUTING_WIDE},
-        scope_attestations=attestation("a-runtime", FailureScope.ROUTING_WIDE, registry, requirement),
-        max_attempts=2,
-    )
-    assert budget_wide.selected_executor is None
-    assert budget_wide.failure is FailureKind.BUDGET_EXCEEDED
-    assert budget_wide.failure_scope is FailureScope.ROUTING_WIDE
-
 
 def test_decision_invariants_and_trusted_digest_requirement():
     registry, scope, requirement, states = fixture()
@@ -248,7 +228,7 @@ def test_bounded_fallback_keeps_registry_constraints_and_stops():
     )
     assert denied.selected_executor is None
     assert denied.failure is FailureKind.POLICY_DENIED
-    assert denied.failure_scope is FailureScope.ROUTING_WIDE
+    assert denied.failure_scope is FailureScope.UNKNOWN
     with pytest.raises(RoutingError, match="compatible"):
         bounded_fallback(
             registry, requirement, denied_scope, states, at=NOW,

@@ -364,17 +364,14 @@ def _scope_for_failure(
     if failure is FailureKind.UNKNOWN:
         raise RoutingError("unknown failure cannot authorize fallback: " + executor_id)
     explicit = scopes.get(executor_id)
-    attestation = attestations.get(executor_id)
     if failure in (FailureKind.POLICY_DENIED, FailureKind.BUDGET_EXCEEDED):
-        if explicit is None:
-            raise RoutingError("explicit failure scope required for terminal or unknown failure: " + executor_id)
-        if explicit is FailureScope.UNKNOWN:
-            raise RoutingError("failure scope is uncertain and cannot authorize fallback: " + executor_id)
-        if (attestation is None or attestation.executor_id != executor_id
-                or attestation.scope is not explicit
-                or not attestation.verifies(registry_hash, requirement_hash)):
-            raise RoutingError("trusted scope attestation does not bind to routing context: " + executor_id)
-        return explicit
+        # Terminal policy/budget denials are fail-closed unless an existing
+        # trusted boundary proves otherwise. Caller-supplied scope metadata and
+        # attestations are descriptive only and cannot authorize fallback here.
+        raise RoutingError(
+            "terminal policy or budget denial has no trusted boundary; fallback disabled: "
+            + executor_id
+        )
     if explicit is FailureScope.UNKNOWN:
         raise RoutingError("failure scope is uncertain and cannot authorize fallback: " + executor_id)
     return explicit or FailureScope.CANDIDATE_LOCAL
@@ -525,7 +522,8 @@ def select_route(
         terminal_scope = FailureScope.ROUTING_WIDE
     elif rejection_failures and all(item in (FailureKind.POLICY_DENIED, FailureKind.BUDGET_EXCEEDED)
                                     for item in rejection_failures):
-        terminal_scope = FailureScope.ROUTING_WIDE
+        # Candidate-set observations do not prove a task-wide boundary.
+        terminal_scope = FailureScope.UNKNOWN
     elif any(item in (FailureKind.POLICY_DENIED, FailureKind.BUDGET_EXCEEDED)
              for item in rejection_failures):
         terminal_scope = FailureScope.UNKNOWN
