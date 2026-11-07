@@ -19,23 +19,34 @@ validated consumer policy overlays, `RELEASE.json`, and `MANIFEST.sha256`. It do
 not contain secrets, credentials, databases, logs, prompts, raw queries, or the
 external Herdr binary.
 
-## Unprivileged preflight
+## Read-only preflight
 
-Extract the verified archive into a fresh private operator directory. Run the
-cutover program from that extracted release so the reviewed tool and candidate
-payload have the same tag and commit:
+The preflight reads the root-owned deployed-release marker and exact installed unit
+bytes. It therefore runs only as root from an immutable, root-owned controller tree
+under `/opt/herdr/releases/<tag>-<sha12>` or
+`/var/lib/herdr/incoming/<private-stage>`. This does not grant `agentops`
+general sudo access and is not a deployment operation.
+
+First copy the verified archive and its adjacent `.sha256` into a fresh private
+staging directory owned by root, extract it without a mutable user-controlled
+source, and verify the archive. Then run the reviewed cutover program with isolated
+Python flags:
 
 ```sh
-python3 deploy/herdr/cutover/cutover.py preflight \
-  --archive /home/quantadmin/herdr-cutover/REVIEWED.tar.gz \
-  --expected-legacy-commit 41179635c8654a60c5d9234acccb6e91b2028b72
+sudo /usr/bin/python3 -I -B deploy/herdr/cutover/cutover.py preflight \
+  --archive /var/lib/herdr/incoming/<private-stage>/REVIEWED.tar.gz \
+  --expected-legacy-commit <verified-current-legacy-sha>
 ```
 
-Preflight is read-only. It verifies the annotated release metadata and every bundle
-hash, consumer schemas, external binary, exact legacy commit, known unit/Nginx
-hashes, service state, current authentication boundary, and a content-only diff
-between the legacy and candidate runtime. It emits no source contents or secrets.
-Any mismatch is a hard stop.
+The controller verifies that the executable tree is root-owned, non-writable by
+group/other, and located only in an approved immutable prefix before reading any
+protected state. Preflight is read-only: it verifies the annotated release metadata
+and every bundle hash, consumer schemas, external binary, exact legacy commit,
+known unit/Nginx hashes, service state, current authentication boundary, and a
+content-only diff between the legacy and candidate runtime. It emits no source
+contents or secrets. Any mismatch, permission error, symlink change, or metadata
+TOCTOU is a hard stop. Running from `/home`, `/tmp`, or a mutable worktree is
+rejected.
 
 ## Single privileged step
 

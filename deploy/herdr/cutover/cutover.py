@@ -51,6 +51,10 @@ CONSUMER_DIR = Path("/etc/herdr/consumers")
 STATE_DIR = Path("/var/lib/herdr/deployments")
 INCOMING_DIR = Path("/var/lib/herdr/incoming")
 PUBLIC_STATE = Path("/var/lib/agent-platform-herdr/deployed-release.json")
+IMMUTABLE_PREFLIGHT_ROOTS = (
+    Path("/opt/herdr/releases"),
+    Path("/var/lib/herdr/incoming"),
+)
 NGINX_ROUTE = Path("/etc/agent-platform/nginx-server.conf")
 NGINX_LOCATION_COMMON = Path("/etc/agent-platform/nginx-location-common.conf")
 UNIT_DIR = Path("/etc/systemd/system")
@@ -263,6 +267,94 @@ def root_owned_readonly(path: Path) -> bool:
     return info.st_uid == 0 and not info.st_mode & 0o022
 
 
+def immutable_preflight_controller() -> bool:
+    """Require root execution from an immutable, approved release tree."""
+    if os.geteuid() != 0:
+        return False
+    try:
+        root = ROOT.resolve(strict=True)
+    except OSError:
+        return False
+    if not any(root.parent == prefix for prefix in IMMUTABLE_PREFLIGHT_ROOTS):
+        return False
+    try:
+        current = root
+        while current != Path("/"):
+            if current.is_symlink() or not root_owned_readonly(current):
+                return False
+            current = current.parent
+    except OSError:
+        return False
+    return True
+
+
+def read_trusted_public_state(path: Path) -> dict[str, object]:
+    """Read the root-owned marker without a check/use race."""
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ReleaseError("current_release_public_state_unreadable") from exc
+    try:
+        before = os.fstat(fd)
+        need(
+            stat.S_ISREG(before.st_mode)
+            and before.st_nlink == 1
+            and before.st_uid == 0
+            and not before.st_mode & 0o022
+            and 0 < before.st_size <= 4096,
+            "unsafe_current_release_public_state",
+        )
+        data = bytearray()
+        while len(data) < before.st_size:
+            chunk = os.read(fd, min(4096, before.st_size - len(data)))
+            if not chunk:
+                raise ReleaseError("current_release_public_state_short_read")
+            data.extend(chunk)
+        extra = os.read(fd, 1)
+        after = os.fstat(fd)
+        need(
+            not extra
+            and (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_uid,
+                before.st_gid,
+                before.st_nlink,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            == (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_uid,
+                after.st_gid,
+                after.st_nlink,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            ),
+            "current_release_public_state_changed",
+        )
+    except ReleaseError:
+        raise
+    except OSError as exc:
+        raise ReleaseError("current_release_public_state_unreadable") from exc
+    finally:
+        os.close(fd)
+    try:
+        value = json.loads(bytes(data).decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError("current_release_public_state_invalid") from exc
+    need(type(value) is dict, "current_release_public_state_invalid")
+    return value
+
+
 def current_release_unit_hashes() -> dict[Path, str]:
     """Return unit hashes independently bound to the deployed release identity."""
     if not CURRENT.exists() and not CURRENT.is_symlink():
@@ -324,12 +416,7 @@ def current_release_unit_hashes() -> dict[Path, str]:
 
     need(PUBLIC_STATE.is_file() and not PUBLIC_STATE.is_symlink(),
          "current_release_public_state_missing")
-    need(root_owned_readonly(PUBLIC_STATE),
-         "unsafe_current_release_public_state")
-    try:
-        public = json.loads(PUBLIC_STATE.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ReleaseError("current_release_public_state_invalid") from exc
+    public = read_trusted_public_state(PUBLIC_STATE)
     need(type(public) is dict
          and public.get("version") == 1
          and public.get("tag") == document["tag"]
@@ -699,6 +786,10 @@ def preflight(
     *,
     allow_degraded_rc8: bool = False,
 ) -> dict[str, object]:
+    need(
+        immutable_preflight_controller(),
+        "preflight_root_required_or_controller_not_immutable",
+    )
     release = verify_archive(archive)
     need((ROOT / "RELEASE.json").is_file(), "cutover_tool_release_missing")
     controller_release = verify_tree(ROOT)

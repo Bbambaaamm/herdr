@@ -298,6 +298,15 @@ def _versioned_current_release_fixture(monkeypatch, tmp_path):
     monkeypatch.setattr(cutover, "UNIT_DIR", unit_dir)
     monkeypatch.setattr(cutover, "PUBLIC_STATE", public_state)
     monkeypatch.setattr(cutover, "root_owned_readonly", lambda _path: True)
+    real_fstat = cutover.os.fstat
+
+    def fixture_fstat(fd):
+        value = list(real_fstat(fd))
+        value[4] = 0
+        value[5] = 0
+        return os.stat_result(value)
+
+    monkeypatch.setattr(cutover.os, "fstat", fixture_fstat)
     return current_release, expected
 
 
@@ -1367,3 +1376,72 @@ def test_already_deployed_requires_full_coherence(
             candidate,
             release_doc,
         )
+
+
+def test_preflight_requires_root_and_fails_closed_before_archive_use(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(cutover.os, "geteuid", lambda: 1001)
+    with pytest.raises(
+        release.ReleaseError,
+        match="preflight_root_required_or_controller_not_immutable",
+    ):
+        cutover.preflight(tmp_path / "candidate.tar.gz", "legacy")
+
+
+def test_preflight_rejects_mutable_controller_path(monkeypatch, tmp_path):
+    root = tmp_path / "home" / "controller"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(cutover, "ROOT", root)
+    monkeypatch.setattr(cutover.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        cutover,
+        "IMMUTABLE_PREFLIGHT_ROOTS",
+        (tmp_path / "approved",),
+    )
+    assert cutover.immutable_preflight_controller() is False
+
+
+def test_preflight_accepts_only_root_owned_approved_controller(
+    monkeypatch,
+    tmp_path,
+):
+    prefix = tmp_path / "approved"
+    root = prefix / "release"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(cutover, "ROOT", root)
+    monkeypatch.setattr(cutover.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(cutover, "IMMUTABLE_PREFLIGHT_ROOTS", (prefix,))
+    monkeypatch.setattr(cutover, "root_owned_readonly", lambda _path: True)
+    assert cutover.immutable_preflight_controller() is True
+
+
+def test_public_state_reader_rejects_symlink_and_tocou(
+    monkeypatch,
+    tmp_path,
+):
+    target = tmp_path / "target.json"
+    target.write_text('{"version": 1}', encoding="utf-8")
+    link = tmp_path / "deployed-release.json"
+    link.symlink_to(target)
+    with pytest.raises(release.ReleaseError, match="current_release_public_state_unreadable"):
+        cutover.read_trusted_public_state(link)
+
+    marker = tmp_path / "marker.json"
+    marker.write_text('{"version": 1}', encoding="utf-8")
+    original_fstat = cutover.os.fstat
+    calls = {"count": 0}
+
+    def changing_fstat(fd):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            marker.write_text('{"version": 222222222222}', encoding="utf-8")
+        value = list(original_fstat(fd))
+        value[4] = 0
+        value[5] = 0
+        return os.stat_result(value)
+
+    monkeypatch.setattr(cutover.os, "fstat", changing_fstat)
+    with pytest.raises(release.ReleaseError, match="current_release_public_state_changed"):
+        cutover.read_trusted_public_state(marker)
