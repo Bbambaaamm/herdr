@@ -287,3 +287,72 @@ def test_consumer_scope_is_carried_without_provider_or_credential_exposure(tmp_p
     )
     assert result.outcome is ShadowOutcome.PASS
     assert "credentials_exposed" not in result.handoff
+
+
+class EconomicBudgetGate(FakeBudgetGate):
+    def __init__(self, **counters):
+        super().__init__()
+        self.reserve_calls = counters.get("reserve_calls", 0)
+        self.charge_calls = counters.get("charge_calls", 0)
+        self.settle_calls = counters.get("settle_calls", 0)
+
+
+@pytest.mark.parametrize("counter", ["reserve_calls", "charge_calls", "settle_calls"])
+def test_shadow_fails_closed_before_provider_for_existing_economic_operation(tmp_path, counter):
+    scheduler, route, identity, kwargs = _scheduled(tmp_path)
+    budget = EconomicBudgetGate(**{counter: 1})
+    provider_calls = []
+
+    result = run_shadow_acceptance(
+        case_id=f"pre-{counter}",
+        scheduler=scheduler,
+        route=route,
+        identity=identity,
+        registry=kwargs["registry"],
+        requirement=kwargs["requirement"],
+        policy=kwargs["policy"],
+        budget_gate=budget,
+        host_gate=_host_gate()[0],
+        fake_provider=lambda _: (
+            provider_calls.append(True) or ShadowProviderResult("success", {})
+        ),
+        static_route={"model": "legacy-model"},
+    )
+
+    assert result.outcome is ShadowOutcome.BLOCKED
+    assert result.unauthorized_operations == (counter,)
+    assert result.provider_calls == 0
+    assert provider_calls == []
+    assert result.outcome is not ShadowOutcome.PASS
+
+
+@pytest.mark.parametrize("counter", ["reserve_calls", "charge_calls", "settle_calls"])
+def test_shadow_fails_closed_when_callback_attempts_economic_operation(tmp_path, counter):
+    scheduler, route, identity, kwargs = _scheduled(tmp_path)
+    budget = EconomicBudgetGate()
+    provider_calls = []
+
+    def provider(_handoff):
+        provider_calls.append(True)
+        setattr(budget, counter, 1)
+        return ShadowProviderResult("success", {})
+
+    result = run_shadow_acceptance(
+        case_id=f"callback-{counter}",
+        scheduler=scheduler,
+        route=route,
+        identity=identity,
+        registry=kwargs["registry"],
+        requirement=kwargs["requirement"],
+        policy=kwargs["policy"],
+        budget_gate=budget,
+        host_gate=_host_gate()[0],
+        fake_provider=provider,
+        static_route={"model": "legacy-model"},
+    )
+
+    assert result.outcome is ShadowOutcome.BLOCKED
+    assert result.unauthorized_operations == (counter,)
+    assert result.provider_calls == 1
+    assert provider_calls == [True]
+    assert all(event.get("status") != "PASS" for event in result.events)

@@ -11,8 +11,8 @@ from enum import StrEnum
 from typing import Any, Callable, Mapping
 
 from .evidence import digest
-from .scheduler_routing import ManagedExecutionHandoff, ManagedRoute, RoutingIntegrationError, build_execution_handoff
-from .security import InvocationIdentity, PolicyDenied
+from .scheduler_routing import ManagedExecutionHandoff, ManagedRoute, build_execution_handoff
+from .security import InvocationIdentity
 from .taskgraph import LifecycleState
 
 
@@ -110,6 +110,25 @@ def _handoff_json(handoff: ManagedExecutionHandoff) -> dict[str, Any]:
     }
 
 
+_ECONOMIC_COUNTERS = ("reserve_calls", "charge_calls", "settle_calls")
+
+
+def _economic_snapshot(budget_gate: Any) -> dict[str, int]:
+    """Read optional test/telemetry counters without creating an authority."""
+    snapshot: dict[str, int] = {}
+    for name in _ECONOMIC_COUNTERS:
+        value = getattr(budget_gate, name, 0)
+        if type(value) is not int or value < 0:
+            raise ShadowAcceptanceError(f"invalid economic counter: {name}")
+        snapshot[name] = value
+    return snapshot
+
+
+def _economic_violations(snapshot: Mapping[str, int]) -> tuple[str, ...]:
+    """Any nonzero economic counter is forbidden in shadow mode."""
+    return tuple(name for name in _ECONOMIC_COUNTERS if snapshot.get(name, 0) != 0)
+
+
 def run_shadow_acceptance(
     *,
     case_id: str,
@@ -140,6 +159,7 @@ def run_shadow_acceptance(
     calls = 0
     shadow_route = _route_json(route)
     handoff: ManagedExecutionHandoff | None = None
+    before_economic: dict[str, int] = {}
     try:
         handoff = build_execution_handoff(
             scheduler=scheduler,
@@ -157,11 +177,24 @@ def run_shadow_acceptance(
             provider=handoff.selected_provider,
             model=handoff.selected_model,
         )
-        # Shadow mode must not reserve or mutate the economic budget.
-        if getattr(budget_gate, "reserve_calls", 0) or getattr(budget_gate, "charge_calls", 0):
-            unauthorized.append("budget_economic_operation")
-        result = fake_provider(handoff)
+        before_economic = _economic_snapshot(budget_gate)
+        unauthorized.extend(_economic_violations(before_economic))
+        if unauthorized:
+            raise ShadowAcceptanceError(
+                "shadow economic operation detected before fake provider: "
+                + ",".join(unauthorized)
+            )
+        # Count invocation before entering the callback so a callback that
+        # mutates a counter and then raises is still recorded as invoked.
         calls = 1
+        result = fake_provider(handoff)
+        after_economic = _economic_snapshot(budget_gate)
+        unauthorized.extend(_economic_violations(after_economic))
+        if unauthorized:
+            raise ShadowAcceptanceError(
+                "shadow economic operation detected after fake provider: "
+                + ",".join(unauthorized)
+            )
         if not isinstance(result, ShadowProviderResult):
             raise ShadowAcceptanceError("fake provider must return ShadowProviderResult")
         if result.status != "success":
@@ -197,7 +230,15 @@ def run_shadow_acceptance(
             events=tuple(events),
             reason="offline shadow path completed",
         )
-    except (RoutingIntegrationError, ShadowAcceptanceError, PolicyDenied) as exc:
+    except Exception as exc:
+        try:
+            after_economic = _economic_snapshot(budget_gate)
+            unauthorized.extend(
+                name for name in _economic_violations(after_economic)
+                if name not in unauthorized
+            )
+        except ShadowAcceptanceError:
+            pass
         events.append({
             "event": "router_v5_shadow_acceptance",
             "version": 1,
@@ -206,7 +247,8 @@ def run_shadow_acceptance(
             "task_id": route.routing_input.task_id,
             "shadow_route": shadow_route,
             "provider_calls": calls,
-            "economic_operation": False,
+            "economic_operation": bool(unauthorized),
+            "unauthorized_operations": list(unauthorized),
             "status": "BLOCKED",
             "reason": str(exc),
         })
