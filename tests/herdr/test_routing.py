@@ -58,6 +58,22 @@ def test_bounded_fallback_keeps_registry_constraints_and_stops():
     )
     assert exhausted.selected_executor is None
     assert exhausted.attempts == 2
+    reverse = bounded_fallback(
+        registry, requirement, scope, states, at=NOW,
+        policy_version="router-v5-policy-1",
+        failed_executors={
+            "b-runtime": FailureKind.RATE_LIMITED,
+            "a-runtime": FailureKind.PROVIDER_UNAVAILABLE,
+        },
+        max_attempts=2,
+    )
+    assert reverse.to_json() == exhausted.to_json()
+    terminal_event = exhausted.to_telemetry_event(
+        sequence=3, timestamp="2026-10-02T10:00:12+00:00", issue="79",
+        task_id="router-test-exhausted", attempt=2, agent_id="hermes", role="router",
+    )
+    assert terminal_event.event_type.value == "model_fallback"
+    assert terminal_event.fallback_chain == ("a-runtime", "b-runtime")
 
     with pytest.raises(RoutingError, match="eligible registry candidate"):
         bounded_fallback(

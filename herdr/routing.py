@@ -190,7 +190,7 @@ class RoutingDecision:
     ) -> TelemetryEvent:
         """Project the decision into the existing closed telemetry contract."""
         fallback = self.attempted_fallbacks
-        event_type = EventType.MODEL_FALLBACK if fallback and self.selected_executor else EventType.MODEL_ROUTE
+        event_type = EventType.MODEL_FALLBACK if fallback else EventType.MODEL_ROUTE
         return TelemetryEvent(
             sequence=sequence,
             timestamp=timestamp,
@@ -340,7 +340,7 @@ def select_route(
             max_attempts=max_attempts,
         )
     if failed and not result.rejections:
-        failure = next(iter(failed.values()))
+        failure = failed[sorted(failed)[0]]
     elif result.rejections:
         failure = _reason_failure(result.rejections[0].reason)
     elif requirement.legacy_model_hints and not available:
