@@ -973,6 +973,20 @@ class DynamicChildScheduler:
             attempt=attempt,
         )
 
+    def prepare_managed_execution_handoff(self, route, *, identity, registry,
+                                          requirement, policy, budget_gate):
+        """Bind a selected route to the existing host-controlled executor gate."""
+        from .scheduler_routing import build_execution_handoff
+        return build_execution_handoff(
+            scheduler=self,
+            route=route,
+            identity=identity,
+            registry=registry,
+            requirement=requirement,
+            policy=policy,
+            budget_gate=budget_gate,
+        )
+
     def graph_dimensions(self) -> tuple[int, int, int]:
         if not self._tasks:
             return (0, 0, 0)

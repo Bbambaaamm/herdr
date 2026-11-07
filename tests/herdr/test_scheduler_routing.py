@@ -11,6 +11,7 @@ from herdr.routing import FailureKind, FailureScope
 from herdr.scheduler import AuditLog, DynamicChildScheduler
 from herdr.scheduler_routing import (
     RoutingIntegrationError,
+    build_execution_handoff,
     record_managed_route,
     select_managed_task_route,
 )
@@ -171,11 +172,29 @@ def test_stale_registry_snapshot_and_changed_requirement_hash_stop_before_budget
     assert budget.calls == []
 
 
-def test_unknown_budget_measurement_or_active_stop_blocks_routing():
-    for budget in (FakeBudgetGate(unknown_measurements=("op-1",)), FakeBudgetGate(active_stops=({"id": "stop"},))):
-        with pytest.raises(RoutingIntegrationError, match="budget"):
-            select_managed_task_route(**route_kwargs(budget=budget))
-        assert budget.calls == []
+def test_unknown_budget_measurement_blocks_routing_but_unrelated_stop_does_not():
+    budget = FakeBudgetGate(unknown_measurements=("op-1",))
+    with pytest.raises(RoutingIntegrationError, match="budget"):
+        select_managed_task_route(**route_kwargs(budget=budget))
+    assert budget.calls == []
+
+    scoped_stop = FakeBudgetGate(active_stops=({"scope": "provider", "provider": "unrelated"},))
+    route = select_managed_task_route(**route_kwargs(budget=scoped_stop))
+    assert route.decision.selected_provider == "a"
+    assert scoped_stop.calls == [None, "a"]
+
+
+def test_selected_provider_budget_stop_blocks_handoff_selection():
+    class StopSelectedProvider(FakeBudgetGate):
+        def require_active(self, allocation_id, identity, provider=None):
+            super().require_active(allocation_id, identity, provider)
+            if provider == "a":
+                raise RoutingIntegrationError("budget stop for selected provider")
+
+    budget = StopSelectedProvider()
+    with pytest.raises(RoutingIntegrationError, match="budget stop"):
+        select_managed_task_route(**route_kwargs(budget=budget))
+    assert budget.calls == [None, "a"]
 
 
 def test_explicit_candidate_local_scope_only_applies_to_retryable_failure():
@@ -353,3 +372,115 @@ def test_routing_input_rejects_identity_drift():
     kwargs = route_kwargs(identity=identity("other-task"))
     with pytest.raises(RoutingIntegrationError, match="bind to task"):
         select_managed_task_route(**kwargs)
+
+
+
+def test_recording_route_rejects_authoritative_task_drift(tmp_path: Path):
+    scheduler, _route = _scheduled_route(tmp_path)
+    kwargs = route_kwargs()
+    alternate_policy = replace(kwargs["policy"], providers=("b",), executors=("b-runtime",))
+    alternate_task = task_node()
+    altered_policy = dict(alternate_task.model_policy)
+    altered_routing = dict(altered_policy["routing_v5"])
+    altered_routing["scope_hash"] = alternate_policy.hash
+    altered_policy["routing_v5"] = altered_routing
+    alternate_task = replace(alternate_task, model_policy=altered_policy)
+    alternate_route = select_managed_task_route(
+        **{**kwargs, "task": alternate_task, "policy": alternate_policy}
+    )
+    with pytest.raises(RoutingIntegrationError, match="authoritative TaskNode"):
+        record_managed_route(scheduler, alternate_route)
+    assert not [row for row in scheduler.audit_log.replay() if row.get("event") == "routing_decision"]
+
+
+def test_execution_handoff_binds_dispatched_record_and_rechecks_budget(tmp_path: Path):
+    node = task_node()
+    scheduler = DynamicChildScheduler(audit_log=AuditLog(tmp_path / "events.jsonl"))
+    graph = TaskGraph(
+        envelope=TaskGraphEnvelope(
+            issue="Bbambaaamm/herdr#79",
+            spec_hash="sha256:" + "d" * 64,
+            graph_version=GRAPH_VERSION,
+            created_at=NOW,
+            planner="router-test@1",
+            policy_profile="default",
+        ),
+        nodes=(node,),
+    )
+    scheduler.submit(graph, repo="Bbambaaamm/herdr", issue="79")
+    scheduler.dispatch(task_ids={node.id})
+    record = scheduler.record_for(node.id)
+    record.parent_agent_id = "agent-parent"
+    record.parent_task_id = "parent-task"
+    route_args = route_kwargs(
+        identity=InvocationIdentity(
+            consumer="github:Bbambaaamm/herdr",
+            agent_id=record.agent_id,
+            parent_agent_id="agent-parent",
+            parent_task_id="parent-task",
+            task_id=node.id,
+            run_token=record.run_token,
+            fencing_token=record.lease.fencing_token,
+        )
+    )
+    route = select_managed_task_route(**route_args)
+    handoff = scheduler.prepare_managed_execution_handoff(
+        route,
+        identity=route_args["identity"],
+        registry=route_args["registry"],
+        requirement=route_args["requirement"],
+        policy=route_args["policy"],
+        budget_gate=route_args["budget_gate"],
+    )
+    handoff.authorize(
+        identity=route_args["identity"],
+        budget_gate=route_args["budget_gate"],
+        provider=route.decision.selected_provider,
+        model=route.decision.selected_model,
+    )
+    assert handoff.task_id == node.id
+    assert route_args["budget_gate"].calls[-1] == route.decision.selected_provider
+
+
+def test_execution_handoff_rejects_provider_or_model_switch(tmp_path: Path):
+    node = task_node()
+    scheduler = DynamicChildScheduler(audit_log=AuditLog(tmp_path / "events.jsonl"))
+    scheduler.submit(
+        TaskGraph(
+            envelope=TaskGraphEnvelope(
+                issue="Bbambaaamm/herdr#79",
+                spec_hash="sha256:" + "e" * 64,
+                graph_version=GRAPH_VERSION,
+                created_at=NOW,
+                planner="router-test@1",
+                policy_profile="default",
+            ),
+            nodes=(node,),
+        ),
+        repo="Bbambaaamm/herdr",
+        issue="79",
+    )
+    scheduler.dispatch(task_ids={node.id})
+    record = scheduler.record_for(node.id)
+    record.parent_agent_id = "agent-parent"
+    record.parent_task_id = "parent-task"
+    ident = InvocationIdentity(
+        consumer="github:Bbambaaamm/herdr",
+        agent_id=record.agent_id,
+        parent_agent_id="agent-parent",
+        parent_task_id="parent-task",
+        task_id=node.id,
+        run_token=record.run_token,
+        fencing_token=record.lease.fencing_token,
+    )
+    kwargs = route_kwargs(identity=ident)
+    route = select_managed_task_route(**kwargs)
+    handoff = build_execution_handoff(
+        scheduler=scheduler, route=route, identity=ident,
+        registry=kwargs["registry"], requirement=kwargs["requirement"],
+        policy=kwargs["policy"], budget_gate=kwargs["budget_gate"],
+    )
+    with pytest.raises(RoutingIntegrationError, match="provider mismatch"):
+        handoff.authorize(identity=ident, budget_gate=kwargs["budget_gate"], provider="b")
+    with pytest.raises(RoutingIntegrationError, match="model mismatch"):
+        handoff.authorize(identity=ident, budget_gate=kwargs["budget_gate"], model="other-model")

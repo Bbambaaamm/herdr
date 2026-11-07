@@ -304,6 +304,33 @@ class WorkInvocationGuard(InvocationGuard):
         super().__init__(grant,**kwargs)
         self.work_authority=work_authority
         self._host_result=contextvars.ContextVar("herdr-host-result",default=None)
+        self._routing_handoff = None
+
+    def bind_routing_handoff(self, handoff):
+        """Bind one immutable Router v5 handoff; replacement is fail-closed."""
+        if not all(hasattr(handoff, name) for name in (
+            "task_id", "run_token", "fencing_token", "selected_provider", "selected_model"
+        )):
+            raise PolicyDenied("routing_handoff_invalid")
+        if self._routing_handoff is not None and self._routing_handoff != handoff:
+            raise PolicyDenied("routing_handoff_replacement_denied")
+        if handoff.task_id != self.grant.identity.task_id:
+            raise PolicyDenied("routing_handoff_task_mismatch")
+        if handoff.run_token != self.grant.identity.run_token or handoff.fencing_token != self.grant.identity.fencing_token:
+            raise PolicyDenied("routing_handoff_identity_mismatch")
+        self._routing_handoff = handoff
+
+    def authorize_routing_model(self, provider, model):
+        handoff = self._routing_handoff
+        if handoff is None:
+            return True
+        identity = self.grant.identity
+        if (handoff.task_id != identity.task_id or handoff.run_token != identity.run_token
+                or handoff.fencing_token != identity.fencing_token
+                or handoff.consumer != identity.consumer
+                or provider != handoff.selected_provider or model != handoff.selected_model):
+            raise PolicyDenied("routing_handoff_model_mismatch")
+        return True
 
     def authorize_provider(self,request,**kwargs):
         self.work_authority(self.grant.identity,self.grant.hash,kind="provider",tool=None)
