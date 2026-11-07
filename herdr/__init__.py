@@ -23,10 +23,12 @@ from .scheduler import (
 )
 from .routing import (
     FailureKind,
+    FailureScope,
     RejectedCandidate,
     RoutingDecision,
     RoutingError,
     bounded_fallback,
+    classify_failure_scope,
     classify_failure,
     select_route,
 )
@@ -50,10 +52,12 @@ __all__ = [
     "SchedulerError",
     "Lease",
     "FailureKind",
+    "FailureScope",
     "RejectedCandidate",
     "RoutingDecision",
     "RoutingError",
     "bounded_fallback",
+    "classify_failure_scope",
     "classify_failure",
     "select_route",
 ]

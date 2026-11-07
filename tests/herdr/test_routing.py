@@ -6,13 +6,85 @@ import pytest
 from herdr.capability import Health
 from herdr.routing import (
     FailureKind,
+    FailureScope,
     RoutingDecision,
     RoutingError,
     bounded_fallback,
     classify_failure,
+    classify_failure_scope,
     select_route,
 )
 from tests.herdr.test_capability import NOW, fixture
+
+
+def test_scope_wide_denial_blocks_fallback_but_candidate_local_can_fallback():
+    registry, scope, requirement, states = fixture()
+    local = bounded_fallback(
+        registry, requirement, scope, states, at=NOW,
+        policy_version="router-v5-policy-1",
+        failed_executors={"a-runtime": FailureKind.POLICY_DENIED},
+        failed_scopes={"a-runtime": FailureScope.CANDIDATE_LOCAL},
+        max_attempts=2,
+    )
+    assert local.selected_executor == "b-runtime"
+    assert local.failure is None
+
+    wide = bounded_fallback(
+        registry, requirement, scope, states, at=NOW,
+        policy_version="router-v5-policy-1",
+        failed_executors={"a-runtime": FailureKind.POLICY_DENIED},
+        failed_scopes={"a-runtime": FailureScope.ROUTING_WIDE},
+        max_attempts=2,
+    )
+    assert wide.selected_executor is None
+    assert wide.failure is FailureKind.POLICY_DENIED
+    assert wide.failure_scope is FailureScope.ROUTING_WIDE
+    assert wide.attempted_fallbacks == ("a-runtime",)
+
+    budget_wide = bounded_fallback(
+        registry, requirement, scope, states, at=NOW,
+        policy_version="router-v5-policy-1",
+        failed_executors={"a-runtime": FailureKind.BUDGET_EXCEEDED},
+        failed_scopes={"a-runtime": FailureScope.ROUTING_WIDE},
+        max_attempts=2,
+    )
+    assert budget_wide.selected_executor is None
+    assert budget_wide.failure is FailureKind.BUDGET_EXCEEDED
+    assert budget_wide.failure_scope is FailureScope.ROUTING_WIDE
+
+
+def test_decision_invariants_and_trusted_digest_requirement():
+    registry, scope, requirement, states = fixture()
+    decision = select_route(
+        registry, requirement, scope, states, at=NOW, policy_version="router-v5-policy-1"
+    )
+    raw = decision.to_json()
+    assert RoutingDecision.from_json(raw).digest == decision.digest
+    with pytest.raises(RoutingError, match="requires decision_sha256"):
+        RoutingDecision.from_json(decision.to_json(include_digest=False))
+    assert RoutingDecision.from_json(decision.to_json(include_digest=False), trusted=False).digest == decision.digest
+    tampered = dict(raw)
+    tampered["selected_provider"] = "b"
+    with pytest.raises(RoutingError, match="digest mismatch"):
+        RoutingDecision.from_json(tampered)
+    with pytest.raises(RoutingError, match="all present"):
+        RoutingDecision(
+            policy_version="router-v5-policy-1", registry_hash="a" * 64,
+            requirement_hash="b" * 64, selected_model="model", selected_provider=None,
+            selected_executor="executor", reasons=("test",),
+        )
+    with pytest.raises(RoutingError, match="requires failure"):
+        RoutingDecision(
+            policy_version="router-v5-policy-1", registry_hash="a" * 64,
+            requirement_hash="b" * 64, selected_model=None, selected_provider=None,
+            selected_executor=None, reasons=("test",),
+        )
+
+
+def test_failure_scope_classifier_is_explicit_and_provider_neutral():
+    assert classify_failure_scope("candidate policy denied") is FailureScope.CANDIDATE_LOCAL
+    assert classify_failure_scope("task-wide policy denied") is FailureScope.ROUTING_WIDE
+    assert classify_failure_scope("global budget exceeded for entire task") is FailureScope.ROUTING_WIDE
 
 
 def test_deterministic_decision_and_versioned_payload():

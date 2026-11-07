@@ -41,6 +41,11 @@ class FailureKind(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+class FailureScope(StrEnum):
+    CANDIDATE_LOCAL = "candidate_local"
+    ROUTING_WIDE = "routing_wide"
+
+
 # Mapping input order is not an execution trace. Terminal failures therefore
 # use this explicit stable precedence; attempted_fallbacks is a sorted set.
 _FAILURE_PRECEDENCE = {
@@ -72,12 +77,14 @@ class RejectedCandidate:
     model: str
     reason: str
     failure: FailureKind | None = None
+    scope: FailureScope = FailureScope.CANDIDATE_LOCAL
 
     def __post_init__(self) -> None:
         for name in ("executor_id", "provider_id", "model", "reason"):
             _token(getattr(self, name), name)
         if self.failure is not None:
             object.__setattr__(self, "failure", FailureKind(self.failure))
+        object.__setattr__(self, "scope", FailureScope(self.scope))
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -86,6 +93,7 @@ class RejectedCandidate:
             "model": self.model,
             "reason": self.reason,
             "failure": self.failure.value if self.failure else None,
+            "scope": self.scope.value,
         }
 
 
@@ -105,6 +113,7 @@ class RoutingDecision:
     # not an execution-order trace.
     attempted_fallbacks: tuple[str, ...] = ()
     failure: FailureKind | None = None
+    failure_scope: FailureScope | None = None
     attempts: int = 0
     max_attempts: int = 1
     schema_version: str = ROUTING_SCHEMA_VERSION
@@ -118,10 +127,13 @@ class RoutingDecision:
             value = getattr(self, name)
             if value is not None:
                 _token(value, name)
-        if self.selected_model is None and self.selected_provider is not None:
-            raise RoutingError("provider requires a selected model")
-        if self.selected_model is None and self.selected_executor is not None:
-            raise RoutingError("executor requires a selected model")
+        selected = (self.selected_model, self.selected_provider, self.selected_executor)
+        if any(value is None for value in selected) and any(value is not None for value in selected):
+            raise RoutingError("selected model, provider and executor must be all present or all absent")
+        if self.selected_model is not None and self.failure is not None:
+            raise RoutingError("selected route cannot carry a failure")
+        if self.selected_model is None and self.failure is None:
+            raise RoutingError("failed decision without selected route requires failure")
         if not isinstance(self.reasons, (tuple, list)) or not self.reasons:
             raise RoutingError("reasons must be non-empty")
         for reason in self.reasons:
@@ -141,6 +153,9 @@ class RoutingDecision:
         object.__setattr__(self, "reasons", tuple(self.reasons))
         if self.failure is not None:
             object.__setattr__(self, "failure", FailureKind(self.failure))
+            object.__setattr__(self, "failure_scope", FailureScope(self.failure_scope or FailureScope.CANDIDATE_LOCAL))
+        elif self.failure_scope is not None:
+            raise RoutingError("failure_scope requires failure")
         if type(self.attempts) is not int or self.attempts < 0:
             raise RoutingError("attempts must be non-negative")
         if type(self.max_attempts) is not int or not 1 <= self.max_attempts <= 16:
@@ -165,6 +180,7 @@ class RoutingDecision:
             "rejected_candidates": [item.to_json() for item in self.rejected_candidates],
             "attempted_fallbacks": list(self.attempted_fallbacks),
             "failure": self.failure.value if self.failure else None,
+            "failure_scope": self.failure_scope.value if self.failure_scope else None,
             "attempts": self.attempts,
             "max_attempts": self.max_attempts,
         }
@@ -173,9 +189,11 @@ class RoutingDecision:
         return data
 
     @classmethod
-    def from_json(cls, raw: Mapping[str, Any]) -> "RoutingDecision":
+    def from_json(cls, raw: Mapping[str, Any], *, trusted: bool = True) -> "RoutingDecision":
         values = dict(raw)
         expected = values.pop("decision_sha256", None)
+        if trusted and expected is None:
+            raise RoutingError("trusted routing decision requires decision_sha256")
         values["reasons"] = tuple(values["reasons"])
         values["rejected_candidates"] = tuple(
             RejectedCandidate(
@@ -184,6 +202,7 @@ class RoutingDecision:
                 model=item["model"],
                 reason=item["reason"],
                 failure=item.get("failure"),
+                scope=item.get("scope", FailureScope.CANDIDATE_LOCAL),
             )
             for item in values["rejected_candidates"]
         )
@@ -261,6 +280,14 @@ def classify_failure(
     return FailureKind.UNKNOWN
 
 
+def classify_failure_scope(message: str) -> FailureScope:
+    """Classify whether an explicit denial applies to one candidate or the route."""
+    text = message.lower()
+    if any(term in text for term in ("task-wide", "routing-wide", "global policy", "all candidates", "entire task")):
+        return FailureScope.ROUTING_WIDE
+    return FailureScope.CANDIDATE_LOCAL
+
+
 def _reason_failure(reason: Reason) -> FailureKind:
     if reason in (Reason.POLICY_DENIED, Reason.DATA_POLICY_DENIED):
         return FailureKind.POLICY_DENIED
@@ -324,11 +351,15 @@ def select_route(
     policy_version: str,
     max_attempts: int = 1,
     failed_executors: Mapping[str, FailureKind] | None = None,
+    failed_scopes: Mapping[str, FailureScope] | None = None,
 ) -> RoutingDecision:
     """Select a route from the existing registry, deterministically and offline."""
     if max_attempts < 1 or max_attempts > 16:
         raise RoutingError("max_attempts must be between 1 and 16")
     failed = {key: FailureKind(value) for key, value in (failed_executors or {}).items()}
+    scopes = {key: FailureScope(value) for key, value in (failed_scopes or {}).items()}
+    if set(scopes) - set(failed):
+        raise RoutingError("failed_scopes contains an executor without a failure")
     result = registry.candidates(requirement, policy, tuple(runtime_state), at=at)
     known_ids = {item.id for item in registry.snapshot.executors}
     rejection_by_id = {item.executor_id: item.reason for item in result.rejections if item.executor_id}
@@ -341,6 +372,8 @@ def select_route(
     )
     if invalid_failed:
         raise RoutingError("failed executor is not compatible with the current routing context: " + ",".join(invalid_failed))
+    routing_wide = any(scopes.get(executor_id, FailureScope.CANDIDATE_LOCAL) is FailureScope.ROUTING_WIDE
+                       for executor_id in failed)
     rejected = [_rejection_for_registry(registry, item.executor_id, item.reason) for item in result.rejections]
     for executor_id, failure in sorted(failed.items()):
         match = next((item for item in result.matches if item.executor_id == executor_id), None)
@@ -351,6 +384,7 @@ def select_route(
                 model=_model_for(registry, match),
                 reason="fallback:" + failure.value,
                 failure=failure,
+                scope=scopes.get(executor_id, FailureScope.CANDIDATE_LOCAL),
             ))
         else:
             executor = next(item for item in registry.snapshot.executors if item.id == executor_id)
@@ -362,8 +396,9 @@ def select_route(
                 model=capability.spec_id,
                 reason="fallback:" + failure.value,
                 failure=failure,
+                scope=scopes.get(executor_id, FailureScope.CANDIDATE_LOCAL),
             ))
-    exhausted = len(failed) >= max_attempts
+    exhausted = len(failed) >= max_attempts or routing_wide
     available = [] if exhausted else [item for item in result.matches if item.executor_id not in failed]
     available.sort(key=lambda item: (-item.preference_score, item.executor_id))
     if available and len(available) > 0:
@@ -403,6 +438,7 @@ def select_route(
         rejected_candidates=tuple(rejected),
         attempted_fallbacks=tuple(sorted(failed)),
         failure=failure,
+        failure_scope=FailureScope.ROUTING_WIDE if routing_wide else FailureScope.CANDIDATE_LOCAL,
         attempts=min(len(failed), max_attempts),
         max_attempts=max_attempts,
     )
@@ -417,6 +453,7 @@ def bounded_fallback(
     at: str,
     policy_version: str,
     failed_executors: Mapping[str, FailureKind],
+    failed_scopes: Mapping[str, FailureScope] | None = None,
     max_attempts: int = 3,
 ) -> RoutingDecision:
     """Retry only compatible registry candidates and stop at a fixed bound."""
@@ -424,10 +461,10 @@ def bounded_fallback(
         return select_route(
             registry, requirement, policy, runtime_state, at=at,
             policy_version=policy_version, max_attempts=max_attempts,
-            failed_executors=failed_executors,
+            failed_executors=failed_executors, failed_scopes=failed_scopes,
         )
     return select_route(
         registry, requirement, policy, runtime_state, at=at,
         policy_version=policy_version, max_attempts=max_attempts,
-        failed_executors=failed_executors,
+        failed_executors=failed_executors, failed_scopes=failed_scopes,
     )
