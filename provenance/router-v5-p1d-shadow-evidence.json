@@ -1,0 +1,82 @@
+{
+  "bundle": "HERDR_ROUTER_V5_P1D_SHADOW_ACCEPTANCE",
+  "schema_version": 1,
+  "source_commit": "7e54c1c0e24d3067ff6489e0ce036c6a6f1973dc",
+  "base_commit": "cccdb251f67687cc05309b60691a221e00535a9a",
+  "pull_request": "https://github.com/Bbambaaamm/herdr/pull/212",
+  "mode": "offline_shadow_only",
+  "provider_api_calls": 0,
+  "economic_operations": 0,
+  "credentials_exposed": false,
+  "authorities_reused": [
+    "TaskGraph",
+    "DynamicChildScheduler",
+    "CapabilityRegistry",
+    "ManagedExecutionHandoff",
+    "WorkBudgetAuthority",
+    "WorkInvocationGuard host boundary",
+    "AuditLog"
+  ],
+  "scenario_matrix": {
+    "A_success": "PASS",
+    "B_laguna_model_not_found": "PASS_taxonomy_and_existing_fallback_tests",
+    "C_claude_opus_5_5_insufficient_credits": "PASS_taxonomy_and_existing_terminal-credit-tests",
+    "D_provider_outage_rate_limit": "PASS_bounded_fake-provider_failure_no_reroute",
+    "E_policy_budget_denial_unknown_budget": "PASS_terminal_and_unknown_fail_closed",
+    "F_delivery_uncertainty": "PASS_existing_reconciliation-before-fallback-tests",
+    "G_crash_restart_replay": "PASS_shadow_audit_replay_idempotency",
+    "H_concurrency_stale_fence": "PASS_existing_scheduler_and_fallback-concurrency-tests",
+    "I_multi_consumer_isolation": "PASS_consumer-bound_handoff",
+    "J_static_routing_regression": "PASS_static_route_is_observed_not_mutated"
+  },
+  "test_evidence": {
+    "shadow_acceptance": "11 passed",
+    "router_fallback_scheduler_routing": "53 passed",
+    "scheduler_taskgraph_worker_host": "277 passed",
+    "manifest": "HERDR_SOURCE_MANIFEST_OK files=453",
+    "repository_contract": "HERDR_REPOSITORY_CONTRACT_OK",
+    "diff_check": "PASS",
+    "py_compile": "PASS"
+  },
+  "independent_review": {
+    "status": "PASS",
+    "review_id": 5814980990,
+    "head": "7e54c1c0e24d3067ff6489e0ce036c6a6f1973dc",
+    "open_findings": 0
+  },
+  "ci": {
+    "run_id": 42413404390,
+    "run_number": 713,
+    "status": "in_progress",
+    "conclusion": null
+  },
+  "deployed_runtime_observation": {
+    "device": "quantlab-staging-01",
+    "release_path": "/opt/herdr/releases/v0.3.0-rc.33-2430899-2430899b3567",
+    "release_commit": "2430899b3567a0fb9663a79abcbb1a17fb67005f",
+    "web": "active",
+    "export": "inactive",
+    "herdr": "inactive",
+    "export_timer": "active",
+    "herdr_timer": "active",
+    "watchdog": "active",
+    "status": "OBSERVED_read_only_runtime_is_older_than_P1D"
+  },
+  "acceptance": {
+    "offline_shadow_slice": "READY_FOR_REVIEW",
+    "deployed_runtime_canary": "NOT_READY",
+    "blockers": [
+      "CI run 713 still in progress at capture",
+      "no deployed P1D runtime evidence",
+      "no approved physical/live canary"
+    ]
+  },
+  "safety": {
+    "merge": false,
+    "deploy": false,
+    "service_restart": false,
+    "runtime_policy_change": false,
+    "apparmor_change": false,
+    "model_calls": false
+  }
+}
