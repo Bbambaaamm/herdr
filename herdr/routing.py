@@ -87,6 +87,7 @@ class RoutingDecision:
     selected_executor: str | None
     reasons: tuple[str, ...]
     rejected_candidates: tuple[RejectedCandidate, ...] = ()
+    attempted_fallbacks: tuple[str, ...] = ()
     failure: FailureKind | None = None
     attempts: int = 0
     max_attempts: int = 1
@@ -115,6 +116,12 @@ class RoutingDecision:
         if any(not isinstance(item, RejectedCandidate) for item in rejected):
             raise RoutingError("rejected_candidates must be typed")
         object.__setattr__(self, "rejected_candidates", rejected)
+        attempted = tuple(self.attempted_fallbacks)
+        for executor_id in attempted:
+            _token(executor_id, "attempted_fallback")
+        if len(attempted) != len(set(attempted)):
+            raise RoutingError("attempted_fallbacks contains duplicates")
+        object.__setattr__(self, "attempted_fallbacks", attempted)
         object.__setattr__(self, "reasons", tuple(self.reasons))
         if self.failure is not None:
             object.__setattr__(self, "failure", FailureKind(self.failure))
@@ -140,6 +147,7 @@ class RoutingDecision:
             "selected_executor": self.selected_executor,
             "reasons": list(self.reasons),
             "rejected_candidates": [item.to_json() for item in self.rejected_candidates],
+            "attempted_fallbacks": list(self.attempted_fallbacks),
             "failure": self.failure.value if self.failure else None,
             "attempts": self.attempts,
             "max_attempts": self.max_attempts,
@@ -163,6 +171,7 @@ class RoutingDecision:
             )
             for item in values["rejected_candidates"]
         )
+        values["attempted_fallbacks"] = tuple(values.get("attempted_fallbacks", ()))
         decision = cls(**values)
         if expected is not None and expected != decision.digest:
             raise RoutingError("routing decision digest mismatch")
@@ -180,8 +189,8 @@ class RoutingDecision:
         role: str,
     ) -> TelemetryEvent:
         """Project the decision into the existing closed telemetry contract."""
-        fallback = tuple(item.executor_id for item in self.rejected_candidates)
-        event_type = EventType.MODEL_FALLBACK if fallback else EventType.MODEL_ROUTE
+        fallback = self.attempted_fallbacks
+        event_type = EventType.MODEL_FALLBACK if fallback and self.selected_executor else EventType.MODEL_ROUTE
         return TelemetryEvent(
             sequence=sequence,
             timestamp=timestamp,
@@ -293,6 +302,10 @@ def select_route(
         raise RoutingError("max_attempts must be between 1 and 16")
     failed = {key: FailureKind(value) for key, value in (failed_executors or {}).items()}
     result = registry.candidates(requirement, policy, tuple(runtime_state), at=at)
+    eligible_ids = {item.executor_id for item in result.matches}
+    unknown_failed = sorted(set(failed) - eligible_ids)
+    if unknown_failed:
+        raise RoutingError("failed executor is not an eligible registry candidate: " + ",".join(unknown_failed))
     rejected = [_rejection_for_registry(registry, item.executor_id, item.reason) for item in result.rejections]
     for executor_id, failure in sorted(failed.items()):
         match = next((item for item in result.matches if item.executor_id == executor_id), None)
@@ -322,6 +335,7 @@ def select_route(
             selected_executor=chosen.executor_id,
             reasons=reasons,
             rejected_candidates=tuple(rejected),
+            attempted_fallbacks=tuple(sorted(failed)),
             attempts=min(len(failed) + 1, max_attempts),
             max_attempts=max_attempts,
         )
@@ -343,6 +357,7 @@ def select_route(
         selected_executor=None,
         reasons=reasons,
         rejected_candidates=tuple(rejected),
+        attempted_fallbacks=tuple(sorted(failed)),
         failure=failure,
         attempts=min(len(failed), max_attempts),
         max_attempts=max_attempts,

@@ -1,8 +1,17 @@
 """Focused Router v5 contract regressions (offline only)."""
 from dataclasses import replace
 
+import pytest
+
 from herdr.capability import Health
-from herdr.routing import FailureKind, RoutingDecision, bounded_fallback, classify_failure, select_route
+from herdr.routing import (
+    FailureKind,
+    RoutingDecision,
+    RoutingError,
+    bounded_fallback,
+    classify_failure,
+    select_route,
+)
 from tests.herdr.test_capability import NOW, fixture
 
 
@@ -36,6 +45,7 @@ def test_bounded_fallback_keeps_registry_constraints_and_stops():
     assert decision.selected_executor == "b-runtime"
     assert "bounded_fallback" in decision.reasons
     assert decision.rejected_candidates[-1].failure is FailureKind.PROVIDER_UNAVAILABLE
+    assert decision.attempted_fallbacks == ("a-runtime",)
 
     exhausted = bounded_fallback(
         registry, requirement, scope, states, at=NOW,
@@ -49,11 +59,19 @@ def test_bounded_fallback_keeps_registry_constraints_and_stops():
     assert exhausted.selected_executor is None
     assert exhausted.attempts == 2
 
-    denied_scope = replace(scope, providers=("a",), executors=("a-runtime",))
+    with pytest.raises(RoutingError, match="eligible registry candidate"):
+        bounded_fallback(
+            registry, requirement, scope, states, at=NOW,
+            policy_version="router-v5-policy-1",
+            failed_executors={"ghost-runtime": FailureKind.PROVIDER_UNAVAILABLE},
+            max_attempts=2,
+        )
+
+    denied_scope = replace(scope, providers=("ghost-provider",), executors=("ghost-runtime",))
     denied = bounded_fallback(
         registry, requirement, denied_scope, states, at=NOW,
         policy_version="router-v5-policy-1",
-        failed_executors={"a-runtime": FailureKind.PROVIDER_UNAVAILABLE},
+        failed_executors={},
         max_attempts=2,
     )
     assert denied.selected_executor is None
@@ -74,7 +92,7 @@ def test_failure_taxonomy_laguna_and_claude_credit_cases():
     assert classify_failure(status_code=418, message="opaque") is FailureKind.UNKNOWN
 
 
-def test_telemetry_projection_contains_audit_digest_and_rejections():
+def test_telemetry_projection_distinguishes_attempted_fallbacks():
     registry, scope, requirement, states = fixture()
     decision = select_route(
         registry, requirement, scope, states, at=NOW, policy_version="router-v5-policy-1",
@@ -88,6 +106,19 @@ def test_telemetry_projection_contains_audit_digest_and_rejections():
     assert event.event_type.value == "model_fallback"
     assert event.fallback_chain == ("a-runtime",)
     assert event.blocker is None
+
+    denied_scope = replace(scope, providers=("ghost-provider",), executors=("ghost-runtime",))
+    denied = select_route(
+        registry, requirement, denied_scope, states, at=NOW,
+        policy_version="router-v5-policy-1",
+    )
+    denied_event = denied.to_telemetry_event(
+        sequence=2, timestamp="2026-10-02T10:00:11+00:00", issue="79",
+        task_id="router-test-denied", attempt=1, agent_id="hermes", role="router",
+    )
+    assert denied_event.event_type.value == "model_route"
+    assert denied_event.fallback_chain == ()
+    assert denied_event.blocker == "POLICY_DENIED"
 
 
 def test_no_candidate_is_fail_closed_for_provider_unavailable():
