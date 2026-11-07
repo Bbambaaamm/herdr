@@ -1,13 +1,19 @@
 {
   "bundle": "HERDR_ROUTER_V5_P1D_SHADOW_ACCEPTANCE",
-  "schema_version": 1,
-  "source_commit": "7e54c1c0e24d3067ff6489e0ce036c6a6f1973dc",
+  "schema_version": 2,
+  "source_commit": "ba9c74119b29d192ea763b8a2b449ec54817abf3",
   "base_commit": "cccdb251f67687cc05309b60691a221e00535a9a",
   "pull_request": "https://github.com/Bbambaaamm/herdr/pull/212",
   "mode": "offline_shadow_only",
   "provider_api_calls": 0,
   "economic_operations": 0,
   "credentials_exposed": false,
+  "p1_fix": {
+    "finding": "shadow PASS could coexist with nonzero economic counters",
+    "resolution": "reserve_calls, charge_calls and settle_calls are checked before and after the fake-provider callback; any nonzero value returns BLOCKED",
+    "preexisting_violation_invokes_provider": false,
+    "callback_violation_returns_pass": false
+  },
   "authorities_reused": [
     "TaskGraph",
     "DynamicChildScheduler",
@@ -30,8 +36,8 @@
     "J_static_routing_regression": "PASS_static_route_is_observed_not_mutated"
   },
   "test_evidence": {
-    "shadow_acceptance": "11 passed",
-    "router_fallback_scheduler_routing": "53 passed",
+    "shadow_acceptance": "17 passed",
+    "router_fallback_scheduler_routing": "80 passed",
     "scheduler_taskgraph_worker_host": "277 passed",
     "manifest": "HERDR_SOURCE_MANIFEST_OK files=453",
     "repository_contract": "HERDR_REPOSITORY_CONTRACT_OK",
@@ -39,34 +45,25 @@
     "py_compile": "PASS"
   },
   "independent_review": {
-    "status": "PASS",
-    "review_id": 5814980990,
-    "head": "7e54c1c0e24d3067ff6489e0ce036c6a6f1973dc",
-    "open_findings": 0
+    "previous_head_review": "PASS",
+    "new_head_review": "PENDING",
+    "open_findings": "PENDING"
   },
   "ci": {
-    "run_id": 42413404390,
-    "run_number": 713,
-    "status": "in_progress",
+    "status": "PENDING_NEW_HEAD_RUN",
     "conclusion": null
   },
   "deployed_runtime_observation": {
     "device": "quantlab-staging-01",
     "release_path": "/opt/herdr/releases/v0.3.0-rc.33-2430899-2430899b3567",
     "release_commit": "2430899b3567a0fb9663a79abcbb1a17fb67005f",
-    "web": "active",
-    "export": "inactive",
-    "herdr": "inactive",
-    "export_timer": "active",
-    "herdr_timer": "active",
-    "watchdog": "active",
     "status": "OBSERVED_read_only_runtime_is_older_than_P1D"
   },
   "acceptance": {
     "offline_shadow_slice": "READY_FOR_REVIEW",
     "deployed_runtime_canary": "NOT_READY",
     "blockers": [
-      "CI run 713 still in progress at capture",
+      "new-head CI and independent review pending",
       "no deployed P1D runtime evidence",
       "no approved physical/live canary"
     ]
