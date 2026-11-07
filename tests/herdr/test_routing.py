@@ -47,6 +47,19 @@ def test_bounded_fallback_keeps_registry_constraints_and_stops():
     assert decision.rejected_candidates[-1].failure is FailureKind.PROVIDER_UNAVAILABLE
     assert decision.attempted_fallbacks == ("a-runtime",)
 
+    changed_states = tuple(
+        replace(state, health=Health.UNAVAILABLE, reason_code="maintenance")
+        if state.executor_id == "a-runtime" else state
+        for state in states
+    )
+    changed = bounded_fallback(
+        registry, requirement, scope, changed_states, at=NOW,
+        policy_version="router-v5-policy-1",
+        failed_executors={"a-runtime": FailureKind.PROVIDER_UNAVAILABLE},
+        max_attempts=2,
+    )
+    assert changed.selected_executor == "b-runtime"
+
     exhausted = bounded_fallback(
         registry, requirement, scope, states, at=NOW,
         policy_version="router-v5-policy-1",
@@ -75,7 +88,7 @@ def test_bounded_fallback_keeps_registry_constraints_and_stops():
     assert terminal_event.event_type.value == "model_fallback"
     assert terminal_event.fallback_chain == ("a-runtime", "b-runtime")
 
-    with pytest.raises(RoutingError, match="eligible registry candidate"):
+    with pytest.raises(RoutingError, match="present in the registry snapshot"):
         bounded_fallback(
             registry, requirement, scope, states, at=NOW,
             policy_version="router-v5-policy-1",

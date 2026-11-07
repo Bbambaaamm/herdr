@@ -41,6 +41,20 @@ class FailureKind(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+# Mapping input order is not an execution trace. Terminal failures therefore
+# use this explicit stable precedence; attempted_fallbacks is a sorted set.
+_FAILURE_PRECEDENCE = {
+    FailureKind.POLICY_DENIED: 80,
+    FailureKind.BUDGET_EXCEEDED: 70,
+    FailureKind.INSUFFICIENT_CREDITS: 60,
+    FailureKind.MODEL_NOT_FOUND: 50,
+    FailureKind.CAPABILITY_MISMATCH: 40,
+    FailureKind.RATE_LIMITED: 30,
+    FailureKind.PROVIDER_UNAVAILABLE: 20,
+    FailureKind.UNKNOWN: 10,
+}
+
+
 def _token(value: str, field: str) -> None:
     if not isinstance(value, str) or not _TOKEN.fullmatch(value):
         raise RoutingError(f"{field} must be a safe token")
@@ -87,6 +101,8 @@ class RoutingDecision:
     selected_executor: str | None
     reasons: tuple[str, ...]
     rejected_candidates: tuple[RejectedCandidate, ...] = ()
+    # Sorted executor IDs for prior failures; this is an unordered aggregate,
+    # not an execution-order trace.
     attempted_fallbacks: tuple[str, ...] = ()
     failure: FailureKind | None = None
     attempts: int = 0
@@ -302,10 +318,10 @@ def select_route(
         raise RoutingError("max_attempts must be between 1 and 16")
     failed = {key: FailureKind(value) for key, value in (failed_executors or {}).items()}
     result = registry.candidates(requirement, policy, tuple(runtime_state), at=at)
-    eligible_ids = {item.executor_id for item in result.matches}
-    unknown_failed = sorted(set(failed) - eligible_ids)
+    known_ids = {item.id for item in registry.snapshot.executors}
+    unknown_failed = sorted(set(failed) - known_ids)
     if unknown_failed:
-        raise RoutingError("failed executor is not an eligible registry candidate: " + ",".join(unknown_failed))
+        raise RoutingError("failed executor is not present in the registry snapshot: " + ",".join(unknown_failed))
     rejected = [_rejection_for_registry(registry, item.executor_id, item.reason) for item in result.rejections]
     for executor_id, failure in sorted(failed.items()):
         match = next((item for item in result.matches if item.executor_id == executor_id), None)
@@ -314,6 +330,17 @@ def select_route(
                 executor_id=executor_id,
                 provider_id=match.provider_id,
                 model=_model_for(registry, match),
+                reason="fallback:" + failure.value,
+                failure=failure,
+            ))
+        else:
+            executor = next(item for item in registry.snapshot.executors if item.id == executor_id)
+            provider = next(item for item in registry.snapshot.providers if item.id == executor.provider_id)
+            capability = next(item for item in registry.snapshot.capabilities if item.id == executor.capability_id)
+            rejected.append(RejectedCandidate(
+                executor_id=executor.id,
+                provider_id=provider.id,
+                model=capability.spec_id,
                 reason="fallback:" + failure.value,
                 failure=failure,
             ))
@@ -340,7 +367,7 @@ def select_route(
             max_attempts=max_attempts,
         )
     if failed and not result.rejections:
-        failure = failed[sorted(failed)[0]]
+        failure = max(failed.values(), key=lambda item: (_FAILURE_PRECEDENCE[item], item.value))
     elif result.rejections:
         failure = _reason_failure(result.rejections[0].reason)
     elif requirement.legacy_model_hints and not available:
