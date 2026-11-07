@@ -18,8 +18,10 @@ from herdr.routing import (
 from tests.herdr.test_capability import NOW, fixture
 
 
-def attestation(executor_id, scope):
-    return {executor_id: ScopeAttestation(executor_id, scope, "policy_evaluator", "a" * 64)}
+def attestation(executor_id, scope, registry, requirement):
+    return {executor_id: ScopeAttestation.for_context(
+        executor_id, scope, "policy_evaluator", registry.snapshot.hash, requirement.hash
+    )}
 
 
 def test_scope_wide_denial_blocks_fallback_but_candidate_local_can_fallback():
@@ -72,13 +74,23 @@ def test_scope_wide_denial_blocks_fallback_but_candidate_local_can_fallback():
             failed_scopes={"a-runtime": FailureScope.CANDIDATE_LOCAL},
             max_attempts=2,
         )
+    forged = {"a-runtime": ScopeAttestation("a-runtime", FailureScope.CANDIDATE_LOCAL, "policy_evaluator", "a" * 64)}
+    with pytest.raises(RoutingError, match="does not bind"):
+        bounded_fallback(
+            registry, requirement, scope, states, at=NOW,
+            policy_version="router-v5-policy-1",
+            failed_executors={"a-runtime": FailureKind.POLICY_DENIED},
+            failed_scopes={"a-runtime": FailureScope.CANDIDATE_LOCAL},
+            scope_attestations=forged,
+            max_attempts=2,
+        )
 
     local = bounded_fallback(
         registry, requirement, scope, states, at=NOW,
         policy_version="router-v5-policy-1",
         failed_executors={"a-runtime": FailureKind.POLICY_DENIED},
         failed_scopes={"a-runtime": FailureScope.CANDIDATE_LOCAL},
-        scope_attestations=attestation("a-runtime", FailureScope.CANDIDATE_LOCAL),
+        scope_attestations=attestation("a-runtime", FailureScope.CANDIDATE_LOCAL, registry, requirement),
         max_attempts=2,
     )
     assert local.selected_executor == "b-runtime"
@@ -89,7 +101,7 @@ def test_scope_wide_denial_blocks_fallback_but_candidate_local_can_fallback():
         policy_version="router-v5-policy-1",
         failed_executors={"a-runtime": FailureKind.POLICY_DENIED},
         failed_scopes={"a-runtime": FailureScope.ROUTING_WIDE},
-        scope_attestations=attestation("a-runtime", FailureScope.ROUTING_WIDE),
+        scope_attestations=attestation("a-runtime", FailureScope.ROUTING_WIDE, registry, requirement),
         max_attempts=2,
     )
     assert wide.selected_executor is None
@@ -102,7 +114,7 @@ def test_scope_wide_denial_blocks_fallback_but_candidate_local_can_fallback():
         policy_version="router-v5-policy-1",
         failed_executors={"a-runtime": FailureKind.BUDGET_EXCEEDED},
         failed_scopes={"a-runtime": FailureScope.ROUTING_WIDE},
-        scope_attestations=attestation("a-runtime", FailureScope.ROUTING_WIDE),
+        scope_attestations=attestation("a-runtime", FailureScope.ROUTING_WIDE, registry, requirement),
         max_attempts=2,
     )
     assert budget_wide.selected_executor is None

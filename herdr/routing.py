@@ -66,8 +66,35 @@ class ScopeAttestation:
             raise RoutingError("unknown scope cannot be attested")
 
 
-# Mapping input order is not an execution trace. Terminal failures therefore
-# use this explicit stable precedence; attempted_fallbacks is a sorted set.
+    @classmethod
+    def for_context(
+        cls,
+        executor_id: str,
+        scope: FailureScope,
+        source: str,
+        registry_hash: str,
+        requirement_hash: str,
+    ) -> "ScopeAttestation":
+        payload = {
+            "executor_id": executor_id,
+            "scope": FailureScope(scope).value,
+            "source": source,
+            "registry_hash": registry_hash,
+            "requirement_hash": requirement_hash,
+        }
+        evidence = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        return cls(executor_id, FailureScope(scope), source, evidence)
+
+    def verifies(self, registry_hash: str, requirement_hash: str) -> bool:
+        expected = self.for_context(
+            self.executor_id, self.scope, self.source, registry_hash, requirement_hash
+        )
+        return self.evidence_sha256 == expected.evidence_sha256
+
+
+# Mapping input order# use this explicit stable precedence; attempted_fallbacks is a sorted set.
 _FAILURE_PRECEDENCE = {
     FailureKind.POLICY_DENIED: 80,
     FailureKind.BUDGET_EXCEEDED: 70,
@@ -331,6 +358,8 @@ def _scope_for_failure(
     failure: FailureKind,
     scopes: Mapping[str, FailureScope],
     attestations: Mapping[str, ScopeAttestation],
+    registry_hash: str,
+    requirement_hash: str,
 ) -> FailureScope:
     if failure is FailureKind.UNKNOWN:
         raise RoutingError("unknown failure cannot authorize fallback: " + executor_id)
@@ -341,8 +370,10 @@ def _scope_for_failure(
             raise RoutingError("explicit failure scope required for terminal or unknown failure: " + executor_id)
         if explicit is FailureScope.UNKNOWN:
             raise RoutingError("failure scope is uncertain and cannot authorize fallback: " + executor_id)
-        if attestation is None or attestation.executor_id != executor_id or attestation.scope is not explicit:
-            raise RoutingError("trusted scope attestation required for terminal failure: " + executor_id)
+        if (attestation is None or attestation.executor_id != executor_id
+                or attestation.scope is not explicit
+                or not attestation.verifies(registry_hash, requirement_hash)):
+            raise RoutingError("trusted scope attestation does not bind to routing context: " + executor_id)
         return explicit
     if explicit is FailureScope.UNKNOWN:
         raise RoutingError("failure scope is uncertain and cannot authorize fallback: " + executor_id)
@@ -415,11 +446,14 @@ def select_route(
         raise RoutingError("scope metadata contains an executor without a failure")
     if any(not isinstance(item, ScopeAttestation) for item in attestations.values()):
         raise RoutingError("scope_attestations must be typed")
+    result = registry.candidates(requirement, policy, tuple(runtime_state), at=at)
     resolved_scopes = {
-        executor_id: _scope_for_failure(executor_id, failure, scopes, attestations)
+        executor_id: _scope_for_failure(
+            executor_id, failure, scopes, attestations,
+            result.registry_hash, requirement.hash,
+        )
         for executor_id, failure in failed.items()
     }
-    result = registry.candidates(requirement, policy, tuple(runtime_state), at=at)
     known_ids = {item.id for item in registry.snapshot.executors}
     rejection_by_id = {item.executor_id: item.reason for item in result.rejections if item.executor_id}
     eligible_ids = {item.executor_id for item in result.matches}
