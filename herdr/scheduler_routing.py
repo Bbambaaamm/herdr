@@ -322,15 +322,14 @@ class ManagedExecutionHandoff:
         if self.policy_hash != self.parent_scope_hash:
             raise RoutingIntegrationError("handoff policy hash is not the parent scope hash")
 
-    def authorize(
+    def authorize_identity(
         self,
         *,
         identity: InvocationIdentity,
-        budget_gate: BudgetGate,
         provider: str | None = None,
         model: str | None = None,
     ) -> None:
-        """Revalidate identity, selected route and current provider budget."""
+        """Revalidate the immutable handoff identity and selected route."""
         if not isinstance(identity, InvocationIdentity):
             raise RoutingIntegrationError("typed invocation identity required")
         if provider is not None and provider != self.selected_provider:
@@ -348,6 +347,17 @@ class ManagedExecutionHandoff:
         for name, value in expected.items():
             if getattr(identity, name) != value:
                 raise RoutingIntegrationError("execution handoff identity mismatch")
+
+    def authorize(
+        self,
+        *,
+        identity: InvocationIdentity,
+        budget_gate: BudgetGate,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        """Revalidate identity, selected route and current provider budget."""
+        self.authorize_identity(identity=identity, provider=provider, model=model)
         _require_active_budget(budget_gate, self.budget_allocation_id, identity, self.selected_provider)
 
 
@@ -382,16 +392,20 @@ def build_execution_handoff(
         raise RoutingIntegrationError("handoff capability evidence is stale")
     if policy.hash != route.routing_input.parent_scope_hash:
         raise RoutingIntegrationError("handoff policy evidence is stale")
+    capabilities = {item.id: item for item in registry.snapshot.capabilities}
     providers = {item.id: item for item in registry.snapshot.providers}
     executors = {item.id: item for item in registry.snapshot.executors}
+    capability_desc = capabilities.get(requirement.capability_id)
     provider_desc = providers.get(decision.selected_provider)
     executor_desc = executors.get(decision.selected_executor)
-    if (provider_desc is None or executor_desc is None
+    if (capability_desc is None or provider_desc is None or executor_desc is None
             or executor_desc.provider_id != decision.selected_provider
             or executor_desc.capability_id != requirement.capability_id
+            or capability_desc.spec_id != decision.selected_model
+            or requirement.capability_id not in provider_desc.capability_refs
             or decision.selected_provider not in policy.providers
             or decision.selected_executor not in policy.executors):
-        raise RoutingIntegrationError("handoff selected capability is not authorized")
+        raise RoutingIntegrationError("handoff selected capability/model is not authorized")
     _require_active_budget(budget_gate, route.routing_input.budget_allocation_id, identity, decision.selected_provider)
     return ManagedExecutionHandoff(
         version=1,

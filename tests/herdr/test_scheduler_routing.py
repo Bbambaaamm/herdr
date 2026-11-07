@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,7 +16,8 @@ from herdr.scheduler_routing import (
     record_managed_route,
     select_managed_task_route,
 )
-from herdr.security import InvocationIdentity
+from herdr.security import InvocationIdentity, PolicyDenied
+from herdr.work_contract_host import WorkInvocationGuard
 from herdr.taskgraph import GRAPH_VERSION, TaskGraph, TaskGraphEnvelope, TaskNode
 from tests.herdr.test_capability import NOW, fixture
 
@@ -441,6 +443,33 @@ def test_execution_handoff_binds_dispatched_record_and_rechecks_budget(tmp_path:
     assert handoff.task_id == node.id
     assert route_args["budget_gate"].calls[-1] == route.decision.selected_provider
 
+    host_guard = object.__new__(WorkInvocationGuard)
+    host_guard.grant = SimpleNamespace(identity=route_args["identity"])
+    host_guard._routing_handoff = None
+    host_guard.bind_routing_handoff(handoff)
+    assert host_guard.authorize_routing_model(
+        route.decision.selected_provider, route.decision.selected_model
+    ) is True
+    with pytest.raises(PolicyDenied, match="model_mismatch"):
+        host_guard.authorize_routing_model(route.decision.selected_provider, "substitute-model")
+
+    tampered_model = replace(route, decision=replace(route.decision, selected_model="substitute-model"))
+    with pytest.raises(RoutingIntegrationError, match="selected capability/model"):
+        build_execution_handoff(
+            scheduler=scheduler, route=tampered_model,
+            identity=route_args["identity"], registry=route_args["registry"],
+            requirement=route_args["requirement"], policy=route_args["policy"],
+            budget_gate=route_args["budget_gate"],
+        )
+    tampered_provider = replace(route, decision=replace(route.decision, selected_provider="b"))
+    with pytest.raises(RoutingIntegrationError, match="selected capability/model"):
+        build_execution_handoff(
+            scheduler=scheduler, route=tampered_provider,
+            identity=route_args["identity"], registry=route_args["registry"],
+            requirement=route_args["requirement"], policy=route_args["policy"],
+            budget_gate=route_args["budget_gate"],
+        )
+
 
 def test_execution_handoff_rejects_provider_or_model_switch(tmp_path: Path):
     node = task_node()
@@ -484,3 +513,19 @@ def test_execution_handoff_rejects_provider_or_model_switch(tmp_path: Path):
         handoff.authorize(identity=ident, budget_gate=kwargs["budget_gate"], provider="b")
     with pytest.raises(RoutingIntegrationError, match="model mismatch"):
         handoff.authorize(identity=ident, budget_gate=kwargs["budget_gate"], model="other-model")
+
+
+
+def test_host_guard_rejects_attribute_only_handoff():
+    guard = object.__new__(WorkInvocationGuard)
+    guard.grant = SimpleNamespace(identity=identity())
+    guard._routing_handoff = None
+    fake = SimpleNamespace(
+        task_id=guard.grant.identity.task_id,
+        run_token=guard.grant.identity.run_token,
+        fencing_token=guard.grant.identity.fencing_token,
+        selected_provider="a",
+        selected_model="reason",
+    )
+    with pytest.raises(PolicyDenied, match="untrusted_type"):
+        guard.bind_routing_handoff(fake)
