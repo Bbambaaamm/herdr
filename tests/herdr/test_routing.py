@@ -41,6 +41,16 @@ def test_scope_wide_denial_blocks_fallback_but_candidate_local_can_fallback():
             failed_scopes={"a-runtime": "uncertain"},
             max_attempts=2,
         )
+    ambiguous = classify_failure_scope("policy denied")
+    assert ambiguous is FailureScope.UNKNOWN
+    with pytest.raises(RoutingError, match="uncertain"):
+        bounded_fallback(
+            registry, requirement, scope, states, at=NOW,
+            policy_version="router-v5-policy-1",
+            failed_executors={"a-runtime": FailureKind.POLICY_DENIED},
+            failed_scopes={"a-runtime": ambiguous},
+            max_attempts=2,
+        )
 
     local = bounded_fallback(
         registry, requirement, scope, states, at=NOW,
@@ -105,7 +115,8 @@ def test_decision_invariants_and_trusted_digest_requirement():
 
 
 def test_failure_scope_classifier_is_explicit_and_provider_neutral():
-    assert classify_failure_scope("candidate policy denied") is FailureScope.CANDIDATE_LOCAL
+    assert classify_failure_scope("candidate-local policy denied") is FailureScope.CANDIDATE_LOCAL
+    assert classify_failure_scope("policy denied") is FailureScope.UNKNOWN
     assert classify_failure_scope("task-wide policy denied") is FailureScope.ROUTING_WIDE
     assert classify_failure_scope("global budget exceeded for entire task") is FailureScope.ROUTING_WIDE
 

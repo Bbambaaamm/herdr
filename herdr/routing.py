@@ -44,6 +44,7 @@ class FailureKind(StrEnum):
 class FailureScope(StrEnum):
     CANDIDATE_LOCAL = "candidate_local"
     ROUTING_WIDE = "routing_wide"
+    UNKNOWN = "unknown"
 
 
 # Mapping input order is not an execution trace. Terminal failures therefore
@@ -285,7 +286,9 @@ def classify_failure_scope(message: str) -> FailureScope:
     text = message.lower()
     if any(term in text for term in ("task-wide", "routing-wide", "global policy", "all candidates", "entire task")):
         return FailureScope.ROUTING_WIDE
-    return FailureScope.CANDIDATE_LOCAL
+    if any(term in text for term in ("candidate-local", "candidate local", "single candidate", "this candidate")):
+        return FailureScope.CANDIDATE_LOCAL
+    return FailureScope.UNKNOWN
 
 
 def _reason_failure(reason: Reason) -> FailureKind:
@@ -305,6 +308,8 @@ def _scope_for_failure(
 ) -> FailureScope:
     explicit = scopes.get(executor_id)
     if explicit is not None:
+        if explicit is FailureScope.UNKNOWN:
+            raise RoutingError("failure scope is uncertain and cannot authorize fallback: " + executor_id)
         return explicit
     if failure in (FailureKind.POLICY_DENIED, FailureKind.BUDGET_EXCEEDED):
         raise RoutingError("explicit failure scope required for policy or budget denial: " + executor_id)
