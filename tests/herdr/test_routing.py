@@ -51,6 +51,13 @@ def test_scope_wide_denial_blocks_fallback_but_candidate_local_can_fallback():
             failed_scopes={"a-runtime": ambiguous},
             max_attempts=2,
         )
+    with pytest.raises(RoutingError, match="terminal or unknown"):
+        bounded_fallback(
+            registry, requirement, scope, states, at=NOW,
+            policy_version="router-v5-policy-1",
+            failed_executors={"a-runtime": FailureKind.UNKNOWN},
+            max_attempts=2,
+        )
 
     local = bounded_fallback(
         registry, requirement, scope, states, at=NOW,
@@ -119,6 +126,7 @@ def test_failure_scope_classifier_is_explicit_and_provider_neutral():
     assert classify_failure_scope("policy denied") is FailureScope.UNKNOWN
     assert classify_failure_scope("task-wide policy denied") is FailureScope.ROUTING_WIDE
     assert classify_failure_scope("global budget exceeded for entire task") is FailureScope.ROUTING_WIDE
+    assert classify_failure_scope("opaque denial") is FailureScope.UNKNOWN
 
 
 def test_deterministic_decision_and_versioned_payload():
@@ -211,6 +219,7 @@ def test_bounded_fallback_keeps_registry_constraints_and_stops():
     )
     assert denied.selected_executor is None
     assert denied.failure is FailureKind.POLICY_DENIED
+    assert denied.failure_scope is FailureScope.ROUTING_WIDE
     with pytest.raises(RoutingError, match="compatible"):
         bounded_fallback(
             registry, requirement, denied_scope, states, at=NOW,
@@ -259,6 +268,8 @@ def test_failure_taxonomy_laguna_and_claude_credit_cases():
     assert classify_failure(message="policy denied") is FailureKind.POLICY_DENIED
     assert classify_failure(message="budget exceeded") is FailureKind.BUDGET_EXCEEDED
     assert classify_failure(status_code=418, message="opaque") is FailureKind.UNKNOWN
+    assert classify_failure(status_code=403, message="") is FailureKind.POLICY_DENIED
+    assert classify_failure(status_code=402, message="") is FailureKind.BUDGET_EXCEEDED
     assert classify_failure(status_code=429, message="policy denied by budget gate") is FailureKind.POLICY_DENIED
     assert classify_failure(status_code=404, message="model not found; budget exceeded") is FailureKind.BUDGET_EXCEEDED
 

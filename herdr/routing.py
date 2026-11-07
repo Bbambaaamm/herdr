@@ -263,6 +263,10 @@ def classify_failure(
         return FailureKind.POLICY_DENIED
     if "budget exceeded" in text or "budget limit" in text:
         return FailureKind.BUDGET_EXCEEDED
+    if status_code == 403:
+        return FailureKind.POLICY_DENIED
+    if status_code == 402:
+        return FailureKind.BUDGET_EXCEEDED
     if any(term in text for term in ("insufficient credit", "insufficient funds", "credit exhausted",
                                      "credits exhausted", "billing limit", "payment required")):
         return FailureKind.INSUFFICIENT_CREDITS
@@ -311,8 +315,8 @@ def _scope_for_failure(
         if explicit is FailureScope.UNKNOWN:
             raise RoutingError("failure scope is uncertain and cannot authorize fallback: " + executor_id)
         return explicit
-    if failure in (FailureKind.POLICY_DENIED, FailureKind.BUDGET_EXCEEDED):
-        raise RoutingError("explicit failure scope required for policy or budget denial: " + executor_id)
+    if failure in (FailureKind.POLICY_DENIED, FailureKind.BUDGET_EXCEEDED, FailureKind.UNKNOWN):
+        raise RoutingError("explicit failure scope required for terminal or unknown failure: " + executor_id)
     return FailureScope.CANDIDATE_LOCAL
 
 
@@ -354,6 +358,8 @@ def _rejection_for_registry(
         model=caps[executor.capability_id].spec_id,
         reason=reason.value,
         failure=_reason_failure(reason),
+        scope=(FailureScope.UNKNOWN if reason in (Reason.POLICY_DENIED, Reason.DATA_POLICY_DENIED, Reason.BUDGET_EXCEEDED)
+               else FailureScope.CANDIDATE_LOCAL),
     )
 
 
@@ -447,6 +453,17 @@ def select_route(
     else:
         failure = FailureKind.CAPABILITY_MISMATCH
     reasons = tuple(item.reason for item in rejected) or ("no_compatible_candidate",)
+    rejection_failures = [_reason_failure(item.reason) for item in result.rejections]
+    if routing_wide:
+        terminal_scope = FailureScope.ROUTING_WIDE
+    elif rejection_failures and all(item in (FailureKind.POLICY_DENIED, FailureKind.BUDGET_EXCEEDED)
+                                    for item in rejection_failures):
+        terminal_scope = FailureScope.ROUTING_WIDE
+    elif any(item in (FailureKind.POLICY_DENIED, FailureKind.BUDGET_EXCEEDED)
+             for item in rejection_failures):
+        terminal_scope = FailureScope.UNKNOWN
+    else:
+        terminal_scope = FailureScope.CANDIDATE_LOCAL
     return RoutingDecision(
         policy_version=policy_version,
         registry_hash=result.registry_hash,
@@ -458,7 +475,7 @@ def select_route(
         rejected_candidates=tuple(rejected),
         attempted_fallbacks=tuple(sorted(failed)),
         failure=failure,
-        failure_scope=FailureScope.ROUTING_WIDE if routing_wide else FailureScope.CANDIDATE_LOCAL,
+        failure_scope=terminal_scope,
         attempts=min(len(failed), max_attempts),
         max_attempts=max_attempts,
     )
