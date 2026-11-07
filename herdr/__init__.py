@@ -33,6 +33,12 @@ from .routing import (
     classify_failure,
     select_route,
 )
+from .fallback_recovery import (
+    FallbackTransition,
+    ProviderFailureObservation,
+    RecoveryAction,
+    decide_managed_fallback,
+)
 from .scheduler_routing import (
     ManagedExecutionHandoff,
     ManagedRoute,
@@ -72,6 +78,10 @@ __all__ = [
     "classify_failure_scope",
     "classify_failure",
     "select_route",
+    "FallbackTransition",
+    "ProviderFailureObservation",
+    "RecoveryAction",
+    "decide_managed_fallback",
     "ManagedExecutionHandoff",
     "ManagedRoute",
     "RoutingInput",

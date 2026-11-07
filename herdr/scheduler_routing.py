@@ -238,6 +238,7 @@ def select_managed_task_route(
     expected_requirement_hash: str,
     failed_executors: Mapping[str, FailureKind] | None = None,
     failed_scopes: Mapping[str, FailureScope] | None = None,
+    scope_attestations: Mapping[str, Any] | None = None,
     attempt: int = 1,
 ) -> ManagedRoute:
     """Select a route without dispatching or reserving an economic operation."""
@@ -265,6 +266,7 @@ def select_managed_task_route(
         max_attempts=task.max_attempts,
         failed_executors=failed_executors,
         failed_scopes=failed_scopes,
+        scope_attestations=scope_attestations,
     )
     if decision.selected_provider is not None:
         _require_active_budget(
@@ -286,6 +288,7 @@ class ManagedExecutionHandoff:
     attempt: int
     fencing_token: int
     consumer: str
+    agent_id: str
     parent_task_id: str | None
     parent_agent_id: str | None
     policy_profile: str
@@ -303,7 +306,7 @@ class ManagedExecutionHandoff:
     def __post_init__(self) -> None:
         if self.version != 1:
             raise RoutingIntegrationError("unsupported execution handoff version")
-        for name in ("task_id", "run_token", "consumer", "policy_profile", "policy_version",
+        for name in ("task_id", "run_token", "consumer", "agent_id", "policy_profile", "policy_version",
                      "selected_executor", "selected_provider", "selected_model"):
             if not isinstance(getattr(self, name), str) or not _TOKEN.fullmatch(getattr(self, name)):
                 raise RoutingIntegrationError(f"{name} must be a safe token")
@@ -338,6 +341,7 @@ class ManagedExecutionHandoff:
             raise RoutingIntegrationError("execution handoff model mismatch")
         expected = {
             "consumer": self.consumer,
+            "agent_id": self.agent_id,
             "task_id": self.task_id,
             "run_token": self.run_token,
             "fencing_token": self.fencing_token,
@@ -385,6 +389,8 @@ def build_execution_handoff(
         raise RoutingIntegrationError("handoff fencing token is not bound to scheduler record")
     if record.parent_task_id != identity.parent_task_id or record.parent_agent_id != identity.parent_agent_id:
         raise RoutingIntegrationError("handoff parent identity is not bound to scheduler record")
+    if record.agent_id is None or identity.agent_id != record.agent_id:
+        raise RoutingIntegrationError("handoff agent identity is not bound to scheduler record")
     decision = route.decision
     if any(value is None for value in (decision.selected_model, decision.selected_provider, decision.selected_executor)):
         raise RoutingIntegrationError("only a successful route can be handed off")
@@ -414,6 +420,7 @@ def build_execution_handoff(
         attempt=route.routing_input.attempt,
         fencing_token=identity.fencing_token,
         consumer=identity.consumer,
+        agent_id=identity.agent_id,
         parent_task_id=identity.parent_task_id,
         parent_agent_id=identity.parent_agent_id,
         policy_profile=route.routing_input.policy_profile,

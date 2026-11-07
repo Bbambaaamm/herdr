@@ -943,6 +943,7 @@ class DynamicChildScheduler:
         expected_requirement_hash: str,
         failed_executors=None,
         failed_scopes=None,
+        scope_attestations=None,
         attempt: int = 1,
     ):
         """Read-only P1-A routing decision before worker dispatch.
@@ -970,6 +971,7 @@ class DynamicChildScheduler:
             expected_requirement_hash=expected_requirement_hash,
             failed_executors=failed_executors,
             failed_scopes=failed_scopes,
+            scope_attestations=scope_attestations,
             attempt=attempt,
         )
 
