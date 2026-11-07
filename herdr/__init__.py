@@ -34,9 +34,11 @@ from .routing import (
     select_route,
 )
 from .scheduler_routing import (
+    ManagedExecutionHandoff,
     ManagedRoute,
     RoutingInput,
     RoutingIntegrationError,
+    build_execution_handoff,
     build_routing_input,
     record_managed_route,
     select_managed_task_route,
@@ -70,9 +72,11 @@ __all__ = [
     "classify_failure_scope",
     "classify_failure",
     "select_route",
+    "ManagedExecutionHandoff",
     "ManagedRoute",
     "RoutingInput",
     "RoutingIntegrationError",
+    "build_execution_handoff",
     "build_routing_input",
     "record_managed_route",
     "select_managed_task_route",

@@ -304,6 +304,41 @@ class WorkInvocationGuard(InvocationGuard):
         super().__init__(grant,**kwargs)
         self.work_authority=work_authority
         self._host_result=contextvars.ContextVar("herdr-host-result",default=None)
+        self._routing_handoff = None
+
+    def bind_routing_handoff(self, handoff):
+        """Bind one immutable Router v5 handoff; replacement is fail-closed."""
+        from .scheduler_routing import ManagedExecutionHandoff, RoutingIntegrationError
+        if not isinstance(handoff, ManagedExecutionHandoff):
+            raise PolicyDenied("routing_handoff_untrusted_type")
+        if self._routing_handoff is not None and self._routing_handoff != handoff:
+            raise PolicyDenied("routing_handoff_replacement_denied")
+        try:
+            handoff.authorize_identity(
+                identity=self.grant.identity,
+                provider=handoff.selected_provider,
+                model=handoff.selected_model,
+            )
+        except RoutingIntegrationError as exc:
+            raise PolicyDenied("routing_handoff_identity_mismatch") from exc
+        self._routing_handoff = handoff
+
+    def authorize_routing_model(self, provider, model):
+        handoff = self._routing_handoff
+        if handoff is None:
+            return True
+        from .scheduler_routing import ManagedExecutionHandoff, RoutingIntegrationError
+        if not isinstance(handoff, ManagedExecutionHandoff):
+            raise PolicyDenied("routing_handoff_untrusted_type")
+        try:
+            handoff.authorize_identity(
+                identity=self.grant.identity,
+                provider=provider,
+                model=model,
+            )
+        except RoutingIntegrationError as exc:
+            raise PolicyDenied("routing_handoff_model_mismatch") from exc
+        return True
 
     def authorize_provider(self,request,**kwargs):
         self.work_authority(self.grant.identity,self.grant.hash,kind="provider",tool=None)

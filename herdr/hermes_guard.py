@@ -1075,6 +1075,11 @@ def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None,
             egress=route.max_egress, retention=route.max_retention,
             training=route.training, credential_ref=credential_ref,
         ))
+        # When a managed Router v5 handoff is bound, the SDK cannot switch the
+        # model or provider after the host has authorized the selected route.
+        check_route = getattr(guard, "authorize_routing_model", None)
+        if callable(check_route):
+            check_route(provider, getattr(agent, "model", None))
 
     original_perform = turn_api_call.perform_api_call
 
