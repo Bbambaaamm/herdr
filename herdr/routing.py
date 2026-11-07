@@ -237,6 +237,12 @@ def classify_failure(
     insufficient-credit response cannot be misreported as a missing model.
     """
     text = message.lower()
+    # Explicit authorization and budget denials are terminal for the stated
+    # candidate and must not be masked by transport/status heuristics.
+    if "policy denied" in text or "permission denied" in text:
+        return FailureKind.POLICY_DENIED
+    if "budget exceeded" in text or "budget limit" in text:
+        return FailureKind.BUDGET_EXCEEDED
     if any(term in text for term in ("insufficient credit", "insufficient funds", "credit exhausted",
                                      "credits exhausted", "billing limit", "payment required")):
         return FailureKind.INSUFFICIENT_CREDITS
@@ -252,10 +258,6 @@ def classify_failure(
         return FailureKind.PROVIDER_UNAVAILABLE
     if "capability mismatch" in text:
         return FailureKind.CAPABILITY_MISMATCH
-    if "policy denied" in text or "permission denied" in text:
-        return FailureKind.POLICY_DENIED
-    if "budget exceeded" in text or "budget limit" in text:
-        return FailureKind.BUDGET_EXCEEDED
     return FailureKind.UNKNOWN
 
 
@@ -329,9 +331,16 @@ def select_route(
     failed = {key: FailureKind(value) for key, value in (failed_executors or {}).items()}
     result = registry.candidates(requirement, policy, tuple(runtime_state), at=at)
     known_ids = {item.id for item in registry.snapshot.executors}
-    unknown_failed = sorted(set(failed) - known_ids)
-    if unknown_failed:
-        raise RoutingError("failed executor is not present in the registry snapshot: " + ",".join(unknown_failed))
+    rejection_by_id = {item.executor_id: item.reason for item in result.rejections if item.executor_id}
+    eligible_ids = {item.executor_id for item in result.matches}
+    runtime_reasons = {Reason.RUNTIME_UNAVAILABLE, Reason.RUNTIME_STALE, Reason.RUNTIME_MISSING, Reason.RATE_LIMITED}
+    invalid_failed = sorted(
+        executor_id for executor_id in failed
+        if executor_id not in known_ids
+        or (executor_id not in eligible_ids and rejection_by_id.get(executor_id) not in runtime_reasons)
+    )
+    if invalid_failed:
+        raise RoutingError("failed executor is not compatible with the current routing context: " + ",".join(invalid_failed))
     rejected = [_rejection_for_registry(registry, item.executor_id, item.reason) for item in result.rejections]
     for executor_id, failure in sorted(failed.items()):
         match = next((item for item in result.matches if item.executor_id == executor_id), None)

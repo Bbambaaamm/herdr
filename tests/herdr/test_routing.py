@@ -88,7 +88,7 @@ def test_bounded_fallback_keeps_registry_constraints_and_stops():
     assert terminal_event.event_type.value == "model_fallback"
     assert terminal_event.fallback_chain == ("a-runtime", "b-runtime")
 
-    with pytest.raises(RoutingError, match="present in the registry snapshot"):
+    with pytest.raises(RoutingError, match="compatible"):
         bounded_fallback(
             registry, requirement, scope, states, at=NOW,
             policy_version="router-v5-policy-1",
@@ -105,26 +105,39 @@ def test_bounded_fallback_keeps_registry_constraints_and_stops():
     )
     assert denied.selected_executor is None
     assert denied.failure is FailureKind.POLICY_DENIED
+    with pytest.raises(RoutingError, match="compatible"):
+        bounded_fallback(
+            registry, requirement, denied_scope, states, at=NOW,
+            policy_version="router-v5-policy-1",
+            failed_executors={"a-runtime": FailureKind.PROVIDER_UNAVAILABLE},
+            max_attempts=2,
+        )
 
+    mixed_states = tuple(
+        replace(
+            state,
+            health=Health.UNAVAILABLE,
+            reason_code="maintenance",
+        ) if state.executor_id == "a-runtime" else replace(
+            state,
+            estimated_cost_microusd=200,
+            requirement_hash=requirement.hash,
+        )
+        for state in states
+    )
     mixed_a = bounded_fallback(
-        registry, requirement, denied_scope, states, at=NOW,
+        registry, requirement, scope, mixed_states, at=NOW,
         policy_version="router-v5-policy-1",
-        failed_executors={
-            "a-runtime": FailureKind.PROVIDER_UNAVAILABLE,
-            "b-runtime": FailureKind.RATE_LIMITED,
-        },
+        failed_executors={"a-runtime": FailureKind.PROVIDER_UNAVAILABLE},
         max_attempts=2,
     )
     mixed_b = bounded_fallback(
-        registry, requirement, denied_scope, states, at=NOW,
+        registry, requirement, scope, mixed_states, at=NOW,
         policy_version="router-v5-policy-1",
-        failed_executors={
-            "b-runtime": FailureKind.RATE_LIMITED,
-            "a-runtime": FailureKind.PROVIDER_UNAVAILABLE,
-        },
+        failed_executors={"a-runtime": FailureKind.PROVIDER_UNAVAILABLE},
         max_attempts=2,
     )
-    assert mixed_a.failure is FailureKind.POLICY_DENIED
+    assert mixed_a.failure is FailureKind.BUDGET_EXCEEDED
     assert mixed_a.to_json() == mixed_b.to_json()
 
 
@@ -140,6 +153,8 @@ def test_failure_taxonomy_laguna_and_claude_credit_cases():
     assert classify_failure(message="policy denied") is FailureKind.POLICY_DENIED
     assert classify_failure(message="budget exceeded") is FailureKind.BUDGET_EXCEEDED
     assert classify_failure(status_code=418, message="opaque") is FailureKind.UNKNOWN
+    assert classify_failure(status_code=429, message="policy denied by budget gate") is FailureKind.POLICY_DENIED
+    assert classify_failure(status_code=404, message="model not found; budget exceeded") is FailureKind.BUDGET_EXCEEDED
 
 
 def test_telemetry_projection_distinguishes_attempted_fallbacks():
