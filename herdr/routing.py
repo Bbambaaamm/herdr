@@ -271,6 +271,16 @@ def _reason_failure(reason: Reason) -> FailureKind:
     return FailureKind.CAPABILITY_MISMATCH
 
 
+def _terminal_failure(
+    failed: Mapping[str, FailureKind], rejections: Sequence[Any]
+) -> FailureKind:
+    candidates = list(failed.values())
+    candidates.extend(_reason_failure(item.reason) for item in rejections)
+    if not candidates:
+        return FailureKind.CAPABILITY_MISMATCH
+    return max(candidates, key=lambda item: (_FAILURE_PRECEDENCE[item], item.value))
+
+
 def _model_for(registry: CapabilityRegistry, match: CapabilityMatch) -> str:
     caps = {item.id: item for item in registry.snapshot.capabilities}
     return caps[match.capability_id].spec_id
@@ -366,10 +376,8 @@ def select_route(
             attempts=min(len(failed) + 1, max_attempts),
             max_attempts=max_attempts,
         )
-    if failed and not result.rejections:
-        failure = max(failed.values(), key=lambda item: (_FAILURE_PRECEDENCE[item], item.value))
-    elif result.rejections:
-        failure = _reason_failure(result.rejections[0].reason)
+    if failed or result.rejections:
+        failure = _terminal_failure(failed, result.rejections)
     elif requirement.legacy_model_hints and not available:
         failure = FailureKind.MODEL_NOT_FOUND
     else:

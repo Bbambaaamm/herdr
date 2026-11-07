@@ -106,6 +106,27 @@ def test_bounded_fallback_keeps_registry_constraints_and_stops():
     assert denied.selected_executor is None
     assert denied.failure is FailureKind.POLICY_DENIED
 
+    mixed_a = bounded_fallback(
+        registry, requirement, denied_scope, states, at=NOW,
+        policy_version="router-v5-policy-1",
+        failed_executors={
+            "a-runtime": FailureKind.PROVIDER_UNAVAILABLE,
+            "b-runtime": FailureKind.RATE_LIMITED,
+        },
+        max_attempts=2,
+    )
+    mixed_b = bounded_fallback(
+        registry, requirement, denied_scope, states, at=NOW,
+        policy_version="router-v5-policy-1",
+        failed_executors={
+            "b-runtime": FailureKind.RATE_LIMITED,
+            "a-runtime": FailureKind.PROVIDER_UNAVAILABLE,
+        },
+        max_attempts=2,
+    )
+    assert mixed_a.failure is FailureKind.POLICY_DENIED
+    assert mixed_a.to_json() == mixed_b.to_json()
+
 
 def test_failure_taxonomy_laguna_and_claude_credit_cases():
     assert classify_failure(
