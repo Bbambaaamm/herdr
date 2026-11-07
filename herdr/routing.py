@@ -300,6 +300,17 @@ def _reason_failure(reason: Reason) -> FailureKind:
     return FailureKind.CAPABILITY_MISMATCH
 
 
+def _scope_for_failure(
+    executor_id: str, failure: FailureKind, scopes: Mapping[str, FailureScope]
+) -> FailureScope:
+    explicit = scopes.get(executor_id)
+    if explicit is not None:
+        return explicit
+    if failure in (FailureKind.POLICY_DENIED, FailureKind.BUDGET_EXCEEDED):
+        raise RoutingError("explicit failure scope required for policy or budget denial: " + executor_id)
+    return FailureScope.CANDIDATE_LOCAL
+
+
 def _terminal_failure(
     failed: Mapping[str, FailureKind], rejections: Sequence[Any]
 ) -> FailureKind:
@@ -360,6 +371,10 @@ def select_route(
     scopes = {key: FailureScope(value) for key, value in (failed_scopes or {}).items()}
     if set(scopes) - set(failed):
         raise RoutingError("failed_scopes contains an executor without a failure")
+    resolved_scopes = {
+        executor_id: _scope_for_failure(executor_id, failure, scopes)
+        for executor_id, failure in failed.items()
+    }
     result = registry.candidates(requirement, policy, tuple(runtime_state), at=at)
     known_ids = {item.id for item in registry.snapshot.executors}
     rejection_by_id = {item.executor_id: item.reason for item in result.rejections if item.executor_id}
@@ -372,7 +387,7 @@ def select_route(
     )
     if invalid_failed:
         raise RoutingError("failed executor is not compatible with the current routing context: " + ",".join(invalid_failed))
-    routing_wide = any(scopes.get(executor_id, FailureScope.CANDIDATE_LOCAL) is FailureScope.ROUTING_WIDE
+    routing_wide = any(resolved_scopes[executor_id] is FailureScope.ROUTING_WIDE
                        for executor_id in failed)
     rejected = [_rejection_for_registry(registry, item.executor_id, item.reason) for item in result.rejections]
     for executor_id, failure in sorted(failed.items()):
@@ -384,7 +399,7 @@ def select_route(
                 model=_model_for(registry, match),
                 reason="fallback:" + failure.value,
                 failure=failure,
-                scope=scopes.get(executor_id, FailureScope.CANDIDATE_LOCAL),
+                scope=resolved_scopes[executor_id],
             ))
         else:
             executor = next(item for item in registry.snapshot.executors if item.id == executor_id)
@@ -396,7 +411,7 @@ def select_route(
                 model=capability.spec_id,
                 reason="fallback:" + failure.value,
                 failure=failure,
-                scope=scopes.get(executor_id, FailureScope.CANDIDATE_LOCAL),
+                scope=resolved_scopes[executor_id],
             ))
     exhausted = len(failed) >= max_attempts or routing_wide
     available = [] if exhausted else [item for item in result.matches if item.executor_id not in failed]

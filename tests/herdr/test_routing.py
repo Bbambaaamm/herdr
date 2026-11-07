@@ -19,6 +19,29 @@ from tests.herdr.test_capability import NOW, fixture
 
 def test_scope_wide_denial_blocks_fallback_but_candidate_local_can_fallback():
     registry, scope, requirement, states = fixture()
+    with pytest.raises(RoutingError, match="explicit failure scope required"):
+        bounded_fallback(
+            registry, requirement, scope, states, at=NOW,
+            policy_version="router-v5-policy-1",
+            failed_executors={"a-runtime": FailureKind.POLICY_DENIED},
+            max_attempts=2,
+        )
+    with pytest.raises(RoutingError, match="explicit failure scope required"):
+        bounded_fallback(
+            registry, requirement, scope, states, at=NOW,
+            policy_version="router-v5-policy-1",
+            failed_executors={"a-runtime": FailureKind.BUDGET_EXCEEDED},
+            max_attempts=2,
+        )
+    with pytest.raises(ValueError):
+        bounded_fallback(
+            registry, requirement, scope, states, at=NOW,
+            policy_version="router-v5-policy-1",
+            failed_executors={"a-runtime": FailureKind.PROVIDER_UNAVAILABLE},
+            failed_scopes={"a-runtime": "uncertain"},
+            max_attempts=2,
+        )
+
     local = bounded_fallback(
         registry, requirement, scope, states, at=NOW,
         policy_version="router-v5-policy-1",
