@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import hashlib
+import fcntl
 import uuid
 import re
 import subprocess
@@ -431,36 +432,77 @@ class AuditLog:
         self._path = path
         self._lock = threading.Lock()
         self._buffer: list[dict[str, object]] = []
+        self._lock_path = path.with_name(path.name + ".lock")
 
     def append(self, event: dict[str, object]) -> None:
         with self._lock:
             self._buffer.append(event)
 
+    def _flush_unlocked(self, *, sync_existing: bool = False) -> None:
+        if not self._buffer:
+            if sync_existing and self._path.exists():
+                with open(self._path, "rb") as fh:
+                    os.fsync(fh.fileno())
+                directory = os.open(self._path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            return
+        events = self._buffer
+        self._buffer = []
+        payload = (json.dumps(e, sort_keys=True, separators=(",", ":")) + "\n" for e in events)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._path, "a", encoding="utf-8") as fh:
+            fh.writelines(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        directory = os.open(self._path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
     def flush(self, *, sync_existing: bool = False) -> None:
         with self._lock:
-            if not self._buffer:
-                if sync_existing:
-                    with open(self._path, "rb") as fh:
-                        os.fsync(fh.fileno())
-                    directory = os.open(self._path.parent, os.O_RDONLY)
-                    try:
-                        os.fsync(directory)
-                    finally:
-                        os.close(directory)
-                return
-            events = self._buffer
-            self._buffer = []
-            payload = (json.dumps(e, sort_keys=True, separators=(",", ":")) + "\n" for e in events)
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self._path, "a", encoding="utf-8") as fh:
-                fh.writelines(payload)
-                fh.flush()
-                os.fsync(fh.fileno())
-            directory = os.open(self._path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+            self._flush_unlocked(sync_existing=sync_existing)
+
+    def _disk_events_unlocked(self) -> list[dict[str, object]]:
+        if not self._path.exists():
+            return []
+        with open(self._path, "r", encoding="utf-8") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def append_if_absent(
+        self,
+        event: dict[str, object],
+        *,
+        identity_fields: tuple[str, ...],
+    ) -> bool:
+        """Atomically append one event if its durable identity is absent.
+
+        The existing in-process lock is combined with a sidecar file lock so a
+        restart or another scheduler process cannot duplicate the same routing
+        decision between replay and append.
+        """
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            with self._lock:
+                def same(candidate: dict[str, object]) -> bool:
+                    return all(candidate.get(field) == event.get(field) for field in identity_fields)
+
+                if any(same(candidate) for candidate in self._disk_events_unlocked()):
+                    return False
+                if any(same(candidate) for candidate in self._buffer):
+                    return False
+                self._buffer.append(event)
+                self._flush_unlocked()
+                return True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
     def replay(self) -> list[dict[str, object]]:
         if not self._path.exists():
@@ -883,6 +925,53 @@ class DynamicChildScheduler:
             "issue": record.issue,
             "policy_profile": record.policy_profile,
         }
+
+    def select_managed_route(
+        self,
+        task_id: str,
+        *,
+        registry,
+        requirement,
+        policy,
+        runtime_state,
+        at: str,
+        policy_version: str,
+        budget_gate,
+        budget_allocation_id: str,
+        identity,
+        expected_registry_hash: str,
+        expected_requirement_hash: str,
+        failed_executors=None,
+        failed_scopes=None,
+        attempt: int = 1,
+    ):
+        """Read-only P1-A routing decision before worker dispatch.
+
+        The adapter reuses the existing capability and budget authorities. It
+        does not claim a lease, reserve a model operation, or grant execution.
+        """
+        rec = self.record_for(task_id)
+        from .scheduler_routing import RoutingIntegrationError, select_managed_task_route
+        if getattr(identity, "consumer", None) != "github:" + rec.repo:
+            raise RoutingIntegrationError("routing identity consumer differs from task repository")
+        return select_managed_task_route(
+            task=rec.node,
+            registry=registry,
+            requirement=requirement,
+            policy=policy,
+            runtime_state=runtime_state,
+            at=at,
+            policy_version=policy_version,
+            policy_profile=rec.policy_profile,
+            budget_gate=budget_gate,
+            budget_allocation_id=budget_allocation_id,
+            identity=identity,
+            expected_registry_hash=expected_registry_hash,
+            expected_requirement_hash=expected_requirement_hash,
+            failed_executors=failed_executors,
+            failed_scopes=failed_scopes,
+            attempt=attempt,
+        )
 
     def graph_dimensions(self) -> tuple[int, int, int]:
         if not self._tasks:

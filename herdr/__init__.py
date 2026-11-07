@@ -33,6 +33,14 @@ from .routing import (
     classify_failure,
     select_route,
 )
+from .scheduler_routing import (
+    ManagedRoute,
+    RoutingInput,
+    RoutingIntegrationError,
+    build_routing_input,
+    record_managed_route,
+    select_managed_task_route,
+)
 
 __all__ = [
     "GRAPH_VERSION",
@@ -62,6 +70,12 @@ __all__ = [
     "classify_failure_scope",
     "classify_failure",
     "select_route",
+    "ManagedRoute",
+    "RoutingInput",
+    "RoutingIntegrationError",
+    "build_routing_input",
+    "record_managed_route",
+    "select_managed_task_route",
 ]
 __version__ = "0.2.0"
 from .workspace import (
