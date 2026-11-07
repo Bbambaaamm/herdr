@@ -1,7 +1,7 @@
 {
   "bundle": "HERDR_ROUTER_V5_P1D_SHADOW_ACCEPTANCE",
-  "schema_version": 2,
-  "source_commit": "ba9c74119b29d192ea763b8a2b449ec54817abf3",
+  "schema_version": 3,
+  "source_commit": "d5461c49989edc1d0714be60d411ba8cf45c615a",
   "base_commit": "cccdb251f67687cc05309b60691a221e00535a9a",
   "pull_request": "https://github.com/Bbambaaamm/herdr/pull/212",
   "mode": "offline_shadow_only",
@@ -50,12 +50,14 @@
     "open_findings": "PENDING"
   },
   "ci": {
+    "last_run": 42419083074,
+    "last_conclusion": "failure_manifest_drift_fixed_in_d5461c4",
     "status": "PENDING_NEW_HEAD_RUN",
     "conclusion": null
   },
   "deployed_runtime_observation": {
     "device": "quantlab-staging-01",
-    "release_path": "/opt/herdr/releases/v0.3.0-rc.33-2430899-2430899b3567",
+    "release_path": "/opt/herdr/releases/v0.3.0-rc.33-2430899b3567",
     "release_commit": "2430899b3567a0fb9663a79abcbb1a17fb67005f",
     "status": "OBSERVED_read_only_runtime_is_older_than_P1D"
   },
