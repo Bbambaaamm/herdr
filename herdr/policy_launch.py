@@ -1449,7 +1449,7 @@ def require_approved_profile_binding(factory, launch, expected_name):
              "typed host policy factory required")
     _require(isinstance(launch, PreparedPolicyLaunch),
              "typed prepared policy launch required")
-    approved = factory.approved_profile
+    approved = getattr(factory, "approved_profile", None)
     snapshot = getattr(launch, "private_profile_snapshot", None)
     if approved is None:
         _require(snapshot is None, "unapproved private profile snapshot")
