@@ -2,7 +2,7 @@
   "schema_version": "herdr-root-authority-slice-b-evidence-1",
   "status": "IMPLEMENTED_SOURCE_ONLY",
   "base_main": "97123203ad6cc0e4546fbf5771cca3b0f9df895f",
-  "source_commit": "pending-final-head",
+  "source_commit": "813c7ac7be53e0c3aaf679460d5ac7b399d4a004",
   "privileged_acceptance": "NOT_RUN",
   "production_mutation": false,
   "changes": [
@@ -25,10 +25,14 @@
     "repository_contract": "PASS",
     "diff_check": "PASS",
     "targeted_pytest": "BLOCKED_ON_WINDOWS_MISSING_FCNTL",
-    "linux_ci": "PENDING_DRAFT_PR"
+    "linux_ci": "PASS_ON_SOURCE_COMMIT_813c7ac7be53e0c3aaf679460d5ac7b399d4a004",
+    "linux_ci_run": "https://github.com/Bbambaaamm/herdr/actions/runs/42477484839",
+    "linux_ci_counts": "5931 passed, 115 skipped; browser 108/108",
+    "exact_head_review": "No new findings reported for source commit 813c7ac7be53e0c3aaf679460d5ac7b399d4a004",
+    "evidence_only_followup_commit": "CI_PENDING_AFTER_THIS_FILE_UPDATE"
   },
   "remaining_blockers": [
-    "Linux CI and exact-head independent review",
+    "Reverify repository-contract and CI after evidence-only update",
     "Privileged root-owned runtime publication and schema-2 host policy alignment",
     "Physical zero-provider canary acceptance"
   ]
