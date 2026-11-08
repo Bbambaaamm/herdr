@@ -49,6 +49,20 @@ from .scheduler_routing import (
     record_managed_route,
     select_managed_task_route,
 )
+from .reconciliation import (
+    DecisionStatus,
+    DurableEvidence,
+    ExternalEvidence,
+    ReconciliationDecision,
+    ReconciliationError,
+    TaskIdentity,
+    TaskSnapshot,
+    build_report,
+    normalize_external_evidence,
+    normalize_task_snapshot,
+    reconcile_snapshot,
+    reconcile_task,
+)
 
 __all__ = [
     "GRAPH_VERSION",
@@ -90,6 +104,18 @@ __all__ = [
     "build_routing_input",
     "record_managed_route",
     "select_managed_task_route",
+    "DecisionStatus",
+    "DurableEvidence",
+    "ExternalEvidence",
+    "ReconciliationDecision",
+    "ReconciliationError",
+    "TaskIdentity",
+    "TaskSnapshot",
+    "build_report",
+    "normalize_external_evidence",
+    "normalize_task_snapshot",
+    "reconcile_snapshot",
+    "reconcile_task",
 ]
 __version__ = "0.2.0"
 from .workspace import (
