@@ -7,16 +7,17 @@ Missing or writable configuration denies before a pane or provider is touched.
 from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime,timedelta,UTC
-import json,os,stat,uuid
+import hashlib,json,os,re,stat,uuid
 from pathlib import Path
 from .policy_launch import (ApprovedTree, ApprovedImmutableTree, ApprovedProfile,
                            HostPolicyLaunchFactory,CODE_TARGET,RUNTIME_TARGETS)
-from .security import SecurityError,SecurityGrant,InvocationIdentity
+from .security import SecurityError,SecurityGrant,InvocationIdentity,canonical_json_bytes
 
 HOST_POLICY_CONFIG=Path("/etc/herdr/host-policy.json")
 # Complete pinned Hermes source, venv and Python manifests exceed 2 MiB.
 # Keep the root-owned, stable-reader input bounded at 4 MiB.
 MAX_CONFIG=4194304
+RUNTIME_PUBLICATION_BINDING_SCHEMA="herdr-runtime-publication-binding-1"
 
 def require(ok,reason):
     if not ok:raise SecurityError(reason)
@@ -62,6 +63,74 @@ def _tree(raw, *, immutable=False):
             raw["max_bytes"],raw["max_file_bytes"],executable_files=tuple(raw["executable_files"]))
     return ApprovedTree(Path(raw["source"]),Path(raw["target"]),raw["files"],
         tuple(raw["executable_files"]),raw["max_bytes"],raw["max_file_bytes"])
+
+
+def _tree_manifest_sha256(tree):
+    """Digest only the canonical approved content inventory, never caller input."""
+    return hashlib.sha256(canonical_json_bytes(dict(sorted(tree.files.items())))).hexdigest()
+
+
+def validate_runtime_publication_binding(raw, *, code=None, runtime=None):
+    """Validate the root-owned publication identity pinned by schema-2 policy.
+
+    This is deliberately a validator, not a publication or admission authority.
+    The binding is optional for schema-1; schema-2 callers must provide it.
+    """
+    require(isinstance(raw,dict) and raw.get("schema_version") == 2,
+            "schema-2 runtime publication binding requires schema-2 policy")
+    private=raw.get("private_launch")
+    require(isinstance(private,dict),"private host policy required")
+    binding=private.get("runtime_publication")
+    require(isinstance(binding,dict) and set(binding)=={
+        "schema_version","version","approval_sha256","record_path","trees"}
+        and binding["schema_version"] == RUNTIME_PUBLICATION_BINDING_SCHEMA,
+        "root runtime publication binding required")
+    require(isinstance(binding["version"],str)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}",binding["version"]),
+            "runtime publication version invalid")
+    require(isinstance(binding["approval_sha256"],str)
+            and re.fullmatch(r"[0-9a-f]{64}",binding["approval_sha256"]),
+            "runtime publication approval digest invalid")
+    record_path=Path(binding["record_path"])
+    require(record_path.is_absolute() and ".." not in record_path.parts,
+            "runtime publication record path invalid")
+    trees=binding["trees"]
+    require(isinstance(trees,dict) and set(trees)=={"code","hermes","python"},
+            "runtime publication tree inventory incomplete")
+    for name,value in trees.items():
+        require(isinstance(value,dict) and set(value)=={"manifest_sha256"}
+                and isinstance(value["manifest_sha256"],str)
+                and re.fullmatch(r"[0-9a-f]{64}",value["manifest_sha256"]),
+                "runtime publication manifest invalid")
+    if code is None:
+        code=_tree(raw["code"],immutable=False)
+    if runtime is None:
+        runtime=tuple(_tree(item,immutable=False) for item in raw["runtime"])
+    from .host_bootstrap import PYTHON_TARGET
+    by_role={"code":code}
+    for tree in runtime:
+        role="python" if tree.target == PYTHON_TARGET else "hermes"
+        require(role not in by_role,"runtime publication roles are ambiguous")
+        by_role[role]=tree
+    require(set(by_role)==set(trees),"runtime publication roles incomplete")
+    expected_manifests={name: _tree_manifest_sha256(tree) for name,tree in by_role.items()}
+    require(all(trees[name]["manifest_sha256"] == expected_manifests[name]
+                for name in by_role),
+            "runtime publication manifest does not match approved source")
+    record=_read_runtime_publication_record(record_path)
+    from .runtime_publication import validate_publication_record
+    validate_publication_record(record, expected_version=binding["version"],
+        expected_approval_sha256=binding["approval_sha256"],
+        expected_manifest_sha256=expected_manifests)
+    require(all(record["trees"][name]["source"] == str(tree.source)
+                for name,tree in by_role.items()),
+            "runtime publication source provenance mismatch")
+    return binding
+
+
+def _read_runtime_publication_record(path):
+    """Read retained root publication evidence through the protected reader."""
+    return _read_configuration(path)
 
 
 def host_entrypoint_command(entrypoint, arguments, *, legacy_command, binding=None):
@@ -120,7 +189,9 @@ def _private_profile(raw):
     is a separate acceptance gate, not implied by this offline preflight.
     """
     require(isinstance(raw,dict) and set(raw)-{"self_observation"} in ({"profile","credential_approval"},
-            {"profile","credential_approval","plan_handoff"}) and ("self_observation" not in raw or
+            {"profile","credential_approval","plan_handoff"},
+            {"profile","credential_approval","runtime_publication"},
+            {"profile","credential_approval","plan_handoff","runtime_publication"}) and ("self_observation" not in raw or
             raw["self_observation"] == "authenticated-root-kernel-v1"),
             "closed private host policy required")
     definition=raw["profile"]
@@ -171,6 +242,9 @@ def build_host_policy_factory(*,parent_grant=None,configuration_path=HOST_POLICY
         require({SHIM_SOURCE,"agent-stack/policy-bin/herdr"} <= set(raw["code"]["executable_files"])
                 and PYTHON_EXECUTABLE in python.files and PYTHON_EXECUTABLE in python_raw["executable_files"],
                 "private executable entrypoint approval required")
+        # Schema-2 is only trusted when the root policy pins the exact
+        # publication identity that supplied these immutable inventories.
+        validate_runtime_publication_binding(raw, code=code, runtime=runtime)
     templates=raw["templates"]
     require(isinstance(templates,dict) and 1<=len(templates)<=32,"bounded consumer policies required")
     grants={consumer:SecurityGrant.from_dict(value) for consumer,value in templates.items()}

@@ -87,6 +87,10 @@ def _policy():
     require(_digest(raw) == issuer["host_policy_sha256"] and raw.get("schema_version") == 2
             and type(raw.get("host_uid")) is int and raw["host_uid"] > 0,
             "current private host policy pin required")
+    # The issuer consumes only a schema-2 policy whose immutable inventories
+    # are pinned to a root-approved runtime publication identity.  This is a
+    # provenance check, not a second admission authority.
+    host.validate_runtime_publication_binding(raw)
     handoff = raw["private_launch"].get("plan_handoff", {})
     require(handoff.get("automatic_issuer") is True, "automatic issuance is not enabled")
     entries = issuer["entrypoints"]
