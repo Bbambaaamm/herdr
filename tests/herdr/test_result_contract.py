@@ -167,6 +167,14 @@ def test_provenance_digest_and_evidence_reference_are_checked():
         validate_result_contract(record)
 
 
+def test_recovery_fields_are_publication_time_evidence_not_rebuilt_from_task_state():
+    record = canonical_result_for_task(task(attempt_state="delivery_uncertain"), result(),
+                                       verification_state="verified")
+    assert record["result_contract"]["recovery"]["delivery_uncertain"] is True
+    assert record["result_contract"]["recovery"]["attempt_state"] == "delivery_uncertain"
+    validate_result_contract(record)
+
+
 @pytest.mark.parametrize("field", ["authority_type", "verification_state"])
 def test_non_string_authority_fields_fail_as_contract_errors(field):
     record = canonical_result_for_task(task(), result())

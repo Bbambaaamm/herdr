@@ -2095,20 +2095,19 @@ def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool)
     # Bind the candidate before any immutable completion verifier records its
     # payload digest.  The accepted receipt must refer to these exact bytes;
     # rewriting a verified result afterward would create a digest conflict on
-    # replay.  Re-canonicalization is deterministic for an already-bound slot.
+    # replay.  An already-bound slot is validated in place and never rebuilt
+    # from mutable task recovery fields.
     try:
         original_result = result
-        existing_state = "candidate"
-        contract = original_result.get("result_contract")
-        if isinstance(contract, dict):
-            authority = contract.get("authority")
-            if isinstance(authority, dict) and isinstance(authority.get("verification_state"), str):
-                existing_state = authority["verification_state"]
-        result = _canonical_result(task, result, verification_state=existing_state)
         if "result_contract" in original_result:
-            if result != original_result:
-                raise EvidenceError("result_contract_changed_on_replay")
+            from herdr.result_contract import ResultContractError, validate_result_contract
+            try:
+                validate_result_contract(original_result)
+            except ResultContractError as exc:
+                raise EvidenceError(f"result_contract_invalid_on_replay:{exc}") from exc
+            result = original_result
         else:
+            result = _canonical_result(task, result, verification_state="candidate")
             _rewrite_result_slot(rp, result)
     except EvidenceError as exc:
         _defer_delivery_reconciliation_locked(

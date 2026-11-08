@@ -227,7 +227,11 @@ def validate_result_contract(record: Mapping[str, Any], *, expected_identity: Ma
     identity = ResultIdentity.from_dict(envelope["identity"])
     if expected_identity is not None and identity.to_dict() != dict(expected_identity):
         raise ResultContractError("result_contract_identity_mismatch")
-    if record.get("identity") != identity.to_dict() or record.get("task_id") != identity.task_id:
+    if (record.get("identity") != identity.to_dict()
+            or record.get("task_id") != identity.task_id
+            or record.get("run_token") != identity.run_token
+            or record.get("fencing_token") != identity.fencing_token
+            or record.get("idempotency_key") != identity.idempotency_key):
         raise ResultContractError("result_contract_binding_mismatch")
     result = envelope["result"]
     if not isinstance(result, Mapping) or set(result) - {"status", "observed_at", "result_ref", "completion_evidence_ref"}:
