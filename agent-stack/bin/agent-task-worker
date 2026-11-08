@@ -2080,13 +2080,31 @@ def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool)
         _defer_delivery_reconciliation_locked(task_path, task, "child result missing exact fence/idempotency/artifact evidence", all_terminal)
         return
 
+    # Closed SDK submissions do not carry a publication timestamp. Allocate a
+    # host-owned timestamp once and persist it with the attempt so replay uses
+    # the same value instead of a fresh wall-clock observation.
+    if not result.get("completed_at") and not result.get("observed_at"):
+        publication_at = task.get("result_publication_at")
+        if not isinstance(publication_at, str) or not publication_at:
+            publication_at = utcnow().isoformat()
+            task["result_publication_at"] = publication_at
+            write_json(task_path, task)
+        result = dict(result)
+        result["observed_at"] = publication_at
+
     # Bind the candidate before any immutable completion verifier records its
     # payload digest.  The accepted receipt must refer to these exact bytes;
     # rewriting a verified result afterward would create a digest conflict on
     # replay.  Re-canonicalization is deterministic for an already-bound slot.
     try:
         original_result = result
-        result = _canonical_result(task, result, verification_state="candidate")
+        existing_state = "candidate"
+        contract = original_result.get("result_contract")
+        if isinstance(contract, dict):
+            authority = contract.get("authority")
+            if isinstance(authority, dict) and isinstance(authority.get("verification_state"), str):
+                existing_state = authority["verification_state"]
+        result = _canonical_result(task, result, verification_state=existing_state)
         if "result_contract" in original_result:
             if result != original_result:
                 raise EvidenceError("result_contract_changed_on_replay")
