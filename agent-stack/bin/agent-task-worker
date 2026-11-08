@@ -114,6 +114,13 @@ def _canonical_result(task: dict, result: dict, *, verification_state: str) -> d
         raise EvidenceError(exc.args[0]) from exc
 
 
+def _supports_result_contract(task: dict) -> bool:
+    """Schema-1 task rows remain on the immutable legacy result path."""
+    required = {"repo", "issue", "id", "attempt_id", "run_token", "fencing_token",
+                "ownership_epoch", "idempotency_key", "consumer"}
+    return isinstance(task, dict) and required <= set(task)
+
+
 def _rewrite_result_slot(path: Path, payload: dict) -> None:
     """Rewrite the existing attempt-owned inode without replacing its xattrs."""
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"),
@@ -1819,8 +1826,9 @@ def reconcile_completion_evidence(task: dict) -> bool:
             "completed_at": utcnow().isoformat(),
         }
     try:
-        _publish_result(result_path(str(task["id"])),
-                        _canonical_result(task, payload, verification_state="verified"))
+        published = (_canonical_result(task, payload, verification_state="verified")
+                     if _supports_result_contract(task) else payload)
+        _publish_result(result_path(str(task["id"])), published)
     except EvidenceError:
         return False
     return True
@@ -1943,7 +1951,9 @@ def _block_task_locked(task_path: Path, task: dict, blocker: str, summary: str,
                 "completed_at": utcnow().isoformat(),
             }
         try:
-            _publish_result(rp, _canonical_result(task, payload, verification_state="candidate"))
+            published = (_canonical_result(task, payload, verification_state="candidate")
+                         if _supports_result_contract(task) else payload)
+            _publish_result(rp, published)
         except EvidenceError as exc:
             _defer_delivery_reconciliation_locked(
                 task_path, task, f"blocked result contract unavailable: {exc.code}", all_terminal)
@@ -2108,9 +2118,16 @@ def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool)
             except ResultContractError as exc:
                 raise EvidenceError(f"result_contract_invalid_on_replay:{exc}") from exc
             result = original_result
-        else:
+        elif _supports_result_contract(task):
             result = _canonical_result(task, result, verification_state="candidate")
-            _rewrite_result_slot(rp, result)
+            # The SDK submission xattr and WorkResultAuthority receipt bind the
+            # original nonempty bytes. Keep that receipt-bound payload intact;
+            # the envelope is verified as an in-memory projection and is never
+            # rewritten into an already-submitted inode.
+        else:
+            # Schema-1 task rows have no complete ResultIdentity. Preserve
+            # their established unwrapped result and legacy verifier path.
+            result = original_result
     except EvidenceError as exc:
         _defer_delivery_reconciliation_locked(
             task_path, task, f"result contract publication requires reconciliation: {exc.code}", all_terminal)
