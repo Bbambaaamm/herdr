@@ -10,6 +10,12 @@ from herdr.policy_launch import (
 from herdr.security import SecurityError
 
 
+class _MismatchedIdentityLaunch(PreparedPolicyLaunch):
+    @property
+    def identity(self):
+        return self._test_identity
+
+
 def _objects(*, schema2=True, snapshot=True, identity=None, mounted=True,
              launch_identity=None):
     approved_identity = {"name": "quantlab", "manifest_sha256": "a" * 64}
@@ -19,9 +25,11 @@ def _objects(*, schema2=True, snapshot=True, identity=None, mounted=True,
         SimpleNamespace(name="quantlab", identity=approved_identity) if schema2 else None
     )
     grant = SimpleNamespace(identity=SimpleNamespace(token="host"))
-    launch = object.__new__(PreparedPolicyLaunch)
+    launch_type = _MismatchedIdentityLaunch if launch_identity is not None else PreparedPolicyLaunch
+    launch = object.__new__(launch_type)
     launch.grant = grant
-    launch.identity = launch_identity or grant.identity
+    if launch_identity is not None:
+        launch._test_identity = launch_identity
     launch.mount = SimpleNamespace()
     if snapshot:
         launch.private_profile_snapshot = SimpleNamespace(
