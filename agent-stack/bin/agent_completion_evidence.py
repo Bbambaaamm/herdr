@@ -650,9 +650,11 @@ def verify_completion(root: Path, task: dict, result: dict, *, invocation_verifi
     collector = collect_local_handoff if invocation_verifier is not None else collect_github
     receipt_digest = None
     if invocation_verifier is not None:
-        from herdr.result_contract import receipt_payload_for_result
+        from herdr.result_contract import ResultIdentity, receipt_payload_for_result
         try:
-            receipt_digest = digest(receipt_payload_for_result(original_result))
+            expected_identity = ResultIdentity.from_task(task).to_dict()
+            receipt_digest = digest(receipt_payload_for_result(
+                original_result, expected_identity=expected_identity))
         except ValueError as exc:
             raise EvidenceError("result receipt projection invalid") from exc
     return accept_artifact(task, result, plan, store, Path(workspace), collector,
