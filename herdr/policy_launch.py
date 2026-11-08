@@ -1435,3 +1435,34 @@ class HostPolicyLaunchFactory:
             return True
         from .launch_ownership import cleanup_orphan
         return cleanup_orphan(self.storage, identity)
+
+
+def require_approved_profile_binding(factory, launch, expected_name):
+    """Fail closed unless the caller carries the host-approved profile binding.
+
+    The factory remains the sole approval authority. This shared caller gate
+    prevents a task-provided or stale ``private_profile_snapshot`` attribute
+    from becoming execution authority. Schema-1 callers retain the exact
+    legacy path when neither side carries a private profile.
+    """
+    _require(isinstance(factory, HostPolicyLaunchFactory),
+             "typed host policy factory required")
+    _require(isinstance(launch, PreparedPolicyLaunch),
+             "typed prepared policy launch required")
+    approved = factory.approved_profile
+    snapshot = getattr(launch, "private_profile_snapshot", None)
+    if approved is None:
+        _require(snapshot is None, "unapproved private profile snapshot")
+        return None
+    _require(isinstance(expected_name, str) and approved.name == expected_name,
+             "host approved profile identity differs")
+    _require(snapshot is not None and snapshot.name == expected_name,
+             "approved private profile snapshot missing")
+    _require(getattr(snapshot, "identity", None) == approved.identity,
+             "approved private profile digest differs")
+    mount = getattr(launch, "mount", None)
+    _require(mount is not None and getattr(mount, "private_profile_snapshot", None) is snapshot,
+             "approved private profile mount binding missing")
+    _require(launch.identity == launch.grant.identity,
+             "prepared launch identity differs from host grant")
+    return snapshot

@@ -570,8 +570,9 @@ class _OwnedChild:
     prompt: str
 
 
-from herdr.policy_launch import HostPolicyLaunchFactory, PreparedPolicyLaunch
-from herdr.security import InvocationIdentity
+from herdr.policy_launch import (HostPolicyLaunchFactory, PreparedPolicyLaunch,
+                                  require_approved_profile_binding)
+from herdr.security import InvocationIdentity, SecurityError
 
 class HerdrChildRuntime:
     def __init__(
@@ -1472,10 +1473,13 @@ class HerdrChildRuntime:
                 tools=node.tools,permissions=node.permissions,**launch_arguments)
             if not isinstance(launch, PreparedPolicyLaunch) or launch.identity != identity:
                 raise HerdrRuntimeError("child_invocation_policy_identity_mismatch", lease.task_id)
-            approved_snapshot = getattr(launch, "private_profile_snapshot", None)
-            if (approved_snapshot is not None
-                    and approved_snapshot.name != self.env.get("HERDR_HERMES_PROFILE", DEFAULT_PROFILE)):
-                raise HerdrRuntimeError("child_approved_profile_identity_mismatch", lease.task_id)
+            try:
+                approved_snapshot = require_approved_profile_binding(
+                    self.policy_launch_factory, launch,
+                    self.env.get("HERDR_HERMES_PROFILE", DEFAULT_PROFILE))
+            except SecurityError as exc:
+                raise HerdrRuntimeError("child_approved_profile_identity_mismatch",
+                                        lease.task_id) from exc
             from .child_evidence import ChildCompletionAuthority
             authority=self.scheduler.completion_authority
             if not isinstance(authority,ChildCompletionAuthority):

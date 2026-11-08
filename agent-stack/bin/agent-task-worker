@@ -956,7 +956,8 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         "PATH": f"{POLICY_BIN}:{ENV['PATH']}",
     }
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from herdr.policy_launch import HostPolicyLaunchFactory, PreparedPolicyLaunch
+    from herdr.policy_launch import (HostPolicyLaunchFactory, PreparedPolicyLaunch,
+                                     require_approved_profile_binding)
     from herdr.security import InvocationIdentity, SecurityError
     factory = policy_launch_factory if policy_launch_factory is not None else _root_policy_factory()
     if not isinstance(factory, HostPolicyLaunchFactory):
@@ -1000,9 +1001,7 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
                               require_slot=False)
         task_env.update(launch.environment())
         profile = _task_hermes_profile(task)
-        private_snapshot = getattr(launch, "private_profile_snapshot", None)
-        if private_snapshot is not None and private_snapshot.name != profile:
-            raise RuntimeError("task_approved_profile_identity_mismatch")
+        private_snapshot = require_approved_profile_binding(factory, launch, profile)
         from herdr.work_configuration import reviewed_root_model_arguments
         root_model_args = reviewed_root_model_arguments(work_factory, private_snapshot)
         # Approved profile was refreshed/validated *before* it was sealed by
