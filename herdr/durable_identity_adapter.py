@@ -30,6 +30,12 @@ from .reconciliation import (
 ADAPTER_VERSION = "durable-identity-adapter-v1"
 SUPPORTED_EPOCH_SCHEMA = "host-v1"
 SUPPORTED_EPOCH_AUTHORITY = "host"
+LEGACY_RESULT_SCHEMA = "herdr-accepted-evidence-v2"
+LEGACY_RESULT_VERSION = 2
+LEGACY_CONTROL_COLLECTOR = "host-control-v1"
+LEGACY_CONTROL_PROOF = "host-schema-v1"
+LEGACY_WORKER_COLLECTOR = "github-api-v1"
+LEGACY_WORKER_PROOF = "github-api"
 _MAX_RECORD_BYTES = 2_000_000
 _REQUIRED_IDENTITY = (
     "repository", "issue", "task_id", "attempt_id", "run_token",
@@ -61,6 +67,23 @@ class AttemptEvidence:
     authority: tuple[Mapping[str, Any], ...]
     conflicts: tuple[str, ...]
     evidence_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class LegacyResultClassification:
+    """Forensic classification of one immutable result observation.
+
+    ``supported`` means only that the source bytes match a known, versioned
+    producer contract.  It does not grant completion authority and the
+    normalized object is still required to carry every current identity field.
+    """
+
+    schema: str
+    supported: bool
+    reason_code: str | None
+    normalized: Mapping[str, Any] | None
+    source_digest: str
+    provenance: tuple[str, ...]
 
 
 def _bounded_text(value: Any, field: str, *, maximum: int = 512) -> str:
@@ -202,6 +225,120 @@ def normalize_legacy_durable_task(raw: Mapping[str, Any]) -> LegacyNormalization
     return LegacyNormalization(snapshot, True, None, tuple(sorted(refs)), source_digest)
 
 
+def _legacy_result_error(raw: Any, reason: str, *, schema: str = "unknown",
+                         provenance: Iterable[str] = ()) -> LegacyResultClassification:
+    return LegacyResultClassification(
+        schema=schema, supported=False, reason_code=reason, normalized=None,
+        source_digest=digest(raw), provenance=tuple(sorted(set(provenance))),
+    )
+
+
+def classify_legacy_result_record(raw: Mapping[str, Any]) -> LegacyResultClassification:
+    """Classify a result against an observed producer schema, without guessing.
+
+    The only historical result contract currently present in source is the
+    host-published ``EvidenceStore`` v2 envelope.  Its identity uses the
+    legacy ``attempt`` spelling.  We normalize that spelling only after
+    checking the exact version, identity member set and host provenance.  The
+    adapter deliberately does not manufacture consumer or ownership-epoch
+    fields; callers still have to provide those independently.
+    """
+    if not isinstance(raw, Mapping):
+        return _legacy_result_error(raw, "legacy_result_not_object")
+    source_digest = digest(raw)
+    identity = raw.get("identity")
+    if type(raw.get("version")) is not int or raw.get("version") != LEGACY_RESULT_VERSION:
+        return _legacy_result_error(raw, "unsupported_legacy_result_schema")
+    if not isinstance(identity, Mapping):
+        return _legacy_result_error(raw, "legacy_result_identity_not_object", schema=LEGACY_RESULT_SCHEMA)
+    if set(identity) != {"id", "run_token", "attempt", "idempotency_key", "fencing_token"}:
+        return _legacy_result_error(raw, "legacy_result_identity_schema_invalid", schema=LEGACY_RESULT_SCHEMA)
+    environment = raw.get("environment")
+    proof = raw.get("proof")
+    level = raw.get("level")
+    if not isinstance(level, str) or level not in {"verified_worker_result", "control_cycle"}:
+        return _legacy_result_error(raw, "legacy_result_level_unsupported", schema=LEGACY_RESULT_SCHEMA)
+    expected_collector, expected_proof = (
+        (LEGACY_CONTROL_COLLECTOR, LEGACY_CONTROL_PROOF)
+        if level == "control_cycle" else
+        (LEGACY_WORKER_COLLECTOR, LEGACY_WORKER_PROOF)
+    )
+    provenance = []
+    if isinstance(environment, Mapping) and environment.get("collector") == expected_collector:
+        provenance.append("environment:" + expected_collector)
+    if isinstance(proof, Mapping) and proof.get("source") == expected_proof:
+        provenance.append("proof:" + expected_proof)
+    if len(provenance) != 2:
+        return _legacy_result_error(
+            raw, "legacy_result_provenance_untrusted", schema=LEGACY_RESULT_SCHEMA,
+            provenance=provenance,
+        )
+    source = dict(identity)
+    if (not isinstance(source["id"], str) or not source["id"]
+            or not isinstance(source["run_token"], str) or not source["run_token"]
+            or not isinstance(source["idempotency_key"], str) or not source["idempotency_key"]
+            or type(source["attempt"]) is not int or source["attempt"] < 0
+            or type(source["fencing_token"]) is not int or source["fencing_token"] < 0):
+        return _legacy_result_error(raw, "legacy_result_identity_types_invalid", schema=LEGACY_RESULT_SCHEMA,
+                                    provenance=provenance)
+    normalized = dict(raw)
+    normalized["identity"] = {
+        "task_id": source["id"], "run_token": source["run_token"],
+        "attempt_id": source["attempt"], "fencing_token": source["fencing_token"],
+        "idempotency_key": source["idempotency_key"],
+    }
+    # This is a host-accepted evidence level, not a new authority.  The
+    # reconciliation engine still requires the task snapshot's own completion
+    # authority and all current identity fields before it can confirm anything.
+    normalized["status"] = "accepted"
+    normalized["authoritative"] = True
+    normalized["compatibility_schema"] = LEGACY_RESULT_SCHEMA
+    return LegacyResultClassification(
+        schema=LEGACY_RESULT_SCHEMA, supported=True, reason_code=None,
+        normalized=normalized, source_digest=source_digest,
+        provenance=tuple(sorted(provenance)),
+    )
+
+
+def legacy_result_schema_inventory() -> Mapping[str, Any]:
+    """Return the source-backed schema inventory used by the compatibility gate."""
+    return {
+        "inventory_version": 1,
+        "live_replay": "NOT_RUN",
+        "observed_source_contracts": [
+            {
+                "schema": LEGACY_RESULT_SCHEMA,
+                "version": LEGACY_RESULT_VERSION,
+                "producer": "herdr.evidence.EvidenceStore",
+                "identity_fields": ["id", "run_token", "attempt", "idempotency_key", "fencing_token"],
+                "provenance": {
+                    "control_cycle": ["environment.collector=host-control-v1", "proof.source=host-schema-v1"],
+                    "verified_worker_result": ["environment.collector=github-api-v1", "proof.source=github-api"],
+                },
+                "normalization": "attempt -> attempt_id only after exact schema/provenance checks",
+                "completion_authority": "host accepted evidence plus current durable snapshot required",
+                "missing_fields_never_filled": ["consumer", "ownership_epoch", "repository", "issue"],
+            },
+            {
+                "schema": "herdr.evidence.ArtifactRef-v1",
+                "version": None,
+                "producer": "herdr.evidence.parse_artifact",
+                "identity_fields": ["task_id", "attempt"],
+                "provenance": ["artifact digest only"],
+                "normalization": "not a result identity; never accepted as completion",
+                "completion_authority": "none",
+            },
+        ],
+        "explicitly_unsupported": [
+            "unversioned attempt/attempts aliases",
+            "records without host provenance",
+            "records missing consumer or ownership_epoch",
+            "conflicting or non-object identities",
+        ],
+        "authoritative_replay_records": "unavailable_without_fresh_staging_read_only_export",
+    }
+
+
 def _validate_result_identity(record: Mapping[str, Any]) -> None:
     if not isinstance(record, Mapping):
         raise DurableIdentityAdapterError("result_identity_not_object")
@@ -235,6 +372,11 @@ def normalize_legacy_result_records(
     for record in records:
         if not isinstance(record, Mapping):
             raise DurableIdentityAdapterError("legacy_result_not_object")
+        classification = classify_legacy_result_record(record)
+        if classification.supported:
+            record = classification.normalized  # type: ignore[assignment]
+        elif "version" in record:
+            raise DurableIdentityAdapterError(classification.reason_code or "unsupported_legacy_result_schema")
         if require_identity:
             _validate_result_identity(record)
         normalized.append(dict(record))
