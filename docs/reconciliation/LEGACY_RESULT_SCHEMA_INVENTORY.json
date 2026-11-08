@@ -1,0 +1,32 @@
+{
+  "inventory_version": 1,
+  "live_replay": "NOT_RUN",
+  "source_contracts": [
+    {
+      "schema": "herdr-accepted-evidence-v2",
+      "version": 2,
+      "producer": "herdr.evidence.EvidenceStore",
+      "identity_fields": ["id", "run_token", "attempt", "idempotency_key", "fencing_token"],
+      "provenance": {
+        "control_cycle": ["environment.collector=host-control-v1", "proof.source=host-schema-v1"],
+        "verified_worker_result": ["environment.collector=github-api-v1", "proof.source=github-api"]
+      },
+      "normalization": "attempt -> attempt_id after exact version and provenance checks",
+      "missing_fields_never_filled": ["consumer", "ownership_epoch", "repository", "issue"]
+    },
+    {
+      "schema": "herdr.evidence.ArtifactRef-v1",
+      "version": null,
+      "producer": "herdr.evidence.parse_artifact",
+      "identity_fields": ["task_id", "attempt"],
+      "completion_authority": "none"
+    }
+  ],
+  "unsupported": [
+    "unversioned attempt/attempts aliases",
+    "records without host provenance",
+    "records missing consumer or ownership_epoch",
+    "conflicting or non-object identities"
+  ],
+  "authoritative_records": "unavailable_without_fresh_staging_read_only_export"
+}

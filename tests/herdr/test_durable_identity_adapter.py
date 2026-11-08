@@ -12,7 +12,9 @@ from herdr.durable_identity_adapter import (
     ADAPTER_VERSION,
     DurableIdentityAdapterError,
     build_reconciliation_snapshot,
+    classify_legacy_result_record,
     collect_authoritative_attempt_evidence,
+    legacy_result_schema_inventory,
     normalize_legacy_durable_task,
     normalize_legacy_result_records,
     read_legacy_json,
@@ -40,6 +42,21 @@ def result(**changes):
         "fencing_token": 8, "ownership_epoch": 2, "idempotency_key": "idem-79-3",
         "consumer": "github:Bbambaaamm/herdr", "status": "completed",
         "authoritative": True,
+    }
+    value.update(changes)
+    return value
+
+
+def accepted_evidence_v2(**changes):
+    value = {
+        "version": 2,
+        "identity": {
+            "id": "legacy-79", "run_token": "run-3", "attempt": 3,
+            "idempotency_key": "idem-79-3", "fencing_token": 8,
+        },
+        "repo": "Bbambaaamm/herdr", "kind": "control", "level": "control_cycle",
+        "plan_hash": "a" * 64, "environment": {"collector": "host-control-v1"},
+        "proof": {"source": "host-schema-v1", "result_digest": "b" * 64},
     }
     value.update(changes)
     return value
@@ -202,6 +219,56 @@ def test_result_normalization_copies_and_rejects_non_objects():
     assert normalized[0] is not original[0]
     with pytest.raises(DurableIdentityAdapterError):
         normalize_legacy_result_records(["not-an-object"])
+
+
+def test_versioned_accepted_evidence_alias_is_normalized_without_filling_identity():
+    classified = classify_legacy_result_record(accepted_evidence_v2())
+    assert classified.supported is True
+    assert classified.schema == "herdr-accepted-evidence-v2"
+    assert classified.normalized["identity"]["attempt_id"] == 3
+    assert "consumer" not in classified.normalized["identity"]
+    assert "ownership_epoch" not in classified.normalized["identity"]
+    with pytest.raises(DurableIdentityAdapterError, match="result_ownership_epoch_invalid"):
+        normalize_legacy_result_records([accepted_evidence_v2()], require_identity=True)
+
+
+@pytest.mark.parametrize("change", [
+    {"version": 1},
+    {"identity": {"id": "legacy-79", "run_token": "run-3", "attempt": 3,
+                   "idempotency_key": "idem-79-3", "fencing_token": 8, "extra": 1}},
+    {"environment": {"collector": "dashboard"}},
+    {"proof": {"source": "worker-claimed", "result_digest": "b" * 64}},
+    {"level": []},
+    {"level": {}},
+    {"identity": {"id": "legacy-79", "run_token": "run-3", "attempt": "3",
+                   "idempotency_key": "idem-79-3", "fencing_token": 8}},
+])
+def test_unproven_versioned_result_never_becomes_supported(change):
+    raw = accepted_evidence_v2(**change)
+    classified = classify_legacy_result_record(raw)
+    assert classified.supported is False
+    assert classified.normalized is None
+    with pytest.raises(DurableIdentityAdapterError):
+        normalize_legacy_result_records([raw], require_identity=True)
+
+
+def test_unversioned_attempt_alias_is_not_a_legacy_decoder():
+    raw = result()
+    raw.pop("attempt_id")
+    raw["attempt"] = 3
+    classified = classify_legacy_result_record(raw)
+    assert classified.supported is False
+    with pytest.raises(DurableIdentityAdapterError, match="result_attempt_id_invalid"):
+        normalize_legacy_result_records([raw], require_identity=True)
+
+
+def test_legacy_schema_inventory_is_source_bounded_and_marks_live_replay_unrun():
+    inventory = legacy_result_schema_inventory()
+    assert inventory["live_replay"] == "NOT_RUN"
+    assert {row["schema"] for row in inventory["observed_source_contracts"]} == {
+        "herdr-accepted-evidence-v2", "herdr.evidence.ArtifactRef-v1"
+    }
+    assert "ownership_epoch" in inventory["observed_source_contracts"][0]["missing_fields_never_filled"]
 
 
 def test_attempt_evidence_is_bounded_and_has_stable_refs():
