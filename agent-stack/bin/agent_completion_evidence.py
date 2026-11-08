@@ -648,8 +648,15 @@ def verify_completion(root: Path, task: dict, result: dict, *, invocation_verifi
     if not isinstance(workspace, str) or not Path(workspace).is_absolute():
         raise EvidenceError("immutable artifact workspace is missing")
     collector = collect_local_handoff if invocation_verifier is not None else collect_github
+    receipt_digest = None
+    if invocation_verifier is not None:
+        from herdr.result_contract import receipt_payload_for_result
+        try:
+            receipt_digest = digest(receipt_payload_for_result(original_result))
+        except ValueError as exc:
+            raise EvidenceError("result receipt projection invalid") from exc
     return accept_artifact(task, result, plan, store, Path(workspace), collector,
-                           result_payload_sha256=digest(original_result) if invocation_verifier is not None else None,
+                           result_payload_sha256=receipt_digest,
                            invocation_verifier=invocation_verifier)
 
 

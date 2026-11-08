@@ -19,6 +19,8 @@ RESULT_STATUSES = frozenset({"completed", "blocked", "failed", "terminal_unknown
 _VERIFICATION_STATES = frozenset({"candidate", "verified", "unverified", "terminal_unknown"})
 _AUTHORITY_TYPES = frozenset({"host_result_publisher", "host_completion_acceptance", "host_control"})
 _MAX_BYTES = 131072
+_RECEIPT_FIELDS = ("task_id", "run_token", "fencing_token", "idempotency_key",
+                   "status", "evidence", "artifact_sha256", "summary")
 
 
 class ResultContractError(ValueError):
@@ -214,6 +216,26 @@ def canonical_result_for_task(task: Mapping[str, Any], result: Mapping[str, Any]
     if len(_canonical(payload)) > _MAX_BYTES:
         raise ResultContractError("result_contract_exceeds_bound")
     return payload
+
+
+def receipt_payload_for_result(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Project a canonical result back to the immutable SDK receipt payload.
+
+    The host result contract is an envelope around the closed eight-field SDK
+    payload. Existing WorkResultAuthority receipts bind those original bytes;
+    verification must compare the same projection rather than the later
+    host-added identity, timestamp and contract fields. Legacy records without
+    an envelope remain byte-for-byte compatible.
+    """
+    if not isinstance(record, Mapping):
+        raise ResultContractError("result_not_object")
+    if "result_contract" not in record:
+        return dict(record)
+    validate_result_contract(record)
+    missing = [field for field in _RECEIPT_FIELDS if field not in record]
+    if missing:
+        raise ResultContractError("result_receipt_payload_incomplete")
+    return {field: record[field] for field in _RECEIPT_FIELDS}
 
 
 def validate_result_contract(record: Mapping[str, Any], *, expected_identity: Mapping[str, Any] | None = None) -> ResultIdentity:

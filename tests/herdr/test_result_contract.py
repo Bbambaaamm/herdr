@@ -7,6 +7,7 @@ from herdr.result_contract import (
     RESULT_SCHEMA,
     ResultContractError,
     canonical_result_for_task,
+    receipt_payload_for_result,
     validate_result_contract,
 )
 
@@ -77,6 +78,27 @@ def test_canonical_serialization_is_stable_and_does_not_add_secrets():
     assert one == two
     assert "prompt" not in one["result_contract"]
     assert "credential" not in one["result_contract"]
+
+
+def test_receipt_projection_preserves_original_closed_sdk_payload():
+    raw = {
+        "task_id": task()["id"], "run_token": task()["run_token"],
+        "fencing_token": task()["fencing_token"],
+        "idempotency_key": task()["idempotency_key"],
+        "status": "completed", "evidence": [{"artifact": "sha256:" + "a" * 64}],
+        "artifact_sha256": "b" * 64, "summary": "verified fixture",
+    }
+    record = canonical_result_for_task(task(), {**raw, "observed_at": "2026-11-08T10:00:00Z"})
+    assert receipt_payload_for_result(record) == raw
+
+
+def test_receipt_projection_rejects_incomplete_canonical_payload():
+    raw = {"status": "completed", "evidence": [{"artifact": "sha256:" + "a" * 64}],
+           "summary": "verified fixture", "completed_at": "2026-11-08T10:00:00Z"}
+    record = canonical_result_for_task(task(), raw)
+    record.pop("artifact_sha256", None)
+    with pytest.raises(ResultContractError):
+        receipt_payload_for_result(record)
 
 
 def test_missing_publication_timestamp_is_not_filled_from_wall_clock():
