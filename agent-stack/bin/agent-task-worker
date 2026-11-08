@@ -131,9 +131,10 @@ def _rewrite_result_slot(path: Path, payload: dict) -> None:
         before = os.fstat(fd)
         named = path.lstat()
         if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or before.st_size != 0
                 or (before.st_dev, before.st_ino) != (named.st_dev, named.st_ino)
                 or before.st_size > 131072):
-            raise EvidenceError("result_slot_replaced_before_contract_publish")
+            raise EvidenceError("result_slot_not_empty_under_publication_lock")
         os.lseek(fd, 0, os.SEEK_SET)
         view = memoryview(encoded)
         while view:
@@ -2092,15 +2093,19 @@ def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool)
 
     # Closed SDK submissions do not carry a publication timestamp. Allocate a
     # host-owned timestamp once and persist it with the attempt so replay uses
-    # the same value instead of a fresh wall-clock observation.
-    if not result.get("completed_at") and not result.get("observed_at"):
+    # the same value instead of a fresh wall-clock observation. Keep the
+    # receipt-bound legacy payload byte-for-byte unchanged; only the canonical
+    # projection receives the host metadata.
+    canonical_input = result
+    if ("result_contract" not in result and _supports_result_contract(task)
+            and not result.get("completed_at") and not result.get("observed_at")):
         publication_at = task.get("result_publication_at")
         if not isinstance(publication_at, str) or not publication_at:
             publication_at = utcnow().isoformat()
             task["result_publication_at"] = publication_at
             write_json(task_path, task)
-        result = dict(result)
-        result["observed_at"] = publication_at
+        canonical_input = dict(result)
+        canonical_input["observed_at"] = publication_at
 
     # Bind the candidate before any immutable completion verifier records its
     # payload digest.  The accepted receipt must refer to these exact bytes;
@@ -2119,7 +2124,7 @@ def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool)
                 raise EvidenceError(f"result_contract_invalid_on_replay:{exc}") from exc
             result = original_result
         elif _supports_result_contract(task):
-            result = _canonical_result(task, result, verification_state="candidate")
+            result = _canonical_result(task, canonical_input, verification_state="candidate")
             # The SDK submission xattr and WorkResultAuthority receipt bind the
             # original nonempty bytes. Keep that receipt-bound payload intact;
             # the envelope is verified as an in-memory projection and is never
@@ -2183,6 +2188,16 @@ def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool)
         write_json(task_path, task)
         return
     task.pop("watchdog_cleanup_blocker", None)
+    if status == "terminal_unknown" or str(result.get("verification_state") or "") == "terminal_unknown":
+        task["watchdog_blocker"] = "delivery_uncertain_requires_recovery"
+        task["recovery_action"] = "await_exact_result_or_inspect_session"
+        task["delivery_reconcile_pending"] = True
+        task["result_status"] = "terminal_unknown"
+        task["attempt_state"] = "delivery_uncertain"
+        task["last_error"] = "terminal_unknown result requires operator reconciliation; retry is forbidden"
+        write_json(task_path, task)
+        move(task_path, BLOCKED)
+        return
     task["agent_output_tail"] = output[-4000:]
     task["result_status"] = status
     task["finished_at"] = utcnow().isoformat()

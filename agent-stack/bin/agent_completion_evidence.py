@@ -652,7 +652,11 @@ def verify_completion(root: Path, task: dict, result: dict, *, invocation_verifi
     if invocation_verifier is not None:
         from herdr.result_contract import ResultIdentity, receipt_payload_for_result
         try:
-            expected_identity = ResultIdentity.from_task(task).to_dict()
+            expected_identity = (
+                ResultIdentity.from_task(task).to_dict()
+                if isinstance(original_result, dict)
+                and "result_contract" in original_result else None
+            )
             receipt_digest = digest(receipt_payload_for_result(
                 original_result, expected_identity=expected_identity))
         except ValueError as exc:
