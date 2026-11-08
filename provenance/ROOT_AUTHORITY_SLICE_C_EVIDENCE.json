@@ -1,0 +1,57 @@
+{
+  "schema_version": "herdr-root-authority-slice-c-evidence-1",
+  "status": "SLICE_C_BLOCKED_WITH_EVIDENCE",
+  "repository": "Bbambaaamm/herdr",
+  "main_sha": "a8392ece7c9ca643ba7cbe5c1f6352d7ed47f58c",
+  "merged_slices": ["#214", "#215"],
+  "source_state": "IMPLEMENTED_SOURCE_ONLY",
+  "runtime_state": "NOT_DEPLOYED_OR_ACTIVATED",
+  "physical_acceptance": "BLOCKED",
+  "canary": "NOT_RUN",
+  "production_mutation": false,
+  "provider_api_calls": 0,
+  "economic_operations": 0,
+  "verification": {
+    "compileall": "PASS",
+    "repository_contract": "PASS",
+    "diff_check": "PASS",
+    "targeted_windows_pytest": "BLOCKED: Windows Python lacks fcntl during collection",
+    "linux_kernel_namespace_probes": "NOT_RUN: Linux privileged environment unavailable",
+    "native_root_child_result": "NOT_RUN",
+    "zero_provider_canary": "NOT_RUN"
+  },
+  "physical_matrix": {
+    "same_uid_rename_before_mount": "BLOCKED_LINUX_REQUIRED",
+    "same_uid_rename_after_mount": "BLOCKED_LINUX_REQUIRED",
+    "symlink_replacement": "BLOCKED_LINUX_REQUIRED",
+    "dangling_symlink": "BLOCKED_LINUX_REQUIRED",
+    "nested_path_substitution": "BLOCKED_LINUX_REQUIRED",
+    "writable_workspace_alias": "BLOCKED_LINUX_REQUIRED",
+    "python_executable_substitution": "BLOCKED_LINUX_REQUIRED",
+    "hermes_executable_substitution": "BLOCKED_LINUX_REQUIRED",
+    "sdk_import_substitution": "BLOCKED_LINUX_REQUIRED",
+    "mode_only_mutation": "BLOCKED_LINUX_REQUIRED",
+    "runtime_tree_replacement": "BLOCKED_LINUX_REQUIRED",
+    "stale_signed_manifest": "BLOCKED_LINUX_REQUIRED",
+    "verify_exec_toctou": "BLOCKED_LINUX_REQUIRED",
+    "host_policy_drift": "BLOCKED_ROOT_AUTHORITY_REQUIRED",
+    "post_launch_runtime_tampering": "BLOCKED_LINUX_REQUIRED"
+  },
+  "blocking_reasons": [
+    "Merged source is not deployed to the staging host.",
+    "Schema-2 root-owned runtime publication and host-policy acceptance are not established on the host.",
+    "The current environment is Windows; fcntl, namespaces, bwrap and kernel mount evidence are unavailable.",
+    "No privileged operator approval exists for a physical canary."
+  ],
+  "required_next_step": "Run the read-only operator package, then request separate approval for one disposable zero-provider canary only if every precondition is PASS.",
+  "safety_boundaries": {
+    "merge": false,
+    "deploy": false,
+    "restart": false,
+    "current_symlink_change": false,
+    "host_policy_change": false,
+    "sudoers_or_apparmor_change": false,
+    "credentials": "synthetic_only",
+    "production_queue_change": false
+  }
+}
