@@ -9,9 +9,12 @@ service restart, sudoers/AppArmor changes, credential use, or a canary.
 1. Confirm hostname and active release identity.
 2. Confirm the release archive and manifest SHA-256 against the approved
    exact-head package.
-3. Confirm that `/opt/herdr/current`, the issuer, runtime trees and retained
-   publication record are root-owned, regular/non-symlink files with the
-   approved modes and ancestry.
+3. Confirm the release objects using their existing cutover contract: inspect
+   `/opt/herdr/current` as a root-owned symlink whose resolved target is the
+   approved release directory; inspect the release/runtime trees as
+   root-owned immutable directories; and require the issuer executable and
+   retained publication record to be root-owned regular non-symlink files with
+   the approved modes and ancestry.
 4. Confirm schema-2 host-policy digest, publication-record digest, profile
    digest, issuer digest, consumer, parent/child grant identity, fencing and
    result-slot binding. Do not infer authority from a readable file alone.
