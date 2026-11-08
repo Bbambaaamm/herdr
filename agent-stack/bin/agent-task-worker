@@ -2080,6 +2080,18 @@ def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool)
         _defer_delivery_reconciliation_locked(task_path, task, "child result missing exact fence/idempotency/artifact evidence", all_terminal)
         return
 
+    # Bind the candidate before any immutable completion verifier records its
+    # payload digest.  The accepted receipt must refer to these exact bytes;
+    # rewriting a verified result afterward would create a digest conflict on
+    # replay.  Re-canonicalization is deterministic for an already-bound slot.
+    try:
+        result = _canonical_result(task, result, verification_state="candidate")
+        _rewrite_result_slot(rp, result)
+    except EvidenceError as exc:
+        _defer_delivery_reconciliation_locked(
+            task_path, task, f"result contract publication requires reconciliation: {exc.code}", all_terminal)
+        return
+
     blocker = str(result.get("blocker") or "").strip()
     verification_state = "candidate"
     if str(result.get("status") or "") == "completed" and (not blocker or blocker.lower() in {"none", "null"}):
@@ -2112,13 +2124,6 @@ def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool)
 
     status = str(result.get("status") or "")
     blocker = str(result.get("blocker") or "").strip()
-    try:
-        result = _canonical_result(task, result, verification_state=verification_state)
-        _rewrite_result_slot(rp, result)
-    except EvidenceError as exc:
-        _defer_delivery_reconciliation_locked(
-            task_path, task, f"result contract publication requires reconciliation: {exc.code}", all_terminal)
-        return
     if defer_for_active_children(task_path, task, all_terminal=all_terminal):
         return
     clear_child_wait(task)

@@ -8,7 +8,6 @@ result envelope and rejects mismatches.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, Mapping
 import hashlib
 import json
@@ -147,7 +146,7 @@ def _result_status(result: Mapping[str, Any]) -> str:
 def _observed_at(result: Mapping[str, Any]) -> str:
     value = result.get("completed_at") or result.get("observed_at")
     if value is None:
-        return datetime.now(timezone.utc).isoformat()
+        raise ResultContractError("result_publication_timestamp_missing")
     return _text(value, "result.observed_at", maximum=128)
 
 
@@ -236,19 +235,39 @@ def validate_result_contract(record: Mapping[str, Any], *, expected_identity: Ma
     if result.get("status") != record.get("status"):
         raise ResultContractError("result_contract_status_mismatch")
     _text(result.get("observed_at"), "result_contract.observed_at", maximum=128)
+    provenance = envelope["provenance"]
+    if (not isinstance(provenance, Mapping)
+            or set(provenance) != {"producer", "source_digest"}):
+        raise ResultContractError("result_contract_provenance_invalid")
+    _text(provenance.get("producer"), "result_contract.producer", maximum=128)
+    source_payload = dict(record)
+    source_payload.pop("result_contract", None)
+    if provenance.get("source_digest") != _digest(source_payload):
+        raise ResultContractError("result_contract_source_digest_invalid")
     authority = envelope["authority"]
     if not isinstance(authority, Mapping) or set(authority) != {"issuer", "authority_type", "identity_binding", "verification_state"}:
         raise ResultContractError("result_contract_authority_invalid")
-    if authority.get("issuer") != "herdr-host" or authority.get("authority_type") not in _AUTHORITY_TYPES:
+    if (authority.get("issuer") != "herdr-host"
+            or not isinstance(authority.get("authority_type"), str)
+            or authority.get("authority_type") not in _AUTHORITY_TYPES):
         raise ResultContractError("result_contract_authority_untrusted")
     if authority.get("identity_binding") != _digest(identity.to_dict()):
         raise ResultContractError("result_contract_identity_binding_invalid")
-    if authority.get("verification_state") not in _VERIFICATION_STATES:
+    if (not isinstance(authority.get("verification_state"), str)
+            or authority.get("verification_state") not in _VERIFICATION_STATES):
         raise ResultContractError("result_contract_verification_state_invalid")
     recovery = envelope["recovery"]
     if not isinstance(recovery, Mapping) or not isinstance(recovery.get("delivery_uncertain"), bool) or not isinstance(recovery.get("terminal_unknown"), bool):
         raise ResultContractError("result_contract_recovery_invalid")
     if recovery["terminal_unknown"] and record.get("status") != "terminal_unknown":
         raise ResultContractError("result_contract_terminal_state_invalid")
+    if "result_ref" in result:
+        evidence = record.get("evidence")
+        if evidence is None or result["result_ref"] != "sha256:" + _digest(evidence):
+            raise ResultContractError("result_contract_result_ref_invalid")
+    if "completion_evidence_ref" in result:
+        bundle_hash = record.get("completion_bundle_hash")
+        if bundle_hash is None or result["completion_evidence_ref"] != bundle_hash:
+            raise ResultContractError("result_contract_completion_ref_invalid")
     return identity
 

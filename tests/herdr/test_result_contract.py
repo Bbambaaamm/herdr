@@ -33,6 +33,21 @@ def result(**changes):
     return value
 
 
+def accepted_result(task_value=None, **changes):
+    identity = task_value or task()
+    value = result(authoritative=True, result_identity={
+        "repository": identity["repo"], "issue": identity["issue"],
+        "task_id": identity["id"], "attempt_id": identity["attempt_id"],
+        "run_token": identity["run_token"], "fencing_token": identity["fencing_token"],
+        "ownership_epoch": identity["ownership_epoch"],
+        "idempotency_key": identity["idempotency_key"], "consumer": identity["consumer"],
+        "parent_task_id": identity.get("parent_task_id"),
+        "parent_run_token": identity.get("parent_run_token"),
+    })
+    value.update(changes)
+    return value
+
+
 def snapshot(**changes):
     identity = TaskIdentity(
         repository="Bbambaaamm/herdr", issue="79", task_id="task-79", attempt_id=3,
@@ -62,6 +77,13 @@ def test_canonical_serialization_is_stable_and_does_not_add_secrets():
     assert one == two
     assert "prompt" not in one["result_contract"]
     assert "credential" not in one["result_contract"]
+
+
+def test_missing_publication_timestamp_is_not_filled_from_wall_clock():
+    raw = result()
+    raw.pop("completed_at")
+    with pytest.raises(ResultContractError, match="result_publication_timestamp_missing"):
+        canonical_result_for_task(task(), raw)
 
 
 @pytest.mark.parametrize("field", [
@@ -108,18 +130,14 @@ def test_terminal_unknown_is_explicit_and_precedes_completed_claim():
 
 
 def test_valid_contract_can_confirm_only_with_durable_host_acceptance():
-    record = canonical_result_for_task(task(), result(), verification_state="verified")
-    record["authoritative"] = True
-    record["result_identity"] = record["identity"]
+    record = canonical_result_for_task(task(), accepted_result(), verification_state="verified")
     decision = reconcile_task(snapshot(), [record], observed_at="fixed")
     assert decision.status is DecisionStatus.RESULT_CONFIRMED
     assert decision.safe_to_retry is False
 
 
 def test_invalid_contract_cannot_confirm_even_when_payload_looks_completed():
-    record = canonical_result_for_task(task(), result(), verification_state="verified")
-    record["authoritative"] = True
-    record["result_identity"] = record["identity"]
+    record = canonical_result_for_task(task(), accepted_result(), verification_state="verified")
     tampered = copy.deepcopy(record)
     tampered["result_contract"]["authority"]["identity_binding"] = "0" * 64
     decision = reconcile_task(snapshot(), [tampered])
@@ -135,11 +153,24 @@ def test_delivery_uncertainty_remains_recovery_required_with_valid_contract():
 
 
 def test_human_gate_is_not_overridden_by_result_contract():
-    record = canonical_result_for_task(task(), result(), verification_state="verified")
-    record["authoritative"] = True
-    record["result_identity"] = record["identity"]
+    record = canonical_result_for_task(task(), accepted_result(), verification_state="verified")
     decision = reconcile_task(snapshot(status="blocked", blocker="human approval required",
                                        completion_authority=False), [record])
     assert decision.status is DecisionStatus.UNKNOWN
     assert decision.safe_to_retry is False
+
+
+def test_provenance_digest_and_evidence_reference_are_checked():
+    record = canonical_result_for_task(task(), result())
+    record["evidence"] = [{"artifact": "sha256:" + "b" * 64}]
+    with pytest.raises(ResultContractError, match="source_digest_invalid|result_ref_invalid"):
+        validate_result_contract(record)
+
+
+@pytest.mark.parametrize("field", ["authority_type", "verification_state"])
+def test_non_string_authority_fields_fail_as_contract_errors(field):
+    record = canonical_result_for_task(task(), result())
+    record["result_contract"]["authority"][field] = []
+    with pytest.raises(ResultContractError):
+        validate_result_contract(record)
 
