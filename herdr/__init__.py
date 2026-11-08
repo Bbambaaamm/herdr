@@ -63,6 +63,18 @@ from .reconciliation import (
     reconcile_snapshot,
     reconcile_task,
 )
+from .durable_identity_adapter import (
+    ADAPTER_VERSION,
+    AttemptEvidence,
+    DurableIdentityAdapterError,
+    LegacyNormalization,
+    build_reconciliation_snapshot,
+    collect_authoritative_attempt_evidence,
+    normalize_legacy_durable_task,
+    normalize_legacy_result_records,
+    read_legacy_json,
+    reconcile_legacy_task,
+)
 
 __all__ = [
     "GRAPH_VERSION",
@@ -116,6 +128,16 @@ __all__ = [
     "normalize_task_snapshot",
     "reconcile_snapshot",
     "reconcile_task",
+    "ADAPTER_VERSION",
+    "AttemptEvidence",
+    "DurableIdentityAdapterError",
+    "LegacyNormalization",
+    "build_reconciliation_snapshot",
+    "collect_authoritative_attempt_evidence",
+    "normalize_legacy_durable_task",
+    "normalize_legacy_result_records",
+    "read_legacy_json",
+    "reconcile_legacy_task",
 ]
 __version__ = "0.2.0"
 from .workspace import (
