@@ -10,7 +10,8 @@ from herdr.policy_launch import (
 from herdr.security import SecurityError
 
 
-def _objects(*, schema2=True, snapshot=True, identity=None, mounted=True):
+def _objects(*, schema2=True, snapshot=True, identity=None, mounted=True,
+             launch_identity=None):
     approved_identity = {"name": "quantlab", "manifest_sha256": "a" * 64}
     snapshot_identity = identity or approved_identity
     factory = object.__new__(HostPolicyLaunchFactory)
@@ -20,6 +21,7 @@ def _objects(*, schema2=True, snapshot=True, identity=None, mounted=True):
     grant = SimpleNamespace(identity=SimpleNamespace(token="host"))
     launch = object.__new__(PreparedPolicyLaunch)
     launch.grant = grant
+    launch.identity = launch_identity or grant.identity
     launch.mount = SimpleNamespace()
     if snapshot:
         launch.private_profile_snapshot = SimpleNamespace(
@@ -59,4 +61,12 @@ def test_schema2_rejects_incomplete_or_stale_profile_binding(kwargs):
 def test_schema1_rejects_task_selected_private_snapshot():
     factory, launch = _objects(schema2=False, snapshot=True)
     with pytest.raises(SecurityError):
+        require_approved_profile_binding(factory, launch, "quantlab")
+
+
+def test_schema2_rejects_launch_grant_identity_mismatch():
+    factory, launch = _objects(
+        launch_identity=SimpleNamespace(token="different-launch-identity")
+    )
+    with pytest.raises(SecurityError, match="prepared launch identity differs"):
         require_approved_profile_binding(factory, launch, "quantlab")
