@@ -89,7 +89,7 @@ def test_receipt_projection_preserves_original_closed_sdk_payload():
         "artifact_sha256": "b" * 64, "summary": "verified fixture",
     }
     record = canonical_result_for_task(task(), {**raw, "observed_at": "2026-11-08T10:00:00Z"})
-    assert receipt_payload_for_result(record) == raw
+    assert receipt_payload_for_result(record, expected_identity=record["identity"]) == raw
 
 
 def test_receipt_projection_rejects_incomplete_canonical_payload():
@@ -98,7 +98,7 @@ def test_receipt_projection_rejects_incomplete_canonical_payload():
     record = canonical_result_for_task(task(), raw)
     record.pop("artifact_sha256", None)
     with pytest.raises(ResultContractError):
-        receipt_payload_for_result(record)
+        receipt_payload_for_result(record, expected_identity=record["identity"])
 
 
 def test_receipt_projection_requires_authoritative_identity_when_supplied():
@@ -106,6 +106,12 @@ def test_receipt_projection_requires_authoritative_identity_when_supplied():
     foreign = dict(record["identity"], attempt_id=99)
     with pytest.raises(ResultContractError, match="result_contract_identity_mismatch"):
         receipt_payload_for_result(record, expected_identity=foreign)
+
+
+def test_receipt_projection_rejects_canonical_record_without_authoritative_identity():
+    record = canonical_result_for_task(task(), result())
+    with pytest.raises(ResultContractError, match="expected_identity_missing"):
+        receipt_payload_for_result(record)
 
 
 def test_missing_publication_timestamp_is_not_filled_from_wall_clock():

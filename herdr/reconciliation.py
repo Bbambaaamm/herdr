@@ -452,16 +452,19 @@ def reconcile_task(snapshot: TaskSnapshot | Mapping[str, Any], result_records: I
                          identity_match=False, confidence="high", action="refresh_authoritative_identity",
                          human_gate=False, policy_version=policy_version, observed_at=obs)
 
+    invalid_contract_refs = []
     for record in records:
         if "result_contract" not in record:
             continue
         try:
             validate_result_contract(record)
         except ResultContractError:
-            refs.append("result_contract:" + digest(_redact(record.get("result_contract"))))
-            return _decision(snapshot, DecisionStatus.UNKNOWN, "result_contract_invalid", refs,
-                             identity_match=False, confidence="high", action="refresh_result_evidence",
-                             human_gate=False, policy_version=policy_version, observed_at=obs)
+            invalid_contract_refs.append("result_contract:" + digest(_redact(record.get("result_contract"))))
+    if invalid_contract_refs:
+        refs.extend(sorted(set(invalid_contract_refs)))
+        return _decision(snapshot, DecisionStatus.UNKNOWN, "result_contract_invalid", refs,
+                         identity_match=False, confidence="high", action="refresh_result_evidence",
+                         human_gate=False, policy_version=policy_version, observed_at=obs)
 
     matching = [record for record in records if _matches(snapshot.identity, record)]
     same_task = [record for record in records if _result_identity(record).get("task_id") == snapshot.identity.task_id]

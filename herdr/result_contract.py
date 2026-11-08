@@ -232,6 +232,8 @@ def receipt_payload_for_result(record: Mapping[str, Any], *,
         raise ResultContractError("result_not_object")
     if "result_contract" not in record:
         return dict(record)
+    if expected_identity is None:
+        raise ResultContractError("result_contract_expected_identity_missing")
     validate_result_contract(record, expected_identity=expected_identity)
     missing = [field for field in _RECEIPT_FIELDS if field not in record]
     if missing:
