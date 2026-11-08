@@ -37,7 +37,30 @@ def private_config(tmp_path,monkeypatch):
             "profile_sha256":approved.identity["manifest_sha256"],
             "valid_until":(datetime.now(UTC)+timedelta(hours=2)).isoformat(),
             "minimum_ttl_seconds":1860}}
+    manifest = lambda tree: hashlib.sha256(
+        config.canonical_json_bytes(dict(sorted(tree["files"].items())))).hexdigest()
+    runtime_by_role = {"code": raw["code"]}
+    from herdr.host_bootstrap import PYTHON_TARGET
+    for item in raw["runtime"]:
+        runtime_by_role["python" if item["target"] == str(PYTHON_TARGET) else "hermes"] = item
+    raw["private_launch"]["runtime_publication"] = {
+        "schema_version": config.RUNTIME_PUBLICATION_BINDING_SCHEMA,
+        "version": "fixture-runtime-v1",
+        "approval_sha256": "a" * 64,
+        "record_path": str(tmp_path / "publication.json"),
+        "trees": {name: {"manifest_sha256": manifest(tree)}
+                  for name, tree in runtime_by_role.items()},
+    }
+    record = {"schema_version": "herdr-runtime-publication-record-1",
+              "version": "fixture-runtime-v1", "approval_sha256": "a" * 64,
+              "trees": {name: {"source": tree["source"],
+                                "manifest_sha256": manifest(tree)}
+                        for name, tree in runtime_by_role.items()}}
+    record["record_sha256"] = hashlib.sha256(
+        config.canonical_json_bytes(record)).hexdigest()
     monkeypatch.setattr(config,"_read_configuration",lambda path:deepcopy(raw))
+    monkeypatch.setattr(config,"_read_runtime_publication_record",
+                        lambda path: deepcopy(record))
     # Portable composition tests provide the same closed worker-policy fields
     # that the real host reads from its protected approval and kernel profile.
     from herdr import credential_isolation
@@ -157,6 +180,20 @@ def test_private_host_requires_approved_executable_inventory(tmp_path,monkeypatc
     elif fault=="missing-python":del python["files"][PYTHON_EXECUTABLE]
     else:python["executable_files"].remove(PYTHON_EXECUTABLE)
     with pytest.raises(SecurityError):config.build_host_policy_factory()
+
+
+@pytest.mark.parametrize("fault", ["missing", "stale", "wrong-role"])
+def test_schema2_requires_root_pinned_runtime_publication_binding(tmp_path, monkeypatch, fault):
+    raw, _, _, _ = private_config(tmp_path, monkeypatch)
+    binding = raw["private_launch"]["runtime_publication"]
+    if fault == "missing":
+        del raw["private_launch"]["runtime_publication"]
+    elif fault == "stale":
+        binding["trees"]["code"]["manifest_sha256"] = "0" * 64
+    else:
+        binding["trees"]["python"] = binding["trees"].pop("hermes")
+    with pytest.raises(SecurityError, match="runtime publication"):
+        config.build_host_policy_factory()
 
 
 @pytest.mark.parametrize("fault",["missing-private","legacy-private","extra-private",

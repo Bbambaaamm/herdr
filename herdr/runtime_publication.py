@@ -8,9 +8,9 @@ import ctypes
 import hashlib
 import os
 from pathlib import Path
-import re
 import stat
 import tempfile
+import re
 
 from .policy_launch import (
     ApprovedTree, FrozenTree, CODE_TARGET, RUNTIME_TARGETS,
@@ -22,6 +22,54 @@ from .security import SecurityError, canonical_json_bytes
 def require(ok, reason):
     if not ok:
         raise SecurityError(reason)
+
+
+PUBLICATION_RECORD_SCHEMA = "herdr-runtime-publication-record-1"
+
+
+def _manifest_sha256(files):
+    return hashlib.sha256(canonical_json_bytes(dict(sorted(files.items())))).hexdigest()
+
+
+def validate_publication_record(record, *, expected_version=None,
+                                expected_approval_sha256=None,
+                                expected_manifest_sha256=None):
+    """Validate retained publication evidence without granting authority."""
+    require(isinstance(record, dict) and set(record) == {
+        "schema_version", "version", "approval_sha256", "trees", "record_sha256"},
+        "closed runtime publication record required")
+    require(record["schema_version"] == PUBLICATION_RECORD_SCHEMA,
+            "runtime publication record schema unsupported")
+    require(isinstance(record["version"], str)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}", record["version"]),
+            "runtime publication record version invalid")
+    for field in ("approval_sha256", "record_sha256"):
+        require(isinstance(record[field], str)
+                and re.fullmatch(r"[0-9a-f]{64}", record[field]),
+                "runtime publication record digest invalid")
+    trees = record["trees"]
+    require(isinstance(trees, dict) and set(trees) == {"code", "hermes", "python"},
+            "runtime publication record tree inventory incomplete")
+    for value in trees.values():
+        require(isinstance(value, dict) and set(value) == {"source", "manifest_sha256"}
+                and isinstance(value["source"], str) and value["source"].startswith("/")
+                and re.fullmatch(r"[0-9a-f]{64}", value["manifest_sha256"]),
+                "runtime publication record tree invalid")
+    unsigned = {key: value for key, value in record.items() if key != "record_sha256"}
+    require(hashlib.sha256(canonical_json_bytes(unsigned)).hexdigest() == record["record_sha256"],
+            "runtime publication retained evidence digest mismatch")
+    if expected_version is not None:
+        require(record["version"] == expected_version, "runtime publication version is stale")
+    if expected_approval_sha256 is not None:
+        require(record["approval_sha256"] == expected_approval_sha256,
+                "runtime publication approval is stale")
+    if expected_manifest_sha256 is not None:
+        require(isinstance(expected_manifest_sha256, dict)
+                and set(expected_manifest_sha256) == set(trees)
+                and all(trees[name]["manifest_sha256"] == expected_manifest_sha256[name]
+                        for name in trees),
+                "runtime publication source manifest is stale")
+    return record
 
 
 def copy_reviewed_payload(tree, storage):
@@ -130,12 +178,16 @@ def publish_reviewed_runtime(configuration_path, *, publish=False):
                 checked.close()
             finally:
                 copied.close()
-        record = {"schema_version": raw["schema_version"], "version": version,
+        record = {"schema_version": PUBLICATION_RECORD_SCHEMA, "version": version,
                   "approval_sha256": hashlib.sha256(canonical_json_bytes(raw)).hexdigest(),
                   "trees": {name: {"source": str(parent / version / name),
-                            "manifest_sha256": hashlib.sha256(canonical_json_bytes(
-                                dict(sorted(tree.files.items())))).hexdigest()}
+                            "manifest_sha256": _manifest_sha256(tree.files)}
                             for name, tree in trees.items()}}
+        record["record_sha256"] = hashlib.sha256(canonical_json_bytes(record)).hexdigest()
+        validate_publication_record(record, expected_version=version,
+                                    expected_approval_sha256=record["approval_sha256"],
+                                    expected_manifest_sha256={name: _manifest_sha256(tree.files)
+                                                              for name, tree in trees.items()})
         with (stage / "publication.json").open("xb") as stream:
             stream.write(canonical_json_bytes(record))
             stream.flush()

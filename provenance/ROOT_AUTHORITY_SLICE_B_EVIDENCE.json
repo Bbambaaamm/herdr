@@ -1,0 +1,35 @@
+{
+  "schema_version": "herdr-root-authority-slice-b-evidence-1",
+  "status": "IMPLEMENTED_SOURCE_ONLY",
+  "base_main": "97123203ad6cc0e4546fbf5771cca3b0f9df895f",
+  "source_commit": "pending-final-head",
+  "privileged_acceptance": "NOT_RUN",
+  "production_mutation": false,
+  "changes": [
+    "host_configuration.validate_runtime_publication_binding",
+    "launch_plan_issuer._policy provenance gate",
+    "runtime_publication.validate_publication_record and retained record digest",
+    "schema-2 binding and retained-evidence regressions"
+  ],
+  "safety_boundaries": {
+    "merge": false,
+    "deploy": false,
+    "restart": false,
+    "host_policy_change": false,
+    "sudoers_or_apparmor": false,
+    "provider_api_calls": false,
+    "physical_canary": false
+  },
+  "verification": {
+    "compileall": "PASS",
+    "repository_contract": "PASS",
+    "diff_check": "PASS",
+    "targeted_pytest": "BLOCKED_ON_WINDOWS_MISSING_FCNTL",
+    "linux_ci": "PENDING_DRAFT_PR"
+  },
+  "remaining_blockers": [
+    "Linux CI and exact-head independent review",
+    "Privileged root-owned runtime publication and schema-2 host policy alignment",
+    "Physical zero-provider canary acceptance"
+  ]
+}

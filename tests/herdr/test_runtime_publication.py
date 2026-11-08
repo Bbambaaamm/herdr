@@ -7,7 +7,8 @@ from dataclasses import replace
 from pathlib import Path
 import pytest
 from herdr.policy_launch import ApprovedTree, CODE_TARGET
-from herdr.runtime_publication import copy_reviewed_payload, _rename_without_replacement, publish_reviewed_runtime
+from herdr.runtime_publication import (copy_reviewed_payload, _rename_without_replacement,
+    publish_reviewed_runtime, validate_publication_record)
 from herdr.security import SecurityError
 
 
@@ -138,3 +139,25 @@ def test_disk_full_during_copy_preserves_source_and_existing_release(tmp_path, m
     assert (tree.source / "program").read_bytes() == b"reviewed-bytes"
     assert (existing / "keep").read_bytes() == b"keep"
     assert list(storage.iterdir()) == [existing]
+
+
+def test_publication_record_is_deterministic_and_rejects_stale_or_tampered_evidence():
+    digests = {"code": "a" * 64, "hermes": "b" * 64, "python": "c" * 64}
+    base = {"schema_version": "herdr-runtime-publication-record-1", "version": "v1",
+            "approval_sha256": "a" * 64,
+            "trees": {name: {"source": "/opt/herdr/v1/" + name,
+                              "manifest_sha256": digests[name]}
+                      for name in ("code", "hermes", "python")}}
+    import json
+    from herdr.security import canonical_json_bytes
+    base["record_sha256"] = hashlib.sha256(canonical_json_bytes(base)).hexdigest()
+    assert validate_publication_record(base, expected_version="v1",
+        expected_approval_sha256="a" * 64,
+        expected_manifest_sha256=digests) == base
+    stale = dict(base, version="v0")
+    with pytest.raises(SecurityError, match="retained evidence digest mismatch"):
+        validate_publication_record(stale)
+    tampered = json.loads(json.dumps(base))
+    tampered["trees"]["code"]["manifest_sha256"] = "f" * 64
+    with pytest.raises(SecurityError, match="retained evidence digest mismatch"):
+        validate_publication_record(tampered)
