@@ -1,9 +1,12 @@
 import copy
 import json
+import os
 import tempfile
 from pathlib import Path
 
 import pytest
+
+import herdr.durable_identity_adapter as adapter
 
 from herdr.durable_identity_adapter import (
     ADAPTER_VERSION,
@@ -137,6 +140,23 @@ def test_embedded_result_without_explicit_epoch_is_unknown():
     assert decision.reason_code == "result_ownership_epoch_invalid"
 
 
+@pytest.mark.parametrize("bad_identity", [None, [], "text", 1, True])
+def test_non_object_embedded_result_identity_fails_closed(bad_identity):
+    decision = reconcile_legacy_task(
+        legacy(result_identity=bad_identity, result_exists=True)
+    )
+    assert decision.status is DecisionStatus.UNKNOWN
+    assert decision.reason_code == "result_identity_not_object"
+
+
+@pytest.mark.parametrize("bad_identity", [None, [], "text", 1, True])
+def test_non_object_nested_result_identity_fails_closed(bad_identity):
+    with pytest.raises(DurableIdentityAdapterError, match="result_identity_not_object"):
+        normalize_legacy_result_records(
+            [{"identity": bad_identity}], require_identity=True
+        )
+
+
 @pytest.mark.parametrize("changes", [
     {"delivery_uncertain": True}, {"terminal_unknown": True},
     {"recovery_state": "delivery_uncertain_requires_recovery"},
@@ -266,6 +286,28 @@ def test_file_reader_rejects_symlink_and_tocou_is_bounded():
             pytest.skip("symlinks unavailable on this platform")
         with pytest.raises(DurableIdentityAdapterError, match="regular"):
             read_legacy_json(link)
+
+
+def test_file_reader_rejects_pathname_replacement_between_lstat_and_open(monkeypatch):
+    with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+        tmp_path = Path(directory)
+        target = tmp_path / "record.json"
+        replacement = tmp_path / "replacement.json"
+        target.write_text(json.dumps(legacy(task_id="before")), encoding="utf-8")
+        replacement.write_text(json.dumps(legacy(task_id="after")), encoding="utf-8")
+        real_open = adapter.os.open
+        replaced = False
+
+        def replace_before_open(path, flags, *args, **kwargs):
+            nonlocal replaced
+            if not replaced and Path(path) == target:
+                replaced = True
+                os.replace(replacement, target)
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(adapter.os, "open", replace_before_open)
+        with pytest.raises(DurableIdentityAdapterError, match="changed_during_read"):
+            read_legacy_json(target)
 
 
 def test_non_object_file_is_rejected():

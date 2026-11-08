@@ -176,9 +176,12 @@ def _legacy_durable(raw: Mapping[str, Any]) -> DurableEvidence:
     if attempt_state == "terminal_unknown":
         source["terminal_unknown"] = True
         source["delivery_uncertain"] = True
-    embedded = source.get("result_identity")
-    if embedded is not None:
-        _validate_result_identity(embedded)
+    # Presence is significant: an explicitly supplied null (or any other
+    # scalar/list) is not an absent optional field.  Result identity is a
+    # trusted boundary and must therefore be an object with a complete,
+    # explicitly typed identity.
+    if "result_identity" in source:
+        _validate_result_identity(source["result_identity"])
     return DurableEvidence.from_mapping(source)
 
 
@@ -200,7 +203,15 @@ def normalize_legacy_durable_task(raw: Mapping[str, Any]) -> LegacyNormalization
 
 
 def _validate_result_identity(record: Mapping[str, Any]) -> None:
-    source = record.get("identity") if isinstance(record.get("identity"), Mapping) else record
+    if not isinstance(record, Mapping):
+        raise DurableIdentityAdapterError("result_identity_not_object")
+    if "identity" in record:
+        nested = record["identity"]
+        if not isinstance(nested, Mapping):
+            raise DurableIdentityAdapterError("result_identity_not_object")
+        source = nested
+    else:
+        source = record
     required = ("task_id", "run_token", "attempt_id", "fencing_token", "ownership_epoch",
                 "idempotency_key", "consumer")
     for field in required:
@@ -378,7 +389,13 @@ def read_legacy_json(path: str | os.PathLike[str], *, max_bytes: int = _MAX_RECO
             if os.name != "nt":
                 stamp_fields += ("st_ctime_ns",)
             stamp = lambda value: tuple(getattr(value, name) for name in stamp_fields)
-            if stamp(before) != stamp(after) or stamp(after) != stamp(named_after):
+            # Compare the pathname observation taken before open with the
+            # descriptor identity as well as the post-read observations.  A
+            # replacement between lstat() and open() must fail closed even if
+            # the replacement is itself a regular, bounded file.
+            if (stamp(named_before) != stamp(before)
+                    or stamp(before) != stamp(after)
+                    or stamp(after) != stamp(named_after)):
                 raise DurableIdentityAdapterError("legacy_file_changed_during_read")
         finally:
             os.close(fd)
