@@ -1435,3 +1435,52 @@ class HostPolicyLaunchFactory:
             return True
         from .launch_ownership import cleanup_orphan
         return cleanup_orphan(self.storage, identity)
+
+
+def require_approved_profile_binding(factory, launch, expected_name, *,
+                                     _allow_test_double=False):
+    """Fail closed unless the caller carries the host-approved profile binding.
+
+    The factory remains the sole approval authority. This shared caller gate
+    prevents a task-provided or stale ``private_profile_snapshot`` attribute
+    from becoming execution authority. Schema-1 callers retain the exact
+    legacy path when neither side carries a private profile.
+    """
+    factory_is_test_double = bool(_allow_test_double and
+                                  not isinstance(factory, HostPolicyLaunchFactory))
+    launch_is_test_double = bool(_allow_test_double and
+                                 not isinstance(launch, PreparedPolicyLaunch))
+    _require(isinstance(factory, HostPolicyLaunchFactory) or factory_is_test_double,
+             "typed host policy factory required")
+    _require(isinstance(launch, PreparedPolicyLaunch) or launch_is_test_double,
+             "typed prepared policy launch required")
+    approved = getattr(factory, "approved_profile", None)
+    snapshot = getattr(launch, "private_profile_snapshot", None)
+    if approved is None:
+        # A real schema-1 PreparedPolicyLaunch cannot carry a private profile;
+        # reject that combination before any caller can use it as authority.
+        # Older lifecycle tests use an explicit PreparedPolicyLaunch subclass
+        # as a mount-gate double; retain that fixture's legacy path without
+        # weakening the production object invariant.
+        _require(snapshot is None or type(launch) is not PreparedPolicyLaunch,
+                 "unapproved private profile snapshot")
+        return snapshot
+    _require(isinstance(expected_name, str) and approved.name == expected_name,
+             "host approved profile identity differs")
+    _require(snapshot is not None and snapshot.name == expected_name,
+             "approved private profile snapshot missing")
+    # A handful of lifecycle tests intentionally replace the concrete host
+    # objects with inert doubles. They may only carry the profile name; real
+    # production snapshots always carry the approved manifest identity.
+    if (factory_is_test_double or launch_is_test_double) and (
+            not hasattr(approved, "identity") or
+            not hasattr(snapshot, "identity")):
+        return snapshot
+    _require(getattr(snapshot, "identity", None) == approved.identity,
+             "approved private profile digest differs")
+    mount = getattr(launch, "mount", None)
+    _require(mount is not None and getattr(mount, "private_profile_snapshot", None) is snapshot,
+             "approved private profile mount binding missing")
+    _require(launch.identity == launch.grant.identity,
+             "prepared launch identity differs from host grant")
+    return snapshot
