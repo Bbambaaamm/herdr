@@ -275,7 +275,10 @@ def immutable_preflight_controller() -> bool:
         root = ROOT.resolve(strict=True)
     except OSError:
         return False
-    if not any(root.parent == prefix for prefix in IMMUTABLE_PREFLIGHT_ROOTS):
+    if not any(
+        root.parent == prefix or root.parent.parent == prefix
+        for prefix in IMMUTABLE_PREFLIGHT_ROOTS
+    ):
         return False
     try:
         current = root

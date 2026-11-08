@@ -23,8 +23,9 @@ external Herdr binary.
 
 The preflight reads the root-owned deployed-release marker and exact installed unit
 bytes. It therefore runs only as root from an immutable, root-owned controller tree
-under `/opt/herdr/releases/<tag>-<sha12>` or
-`/var/lib/herdr/incoming/<private-stage>`. This does not grant `agentops`
+under `/opt/herdr/releases/<tag>-<sha12>`, or one level below a
+root-owned private staging directory under `/var/lib/herdr/incoming/`. This
+does not grant `agentops`
 general sudo access and is not a deployment operation.
 
 First copy the verified archive and its adjacent `.sha256` into a fresh private

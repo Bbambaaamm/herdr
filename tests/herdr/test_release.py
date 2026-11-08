@@ -1445,3 +1445,26 @@ def test_public_state_reader_rejects_symlink_and_tocou(
     monkeypatch.setattr(cutover.os, "fstat", changing_fstat)
     with pytest.raises(release.ReleaseError, match="current_release_public_state_changed"):
         cutover.read_trusted_public_state(marker)
+
+
+def test_preflight_accepts_one_root_owned_staging_level(monkeypatch, tmp_path):
+    prefix = tmp_path / "incoming"
+    stage = prefix / "stage"
+    root = stage / "release"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(cutover, "ROOT", root)
+    monkeypatch.setattr(cutover.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(cutover, "IMMUTABLE_PREFLIGHT_ROOTS", (prefix,))
+    monkeypatch.setattr(cutover, "root_owned_readonly", lambda _path: True)
+    assert cutover.immutable_preflight_controller() is True
+
+
+def test_preflight_rejects_deep_controller_nesting(monkeypatch, tmp_path):
+    prefix = tmp_path / "incoming"
+    root = prefix / "stage" / "nested" / "release"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(cutover, "ROOT", root)
+    monkeypatch.setattr(cutover.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(cutover, "IMMUTABLE_PREFLIGHT_ROOTS", (prefix,))
+    monkeypatch.setattr(cutover, "root_owned_readonly", lambda _path: True)
+    assert cutover.immutable_preflight_controller() is False
