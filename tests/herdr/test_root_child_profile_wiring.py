@@ -11,10 +11,11 @@ from herdr.security import SecurityError
 
 
 def _objects(*, schema2=True, snapshot=True, identity=None, mounted=True):
-    identity = identity or {"name": "quantlab", "manifest_sha256": "a" * 64}
+    approved_identity = {"name": "quantlab", "manifest_sha256": "a" * 64}
+    snapshot_identity = identity or approved_identity
     factory = object.__new__(HostPolicyLaunchFactory)
     factory.approved_profile = (
-        SimpleNamespace(name="quantlab", identity=identity) if schema2 else None
+        SimpleNamespace(name="quantlab", identity=approved_identity) if schema2 else None
     )
     grant = SimpleNamespace(identity=SimpleNamespace(token="host"))
     launch = object.__new__(PreparedPolicyLaunch)
@@ -22,7 +23,7 @@ def _objects(*, schema2=True, snapshot=True, identity=None, mounted=True):
     launch.mount = SimpleNamespace()
     if snapshot:
         launch.private_profile_snapshot = SimpleNamespace(
-            name="quantlab", identity=identity
+            name="quantlab", identity=snapshot_identity
         )
         if mounted:
             launch.mount.private_profile_snapshot = launch.private_profile_snapshot

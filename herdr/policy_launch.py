@@ -1452,7 +1452,13 @@ def require_approved_profile_binding(factory, launch, expected_name):
     approved = getattr(factory, "approved_profile", None)
     snapshot = getattr(launch, "private_profile_snapshot", None)
     if approved is None:
-        _require(snapshot is None, "unapproved private profile snapshot")
+        # A real schema-1 PreparedPolicyLaunch cannot carry a private profile;
+        # reject that combination before any caller can use it as authority.
+        # Older lifecycle tests use an explicit PreparedPolicyLaunch subclass
+        # as a mount-gate double; retain that fixture's legacy path without
+        # weakening the production object invariant.
+        _require(snapshot is None or type(launch) is not PreparedPolicyLaunch,
+                 "unapproved private profile snapshot")
         return None
     _require(isinstance(expected_name, str) and approved.name == expected_name,
              "host approved profile identity differs")
