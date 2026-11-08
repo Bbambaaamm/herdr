@@ -2102,7 +2102,9 @@ def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool)
         if "result_contract" in original_result:
             from herdr.result_contract import ResultContractError, validate_result_contract
             try:
-                validate_result_contract(original_result)
+                from herdr.result_contract import ResultIdentity
+                validate_result_contract(original_result,
+                    expected_identity=ResultIdentity.from_task(task).to_dict())
             except ResultContractError as exc:
                 raise EvidenceError(f"result_contract_invalid_on_replay:{exc}") from exc
             result = original_result

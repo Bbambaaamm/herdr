@@ -218,7 +218,8 @@ def canonical_result_for_task(task: Mapping[str, Any], result: Mapping[str, Any]
     return payload
 
 
-def receipt_payload_for_result(record: Mapping[str, Any]) -> dict[str, Any]:
+def receipt_payload_for_result(record: Mapping[str, Any], *,
+                              expected_identity: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Project a canonical result back to the immutable SDK receipt payload.
 
     The host result contract is an envelope around the closed eight-field SDK
@@ -231,7 +232,7 @@ def receipt_payload_for_result(record: Mapping[str, Any]) -> dict[str, Any]:
         raise ResultContractError("result_not_object")
     if "result_contract" not in record:
         return dict(record)
-    validate_result_contract(record)
+    validate_result_contract(record, expected_identity=expected_identity)
     missing = [field for field in _RECEIPT_FIELDS if field not in record]
     if missing:
         raise ResultContractError("result_receipt_payload_incomplete")

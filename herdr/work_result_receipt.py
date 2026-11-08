@@ -84,7 +84,13 @@ class WorkResultAuthority:
         key = self._key(task, plan)
         receipt = self.store.read("work-result", key)
         try:
-            receipt_payload = receipt_payload_for_result(payload)
+            expected_identity = None
+            if isinstance(task, dict) and {"repo", "issue", "id", "attempt_id", "run_token",
+                                          "fencing_token", "ownership_epoch", "idempotency_key",
+                                          "consumer"} <= set(task):
+                from .result_contract import ResultIdentity
+                expected_identity = ResultIdentity.from_task(task).to_dict()
+            receipt_payload = receipt_payload_for_result(payload, expected_identity=expected_identity)
         except ResultContractError as exc:
             raise EvidenceError(f"result receipt projection invalid: {exc}") from exc
         candidate = completion_candidate(payload, workspace=task["workspace"])

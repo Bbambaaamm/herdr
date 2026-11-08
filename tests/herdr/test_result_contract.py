@@ -101,6 +101,13 @@ def test_receipt_projection_rejects_incomplete_canonical_payload():
         receipt_payload_for_result(record)
 
 
+def test_receipt_projection_requires_authoritative_identity_when_supplied():
+    record = canonical_result_for_task(task(), result())
+    foreign = dict(record["identity"], attempt_id=99)
+    with pytest.raises(ResultContractError, match="result_contract_identity_mismatch"):
+        receipt_payload_for_result(record, expected_identity=foreign)
+
+
 def test_missing_publication_timestamp_is_not_filled_from_wall_clock():
     raw = result()
     raw.pop("completed_at")
