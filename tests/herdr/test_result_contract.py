@@ -1,0 +1,145 @@
+import copy
+
+import pytest
+
+from herdr.reconciliation import DecisionStatus, DurableEvidence, TaskIdentity, TaskSnapshot, reconcile_task
+from herdr.result_contract import (
+    RESULT_SCHEMA,
+    ResultContractError,
+    canonical_result_for_task,
+    validate_result_contract,
+)
+
+
+def task(**changes):
+    value = {
+        "repo": "Bbambaaamm/herdr", "issue": 79, "id": "task-79", "attempt_id": 3,
+        "run_token": "run-3", "fencing_token": 8,
+        "ownership_epoch": {"version": 1, "run_token": "run-3", "fencing_token": 8},
+        "idempotency_key": "idem-79-3", "consumer": "github:Bbambaaamm/herdr",
+        "parent_task_id": "parent-1", "parent_run_token": "parent-run-1",
+        "attempt_state": "working",
+    }
+    value.update(changes)
+    return value
+
+
+def result(**changes):
+    value = {
+        "status": "completed", "evidence": [{"artifact": "sha256:" + "a" * 64}],
+        "summary": "verified fixture", "completed_at": "2026-11-08T10:00:00Z",
+    }
+    value.update(changes)
+    return value
+
+
+def snapshot(**changes):
+    identity = TaskIdentity(
+        repository="Bbambaaamm/herdr", issue="79", task_id="task-79", attempt_id=3,
+        run_token="run-3", fencing_token=8,
+        ownership_epoch={"version": 1, "run_token": "run-3", "fencing_token": 8},
+        idempotency_key="idem-79-3", consumer="github:Bbambaaamm/herdr",
+        parent_task_id="parent-1", parent_run_token="parent-run-1",
+    )
+    durable_values = {"status": "completed", "result_exists": True,
+                      "completion_authority": True}
+    durable_values.update(changes)
+    durable = DurableEvidence(**durable_values)
+    return TaskSnapshot(identity, durable)
+
+
+def test_new_result_contract_binds_complete_root_and_child_identity():
+    record = canonical_result_for_task(task(), result())
+    assert record["result_contract"]["schema"] == RESULT_SCHEMA
+    assert record["identity"]["attempt_id"] == 3
+    assert record["identity"]["parent_task_id"] == "parent-1"
+    assert validate_result_contract(record).to_dict() == record["identity"]
+
+
+def test_canonical_serialization_is_stable_and_does_not_add_secrets():
+    one = canonical_result_for_task(task(), result())
+    two = canonical_result_for_task(task(), result())
+    assert one == two
+    assert "prompt" not in one["result_contract"]
+    assert "credential" not in one["result_contract"]
+
+
+@pytest.mark.parametrize("field", [
+    "repo", "issue", "id", "attempt_id", "run_token", "fencing_token",
+    "ownership_epoch", "idempotency_key", "consumer",
+])
+def test_missing_authoritative_identity_never_gets_a_default(field):
+    raw = task()
+    raw.pop(field)
+    with pytest.raises(ResultContractError, match="authoritative_task_identity_incomplete"):
+        canonical_result_for_task(raw, result())
+
+
+@pytest.mark.parametrize("field, value", [
+    ("attempt_id", 2), ("run_token", "foreign"), ("fencing_token", 9),
+    ("idempotency_key", "foreign"), ("consumer", "github:other/repo"),
+    ("ownership_epoch", {"version": 1, "run_token": "foreign", "fencing_token": 8}),
+])
+def test_result_identity_conflict_is_fail_closed(field, value):
+    record = canonical_result_for_task(task(), result())
+    record["identity"][field] = value
+    with pytest.raises(ResultContractError):
+        validate_result_contract(record)
+
+
+@pytest.mark.parametrize("field, value", [
+    ("status", "done"), ("status", "terminal_unknown"), ("result_contract", {}),
+])
+def test_malformed_or_terminal_contract_does_not_validate(field, value):
+    record = canonical_result_for_task(task(), result())
+    record[field] = value
+    with pytest.raises(ResultContractError):
+        validate_result_contract(record)
+
+
+def test_terminal_unknown_is_explicit_and_precedes_completed_claim():
+    record = canonical_result_for_task(task(attempt_state="terminal_unknown"),
+                                       result(status="terminal_unknown"),
+                                       verification_state="terminal_unknown")
+    current = snapshot(status="completed", terminal_unknown=True, delivery_uncertain=True)
+    decision = reconcile_task(current, [record])
+    assert decision.status is DecisionStatus.RECOVERY_REQUIRED
+    assert decision.safe_to_retry is False
+
+
+def test_valid_contract_can_confirm_only_with_durable_host_acceptance():
+    record = canonical_result_for_task(task(), result(), verification_state="verified")
+    record["authoritative"] = True
+    record["result_identity"] = record["identity"]
+    decision = reconcile_task(snapshot(), [record], observed_at="fixed")
+    assert decision.status is DecisionStatus.RESULT_CONFIRMED
+    assert decision.safe_to_retry is False
+
+
+def test_invalid_contract_cannot_confirm_even_when_payload_looks_completed():
+    record = canonical_result_for_task(task(), result(), verification_state="verified")
+    record["authoritative"] = True
+    record["result_identity"] = record["identity"]
+    tampered = copy.deepcopy(record)
+    tampered["result_contract"]["authority"]["identity_binding"] = "0" * 64
+    decision = reconcile_task(snapshot(), [tampered])
+    assert decision.status is DecisionStatus.UNKNOWN
+    assert decision.reason_code == "result_contract_invalid"
+
+
+def test_delivery_uncertainty_remains_recovery_required_with_valid_contract():
+    record = canonical_result_for_task(task(), result(), verification_state="candidate")
+    decision = reconcile_task(snapshot(delivery_uncertain=True), [record])
+    assert decision.status is DecisionStatus.RECOVERY_REQUIRED
+    assert decision.safe_to_retry is False
+
+
+def test_human_gate_is_not_overridden_by_result_contract():
+    record = canonical_result_for_task(task(), result(), verification_state="verified")
+    record["authoritative"] = True
+    record["result_identity"] = record["identity"]
+    decision = reconcile_task(snapshot(status="blocked", blocker="human approval required",
+                                       completion_authority=False), [record])
+    assert decision.status is DecisionStatus.UNKNOWN
+    assert decision.safe_to_retry is False
+
