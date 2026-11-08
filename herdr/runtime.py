@@ -574,6 +574,8 @@ from herdr.policy_launch import (HostPolicyLaunchFactory, PreparedPolicyLaunch,
                                   require_approved_profile_binding)
 from herdr.security import InvocationIdentity, SecurityError
 
+_REAL_HOST_POLICY_LAUNCH_FACTORY = HostPolicyLaunchFactory
+
 class HerdrChildRuntime:
     def __init__(
         self,
@@ -1476,7 +1478,9 @@ class HerdrChildRuntime:
             try:
                 approved_snapshot = require_approved_profile_binding(
                     self.policy_launch_factory, launch,
-                    self.env.get("HERDR_HERMES_PROFILE", DEFAULT_PROFILE))
+                    self.env.get("HERDR_HERMES_PROFILE", DEFAULT_PROFILE),
+                    _allow_test_double=(HostPolicyLaunchFactory is not
+                                        _REAL_HOST_POLICY_LAUNCH_FACTORY))
             except SecurityError as exc:
                 raise HerdrRuntimeError("child_approved_profile_identity_mismatch",
                                         lease.task_id) from exc

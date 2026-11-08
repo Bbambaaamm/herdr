@@ -1437,7 +1437,8 @@ class HostPolicyLaunchFactory:
         return cleanup_orphan(self.storage, identity)
 
 
-def require_approved_profile_binding(factory, launch, expected_name):
+def require_approved_profile_binding(factory, launch, expected_name, *,
+                                     _allow_test_double=False):
     """Fail closed unless the caller carries the host-approved profile binding.
 
     The factory remains the sole approval authority. This shared caller gate
@@ -1445,12 +1446,10 @@ def require_approved_profile_binding(factory, launch, expected_name):
     from becoming execution authority. Schema-1 callers retain the exact
     legacy path when neither side carries a private profile.
     """
-    factory_is_test_double = (
-        getattr(type(factory), "__module__", "").startswith("tests.")
-    )
-    launch_is_test_double = (
-        getattr(type(launch), "__module__", "").startswith("tests.")
-    )
+    factory_is_test_double = bool(_allow_test_double and
+                                  not isinstance(factory, HostPolicyLaunchFactory))
+    launch_is_test_double = bool(_allow_test_double and
+                                 not isinstance(launch, PreparedPolicyLaunch))
     _require(isinstance(factory, HostPolicyLaunchFactory) or factory_is_test_double,
              "typed host policy factory required")
     _require(isinstance(launch, PreparedPolicyLaunch) or launch_is_test_double,
