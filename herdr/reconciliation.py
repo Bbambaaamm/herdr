@@ -13,6 +13,7 @@ from enum import StrEnum
 from typing import Any, Iterable, Mapping
 
 from .evidence import canonical, digest
+from .result_contract import ResultContractError, validate_result_contract
 
 
 class ReconciliationError(ValueError):
@@ -81,7 +82,7 @@ class TaskIdentity:
     attempt_id: int | None
     run_token: str | None
     fencing_token: int | None
-    ownership_epoch: int | None
+    ownership_epoch: int | Mapping[str, Any] | None
     idempotency_key: str | None
     consumer: str | None
     parent_task_id: str | None = None
@@ -92,10 +93,21 @@ class TaskIdentity:
             value = getattr(self, name)
             if value is not None:
                 _text(value, f"identity.{name}")
-        for name in ("attempt_id", "fencing_token", "ownership_epoch"):
+        for name in ("attempt_id", "fencing_token"):
             value = getattr(self, name)
             if value is not None:
                 _integer(value, f"identity.{name}")
+        if self.ownership_epoch is not None:
+            if type(self.ownership_epoch) is int:
+                _integer(self.ownership_epoch, "identity.ownership_epoch")
+            elif isinstance(self.ownership_epoch, Mapping):
+                if set(self.ownership_epoch) != {"version", "run_token", "fencing_token"}:
+                    raise ReconciliationError("identity.ownership_epoch is invalid")
+                _integer(self.ownership_epoch.get("version"), "identity.ownership_epoch.version", minimum=1)
+                _text(self.ownership_epoch.get("run_token"), "identity.ownership_epoch.run_token")
+                _integer(self.ownership_epoch.get("fencing_token"), "identity.ownership_epoch.fencing_token", minimum=1)
+            else:
+                raise ReconciliationError("identity.ownership_epoch is invalid")
         if self.parent_task_id is not None:
             _text(self.parent_task_id, "identity.parent_task_id")
         if self.parent_run_token is not None:
@@ -111,10 +123,10 @@ class TaskIdentity:
             repository=value.get("repository", value.get("repo")),
             issue=value.get("issue"),
             task_id=value.get("task_id", value.get("id")),
-            attempt_id=value.get("attempt_id", value.get("attempt", value.get("attempts"))),
+            attempt_id=value.get("attempt_id", value.get("attempt")),
             run_token=value.get("run_token"),
             fencing_token=value.get("fencing_token"),
-            ownership_epoch=value.get("ownership_epoch", 0),
+            ownership_epoch=value.get("ownership_epoch"),
             idempotency_key=value.get("idempotency_key"),
             consumer=value.get("consumer"),
             parent_task_id=value.get("parent_task_id"),
@@ -320,7 +332,7 @@ def _result_identity(record: Mapping[str, Any]) -> dict[str, Any]:
         "run_token": identity.get("run_token"),
         "attempt_id": identity.get("attempt_id", identity.get("attempt")),
         "fencing_token": identity.get("fencing_token"),
-        "ownership_epoch": identity.get("ownership_epoch", 0),
+        "ownership_epoch": identity.get("ownership_epoch"),
         "idempotency_key": identity.get("idempotency_key"),
         "consumer": identity.get("consumer"),
         "parent_task_id": identity.get("parent_task_id"),
@@ -332,9 +344,24 @@ def _valid_result_identity(identity: Mapping[str, Any]) -> bool:
     required_text = ("task_id", "run_token", "idempotency_key", "consumer")
     if any(not isinstance(identity.get(field), str) or not identity.get(field) for field in required_text):
         return False
-    for field in ("attempt_id", "fencing_token", "ownership_epoch"):
+    for field in ("attempt_id", "fencing_token"):
         if type(identity.get(field)) is not int or identity[field] < 0:
             return False
+    epoch = identity.get("ownership_epoch")
+    if type(epoch) is int:
+        if epoch < 0:
+            return False
+    elif isinstance(epoch, Mapping):
+        if set(epoch) != {"version", "run_token", "fencing_token"}:
+            return False
+        if (type(epoch.get("version")) is not int or epoch["version"] < 1
+                or not isinstance(epoch.get("run_token"), str) or not epoch["run_token"]
+                or type(epoch.get("fencing_token")) is not int or epoch["fencing_token"] < 1
+                or epoch["run_token"] != identity.get("run_token")
+                or epoch["fencing_token"] != identity.get("fencing_token")):
+            return False
+    else:
+        return False
     for field in ("parent_task_id", "parent_run_token"):
         if identity.get(field) is not None and not isinstance(identity[field], str):
             return False
@@ -423,6 +450,20 @@ def reconcile_task(snapshot: TaskSnapshot | Mapping[str, Any], result_records: I
     if not _identity_complete(snapshot.identity):
         return _decision(snapshot, DecisionStatus.UNKNOWN, "incomplete_attempt_identity", refs,
                          identity_match=False, confidence="high", action="refresh_authoritative_identity",
+                         human_gate=False, policy_version=policy_version, observed_at=obs)
+
+    invalid_contract_refs = []
+    for record in records:
+        if "result_contract" not in record:
+            continue
+        try:
+            validate_result_contract(record)
+        except ResultContractError:
+            invalid_contract_refs.append("result_contract:" + digest(_redact(record.get("result_contract"))))
+    if invalid_contract_refs:
+        refs.extend(sorted(set(invalid_contract_refs)))
+        return _decision(snapshot, DecisionStatus.UNKNOWN, "result_contract_invalid", refs,
+                         identity_match=False, confidence="high", action="refresh_result_evidence",
                          human_gate=False, policy_version=policy_version, observed_at=obs)
 
     matching = [record for record in records if _matches(snapshot.identity, record)]

@@ -624,6 +624,22 @@ def verify_completion(root: Path, task: dict, result: dict, *, invocation_verifi
         if (not isinstance(result.get("summary"), str) or not result["summary"].strip()
                 or not isinstance(result.get("next_action"), str) or not result["next_action"].strip()):
             raise EvidenceError("immutable control cycle requires summary and next action")
+        receipt_result = original_result
+        sdk_receipt_fields = {
+            "task_id", "run_token", "fencing_token", "idempotency_key",
+            "status", "evidence", "artifact_sha256", "summary",
+        }
+        if (isinstance(original_result, dict)
+                and "result_contract" in original_result
+                and sdk_receipt_fields <= set(original_result)):
+            from herdr.result_contract import ResultContractError, ResultIdentity, receipt_payload_for_result
+            try:
+                receipt_result = receipt_payload_for_result(
+                    original_result,
+                    expected_identity=ResultIdentity.from_task(task).to_dict(),
+                )
+            except ResultContractError as exc:
+                raise EvidenceError("result receipt projection invalid") from exc
         key = digest({"identity": identity, "plan_hash": plan["plan_hash"]})
         previous, legacy = store.lookup_acceptance(identity, plan["plan_hash"])
         if previous is not None:
@@ -632,7 +648,7 @@ def verify_completion(root: Path, task: dict, result: dict, *, invocation_verifi
                     or previous.get("kind") != "control" or previous.get("level") != "control_cycle"
                     or previous.get("spec_hash") != plan["spec_hash"]
                     or previous.get("policy_hash") != plan["policy_hash"]
-                    or previous.get("proof", {}).get("result_digest") != digest(original_result)):
+                    or previous.get("proof", {}).get("result_digest") != digest(receipt_result)):
                 raise EvidenceError("immutable control outcome publication conflict")
             if legacy:
                 store.publish("accepted", key, previous)
@@ -641,15 +657,28 @@ def verify_completion(root: Path, task: dict, result: dict, *, invocation_verifi
                   "level": "control_cycle", "kind": "control", "spec_hash": plan["spec_hash"],
                   "policy_hash": plan["policy_hash"], "plan_hash": plan["plan_hash"],
                   "baseline": plan["baseline"], "environment": plan["environment"],
-                  "proof": {"source": "host-schema-v1", "result_digest": digest(original_result)},
+                  "proof": {"source": "host-schema-v1", "result_digest": digest(receipt_result)},
                   "integration": None, "deployment": None}
         return {**bundle, "bundle_hash": store.publish("accepted", key, bundle)}
     workspace = result.get("artifact_workspace")
     if not isinstance(workspace, str) or not Path(workspace).is_absolute():
         raise EvidenceError("immutable artifact workspace is missing")
     collector = collect_local_handoff if invocation_verifier is not None else collect_github
+    receipt_digest = None
+    if invocation_verifier is not None:
+        from herdr.result_contract import ResultIdentity, receipt_payload_for_result
+        try:
+            expected_identity = (
+                ResultIdentity.from_task(task).to_dict()
+                if isinstance(original_result, dict)
+                and "result_contract" in original_result else None
+            )
+            receipt_digest = digest(receipt_payload_for_result(
+                original_result, expected_identity=expected_identity))
+        except ValueError as exc:
+            raise EvidenceError("result receipt projection invalid") from exc
     return accept_artifact(task, result, plan, store, Path(workspace), collector,
-                           result_payload_sha256=digest(original_result) if invocation_verifier is not None else None,
+                           result_payload_sha256=receipt_digest,
                            invocation_verifier=invocation_verifier)
 
 

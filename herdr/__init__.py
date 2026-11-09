@@ -78,6 +78,14 @@ from .durable_identity_adapter import (
     read_legacy_json,
     reconcile_legacy_task,
 )
+from .result_contract import (
+    RESULT_SCHEMA,
+    RESULT_VERSION,
+    ResultContractError,
+    ResultIdentity,
+    canonical_result_for_task,
+    validate_result_contract,
+)
 
 __all__ = [
     "GRAPH_VERSION",
@@ -144,6 +152,12 @@ __all__ = [
     "normalize_legacy_result_records",
     "read_legacy_json",
     "reconcile_legacy_task",
+    "RESULT_SCHEMA",
+    "RESULT_VERSION",
+    "ResultContractError",
+    "ResultIdentity",
+    "canonical_result_for_task",
+    "validate_result_contract",
 ]
 __version__ = "0.2.0"
 from .workspace import (

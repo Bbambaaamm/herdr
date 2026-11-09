@@ -107,6 +107,13 @@ def matching_result(task: dict) -> tuple[dict | None, str]:
         return None, "task_id_mismatch"
     if str(payload.get("run_token") or "") != run_token:
         return None, "run_token_mismatch"
+    if "result_contract" in payload:
+        try:
+            from herdr.result_contract import ResultContractError, ResultIdentity, validate_result_contract
+            validate_result_contract(payload,
+                                     expected_identity=ResultIdentity.from_task(task).to_dict())
+        except (ResultContractError, ValueError, TypeError, KeyError):
+            return None, "result_contract_invalid"
     if task.get("parent_task_id"):
         evidence = payload.get("evidence")
         try:

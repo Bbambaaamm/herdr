@@ -46,6 +46,8 @@ FILES = (
          Path("docs/architecture/GITHUB_INTAKE_ADMISSION.md"),
     Path("docs/reconciliation/LEGACY_RESULT_SCHEMA_INVENTORY.md"),
     Path("docs/reconciliation/LEGACY_RESULT_SCHEMA_INVENTORY.json"),
+    Path("docs/reconciliation/RESULT_EVIDENCE_CONTRACT_V1.md"),
+    Path("docs/reconciliation/RESULT_EVIDENCE_CONTRACT_V1.json"),
 )
 OUTPUT = Path("provenance/CANONICAL_SOURCE_MANIFEST.sha256")
 TEXT_SUFFIXES = {

@@ -1,0 +1,27 @@
+{
+  "schema": "herdr-durable-result-v1",
+  "version": 1,
+  "live_replay": "NOT_RUN",
+  "physical_e2e": "NOT_RUN",
+  "authority_map": {
+    "attempt": "agent-stack/bin/agent-task-worker.prepare_attempt",
+    "candidate": "herdr_submit_result",
+    "completion": "agent_completion_evidence.verify_completion",
+    "transition": "existing worker and scheduler transition paths",
+    "consumer": "herdr.reconciliation.reconcile_task"
+  },
+  "identity": [
+    "repository", "issue", "task_id", "attempt_id", "run_token",
+    "fencing_token", "ownership_epoch", "idempotency_key", "consumer",
+    "parent_task_id", "parent_run_token"
+  ],
+  "unsupported_inference": [
+    "attempts_to_attempt_id", "missing_consumer", "missing_epoch",
+    "missing_repository", "missing_issue", "new_run_token",
+    "new_fencing_token", "new_idempotency_key"
+  ],
+  "retry_authority": false,
+  "durable_write_authority_added": false,
+  "provider_calls": false,
+  "economic_operations": false
+}

@@ -13,6 +13,7 @@ from herdr.reconciliation import (
     reconcile_snapshot,
     reconcile_task,
 )
+from herdr.result_contract import canonical_result_for_task
 
 
 def identity(**changes):
@@ -91,6 +92,26 @@ def test_duplicate_evidence_digest_is_order_independent():
     two = reconcile_task(current, [newer, older], observed_at="fixed")
     assert one.status is DecisionStatus.UNKNOWN
     assert one.decision_id == two.decision_id
+
+
+def test_invalid_contract_evidence_is_order_independent():
+    canonical_task = {
+        "repo": "Bbambaaamm/herdr", "issue": 79, "id": "task-79", "attempt_id": 3,
+        "run_token": "run-3", "fencing_token": 8,
+        "ownership_epoch": {"version": 1, "run_token": "run-3", "fencing_token": 8},
+        "idempotency_key": "idem-79-3", "consumer": "github:Bbambaaamm/herdr",
+    }
+    base = {"status": "completed", "evidence": [{"artifact": "sha256:" + "a" * 64}],
+            "summary": "fixture", "completed_at": "2026-11-08T10:00:00Z"}
+    first = canonical_result_for_task(canonical_task, base)
+    second = canonical_result_for_task(canonical_task, {**base, "summary": "other"})
+    first["result_contract"]["authority"]["identity_binding"] = "1" * 64
+    second["result_contract"]["authority"]["identity_binding"] = "2" * 64
+    one = reconcile_task(snapshot(), [first, second], observed_at="fixed")
+    two = reconcile_task(snapshot(), [second, first], observed_at="fixed")
+    assert one.reason_code == two.reason_code == "result_contract_invalid"
+    assert one.decision_id == two.decision_id
+    assert one.evidence_refs == two.evidence_refs
 
 
 def test_completed_status_without_authority_is_not_acceptance():

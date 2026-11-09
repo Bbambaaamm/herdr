@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import hashlib
+import fcntl
 import json
 import os
 import signal
@@ -102,6 +103,71 @@ def move(path: Path, target_dir: Path) -> Path:
 
 def result_path(task_id: str) -> Path:
     return RESULTS / f"{task_id}.json"
+
+
+def _canonical_result(task: dict, result: dict, *, verification_state: str) -> dict:
+    """Project a host-owned task identity into the v1 result contract."""
+    from herdr.result_contract import ResultContractError, canonical_result_for_task
+    try:
+        return canonical_result_for_task(task, result, verification_state=verification_state)
+    except ResultContractError as exc:
+        raise EvidenceError(exc.args[0]) from exc
+
+
+def _supports_result_contract(task: dict) -> bool:
+    """Schema-1 task rows remain on the immutable legacy result path."""
+    required = {"repo", "issue", "id", "attempt_id", "run_token", "fencing_token",
+                "ownership_epoch", "idempotency_key", "consumer"}
+    return isinstance(task, dict) and required <= set(task)
+
+
+def _rewrite_result_slot(path: Path, payload: dict) -> None:
+    """Rewrite the existing attempt-owned inode without replacing its xattrs."""
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False, allow_nan=False).encode("utf-8")
+    fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        before = os.fstat(fd)
+        named = path.lstat()
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or before.st_size != 0
+                or (before.st_dev, before.st_ino) != (named.st_dev, named.st_ino)
+                or before.st_size > 131072):
+            raise EvidenceError("result_slot_not_empty_under_publication_lock")
+        os.lseek(fd, 0, os.SEEK_SET)
+        view = memoryview(encoded)
+        while view:
+            count = os.write(fd, view)
+            if count <= 0:
+                raise EvidenceError("result_contract_write_incomplete")
+            view = view[count:]
+        os.ftruncate(fd, len(encoded))
+        os.fsync(fd)
+        after = os.fstat(fd)
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise EvidenceError("result_slot_changed_during_contract_publish")
+    finally:
+        os.close(fd)
+
+
+def _publish_result(path: Path, payload: dict) -> None:
+    """Publish only into an absent or already-reserved result slot.
+
+    Reserved attempt slots carry filesystem ownership/xattrs used by the
+    admission path.  Keep that inode and fail closed if another result is
+    already present; never replace an owned slot during evidence publication.
+    """
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        write_json(path, payload)
+        return
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise EvidenceError("result_slot_not_regular")
+    if info.st_size != 0:
+        raise EvidenceError("result_slot_already_published")
+    _rewrite_result_slot(path, payload)
 
 def archive_previous_result(task_id: str, attempt: int) -> None:
     rp = result_path(task_id)
@@ -1748,9 +1814,7 @@ def reconcile_completion_evidence(task: dict) -> bool:
     evidence = _swarm_snapshot_evidence(task, spec)
     if evidence is None:
         return False
-    write_json(
-        result_path(str(task["id"])),
-        {
+    payload = {
             "task_id": str(task["id"]),
             "run_token": str(task.get("run_token") or ""),
             "status": "completed",
@@ -1761,8 +1825,13 @@ def reconcile_completion_evidence(task: dict) -> bool:
             "blocker": None,
             "next_action": "Continue with the next dependency-safe orchestration slice.",
             "completed_at": utcnow().isoformat(),
-        },
-    )
+        }
+    try:
+        published = (_canonical_result(task, payload, verification_state="verified")
+                     if _supports_result_contract(task) else payload)
+        _publish_result(result_path(str(task["id"])), published)
+    except EvidenceError:
+        return False
     return True
 
 
@@ -1870,9 +1939,7 @@ def _block_task_locked(task_path: Path, task: dict, blocker: str, summary: str,
             task_path, task, "result path is not a regular file", all_terminal)
         return
     if info is None or info.st_size == 0:
-        write_json(
-            rp,
-            {
+        payload = {
                 "task_id": task_id,
                 "run_token": str(task.get("run_token") or ""),
                 "status": "blocked",
@@ -1883,8 +1950,15 @@ def _block_task_locked(task_path: Path, task: dict, blocker: str, summary: str,
                 "blocker": blocker,
                 "next_action": "Resolve the documented blocker, then requeue the same durable task without duplicating implementation.",
                 "completed_at": utcnow().isoformat(),
-            },
-        )
+            }
+        try:
+            published = (_canonical_result(task, payload, verification_state="candidate")
+                         if _supports_result_contract(task) else payload)
+            _publish_result(rp, published)
+        except EvidenceError as exc:
+            _defer_delivery_reconciliation_locked(
+                task_path, task, f"blocked result contract unavailable: {exc.code}", all_terminal)
+            return
     if defer_for_active_children(task_path, task, reason=summary, all_terminal=all_terminal):
         return
     clear_child_wait(task)
@@ -2017,7 +2091,55 @@ def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool)
         _defer_delivery_reconciliation_locked(task_path, task, "child result missing exact fence/idempotency/artifact evidence", all_terminal)
         return
 
+    # Closed SDK submissions do not carry a publication timestamp. Allocate a
+    # host-owned timestamp once and persist it with the attempt so replay uses
+    # the same value instead of a fresh wall-clock observation. Keep the
+    # receipt-bound legacy payload byte-for-byte unchanged; only the canonical
+    # projection receives the host metadata.
+    canonical_input = result
+    if ("result_contract" not in result and _supports_result_contract(task)
+            and not result.get("completed_at") and not result.get("observed_at")):
+        publication_at = task.get("result_publication_at")
+        if not isinstance(publication_at, str) or not publication_at:
+            publication_at = utcnow().isoformat()
+            task["result_publication_at"] = publication_at
+            write_json(task_path, task)
+        canonical_input = dict(result)
+        canonical_input["observed_at"] = publication_at
+
+    # Bind the candidate before any immutable completion verifier records its
+    # payload digest.  The accepted receipt must refer to these exact bytes;
+    # rewriting a verified result afterward would create a digest conflict on
+    # replay.  An already-bound slot is validated in place and never rebuilt
+    # from mutable task recovery fields.
+    try:
+        original_result = result
+        if "result_contract" in original_result:
+            from herdr.result_contract import ResultContractError, validate_result_contract
+            try:
+                from herdr.result_contract import ResultIdentity
+                validate_result_contract(original_result,
+                    expected_identity=ResultIdentity.from_task(task).to_dict())
+            except ResultContractError as exc:
+                raise EvidenceError(f"result_contract_invalid_on_replay:{exc}") from exc
+            result = original_result
+        elif _supports_result_contract(task):
+            result = _canonical_result(task, canonical_input, verification_state="candidate")
+            # The SDK submission xattr and WorkResultAuthority receipt bind the
+            # original nonempty bytes. Keep that receipt-bound payload intact;
+            # the envelope is verified as an in-memory projection and is never
+            # rewritten into an already-submitted inode.
+        else:
+            # Schema-1 task rows have no complete ResultIdentity. Preserve
+            # their established unwrapped result and legacy verifier path.
+            result = original_result
+    except EvidenceError as exc:
+        _defer_delivery_reconciliation_locked(
+            task_path, task, f"result contract publication requires reconciliation: {exc.code}", all_terminal)
+        return
+
     blocker = str(result.get("blocker") or "").strip()
+    verification_state = "candidate"
     if str(result.get("status") or "") == "completed" and (not blocker or blocker.lower() in {"none", "null"}):
         try:
             accepted = _verify_root_completion(task, result)
@@ -2043,6 +2165,8 @@ def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool)
         task["completion_bundle_hash"] = accepted.get("bundle_hash", accepted.get("result_digest"))
         task["verification_status"] = ("accepted" if verification_applies(task)
                                        else "legacy_unverified")
+        verification_state = ("verified" if accepted["level"] != "legacy_unverified_result"
+                              else "unverified")
 
     status = str(result.get("status") or "")
     blocker = str(result.get("blocker") or "").strip()
@@ -2064,6 +2188,16 @@ def _finish_locked(task_path: Path, task: dict, output: str, all_terminal: bool)
         write_json(task_path, task)
         return
     task.pop("watchdog_cleanup_blocker", None)
+    if status == "terminal_unknown" or str(result.get("verification_state") or "") == "terminal_unknown":
+        task["watchdog_blocker"] = "delivery_uncertain_requires_recovery"
+        task["recovery_action"] = "await_exact_result_or_inspect_session"
+        task["delivery_reconcile_pending"] = True
+        task["result_status"] = "terminal_unknown"
+        task["attempt_state"] = "delivery_uncertain"
+        task["last_error"] = "terminal_unknown result requires operator reconciliation; retry is forbidden"
+        write_json(task_path, task)
+        move(task_path, BLOCKED)
+        return
     task["agent_output_tail"] = output[-4000:]
     task["result_status"] = status
     task["finished_at"] = utcnow().isoformat()

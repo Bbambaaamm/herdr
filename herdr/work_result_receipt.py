@@ -80,13 +80,24 @@ class WorkResultAuthority:
 
     def verifier(self, task, payload, plan, *, work_plan_sha256):
         """Read the same immutable observation; it grants no new invocation."""
+        from .result_contract import ResultContractError, receipt_payload_for_result
         key = self._key(task, plan)
         receipt = self.store.read("work-result", key)
+        try:
+            expected_identity = None
+            if isinstance(task, dict) and {"repo", "issue", "id", "attempt_id", "run_token",
+                                          "fencing_token", "ownership_epoch", "idempotency_key",
+                                          "consumer"} <= set(task):
+                from .result_contract import ResultIdentity
+                expected_identity = ResultIdentity.from_task(task).to_dict()
+            receipt_payload = receipt_payload_for_result(payload, expected_identity=expected_identity)
+        except ResultContractError as exc:
+            raise EvidenceError(f"result receipt projection invalid: {exc}") from exc
         candidate = completion_candidate(payload, workspace=task["workspace"])
         artifact = parse_artifact(candidate.get("artifact"))
         expected = {"version": 1, "identity": binding(task), "invocation": invocation_identity(task).to_json(),
                     "plan_hash": plan["plan_hash"], "spec_hash": plan["spec_hash"], "policy_hash": plan["policy_hash"],
-                    "work_plan_sha256": work_plan_sha256, "result_payload_sha256": digest(payload),
+                    "work_plan_sha256": work_plan_sha256, "result_payload_sha256": digest(receipt_payload),
                     "artifact": artifact.to_json(), "workspace": str(task["workspace"]),
                     "launch_policy": (task["execution_session"] or {}).get("invocation_policy"),
                     "level": "verified_local_artifact"}
