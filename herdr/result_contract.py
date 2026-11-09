@@ -168,7 +168,7 @@ def canonical_result_for_task(task: Mapping[str, Any], result: Mapping[str, Any]
     if verification_state not in _VERIFICATION_STATES:
         raise ResultContractError("verification_state_invalid")
     producer = _text(producer, "result.producer", maximum=128)
-    if status == "terminal_unknown" and verification_state != "terminal_unknown":
+    if (status == "terminal_unknown") != (verification_state == "terminal_unknown"):
         raise ResultContractError("terminal_unknown_requires_terminal_state")
     existing = result.get("identity")
     if existing is not None and ResultIdentity.from_dict(existing).to_dict() != identity.to_dict():
