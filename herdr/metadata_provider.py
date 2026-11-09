@@ -34,7 +34,7 @@ def layout_metadata(context):
     arity = {"--tmpfs": 1, "--dir": 1, "--dev": 1, "--proc": 1, "--remount-ro": 1,
         "--chdir": 1, "--setenv": 2, "--unsetenv": 1, "--ro-bind": 2,
         "--bind-fd": 2, "--ro-bind-fd": 2, "--ro-bind-data": 2,
-        "--unshare-pid": 0, "--die-with-parent": 0, "--disable-userns": 0, "--cap-drop": 1}
+        "--unshare-user": 0, "--unshare-pid": 0, "--die-with-parent": 0, "--disable-userns": 0, "--cap-drop": 1}
     while i < end:
         operation = argv[i]; require(operation in arity and i + arity[operation] < end, "closed_layout_grammar_required")
         values = argv[i + 1:i + 1 + arity[operation]]; i += 1 + arity[operation]

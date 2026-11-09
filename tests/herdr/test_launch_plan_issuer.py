@@ -456,7 +456,7 @@ def physical(live, monkeypatch):
     argv = ["/usr/bin/bwrap", "--tmpfs", "/",
             *(part for name in sorted(credential_isolation.SYSTEM_RUNTIME_FILES)
               for part in ("--ro-bind", name, name)),
-            "--dev", "/dev", "--unshare-pid", "--die-with-parent",
+            "--dev", "/dev", "--unshare-user", "--unshare-pid", "--die-with-parent",
             "--disable-userns", "--cap-drop", "ALL",
             "--tmpfs", "/tmp", "--tmpfs", "/home/agentops", "--proc", "/proc", "--chdir", grant.workspace_root,
             "--tmpfs", "/home/agentops/.config/herdr", "--tmpfs", "/opt/agent-platform", "--tmpfs", "/run"]
@@ -595,10 +595,18 @@ def test_accepts_the_actual_native_builder_command(physical, monkeypatch, grant_
     mount.require_immutable_runtime = lambda: None  # Disposable roots cannot claim privileged immutability.
     mount.private_workspace_pin = p.live.work; mount.private_result_pin = p.live.output
     mount.private_identity = p.grant.identity
+    # A socketpair has no pathname; the real bootstrap verifies that the
+    # root-owned broker FD and pathname designate the same socket inode.
+    # Use a disposable *named* UNIX socket for this physical builder test.
+    broker_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    broker_path = p.bundle.parent / "bootstrap.sock"
+    broker_socket.bind(str(broker_path))
+    broker_socket.listen(1)
+    broker_fd = os.open(broker_path, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
     broker = HostBootstrap.__new__(HostBootstrap)
-    broker.tree = p.bootstrap; broker.socket_path = p.bundle.parent / "bootstrap.sock"
-    broker.socket_fd = p.fds[-3]
-    info = os.fstat(broker.socket_fd); broker.socket_identity = (info.st_dev, info.st_ino)
+    broker.tree = p.bootstrap; broker.socket_path = broker_path
+    broker.socket_fd = broker_fd
+    info = os.fstat(broker_fd); broker.socket_identity = (info.st_dev, info.st_ino)
     mount.bootstrap = broker
     module = sandbox_module()
     if not (module.BWRAP.is_file() and Path("/home/agentops/.local/bin/herdr").is_file()
@@ -625,6 +633,9 @@ def test_accepts_the_actual_native_builder_command(physical, monkeypatch, grant_
             with pytest.raises(SecurityError, match="write mount exceeds host grant"):
                 issuer._physical(*args)
     finally:
+        os.close(broker_fd)
+        broker_socket.close()
+        broker_path.unlink(missing_ok=True)
         for fd in mount.private_cli_pins.values(): os.close(fd)
         if mount.resolver_snapshot is not None: mount.resolver_snapshot.close()
         stage.close()
@@ -633,7 +644,8 @@ def test_accepts_the_actual_native_builder_command(physical, monkeypatch, grant_
 @pytest.mark.parametrize("fault", ["fd-reorder", "fd-number", "profile-hash", "writable-code", "late-root-bind", "late-home",
                                    "arbitrary-command", "result-intent", "result-bytes", "bootstrap-bytes", "bundle-bytes",
                                    "missing-runtime", "work-write", "literal-write", "namespace", "unknown-option",
-                                   "missing-custody", "duplicate-custody"])
+                                   "missing-custody", "duplicate-custody",
+                                   "missing-userns", "duplicate-userns"])
 def test_physical_policy_rejects_source_and_command_attacks(physical, fault):
     p = physical; argv = list(p.argv); entries = deepcopy(p.plan["descriptors"]); fds = list(p.fds)
     extra = None
@@ -659,6 +671,8 @@ def test_physical_policy_rejects_source_and_command_attacks(physical, fault):
         at = argv.index(target); del argv[at - 2:at + 1]
     elif fault == "work-write": argv[argv.index(str(p.live.work.fd)) - 1] = "--bind-fd"
     elif fault == "literal-write": argv[argv.index("--"):argv.index("--")] = ["--bind", "/tmp", "/tmp"]
+    elif fault == "missing-userns": argv.remove("--unshare-user")
+    elif fault == "duplicate-userns": argv.insert(argv.index("--unshare-user"), "--unshare-user")
     elif fault == "namespace": argv.remove("--unshare-pid")
     elif fault == "missing-custody": argv.remove("--die-with-parent")
     elif fault == "duplicate-custody": argv.insert(argv.index("--"), "--die-with-parent")

@@ -336,7 +336,7 @@ if private_home:
     # --args: recursive option expansion bypasses ordinary mount validation.
     # Deny capability grants, alternate PID namespaces, fail-open modes and
     # new options unless independently audited and added to this contract.
-    flags = {"--unshare-pid", "--die-with-parent", "--unshare-net",
+    flags = {"--unshare-user", "--unshare-pid", "--die-with-parent", "--unshare-net",
              "--disable-userns"}
     path_options = {"--dev", "--proc", "--tmpfs", "--dir", "--chdir",
                     "--remount-ro"}
@@ -405,7 +405,8 @@ if private_home:
         or sum(option == "--proc" and value == ["/proc"]
                for option, value, _ in parsed) != 1):
         raise SystemExit("policy_fd_private_proc_missing")
-    if (sum(option == "--disable-userns" for option, _, _ in parsed) != 1
+    if (sum(option == "--unshare-user" for option, _, _ in parsed) != 1
+        or sum(option == "--disable-userns" for option, _, _ in parsed) != 1
         or sum(option == "--cap-drop" and value == ["ALL"]
                for option, value, _ in parsed) != 1):
         raise SystemExit("policy_fd_private_lifetime_boundary_missing")
@@ -870,6 +871,7 @@ def command(
         *((part for name in sorted(_system_runtime_files) for part in
            ("--ro-bind", name, name)) if private_profile_mounts else []),
         "--dev", "/dev",
+        *(["--unshare-user"] if private_profile_mounts else []),
         "--unshare-pid",
         *(["--disable-userns", "--cap-drop", "ALL"] if private_profile_mounts else []),
         *(["--die-with-parent"] if admission_root is not None else []),
