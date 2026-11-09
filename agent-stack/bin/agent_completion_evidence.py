@@ -625,7 +625,13 @@ def verify_completion(root: Path, task: dict, result: dict, *, invocation_verifi
                 or not isinstance(result.get("next_action"), str) or not result["next_action"].strip()):
             raise EvidenceError("immutable control cycle requires summary and next action")
         receipt_result = original_result
-        if isinstance(original_result, dict) and "result_contract" in original_result:
+        sdk_receipt_fields = {
+            "task_id", "run_token", "fencing_token", "idempotency_key",
+            "status", "evidence", "artifact_sha256", "summary",
+        }
+        if (isinstance(original_result, dict)
+                and "result_contract" in original_result
+                and sdk_receipt_fields <= set(original_result)):
             from herdr.result_contract import ResultContractError, ResultIdentity, receipt_payload_for_result
             try:
                 receipt_result = receipt_payload_for_result(
