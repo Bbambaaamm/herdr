@@ -232,7 +232,7 @@ def _argv(plan, argv, workspace, profile):
     arities = {"--ro-bind": 2, "--bind-fd": 2, "--ro-bind-fd": 2, "--ro-bind-data": 2,
                "--tmpfs": 1, "--dev": 1, "--proc": 1, "--dir": 1, "--chdir": 1,
                "--remount-ro": 1, "--setenv": 2, "--unsetenv": 1,
-               "--unshare-pid": 0, "--die-with-parent": 0,
+               "--unshare-user": 0, "--unshare-pid": 0, "--die-with-parent": 0,
                "--disable-userns": 0, "--cap-drop": 1}
     public = {"HOME": "/home/agentops", "PATH": "/run/herdr/policy-code/agent-stack/policy-bin:/usr/bin:/bin",
               "HERDR_DURABLE_SANDBOX": "1"}
@@ -263,7 +263,7 @@ def _argv(plan, argv, workspace, profile):
     required = {("--tmpfs", ("/",)), ("--remount-ro", ("/",)),
                 *(("--ro-bind", (name, name)) for name in SYSTEM_RUNTIME_FILES),
                 ("--dev", ("/dev",)), ("--proc", ("/proc",)),
-                ("--unshare-pid", ()), ("--die-with-parent", ()),
+                ("--unshare-user", ()), ("--unshare-pid", ()), ("--die-with-parent", ()),
                 ("--disable-userns", ()), ("--cap-drop", ("ALL",)),
                 ("--chdir", (workspace,)), ("--tmpfs", ("/tmp",)),
                 ("--tmpfs", ("/run",)), ("--tmpfs", ("/home/agentops",)),

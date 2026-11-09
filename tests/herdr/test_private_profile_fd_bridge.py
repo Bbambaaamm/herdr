@@ -92,7 +92,7 @@ def command_for(sandbox, snapshot, *, descriptors=None, opts=None):
         "/usr/bin/bwrap", "--tmpfs", "/",
         *(part for name in sorted(SYSTEM_RUNTIME_FILES)
           for part in ("--ro-bind", name, name)),
-        "--dev", "/dev", "--proc", "/proc", "--unshare-pid",
+        "--dev", "/dev", "--proc", "/proc", "--unshare-user", "--unshare-pid",
         "--disable-userns", "--cap-drop", "ALL", "--tmpfs", "/tmp",
         *profile_flags, "--tmpfs", "/run", "--tmpfs", "/home/agentops/.config/herdr",
         "--tmpfs", "/opt/agent-platform",
@@ -403,6 +403,9 @@ def test_unsealed_regular_fd_cannot_impersonate_profile_memfd(tmp_path):
     ("redirect_home", "policy_fd_private_home_env_invalid"),
     ("untrusted_profile_env", "policy_fd_private_home_env_invalid"),
     ("clearenv", "policy_fd_private_option_denied"),
+    ("omit_user_unshare", "policy_fd_private_lifetime_boundary_missing"),
+    ("duplicate_user_unshare", "policy_fd_private_lifetime_boundary_missing"),
+    ("omit_userns_disable", "policy_fd_private_lifetime_boundary_missing"),
     ("omit_pid_unshare", "policy_fd_private_proc_missing"),
     ("omit_proc_mount", "policy_fd_private_proc_missing"),
     ("shadow_proc", "policy_fd_private_proc_shadowed"),
@@ -462,7 +465,13 @@ def test_private_home_rejects_bubblewrap_grammar_and_environment_bypasses(
         elif attack == "duplicate_xdg_unset":
             opts[-2:-2] = ["--unsetenv", "XDG_DATA_HOME"]
         command = command_for(sandbox, snapshot, opts=opts)
-        if attack == "omit_pid_unshare":
+        if attack == "omit_user_unshare":
+            command.remove("--unshare-user")
+        elif attack == "duplicate_user_unshare":
+            command.insert(command.index("--unshare-user"), "--unshare-user")
+        elif attack == "omit_userns_disable":
+            command.remove("--disable-userns")
+        elif attack == "omit_pid_unshare":
             command.remove("--unshare-pid")
         elif attack == "omit_proc_mount":
             index = command.index("--proc")
