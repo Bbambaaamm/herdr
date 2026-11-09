@@ -140,7 +140,7 @@ class ResultIdentity:
 
 def _result_status(result: Mapping[str, Any]) -> str:
     status = result.get("status")
-    if status not in RESULT_STATUSES:
+    if not isinstance(status, str) or status not in RESULT_STATUSES:
         raise ResultContractError("result_status_invalid")
     return status
 
@@ -285,6 +285,10 @@ def validate_result_contract(record: Mapping[str, Any], *, expected_identity: Ma
     if (not isinstance(authority.get("verification_state"), str)
             or authority.get("verification_state") not in _VERIFICATION_STATES):
         raise ResultContractError("result_contract_verification_state_invalid")
+    verification_state = authority["verification_state"]
+    status = _result_status(record)
+    if ((verification_state == "terminal_unknown") != (status == "terminal_unknown")):
+        raise ResultContractError("result_contract_terminal_state_invalid")
     recovery = envelope["recovery"]
     if not isinstance(recovery, Mapping) or not isinstance(recovery.get("delivery_uncertain"), bool) or not isinstance(recovery.get("terminal_unknown"), bool):
         raise ResultContractError("result_contract_recovery_invalid")

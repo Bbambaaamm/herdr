@@ -164,6 +164,32 @@ def test_terminal_unknown_is_explicit_and_precedes_completed_claim():
     assert decision.safe_to_retry is False
 
 
+@pytest.mark.parametrize("status", [[], {}, 1, True, None])
+def test_non_string_status_is_rejected_fail_closed(status):
+    with pytest.raises(ResultContractError, match="result_status_invalid"):
+        canonical_result_for_task(task(), result(status=status))
+
+
+@pytest.mark.parametrize("status, verification_state", [
+    ("failed", "terminal_unknown"),
+    ("completed", "terminal_unknown"),
+    ("terminal_unknown", "candidate"),
+])
+def test_terminal_unknown_authority_state_must_match_result_status(status, verification_state):
+    if status == "terminal_unknown":
+        with pytest.raises(ResultContractError, match="terminal_unknown_requires_terminal_state"):
+            canonical_result_for_task(
+                task(attempt_state="terminal_unknown"),
+                result(status=status),
+                verification_state=verification_state,
+            )
+        return
+    record = canonical_result_for_task(
+        task(attempt_state="working"), result(status=status), verification_state=verification_state)
+    with pytest.raises(ResultContractError, match="terminal_state_invalid"):
+        validate_result_contract(record)
+
+
 def test_valid_contract_can_confirm_only_with_durable_host_acceptance():
     record = canonical_result_for_task(task(), accepted_result(), verification_state="verified")
     decision = reconcile_task(snapshot(), [record], observed_at="fixed")

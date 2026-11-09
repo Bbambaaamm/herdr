@@ -624,6 +624,16 @@ def verify_completion(root: Path, task: dict, result: dict, *, invocation_verifi
         if (not isinstance(result.get("summary"), str) or not result["summary"].strip()
                 or not isinstance(result.get("next_action"), str) or not result["next_action"].strip()):
             raise EvidenceError("immutable control cycle requires summary and next action")
+        receipt_result = original_result
+        if isinstance(original_result, dict) and "result_contract" in original_result:
+            from herdr.result_contract import ResultContractError, ResultIdentity, receipt_payload_for_result
+            try:
+                receipt_result = receipt_payload_for_result(
+                    original_result,
+                    expected_identity=ResultIdentity.from_task(task).to_dict(),
+                )
+            except ResultContractError as exc:
+                raise EvidenceError("result receipt projection invalid") from exc
         key = digest({"identity": identity, "plan_hash": plan["plan_hash"]})
         previous, legacy = store.lookup_acceptance(identity, plan["plan_hash"])
         if previous is not None:
@@ -632,7 +642,7 @@ def verify_completion(root: Path, task: dict, result: dict, *, invocation_verifi
                     or previous.get("kind") != "control" or previous.get("level") != "control_cycle"
                     or previous.get("spec_hash") != plan["spec_hash"]
                     or previous.get("policy_hash") != plan["policy_hash"]
-                    or previous.get("proof", {}).get("result_digest") != digest(original_result)):
+                    or previous.get("proof", {}).get("result_digest") != digest(receipt_result)):
                 raise EvidenceError("immutable control outcome publication conflict")
             if legacy:
                 store.publish("accepted", key, previous)
@@ -641,7 +651,7 @@ def verify_completion(root: Path, task: dict, result: dict, *, invocation_verifi
                   "level": "control_cycle", "kind": "control", "spec_hash": plan["spec_hash"],
                   "policy_hash": plan["policy_hash"], "plan_hash": plan["plan_hash"],
                   "baseline": plan["baseline"], "environment": plan["environment"],
-                  "proof": {"source": "host-schema-v1", "result_digest": digest(original_result)},
+                  "proof": {"source": "host-schema-v1", "result_digest": digest(receipt_result)},
                   "integration": None, "deployment": None}
         return {**bundle, "bundle_hash": store.publish("accepted", key, bundle)}
     workspace = result.get("artifact_workspace")
