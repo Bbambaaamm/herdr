@@ -1,0 +1,22 @@
+{
+  "schema_version": "herdr-runtime-publication-proposal-1",
+  "state": "OPERATOR_REVIEW_REQUIRED",
+  "target_release": "v0.3.0-router-v5-p1d-rc6",
+  "target_commit": "8d8ad50375557b7ac77348e6475cb455682f4a9a",
+  "historical_review_inputs": [
+    "p0-5035d92-test",
+    "p0-8e34c6f-test"
+  ],
+  "candidate": {
+    "runtime_approval_request": null,
+    "root_owned_publication_record": null,
+    "code_manifest_sha256": null,
+    "hermes_manifest_sha256": null,
+    "python_manifest_sha256": null,
+    "operator_approved_version": null
+  },
+  "reused_manifest_is_not_an_approval": true,
+  "authorization_granted": false,
+  "publication_allowed": false,
+  "native_root_child_e2e_accepted": false
+}
