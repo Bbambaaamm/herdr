@@ -1,0 +1,44 @@
+{
+  "schema_version": "herdr-schema2-operator-proposal-1",
+  "state": "NOT_APPROVED_NOT_PUBLISHED",
+  "target": {
+    "release_tag": "v0.3.0-router-v5-p1d-rc6",
+    "release_commit": "8d8ad50375557b7ac77348e6475cb455682f4a9a"
+  },
+  "source_authorities": {
+    "runtime_approval": {
+      "operator_approved_request_sha256": null,
+      "root_owned_publication_record_path": null,
+      "record_sha256": null,
+      "code_manifest_sha256": null,
+      "hermes_manifest_sha256": null,
+      "python_manifest_sha256": null
+    },
+    "profile_approval": {
+      "root_approved_profile_manifest_sha256": null,
+      "credential_approval_expires_at": null,
+      "root_approved_profile_source": null
+    },
+    "host_policy": {
+      "schema_version_required": 2,
+      "approved_schema2_policy_sha256": null,
+      "preserve_existing_consumer_grants": true,
+      "preserve_existing_budget_limits": true,
+      "root_owned_policy_path": "/etc/herdr/host-policy.json"
+    },
+    "issuer_policy": {
+      "required_schema": "herdr-automatic-launch-plan-1",
+      "approved_issuer_policy_sha256": null,
+      "root_owned_policy_path": "/etc/herdr/launch-plan-issuer.json",
+      "host_policy_sha256_must_match": true
+    },
+    "one_shot_operator_canary": {
+      "separate_authorization_required": true,
+      "zero_providers": true,
+      "zero_cost": true,
+      "native_root_child_result_accepted": false
+    }
+  },
+  "authority_granted": false,
+  "deploy_allowed": false
+}
