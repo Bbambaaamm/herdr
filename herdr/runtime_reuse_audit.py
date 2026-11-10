@@ -16,33 +16,45 @@ ROLES = frozenset(('code', 'hermes', 'python'))
 
 
 def inspect_pair(request: dict, record: dict, *, tree_presence: dict[str, bool]):
-    """Pure inspection; cannot grant approval even if every check is true."""
+    """Pure inspection; malformed or stale evidence never becomes authority."""
+    req_trees = request.get('trees') if isinstance(request, dict) else None
+    rec_trees = record.get('trees') if isinstance(record, dict) else None
+    version = request.get('version') if isinstance(request, dict) else None
     candidate = (isinstance(request, dict) and isinstance(record, dict)
                  and request.get('schema_version') == 'herdr-runtime-publication-1'
-                 and set(request.get('trees', {})) == ROLES
-                 and set(record.get('trees', {})) == ROLES)
+                 and record.get('schema_version') in (
+                     'herdr-runtime-publication-1',
+                     'herdr-runtime-publication-record-1')
+                 and isinstance(version, str) and bool(version)
+                 and isinstance(req_trees, dict) and set(req_trees) == ROLES
+                 and isinstance(rec_trees, dict) and set(rec_trees) == ROLES)
     match = False
     old_format = False
+    current_record = False
     if candidate:
         try:
             approved = hashlib.sha256(canonical_json_bytes(request)).hexdigest()
             match = (record.get('approval_sha256') == approved
-                     and record.get('version') == request.get('version')
-                     and all(record['trees'][role]['manifest_sha256'] ==
-                             _manifest_sha256(request['trees'][role]['files'])
+                     and record.get('version') == version
+                     and all(isinstance(req_trees[role], dict)
+                             and isinstance(rec_trees[role], dict)
+                             and rec_trees[role]['manifest_sha256'] ==
+                             _manifest_sha256(req_trees[role]['files'])
                              for role in ROLES))
-            try:
-                validate_publication_record(record)
-            except (SecurityError, KeyError, TypeError, ValueError):
-                old_format = True
-            else:
-                old_format = False
-        except (KeyError, TypeError, ValueError):
+            if match:
+                try:
+                    validate_publication_record(record)
+                except (SecurityError, KeyError, TypeError, ValueError, AttributeError):
+                    old_format = record.get('schema_version') == 'herdr-runtime-publication-1'
+                else:
+                    current_record = True
+        except (SecurityError, KeyError, TypeError, ValueError, AttributeError, OverflowError):
             match = False
-    trees = {role: bool(tree_presence.get(role, False)) for role in sorted(ROLES)}
+    presence = tree_presence if isinstance(tree_presence, dict) else {}
+    trees = {role: presence.get(role) is True for role in sorted(ROLES)}
     return {'request_record_digest_match': match, 'tree_present': trees,
-            'current_record_contract_pass': candidate and not old_format and match,
-            'historical_record_only': old_format,
+            'current_record_contract_pass': current_record and match,
+            'historical_record_only': old_format and match,
             'source_only_reuse_candidate': match and all(trees.values()),
             'authorized_for_schema2': False,
             'can_publish_without_operator': False}
@@ -57,7 +69,9 @@ def inspect_root_owned_pair(request_path: Path, record_path: Path):
     trees = {}
     for role in ROLES:
         expected = record_path.parent / role
-        source = record.get('trees', {}).get(role, {}).get('source')
+        record_trees = record.get('trees')
+        row = record_trees.get(role) if isinstance(record_trees, dict) else None
+        source = row.get('source') if isinstance(row, dict) else None
         # Do not trust a manifest's own arbitrary source or follow symlinks.
         try:
             info = expected.lstat()
@@ -77,7 +91,7 @@ def audit_historical_publications(*, release_dir=Path('/opt/herdr/releases')):
         record = release_dir / f'{prefix}-test' / 'publication.json'
         try:
             rows[prefix] = inspect_root_owned_pair(request, record)
-        except (SecurityError, OSError, ValueError, KeyError, TypeError) as exc:
+        except (SecurityError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             rows[prefix] = {'status': 'BLOCKED', 'error': type(exc).__name__,
                             'authorized_for_schema2': False}
     return {'schema_version': VERSION, 'status': 'OPERATOR_REVIEW_REQUIRED',

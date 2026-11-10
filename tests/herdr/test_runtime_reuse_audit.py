@@ -75,3 +75,60 @@ def test_root_reader_and_missing_tree_do_not_generate_approval(monkeypatch, tmp_
     out = audit.inspect_root_owned_pair(request_path, record_path)
     assert not out['source_only_reuse_candidate']
     assert not out['authorized_for_schema2']
+
+
+@pytest.mark.parametrize('malformed', [None, 4, [{'unexpected': 1}], [1, 2], 'abc'])
+def test_invalid_tree_shapes_never_throw_or_approve(malformed):
+    req, rec = pair()
+    req['trees'] = malformed
+    out = audit.inspect_pair(req, rec, tree_presence={})
+    assert not out['source_only_reuse_candidate']
+    assert not out['historical_record_only']
+    assert not out['authorized_for_schema2']
+    req, rec = pair()
+    rec['trees'] = malformed
+    out = audit.inspect_pair(req, rec, tree_presence={})
+    assert not out['source_only_reuse_candidate']
+    assert not out['historical_record_only']
+
+
+@pytest.mark.parametrize('wrong', [None, '', 5, True])
+def test_missing_or_nonstring_version_never_matches(wrong):
+    req, rec = pair()
+    req['version'] = wrong
+    rec['version'] = wrong
+    req['schema_version'] = 'herdr-runtime-publication-1'
+    rec['approval_sha256'] = hashlib.sha256(canonical_json_bytes(req)).hexdigest()
+    out = audit.inspect_pair(req, rec, tree_presence=dict.fromkeys(rec['trees'], True))
+    assert not out['source_only_reuse_candidate']
+    assert not out['historical_record_only']
+
+
+def test_corrupt_modern_record_is_not_labeled_legacy():
+    req, rec = pair()
+    rec['schema_version'] = 'herdr-runtime-publication-record-1'
+    out = audit.inspect_pair(req, rec, tree_presence=dict.fromkeys(rec['trees'], True))
+    assert out['request_record_digest_match']
+    assert not out['historical_record_only']
+    assert not out['current_record_contract_pass']
+    assert not out['authorized_for_schema2']
+
+
+def test_mismatching_record_does_not_claim_legacy():
+    req, rec = pair()
+    rec['approval_sha256'] = '0' * 64
+    out = audit.inspect_pair(req, rec, tree_presence=dict.fromkeys(rec['trees'], True))
+    assert not out['historical_record_only']
+
+
+def test_malformed_record_trees_in_root_reader_are_fail_closed(monkeypatch, tmp_path):
+    req, rec = pair()
+    rec['trees'] = ['not-a-dict']
+    request_path = tmp_path / 'request.json'
+    record_path = tmp_path / 'historical' / 'publication.json'
+    record_path.parent.mkdir()
+    monkeypatch.setattr(audit, '_read_configuration',
+                        lambda path: req if path == request_path else rec)
+    out = audit.inspect_root_owned_pair(request_path, record_path)
+    assert not out['source_only_reuse_candidate']
+    assert not out['authorized_for_schema2']
