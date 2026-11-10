@@ -62,11 +62,14 @@ def evaluate(host: dict, issuer: dict, *, authority_root_exists: bool,
             checks["runtime_publication_record"] = True
     if isinstance(private, dict) and checks["host_schema_2"]:
         try:
+            ttl = host.get("grant_ttl_seconds")
+            if type(ttl) is not int or not 1 <= ttl <= 3600:
+                raise SecurityError("finite host grant lifetime required")
             _, expiry, floor = _private_profile(private)
             if not expiry > datetime.now(UTC) + timedelta(
-                seconds=max(floor, host.get("grant_ttl_seconds", 0) + 60)):
+                seconds=max(floor, ttl + 60)):
                 raise SecurityError("credential approval window expired or insufficient")
-        except (SecurityError, KeyError, TypeError, ValueError):
+        except (SecurityError, KeyError, TypeError, ValueError, OverflowError):
             pass
         else:
             checks["profile_credential_approval"] = True
@@ -99,6 +102,8 @@ def read_current(*, host_path=Path("/etc/herdr/host-policy.json"),
     """Use existing protected no-follow root reader; never follow task paths."""
     host = _read_configuration(host_path)
     issuer = _read_configuration(issuer_path)
+    if not isinstance(host, dict) or not isinstance(issuer, dict):
+        raise SecurityError("root policy and issuer records must be objects")
     private = host.get("private_launch")
     binding = private.get("runtime_publication") if isinstance(private, dict) else None
     publication = None

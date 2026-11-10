@@ -4,7 +4,9 @@ import json
 from pathlib import Path
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+if not sys.flags.isolated or not sys.dont_write_bytecode:
+    raise SystemExit("isolated interpreter -I -B required")
+sys.path.insert(0, str(Path(__file__).resolve(strict=True).parents[1]))
 from herdr.schema2_approval_audit import read_current
 from herdr.security import SecurityError
 

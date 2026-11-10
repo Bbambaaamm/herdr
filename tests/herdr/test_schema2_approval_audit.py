@@ -75,6 +75,7 @@ def test_read_current_only_uses_existing_root_validator(monkeypatch):
 def test_no_default_acceptance_even_if_every_structural_check_passed(monkeypatch):
     host, issuer = sample()
     host["schema_version"] = 2
+    host["grant_ttl_seconds"] = 300
     host["private_launch"] = {"plan_handoff": {"automatic_issuer": True},
                               "runtime_publication": {"version":"reviewed", "approval_sha256": "a"*64,
                                                       "trees": {"code":{"manifest_sha256":"b"*64}}}}
@@ -120,3 +121,26 @@ def test_checked_in_proposal_is_not_an_authorization():
     assert raw["source_authorities"]["host_policy"]["approved_schema2_policy_sha256"] is None
     assert raw["source_authorities"]["profile_approval"]["root_approved_profile_manifest_sha256"] is None
     assert raw["source_authorities"]["one_shot_operator_canary"]["native_root_child_result_accepted"] is False
+
+
+@pytest.mark.parametrize("ttl", [None, True, "60", 0, -1, 3601, 10**15])
+def test_invalid_grant_ttl_is_a_clean_fail_closed_status(monkeypatch, ttl):
+    from datetime import datetime, timedelta, UTC
+    host, issuer = sample()
+    host["schema_version"] = 2
+    host["grant_ttl_seconds"] = ttl
+    host["private_launch"] = {}
+    monkeypatch.setattr(audit, "_private_profile", lambda _: (
+        None, datetime.now(UTC) + timedelta(days=30), 60))
+    report = evaluate(host, issuer, authority_root_exists=True)
+    assert report["status"] == "ROOT_PREFLIGHT_BLOCKED"
+    assert report["checks"]["profile_credential_approval"] is False
+
+
+@pytest.mark.parametrize("bad", [None, 42, [], "bad"])
+def test_nonobject_trusted_policy_is_denied_before_attribute_access(monkeypatch, bad):
+    host, issuer = sample()
+    monkeypatch.setattr(audit, "_read_configuration", lambda path: bad)
+    from herdr.security import SecurityError
+    with pytest.raises(SecurityError, match="must be objects"):
+        read_current()
