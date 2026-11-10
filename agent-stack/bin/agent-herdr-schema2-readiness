@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""Offline report only; never install schema-2 policy or issue an approval."""
+import json
+from pathlib import Path
+import sys
+
+if not sys.flags.isolated or not sys.dont_write_bytecode:
+    raise SystemExit("isolated interpreter -I -B required")
+sys.path.insert(0, str(Path(__file__).resolve(strict=True).parents[2]))
+from herdr.schema2_approval_audit import read_current
+from herdr.security import SecurityError
+
+try:
+    report = read_current()
+except (OSError, ValueError, SecurityError) as error:
+    print(json.dumps({"status": "ROOT_PREFLIGHT_BLOCKED", "error": type(error).__name__}))
+    raise SystemExit(2)
+print(json.dumps(report, sort_keys=True))
+raise SystemExit(0 if report["status"] == "STATIC_GATES_PASS_NATIVE_E2E_PENDING" else 2)
