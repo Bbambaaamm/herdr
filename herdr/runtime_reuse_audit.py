@@ -41,7 +41,9 @@ def inspect_pair(request: dict, record: dict, *, tree_presence: dict[str, bool])
                              and rec_trees[role]['manifest_sha256'] ==
                              _manifest_sha256(req_trees[role]['files'])
                              for role in ROLES))
-            if match:
+            if match and all(isinstance(rec_trees[role].get('source'), str)
+                             and rec_trees[role]['source'].startswith('/')
+                             for role in ROLES):
                 try:
                     validate_publication_record(record)
                 except (SecurityError, KeyError, TypeError, ValueError, AttributeError):
@@ -55,7 +57,7 @@ def inspect_pair(request: dict, record: dict, *, tree_presence: dict[str, bool])
     return {'request_record_digest_match': match, 'tree_present': trees,
             'current_record_contract_pass': current_record and match,
             'historical_record_only': old_format and match,
-            'source_only_reuse_candidate': match and all(trees.values()),
+            'source_only_reuse_candidate': (current_record or old_format) and match and all(trees.values()),
             'authorized_for_schema2': False,
             'can_publish_without_operator': False}
 

@@ -111,6 +111,7 @@ def test_corrupt_modern_record_is_not_labeled_legacy():
     assert out['request_record_digest_match']
     assert not out['historical_record_only']
     assert not out['current_record_contract_pass']
+    assert not out['source_only_reuse_candidate']
     assert not out['authorized_for_schema2']
 
 
@@ -130,5 +131,15 @@ def test_malformed_record_trees_in_root_reader_are_fail_closed(monkeypatch, tmp_
     monkeypatch.setattr(audit, '_read_configuration',
                         lambda path: req if path == request_path else rec)
     out = audit.inspect_root_owned_pair(request_path, record_path)
+    assert not out['source_only_reuse_candidate']
+    assert not out['authorized_for_schema2']
+
+
+@pytest.mark.parametrize('source', [None, '', 'relative/path', 7])
+def test_legacy_record_requires_absolute_source_path(source):
+    req, rec = pair()
+    rec['trees']['code']['source'] = source
+    out = audit.inspect_pair(req, rec, tree_presence=dict.fromkeys(rec['trees'], True))
+    assert not out['historical_record_only']
     assert not out['source_only_reuse_candidate']
     assert not out['authorized_for_schema2']
