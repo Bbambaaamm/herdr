@@ -884,6 +884,9 @@ def bootstrap(hermes_args: list[str]) -> int:
                 raise ValueError("authenticated host reference mismatches signed grant")
         except (TypeError, ValueError, reference_module.HostReferenceDenied) as exc:
             raise SystemExit("authenticated host reference invalid") from exc
+        egress_module = importlib.import_module("herdr.host_reference_egress")
+        _require_module_origin(egress_module, policy_code_root, "herdr.host_reference_egress")
+        egress_module.require_network_isolated_host_reference(grant)
         # Arm a permanent process-wide SDK deny gate before importing Hermes.
         # It does not grant authority; independent WorkInvocationGuard still owns
         # all reserved model effects. Auxiliary SDK paths fail closed in host mode.
