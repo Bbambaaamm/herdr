@@ -4,9 +4,9 @@ This directory includes the review-only nonsecret reference contract and an
 **actual Hermes SDK source patch** based on the pinned external Hermes commit
 `ee5ee84a345204a3b1d6ef6ba1ab747e602867b9`.
 
-- External candidate commit (local isolated git worktree): `4a5edce10b53488103e6cd6bc216fed363bd656b`
+- External candidate commit (local isolated git worktree): `c5ccac0353e2b015723d43701817e5522b3f2819`
 - Transfer patch: `0001-host-reference-sdk-integration.patch.b64.txt` (base64-encoded Git format-patch; decode before `git am`).
-  SHA256 of decoded patch: `897af187ede2ab0d33b83a268f9771b6793a5facd70c1c4af1da01173ac06248`
+  SHA256 of decoded patch: `357f228a9badcaf2444e62fd862ddf92d9abcbb06cd1c1243c6f5137ba1a9979`
 - Module source: `agent/host_reference.py`, included in that patch.
 - Original SDK integration touches `run_agent.py`, `agent/agent_init.py`,
   `hermes_cli/cli_agent_setup_mixin.py` and adds 10 constructor/CLI seam tests.
