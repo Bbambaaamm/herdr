@@ -135,3 +135,15 @@ def deny_host_reference_mutation(agent):
     if getattr(agent, "_host_reference", None) is not None:
         assert_host_reference_runtime(agent)
         raise HostReferenceDenied("host reference forbids SDK route or credential mutation")
+
+
+def deny_host_direct_provider_call(agent):
+    """No direct SDK network path may carry a Herdr host reference.
+
+    The independently authenticated Herdr WorkInvocationGuard must reserve
+    and dispatch the effect using the host transport. Unwrapped SDK calls
+    are denied *before* opening a socket, creating a client or emitting tokens.
+    """
+    if getattr(agent, "_host_reference", None) is not None:
+        assert_host_reference_runtime(agent)
+        raise HostReferenceDenied("host reference requires guarded host model transport")

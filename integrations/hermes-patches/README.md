@@ -1,52 +1,59 @@
 # Hermes host-reference SDK patch — DRAFT / NOT DEPLOYABLE
 
-This folder contains an **external Hermes SDK patch** for the exact upstream
-commit `ee5ee84a345204a3b1d6ef6ba1ab747e602867b9`.
+Pinned external Hermes upstream commit:
+`ee5ee84a345204a3b1d6ef6ba1ab747e602867b9`.
 
-- Isolated Hermes candidate commit: `29d47ae3d81100a62d03056144542bb7c4f7aa91`
+- Isolated external candidate commit:
+  `6238133d7c636c353b4d2f18a749ac5c1f49fd21`
 - Transfer: `0001-host-reference-sdk-integration.patch.b64.txt`
-- Decoded Git patch SHA-256:
-  `49e5704c9ba0bee183c7e19f5b4981532ffad8a670d2bac92494883c41a1204a`
+- Decoded Git patch SHA256:
+  `668dff2d289ab2398d1ae960f2b2eef2f4314980cc7a6dac38487cde768fb02a`
 - Exact upstream `git apply --check`: PASS
-- Targeted Hermes constructor/CLI/effect and mutation-gate tests: 13 PASS
-- Herdr host-reference guard/contract suite: 58 PASS (includes 2 deletion/replacement negatives)
+- Focused external SDK tests: **17 PASS**
+- Previously verified Herdr guard and host-reference suite: **58 PASS**
 
-## Security design
+## Candidate hardening completed
 
-The host-authenticated stage2 reference is a frozen nonsecret object, not a key,
-pool selection or authority by itself. It reaches the deferred HermesCLI and
-AIAgent constructors; ordinary provider credentials, fallback and Nous keepalive
-are bypassed in this mode. The **original** object is validated before and after
-construction.
+Herdr stage2 must independently authenticate the reference and keep the
+original admitted object identity. The SDK patch uses a nonsecret frozen
+reference through deferred `HermesCLI -> AIAgent` initialization and disables
+normal key resolution/keepalive in host mode. The ordinary no-reference mode is
+unchanged in targeted tests.
 
-The patch denies host-mode runtime changes in credential-pool recovery,
-credential rotation, manual model switching, fallback activation and fallback
-pool rebinding. Every request-assembly attempt validates the effective
-provider/model/endpoint/api_mode and forbids raw SDK keys or forged pool identity.
-Herdr's independent guard additionally rejects any deletion/replacement of
-the original stage2-admitted reference, including when an SDK attribute was
-changed to `None`. This must remain independently authoritative.
+This candidate blocks post-construction SDK model switch, credential rotation,
+fallback activation and fallback pool rebinding. It checks route/pool/key
+identity before the request build and at provider-effect dispatch.
 
-## Remaining blockers — no acceptance or publication
+**Critical protection:** Direct SDK non-streaming/streaming provider transports,
+retry dispatch, and iteration-limit summary calls reject host-mode requests
+before opening the SDK transport. Only independently authenticated Herdr
+`WorkInvocationGuard` and host transport can perform model effects. A reference
+object alone never authorizes a model call.
 
-1. This is **not** upstream-approved and not a root-owned immutable runtime.
-2. No full Hermes CLI lifecycle, network-isolated native Hermes zero-provider
-   root→child→durable-result E2E or complete provider-effect interception audit.
-3. SDK background workers, route-change callbacks, retries after partial output,
-   concurrent fallback races and all direct model-call entrypoints still require
-   independent adversarial review.
-4. A clean upstream fork/review commit, new exact source inventory, updated
-   Hermes stage1/stage2/executor pins and independent CI/security review must
-   precede a *new* reviewed release candidate.
-5. Separate operator approval for root-owned publication/schema2 policy and
-   canary; RC6 stays fail-closed and no provider/model/queue calls are allowed.
+**Delegation:** Host-mode agents cannot launch a normal inherited
+`delegate_tool._build_child_agent` or background-review fork. A future managed
+child must be issued by a separately approved host authority and receive its
+own task identity, grant and budget, not an inherited SDK key.
 
-To verify that the patch applies without making any changes:
+## Not yet security-accepted
+
+- The direct auxiliary APIs in `agent/auxiliary_client.py` such as
+  `call_llm()`, their async/streaming variants, and external plugin/provider
+  clients can run without a particular AIAgent object. These need explicit
+  host-mode process-level denial or a verified centralized effect boundary
+  with independent review. Do not enable these in production.
+- Concurrency, stream callbacks after cancellation, direct raw transport
+  imports and plugin code need further adversarial tests; only selected
+  entrypoints are instrumented.
+- No full external Hermes regression run, approved fork, immutable Hermes
+  candidate release, regenerated source/executor pins or physical zero-provider
+  root->child->durable-result E2E.
+- No privileged root publication or active RC6 change. #132 remains OPEN,
+  #225 DRAFT and MUST NOT be merged as a complete resolution.
+
+To check the patch without applying it:
 
 ```sh
 base64 -d integrations/hermes-patches/0001-host-reference-sdk-integration.patch.b64.txt |
   git -C /path/to/exact/hermes-checkout apply --check -
 ```
-
-**Do not** patch the live Hermes checkout, change the existing historical
-root-owned source, waive source pins or merge PR #225 as final #132 acceptance.
