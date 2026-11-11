@@ -45,9 +45,17 @@ A second physical test runs the **real** `WorkAuthorityClient` inside the
 isolated user/PID/network namespace, passing its exact canonical
 `work-authorize` tool request to a pinned pathname AF_UNIX fixture broker.
 The fixture verifies the identity, digest, method and `SO_PEERCRED` before
-returning `work-ok`. Child host-loopback TCP remains unavailable. This proves
-the client transport can cross the namespace but does **not** attest the
-real root-owned `HostBootstrap` dispatcher or a live grant.
+returning `work-ok`. Child host-loopback TCP remains unavailable.
+
+A third test invokes the **real** `dispatch_work_connection` on a host
+thread with a prepared `HostWorkContractFactory` and a real child process
+identity observed using `inspect_peer` across the network namespace.
+The signed-grant/tool authorization succeeds once; a subsequent request
+with the wrong grant SHA-256 is rejected. The host mount verification
+entrypoint is a fixture adapter, **not** root-owned native
+`PolicyMount.verify_mounted`. This confirms dispatcher and client IPC, but
+not production `HostBootstrap` continuation, root launch plan, exact
+mounted tree attestation, or durable result acknowledgment.
 
 **Independent admission guard:** stage2 checks the origin-verified
 `herdr.host_reference_egress.require_network_isolated_host_reference(grant)`
