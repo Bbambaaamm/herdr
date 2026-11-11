@@ -41,6 +41,14 @@ The child connected successfully and the host verified the authentic
 A malformed-launch regression denies missing or duplicate `--unshare-net`
 even when the test approval plan is recomputed for the malformed command.
 
+A second physical test runs the **real** `WorkAuthorityClient` inside the
+isolated user/PID/network namespace, passing its exact canonical
+`work-authorize` tool request to a pinned pathname AF_UNIX fixture broker.
+The fixture verifies the identity, digest, method and `SO_PEERCRED` before
+returning `work-ok`. Child host-loopback TCP remains unavailable. This proves
+the client transport can cross the namespace but does **not** attest the
+real root-owned `HostBootstrap` dispatcher or a live grant.
+
 **Independent admission guard:** stage2 checks the origin-verified
 `herdr.host_reference_egress.require_network_isolated_host_reference(grant)`
 AFTER authenticating the grant and BEFORE arming SDK references or importing
