@@ -147,3 +147,22 @@ def deny_host_direct_provider_call(agent):
     if getattr(agent, "_host_reference", None) is not None:
         assert_host_reference_runtime(agent)
         raise HostReferenceDenied("host reference requires guarded host model transport")
+
+
+# One-way process-wide rejection mode, set only after the Herdr stage-two
+# process has independently authenticated the signed grant and reference.
+# This is a defense-in-depth SDK gate, NOT a security boundary against
+# arbitrary hostile Python code inside the same interpreter.
+_host_process_reference = None
+
+
+def arm_host_reference_process(reference):
+    global _host_process_reference
+    require(type(reference) is HostCredentialReference)
+    require(_host_process_reference is None or _host_process_reference is reference)
+    _host_process_reference = reference
+
+
+def deny_unmanaged_auxiliary_effect():
+    if _host_process_reference is not None:
+        raise HostReferenceDenied("host-mode auxiliary model effect requires host authority")

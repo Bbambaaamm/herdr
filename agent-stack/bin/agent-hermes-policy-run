@@ -884,6 +884,10 @@ def bootstrap(hermes_args: list[str]) -> int:
                 raise ValueError("authenticated host reference mismatches signed grant")
         except (TypeError, ValueError, reference_module.HostReferenceDenied) as exc:
             raise SystemExit("authenticated host reference invalid") from exc
+        # Arm a permanent process-wide SDK deny gate before importing Hermes.
+        # It does not grant authority; independent WorkInvocationGuard still owns
+        # all reserved model effects. Auxiliary SDK paths fail closed in host mode.
+        reference_module.arm_host_reference_process(reference_binding)
         guard._admitted_host_reference = reference_binding
     elif authenticated_reference is not None:
         raise SystemExit("unexpected host reference bootstrap response")
