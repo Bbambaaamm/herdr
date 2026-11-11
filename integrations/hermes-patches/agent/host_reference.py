@@ -107,3 +107,31 @@ def runtime_for_host_reference(reference, *, model_override=None, runtime_overri
         "credential_pool": pool,
         "source": "host-reference",
     }
+
+
+def assert_host_reference_runtime(agent):
+    """Check the original immutable identity at every SDK effect boundary.
+
+    The independently signed Herdr host guard must ALSO verify its own
+    admitted reference and reject any missing/changed agent attribute.
+    """
+    binding = getattr(agent, "_host_reference", None)
+    if binding is None:
+        return
+    require(type(binding) is HostCredentialReference)
+    validate_reference_runtime(
+        binding, provider=getattr(agent, "provider", None),
+        model=getattr(agent, "model", None),
+        base_url=getattr(agent, "base_url", None),
+        api_mode=getattr(agent, "api_mode", None),
+        api_key=getattr(agent, "api_key", None),
+        pool=getattr(agent, "_credential_pool", None),
+    )
+    require(getattr(agent, "fallback_model", None) is None)
+
+
+def deny_host_reference_mutation(agent):
+    """No SDK failover, key rotation or model switch after host admission."""
+    if getattr(agent, "_host_reference", None) is not None:
+        assert_host_reference_runtime(agent)
+        raise HostReferenceDenied("host reference forbids SDK route or credential mutation")
