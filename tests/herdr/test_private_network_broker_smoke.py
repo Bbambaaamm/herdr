@@ -69,7 +69,8 @@ print("PINNED_UNIX_BROKER_ACROSS_NETNS_PASS")
 '''.replace("PORT", str(port)).replace("HOST_NET", repr(os.readlink("/proc/self/ns/net")))
     args = [
         "/usr/bin/bwrap", "--ro-bind", "/", "/", "--unshare-net",
-        "--unshare-pid", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+        "--unshare-user", "--unshare-pid", "--disable-userns", "--cap-drop", "ALL",
+        "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
         "--tmpfs", "/run", "--dir", "/run/herdr-policy",
         "--ro-bind-fd", str(fd), "/run/herdr-policy/bootstrap-authority.sock",
         "--", sys.executable, "-I", "-B", "-c", child,
