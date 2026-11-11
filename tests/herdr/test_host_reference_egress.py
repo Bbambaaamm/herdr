@@ -48,10 +48,9 @@ def test_native_stage2_egress_gate_precedes_sdk_reference_arm_and_cli_import():
     assert check < arm < cli
 
 
-def test_private_profile_network_architecture_remains_blocked():
-    # Evidence of an architectural gap; fail-closed stage2 must remain until
-    # a separately reviewed private broker redesign physically isolates net.
+def test_private_profile_network_architecture_requires_isolation():
     src = (ROOT / "agent-stack/bin/agent_durable_sandbox.py").read_text()
-    assert "Keep the host network namespace" in src
+    assert '*(["--unshare-net"] if private_profile_mounts else [])' in src
+    assert 'sum(option == "--unshare-net" for option, _, _ in parsed) != 1' in src
     assert "require_network_isolated_host_reference(grant)" in (
         ROOT / "agent-stack/bin/agent-hermes-policy-run").read_text()

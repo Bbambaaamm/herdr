@@ -405,7 +405,8 @@ if private_home:
         or sum(option == "--proc" and value == ["/proc"]
                for option, value, _ in parsed) != 1):
         raise SystemExit("policy_fd_private_proc_missing")
-    if (sum(option == "--unshare-user" for option, _, _ in parsed) != 1
+    if (sum(option == "--unshare-net" for option, _, _ in parsed) != 1
+        or sum(option == "--unshare-user" for option, _, _ in parsed) != 1
         or sum(option == "--disable-userns" for option, _, _ in parsed) != 1
         or sum(option == "--cap-drop" and value == ["ALL"]
                for option, value, _ in parsed) != 1):
@@ -873,6 +874,11 @@ def command(
         "--dev", "/dev",
         *(["--unshare-user"] if private_profile_mounts else []),
         "--unshare-pid",
+        # Authenticated private Hermes is not a network client. Host model
+        # effects use the exact pinned pathname AF_UNIX authority socket,
+        # which works across network namespaces. This must not be optional
+        # for private-profile launches.
+        *(["--unshare-net"] if private_profile_mounts else []),
         *(["--disable-userns", "--cap-drop", "ALL"] if private_profile_mounts else []),
         *(["--die-with-parent"] if admission_root is not None else []),
         "--tmpfs", "/tmp",
@@ -924,10 +930,9 @@ def command(
         if private_profile_snapshot is None:
             for runtime_dir in _ephemeral_sdk_runtime_dirs(HOME):
                 args += ["--tmpfs", str(runtime_dir)]
-        # Keep the host network namespace: Hermes needs provider egress and
-        # the durable delegation bridge uses an abstract AF_UNIX socket, which
-        # is scoped by the network namespace. Network-capable model tools are
-        # denied by the explicit Hermes toolset allowlist instead.
+        # Private launch has its own network namespace. The authenticated
+        # host broker is a pinned pathname AF_UNIX mount, not a general TCP
+        # bridge. Legacy launch remains unchanged until separate migration.
 
     args += ["--tmpfs", str(HERDR_CONFIG), "--tmpfs", str(HERDR_RELEASES)]
     for path in {real_binary, real_binary.resolve(strict=True)}:

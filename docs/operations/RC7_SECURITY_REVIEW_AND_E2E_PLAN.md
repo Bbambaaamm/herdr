@@ -4,18 +4,23 @@
 **Baseline:** draft PR #225 / existing RC6 remains unchanged
 **Status:** SECURITY_STOP / NOT_READY_FOR_ROOT_PUBLICATION
 
-This is an independent *read-only technical review of the observed code and
-physical smoke probe*, not an independent third-party security approval.
+This is an engineering review of the isolated candidate and physical
+smoke probe, not an independent third-party security approval.
 All effects and deployment remain blocked pending exact-head review and host
 operator authorization.
 
 ## Verified P0 findings
 
-### P0-1 — Shared host network namespace in private Hermes sandbox
+### P0-1 — Private Hermes network namespace (candidate repair)
 
-`agent-stack/bin/agent_durable_sandbox.py` intentionally retains host netns:
-the existing abstract AF_UNIX delegation bridge is network-namespace scoped.
-The private Bubblewrap command does **not** require `--unshare-net`.
+Historical RC6 shared the host network namespace. The draft candidate changes
+`agent-stack/bin/agent_durable_sandbox.py` to require exactly one `--unshare-net`
+for private-profile launches, enforced at command generation and by the closed
+FD-launcher grammar.
+
+The actual host WorkAuthorityClient uses a **pathname AF_UNIX** socket at
+`/run/herdr-policy/bootstrap-authority.sock`, not an abstract socket. This
+socket can be mounted via pinned read-only FD across separate net namespaces.
 
 Physical staging smoke test: parent only listened on ephemeral
 `127.0.0.1`; a child Bubblewrap namespace sharing host net connected and
@@ -28,21 +33,28 @@ Hermes Python globals are mutable by arbitrary in-process Python code;
 their one-way deny flag is only defense in depth. A failed network gate
 MUST prevent even a zero-cost provider from being called.
 
-**Immediate code mitigation in draft PR:** stage2 calls the origin-verified
-`herdr.host_reference_egress.require_network_isolated_host_reference(grant)`
-AFTER checking the authenticated host grant/profile and BEFORE arming the
-SDK reference or importing Hermes CLI. It denies global/untyped network
-assurance, unverified sandbox or missing assurance. This deliberately
-**blocks current private host-reference activation** until redesign.
+**Physical candidate evidence:** a fixture-only host Unix listener was
+exposed to a private net namespace through a pinned read-only socket FD.
+The child connected successfully and the host verified the authentic
+`SO_PEERCRED` PID/UID/GID. The child's TCP connection to the parent's
+`127.0.0.1` listener was denied, including from a subprocess. No provider calls.
+A malformed-launch regression denies missing or duplicate `--unshare-net`
+even when the test approval plan is recomputed for the malformed command.
 
-**Required structural repair:** move delegation/model-effect authority to
-one host-owned broker reachable without sharing host network namespace,
-using an independently verified pathname AF_UNIX socket with pinned inode
-and peer credentials or a preconnected bounded FD channel. Recheck SCM_RIGHTS,
-path length, SO_PEERCRED, peer start ticks and PID/fencing identity. Ensure the
-broker alone can contact providers and only after exact reserve/charge/settle
-checks. The child must not have host network, bearer keys or writable broker
-configuration. No generic network proxy may be exposed as ambient authority.
+**Independent admission guard:** stage2 checks the origin-verified
+`herdr.host_reference_egress.require_network_isolated_host_reference(grant)`
+AFTER authenticating the grant and BEFORE arming SDK references or importing
+Hermes CLI. Global/unverified network assurance is denied. Immutable RC6
+remains unchanged and blocked.
+
+**Still required before network acceptance:** prove the full root-owned
+broker protocol (stage1, stage2, work budgets, parent-child ownership and
+durable result) works after net namespace isolation, not only a test socket.
+Recheck pinned inode, `SO_PEERCRED`, peer start ticks, fencing, `SCM_RIGHTS`,
+socket revocation and replay. Keep model egress exclusively in the host broker
+after exact reserve/charge/settle. The child must not receive host network,
+bearer keys, writable broker configuration or a generic TCP proxy. Complete
+IPv4/IPv6, UDP/DNS, plugin and grandchild egress denial tests.
 
 ### P0-2 — Insufficient proof of direct/provider effect coverage
 
@@ -84,7 +96,9 @@ replay after intentional interruption.
 
 ## Exact-head review disposition
 
-- **BLOCKER:** P0-1, P0-2, P0-3, P0-4 are open.
+- **BLOCKER:** P0-1 is mitigated in the isolated candidate with a
+  physical FD-mounted Unix socket/TCP smoke test but not accepted for native
+  root-owned broker E2E; P0-2, P0-3 and P0-4 remain open.
 - **Candidate code checks:** targeted unit/contract suites may pass while the
   OS isolation remains unsafe. They cannot waive a kernel or root gate.
 - **Review must be external to the code author** and record explicit
