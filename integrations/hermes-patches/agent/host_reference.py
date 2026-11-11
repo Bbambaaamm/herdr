@@ -84,3 +84,26 @@ def validate_reference_runtime(reference, *, provider, model, base_url,
             and base_url == reference.endpoint and api_mode == reference.api_mode)
     require(api_key is None or (type(api_key) is str and api_key == ""))
     pool.verify_binding(reference)
+
+
+def runtime_for_host_reference(reference, *, model_override=None, runtime_override=None):
+    """Return a credentialless fixed-route constructor envelope.
+
+    Only an authenticated Herdr stage-two caller may supply this object.
+    The SDK may not grant authority from this envelope; the host transport
+    and WorkInvocationGuard must independently approve every model effect.
+    """
+    require(type(reference) is HostCredentialReference
+            and model_override is None and runtime_override is None)
+    pool = ReferencePool(reference.provider, reference.credential_ref,
+                         reference.entry_id, reference)
+    return {
+        "model": reference.model,
+        "provider": reference.provider,
+        "requested_provider": reference.provider,
+        "base_url": reference.endpoint,
+        "api_mode": reference.api_mode,
+        "api_key": None,
+        "credential_pool": pool,
+        "source": "host-reference",
+    }
