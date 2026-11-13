@@ -172,3 +172,52 @@ replay after intentional interruption.
 - [ ] Operator explicitly authorizes privileged publication/canary.
 
 **Current verdict: NO-GO.** These are future gates, not completed milestones.
+
+
+## 2026-11-13 — Integrated zero-provider candidate evidence and hard stop
+
+A new physical test, `tests/herdr/test_real_dispatch_mount_cross_netns.py`,
+combines these operations in a **single fixture-owned run**:
+
+1. A Bubblewrap child is isolated with separate network, user and PID
+   namespaces, no capabilities, and four exact source FD-mounted policy trees.
+2. The host calls the real `PolicyMount.verify_mounted(pid)` against the
+   child's `/proc/<pid>/mountinfo`, verifying the grant file, policy-code,
+   Hermes and Python tree inode identities and read-only mount rows.
+3. The child uses the real `WorkAuthorityClient` through an FD-mounted
+   pathname AF_UNIX socket. The host calls real
+   `dispatch_work_connection` with `inspect_peer` verification of process
+   start ticks and executable inode, then authenticates the work contract.
+4. Correct work authorization succeeds; a second request using an incorrect
+   grant hash is denied.
+5. The sandbox child writes a bounded test result into a dedicated writable
+   workspace mount. The host runs real contract verification and artifact
+   sealing, persists a handoff event and reconstructs the finished work
+   cycle from the append-only host audit ledger, without re-planning.
+6. No provider call, model key, live issue execution, root publication,
+   service restart or production queue mutation is performed.
+
+This is **integrated physical fixture evidence**, **not accepted production
+root-owned stage1 -> stage2 -> managed child -> parent ACK E2E**. It uses
+temporary non-root-owned, unsigned/synthetic FrozenTrees and bundle source;
+the full signed `HostBootstrap` continuation, root-owned private mount-plan
+authority and real parent result publication transport are not exercised.
+A test-only broker wrapper supplies the authentic work grant and calls
+the actual mount verifier; it is not itself the root-owned HostBootstrap.
+Its initial host filesystem view is a fixture read-only bind, not the
+complete approved private HOME layout.
+
+The official physical bootstrap probe now calls
+`herdr.hermes_preflight.preflight_pinned_hermes_source` before any expensive
+source snapshot. On the actual installed checkout, it exits **1 / blocked**
+with `PINNED_HERMES_SOURCE_FILE_MISSING: agent/host_reference.py`. This is
+a desired fail-closed result, not a passed stage1/stage2 chain. The source
+preflight is presence-only: all later byte hashes, immutable inodes, root
+signatures and launch-policy checks are still mandatory.
+
+**Disposition remains NO-GO.** First finish the independently reviewed
+exact external Hermes commit, root-published stage1/stage2 code/manifest,
+approved schema-2 host launch policy, secure private HOME mount and broker
+proof; then run official native root -> child -> durable result -> parent
+ACK/replay with all negative controls. Never call a model or bypass the pin
+for the sake of a green test.
