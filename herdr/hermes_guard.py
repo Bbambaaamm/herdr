@@ -358,6 +358,11 @@ def _actual_provider_credential_ref(agent: Any, route: Any, *, guard=None, priva
     """Resolve the actual selected key through Hermes' credential pool identity."""
     refs = tuple(getattr(route, "credential_refs", ()) or ())
     binding = getattr(agent, "_host_reference", None)
+    admitted = getattr(guard, "_admitted_host_reference", None)
+    if admitted is not None and binding is not admitted:
+        # SDK code may delete/replace its mutable attribute. The independent
+        # stage2 admission must stay authoritative, never just the SDK flag.
+        raise PolicyDenied("host_reference_not_admitted_by_stage2")
     if binding is not None:
         from agent.host_reference import HostCredentialReference, ReferencePool, validate_reference_runtime
         pool = getattr(agent, "_credential_pool", None)
@@ -1129,7 +1134,12 @@ def install_hermes_guard(guard: InvocationGuard, *, private_sdk_policy=None,
             # observed network mode must not bypass the authenticated work port.
             host_transport = budgeted_transport and (private_sdk_policy is not None
                 or access == "none" or (callable(transport) and supported_host_route))
-            if getattr(agent, "_host_reference", None) is not None and not host_transport:
+            if (getattr(guard, "_admitted_host_reference", None) is not None
+                    and getattr(agent, "_host_reference", None)
+                        is not guard._admitted_host_reference):
+                raise PolicyDenied("host_reference_not_admitted_by_stage2")
+            if (getattr(agent, "_host_reference", None) is not None
+                    or getattr(guard, "_admitted_host_reference", None) is not None) and not host_transport:
                 raise PolicyDenied("host_reference_protected_transport_required")
             if host_transport:
                 if (not callable(transport) or agent.provider != "nous"

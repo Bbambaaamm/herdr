@@ -9,7 +9,7 @@ import subprocess
 import pytest
 
 from herdr.private_profile_namespace import PrivateProfileSnapshot
-from tests.herdr.test_private_profile_fd_bridge import bridge_module, command_for
+from tests.herdr.test_private_profile_fd_bridge import bridge_module, command_for, approved_invocation
 
 SDK = Path('/opt/herdr/releases/p0-5035d92-test/hermes')
 PYTHON = Path('/opt/herdr/releases/p0-5035d92-test/python/bin/python3.11')
@@ -32,7 +32,7 @@ def test_sdk_skeleton_adds_no_writable_profile_mounts(tmp_path):
         assert args[-2:] == ['--remount-ro',str(snapshot.home)]
 
 
-def test_pinned_sdk_initializes_without_writing_approved_profile(tmp_path):
+def test_private_profile_without_runtime_fd_denies_unpinned_sdk_exec(tmp_path):
     if not SDK.is_dir() or not PYTHON.is_file() or not Path('/home/agentops').is_dir() or not shutil.which('bwrap'):
         pytest.skip('fixed pinned Hermes SDK and Linux staging home required')
     source = tmp_path / 'approved'
@@ -65,12 +65,19 @@ print(json.dumps({'pinned_sdk_initialization':True,'profile_readonly':True,'priv
 '''
     with PrivateProfileSnapshot.from_approved(source, name='quantlab', approved_sha256=before) as snapshot:
         command = command_for(bridge_module(), snapshot)
-        command.insert(command.index('--unshare-pid'), '--unshare-net')
+        assert command.count('--unshare-net') == 1
         index = command.index('--')
         command[index:] = ['--', str(PYTHON), '-I', '-B', '-c', script, str(SDK), profile]
-        result = subprocess.run(command, capture_output=True, text=True, timeout=45)
+        descriptors = snapshot.fd_descriptors()
+        invocation, env, passed = approved_invocation(
+            tmp_path, command, descriptors, execute_bwrap=True)
+        result = subprocess.run(invocation, pass_fds=passed, env=env,
+                                capture_output=True, text=True, timeout=45)
         if 'Operation not permitted' in result.stderr or 'Creating new namespace failed' in result.stderr:
             pytest.skip('unprivileged namespaces disabled by runner')
-        assert result.returncode == 0, result.stdout + result.stderr
-        assert json.loads(result.stdout) == {'pinned_sdk_initialization':True,'profile_readonly':True,'private_logs_writable':True}
+        # This profile-only fixture does NOT mount the protected Hermes or
+        # Python runtime trees. A private root must deny the old /opt alias
+        # rather than silently falling back to host-owned mutable files.
+        assert result.returncode != 0
+        assert "No such file or directory" in result.stderr
     assert {name: hashlib.sha256((source/name).read_bytes()).hexdigest() for name in values} == before
