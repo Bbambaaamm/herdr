@@ -221,3 +221,41 @@ approved schema-2 host launch policy, secure private HOME mount and broker
 proof; then run official native root -> child -> durable result -> parent
 ACK/replay with all negative controls. Never call a model or bypass the pin
 for the sake of a green test.
+
+
+## 2026-11-14 — Exact Hermes source and lock-reproduced venv candidate
+
+Draft PR #225 adds a **new, non-deployable** Hermes runtime pin candidate,
+fully documented in `docs/operations/HERMES_RUNTIME_PIN_CANDIDATE_132.md`.
+The verified SDK source commit is `ef0342358f6421efb4ce919ba859d69940ca13b7`.
+The complete 1,821-file source digest is
+`d0bd4e3e6023166b3feed4b3fc47ac811d9453476866c8c5e4319bf1038f02fa`,
+and the lock-reproduced 108-dependency venv surface digest is
+`d986a36b26e4a57ce5a89fca094843c98b10f8d73c9185f95c09cb1da4172330`.
+Both passed the **actual** stage2 source/site verifiers. The new executor
+identity is `hermes:0.21.5:sha256:28cbd35dd0e7d738a321becce73eb05c91f269ac1c821e0e2adbfefd5b313b4b`.
+
+The earlier 1,249-file inventory omitted 572 Git-tracked Python files
+from declared runtime packages including `hermes_platform`, `plugins`
+and `gateway`. A first import in isolated netns failed. After adding
+exact candidate-commit sources (without test/developer .py files), the
+real `run_agent.AIAgent` and `hermes_cli.main` imported successfully
+in no-network safe mode. A lockfile venv compatibility check found
+108 compatible external distributions. See the machine-readable read-only
+audit `docs/evidence/hermes_runtime_candidate_132.audit.json`.
+
+A preflight against the unchanged historical installed Hermes still fails
+**as intended**, before runtime snapshotting:
+`PINNED_HERMES_SOURCE_FILE_MISSING: agent/host_reference.py`.
+This protects RC6 from adopting the new identity without an approved
+runtime. The CLI `--version` attempted through an uninstalled-project
+candidate did not provide a reliable terminal completion; no successful
+full native CLI startup is claimed.
+
+**Remaining release blockers unchanged:** independently reviewed and
+root-published Hermes/Python closure, project wheel and asset provenance,
+exact signed executor inventory, full host-bootstrap continuation,
+stage2 admission, durable managed-child parent ACK/replay, root-owned
+schema2 publication authorization, full negative kernel/plugin tests and
+independent exact-head security approval. No RC7 tag, deployment or
+provider/model call was made.
