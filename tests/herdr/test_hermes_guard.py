@@ -1025,3 +1025,14 @@ def test_read_only_logical_rule_cannot_acquire_an_attested_write_root():
     grant = types.SimpleNamespace(runtime_assurance=types.SimpleNamespace(
         sandbox_verified=True, writable_roots=('/work/child/result.py',)))
     assert hermes_guard._runtime_file_roots(grant, rules) == {'/work'}
+
+
+@pytest.mark.parametrize("replacement", [None, object()])
+def test_stage2_admitted_host_reference_cannot_be_deleted_or_replaced(replacement):
+    """SDK-owned attributes are mutable; the independent guard must retain authority."""
+    admitted = object()
+    route = types.SimpleNamespace(provider="nous", credential_refs=("pool:nous:approved",))
+    guard = types.SimpleNamespace(_admitted_host_reference=admitted)
+    agent = types.SimpleNamespace(_host_reference=replacement)
+    with pytest.raises(PolicyDenied, match="host_reference_not_admitted_by_stage2"):
+        hermes_guard._actual_provider_credential_ref(agent, route, guard=guard)

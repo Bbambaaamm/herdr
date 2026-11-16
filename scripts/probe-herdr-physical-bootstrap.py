@@ -52,6 +52,11 @@ def main():
         str(repo/"agent-stack/bin/agent_durable_sandbox.py"))
     spec=importlib.util.spec_from_loader(loader.name,loader)
     sandbox=importlib.util.module_from_spec(spec);sys.modules[spec.name]=sandbox;loader.exec_module(sandbox)
+    # Reject incomplete pinned Hermes source before expensive runtime copies,
+    # namespace setup or issuance. Presence is not provenance attestation.
+    from herdr.hermes_preflight import preflight_pinned_hermes_source
+    preflight_pinned_hermes_source(
+        repo / "herdr/hermes_source_inventory.json", launcher.HERMES_ROOT)
     manifest={}
     names=set(subprocess.check_output(["git","-C",str(repo),"ls-files","-z"]).split(b"\0"))
     for line in (repo/"provenance/CANONICAL_SOURCE_MANIFEST.sha256").read_text().splitlines():

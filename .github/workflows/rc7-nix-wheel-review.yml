@@ -1,0 +1,82 @@
+# Manually invoked on an independently authorized self-hosted Nix builder.
+# NEVER publishes, deploys, changes services, or calls providers.
+# Source repository must contain the independently reviewed SDK commit.
+name: RC7 Hermes Nix wheel candidate (review only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rc7-hermes-nix-review
+  cancel-in-progress: false
+
+jobs:
+  review-build:
+    if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/132-hermes-host-reference-candidate' }}
+    runs-on: [self-hosted, linux, x64, herdr-nix-reviewed]
+    environment: rc7-nix-build-review
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Herdr pinned candidate (no credentials retained)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Require independently configured source and Nix
+        shell: bash
+        env:
+          SDK_REPOSITORY: ${{ vars.RC7_REVIEWED_HERMES_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          test -n "$SDK_REPOSITORY"
+          case "$SDK_REPOSITORY" in
+            https://github.com/Bbambaaamm/*) ;;
+            *) echo "BLOCKED: only reviewed owner-approved Git source" >&2; exit 2 ;;
+          esac
+          nix --version
+          test -f herdr/hermes_source_inventory.json
+          test -f scripts/rc7_hermes_nix_source_preflight.py
+          printf 'RC7_NIX_REVIEW_PREREQUISITES_PASS\n'
+      - name: Fetch exact reviewed Hermes SDK commit
+        shell: bash
+        env:
+          SDK_REPOSITORY: ${{ vars.RC7_REVIEWED_HERMES_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/herdr-rc7"
+          git clone --no-checkout --filter=blob:none "$SDK_REPOSITORY" "$RUNNER_TEMP/herdr-rc7/hermes"
+          git -C "$RUNNER_TEMP/herdr-rc7/hermes" fetch --no-tags origin ef0342358f6421efb4ce919ba859d69940ca13b7
+          git -C "$RUNNER_TEMP/herdr-rc7/hermes" checkout --detach ef0342358f6421efb4ce919ba859d69940ca13b7
+          python3 -I -B scripts/rc7_hermes_nix_source_preflight.py \
+            --hermes-source "$RUNNER_TEMP/herdr-rc7/hermes" \
+            > "$RUNNER_TEMP/herdr-rc7/source-preflight.json"
+          cat "$RUNNER_TEMP/herdr-rc7/source-preflight.json"
+      - name: Nix build from exact reviewed flake lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/herdr-rc7/hermes"
+          test -f flake.lock
+          nix build --no-link --print-out-paths \
+            --option restrict-eval true --option sandbox true \
+            .#minimal > "$RUNNER_TEMP/herdr-rc7/minimal-nix-store-path.txt"
+          nix build --no-link --print-out-paths \
+            --option restrict-eval true --option sandbox true \
+            .#web > "$RUNNER_TEMP/herdr-rc7/web-nix-store-path.txt"
+          nix build --no-link --print-out-paths \
+            --option restrict-eval true --option sandbox true \
+            .#tui > "$RUNNER_TEMP/herdr-rc7/tui-nix-store-path.txt"
+          test -s "$RUNNER_TEMP/herdr-rc7/minimal-nix-store-path.txt"
+          test -s "$RUNNER_TEMP/herdr-rc7/web-nix-store-path.txt"
+          test -s "$RUNNER_TEMP/herdr-rc7/tui-nix-store-path.txt"
+          echo "NIX_CANDIDATE_BUILD_COMPLETED_NOT_PUBLISHED"
+      - name: Summarize candidates without deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/herdr-rc7"
+          sha256sum source-preflight.json *-nix-store-path.txt > input-evidence-sha256.txt
+          cat input-evidence-sha256.txt
+          echo "NOT_A_RELEASE; NO_MODEL_CALLS; NO_ROOT_PUBLICATION"

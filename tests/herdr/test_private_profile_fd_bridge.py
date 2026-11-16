@@ -93,7 +93,7 @@ def command_for(sandbox, snapshot, *, descriptors=None, opts=None):
         *(part for name in sorted(SYSTEM_RUNTIME_FILES)
           for part in ("--ro-bind", name, name)),
         "--dev", "/dev", "--proc", "/proc", "--unshare-user", "--unshare-pid",
-        "--disable-userns", "--cap-drop", "ALL", "--tmpfs", "/tmp",
+        "--unshare-net", "--disable-userns", "--cap-drop", "ALL", "--tmpfs", "/tmp",
         *profile_flags, "--tmpfs", "/run", "--tmpfs", "/home/agentops/.config/herdr",
         "--tmpfs", "/opt/agent-platform",
         "--setenv", "PATH", "/run/herdr/policy-code/agent-stack/policy-bin:/usr/bin:/bin",
@@ -593,3 +593,22 @@ def test_private_home_denies_host_user_mutable_cli_bytes(tmp_path):
         result = run_approved_command(tmp_path, command_for(sandbox, snapshot, opts=opts), entries)
         assert result.returncode != 0
         assert b"policy_fd_private_literal_source_unpinned" in result.stderr
+
+@pytest.mark.parametrize("mutation", ["missing-net", "duplicate-net"])
+def test_private_launcher_rejects_missing_or_duplicate_network_namespace(tmp_path, mutation):
+    sandbox = bridge_module()
+    _, _, snapshot = fixture_snapshot(tmp_path)
+    with snapshot:
+        entries = snapshot.fd_descriptors()
+        command = command_for(sandbox, snapshot, descriptors=entries)
+        assert command.count("--unshare-net") == 1
+        if mutation == "missing-net":
+            command.remove("--unshare-net")
+        else:
+            command.insert(command.index("--unshare-net"), "--unshare-net")
+        # The approval fixture is recomputed for the malicious command, so
+        # failure is attributable to the closed kernel namespace grammar,
+        # not just a stale plan digest.
+        result = run_approved_command(tmp_path, command, entries)
+        assert result.returncode != 0
+        assert b"policy_fd_private_lifetime_boundary_missing" in result.stderr

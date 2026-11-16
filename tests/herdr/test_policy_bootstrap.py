@@ -873,5 +873,5 @@ def test_committed_hermes_inventory_matches_launcher_pins(monkeypatch):
     assert data["revision"] == module.HERMES_HEAD
     # This is the complete original SDK source set.  The generic installed
     # runtime inventory is a separate closure with a different member count.
-    assert len(data["files"]) == 1249
+    assert len(data["files"]) == 1821
     assert data["source_sha256"] == module.HERMES_SOURCE_SHA256
