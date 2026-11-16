@@ -41,6 +41,23 @@ def _canonical(value: Any) -> bytes:
                       ensure_ascii=False, allow_nan=False).encode("utf-8")
 
 
+def _strict_json(payload: bytes) -> Any:
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise BuildHostEvidenceError("HOST_EVIDENCE_DUPLICATE_JSON_FIELD")
+            result[key] = value
+        return result
+
+    try:
+        return json.loads(payload, object_pairs_hook=unique)
+    except BuildHostEvidenceError:
+        raise
+    except (ValueError, UnicodeError) as exc:
+        raise BuildHostEvidenceError("HOST_EVIDENCE_JSON_INVALID") from exc
+
+
 def _b64(text: str, expected_bytes: int) -> bytes:
     if not isinstance(text, str) or len(text) > 256:
         raise BuildHostEvidenceError("EVIDENCE_SIGNATURE_OR_KEY_INVALID")
@@ -158,7 +175,7 @@ def read_root_trust_anchor(path: Path = Path("/etc/herdr/build-lifecycle-trust.j
     """Read through existing root-owned no-follow protection, not user paths."""
     data = read_protected(path, owner=0, limit=4096)
     try:
-        root = json.loads(data)
+        root = _strict_json(data)
     except (ValueError, UnicodeError) as exc:
         raise BuildHostEvidenceError("HOST_EVIDENCE_TRUST_ANCHOR_INVALID") from exc
     if type(root) is not dict or set(root) != {
@@ -175,7 +192,7 @@ def read_root_envelope(path: Path) -> dict[str, Any]:
     """A receipt must be in a separately root-controlled, read-only tree."""
     body = read_protected(path, owner=0, limit=_MAX_RECORD)
     try:
-        value = json.loads(body)
+        value = _strict_json(body)
     except (ValueError, UnicodeError) as exc:
         raise BuildHostEvidenceError("HOST_EVIDENCE_ENVELOPE_INVALID") from exc
     if type(value) is not dict:
@@ -191,16 +208,27 @@ def inspect_mount_boundary(path: Path, *, mountinfo: str | None = None) -> dict[
     """
     if mountinfo is None:
         try:
-            mountinfo = Path("/proc/self/mountinfo").read_text()
-        except OSError:
+            with Path("/proc/self/mountinfo").open("rb") as stream:
+                data = stream.read(2_097_153)
+            if len(data) > 2_097_152:
+                return {"state": "UNKNOWN", "matches": [], "cleanup_authorized": False}
+            mountinfo = data.decode("utf-8")
+        except (OSError, UnicodeError):
             return {"state": "UNKNOWN", "matches": [], "cleanup_authorized": False}
+    if type(mountinfo) is not str or len(mountinfo) > 2_097_152:
+        return {"state": "UNKNOWN", "matches": [], "cleanup_authorized": False}
     path_text = str(path)
     matches = []
+
+    def unescape_mountpoint(value: str) -> str:
+        return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value)
+
     for line in mountinfo.splitlines():
-        fields = line.split(" ")
-        if len(fields) < 7:
+        prefix, sep, _suffix = line.partition(" - ")
+        fields = prefix.split(" ")
+        if not sep or len(fields) < 6 or any(not part for part in fields[:6]):
             return {"state": "UNKNOWN", "matches": [], "cleanup_authorized": False}
-        point = fields[4].replace("\\040", " ").replace("\\011", "\t")
+        point = unescape_mountpoint(fields[4])
         if point == path_text or point.startswith(path_text + "/"):
             matches.append(point)
     return {
@@ -228,16 +256,21 @@ def inspect_process_references(
     references = []
     incomplete = False
     try:
-        entries = sorted((entry.name for entry in os.scandir(proc)
-                          if entry.name.isdecimal()), key=int)
+        entries = []
+        with os.scandir(proc) as listing:
+            for entry in listing:
+                if not entry.name.isdecimal():
+                    continue
+                if len(entries) >= max_pids:
+                    incomplete = True
+                    break
+                entries.append(entry.name)
     except OSError:
         return {
             "state": "UNKNOWN", "references": [],
             "incomplete": True, "cleanup_authorized": False,
         }
-    if len(entries) > max_pids:
-        entries = entries[:max_pids]
-        incomplete = True
+    entries.sort(key=int)
 
     def hit(value: str) -> bool:
         # A deleted cwd/fd may still hold blocks; retain its path observation.
@@ -262,13 +295,17 @@ def inspect_process_references(
                 observed = True
         fd_dir = directory / "fd"
         try:
-            fds = sorted(os.listdir(fd_dir))
-        except (FileNotFoundError, OSError):
+            fds = []
+            with os.scandir(fd_dir) as fd_listing:
+                for item in fd_listing:
+                    if len(fds) >= max_fds:
+                        incomplete = True
+                        break
+                    fds.append(item.name)
+        except OSError:
             incomplete = True
             continue
-        if len(fds) > max_fds:
-            incomplete = True
-            fds = fds[:max_fds]
+        fds.sort()
         for fd in fds:
             try:
                 target = os.readlink(fd_dir / fd)

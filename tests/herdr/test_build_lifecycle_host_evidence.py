@@ -256,3 +256,65 @@ def test_no_filesystem_mutation_and_no_model_call(monkeypatch, tmp_path):
     report = h.host_evidence_scan(root, (candidate.name,), trust_path=tmp_path / "missing")
     assert report["model_calls"] == 0
     assert report["deletion_performed"] is False
+
+
+def test_process_scan_never_uses_unbounded_listdir(monkeypatch, tmp_path):
+    root = tmp_path / "scratch"
+    root.mkdir()
+    proc = tmp_path / "proc"
+    fds = proc / "1000" / "fd"
+    fds.mkdir(parents=True)
+    (proc / "1000" / "cwd").symlink_to("/")
+    (proc / "1000" / "root").symlink_to("/")
+    for i in range(12):
+        (fds / str(i)).symlink_to("/elsewhere")
+    def forbid_listdir(*_args, **_kwargs):
+        raise AssertionError("unbounded listdir on /proc is forbidden")
+    monkeypatch.setattr(os, "listdir", forbid_listdir)
+    report = h.inspect_process_references(root, proc=proc, max_pids=5, max_fds=2)
+    assert report["incomplete"] is True
+    assert report["state"] == "UNKNOWN"
+    assert report["cleanup_authorized"] is False
+
+
+def test_process_scan_stops_at_bounded_number_of_pids(monkeypatch, tmp_path):
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    for i in range(30):
+        (proc / str(2000 + i) / "fd").mkdir(parents=True)
+    report = h.inspect_process_references(tmp_path / "missing",
+                                          proc=proc, max_pids=3)
+    assert report["incomplete"] is True
+    assert report["state"] == "UNKNOWN"
+    assert not report["cleanup_authorized"]
+
+
+def test_escaped_mountpoint_is_detected_and_never_authorized(tmp_path):
+    path = tmp_path / "herdr build"
+    encoded = str(path).replace(" ", r"\040")
+    mountinfo = f"50 40 8:1 / {encoded} rw,relatime - ext4 /dev/sda1 rw\n"
+    result = h.inspect_mount_boundary(path, mountinfo=mountinfo)
+    assert result["state"] == "MOUNT_FOUND"
+    assert result["matches"] == [str(path)]
+    assert result["cleanup_authorized"] is False
+
+
+def test_ambiguous_or_oversized_mountinfo_is_unknown(tmp_path):
+    path = tmp_path / "herdr build"
+    for mountinfo in (
+        "not a valid mountinfo record",
+        "bad" * 700000,
+        "50 40 8:1 / /bad rw,relatime",
+    ):
+        result = h.inspect_mount_boundary(path, mountinfo=mountinfo)
+        assert result["state"] == "UNKNOWN"
+        assert result["cleanup_authorized"] is False
+
+
+def test_root_trust_and_receipt_duplicate_json_fields_fail_closed(tmp_path):
+    root = tmp_path / "receipt.json"
+    root.write_text('{"schema_version":1,"schema_version":1}')
+    with pytest.raises(h.BuildHostEvidenceError, match="DUPLICATE_JSON"):
+        h._strict_json(root.read_bytes())
+    with pytest.raises(h.BuildHostEvidenceError, match="JSON_INVALID"):
+        h._strict_json(b"{garbled")
