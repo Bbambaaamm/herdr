@@ -118,6 +118,7 @@ def _walk(fd: int, root_dev: int, state: _Bounds, depth: int,
         state.limits_hit = True
         return
     try:
+        before_directory = os.fstat(fd)
         rows = os.scandir(fd)
         with rows as entries:
             for item in entries:
@@ -165,6 +166,8 @@ def _walk(fd: int, root_dev: int, state: _Bounds, depth: int,
                         os.close(child)
                 else:
                     state.boundary_changes += 1
+        if _identity(os.fstat(fd)) != _identity(before_directory):
+            state.boundary_changes += 1
     except OSError:
         state.unreadable += 1
 
@@ -228,6 +231,9 @@ def scan_one(rootfd: int, root: Path, name: str,
             "allocated_bytes_observed": count.allocated_bytes,
             "measurement_complete": not (count.limits_hit or count.unreadable
                                          or count.boundary_changes),
+            # Even a complete bounded walk is not an atomic snapshot:
+            # mutable file bytes/paths and other namespaces may change.
+            "stable_snapshot_verified": False,
             "entries_observed": count.count,
             "regular_files_observed": count.regular_files,
             "symlinks_observed": count.symlinks,

@@ -196,3 +196,55 @@ def test_cli_is_readonly_and_invalid_paths_fail_closed(tmp_path):
     bad = subprocess.run(command[:-1] + ["../other"], capture_output=True, text=True, timeout=12)
     assert bad.returncode == 2
     assert json.loads(bad.stdout)["cleanup_authorized"] is False
+
+
+def test_nested_directory_modified_during_scan_is_not_complete(tmp_path, monkeypatch):
+    import herdr.build_lifecycle as module
+    base = root(tmp_path)
+    target = candidate(base)
+    subdir = target / "nested"
+    subdir.mkdir()
+    (subdir / "file.txt").write_bytes(b"prior")
+    original_scandir = module.os.scandir
+    nested_inode = subdir.stat().st_ino
+
+    class Scanner:
+        def __init__(self, iterator):
+            self.iterator = iterator
+
+        def __enter__(self):
+            self.iterator.__enter__()
+            return self
+
+        def __iter__(self):
+            return iter(self.iterator)
+
+        def __exit__(self, *args):
+            result = self.iterator.__exit__(*args)
+            # Mutate a nested directory *after* its entries were enumerated
+            # but before _walk compares the pinned directory identity.
+            (subdir / "changed-after-enumeration.txt").write_bytes(b"changed")
+            return result
+
+    def mutating_scandir(fd):
+        value = original_scandir(fd)
+        if isinstance(fd, int) and os.fstat(fd).st_ino == nested_inode:
+            return Scanner(value)
+        return value
+
+    monkeypatch.setattr(module.os, "scandir", mutating_scandir)
+    result = module.inventory(base, (target.name,))
+    row = result["candidates"][0]
+    assert not row["measurement_complete"]
+    assert not row["stable_snapshot_verified"]
+    assert "FILESYSTEM_OR_IDENTITY_BOUNDARY_UNCERTAIN" in row["blockers"]
+    assert not row["can_delete"]
+
+
+def test_complete_bounded_walk_is_not_immutable_snapshot(tmp_path):
+    base = root(tmp_path)
+    target = candidate(base)
+    row = inventory(base, (target.name,))["candidates"][0]
+    assert row["measurement_complete"]
+    assert row["stable_snapshot_verified"] is False
+    assert row["cleanup_authorized"] is False
