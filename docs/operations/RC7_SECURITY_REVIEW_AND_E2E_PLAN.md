@@ -287,3 +287,34 @@ Therefore the complete immutable RC7 is still **NO-GO**. For full build
 evidence and remaining gates see
 `docs/operations/HERMES_WEB_TUI_WHEEL_RC7.md` and
 `docs/evidence/hermes_web_tui_rc7_candidate.audit.json`.
+
+
+## 2026-11-16 — Read-only release gate on actual candidate archives
+
+The non-authorizing `scripts/rc7_acceptance_preflight.py` independently
+compares local web/TUI tar SHA-256 against candidate build evidence, binds
+the source revision/lockfile to the read-only Hermes site audit, reads scoped
+npm advisory counts and produces explicit RC7 blockers. It **always exits
+3 / NO-GO** on otherwise well-formed local records; missing, tampered or
+untrusted evidence exits 2 / BLOCKED. Local JSON is NOT signed root
+publication authority and can never authorize model calls or job queues.
+
+Verified against the exact nonprivileged staging candidate:
+
+```sh
+python3 -I -B scripts/rc7_acceptance_preflight.py \
+  --source-evidence docs/evidence/hermes_runtime_candidate_132.audit.json \
+  --artifact-evidence docs/evidence/hermes_web_tui_rc7_candidate.audit.json \
+  --supply-evidence docs/evidence/rc7_supply_chain_audit_2026-11-16.json \
+  --artifact-dir /path/to/isolated/candidate/artifacts
+# Expected: exit 3, NO_GO. Never a release approval.
+```
+
+The two archived frontend SHA-256 digests match, but 3 critical and 6 high
+npm dependency-tree advisories remain to be triaged, the Nix wheel/asset
+closure has not been independently accepted, exact-head security review
+and root-owned schema-2 publication remain unapproved, the native end-to-end
+parent ACK still lacks acceptance, and no canary/rollback operator GO exists.
+Evidence: `docs/evidence/rc7_preflight_2026-11-16.json`.
+
+**No production changes, no provider calls, no release tag.**

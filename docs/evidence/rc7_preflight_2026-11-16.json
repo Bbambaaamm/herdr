@@ -1,0 +1,26 @@
+{
+  "archive_digest_matches": {
+    "tui": true,
+    "web": true
+  },
+  "blockers": [
+    "UNTRIAGED_CRITICAL_HIGH_NPM_ADVISORIES",
+    "APPROVED_NIX_WHEEL_AND_COMPLETE_ASSET_CLOSURE_MISSING",
+    "INDEPENDENT_EXACT_HEAD_SECURITY_ACCEPTANCE_MISSING",
+    "SIGNED_ROOT_OWNED_RC7_SCHEMA2_APPROVAL_MISSING",
+    "NATIVE_ROOT_CHILD_DURABLE_PARENT_ACK_E2E_MISSING",
+    "OPERATOR_CANARY_AND_ROLLBACK_AUTHORIZATION_MISSING"
+  ],
+  "can_call_model": false,
+  "can_publish": false,
+  "can_queue_autonomous_issues": false,
+  "commit": "ef0342358f6421efb4ce919ba859d69940ca13b7",
+  "schema_version": "herdr-rc7-scratch-preflight-1",
+  "state": "NO_GO",
+  "vulnerability_counts": {
+    "critical": 3,
+    "high": 6,
+    "low": 9,
+    "moderate": 9
+  }
+}
