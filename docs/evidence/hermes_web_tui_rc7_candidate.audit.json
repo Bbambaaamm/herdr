@@ -1,0 +1,27 @@
+{
+  "approved_for_release": false,
+  "artifacts_sha256": {
+    "tui": "bdf7e5be3d65a359e1e04de8ddb285521162b217fd7a24683957571a848df0f8",
+    "web": "b428a9b4560367d89ef33607ef250c6c8ccebaf0ed2675fc0b2b0a49a9951c4f"
+  },
+  "commit": "ef0342358f6421efb4ce919ba859d69940ca13b7",
+  "date": "2026-11-16",
+  "full_root_child_durable_ack_e2e_passed": false,
+  "independent_security_review_accepted": false,
+  "initial_registry_install_used": true,
+  "model_calls": 0,
+  "nix_available_on_staging": false,
+  "npm_install_scripts": "disabled",
+  "npm_lock_sha256": "193a3a3703499eb7c4b4ce48d3ba1e9dae2be62a48315c1e7ea9545e8be4a067",
+  "root_owned_runtime_published": false,
+  "schema_version": "herdr-hermes-web-tui-build-1",
+  "second_candidate_build_offline": true,
+  "source_project_install_complete": false,
+  "status": "WEB_TUI_CANDIDATE_VERIFIED_ONLY",
+  "tui_file_count": 1,
+  "upstream_nix_wheel_guard_observed": true,
+  "uv_lock_sha256": "5b3798f326209475abca8ef7cbf7c9406f12e687c28c0b540dfe597466f48590",
+  "web_file_count": 62,
+  "web_tui_reproducible": true,
+  "wheel_status": "BLOCKED_REQUIRES_APPROVED_NIX_BUILD"
+}

@@ -259,3 +259,31 @@ stage2 admission, durable managed-child parent ACK/replay, root-owned
 schema2 publication authorization, full negative kernel/plugin tests and
 independent exact-head security approval. No RC7 tag, deployment or
 provider/model call was made.
+
+
+## 2026-11-16 — Reproducible web/TUI artifacts, Nix-only wheel blocker
+
+The exact Hermes SDK candidate commit `ef0342358f6421efb4ce919ba859d69940ca13b7`
+was archived into a nonprivileged scratch build root. Its pinned
+`package-lock.json`/ `uv.lock` digests matched the reviewed records.
+We ran `npm ci --ignore-scripts` and built web and TUI in isolation.
+Web produced 62 output files, and TUI produced `dist/entry.js`.
+Deterministic archives were rebuilt twice and confirmed byte-identical:
+
+- web SHA256: `b428a9b4560367d89ef33607ef250c6c8ccebaf0ed2675fc0b2b0a49a9951c4f`
+- TUI SHA256: `bdf7e5be3d65a359e1e04de8ddb285521162b217fd7a24683957571a848df0f8`
+
+The independent, checked-in `scripts/build-hermes-web-tui-candidate.py`
+reproduced both artifacts from Git archive, and its second install used the
+offline cache. Existing npm lifecycle scripts were disabled during installs.
+The first attempt to install purely offline failed on a missing npm cache
+entry; the operator run fetched exact lockfile dependencies from the npm
+registry, without contacting model providers.
+
+The official `uv build --wheel` attempt was **blocked by the explicit
+Hermes upstream `setup.py` Nix-only guard**. Nix/uv2nix is not installed
+on staging. No fake `HERMES_NIX_BUILD` flag or unsupported wheel was used.
+Therefore the complete immutable RC7 is still **NO-GO**. For full build
+evidence and remaining gates see
+`docs/operations/HERMES_WEB_TUI_WHEEL_RC7.md` and
+`docs/evidence/hermes_web_tui_rc7_candidate.audit.json`.
