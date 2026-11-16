@@ -107,7 +107,7 @@ class EvidenceStore:
                 raise EvidenceError("evidence store overlaps a worker-writable root")
 
     def _path(self, kind: str, key: str) -> Path:
-        if kind not in {"plan", "accepted", "work-result", "work-handoff-intent"} or not _SHA.fullmatch(key):
+        if kind not in {"plan", "accepted", "work-result", "work-handoff-intent", "operational-report"} or not _SHA.fullmatch(key):
             raise EvidenceError("invalid evidence address")
         return self.root / f"{kind}-{key}.json"
 
@@ -190,7 +190,7 @@ class EvidenceStore:
 
     def publish(self, kind: str, key: str, payload: dict) -> str:
         try:
-            return self._publish(kind, key, payload)
+            return self._publish(kind, key, payload, register_index=kind != "operational-report")
         except OSError as exc:
             raise EvidenceUnavailable("host evidence publication is unavailable") from exc
 
