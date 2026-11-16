@@ -7,15 +7,14 @@ import os
 import socket
 
 from . import operation_readiness as readiness
+from .capacity_attestor import MAX_ATTESTATION_AGE, MAX_RECEIPT_BYTES, RECEIPT_PATH, verify_receipt
 from .evidence import canonical, digest
-from .operational_adapters import MAX_INPUT_BYTES, _object, capacity_snapshot
+from .operational_adapters import MAX_INPUT_BYTES, capacity_snapshot
 from .operational_incidents import (
     Detail, IncidentError, IncidentType, Observation, Scope, State, correlate, epoch, require,
     timestamp, token,
 )
 
-RECEIPT_PATH = "/run/herdr/capacity-exporter/receipt.json"
-RECEIPT_SCHEMA = "herdr-capacity-receipt-1"
 EVENT_SCHEMA = "herdr-capacity-event-1"
 RECORD_SCHEMA = "herdr-capacity-record-1"
 RECORD_KIND = "capacity-observation"
@@ -107,12 +106,7 @@ def _sample(policy, raw, receipt, *, now, build=None):
     trusted = receipt is not None
     refs = row.evidence_sha256
     if trusted:
-        fields = {"schema_version", "server", "consumer", "project", "event_at", "source_sha256"}
-        data, _ = _object(receipt, fields)
-        require(data == {
-            "schema_version": RECEIPT_SCHEMA, "server": policy.server,
-            **asdict(policy.scope), "event_at": row.event_at, "source_sha256": raw_hash,
-        } and type(data["event_at"]) is int, "capacity receipt identity or digest mismatch")
+        data = verify_receipt(receipt, raw, row.event_at, dict(row.facts), policy.server, policy.scope)
         receipt = canonical(data)
         refs = (*refs, digest(data))
     # Freshness is a property of the projection. Preserve the measured state
@@ -132,7 +126,7 @@ def _read_sample(policy, now, build=None):
     require(socket.gethostname() == policy.server, "capacity host identity mismatch")
     raw = readiness.read_capacity_report()
     try:
-        receipt = readiness.read_protected(RECEIPT_PATH, limit=4096)
+        receipt = readiness.read_protected(RECEIPT_PATH, limit=MAX_RECEIPT_BYTES)
     except (OSError, readiness.ReadinessError):
         receipt = None
     try:
@@ -157,7 +151,8 @@ def _fold(policy, samples, *, now):
         return _blocked()
     latest = slots[max(slots)]
     current = latest.row
-    usable = latest.receipt is not None and epoch(now) - current.event_at <= policy.max_age
+    usable = (latest.receipt is not None
+              and epoch(now) - current.event_at <= min(policy.max_age, MAX_ATTESTATION_AGE))
     history = [item.row for _, item in sorted(slots.items()) if item.receipt is not None
                and item.row.event_at < current.event_at]
     if not usable:
@@ -210,7 +205,7 @@ def canary(policy, *, now, build=None):
 def record_host_observation(store, policy, *, now, build=None):
     """Explicit opt-in for the existing protected EvidenceStore, never used by canary."""
     sample = _read_sample(policy, now, build)
-    require(sample.receipt is not None and now - sample.row.event_at <= policy.max_age,
+    require(sample.receipt is not None and now - sample.row.event_at <= min(policy.max_age, MAX_ATTESTATION_AGE),
             "fresh host receipt required for durable capacity publication")
     key = _slot(policy, sample.row.event_at)
     payload = {
@@ -242,7 +237,7 @@ def replay_recorded(store, policy, *, now):
         if data["server"] != policy.server or data["scope"] != asdict(policy.scope):
             continue
         require(type(data["raw"]) is str and 0 < len(data["raw"]) <= 2 * MAX_INPUT_BYTES
-                and type(data["receipt"]) is str and 0 < len(data["receipt"]) <= 8192,
+                and type(data["receipt"]) is str and 0 < len(data["receipt"]) <= 2 * MAX_RECEIPT_BYTES,
                 "invalid stored capacity evidence")
         raw, receipt = (bytes.fromhex(data[name]) for name in ("raw", "receipt"))
         build = data["build"]
