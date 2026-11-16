@@ -1,15 +1,20 @@
 import hashlib
+import json
 import os
 
 import pytest
 
+from herdr import capacity_attestor
 from herdr import capacity_events as bridge
 from herdr.evidence import EvidenceError, EvidenceStore, canonical
 from herdr.operational_incidents import IncidentError, Scope
 
 
 NOW = 1794820000
-POLICY = bridge.CapacityPolicy("quantlab-staging-01", Scope("herdr", "Bbambaaamm/herdr"))
+SCOPE = Scope("herdr", "Bbambaaamm/herdr")
+ATTESTOR = capacity_attestor.AttestorPolicy(
+    "quantlab-staging-01", SCOPE, floor=200, start_guard=0)
+POLICY = bridge.CapacityPolicy("quantlab-staging-01", SCOPE, attestor=ATTESTOR)
 
 
 def report(at=NOW - 1, available=100):
@@ -39,7 +44,14 @@ def host(monkeypatch):
             raise FileNotFoundError
         return data[1]
 
+    def measurement(path=capacity_attestor.MEASURE_PATH):
+        return capacity_attestor.FilesystemMeasurement(
+            path, 2049, 2, path, 4096, 4096, json.loads(data[0])["available_bytes"])
+
     monkeypatch.setattr(bridge.socket, "gethostname", lambda: POLICY.server)
+    monkeypatch.setattr(capacity_attestor, "host_identity",
+                        lambda: capacity_attestor.HostIdentity(POLICY.server, 0))
+    monkeypatch.setattr(capacity_attestor, "measure_filesystem", measurement)
     monkeypatch.setattr(bridge.readiness, "read_capacity_report", lambda: data[0])
     monkeypatch.setattr(bridge.readiness, "read_protected", read_protected)
     return data
@@ -166,3 +178,41 @@ def test_retry_after_uncertain_publication(host, tmp_path, monkeypatch):
     bridge.record_host_observation(restarted, POLICY, now=NOW)
     assert before_retry == bridge.replay_recorded(restarted, POLICY, now=NOW)
     assert len(list(tmp_path.glob("capacity-observation-*.json"))) == 1
+
+
+def test_host_trust_requires_attestation(host, monkeypatch):
+    assert bridge.canary(POLICY, now=NOW)["event"]["trust"] == "HOST_OWNED"
+    monkeypatch.setattr(capacity_attestor, "host_identity",
+                        lambda: capacity_attestor.HostIdentity(POLICY.server, 1001))
+    blocked = bridge.canary(POLICY, now=NOW)
+    assert blocked["status"] == bridge.BLOCKED
+    assert blocked["event"]["trust"] == "PUBLISHER_OBSERVED"
+    assert blocked["task_proposal"] is None
+
+
+def test_forged_host_measurement_cannot_authorize_proposal(host, monkeypatch):
+    def forged(path=capacity_attestor.MEASURE_PATH):
+        return capacity_attestor.FilesystemMeasurement(
+            path, 2049, 2, path, 4096, 4096, 10 ** 12)
+    monkeypatch.setattr(capacity_attestor, "measure_filesystem", forged)
+    result = bridge.canary(POLICY, now=NOW)
+    assert result["status"] == bridge.BLOCKED
+    assert result["event"]["trust"] == "PUBLISHER_OBSERVED"
+    assert result["incident"]["state"] == "UNKNOWN"
+    assert result["task_proposal"] is None
+
+
+def test_filesystem_identity_mismatch_falls_back_to_untrusted(host, monkeypatch):
+    pinned = bridge.CapacityPolicy(
+        POLICY.server, POLICY.scope,
+        attestor=capacity_attestor.AttestorPolicy(
+            POLICY.server, POLICY.scope, floor=200, start_guard=0,
+            expected_device=2049, expected_inode=2))
+    def foreign(path=capacity_attestor.MEASURE_PATH):
+        return capacity_attestor.FilesystemMeasurement(
+            path, 4096, 2, path, 4096, 4096, json.loads(host[0])["available_bytes"])
+    monkeypatch.setattr(capacity_attestor, "measure_filesystem", foreign)
+    result = bridge.canary(pinned, now=NOW)
+    assert result["status"] == bridge.BLOCKED
+    assert result["event"]["trust"] == "PUBLISHER_OBSERVED"
+    assert result["task_proposal"] is None
