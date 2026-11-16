@@ -1,0 +1,70 @@
+{
+  "date": "2026-11-16",
+  "independent_review": false,
+  "model_calls": 0,
+  "npm_audit": {
+    "all-workspaces": {
+      "counts": {
+        "critical": 3,
+        "high": 6,
+        "low": 9,
+        "moderate": 9,
+        "total": 27
+      },
+      "critical": [
+        "@simple-git/argv-parser",
+        "dompurify",
+        "simple-git"
+      ],
+      "high": [
+        "brace-expansion",
+        "minimatch",
+        "source-map-js",
+        "undici",
+        "vite",
+        "zod"
+      ],
+      "source_audit_sha256": "07f075968463be0279c724c4dc01b1bd54d60725cdad674afa625c8b8fb915f9",
+      "status": "VULNERABILITIES_REPORTED"
+    },
+    "ui-tui": {
+      "counts": {
+        "critical": 0,
+        "high": 3,
+        "low": 0,
+        "moderate": 0,
+        "total": 3
+      },
+      "critical": [],
+      "high": [
+        "source-map-js",
+        "undici",
+        "vite"
+      ],
+      "source_audit_sha256": "167a419cd8dd032b622039351a03a05c938d13cbe3345958d6d9ec14bd37d53e",
+      "status": "VULNERABILITIES_REPORTED"
+    },
+    "web": {
+      "counts": {
+        "critical": 0,
+        "high": 3,
+        "low": 1,
+        "moderate": 1,
+        "total": 5
+      },
+      "critical": [],
+      "high": [
+        "brace-expansion",
+        "source-map-js",
+        "vite"
+      ],
+      "source_audit_sha256": "f467122fe20bd81c098d26e437ab157b4d62e67525d9d2159f5e5dfe16896fc1",
+      "status": "VULNERABILITIES_REPORTED"
+    }
+  },
+  "npm_lock_sha256": "193a3a3703499eb7c4b4ce48d3ba1e9dae2be62a48315c1e7ea9545e8be4a067",
+  "release_approval": false,
+  "schema_version": "herdr-rc7-supply-chain-audit-1",
+  "source_commit": "ef0342358f6421efb4ce919ba859d69940ca13b7",
+  "wheel_status": "BLOCKED_APPROVED_NIX_BUILDER_MISSING"
+}
