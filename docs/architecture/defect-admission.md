@@ -1,0 +1,114 @@
+# Defect observation → admission decision bridge
+
+Status: draft implementation on `feat/100-defect-admission`, stacked on
+`feat/100-operational-incidents-p0` (#229).
+
+## Ownership
+
+- #100 remains the single Event/Trigger and Human Steering owner.
+- #53 remains the sole autonomous backlog control root.
+- #82 remains the durable task identity and execution authority.
+- #87 remains the budget and economic reconciliation authority.
+
+This module adds no scheduler, no budget ledger and no second source of truth.
+It is a **proposal-only** classifier: its output is a `TaskProposal` payload that
+must still pass the existing `AdmissionControl` / TaskGraph path. A decision here
+is a request, never authority. Every `ADMIT` carries
+`authorizes_execution: False`, `task_proposals_submitted: 0` and
+`budget_operations: 0`.
+
+## Normalization
+
+`DefectObservation` pins one authenticated observation to an exact source
+revision:
+
+| Field | Meaning |
+| --- | --- |
+| `source` | authenticated origin (`CI_CHECK`, `REVIEW_COMMENT`, `VALIDATION`, `SECURITY_SCAN`, `RUNTIME_TELEMETRY`, `DEPENDENT_PR`, `EVIDENCE_STALENESS`, `UNTRUSTED_TEXT`) |
+| `category` | defect class |
+| `repository` | `owner/repo`, allow-listed by the caller |
+| `commit_sha` | exact 40-hex source revision the observation is about |
+| `ref` | branch or PR |
+| `subject` | bounded tuple of identifiers (≤4) |
+| `observed_at` | freshness |
+| `evidence_sha256` | ≤4 bounded evidence digests; `UNKNOWN` requires evidence |
+| `workflow` / `check_run_id` / `event_revision` | delivery identity |
+
+Fail-closed validation: malformed SHA/repo/subject/timestamp/evidence raises
+`DefectError` rather than being coerced. A source may only carry categories it
+can actually observe (`SOURCE_CATEGORIES`); anything else is rejected, not
+re-labelled.
+
+## Identity
+
+- `fingerprint` = `digest([SCHEMA, source, repository, commit_sha, category, subject])`
+  — semantic defect identity. A regression on a new revision is a new identity.
+- `deduplication_id` = `digest([fingerprint, workflow, check_run_id, event_revision, observed_at])`
+  — delivery identity, so a redelivered webhook is not a new defect.
+
+## Decision order (first match wins)
+
+1. `UNTRUSTED_TEXT` → `DENY`
+2. repository not authorized → `DENY`
+3. credentials `MISSING` → `CREDENTIAL_GATE`
+4. credentials `UNKNOWN` → `UNKNOWN`
+5. budget `EXHAUSTED` → `BLOCKED`
+6. budget `UNKNOWN` → `UNKNOWN`
+7. capacity below floor → `BLOCKED`
+8. category requires an operator (security findings) → `HUMAN_GATE`
+9. already resolved → `NO_ACTION`
+10. a repair is already active for this defect → `NO_ACTION`
+11. `repeat_count >= max_repairs` (authoritative config) → `BLOCKED`
+12. otherwise → `ADMIT` with a bounded single-node proposal
+
+Unknown economic state is never treated as zero and never as permission.
+
+## Durable dedup
+
+`DecisionJournal` writes through the existing `admission.AuditLog`
+(append-only JSONL, mode 0640). The dedup key is
+`(fingerprint, commit_sha, disposition)`:
+
+- the same event redelivered (restart, retry, duplicate webhook) creates no
+  second record;
+- the same defect reappearing on a **new** revision creates a new record;
+- a changed PR HEAD invalidates an older approval (`approval_is_stale` compares
+  the pinned `commit_sha`).
+
+## §8 fault-injection coverage
+
+Covered deterministically offline by `tests/herdr/test_defect_admission.py`:
+
+| Scenario | Fixture |
+| --- | --- |
+| A new CI regression → one proposal | `test_a_…` |
+| B duplicate CI event → no duplicate record | `test_b_…` |
+| C known resolved defect → NO_ACTION | `test_c_…` |
+| D reopened failure on a new SHA | `test_d_…` |
+| E review finding follows the same workflow | `test_e_…` |
+| F worker crash during patch → durable recovery | `test_f_…` |
+| G crash after possible side effect → reconciliation | `test_g_…` (UNKNOWN, no second economic attempt) |
+| I budget exhausted → BLOCKED | `test_i_…` |
+| J missing credentials → CREDENTIAL_GATE | `test_j_…` |
+| K unauthorized repository → DENY | `test_k_…` |
+| L malicious comment is data, no grant escalation | `test_l_…` |
+| M repeated failure → bounded stop | `test_m_…` |
+| N successful fix → next selection | `test_n_…` |
+| O capacity below floor → no unsafe work | `test_o_…` |
+| P changed PR HEAD invalidates old review | `test_p_…` |
+| Q ingress restart → no loss or duplication | `test_q_…` |
+| R source change after approval → stale approval rejected | `test_r_…` |
+
+Not covered here, by design:
+
+- **H (provider HTTP 429 → bounded wait or approved fallback)** is owned by
+  Router v5, delivered in PR #236.
+- **F/G with a real crashed worker and live economic side effect** require the
+  durable event consumer and the #85/#87 reconciliation path. If no approved
+  long-running consumer is deployed, that integration is prepared but not
+  activated.
+
+## Out of scope
+
+Live model calls, merges, deployments, credential creation, budget changes and
+any widening of the approved provider/model/endpoint/egress set.
