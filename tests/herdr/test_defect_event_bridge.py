@@ -9,7 +9,13 @@ from __future__ import annotations
 import pytest
 
 from herdr.admission import AdmissionControl, AuditLog, PlanBudget, ResourceUsage
-from herdr.defect_admission import DefectCategory, DefectError, DefectObservation
+from herdr.defect_admission import (
+    DecisionJournal,
+    DefectCategory,
+    DefectContext,
+    DefectError,
+    DefectObservation,
+)
 from herdr.defect_event_bridge import (
     DEFECT_CATEGORY,
     admission_proposal,
@@ -69,8 +75,6 @@ def context(**overrides):
         "max_repairs": 3,
     }
     payload.update(overrides)
-    from herdr.defect_admission import DefectContext
-
     return DefectContext(**payload)
 
 
@@ -111,7 +115,7 @@ def test_open_ci_observation_translates_to_a_defect():
     assert defect.repository == PROJECT
     assert defect.commit_sha == HEAD
     assert defect.ref == "refs/pull/237/head"
-    assert defect.finding_identity == "ci-12345-22"
+    assert defect.finding_identity == ci_observation().correlation_id
 
 
 def test_resolved_ci_observation_is_not_a_defect():
@@ -155,9 +159,18 @@ def test_capacity_incident_is_not_routed_to_a_repair_backlog():
 
 
 def test_missing_ci_facts_are_rejected_not_guessed():
-    observation = ci_observation(facts=(("head", HEAD), ("run_id", 11)))
+    observation = ci_observation(facts=(("run_id", 11), ("job_id", 22)))
     with pytest.raises(DefectError):
         defect_from_observation(observation)
+
+
+def test_open_success_is_a_contradictory_record_not_a_defect():
+    observation = ci_observation(detail=Detail.CI_SUCCESS)
+    assert defect_from_observation(observation) is None
+
+
+def test_open_skipped_is_not_a_defect():
+    assert defect_from_observation(ci_observation(detail=Detail.CI_SKIPPED)) is None
 
 
 def test_non_observation_input_is_rejected():
@@ -181,9 +194,16 @@ def test_repeated_run_of_one_check_is_one_defect():
     assert first.deduplication_id != second.deduplication_id
 
 
-def test_two_distinct_checks_are_two_defects():
+def test_two_job_instances_of_one_workflow_are_one_defect():
+    """job_id is a per-run instance id; it must not fragment one red PR."""
     first = defect_from_observation(ci_observation(facts=(("head", HEAD), ("run_id", 11), ("job_id", 22))))
     second = defect_from_observation(ci_observation(facts=(("head", HEAD), ("run_id", 11), ("job_id", 23))))
+    assert first.fingerprint == second.fingerprint
+
+
+def test_two_workflows_on_one_pr_are_two_defects():
+    first = defect_from_observation(ci_observation(subject=("237", "12345")))
+    second = defect_from_observation(ci_observation(subject=("237", "67890")))
     assert first.fingerprint != second.fingerprint
 
 
@@ -224,12 +244,18 @@ def test_identity_input_is_validated():
 # --- end to end against the existing gate ---------------------------------- #
 
 
+def journal(tmp_path):
+    return DecisionJournal(AuditLog(str(tmp_path / "defect.jsonl")))
+
+
 def test_admit_path_never_authorizes_execution(tmp_path):
     proposal = admission_proposal(
-        ci_observation(), context(), control(tmp_path), host_usage()
+        ci_observation(), context(), control(tmp_path), host_usage(),
+        pin=EVIDENCE, journal=journal(tmp_path),
     )
     assert proposal["eligible"] is True
     assert proposal["disposition"] == "ADMIT"
+    assert proposal["deduplicated"] is False
     assert proposal["authorizes_execution"] is False
     assert proposal["task_proposals_submitted"] == 0
     assert proposal["budget_operations"] == 0
@@ -251,14 +277,62 @@ def test_non_defect_observation_is_not_eligible(tmp_path):
         evidence_sha256=("c" * 64,),
         facts=(("available_bytes", 1),),
     )
-    proposal = admission_proposal(observation, context(), control(tmp_path), ResourceUsage())
+    proposal = admission_proposal(
+        observation, context(), control(tmp_path), host_usage(),
+        pin="c" * 64, journal=journal(tmp_path),
+    )
     assert proposal["eligible"] is False
     assert proposal["authorizes_execution"] is False
+    assert not (tmp_path / "defect.jsonl").exists()
+
+
+def test_redelivery_is_deduplicated_before_the_swarm_gate(tmp_path):
+    """E4 round 8 P1-1: a redelivered event must not re-enter the gate."""
+    first = admission_proposal(
+        ci_observation(), context(), control(tmp_path), host_usage(),
+        pin=EVIDENCE, journal=journal(tmp_path),
+    )
+    second = admission_proposal(
+        ci_observation(), context(), control(tmp_path), host_usage(),
+        pin=EVIDENCE, journal=journal(tmp_path),
+    )
+    assert first["admission"]["denied"] is False
+    assert second["deduplicated"] is True
+    assert second["admission"]["denied"] is True
+    # exactly one swarm-gate decision, one durable defect record
+    rows = (tmp_path / "admission.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 1
+    assert len((tmp_path / "defect.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_forged_gate_is_rejected(tmp_path):
+    with pytest.raises(DefectError):
+        admission_proposal(
+            ci_observation(), context(), object(), host_usage(),
+            pin=EVIDENCE, journal=journal(tmp_path),
+        )
+
+
+def test_missing_journal_is_rejected(tmp_path):
+    with pytest.raises(DefectError):
+        admission_proposal(
+            ci_observation(), context(), control(tmp_path), host_usage(),
+            pin=EVIDENCE, journal=None,
+        )
+
+
+def test_unpinned_observation_is_rejected(tmp_path):
+    with pytest.raises(DefectError):
+        admission_proposal(
+            ci_observation(), context(), control(tmp_path), host_usage(),
+            pin="e" * 64, journal=journal(tmp_path),
+        )
 
 
 def test_defect_gate_denial_is_propagated_without_consulting_the_swarm_gate(tmp_path):
     proposal = admission_proposal(
-        ci_observation(), context(budget_state="EXHAUSTED"), control(tmp_path), host_usage()
+        ci_observation(), context(budget_state="EXHAUSTED"), control(tmp_path), host_usage(),
+        pin=EVIDENCE, journal=journal(tmp_path),
     )
     assert proposal["disposition"] == "BLOCKED"
     assert proposal["admission"]["denied"] is True
@@ -267,21 +341,29 @@ def test_defect_gate_denial_is_propagated_without_consulting_the_swarm_gate(tmp_
 
 def test_swarm_gate_denial_is_propagated(tmp_path):
     proposal = admission_proposal(
-        ci_observation(), context(), control(tmp_path), host_usage(active_agents=4)
+        ci_observation(), context(), control(tmp_path), host_usage(active_agents=4),
+        pin=EVIDENCE, journal=journal(tmp_path),
     )
     assert proposal["admission"]["denied"] is True
     assert proposal["admission"]["reason"] == "global_agent_limit"
 
 
 def test_existing_gate_audits_its_own_decision(tmp_path):
-    admission_proposal(ci_observation(), context(), control(tmp_path), host_usage())
-    records = (tmp_path / "admission.jsonl").read_text(encoding="utf-8").splitlines()
-    assert len(records) == 1
-    assert '"event": "allow"' in records[0]
+    admission_proposal(
+        ci_observation(), context(), control(tmp_path), host_usage(),
+        pin=EVIDENCE, journal=journal(tmp_path),
+    )
+    rows = (tmp_path / "admission.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 1
+    assert '"event": "allow"' in rows[0]
+    assert len((tmp_path / "defect.jsonl").read_text(encoding="utf-8").splitlines()) == 1
 
 
 def test_denied_defect_never_reaches_the_swarm_gate(tmp_path):
     admission_proposal(
-        ci_observation(), context(budget_state="EXHAUSTED"), control(tmp_path), host_usage()
+        ci_observation(), context(budget_state="EXHAUSTED"), control(tmp_path), host_usage(),
+        pin=EVIDENCE, journal=journal(tmp_path),
     )
     assert not (tmp_path / "admission.jsonl").exists()
+    # but the durable defect decision is still recorded
+    assert len((tmp_path / "defect.jsonl").read_text(encoding="utf-8").splitlines()) == 1

@@ -154,16 +154,24 @@ is a pure translator between them and adds no authority:
   backup and worker incidents belong to their own operational owners and are
   never routed into a repair backlog.
 - `defect_from_observation()` derives `commit_sha` from the #100 `head` fact,
-  `finding_identity` from the stable workflow/job pair, and keeps `run_id` /
-  `revision` as delivery identity only.
+  `finding_identity` from #100's own `correlation_id`, and keeps `run_id` /
+  `revision` as delivery identity only. The adapter's `job_id` is a per-run
+  instance id and would fragment one red PR into N defects; a per-check split
+  requires #100 to expose the workflow job *definition* id, which it does not
+  today. Only an open observation reporting an actual `CI_FAILURE` is a defect.
 - `repair_tools()` reuses `ROLE_TOOL_ALLOWLIST["writer"]`; `git_push`,
   `deploy` and `git_merge` stay out of reach.
 - `task_graph_spec()` is a single-node plan; `AdmissionControl` still applies
   its own ceilings and its own consumer policy.
-- `admission_proposal()` runs the EXISTING `#8` gate and returns a proposal
-  that carries `authorizes_execution=False`, `task_proposals_submitted=0` and
-  `budget_operations=0`. When the defect gate denies, the swarm gate is not
-  consulted at all.
+- `admission_proposal()` requires the caller to supply the #100 evidence
+  `pin`, which must match the observation's own evidence digests, and a
+  mandatory durable `DecisionJournal`. The decision is recorded before the
+  swarm gate is consulted, so a redelivered event returns a deduplicated
+  proposal and never re-enters the gate. The gate object must be the real
+  `AdmissionControl`.
+- The returned proposal carries `authorizes_execution=False`,
+  `task_proposals_submitted=0` and `budget_operations=0`. When the defect gate
+  denies, the swarm gate is not consulted at all.
 
 Ownership is unchanged: `#100` produces the observation, `#8` admits or denies
 the spawn, `#53` owns the backlog, `#82` the durable task identity.

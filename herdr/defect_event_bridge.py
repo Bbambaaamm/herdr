@@ -32,9 +32,10 @@ from herdr.defect_admission import (
     DefectSource,
     DefectDecision,
     DefectDisposition,
+    DecisionJournal,
     decide_defect_admission,
 )
-from herdr.operational_incidents import IncidentType, Observation, Source, State
+from herdr.operational_incidents import Detail, IncidentType, Observation, Source, State
 
 __all__ = [
     "DEFECT_CATEGORY",
@@ -63,12 +64,15 @@ def defect_category(observation: Observation) -> DefectCategory | None:
     """Return the defect category, or ``None`` when this is not a code defect.
 
     Fail-closed: an observation shape that the Event Fabric did not already
-    constrain is rejected rather than guessed at.
+    constrain is rejected rather than guessed at.  A CI observation is only a
+    defect when it is both still open and reports an actual failure — an
+    ``OPEN`` row carrying ``CI_SUCCESS`` is a contradictory record, not a defect.
     """
     if type(observation) is not Observation:
         raise DefectError("not an operational observation")
     category = DEFECT_CATEGORY.get((observation.source, observation.kind))
-    if category is None or observation.state not in _OPEN_STATES:
+    if (category is None or observation.state not in _OPEN_STATES
+            or observation.detail is not Detail.CI_FAILURE):
         return None
     return category
 
@@ -82,11 +86,11 @@ def defect_from_observation(observation: Observation) -> DefectObservation | Non
     if category is None:
         return None
     facts = dict(observation.facts)
-    head, run_id, job_id = facts.get("head"), facts.get("run_id"), facts.get("job_id")
-    if type(head) is not str or type(run_id) is not int or type(job_id) is not int:
+    head, run_id = facts.get("head"), facts.get("run_id")
+    if type(head) is not str or type(run_id) is not int:
         # The #100 CI adapter requires these facts, but a bridged observation
         # must not silently repair a missing identity.
-        raise DefectError("CI observation lacks the head/run/job facts")
+        raise DefectError("CI observation lacks the head/run facts")
     subject = observation.subject
     if len(subject) < 2:
         raise DefectError("CI observation subject does not carry pr and workflow")
@@ -98,7 +102,11 @@ def defect_from_observation(observation: Observation) -> DefectObservation | Non
         commit_sha=head,
         ref=f"refs/pull/{pr}/head",
         subject=(f"pr-{pr}", f"workflow-{workflow}"),
-        finding_identity=f"ci-{workflow}-{job_id}",
+        # #100's own correlation identity (source + scope + subject) is the only
+        # stable check identity available today: the adapter's ``job_id`` is a
+        # per-run instance id and would fragment one red PR into N defects.  A
+        # per-check split needs #100 to expose the workflow job definition id.
+        finding_identity=observation.correlation_id,
         workflow=workflow,
         check_run_id=str(run_id),
         event_revision=observation.revision,
@@ -136,12 +144,30 @@ def admission_proposal(
     context,
     control: AdmissionControl,
     usage: ResourceUsage,
+    *,
+    pin: str,
+    journal: DecisionJournal,
 ) -> dict:
     """Run the full proposal path against the EXISTING admission gate.
+
+    ``pin`` is the #100 evidence digest that the observation was built from; it
+    must match one of the observation's own evidence digests, so a fabricated
+    observation cannot be paired with someone else's pinned evidence.
+
+    ``journal`` is mandatory: without a durable dedup record a redelivered event
+    would re-enter the swarm gate and produce a second allow.
 
     The result carries ``authorizes_execution=False`` and no economic effect:
     it is a proposal for #8 to accept or deny, not permission to act.
     """
+    if type(observation) is not Observation:
+        raise DefectError("not an operational observation")
+    if type(control) is not AdmissionControl:
+        raise DefectError("not an approved admission gate")
+    if type(journal) is not DecisionJournal:
+        raise DefectError("durable dedup journal is required")
+    if type(pin) is not str or pin not in observation.evidence_sha256:
+        raise DefectError("observation is not pinned to the supplied evidence")
     defect = defect_from_observation(observation)
     if defect is None:
         return {
@@ -152,6 +178,23 @@ def admission_proposal(
             "budget_operations": 0,
         }
     decision: DefectDecision = decide_defect_admission(defect, context)
+    _, recorded = journal.record(decision)
+    if not recorded:
+        # Durable dedup hit: this exact decision already exists.  Do not ask
+        # the swarm gate again.
+        return {
+            "eligible": True,
+            "fingerprint": defect.fingerprint,
+            "deduplication_id": defect.deduplication_id,
+            "disposition": decision.disposition.value,
+            "reason": ",".join(decision.reasons),
+            "deduplicated": True,
+            "authorizes_execution": False,
+            "task_proposals_submitted": 0,
+            "budget_operations": 0,
+            "admission": {"denied": True, "reason": "deduplicated",
+                          "detail": "decision already recorded durably"},
+        }
     if decision.disposition is DefectDisposition.ADMIT:
         verdict = control.check(
             agent_identity(defect), task_graph_spec(), usage, tuple(sorted(repair_tools()))
@@ -171,6 +214,7 @@ def admission_proposal(
         "deduplication_id": defect.deduplication_id,
         "disposition": decision.disposition.value,
         "reason": ",".join(decision.reasons),
+        "deduplicated": False,
         "authorizes_execution": False,
         "task_proposals_submitted": 0,
         "budget_operations": 0,
