@@ -7,18 +7,40 @@ second ledger or scheduler.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 import re
 from typing import Any
 
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _TOKEN = re.compile(r"^[A-Za-z0-9._:/@+-]{1,256}$")
+_EPOCH = re.compile(r"^[0-9]+(\.[0-9]+)?$")
+
+
+def _epoch(value: str) -> float:
+    """Normalize an ISO-8601 or epoch-seconds reference time to a POSIX float."""
+    if not isinstance(value, str):
+        raise RoutingIntegrationError("reference time must be text")
+    text = value.strip()
+    if _EPOCH.fullmatch(text):
+        return float(text)
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise RoutingIntegrationError("invalid reference timestamp: " + value[:64]) from exc
+    if parsed.tzinfo is None:
+        raise RoutingIntegrationError("reference timestamp must carry a timezone")
+    return parsed.timestamp()
 
 from .routing import (
     FailureKind,
     FailureScope,
+    RetryGuidance,
     ScopeAttestation,
     classify_failure,
+    plan_retry,
 )
 from .scheduler_routing import ManagedExecutionHandoff, ManagedRoute, RoutingIntegrationError
 from .security import InvocationIdentity
@@ -40,6 +62,8 @@ class ProviderFailureObservation:
     model_known: bool | None = None
     scope: FailureScope | None = None
     scope_attestation: ScopeAttestation | None = None
+    retry_after: str | None = None
+    reset_at: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.executor_id, str) or not _TOKEN.fullmatch(self.executor_id):
@@ -52,6 +76,10 @@ class ProviderFailureObservation:
             raise RoutingIntegrationError("invalid provider status code")
         if not isinstance(self.message, str):
             raise RoutingIntegrationError("failure message must be text")
+        for name in ("retry_after", "reset_at"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, str):
+                raise RoutingIntegrationError(f"{name} must be text when present")
         object.__setattr__(
             self,
             "scope",
@@ -80,6 +108,7 @@ class FallbackTransition:
     source_decision_sha256: str
     next_decision_sha256: str | None = None
     handoff: ManagedExecutionHandoff | None = None
+    retry: RetryGuidance | None = None
 
     def __post_init__(self) -> None:
         if self.version != 1:
@@ -103,6 +132,10 @@ class FallbackTransition:
             raise RoutingIntegrationError("fallback transition requires a handoff")
         if self.action is not RecoveryAction.FALLBACK and self.handoff is not None:
             raise RoutingIntegrationError("non-fallback transition cannot carry a handoff")
+        if self.retry is not None and not isinstance(self.retry, RetryGuidance):
+            raise RoutingIntegrationError("typed retry guidance required")
+        if self.action is RecoveryAction.FALLBACK and self.retry is None:
+            raise RoutingIntegrationError("fallback transition requires retry guidance")
 
     def audit_event(self) -> dict[str, Any]:
         handoff = None
@@ -135,6 +168,7 @@ class FallbackTransition:
             "source_decision_sha256": self.source_decision_sha256,
             "next_decision_sha256": self.next_decision_sha256,
             "handoff": handoff,
+            "retry": self.retry.to_json() if self.retry is not None else None,
         }
 
     @classmethod
@@ -156,6 +190,7 @@ class FallbackTransition:
             reconciliation_required=event["reconciliation_required"],
             source_decision_sha256=event["source_decision_sha256"],
             next_decision_sha256=event.get("next_decision_sha256"), handoff=handoff,
+            retry=RetryGuidance.from_json(event["retry"]) if event.get("retry") else None,
         )
 
 
@@ -249,6 +284,7 @@ def decide_managed_fallback(
     expected_requirement_hash: str,
     fallback_count: int,
     max_fallbacks: int,
+    deadline: str | None = None,
 ) -> FallbackTransition:
     """Classify one offline provider observation and choose one bounded action.
 
@@ -280,6 +316,17 @@ def decide_managed_fallback(
         policy_version=policy_version,
     )
     source_digest = route.decision_sha256
+    now = _epoch(at)
+    task_deadline = _epoch(deadline) if deadline is not None else None
+    guidance = plan_retry(
+        failure=failure,
+        retry_after=observation.retry_after,
+        reset_at=observation.reset_at,
+        at=now,
+        attempt=route.routing_input.attempt + 1,
+        deadline=task_deadline,
+        seed=task_id + ":" + observation.executor_id,
+    )
     if observation.delivery_uncertain:
         transition = FallbackTransition(
             1, RecoveryAction.RECONCILE, task_id, identity.run_token, route.routing_input.attempt,
@@ -304,6 +351,14 @@ def decide_managed_fallback(
             False, source_digest,
         )
     elif fallback_count >= max_fallbacks or route.routing_input.attempt >= record.node.max_attempts:
+        transition = FallbackTransition(
+            1, RecoveryAction.TERMINATE, task_id, identity.run_token, route.routing_input.attempt,
+            identity.fencing_token, observation.executor_id, failure,
+            FailureScope.CANDIDATE_LOCAL, fallback_count, max_fallbacks, False, source_digest,
+        )
+    elif not guidance.retryable:
+        # Provider guidance is explicit but the legal wait no longer fits the
+        # task deadline; fail closed instead of retrying unboundedly.
         transition = FallbackTransition(
             1, RecoveryAction.TERMINATE, task_id, identity.run_token, route.routing_input.attempt,
             identity.fencing_token, observation.executor_id, failure,
@@ -341,7 +396,7 @@ def decide_managed_fallback(
             next_route.routing_input.attempt, identity.fencing_token,
             observation.executor_id, failure, FailureScope.CANDIDATE_LOCAL,
             fallback_count + 1, max_fallbacks, False, source_digest,
-            next_route.decision_sha256, handoff,
+            next_route.decision_sha256, handoff, guidance,
         )
     event = transition.audit_event()
     try:

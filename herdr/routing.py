@@ -34,11 +34,34 @@ class FailureKind(StrEnum):
     MODEL_NOT_FOUND = "MODEL_NOT_FOUND"
     INSUFFICIENT_CREDITS = "INSUFFICIENT_CREDITS"
     RATE_LIMITED = "RATE_LIMITED"
+    RATE_LIMIT_QUOTA = "RATE_LIMIT_QUOTA"
     PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
+    PROVIDER_SERVER_ERROR = "PROVIDER_SERVER_ERROR"
+    AUTH_INVALID = "AUTH_INVALID"
     CAPABILITY_MISMATCH = "CAPABILITY_MISMATCH"
+    TOOL_INCOMPATIBLE = "TOOL_INCOMPATIBLE"
+    CONTEXT_LIMIT = "CONTEXT_LIMIT"
+    TRANSPORT_TIMEOUT = "TRANSPORT_TIMEOUT"
     POLICY_DENIED = "POLICY_DENIED"
     BUDGET_EXCEEDED = "BUDGET_EXCEEDED"
     UNKNOWN = "UNKNOWN"
+
+
+# Kinds for which a *different approved candidate* may legally be tried.
+# Authorization and budget denials are terminal: no timing guidance can
+# authorize an alternative candidate.
+RETRYABLE_FAILURES = frozenset({
+    FailureKind.RATE_LIMITED,
+    FailureKind.RATE_LIMIT_QUOTA,
+    FailureKind.PROVIDER_UNAVAILABLE,
+    FailureKind.PROVIDER_SERVER_ERROR,
+    FailureKind.TRANSPORT_TIMEOUT,
+    FailureKind.MODEL_NOT_FOUND,
+    FailureKind.INSUFFICIENT_CREDITS,
+    FailureKind.CAPABILITY_MISMATCH,
+    FailureKind.TOOL_INCOMPATIBLE,
+    FailureKind.CONTEXT_LIMIT,
+})
 
 
 class FailureScope(StrEnum):
@@ -96,13 +119,19 @@ class ScopeAttestation:
 
 # Mapping input order# use this explicit stable precedence; attempted_fallbacks is a sorted set.
 _FAILURE_PRECEDENCE = {
-    FailureKind.POLICY_DENIED: 80,
-    FailureKind.BUDGET_EXCEEDED: 70,
-    FailureKind.INSUFFICIENT_CREDITS: 60,
-    FailureKind.MODEL_NOT_FOUND: 50,
+    FailureKind.POLICY_DENIED: 90,
+    FailureKind.BUDGET_EXCEEDED: 80,
+    FailureKind.INSUFFICIENT_CREDITS: 70,
+    FailureKind.AUTH_INVALID: 65,
+    FailureKind.MODEL_NOT_FOUND: 60,
+    FailureKind.CONTEXT_LIMIT: 55,
+    FailureKind.TOOL_INCOMPATIBLE: 50,
     FailureKind.CAPABILITY_MISMATCH: 40,
+    FailureKind.RATE_LIMIT_QUOTA: 35,
     FailureKind.RATE_LIMITED: 30,
     FailureKind.PROVIDER_UNAVAILABLE: 20,
+    FailureKind.PROVIDER_SERVER_ERROR: 18,
+    FailureKind.TRANSPORT_TIMEOUT: 15,
     FailureKind.UNKNOWN: 10,
 }
 
@@ -313,14 +342,33 @@ def classify_failure(
         return FailureKind.POLICY_DENIED
     if status_code == 402:
         return FailureKind.BUDGET_EXCEEDED
+    if status_code == 401:
+        return FailureKind.AUTH_INVALID
     if any(term in text for term in ("insufficient credit", "insufficient funds", "credit exhausted",
                                      "credits exhausted", "billing limit", "payment required")):
         return FailureKind.INSUFFICIENT_CREDITS
-    if any(term in text for term in ("rate limit", "too many requests", "quota exceeded")) or status_code == 429:
+    if status_code == 429 or any(term in text for term in ("rate limit", "too many requests")):
+        # A 429 is transient fair-share throttling unless the provider states the
+        # quota itself is exhausted; the two need different recovery budgets.
+        if any(term in text for term in ("quota exhausted", "quota depleted", "daily quota",
+                                         "monthly quota", "limit reached", "quota reached")):
+            return FailureKind.RATE_LIMIT_QUOTA
+        if "quota exceeded" in text:
+            return FailureKind.RATE_LIMIT_QUOTA
         return FailureKind.RATE_LIMITED
     if any(term in text for term in ("model not found", "unknown model", "no such model",
                                      "model does not exist")) or (status_code == 404 and model_known is False):
         return FailureKind.MODEL_NOT_FOUND
+    if any(term in text for term in ("context length", "context window", "context limit",
+                                     "maximum context", "too many tokens", "token limit exceeded")):
+        return FailureKind.CONTEXT_LIMIT
+    if any(term in text for term in ("tool call not supported", "unsupported tool", "tool not supported",
+                                     "tool incompatible", "tools are not supported")):
+        return FailureKind.TOOL_INCOMPATIBLE
+    if any(term in text for term in ("timeout", "timed out", "deadline exceeded")):
+        return FailureKind.TRANSPORT_TIMEOUT
+    if status_code == 500:
+        return FailureKind.PROVIDER_SERVER_ERROR
     if status_code in (502, 503, 504) or any(term in text for term in ("provider unavailable",
                                                                          "service unavailable",
                                                                          "temporarily unavailable",
@@ -573,3 +621,185 @@ def bounded_fallback(
         failed_executors=failed_executors, failed_scopes=failed_scopes,
             scope_attestations=scope_attestations,
     )
+
+
+# --- Retry timing -----------------------------------------------------------
+#
+# Router v5 stays the only routing authority, so retry timing is derived here
+# from the provider's own headers instead of delegating to the Hermes native
+# fallback chain (which Herdr deliberately keeps empty for managed tasks).
+
+RETRY_WAIT_CAP_SECONDS = 900.0
+_BACKOFF_BASE_SECONDS = 1.0
+_BACKOFF_CAP_SECONDS = 60.0
+_MAX_SKEW_SECONDS = 3600.0
+
+
+@dataclass(frozen=True)
+class RetryGuidance:
+    """One normalized, bounded wait before the next attempt."""
+
+    retryable: bool
+    wait_seconds: float | None
+    source: str
+    raw: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.retryable) is not bool:
+            raise RoutingError("retryable must be boolean")
+        if self.retryable and self.wait_seconds is None:
+            raise RoutingError("retryable guidance requires a wait")
+        if self.wait_seconds is not None:
+            if type(self.wait_seconds) is not float or not 0.0 <= self.wait_seconds <= RETRY_WAIT_CAP_SECONDS:
+                raise RoutingError("retry wait must be a bounded float")
+        if self.source not in ("none", "retry_after", "reset_timestamp", "backoff", "deadline_exceeded"):
+            raise RoutingError("unknown retry guidance source")
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "retryable": self.retryable,
+            "wait_seconds": self.wait_seconds,
+            "source": self.source,
+            "raw": self.raw,
+        }
+
+    @classmethod
+    def from_json(cls, value: Mapping[str, Any]) -> "RetryGuidance":
+        return cls(
+            retryable=bool(value["retryable"]),
+            wait_seconds=value.get("wait_seconds"),
+            source=str(value["source"]),
+            raw=value.get("raw"),
+        )
+
+
+def parse_retry_after(value: Any, *, at: float) -> float | None:
+    """Normalize a Retry-After header (delta-seconds or HTTP date) to seconds."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        seconds = float(value)
+        return seconds if 0.0 <= seconds <= RETRY_WAIT_CAP_SECONDS else None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if re.fullmatch(r"[0-9]+", text):
+        seconds = float(text)
+        return seconds if 0.0 <= seconds <= RETRY_WAIT_CAP_SECONDS else None
+    parsed = _parse_http_date(text)
+    if parsed is None:
+        return None
+    return _clamp_wait(parsed - at)
+
+
+def normalize_reset_timestamp(value: Any, *, at: float) -> float | None:
+    """Normalize a provider reset hint (epoch seconds or ISO-8601) to seconds."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _clamp_wait(float(value) - at)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if re.fullmatch(r"[0-9]+(\.[0-9]+)?", text):
+        return _clamp_wait(float(text) - at)
+    parsed = _parse_iso8601(text)
+    if parsed is None:
+        return None
+    return _clamp_wait(parsed - at)
+
+
+def bounded_backoff(attempt: int, *, seed: str = "") -> float:
+    """Deterministic, capped exponential backoff with bounded jitter."""
+    if type(attempt) is not int or attempt < 1:
+        raise RoutingError("backoff attempt must be a positive integer")
+    exponent = min(attempt - 1, 5)
+    base = min(_BACKOFF_BASE_SECONDS * (2 ** exponent), _BACKOFF_CAP_SECONDS)
+    jitter = 0.0
+    if seed:
+        digest = hashlib.sha256(seed.encode("utf-8")).digest()
+        jitter = (int.from_bytes(digest[:8], "big") % 1000) / 1000.0
+    return base + (jitter if base < _BACKOFF_CAP_SECONDS else 0.0)
+
+
+def plan_retry(
+    *,
+    failure: FailureKind,
+    retry_after: Any = None,
+    reset_at: Any = None,
+    at: float,
+    attempt: int,
+    deadline: float | None = None,
+    seed: str = "",
+) -> RetryGuidance:
+    """Choose one legal wait for a failed attempt, or declare it terminal.
+
+    Explicit provider guidance wins; a normalized reset timestamp is honoured
+    next; otherwise a bounded backoff is used.  The wait is always clamped to
+    the task deadline so a misread reset timestamp cannot create an unbounded
+    retry loop.
+    """
+    if type(at) is not float or not 0.0 < at < 4102444800.0:
+        raise RoutingError("retry reference time must be a POSIX epoch float")
+    if failure not in RETRYABLE_FAILURES:
+        return RetryGuidance(False, None, "none")
+    if deadline is not None:
+        if type(deadline) is not float or deadline <= at:
+            return RetryGuidance(False, None, "deadline_exceeded")
+        remaining = deadline - at
+    else:
+        remaining = RETRY_WAIT_CAP_SECONDS
+    wait = parse_retry_after(retry_after, at=at)
+    if wait is not None:
+        if wait > remaining:
+            return RetryGuidance(False, None, "deadline_exceeded", raw=str(retry_after))
+        return RetryGuidance(True, wait, "retry_after", raw=str(retry_after))
+    wait = normalize_reset_timestamp(reset_at, at=at)
+    if wait is not None:
+        if wait > remaining:
+            return RetryGuidance(False, None, "deadline_exceeded", raw=str(reset_at))
+        return RetryGuidance(True, wait, "reset_timestamp", raw=str(reset_at))
+    wait = min(bounded_backoff(attempt, seed=seed), remaining)
+    if wait <= 0.0:
+        return RetryGuidance(False, None, "deadline_exceeded")
+    return RetryGuidance(True, wait, "backoff")
+
+
+def _clamp_wait(seconds: float) -> float | None:
+    """Return a bounded positive wait, or None when the hint is unusable."""
+    if seconds != seconds or seconds < 0.0 or seconds > RETRY_WAIT_CAP_SECONDS + _MAX_SKEW_SECONDS:
+        return None
+    return min(seconds, RETRY_WAIT_CAP_SECONDS)
+
+
+def _parse_http_date(value: str) -> float | None:
+    from email.utils import parsedate_to_datetime
+
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.timestamp()
+
+
+def _parse_iso8601(value: str) -> float | None:
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        from datetime import datetime
+
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.timestamp()
