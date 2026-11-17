@@ -280,6 +280,58 @@ def network_denial_filter(*, deny_process_creation=False):
             lib.seccomp_release(ctx)
 
 
+def _authorized_readonly_mounts(root: Path, git: Path) -> list[tuple[str, str]]:
+    """Host-side discovery of the authorized worktree and its Git object stores.
+
+    Only these subtrees are exposed to the untrusted verifier below the private
+    /tmp scratch mount; every other host temporary file stays hidden. Discovery
+    itself runs on the host with the trusted Git binary and read-only flags.
+    """
+    paths = [root]
+    try:
+        resolved = subprocess.run(
+            [str(git), "-C", str(root), "--no-optional-locks", "--no-replace-objects",
+             "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+             "-c", "diff.external=", "rev-parse", "--absolute-git-dir", "--git-common-dir"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30, check=False,
+        ).stdout.splitlines()
+    except (OSError, subprocess.SubprocessError):
+        resolved = []
+    values = [line.strip() for line in resolved if line.strip()]
+    if values:
+        git_dir = Path(values[0])
+        paths.append(git_dir)
+        if len(values) > 1:
+            common = Path(values[1])
+            if common.is_absolute():
+                paths.append(common)
+            else:
+                # `--git-common-dir` is relative to the invocation directory
+                # in some Git versions and to the git dir in others; accept
+                # whichever candidate actually exists on the host.
+                for candidate in (root / common, git_dir / common):
+                    if candidate.is_dir():
+                        paths.append(candidate)
+                        break
+    for base in list(paths):
+        try:
+            entries = (base / "objects" / "info" / "alternates").read_text().split()
+        except OSError:
+            continue
+        for entry in entries:
+            target = Path(entry)
+            paths.append(target if target.is_absolute() else base / "objects" / target)
+    unique: list[Path] = []
+    for path in paths:
+        try:
+            resolved_path = path.resolve()
+        except OSError:
+            continue
+        if resolved_path not in unique:
+            unique.append(resolved_path)
+    return [(str(path), str(path)) for path in unique]
+
+
 def read_only_git(root: Path):
     """Untrusted worktree Git configuration never runs in the host namespace.
 
@@ -295,12 +347,13 @@ def read_only_git(root: Path):
         command = [
             str(bwrap), "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
             "--unshare-pid", "--unshare-net", "--seccomp", str(seccomp_fd),
-            # /tmp stays visible but read-only: the verified worktree may
-            # itself live below /tmp (for example a CI evidence boundary), and
-            # shadowing it would make linked-worktree object alternates
-            # unreachable. The untrusted verifier still gets no writable host
-            # mount.
-            "--ro-bind", "/tmp", "/tmp",
+            # Private writable scratch. The host /tmp stays hidden; only the
+            # authorized worktree and its Git object stores are re-exposed
+            # read-only, so a worktree below /tmp (for example a CI evidence
+            # boundary) remains verifiable without granting a general /tmp read.
+            "--tmpfs", "/tmp",
+            *(part for source, target in _authorized_readonly_mounts(root, git)
+              for part in ("--ro-bind", source, target)),
             "--clearenv",
             "--setenv", "PATH", "/usr/bin:/bin", "--setenv", "HOME", "/tmp",
             "--", str(git), "--no-optional-locks", "--no-replace-objects",

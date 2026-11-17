@@ -275,6 +275,35 @@ def test_actual_read_only_git_reaches_workspace_below_shadowed_tmp():
             pytest.skip("this test host cannot execute the read-only verifier namespace")
 
 
+def test_actual_read_only_git_exposes_only_authorized_subtrees(monkeypatch, tmp_path):
+    import herdr.evidence as evidence
+    if not shutil.which("bwrap"):
+        pytest.skip("physical artifact verifier is unavailable")
+    captured = {}
+
+    def fake_command(argv, **kwargs):
+        captured["argv"] = list(argv)
+        return b""
+
+    monkeypatch.setattr(evidence, "artifact_command", fake_command)
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    run_git(workspace, "init")
+    (workspace / "result.txt").write_text("bounded\n")
+    run_git(workspace, "add", "result.txt")
+    run_git(workspace, "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-m", "init")
+    evidence.read_only_git(workspace)(["ls-files", "-z", "--cached", "--others"])
+    argv = captured["argv"]
+    assert argv[argv.index("--tmpfs") + 1] == "/tmp"
+    pairs = [(argv[index + 1], argv[index + 2])
+             for index, part in enumerate(argv) if part == "--ro-bind"]
+    assert ("/tmp", "/tmp") not in pairs
+    assert all(source == target for source, target in pairs)
+    exposed = {source for source, _ in pairs}
+    assert str(workspace.resolve()) in exposed
+    assert "/etc" not in exposed and "/home" not in exposed
+
+
 def typed_fixture(tmp_path, kind, fault=None):
     task, result, plan, store, path, proof = fixture(tmp_path)
     report_path = f"reports/{kind}/report.json"
