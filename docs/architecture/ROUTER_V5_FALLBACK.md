@@ -13,9 +13,15 @@ Herdr-managed tasks. Hermes native fallback is an execution mechanism only.
   (`_provider_reset_delay`, `switch_deferred_by_reset`, `_arm_rate_limit_cooldown`,
   `min_switch_reset_seconds`), `agent/turn_recovery.py`, `agent/turn_api_error.py`
   (`FailoverReason` — 17 reasons, `_try_activate_fallback(reason=..., reset_at=...)`).
-- Config keys observed: `fallback_providers`, `fallback_model`, `fallback_on`,
-  `fallback.min_switch_reset_seconds`, `api_max_retries`, `auxiliary_model`,
-  `fallback_policy`, `delegation.fallback`, `cron.fallback`.
+- Config keys observed in this profile
+  (`/home/agentops/.hermes/profiles/quantlab/config.yaml`): `model.default`
+  `meituan/longcat-2.5:free` via provider `nous`, `fallback_providers: []`
+  (no native chain configured), `fallback.min_switch_reset_seconds: 120`,
+  `agent.reasoning_effort: low`. The default profile additionally ships
+  `api_max_retries` and `fallback_on` as commented defaults.
+- Measured consequence: with an empty `fallback_providers` list and the guard's
+  `private_sdk_fallback_not_empty` rejection, the Hermes native chain cannot
+  widen the approved provider set here. It is a no-op, not a parallel authority.
 
 ### Herdr
 
