@@ -58,21 +58,32 @@ never invents a rate and never invents a cost.
 - `select_billable(...)`: reconciles attempts of one economic `request_id`;
   only a `DELIVERED` attempt bills, so retries/fallbacks/uncertain delivery are
   never charged twice.
+- `billable_cost_microusd(...)`: returns a known cost or `None`. `None` is the only
+  representation of an unknown cost; it must never be coerced to zero.
 
 Invariants enforced in `__post_init__`:
 
 1. `MEASURED` requires all four buckets, a delivered response and no unknown
    reasons.
-2. `PARTIAL` requires input+output coverage plus explicit unknown reasons; it
-   contributes **no** token totals to the aggregate (a missing bucket is not 0).
-3. `UNKNOWN` carries no token buckets and an explicit reason.
+2. `PARTIAL` requires output coverage (output is directly reported for every API
+   mode) plus explicit unknown reasons; it contributes **no** token totals to the
+   aggregate (a missing bucket is not 0).  `input_tokens` may be missing when
+   chat/codex cache metadata is incomplete and uncached input cannot be derived;
+   the directly reported output and cache buckets remain valid evidence.
+3. `UNKNOWN` carries no token buckets and an explicit reason.  Malformed evidence
+   (`provider_malformed`) always degrades the whole observation to `UNKNOWN`.
 4. `NON_BILLABLE` is the only status that may carry a concrete zero cost, and only
    with `non_billable_route`.
-5. A core bucket that is malformed or absent degrades the whole observation to
-   `UNKNOWN` instead of reporting a partial sum.
-6. A cache bucket larger than the reported input total is malformed evidence, not
-   a clamped number.
+5. A cache bucket that exceeds the provider-reported input total is malformed
+   evidence, not a clamped number.  The comparison is against that total: the
+   chat/codex prompt total, and `input + cache_read + cache_write` for Anthropic.
+6. Cost is computed exactly once from the normalized buckets:
+   `uncached_input*input_rate + cache_read*cache_read_rate +
+   cache_write*cache_write_rate + output*output_rate`. Normalization is not
+   repeated in the price computation, so cached tokens are never charged twice.
 7. Unknown cost requires `cost_unknown_reason`; known cost forbids it.
+8. `cost_state` is `measured`, `partial`, `unknown` or `non_billable`; only
+   `non_billable` may render a concrete zero.
 
 ## 4. Offline fixtures (`tests/herdr/fixtures/`)
 

@@ -20,6 +20,7 @@ from herdr.provider_usage import (
     UsageObservation,
     UsageStatus,
     UsageStatus as Status,
+    billable_cost_microusd,
     observe_usage,
     select_billable,
 )
@@ -56,8 +57,9 @@ def test_successful_anthropic_call_is_measured_with_cache_buckets():
     assert observed.cache_write_tokens == 250
     assert observed.coverage == {
         "input": True, "output": True, "cache_read": True, "cache_write": True}
-    # 250 uncached * 3 + 500 * 0.3 + 250 * 3.75 + 200 * 15 = 750 + 150 + 937.5 + 3000
-    assert observed.estimated_cost_microusd == 4838
+    # uncached input 1000 * 3 + cache read 500 * 0.3 + cache write 250 * 3.75
+    # + output 200 * 15 = 3000 + 150 + 937.5 + 3000
+    assert observed.estimated_cost_microusd == 7088
 
 
 def test_successful_openai_call_splits_cached_from_prompt_total():
@@ -71,7 +73,9 @@ def test_successful_openai_call_splits_cached_from_prompt_total():
     assert observed.cache_read_tokens == 200
     assert observed.output_tokens == 150
     assert observed.cache_write_tokens == 0
-    assert observed.estimated_cost_microusd == 4110
+    # uncached 800 * 3 + cache read 200 * 0.3 + cache write 0 * 3.75
+    # + output 150 * 15 = 2400 + 60 + 0 + 2250
+    assert observed.estimated_cost_microusd == 4710
 
 
 def test_codex_missing_cache_write_metadata_is_partial_not_measured():
@@ -81,12 +85,14 @@ def test_codex_missing_cache_write_metadata_is_partial_not_measured():
         request_id="req-3", pricing=PRICING, usage=usage,
     )
     assert observed.status is UsageStatus.PARTIAL
-    assert observed.input_tokens == 400
+    assert observed.input_tokens is None
     assert observed.cache_read_tokens == 100
     assert observed.output_tokens == 150
     assert observed.cache_write_tokens is None
     assert observed.unknown_reasons == ("provider_omitted",)
     assert observed.estimated_cost_microusd is None
+    # The unknown cache write is never reported as zero: uncached input is unknown.
+    assert observed.coverage["input"] is False
 
 
 # ------------------------------------------------------------------ failure
@@ -225,16 +231,38 @@ def test_malformed_provider_value_is_unknown_not_zero():
     assert "provider_malformed" in observed.unknown_reasons
 
 
-def test_cache_buckets_cannot_exceed_input_tokens():
-    usage = {"input_tokens": 100, "output_tokens": 5, "cache_read_input_tokens": 200,
-             "cache_creation_input_tokens": 0}
+def test_cache_buckets_cannot_exceed_the_provider_input_total():
+    # chat/codex prompt total includes cached tokens: cached 900 + written 200
+    # exceeds the reported 1000 prompt total, so the row is malformed evidence.
+    usage = {"prompt_tokens": 1000, "completion_tokens": 5,
+             "prompt_tokens_details": {"cached_tokens": 900,
+                                       "cache_write_tokens": 200}}
+    observed = observe_usage(
+        provider="openai", model="gpt-5.3-codex", api_mode="chat_completions",
+        request_id="req-13", pricing=PRICING, usage=usage)
+    assert observed.status is UsageStatus.UNKNOWN
+    assert observed.input_tokens is None
+    assert observed.cache_read_tokens is None
+    assert observed.cache_write_tokens is None
+    assert observed.output_tokens is None
+    assert "provider_malformed" in observed.unknown_reasons
+
+
+def test_anthropic_cache_buckets_are_not_part_of_uncached_input():
+    # Anthropic reports uncached input plus independent cache buckets, so a cache
+    # bucket larger than input_tokens is valid evidence, not a contradiction.
+    usage = {"input_tokens": 100, "output_tokens": 5, "cache_read_input_tokens": 900,
+             "cache_creation_input_tokens": 200}
     observed = observe_usage(
         provider="anthropic", model="claude-opus-4-6", api_mode="anthropic_messages",
-        request_id="req-13", pricing=PRICING, usage=usage)
-    assert observed.status is UsageStatus.PARTIAL
+        request_id="req-13b", pricing=PRICING, usage=usage)
+    assert observed.status is UsageStatus.MEASURED
     assert observed.input_tokens == 100
-    assert observed.cache_read_tokens is None
-    assert "provider_malformed" in observed.unknown_reasons
+    assert observed.cache_read_tokens == 900
+    assert observed.cache_write_tokens == 200
+    expected = (100 * 3_000_000 + 900 * 300_000 + 200 * 3_750_000
+                + 5 * 15_000_000 + 999_999) // 1_000_000
+    assert observed.estimated_cost_microusd == expected
 
 
 def test_actual_cost_without_a_reason_is_rejected_by_the_contract():
@@ -305,3 +333,135 @@ def test_unknown_reasons_and_notes_are_closed_and_bounded():
         observe_usage(
             provider="anthropic", model="claude-opus-4-6", api_mode="anthropic_messages",
             request_id="req-19", usage=None, notes=["x" * 257])
+
+
+# ------------------------------------------------- cache hit parametrization
+# The same economic call expressed at different cache hit ratios must never charge
+# the cached tokens twice: the normalized input bucket is uncached input, and the
+# cache buckets are billed once at their own rate.
+@pytest.mark.parametrize("hit", [0.0, 0.5, 0.9, 1.0])
+@pytest.mark.parametrize("api_mode", ["chat_completions", "codex_responses"])
+def test_openai_cache_hit_ratios_never_double_count(api_mode, hit):
+    prompt_total, output = 1000, 100
+    cached = round(prompt_total * hit)
+    if api_mode == "chat_completions":
+        usage = {"prompt_tokens": prompt_total, "completion_tokens": output,
+                 "prompt_tokens_details": {"cached_tokens": cached},
+                 "cache_write_tokens": 0}
+    else:
+        usage = {"input_tokens": prompt_total, "output_tokens": output,
+                 "input_tokens_details": {"cached_tokens": cached,
+                                          "cache_write_tokens": 0}}
+    observed = observe_usage(
+        provider="openai", model="gpt-5.3-codex", api_mode=api_mode,
+        request_id=f"hit-{api_mode}-{hit}", pricing=PRICING, usage=usage)
+    assert observed.status is UsageStatus.MEASURED
+    assert observed.input_tokens == prompt_total - cached
+    assert observed.cache_read_tokens == cached
+    assert observed.cache_write_tokens == 0
+    expected = ((prompt_total - cached) * 3_000_000 + cached * 300_000
+                + output * 15_000_000)
+    assert observed.estimated_cost_microusd == (expected + 999_999) // 1_000_000
+
+
+@pytest.mark.parametrize("hit", [0.0, 0.5, 0.9, 1.0])
+def test_anthropic_cache_hit_ratios_and_cache_write(hit):
+    total_input, cache_write, output = 1000, 250, 100
+    cache_read = round((total_input - cache_write) * hit)
+    uncached = total_input - cache_write - cache_read
+    usage = {"input_tokens": uncached, "output_tokens": output,
+             "cache_read_input_tokens": cache_read,
+             "cache_creation_input_tokens": cache_write}
+    observed = observe_usage(
+        provider="anthropic", model="claude-opus-4-6", api_mode="anthropic_messages",
+        request_id=f"hit-anthropic-{hit}", pricing=PRICING, usage=usage)
+    assert observed.status is UsageStatus.MEASURED
+    assert observed.input_tokens == uncached
+    assert observed.cache_read_tokens == cache_read
+    assert observed.cache_write_tokens == cache_write
+    expected = (uncached * 3_000_000 + cache_read * 300_000
+                + cache_write * 3_750_000 + output * 15_000_000)
+    assert observed.estimated_cost_microusd == (expected + 999_999) // 1_000_000
+
+
+def test_full_cache_hit_charges_no_uncached_input_rate():
+    # Regression guard for the double-subtraction defect: at a 100% hit the whole
+    # prompt total is charged at the cache-read rate only.
+    prompt_total, output = 1000, 100
+    usage = {"prompt_tokens": prompt_total, "completion_tokens": output,
+             "prompt_tokens_details": {"cached_tokens": prompt_total},
+             "cache_write_tokens": 0}
+    observed = observe_usage(
+        provider="openai", model="gpt-5.3-codex", api_mode="chat_completions",
+        request_id="hit-full", pricing=PRICING, usage=usage)
+    assert observed.input_tokens == 0
+    assert observed.estimated_cost_microusd == (
+        prompt_total * 300_000 + output * 15_000_000 + 999_999) // 1_000_000
+
+
+def test_zero_cache_hit_charges_the_full_prompt_total():
+    prompt_total, output = 1000, 100
+    usage = {"prompt_tokens": prompt_total, "completion_tokens": output,
+             "prompt_tokens_details": {"cached_tokens": 0},
+             "cache_write_tokens": 0}
+    observed = observe_usage(
+        provider="openai", model="gpt-5.3-codex", api_mode="chat_completions",
+        request_id="hit-zero", pricing=PRICING, usage=usage)
+    assert observed.input_tokens == prompt_total
+    assert observed.estimated_cost_microusd == (
+        prompt_total * 3_000_000 + output * 15_000_000 + 999_999) // 1_000_000
+
+
+# ------------------------------------------------- uncertain delivery economics
+def test_uncertain_delivery_cost_is_unknown_never_zero():
+    usage = {"prompt_tokens": 1000, "completion_tokens": 10,
+             "prompt_tokens_details": {"cached_tokens": 0},
+             "cache_write_tokens": 0}
+    uncertain = observe_usage(
+        provider="openai", model="gpt-5.3-codex", api_mode="chat_completions",
+        request_id="req-uncertain", attempt_index=0, pricing=PRICING,
+        usage=usage, delivery=DeliveryOutcome.UNCERTAIN)
+    billable = select_billable([uncertain])
+    assert set(billable) == {"req-uncertain"}
+    row = billable["req-uncertain"]
+    assert row.status is UsageStatus.UNKNOWN
+    assert row.cost_state == "unknown"
+    assert row.actual_cost_microusd is None
+    assert billable_cost_microusd(row) is None
+    assert billable_cost_microusd(row) != 0
+    payload = row.to_json()
+    assert payload["cost_state"] == "unknown"
+    assert payload["actual_cost_microusd"] is None
+
+
+def test_billable_cost_helper_keeps_measured_and_non_billable_distinct():
+    usage = {"prompt_tokens": 10, "completion_tokens": 1,
+             "prompt_tokens_details": {"cached_tokens": 0},
+             "cache_write_tokens": 0}
+    measured = observe_usage(
+        provider="openai", model="gpt-5.3-codex", api_mode="chat_completions",
+        request_id="req-cost-1", pricing=PRICING, usage=usage)
+    non_billable = observe_usage(
+        provider="openai", model="gpt-5.3-codex", api_mode="chat_completions",
+        request_id="req-cost-2", pricing=PRICING, usage=usage, non_billable=True)
+    assert billable_cost_microusd(measured) == measured.estimated_cost_microusd
+    assert billable_cost_microusd(non_billable) == 0
+    assert non_billable.cost_state == "non_billable"
+
+
+def test_uncertain_delivery_never_suppresses_a_delivered_fallback_cost():
+    usage = {"prompt_tokens": 1000, "completion_tokens": 10,
+             "prompt_tokens_details": {"cached_tokens": 0},
+             "cache_write_tokens": 0}
+    uncertain = observe_usage(
+        provider="openai", model="gpt-5.3-codex", api_mode="chat_completions",
+        request_id="req-uncertain-fallback", attempt_index=0, pricing=PRICING,
+        usage=usage, delivery=DeliveryOutcome.UNCERTAIN)
+    delivered = observe_usage(
+        provider="openai", model="gpt-5.3-codex", api_mode="chat_completions",
+        request_id="req-uncertain-fallback", attempt_index=1, pricing=PRICING,
+        usage=usage, delivery=DeliveryOutcome.DELIVERED)
+    billable = select_billable([uncertain, delivered])
+    assert billable["req-uncertain-fallback"].delivery is DeliveryOutcome.DELIVERED
+    assert billable_cost_microusd(billable["req-uncertain-fallback"]) == (
+        1000 * 3_000_000 + 10 * 15_000_000 + 999_999) // 1_000_000

@@ -263,21 +263,22 @@ class UsageObservation:
                 continue
             if type(value) is not int or isinstance(value, bool) or not 0 <= value <= 10**15:
                 raise UsageFieldError(f"{name}_tokens must be a bounded non-negative integer")
-        if (self.cache_read_tokens is not None and self.input_tokens is not None
-                and self.cache_read_tokens > self.input_tokens):
-            raise UsageFieldError("cache_read_tokens cannot exceed input_tokens")
-        if (self.cache_write_tokens is not None and self.input_tokens is not None
-                and self.cache_write_tokens > self.input_tokens):
-            raise UsageFieldError("cache_write_tokens cannot exceed input_tokens")
+        # No cross-bucket bound here: ``input_tokens`` is uncached input for every
+        # API mode, so a cache bucket may legitimately exceed it (a 100% cache hit
+        # yields input_tokens == 0).  Contradictions against the provider-reported
+        # input total are rejected in ``observe_usage`` before normalization.
         if (self.cache_read_tokens is None) != (self.cache_write_tokens is None):
             # Missing cache metadata is a coverage gap, not a contradiction; the
             # aggregate reports it through unknown_cache_observations.
             pass
-        if (self.input_tokens is None) != (self.output_tokens is None) and self.status in (
+        if self.input_tokens is None and self.status is UsageStatus.MEASURED:
+            raise UsageFieldError("measured observation requires input coverage")
+        if self.output_tokens is None and self.status in (
                 UsageStatus.MEASURED, UsageStatus.PARTIAL):
-            # UNKNOWN observations legitimately have neither; only measured/partial
-            # observations must carry the core input/output pair together.
-            raise UsageFieldError("input and output coverage must be reported together")
+            # Output is directly reported for every API mode; a row without it has
+            # no trustworthy measurement.  Input may legitimately be missing in a
+            # PARTIAL row when cache metadata prevents deriving uncached input.
+            raise UsageFieldError("measured/partial observation requires output coverage")
         object.__setattr__(self, "unknown_reasons", _unknown_reasons(self.unknown_reasons))
         object.__setattr__(self, "notes", _notes(self.notes))
         if self.reported_sha256 is not None and (
@@ -307,8 +308,8 @@ class UsageObservation:
         if self.status is UsageStatus.PARTIAL:
             if not measured:
                 raise UsageFieldError("partial observation requires at least one measured bucket")
-            if self.input_tokens is None or self.output_tokens is None:
-                raise UsageFieldError("partial observation must state input/output coverage")
+            if self.output_tokens is None:
+                raise UsageFieldError("partial observation must state output coverage")
             if not self.unknown_reasons:
                 raise UsageFieldError("partial observation requires explicit unknown reasons")
             return
@@ -361,6 +362,19 @@ class UsageObservation:
         return {name: name in self.measured_fields for name in TOKEN_FIELDS}
 
     @property
+    def cost_state(self) -> str:
+        """Explicit economic state so a consumer cannot read unknown as zero.
+
+        ``unknown`` means the cost is not known; it is never rendered as a zero.
+        ``non_billable`` is the only state allowed a concrete zero.
+        """
+        if self.status is UsageStatus.NON_BILLABLE:
+            return "non_billable"
+        if self.status is UsageStatus.UNKNOWN or self.actual_cost_microusd is None:
+            return "unknown"
+        return "measured" if self.status is UsageStatus.MEASURED else "partial"
+
+    @property
     def observation_id(self) -> str:
         return digest(self.to_json(include_observation_id=False))
 
@@ -374,6 +388,7 @@ class UsageObservation:
             "attempt_index": self.attempt_index,
             "delivery": self.delivery.value,
             "status": self.status.value,
+            "cost_state": self.cost_state,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "cache_read_tokens": self.cache_read_tokens,
@@ -402,12 +417,13 @@ class UsageObservation:
 
     @classmethod
     def from_json(cls, raw: Mapping[str, Any]) -> "UsageObservation":
-        allowed = set(cls.__dataclass_fields__) | {"observation_id", "coverage"}
+        allowed = set(cls.__dataclass_fields__) | {"observation_id", "coverage", "cost_state"}
         if type(raw) is not dict or set(raw) - allowed:
             raise UsageFieldError("unknown usage observation fields rejected")
         values = dict(raw)
         expected = values.pop("observation_id", None)
         values.pop("coverage", None)
+        values.pop("cost_state", None)
         pricing = values.get("pricing")
         if pricing is not None:
             values["pricing"] = PricingObservation.from_mapping(pricing)
@@ -507,7 +523,11 @@ def _estimate(observation: UsageObservation) -> int | None:
             return None
         if buckets[name] is None:
             return None
-    uncached = buckets["input"] - (buckets["cache_read"] or 0) - (buckets["cache_write"] or 0)
+    # ``input_tokens`` is already the uncached input: ``observe_usage`` subtracts
+    # cache-read/cache-write from the provider prompt total for chat/codex, and
+    # Anthropic reports uncached ``input_tokens`` directly.  Subtracting again
+    # here would charge cached tokens twice.
+    uncached = buckets["input"]
     if uncached < 0:
         raise UsageFieldError("cache buckets cannot exceed input tokens")
     numerator = (uncached * pricing.input_microusd_per_million
@@ -556,31 +576,66 @@ def observe_usage(
             buckets[name] = None
             if UnknownReason.PROVIDER_MALFORMED.value not in reasons:
                 reasons.append(UnknownReason.PROVIDER_MALFORMED.value)
+    # Provider-reported input total, captured before normalization.
+    # chat/codex: prompt total already includes cached tokens.
+    # anthropic: input_tokens is uncached, so the total adds the cache buckets.
+    if mode is ApiMode.ANTHROPIC_MESSAGES:
+        base_input = buckets["input"]
+        provider_input_total = (
+            None if base_input is None
+            else base_input + (buckets["cache_read"] or 0) + (buckets["cache_write"] or 0)
+        )
+    else:
+        provider_input_total = buckets["input"]
+
+    # Contradiction check against the provider total, never against the normalized
+    # uncached input.  Cache buckets that exceed it are malformed evidence.
+    if provider_input_total is not None:
+        cache_sum = (buckets["cache_read"] or 0) + (buckets["cache_write"] or 0)
+        malformed = cache_sum > provider_input_total
+        if not malformed:
+            for name in ("cache_read", "cache_write"):
+                value = buckets[name]
+                if value is not None and value > provider_input_total:
+                    buckets[name] = None
+                    malformed = True
+        if malformed:
+            for name in ("input", "cache_read", "cache_write"):
+                buckets[name] = None
+            if UnknownReason.PROVIDER_MALFORMED.value not in reasons:
+                reasons.append(UnknownReason.PROVIDER_MALFORMED.value)
+
     if mode is not ApiMode.ANTHROPIC_MESSAGES:
-        # OpenAI/Codex totals include cached tokens; Anthropic reports uncached input.
+        # Normalize the prompt total to uncached input; the normalized ``input``
+        # bucket is always uncached input, for every API mode.  Without both cache
+        # buckets the uncached input cannot be derived, so it is reported as
+        # missing instead of treating the unknown cache write as zero.
         prompt_total = buckets["input"]
+        cache_known = (buckets["cache_read"] is not None
+                       and buckets["cache_write"] is not None)
         if prompt_total is not None:
-            buckets["input"] = max(0, prompt_total - (buckets["cache_read"] or 0)
-                                   - (buckets["cache_write"] or 0))
-        elif buckets["cache_read"] is None and buckets["cache_write"] is None:
+            if cache_known:
+                buckets["input"] = max(0, prompt_total - (buckets["cache_read"] or 0)
+                                       - (buckets["cache_write"] or 0))
+            else:
+                buckets["input"] = None
+                if UnknownReason.PROVIDER_OMITTED.value not in reasons:
+                    reasons.append(UnknownReason.PROVIDER_OMITTED.value)
+        elif not cache_known:
             if UnknownReason.PROVIDER_OMITTED.value not in reasons:
                 reasons.append(UnknownReason.PROVIDER_OMITTED.value)
     if raw:
         reported_sha256 = digest(raw)
 
-    # Contradiction check before status derivation: a cache bucket that exceeds the
-    # reported input total is malformed evidence, never a silently clamped number.
-    input_total = buckets["input"]
-    if input_total is not None:
-        for name in ("cache_read", "cache_write"):
-            value = buckets[name]
-            if value is not None and value > input_total:
-                buckets[name] = None
-                if UnknownReason.PROVIDER_MALFORMED.value not in reasons:
-                    reasons.append(UnknownReason.PROVIDER_MALFORMED.value)
-
     status = UsageStatus.MEASURED
-    if non_billable:
+    if UnknownReason.PROVIDER_MALFORMED.value in reasons:
+        # Malformed evidence is never reported as a partial measurement: the whole
+        # observation degrades to UNKNOWN with no token buckets.
+        status = UsageStatus.UNKNOWN
+        buckets = {name: None for name in TOKEN_FIELDS}
+        if outcome is DeliveryOutcome.DELIVERED:
+            outcome = DeliveryOutcome.FAILED
+    elif non_billable:
         status = UsageStatus.NON_BILLABLE
         reasons = [UnknownReason.NON_BILLABLE_ROUTE.value]
     elif outcome is not DeliveryOutcome.DELIVERED:
@@ -603,10 +658,12 @@ def observe_usage(
         status = UsageStatus.PARTIAL
         if not reasons:
             reasons = [UnknownReason.PROVIDER_OMITTED.value]
-    if status is UsageStatus.PARTIAL and (
-            buckets["input"] is None or buckets["output"] is None):
-        # A core bucket that is malformed or absent cannot be reported as a
-        # partial measurement; the whole observation is unknown.
+    if status is UsageStatus.PARTIAL and buckets["output"] is None:
+        # Output is always directly reported, never derived, so a missing output
+        # bucket means the row carries no trustworthy measurement.  A missing
+        # ``input`` is tolerated: uncached input is derived and may be unavailable
+        # when cache metadata is incomplete, while output and cache buckets remain
+        # valid evidence.
         status = UsageStatus.UNKNOWN
         buckets = {name: None for name in TOKEN_FIELDS}
         if outcome is DeliveryOutcome.DELIVERED:
@@ -666,9 +723,31 @@ def observe_usage(
         reported_sha256=reported_sha256,
     )
     estimated = _estimate(observation)
+    if observation.status is UsageStatus.NON_BILLABLE:
+        # A non-billable route carries a concrete zero, never a computed charge.
+        estimated = 0
     if estimated is not None:
         observation = replace(observation, estimated_cost_microusd=estimated)
     return observation
+
+
+def billable_cost_microusd(observation: UsageObservation) -> int | None:
+    """Known billed cost in micro-USD, or ``None`` when it is unknown.
+
+    ``None`` is the only representation of an unknown economic cost; callers must
+    not coerce it to zero.  A provider-reported actual cost wins; otherwise a
+    fully measured row falls back to its pricing-derived estimate.  A ``PARTIAL``
+    row whose buckets are incomplete has no cost and stays ``None``.
+    ``NON_BILLABLE`` is the sole state allowed a concrete zero, because the
+    provider/route itself excluded the call from billing.
+    """
+    if observation.status is UsageStatus.UNKNOWN:
+        return None
+    if observation.status is UsageStatus.NON_BILLABLE:
+        return 0
+    if observation.actual_cost_microusd is not None:
+        return observation.actual_cost_microusd
+    return observation.estimated_cost_microusd
 
 
 def select_billable(observations: Iterable[UsageObservation]) -> dict[str, UsageObservation]:
@@ -677,6 +756,11 @@ def select_billable(observations: Iterable[UsageObservation]) -> dict[str, Usage
     The first ``DELIVERED`` attempt wins; retries and fallbacks of the same
     ``request_id`` are superseded, and an uncertain delivery never becomes a
     second charge.  Non-billable routes are dropped from the billable set.
+
+    The returned observation keeps its own ``cost_state``: an uncertain delivery
+    that never got a delivered fallback stays ``cost_state="unknown"`` with
+    ``actual_cost_microusd=None``.  Use :func:`billable_cost_microusd` to read the
+    cost; never substitute zero for the ``None`` it returns.
     """
     billable: dict[str, UsageObservation] = {}
     for observation in observations:
