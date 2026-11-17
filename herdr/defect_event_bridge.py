@@ -33,6 +33,7 @@ from herdr.defect_admission import (
     DefectDecision,
     DefectDisposition,
     DecisionJournal,
+    _token,
     decide_defect_admission,
 )
 from herdr.operational_incidents import (
@@ -84,11 +85,19 @@ def defect_category(observation: Observation) -> DefectCategory | None:
     return category
 
 
-def defect_from_observation(observation: Observation) -> DefectObservation | None:
+def defect_from_observation(observation: Observation, *, check_id: str) -> DefectObservation | None:
     """Translate an open #100 CI observation into the defect contract.
 
     Returns ``None`` for anything that is not an open CI validation failure.
+
+    ``check_id`` must be the stable identity of the *defined* check, supplied by
+    the caller from #100's durable record.  It is validated, never guessed: #100
+    exposes no such id today (its ``job_id`` is a per-run instance and its
+    ``correlation_id`` covers the whole group), so the caller must provide it or
+    the translation is refused.
     """
+    if type(check_id) is not str or _token(check_id) is None:
+        raise DefectError("stable check identity is required")
     category = defect_category(observation)
     if category is None:
         return None
@@ -102,7 +111,6 @@ def defect_from_observation(observation: Observation) -> DefectObservation | Non
     if len(subject) < 2:
         raise DefectError("CI observation subject does not carry pr and workflow")
     pr, workflow = subject[0], subject[1]
-    evidence = observation.evidence_sha256[0]
     return DefectObservation(
         source=DefectSource.CI_CHECK,
         category=category,
@@ -110,14 +118,12 @@ def defect_from_observation(observation: Observation) -> DefectObservation | Non
         commit_sha=head,
         ref=f"refs/pull/{pr}/head",
         subject=(f"pr-{pr}", f"workflow-{workflow}"),
-        # #100 exposes no stable workflow-job *definition* id today: its
-        # ``job_id`` is a per-run instance and its ``correlation_id`` covers the
-        # whole (source, scope, subject) group.  Collapsing by correlation alone
-        # would hide a second failing job, so the pinned evidence digest of the
-        # individual #100 output participates in the identity.  That errs on the
-        # side of reporting distinct failures; a stable definition id from #100
-        # would replace it.
-        finding_identity=f"ci-{observation.correlation_id[:16]}-{evidence[:12]}",
+        # The identity is the *defined* check the caller pinned from #100's
+        # durable record.  #100's per-run ``job_id`` and per-run evidence digest
+        # are deliberately NOT part of it: neither is stable across runs, so
+        # either one would silently change what "the same defect" means
+        # (fragmenting a red PR, or collapsing two distinct checks).
+        finding_identity=f"ci-{check_id}",
         workflow=workflow,
         check_run_id=str(run_id),
         event_revision=observation.revision,
@@ -157,6 +163,7 @@ def admission_proposal(
     usage: ResourceUsage,
     *,
     pin: str,
+    check_id: str,
     journal: DecisionJournal,
 ) -> dict:
     """Run the full proposal path against the EXISTING admission gate.
@@ -167,6 +174,11 @@ def admission_proposal(
     digests.  Provenance beyond that is #100's EventEnvelope boundary, not this
     module's: the bridge never authenticates its input, it only refuses input
     that did not come from the #100 fabric.
+
+    ``check_id`` is the stable identity of the *defined* check, supplied by the
+    caller from #100's durable record.  The bridge will not invent one: neither
+    #100's per-run ``job_id`` nor its per-run evidence digest is stable, and
+    using either silently changes what "the same defect" means.
 
     ``journal`` is mandatory.  The defect decision is recorded durably, and the
     gate verdict separately.  Only a recorded ALLOW makes the proposal
@@ -187,7 +199,7 @@ def admission_proposal(
         raise DefectError("durable dedup journal is required")
     if type(pin) is not str or pin not in observation.evidence_sha256:
         raise DefectError("envelope is not pinned to the supplied evidence")
-    defect = defect_from_observation(observation)
+    defect = defect_from_observation(observation, check_id=check_id)
     if defect is None:
         return {
             "eligible": False,
@@ -198,44 +210,34 @@ def admission_proposal(
         }
     decision: DefectDecision = decide_defect_admission(defect, context)
     journal.record(decision)
-    outcome = journal.gate_outcome(decision)
-    if outcome is not None and outcome.get("denied") is False:
-        # A real allow already exists for this exact defect: idempotent.
-        return {
-            "eligible": True,
-            "fingerprint": defect.fingerprint,
-            "deduplication_id": defect.deduplication_id,
-            "disposition": decision.disposition.value,
-            "reason": ",".join(decision.reasons),
-            "deduplicated": True,
-            "authorizes_execution": False,
-            "task_proposals_submitted": 0,
-            "budget_operations": 0,
-            "admission": {"denied": False, "reason": "ALLOWED",
-                          "detail": "gate already allowed this defect"},
-        }
-    if decision.disposition is DefectDisposition.ADMIT:
-        verdict = control.check(
-            agent_identity(defect), task_graph_spec(), usage, tuple(sorted(repair_tools()))
-        )
-        reason = getattr(verdict, "reason", None)
-        reason_text = str(reason) if reason is not None else "ALLOWED"
-        journal.record_gate(decision, denied=bool(verdict.denied), reason=reason_text)
-        admission = {
-            "denied": bool(verdict.denied),
-            "reason": reason_text,
-            "detail": str(getattr(verdict, "detail", "")),
-        }
-    else:
+    if decision.disposition is not DefectDisposition.ADMIT:
+        # The defect gate is authoritative for its own verdict: a BLOCKED
+        # defect stays blocked even if an earlier delivery was allowed.
         admission = {"denied": True, "reason": "defect-admission",
                      "detail": ",".join(decision.reasons)}
+        deduplicated = False
+    else:
+        verdict = journal.evaluate(
+            decision,
+            control=control,
+            usage=usage,
+            spec=task_graph_spec(),
+            identity=agent_identity(defect),
+            tools=tuple(sorted(repair_tools())),
+        )
+        admission = {
+            "denied": bool(verdict["denied"]),
+            "reason": str(verdict["reason"]),
+            "detail": str(verdict["detail"]),
+        }
+        deduplicated = bool(verdict["deduplicated"])
     return {
         "eligible": True,
         "fingerprint": defect.fingerprint,
         "deduplication_id": defect.deduplication_id,
         "disposition": decision.disposition.value,
         "reason": ",".join(decision.reasons),
-        "deduplicated": False,
+        "deduplicated": deduplicated,
         "authorizes_execution": False,
         "task_proposals_submitted": 0,
         "budget_operations": 0,

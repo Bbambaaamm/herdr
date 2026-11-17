@@ -154,13 +154,14 @@ is a pure translator between them and adds no authority:
   backup and worker incidents belong to their own operational owners and are
   never routed into a repair backlog.
 - `defect_from_observation()` derives `commit_sha` from the #100 `head` fact
-  and `finding_identity` from #100's `correlation_id` plus the pinned evidence
-  digest of the individual #100 output. #100 exposes no stable workflow-job
-  *definition* id: its `job_id` is a per-run instance and its `correlation_id`
-  covers the whole group, so collapsing on correlation alone would hide a second
-  failing job. The digest errs on the side of reporting distinct failures; a
-  stable definition id from #100 would replace it. Only an open observation
-  reporting an actual `CI_FAILURE` is a defect.
+  and requires a caller-supplied `check_id`: the stable identity of the
+  *defined* check, taken from #100's durable record. The bridge will not invent
+  one. #100 exposes no such id today — its `job_id` is a per-run instance and
+  its `correlation_id` covers the whole group — so a missing or malformed
+  `check_id` refuses the translation rather than silently changing what "the
+  same defect" means (either fragmenting one red PR or collapsing two distinct
+  checks). Only an open observation reporting an actual `CI_FAILURE` is a
+  defect.
 - `repair_tools()` reuses `ROLE_TOOL_ALLOWLIST["writer"]`; `git_push`,
   `deploy` and `git_merge` stay out of reach.
 - `task_graph_spec()` is a single-node plan; `AdmissionControl` still applies
@@ -171,12 +172,29 @@ is a pure translator between them and adds no authority:
   EventEnvelope boundary, not the bridge's.
 - The defect decision is recorded durably, and the gate verdict separately
   (`defect_admission_gate`). Only a recorded ALLOW makes the proposal
-  idempotent: a pending verdict (a crash between the two writes) or a denied one
-  stays re-evaluable, so a transient gate denial can never wedge a repair.
+  idempotent: a pending verdict (crash between the two writes) or a denied one
+  stays re-evaluable, so a transient gate denial can never wedge a repair. A
+  later ALLOW replaces an older DENY, so the durable last word is never a stale
+  denial. The claim, the gate call and the verdict write share one advisory
+  lock, so concurrent deliveries of one defect cannot both reach the gate.
+- The defect gate's own verdict is authoritative for its disposition: a
+  BLOCKED defect stays blocked even if an earlier delivery of the same
+  fingerprint was allowed by the swarm gate.
 - The gate object must be the real `AdmissionControl`; the journal is
   mandatory. The returned proposal carries `authorizes_execution=False`,
   `task_proposals_submitted=0` and `budget_operations=0`. When the defect gate
   denies, the swarm gate is not consulted at all.
+
+## Known boundary (not closable in this PR)
+
+The bridge can require a #100 `OperationalIncident` envelope and a matching
+evidence `pin`, but it cannot *authenticate* that envelope: both values arrive
+from the same caller, and #100 exposes no signature or independently-verified
+record primitive today. End-to-end provenance is therefore #100's
+EventEnvelope boundary. Closing it needs a #100-side primitive (a durable
+per-check identity plus an independently verifiable envelope digest); until
+then the bridge must not be wired to any consumer that treats its proposal as
+authenticated input.
 
 Ownership is unchanged: `#100` produces the observation, `#8` admits or denies
 the spawn, `#53` owns the backlog, `#82` the durable task identity.

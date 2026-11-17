@@ -11,6 +11,7 @@ a request, not authority.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
 from collections.abc import Mapping
@@ -377,24 +378,35 @@ class DecisionJournal:
         """
         _require(type(denied) is bool, "invalid gate outcome")
         _token(reason, re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}"))
+        with self._lock():
+            # A recorded ALLOW is terminal.  A recorded DENY is not: the
+            # verdict is replaced so a transient denial can never become the
+            # durable last word.
+            prior = self.gate_outcome(decision)
+            if prior is not None and prior.get("denied") is False:
+                return prior
+            return self._append_locked({
+                "event": self.EVENT_GATE,
+                "fingerprint": decision.fingerprint,
+                "commit_sha": decision.commit_sha,
+                "denied": denied,
+                "reason": reason,
+            })
+
+    @contextmanager
+    def _lock(self):
         path = self._log.path
         path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = path.parent / f".{path.name}.lock"
         with lock_path.open("a+b") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             try:
-                prior = self.gate_outcome(decision)
-                if prior is not None:
-                    return prior
-                return self._log.append({
-                    "event": self.EVENT_GATE,
-                    "fingerprint": decision.fingerprint,
-                    "commit_sha": decision.commit_sha,
-                    "denied": denied,
-                    "reason": reason,
-                })
+                yield
             finally:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def _append_locked(self, row: dict) -> dict:
+        return self._log.append(row)
 
     def gate_outcome(self, decision: DefectDecision) -> dict | None:
         latest = None
@@ -405,6 +417,37 @@ class DecisionJournal:
                     and row.get("commit_sha") == decision.commit_sha):
                 latest = row
         return latest
+
+    def evaluate(self, decision: DefectDecision, *, control, usage, spec,
+                 identity, tools) -> dict:
+        """Atomically claim, consult and record the gate verdict.
+
+        The claim, the gate call and the verdict write share one advisory lock,
+        so two concurrent deliveries of the same defect cannot both reach the
+        gate.  The lock is advisory and process-local; it fences this journal's
+        own writers, which is exactly the set that can produce a duplicate
+        proposal.
+        """
+        _require(type(decision) is DefectDecision, "invalid decision")
+        with self._lock():
+            prior = self.gate_outcome(decision)
+            if prior is not None and prior.get("denied") is False:
+                return {"deduplicated": True, "denied": False,
+                        "reason": "ALLOWED",
+                        "detail": "gate already allowed this defect"}
+            verdict = control.check(identity, spec, usage, tools)
+            reason = getattr(verdict, "reason", None)
+            reason_text = str(reason) if reason is not None else "ALLOWED"
+            self._append_locked({
+                "event": self.EVENT_GATE,
+                "fingerprint": decision.fingerprint,
+                "commit_sha": decision.commit_sha,
+                "denied": bool(verdict.denied),
+                "reason": reason_text,
+            })
+            return {"deduplicated": False, "denied": bool(verdict.denied),
+                    "reason": reason_text,
+                    "detail": str(getattr(verdict, "detail", ""))}
 
 
 def approval_is_stale(approval: dict, commit_sha: str) -> bool:
