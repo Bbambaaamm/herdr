@@ -588,6 +588,33 @@ def test_retry_without_boundary_replays_as_redecide(tmp_path):
         restored.handoff.assert_dispatchable("2000-01-01T00:00:00+00:00")
 
 
+def test_previous_format_without_wait_flag_replays_without_conflict(tmp_path):
+    """E4 P1: a record written before waits_for_provider must still replay."""
+    from herdr.fallback_recovery import normalize_transition_event
+    from herdr.scheduler import AuditLog
+
+    transition, _ = _decision(tmp_path, retry_after="60")
+    legacy = transition.audit_event()
+    legacy["handoff"] = {
+        key: value for key, value in legacy["handoff"].items()
+        if key != "waits_for_provider"
+    }
+    log = AuditLog(tmp_path / "replay.jsonl")
+    identity = (
+        "event", "task_id", "run_token", "attempt",
+        "failed_executor", "source_decision_sha256",
+    )
+    stored = log.append_or_get_strict(
+        legacy, identity_fields=identity, normalize=normalize_transition_event
+    )
+    newer = dict(legacy)
+    newer["handoff"] = dict(legacy["handoff"], waits_for_provider=True)
+    returned = log.append_or_get_strict(
+        newer, identity_fields=identity, normalize=normalize_transition_event
+    )
+    assert returned == stored
+
+
 def test_changed_wait_replays_the_durable_boundary(tmp_path):
     """E4 P1: a later weaker hint must not open an earlier retry window."""
     from herdr.fallback_recovery import ProviderFailureObservation, decide_managed_fallback

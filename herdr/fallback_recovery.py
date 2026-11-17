@@ -78,6 +78,7 @@ def normalize_transition_event(event: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(handoff, dict):
         repaired = dict(handoff)
         repaired.pop("not_before", None)
+        repaired.pop("waits_for_provider", None)
         canonical["handoff"] = repaired
     return canonical
 
