@@ -37,7 +37,7 @@ def observation(**overrides):
         "subject": ("test_example", "test_it"),
         "observed_at": 1_000,
         "workflow": "Herdr contract",
-        "check_identity": "herdr-contract",
+        "finding_identity": "herdr-contract",
         "check_run_id": "run-1",
         "event_revision": "rev-1",
         "evidence_sha256": ("d" * 64,),
@@ -324,9 +324,9 @@ def test_one_check_redelivered_is_one_defect():
 
 def test_repeated_runs_of_one_check_are_one_defect():
     """E4 P1: a run id is delivery identity, not semantic identity."""
-    first = observation(workflow="Herdr contract", check_identity="herdr-contract",
+    first = observation(workflow="Herdr contract", finding_identity="herdr-contract",
                         check_run_id="run-1")
-    second = observation(workflow="Herdr contract", check_identity="herdr-contract",
+    second = observation(workflow="Herdr contract", finding_identity="herdr-contract",
                          check_run_id="run-2")
     assert first.fingerprint == second.fingerprint
     assert first.deduplication_id != second.deduplication_id
@@ -334,16 +334,44 @@ def test_repeated_runs_of_one_check_are_one_defect():
 
 def test_two_distinct_checks_in_one_workflow_are_two_defects():
     """E4 P1: workflow alone is not a stable check identity."""
-    first = observation(workflow="Herdr contract", check_identity="herdr-contract",
+    first = observation(workflow="Herdr contract", finding_identity="herdr-contract",
                         check_run_id="run-1")
-    second = observation(workflow="Herdr contract", check_identity="herdr-security",
+    second = observation(workflow="Herdr contract", finding_identity="herdr-security",
                          check_run_id="run-2")
     assert first.fingerprint != second.fingerprint
 
 
-def test_ci_observation_requires_a_stable_check_identity():
+def test_ci_observation_requires_a_stable_finding_identity():
     with pytest.raises(DefectError):
-        observation(source=DefectSource.CI_CHECK, check_identity="")
+        observation(source=DefectSource.CI_CHECK, finding_identity="")
+
+
+def test_non_ci_findings_require_a_stable_identity_too():
+    """E4 P1: two review findings sharing a subject must not collapse."""
+    with pytest.raises(DefectError):
+        observation(source=DefectSource.REVIEW_COMMENT,
+                    category=DefectCategory.REVIEW_FINDING,
+                    finding_identity="")
+
+
+def test_two_review_findings_on_one_subject_are_two_defects():
+    """E4 P1: the journal must not suppress a second review finding."""
+    first = observation(source=DefectSource.REVIEW_COMMENT,
+                        category=DefectCategory.REVIEW_FINDING,
+                        finding_identity="review-1", event_revision="rev-1")
+    second = observation(source=DefectSource.REVIEW_COMMENT,
+                         category=DefectCategory.REVIEW_FINDING,
+                         finding_identity="review-2", event_revision="rev-2")
+    assert first.fingerprint != second.fingerprint
+
+
+def test_freeze_rejects_unsupported_mutable_payload_values():
+    """E4 P2: a set inside the payload must be refused, not passed through."""
+    good = decide_defect_admission(observation(), context()).proposal
+    with pytest.raises(DefectError):
+        DefectDecision(DefectDisposition.ADMIT, "e" * 64, SHA_A, ("eligible",),
+                       task_class="validation_failure",
+                       proposal=dict(good, extra={1, 2, 3}))
 
 
 def test_unhandled_context_states_fail_closed():

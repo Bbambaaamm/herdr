@@ -94,12 +94,19 @@ HUMAN_CATEGORIES = frozenset({DefectCategory.SECURITY_FINDING})
 
 
 def _freeze(value):
-    """Recursively immobilize a payload so post-validation mutation is impossible."""
+    """Recursively immobilize a payload so post-validation mutation is impossible.
+
+    Only immutable scalars and supported containers are accepted; anything else
+    (set, custom object, generator) is rejected rather than passed through
+    mutable.
+    """
     if isinstance(value, Mapping):
         return MappingProxyType({key: _freeze(item) for key, item in value.items()})
     if isinstance(value, (list, tuple)):
         return tuple(_freeze(item) for item in value)
-    return value
+    if isinstance(value, (str, int, float, bool, type(None), bytes)):
+        return value
+    raise DefectError("unsupported payload value")
 
 
 def _require(condition: bool, message: str) -> None:
@@ -124,7 +131,7 @@ class DefectObservation:
     subject: tuple[str, ...]
     observed_at: int
     evidence_sha256: tuple[str, ...] = ()
-    check_identity: str = ""
+    finding_identity: str = ""
     workflow: str = ""
     check_run_id: str = ""
     event_revision: str = ""
@@ -152,14 +159,11 @@ class DefectObservation:
             _token(ref, re.compile(r"[a-f0-9]{64}"))
         for value in (self.workflow, self.check_run_id):
             _require(type(value) is str and len(value) <= 128, "invalid identifier field")
-        _require(type(self.check_identity) is str, "invalid check identity")
-        if self.source is DefectSource.CI_CHECK:
-            # A CI observation must name the stable check it came from; a bare
-            # run id would make every re-run look like a new defect.
-            _require(_TOKEN.fullmatch(self.check_identity) is not None,
-                     "CI observation requires a stable check identity")
-        else:
-            _require(len(self.check_identity) <= 64, "invalid check identity")
+        # Every source must name the stable finding it reports.  Without it two
+        # distinct findings sharing a subject — two review comments, two runtime
+        # errors — collapse into one durable record.
+        _require(_TOKEN.fullmatch(self.finding_identity) is not None,
+                 "observation requires a stable finding identity")
         _require(type(self.event_revision) is str and 0 < len(self.event_revision) <= MAX_REVISION,
                  "invalid event revision")
 
@@ -167,7 +171,7 @@ class DefectObservation:
     def fingerprint(self) -> str:
         """Semantic defect identity.
 
-        ``workflow`` and ``check_identity`` participate because the #100 CI
+        ``workflow`` and ``finding_identity`` participate because the #100 CI
         adapter proves only "this exact revision failed a required check": two
         different required checks failing on the same revision are two distinct
         defects and must not be collapsed into one durable record.  Re-running
@@ -176,7 +180,7 @@ class DefectObservation:
         """
         return digest([SCHEMA, self.source, self.repository, self.commit_sha,
                        self.category, self.subject, self.workflow,
-                       self.check_identity])
+                       self.finding_identity])
 
     @property
     def deduplication_id(self) -> str:
