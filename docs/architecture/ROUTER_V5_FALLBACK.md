@@ -236,6 +236,10 @@ Cumulative: all six rounds of findings are fixed. The local routing/
 namespace/security set is 271 passed, 1 skipped, exit 0, and
 `scripts/validate_repo.py` reports `HERDR_REPOSITORY_CONTRACT_OK`.
 
+**E4 independent review: PASS** at HEAD `cf788f3` — P0 0, P1 0, P2 0, verified on
+an isolated export of that exact HEAD. Exact-head CI run `44148378040` success;
+CI on the final HEAD `64079a0` run `44149417744` success.
+
 ## 12. Remaining blockers and next step
 
 - Cross-task durable provider cooldown: BLOCKED on the capacity/observability
