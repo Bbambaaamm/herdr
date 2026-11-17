@@ -550,6 +550,30 @@ def test_different_transition_still_conflicts(tmp_path):
         log.append_or_get_strict(changed, identity_fields=identity, normalize=normalize_transition_event)
 
 
+def test_changed_wait_is_a_new_durable_record_not_a_silent_override(tmp_path):
+    """E4 P1: a different honoured wait must not override the stored one."""
+    from herdr.fallback_recovery import normalize_transition_event
+    from herdr.scheduler import AuditLog
+
+    log = AuditLog(tmp_path / "audit.jsonl")
+    identity = (
+        "event", "task_id", "run_token", "attempt",
+        "failed_executor", "source_decision_sha256", "not_before",
+    )
+    first = {
+        "event": "managed_fallback_transition", "task_id": "task-x", "run_token": "run-x",
+        "attempt": 2, "failed_executor": "exec-x", "source_decision_sha256": "a" * 64,
+        "not_before": "2026-10-02T10:02:10+00:00", "handoff": None, "retry": None,
+    }
+    log.append_or_get_strict(first, identity_fields=identity, normalize=normalize_transition_event)
+    second = dict(first)
+    second["not_before"] = "2026-10-02T10:00:10+00:00"
+    second["retry"] = RetryGuidance(True, 0.0, "retry_after", raw="0").to_json()
+    returned = log.append_or_get_strict(second, identity_fields=identity, normalize=normalize_transition_event)
+    assert returned["not_before"] == "2026-10-02T10:00:10+00:00"
+    assert len([line for line in (tmp_path / "audit.jsonl").read_text().splitlines() if line.strip()]) == 2
+
+
 def test_retry_policy_change_does_not_break_replay(tmp_path):
     """Derived timing is not part of the decision identity (E4 P1)."""
     from herdr.fallback_recovery import normalize_transition_event

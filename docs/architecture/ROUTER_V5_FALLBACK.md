@@ -174,8 +174,10 @@ is input-token cost and must be recorded by the existing usage observation
 
 ## 11. E4 independent review and remediation
 
-Review by `quantlab-codex` at HEAD `88daac00` returned **E4 FAIL** with three
-P1 and two P2 findings. All five were reproduced and fixed.
+Review by `quantlab-codex` returned **E4 FAIL** in two rounds; every finding was
+reproduced and fixed.
+
+Round 1 at HEAD `88daac00` — three P1 and two P2.
 
 | Finding | Fix |
 | --- | --- |
@@ -187,7 +189,17 @@ P1 and two P2 findings. All five were reproduced and fixed.
 
 Regression tests for every finding are in
 `tests/herdr/test_router_retry_backoff.py`; the routing/namespace/security set
-is 265 passed, 1 skipped.
+is 267 passed, 1 skipped.
+
+Round 2 at HEAD `9107ade` — two further P1, both in durable replay.
+
+| Finding | Fix |
+| --- | --- |
+| P1: a restored handoff lost `not_before`, so replay made an unready route dispatchable | `audit_event()` now serializes `not_before`; regression test asserts the round trip refuses early dispatch |
+| P1: a genuine older FALLBACK event without `retry` still raised an audit identity conflict | `normalize_transition_event()` drops the *derived* timing fields (`retry`, `handoff.not_before`) before comparison; replay of an unchanged decision succeeds while a genuinely different transition still conflicts |
+
+The reviewer's independent run outside the sandbox reported 265 passed,
+1 skipped. A final verification pass at HEAD `476e9ba` is pending.
 
 ## 12. Remaining blockers and next step
 

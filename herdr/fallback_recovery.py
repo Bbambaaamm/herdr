@@ -195,6 +195,7 @@ class FallbackTransition:
             "reconciliation_required": self.reconciliation_required,
             "source_decision_sha256": self.source_decision_sha256,
             "next_decision_sha256": self.next_decision_sha256,
+            "not_before": handoff["not_before"] if handoff is not None else None,
             "handoff": handoff,
             "retry": self.retry.to_json() if self.retry is not None else None,
         }
@@ -439,7 +440,7 @@ def decide_managed_fallback(
             event,
             identity_fields=(
                 "event", "task_id", "run_token", "attempt",
-                "failed_executor", "source_decision_sha256",
+                "failed_executor", "source_decision_sha256", "not_before",
             ),
             normalize=normalize_transition_event,
         )
