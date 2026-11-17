@@ -104,7 +104,7 @@ def _freeze(value):
         return MappingProxyType({key: _freeze(item) for key, item in value.items()})
     if isinstance(value, (list, tuple)):
         return tuple(_freeze(item) for item in value)
-    if isinstance(value, (str, int, float, bool, type(None), bytes)):
+    if value is None or type(value) in (str, int, float, bool, bytes):
         return value
     raise DefectError("unsupported payload value")
 
@@ -162,7 +162,8 @@ class DefectObservation:
         # Every source must name the stable finding it reports.  Without it two
         # distinct findings sharing a subject — two review comments, two runtime
         # errors — collapse into one durable record.
-        _require(_TOKEN.fullmatch(self.finding_identity) is not None,
+        _require(type(self.finding_identity) is str
+                 and _TOKEN.fullmatch(self.finding_identity) is not None,
                  "observation requires a stable finding identity")
         _require(type(self.event_revision) is str and 0 < len(self.event_revision) <= MAX_REVISION,
                  "invalid event revision")
@@ -245,7 +246,9 @@ class DefectDecision:
             # The ADMIT contract is part of the payload, not just the summary:
             # a proposal never authorizes execution, submits a task or spends.
             _require(self.proposal.get("authorizes_execution") is False
+                     and type(self.proposal.get("task_proposals_submitted")) is int
                      and self.proposal.get("task_proposals_submitted") == 0
+                     and type(self.proposal.get("budget_operations")) is int
                      and self.proposal.get("budget_operations") == 0,
                      "ADMIT proposal violates the proposal-only contract")
 

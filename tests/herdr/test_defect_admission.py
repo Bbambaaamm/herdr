@@ -374,6 +374,26 @@ def test_freeze_rejects_unsupported_mutable_payload_values():
                        proposal=dict(good, extra={1, 2, 3}))
 
 
+def test_freeze_rejects_a_mutable_int_subclass():
+    """E4 P2: only exact scalar types are immutable."""
+
+    class MutableInt(int):
+        pass
+
+    good = decide_defect_admission(observation(), context()).proposal
+    with pytest.raises(DefectError):
+        DefectDecision(DefectDisposition.ADMIT, "e" * 64, SHA_A, ("eligible",),
+                       task_class="validation_failure",
+                       proposal=dict(good, extra=MutableInt(0)))
+
+
+@pytest.mark.parametrize("value", [None, 123, [], True])
+def test_non_string_finding_identity_raises_defect_error(value):
+    """E4 P2: malformed input must surface as DefectError, not TypeError."""
+    with pytest.raises(DefectError):
+        observation(finding_identity=value)
+
+
 def test_unhandled_context_states_fail_closed():
     with pytest.raises(DefectError):
         context(budget_state="MISSING")
