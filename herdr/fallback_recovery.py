@@ -6,7 +6,7 @@ second ledger or scheduler.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
 import re
@@ -178,6 +178,7 @@ class FallbackTransition:
                     "selected_executor", "selected_provider", "selected_model",
                     "registry_hash", "requirement_hash", "parent_scope_hash",
                     "policy_hash", "budget_allocation_id", "not_before",
+                    "waits_for_provider",
                 )
             }
         return {
@@ -219,9 +220,11 @@ class FallbackTransition:
         ):
             # A durable record written before retry timing existed, or one whose
             # handoff lost its boundary, cannot prove the wait elapsed.  Replay
-            # it as "re-decide required" instead of handing the caller an
-            # immediately dispatchable fallback.
+            # it as "re-decide required" and refuse dispatch outright instead of
+            # handing the caller an immediately dispatchable fallback.
             retry = RetryGuidance(False, None, "unknown")
+            if handoff is not None:
+                handoff = replace(handoff, waits_for_provider=True)
         return cls(
             version=event["version"], action=action, task_id=event["task_id"],
             run_token=event["run_token"], attempt=event["attempt"],
@@ -438,6 +441,7 @@ def decide_managed_fallback(
             policy=policy,
             budget_gate=budget_gate,
             not_before=not_before,
+            waits_for_provider=True,
         )
         transition = FallbackTransition(
             1, RecoveryAction.FALLBACK, task_id, identity.run_token,

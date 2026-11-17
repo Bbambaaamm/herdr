@@ -552,6 +552,8 @@ def test_different_transition_still_conflicts(tmp_path):
 
 def test_legacy_fallback_event_without_retry_replays_as_redecide(tmp_path):
     """E4 P1: a pre-timing durable fallback must not crash or dispatch."""
+    from herdr.scheduler_routing import RoutingIntegrationError
+
     transition, _ = _decision(tmp_path, retry_after="60")
     legacy = transition.audit_event()
     legacy.pop("retry", None)
@@ -564,10 +566,14 @@ def test_legacy_fallback_event_without_retry_replays_as_redecide(tmp_path):
     assert restored.retry is not None
     assert restored.retry.retryable is False
     assert restored.retry.source == "unknown"
+    with pytest.raises(RoutingIntegrationError):
+        restored.handoff.assert_dispatchable("2000-01-01T00:00:00+00:00")
 
 
 def test_retry_without_boundary_replays_as_redecide(tmp_path):
     """E4 P1: a retryable hint with no boundary cannot prove the wait elapsed."""
+    from herdr.scheduler_routing import RoutingIntegrationError
+
     transition, _ = _decision(tmp_path, retry_after="60")
     event = transition.audit_event()
     event.pop("not_before", None)
@@ -578,6 +584,8 @@ def test_retry_without_boundary_replays_as_redecide(tmp_path):
     assert restored.retry is not None
     assert restored.retry.retryable is False
     assert restored.retry.source == "unknown"
+    with pytest.raises(RoutingIntegrationError):
+        restored.handoff.assert_dispatchable("2000-01-01T00:00:00+00:00")
 
 
 def test_changed_wait_replays_the_durable_boundary(tmp_path):

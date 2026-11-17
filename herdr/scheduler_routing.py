@@ -319,6 +319,7 @@ class ManagedExecutionHandoff:
     policy_hash: str
     budget_allocation_id: str
     not_before: str | None = None
+    waits_for_provider: bool = False
 
     def __post_init__(self) -> None:
         if self.version != 1:
@@ -348,6 +349,10 @@ class ManagedExecutionHandoff:
     def assert_dispatchable(self, at: str) -> None:
         """Refuse dispatch before the honoured provider wait has elapsed."""
         if self.not_before is None:
+            if self.waits_for_provider:
+                # A fallback handoff must never be dispatched without a
+                # provable boundary: the wait cannot be shown to have elapsed.
+                raise RoutingIntegrationError("handoff_wait_unknown")
             return
         moment = _parse_iso8601(at)
         if moment is None:
@@ -406,6 +411,7 @@ def build_execution_handoff(
     policy: CapabilityScope,
     budget_gate: BudgetGate,
     not_before: str | None = None,
+    waits_for_provider: bool = False,
 ) -> ManagedExecutionHandoff:
     """Bind one selected route to an existing scheduler record and budget gate."""
     record = scheduler.record_for(route.routing_input.task_id)
@@ -467,6 +473,7 @@ def build_execution_handoff(
         policy_hash=policy.hash,
         budget_allocation_id=route.routing_input.budget_allocation_id,
         not_before=not_before,
+        waits_for_provider=waits_for_provider,
     )
 
 

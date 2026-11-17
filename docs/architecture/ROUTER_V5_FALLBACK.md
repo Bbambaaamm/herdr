@@ -206,8 +206,19 @@ attempt, and the later handoff was immediately dispatchable.
 | --- | --- |
 | P1: a later weaker hint could open an earlier retry window | the wait is *not* part of the decision identity; a re-decision replays the durable record (`authoritative_event != event` returns the stored transition), so the first recorded boundary governs. The conflict check stays normalized so derived timing never masquerades as a different decision. Regression test `test_changed_wait_replays_the_durable_boundary` |
 
-Cumulative: all three rounds of findings are fixed. The local routing/
-namespace/security set is 268 passed, 1 skipped, exit 0.
+Round 4 at HEAD `74019c0` — two backward-compatibility P1: a durable record
+written with `retry` but without `not_before` replayed into an immediately
+dispatchable handoff, and an older record without `retry` crashed
+`from_audit_event`.
+
+| Finding | Fix |
+| --- | --- |
+| P1: retryable hint without a boundary dispatched immediately | `from_audit_event` replays it as `RetryGuidance(False, None, "unknown")` — "re-decide required", never an immediate dispatch |
+| P1: pre-`retry` record crashed replay | same fail-closed reconstruction; a new `"unknown"` guidance source is admitted |
+
+Cumulative: all four rounds of findings are fixed. The local routing/
+namespace/security set is 270 passed, 1 skipped, exit 0, and
+`scripts/validate_repo.py` reports `HERDR_REPOSITORY_CONTRACT_OK`.
 
 ## 12. Remaining blockers and next step
 
