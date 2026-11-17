@@ -140,7 +140,7 @@ class Boundary:
         assert limit == 2_000_000 and 0 < timeout <= 30 and len(pass_fds) == 1
         fd = pass_fds[0];assert fd in self.filters
         prefix = ["/usr/bin/bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
-            "--unshare-pid", "--unshare-net", "--seccomp", str(fd), "--tmpfs", "/tmp", "--clearenv",
+            "--unshare-pid", "--unshare-net", "--seccomp", str(fd), "--ro-bind", "/tmp", "/tmp", "--clearenv",
             "--setenv", "PATH", "/usr/bin:/bin", "--setenv", "HOME", "/tmp", "--"]
         assert argv[:len(prefix)] == prefix
         inner = argv[len(prefix):]
