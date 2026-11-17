@@ -123,6 +123,27 @@ Not covered here, by design:
   long-running consumer is deployed, that integration is prepared but not
   activated.
 
+## E4 independent review
+
+Seven rounds against exact HEADs; all findings were fixed and the seventh round
+returned **PASS (P0 0 / P1 0 / P2 0)** on
+`3441ee2afbe308aed58276d1e1e8fab779fdb62d` (isolated export of that HEAD).
+
+| Round | HEAD | Result |
+| --- | --- | --- |
+| 1 | `81ae0be0` | FAIL — 3×P1, 3×P2 (unhandled context states; fingerprint keyed on delivery id; non-atomic dedup; loose ref/timestamp/evidence; proposal not carrying the counters; `CI_CHECK` claiming unproven categories) |
+| 2 | `a9570129` | FAIL — 3×P1, 1×P2 (healthy defaults on `DefectContext`; workflow not a check identity; mutable ADMIT payload) |
+| 3 | `b92caf0c` | FAIL — 2×P1 (run id is not a stable check identity; nested `graph` mutable) |
+| 4 | `027ec320` | FAIL — 1×P1, 1×P2 (only `CI_CHECK` required a stable identity; `_freeze` passed sets through) |
+| 5 | `0506385b` | FAIL — 0×P1, 2×P2 (mutable `int` subclass; non-string `finding_identity` raised `TypeError`) |
+| 6 | `605db0c2` | FAIL — 1×P1 (state membership checked without an exact type) |
+| 7 | `3441ee2a` | **PASS — P0 0, P1 0, P2 0** |
+
+Residual UNKNOWN outside the reviewed scope: this module does not itself call
+the authenticated #100 source nor obtain `DefectContext` values from the
+authoritative runtime, so their provenance cannot be proven by this PR. The
+PASS does not extend to that future integration.
+
 ## Out of scope
 
 Live model calls, merges, deployments, credential creation, budget changes and
