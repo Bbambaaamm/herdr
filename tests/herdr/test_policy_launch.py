@@ -120,9 +120,10 @@ def isolated_runtime_destinations():
     return setup
 
 def test_isolated_runtime_destinations_create_writable_targets_without_host_layout(monkeypatch):
+    import sys
     fake = {Path("/nonexistent-herdr/home/agentops/.hermes/hermes-agent"),
             Path("/nonexistent-herdr/home/agentops/.local/share/uv/python/cpython-3.11.16-linux-x86_64-gnu")}
-    monkeypatch.setattr("tests.herdr.test_policy_launch.RUNTIME_TARGETS", fake)
+    monkeypatch.setattr(sys.modules[__name__], "RUNTIME_TARGETS", fake)
     argv = isolated_runtime_destinations()
     assert argv[:2] == ["--tmpfs", "/home"]
     assert argv[2:] == [part for target in sorted(fake) for part in ("--dir", str(target))]
