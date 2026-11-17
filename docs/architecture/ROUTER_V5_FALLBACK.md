@@ -49,6 +49,7 @@ this increment. It extends `herdr/routing.py`, `herdr/fallback_recovery.py` and
 | --- | --- |
 | Routing decision authority | EXISTING |
 | Bounded candidate fallback | EXISTING |
+| Per-task failed-candidate exclusion | EXISTING (`failed_executors` in the handoff) |
 | Durable identity / handoff continuity | EXISTING |
 | Duplicate economic effect protection (audit replay) | EXISTING |
 | Uncertain-delivery reconciliation | EXISTING |
@@ -57,7 +58,8 @@ this increment. It extends `herdr/routing.py`, `herdr/fallback_recovery.py` and
 | **Retry-After parsing** | **MISSING** |
 | **Reset-timestamp normalization** | **MISSING** |
 | **Bounded backoff with jitter** | **MISSING** |
-| **Provider cooldown expiry** | **PARTIAL** (in-memory, never expires) |
+| **Provider cooldown expiry** | **PARTIAL** (in-memory, never expires, unwired) |
+| Cross-task durable provider cooldown | MISSING (deliberate, see §5) |
 | Provider capability matrix | MISSING |
 | Provider portfolio breadth | PARTIAL (openai, anthropic, codex, nous only) |
 | Measured-quality adaptive routing | PARTIAL (#74 eval framework, no router feedback) |
@@ -95,6 +97,20 @@ grant. That is a HUMAN/PRIVILEGE gate, not a technical decision.
    preserves durable identity.
 4. `ProviderCircuitBreaker` now has a real expiry: a cooldown never widens to
    another provider and never permanently removes a candidate.
+
+### Cross-task durable cooldown — deliberately out of scope
+
+Per-task failed-candidate exclusion already exists (`failed_executors` in the
+handoff, honoured by `select_managed_route`). A *cross-task* provider cooldown
+would need a durable cooldown store. That store is not added here on purpose:
+it would be a second health authority next to `RuntimeStateSnapshot.health`
+(`herdr/capability.py`), which is the existing authoritative health source with
+its own TTL and `reason_code`. Adding a parallel store would violate the
+single-authority rule. The correct home is the existing capacity/health
+observability work (#126 / #230 / #232) feeding the registry's RuntimeState.
+
+`ProviderCircuitBreaker` remains a local, per-process guard primitive; wiring it
+to a durable store is the next decision, not a silent bolt-on.
 
 ## 6. Error taxonomy
 
