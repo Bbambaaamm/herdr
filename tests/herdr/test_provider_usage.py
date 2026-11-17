@@ -180,6 +180,7 @@ def test_non_billable_route_keeps_a_concrete_zero_and_no_unknown_tokens():
     observed = observe_usage(
         provider="anthropic", model="claude-opus-4-6", api_mode="anthropic_messages",
         request_id="req-9", usage=None, pricing=PRICING, non_billable=True,
+        non_billable_route="internal-shadow",
     )
     assert observed.status is UsageStatus.NON_BILLABLE
     assert observed.actual_cost_microusd == 0
@@ -443,7 +444,8 @@ def test_billable_cost_helper_keeps_measured_and_non_billable_distinct():
         request_id="req-cost-1", pricing=PRICING, usage=usage)
     non_billable = observe_usage(
         provider="openai", model="gpt-5.3-codex", api_mode="chat_completions",
-        request_id="req-cost-2", pricing=PRICING, usage=usage, non_billable=True)
+        request_id="req-cost-2", pricing=PRICING, usage=usage, non_billable=True,
+        non_billable_route="internal-shadow")
     assert billable_cost_microusd(measured) == measured.estimated_cost_microusd
     assert billable_cost_microusd(non_billable) == 0
     assert non_billable.cost_state == "non_billable"
@@ -465,3 +467,70 @@ def test_uncertain_delivery_never_suppresses_a_delivered_fallback_cost():
     assert billable["req-uncertain-fallback"].delivery is DeliveryOutcome.DELIVERED
     assert billable_cost_microusd(billable["req-uncertain-fallback"]) == (
         1000 * 3_000_000 + 10 * 15_000_000 + 999_999) // 1_000_000
+
+
+def test_non_billable_requires_an_explicit_route_label():
+    # A bare non_billable boolean is untrusted input: it must not be able to turn
+    # an unknown charge into a concrete zero.
+    with pytest.raises(UsageFieldError):
+        observe_usage(provider="openai", model="gpt-5.3-codex",
+                      api_mode="chat_completions", request_id="req-nb",
+                      pricing=PRICING, usage={"prompt_tokens": 10, "completion_tokens": 1},
+                      non_billable=True)
+    with pytest.raises(UsageFieldError):
+        observe_usage(provider="openai", model="gpt-5.3-codex",
+                      api_mode="chat_completions", request_id="req-nb",
+                      pricing=PRICING, usage={"prompt_tokens": 10, "completion_tokens": 1},
+                      non_billable=True, non_billable_route="   ")
+
+
+def test_non_billable_route_label_is_attributed_in_notes():
+    observed = observe_usage(
+        provider="openai", model="gpt-5.3-codex", api_mode="chat_completions",
+        request_id="req-nb2", pricing=PRICING,
+        usage={"prompt_tokens": 10, "completion_tokens": 1,
+               "prompt_tokens_details": {"cached_tokens": 0}},
+        non_billable=True, non_billable_route="internal-shadow")
+    assert observed.cost_state == "non_billable"
+    assert billable_cost_microusd(observed) == 0
+    assert "non_billable_route=internal-shadow" in observed.notes
+
+
+def test_replayed_observation_is_idempotent():
+    observed = observe_usage(
+        provider="openai", model="gpt-5.3-codex", api_mode="chat_completions",
+        request_id="req-replay", pricing=PRICING,
+        usage={"prompt_tokens": 1000, "completion_tokens": 100,
+               "prompt_tokens_details": {"cached_tokens": 0},
+               "cache_write_tokens": 0})
+    once = UsageAggregate().add(observed)
+    twice = once.add(observed)
+    assert twice == once
+    assert twice.observations == 1
+    assert twice.input_tokens == 1000
+    assert twice.actual_cost_microusd == once.actual_cost_microusd
+    # A distinct event with the same economics is still counted.
+    other = observe_usage(
+        provider="openai", model="gpt-5.3-codex", api_mode="chat_completions",
+        request_id="req-replay-2", pricing=PRICING,
+        usage={"prompt_tokens": 1000, "completion_tokens": 100,
+               "prompt_tokens_details": {"cached_tokens": 0},
+               "cache_write_tokens": 0})
+    assert twice.add(other).observations == 2
+
+
+def test_from_json_rejects_tampered_derived_fields():
+    observed = observe_usage(
+        provider="openai", model="gpt-5.3-codex", api_mode="chat_completions",
+        request_id="req-tamper", pricing=PRICING,
+        usage={"prompt_tokens": 100, "completion_tokens": 10,
+               "prompt_tokens_details": {"cached_tokens": 0},
+               "cache_write_tokens": 0})
+    payload = observed.to_json()
+    assert UsageObservation.from_json(payload) == observed
+    with pytest.raises(UsageFieldError):
+        UsageObservation.from_json({**payload, "coverage": {**payload["coverage"],
+                                                           "input": False}})
+    with pytest.raises(UsageFieldError):
+        UsageObservation.from_json({**payload, "cost_state": "measured"
+                                    if observed.cost_state != "measured" else "unknown"})

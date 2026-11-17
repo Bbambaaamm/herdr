@@ -422,14 +422,21 @@ class UsageObservation:
             raise UsageFieldError("unknown usage observation fields rejected")
         values = dict(raw)
         expected = values.pop("observation_id", None)
-        values.pop("coverage", None)
-        values.pop("cost_state", None)
+        supplied_coverage = values.pop("coverage", None)
+        supplied_cost_state = values.pop("cost_state", None)
         pricing = values.get("pricing")
         if pricing is not None:
             values["pricing"] = PricingObservation.from_mapping(pricing)
         observation = cls(**values)
         if expected is not None and expected != observation.observation_id:
             raise UsageFieldError("usage observation_id mismatch")
+        # Derived fields are not trusted input: a payload that disagrees with the
+        # recomputed coverage or cost state is rejected rather than silently
+        # accepted (fail-closed on tampered or stale evidence).
+        if supplied_coverage is not None and supplied_coverage != observation.coverage:
+            raise UsageFieldError("usage observation coverage mismatch")
+        if supplied_cost_state is not None and supplied_cost_state != observation.cost_state:
+            raise UsageFieldError("usage observation cost_state mismatch")
         return observation
 
 
@@ -455,12 +462,23 @@ class UsageAggregate:
     cache_read_coverage: int = 0
     cache_write_coverage: int = 0
 
+    seen_observation_ids: frozenset[str] = frozenset()
+
     def add(self, observation: UsageObservation) -> "UsageAggregate":
+        # Replay protection: re-ingesting the same evidence event must be a no-op.
+        # Identity is the observation digest (content-derived), never a
+        # caller-supplied flag, so a replayed ledger entry cannot inflate totals.
+        identity = observation.observation_id
+        if identity in self.seen_observation_ids:
+            return self
+        seen = self.seen_observation_ids | {identity}
         if observation.status is UsageStatus.NON_BILLABLE:
-            return replace(self, observations=self.observations + 1,
+            return replace(self, seen_observation_ids=seen,
+                           observations=self.observations + 1,
                            non_billable_observations=self.non_billable_observations + 1)
         if observation.status is UsageStatus.UNKNOWN:
-            return replace(self, observations=self.observations + 1,
+            return replace(self, seen_observation_ids=seen,
+                           observations=self.observations + 1,
                            unknown_observations=self.unknown_observations + 1,
                            unknown_cost_observations=self.unknown_cost_observations + 1)
         # Partial observations never contribute token totals: a bucket that is
@@ -470,6 +488,7 @@ class UsageAggregate:
         if observation.status is UsageStatus.PARTIAL:
             return replace(
                 self,
+                seen_observation_ids=seen,
                 observations=self.observations + 1,
                 partial_observations=self.partial_observations + 1,
                 billable_attempts=self.billable_attempts + int(
@@ -486,6 +505,7 @@ class UsageAggregate:
             )
         return replace(
             self,
+            seen_observation_ids=seen,
             observations=self.observations + 1,
             measured_observations=self.measured_observations
             + int(observation.status is UsageStatus.MEASURED),
@@ -552,6 +572,7 @@ def observe_usage(
     unknown_reasons: Iterable[str] = (),
     notes: Iterable[str] = (),
     non_billable: bool = False,
+    non_billable_route: str | None = None,
     reported_sha256: str | None = None,
 ) -> UsageObservation:
     """Normalize one provider response into the closed observation contract.
@@ -559,7 +580,19 @@ def observe_usage(
     ``usage`` is the raw provider payload (or ``None`` when the provider reported
     nothing).  Nothing is inferred from prefixes, hashes or prior requests: a
     missing field stays ``None`` and produces an explicit unknown reason.
+
+    ``non_billable`` may only be asserted together with an explicit route label
+    (``non_billable_route``): a bare boolean is untrusted input and could turn an
+    unknown charge into a zero.  The label is carried in ``notes`` so the zero is
+    always attributable to a named route contract.
     """
+    if non_billable:
+        if (not isinstance(non_billable_route, str) or not non_billable_route.strip()
+                or len(non_billable_route) > 128
+                or any(character.isspace() and character != " "
+                       for character in non_billable_route)):
+            raise UsageFieldError(
+                "non-billable status requires an explicit bounded route label")
     mode = ApiMode(api_mode)
     outcome = DeliveryOutcome(delivery)
     reasons = list(unknown_reasons)
@@ -638,6 +671,7 @@ def observe_usage(
     elif non_billable:
         status = UsageStatus.NON_BILLABLE
         reasons = [UnknownReason.NON_BILLABLE_ROUTE.value]
+        notes = tuple(notes) + (f"non_billable_route={non_billable_route}",)
     elif outcome is not DeliveryOutcome.DELIVERED:
         # A response the transport never confirmed cannot be a measured row.
         status = UsageStatus.UNKNOWN

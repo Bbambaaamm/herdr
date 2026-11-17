@@ -112,3 +112,30 @@ uncertain delivery and non-billable are produced by the adapter's
    fixture-driven adapter run reports `PARTIAL`, not `MEASURED`.
 4. Pricing version must be pinned per route from `work_budget_configuration`
    `model_quotes`; the adapter accepts it but does not invent it.
+
+## 7. Economic reconciliation rules (P1 review)
+
+- **One normalization.** `observe_usage` converts the provider prompt total to
+  uncached input exactly once (chat/codex subtract cache buckets; Anthropic
+  `input_tokens` is already uncached). `_estimate` never subtracts cache again.
+- **Cache buckets are validated against the provider input total.** chat/codex:
+  `cache_read + cache_write` may not exceed the reported prompt total. Anthropic:
+  the buckets are independent of `input_tokens`, so they are not bounded by it.
+  Contradiction on chat/codex degrades the whole row to `UNKNOWN` (no buckets).
+- **Cost is computed once** from `uncached_input*input_rate +
+  cache_read*cache_read_rate + cache_write*cache_write_rate + output*output_rate`.
+  Parametric tests cover cache hit 0 % / 50 % / 90 % / 100 % for chat, codex and
+  Anthropic, including Anthropic cache-write.
+- **Uncertain delivery is never a zero.** `select_billable` keeps the first
+  `DELIVERED` attempt per `request_id`; an uncertain attempt without a delivered
+  fallback stays `cost_state="unknown"` with `actual_cost_microusd=None`.
+  `billable_cost_microusd()` returns `None` for it — never `0`.
+- **Non-billable requires a named route.** `observe_usage(..., non_billable=True)`
+  is rejected unless `non_billable_route` is supplied; the label is recorded in
+  `notes`. A bare boolean cannot turn an unknown charge into a concrete zero.
+- **Idempotent projection.** `UsageAggregate.add()` deduplicates on the derived
+  `observation_id`; replaying the same evidence event is a no-op, so a replayed
+  ledger entry cannot inflate token or cost totals. No second budget settlement
+  is introduced.
+- **Derived fields are not trusted input.** `from_json` recomputes `coverage` and
+  `cost_state` and rejects a payload whose supplied values disagree.
