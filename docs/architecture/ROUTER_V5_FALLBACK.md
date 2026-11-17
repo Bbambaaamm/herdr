@@ -216,7 +216,15 @@ dispatchable handoff, and an older record without `retry` crashed
 | P1: retryable hint without a boundary dispatched immediately | `from_audit_event` replays it as `RetryGuidance(False, None, "unknown")` — "re-decide required", never an immediate dispatch |
 | P1: pre-`retry` record crashed replay | same fail-closed reconstruction; a new `"unknown"` guidance source is admitted |
 
-Cumulative: all four rounds of findings are fixed. The local routing/
+Round 5 at HEAD `0f1895d` — the `"unknown"` marker was advisory only: a restored
+transition still carried a handoff without a boundary that accepted an early
+dispatch.
+
+| Finding | Fix |
+| --- | --- |
+| P1: `"unknown"` did not enforce refusal | `ManagedExecutionHandoff.waits_for_provider` is set by every fallback decision; `assert_dispatchable` raises `handoff_wait_unknown` when the boundary is missing, and `from_audit_event` marks legacy handoffs the same way. Verified: both reviewer reproductions now refuse dispatch |
+
+Cumulative: all five rounds of findings are fixed. The local routing/
 namespace/security set is 270 passed, 1 skipped, exit 0, and
 `scripts/validate_repo.py` reports `HERDR_REPOSITORY_CONTRACT_OK`.
 
