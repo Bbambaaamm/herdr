@@ -13,8 +13,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+from collections.abc import Mapping
 import fcntl
 import re
+from types import MappingProxyType
 
 from .admission import AuditLog
 from .evidence import digest
@@ -73,9 +75,7 @@ SOURCE_CATEGORIES: dict[DefectSource, frozenset[DefectCategory]] = {
     # A CI observation from the #100 adapter only proves "this exact revision
     # failed a required check"; it does not prove a test regression without
     # per-test evidence, so that category is not claimable here.
-    DefectSource.CI_CHECK: frozenset({
-        DefectCategory.VALIDATION_FAILURE, DefectCategory.DEPENDENCY_CONFLICT,
-    }),
+    DefectSource.CI_CHECK: frozenset({DefectCategory.VALIDATION_FAILURE}),
     DefectSource.REVIEW_COMMENT: frozenset({DefectCategory.REVIEW_FINDING}),
     DefectSource.VALIDATION: frozenset({
         DefectCategory.VALIDATION_FAILURE, DefectCategory.TEST_REGRESSION,
@@ -149,14 +149,15 @@ class DefectObservation:
     def fingerprint(self) -> str:
         """Semantic defect identity.
 
-        ``workflow`` participates because the #100 CI adapter proves only "this
-        exact revision failed a required check": two different required checks
-        failing on the same revision are two distinct defects and must not be
-        collapsed into one durable record.  Redelivery of one check still maps
-        to one identity.
+        ``workflow`` and ``check_run_id`` participate because the #100 CI adapter
+        proves only "this exact revision failed a required check": two different
+        required checks failing on the same revision are two distinct defects and
+        must not be collapsed into one durable record.  Redelivery of one check
+        run still maps to one identity.
         """
         return digest([SCHEMA, self.source, self.repository, self.commit_sha,
-                       self.category, self.subject, self.workflow])
+                       self.category, self.subject, self.workflow,
+                       self.check_run_id])
 
     @property
     def deduplication_id(self) -> str:
@@ -167,15 +168,20 @@ class DefectObservation:
 
 @dataclass(frozen=True)
 class DefectContext:
-    """Injected, observable decision inputs.  No live probes, no ledger writes."""
+    """Injected, observable decision inputs.  No live probes, no ledger writes.
 
-    repository_authorized: bool = False
-    already_resolved: bool = False
-    active_repairs: int = 0
-    repeat_count: int = 0
-    budget_state: str = "OK"
-    credentials_state: str = "OK"
-    capacity_ok: bool = True
+    Every risk-relevant field is required: an unobserved budget, credential,
+    capacity or repair state must never silently read as healthy and fall
+    through to ADMIT.
+    """
+
+    repository_authorized: bool
+    already_resolved: bool
+    active_repairs: int
+    repeat_count: int
+    budget_state: str
+    credentials_state: str
+    capacity_ok: bool
     max_repairs: int = DEFAULT_MAX_REPAIRS
     task_id: str | None = None
 
@@ -202,13 +208,16 @@ class DefectDecision:
     commit_sha: str
     reasons: tuple[str, ...] = ()
     task_class: str | None = None
-    proposal: dict = field(default_factory=dict)
+    proposal: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _require(type(self.disposition) is DefectDisposition, "invalid disposition")
         _token(self.fingerprint, re.compile(r"[a-f0-9]{64}"))
         _token(self.commit_sha, _SHA)
         _require(type(self.reasons) is tuple, "invalid reasons")
+        # Deep-freeze the payload: a later mutation must not be able to turn a
+        # validated proposal into an authorization.
+        object.__setattr__(self, "proposal", MappingProxyType(dict(self.proposal)))
         if self.disposition is DefectDisposition.ADMIT:
             # The ADMIT contract is part of the payload, not just the summary:
             # a proposal never authorizes execution, submits a task or spends.

@@ -44,14 +44,19 @@ evidence.
 
 ## Identity
 
-- `fingerprint` = `digest([SCHEMA, source, repository, commit_sha, category, subject, workflow])`
+- `fingerprint` = `digest([SCHEMA, source, repository, commit_sha, category, subject, workflow, check_run_id])`
   — semantic defect identity. A regression on a new revision is a new identity,
-  and two distinct required checks failing on one revision are two defects
-  rather than one collapsed record.
+  and two distinct required checks (or two distinct check runs) failing on one
+  revision are two defects rather than one collapsed record.
 - `deduplication_id` = `digest([fingerprint, workflow, check_run_id, event_revision, observed_at])`
   — delivery identity, so a redelivered webhook is not a new defect.
 
 ## Decision order (first match wins)
+
+`DefectContext` carries **no healthy defaults**: budget, credentials, capacity,
+repair state and resolution state must all be supplied as verified observations.
+An unobserved state can never silently read as healthy and fall through to
+ADMIT.
 
 1. `UNTRUSTED_TEXT` → `DENY`
 2. repository not authorized → `DENY`

@@ -48,6 +48,9 @@ def observation(**overrides):
 def context(**overrides):
     payload = {
         "repository_authorized": True,
+        "already_resolved": False,
+        "active_repairs": 0,
+        "repeat_count": 0,
         "budget_state": "OK",
         "credentials_state": "OK",
         "capacity_ok": True,
@@ -318,6 +321,13 @@ def test_one_check_redelivered_is_one_defect():
     assert first.deduplication_id == second.deduplication_id
 
 
+def test_distinct_check_runs_in_one_workflow_are_two_defects():
+    """E4 P1: workflow alone is not a stable check identity."""
+    first = observation(workflow="Herdr contract", check_run_id="run-1")
+    second = observation(workflow="Herdr contract", check_run_id="run-2")
+    assert first.fingerprint != second.fingerprint
+
+
 def test_unhandled_context_states_fail_closed():
     with pytest.raises(DefectError):
         context(budget_state="MISSING")
@@ -381,3 +391,34 @@ def test_ci_check_cannot_claim_a_test_regression_without_evidence():
     with pytest.raises(DefectError):
         observation(source=DefectSource.CI_CHECK,
                     category=DefectCategory.TEST_REGRESSION)
+
+
+def test_ci_check_cannot_claim_a_dependency_conflict():
+    """E4 P2: only the dependent-PR source observes a conflict."""
+    with pytest.raises(DefectError):
+        observation(source=DefectSource.CI_CHECK,
+                    category=DefectCategory.DEPENDENCY_CONFLICT)
+
+
+# --- E4 round 2 remediation ------------------------------------------------- #
+
+
+def test_unobserved_context_state_cannot_default_to_healthy():
+    """E4 P1: every risk-relevant input must be supplied explicitly."""
+    with pytest.raises(TypeError):
+        DefectContext(repository_authorized=True)  # type: ignore[call-arg]
+
+
+def test_admit_payload_is_immutable_after_validation():
+    """E4 P1: a post-validation mutation must not be able to authorize."""
+    decision = decide_defect_admission(observation(), context())
+    assert decision.disposition is DefectDisposition.ADMIT
+    with pytest.raises(TypeError):
+        decision.proposal["authorizes_execution"] = True  # type: ignore[index]
+    assert decision.proposal["authorizes_execution"] is False
+
+
+def test_admit_payload_cannot_be_reassigned():
+    decision = decide_defect_admission(observation(), context())
+    with pytest.raises(Exception):  # FrozenInstanceError
+        decision.proposal = {}  # type: ignore[misc]
