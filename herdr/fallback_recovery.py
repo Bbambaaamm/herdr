@@ -73,6 +73,7 @@ def normalize_transition_event(event: Mapping[str, Any]) -> dict[str, Any]:
     """
     canonical = dict(event)
     canonical.pop("retry", None)
+    canonical.pop("not_before", None)
     handoff = canonical.get("handoff")
     if isinstance(handoff, dict):
         repaired = dict(handoff)
@@ -440,14 +441,16 @@ def decide_managed_fallback(
             event,
             identity_fields=(
                 "event", "task_id", "run_token", "attempt",
-                "failed_executor", "source_decision_sha256", "not_before",
+                "failed_executor", "source_decision_sha256",
             ),
             normalize=normalize_transition_event,
         )
     except Exception as exc:
         raise RoutingIntegrationError("fallback replay conflict") from exc
-    if normalize_transition_event(authoritative_event) != normalize_transition_event(event):
+    if authoritative_event != event:
         # A concurrent/restarted caller receives only the durable authoritative
-        # result; it cannot publish a newly computed conflicting transition.
+        # result; it cannot publish a newly computed transition.  Derived timing
+        # may differ without being a conflict (handled by the normalizer), but
+        # the durable record still governs.
         return FallbackTransition.from_audit_event(authoritative_event)
     return transition

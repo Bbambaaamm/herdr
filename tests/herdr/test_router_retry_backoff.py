@@ -550,28 +550,39 @@ def test_different_transition_still_conflicts(tmp_path):
         log.append_or_get_strict(changed, identity_fields=identity, normalize=normalize_transition_event)
 
 
-def test_changed_wait_is_a_new_durable_record_not_a_silent_override(tmp_path):
-    """E4 P1: a different honoured wait must not override the stored one."""
-    from herdr.fallback_recovery import normalize_transition_event
-    from herdr.scheduler import AuditLog
+def test_changed_wait_replays_the_durable_boundary(tmp_path):
+    """E4 P1: a later weaker hint must not open an earlier retry window."""
+    from herdr.fallback_recovery import ProviderFailureObservation, decide_managed_fallback
+    from herdr.scheduler_routing import RoutingIntegrationError
 
-    log = AuditLog(tmp_path / "audit.jsonl")
-    identity = (
-        "event", "task_id", "run_token", "attempt",
-        "failed_executor", "source_decision_sha256", "not_before",
-    )
-    first = {
-        "event": "managed_fallback_transition", "task_id": "task-x", "run_token": "run-x",
-        "attempt": 2, "failed_executor": "exec-x", "source_decision_sha256": "a" * 64,
-        "not_before": "2026-10-02T10:02:10+00:00", "handoff": None, "retry": None,
-    }
-    log.append_or_get_strict(first, identity_fields=identity, normalize=normalize_transition_event)
-    second = dict(first)
-    second["not_before"] = "2026-10-02T10:00:10+00:00"
-    second["retry"] = RetryGuidance(True, 0.0, "retry_after", raw="0").to_json()
-    returned = log.append_or_get_strict(second, identity_fields=identity, normalize=normalize_transition_event)
-    assert returned["not_before"] == "2026-10-02T10:00:10+00:00"
-    assert len([line for line in (tmp_path / "audit.jsonl").read_text().splitlines() if line.strip()]) == 2
+    scheduler, node, ident, kwargs, route = _scheduled(tmp_path)
+
+    def decide(**observation_kwargs):
+        attestation = _attestation(
+            "a-runtime", kwargs["registry"].snapshot.hash, kwargs["requirement"].hash
+        )
+        observation = ProviderFailureObservation(
+            executor_id="a-runtime", status_code=429, message="rate limit",
+            scope=FailureScope.CANDIDATE_LOCAL, scope_attestation=attestation,
+            **observation_kwargs,
+        )
+        return decide_managed_fallback(
+            scheduler, task_id=node.id, route=route, observation=observation,
+            identity=ident, registry=kwargs["registry"], requirement=kwargs["requirement"],
+            policy=kwargs["policy"], runtime_state=kwargs["runtime_state"],
+            at=kwargs["at"], policy_version=kwargs["policy_version"],
+            budget_gate=kwargs["budget_gate"], budget_allocation_id=ALLOCATION,
+            expected_registry_hash=kwargs["expected_registry_hash"],
+            expected_requirement_hash=kwargs["expected_requirement_hash"],
+            fallback_count=0, max_fallbacks=1,
+        )
+
+    first = decide(retry_after="120")
+    second = decide(retry_after="0")
+    assert first.handoff is not None and second.handoff is not None
+    assert second.handoff.not_before == first.handoff.not_before
+    with pytest.raises(RoutingIntegrationError):
+        second.handoff.assert_dispatchable("2000-01-01T00:00:00+00:00")
 
 
 def test_retry_policy_change_does_not_break_replay(tmp_path):
