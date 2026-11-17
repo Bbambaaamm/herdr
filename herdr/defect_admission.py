@@ -217,7 +217,10 @@ class DefectContext:
                               ("credentials_state", {"OK", "MISSING", "UNKNOWN"})):
             # Only states with an explicit decision branch are accepted; an
             # unhandled state must fail closed rather than fall through to ADMIT.
-            _require(getattr(self, name) in allowed, f"invalid {name}")
+            value = getattr(self, name)
+            # Exact type first: an object with a custom __eq__/__hash__ must not
+            # be able to impersonate a valid state and fall through to ADMIT.
+            _require(type(value) is str and value in allowed, f"invalid {name}")
         _require(type(self.active_repairs) is int and self.active_repairs >= 0, "invalid repair count")
         _require(type(self.repeat_count) is int and self.repeat_count >= 0, "invalid repeat count")
         _require(type(self.max_repairs) is int and self.max_repairs > 0, "invalid repair ceiling")

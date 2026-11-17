@@ -401,6 +401,18 @@ def test_unhandled_context_states_fail_closed():
         context(credentials_state="EXHAUSTED")
 
 
+def test_context_state_impersonation_is_rejected():
+    """E6 P1: a custom __eq__/__hash__ must not impersonate a valid state."""
+
+    class PretendOK(str):
+        pass
+
+    with pytest.raises(DefectError):
+        context(budget_state=PretendOK("OK"))
+    with pytest.raises(DefectError):
+        context(credentials_state=PretendOK("OK"))
+
+
 @pytest.mark.parametrize("overrides", [
     {"ref": "feat/ex\nline"},
     {"ref": ""},
