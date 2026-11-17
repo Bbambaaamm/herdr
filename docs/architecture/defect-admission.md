@@ -33,6 +33,7 @@ revision:
 | `observed_at` | freshness |
 | `evidence_sha256` | ≤4 bounded evidence digests; `UNKNOWN` requires evidence |
 | `workflow` / `check_run_id` / `event_revision` | delivery identity |
+| `check_identity` | stable identity of the specific check (required for `CI_CHECK`) |
 
 Fail-closed validation: malformed SHA/repo/ref/subject/timestamp/evidence raises
 `DefectError` rather than being coerced. A source may only carry categories it
@@ -44,10 +45,11 @@ evidence.
 
 ## Identity
 
-- `fingerprint` = `digest([SCHEMA, source, repository, commit_sha, category, subject, workflow, check_run_id])`
+- `fingerprint` = `digest([SCHEMA, source, repository, commit_sha, category, subject, workflow, check_identity])`
   — semantic defect identity. A regression on a new revision is a new identity,
-  and two distinct required checks (or two distinct check runs) failing on one
-  revision are two defects rather than one collapsed record.
+  and two distinct required checks failing on one revision are two defects
+  rather than one collapsed record. A repeated run of one check (new
+  `check_run_id`) is still the same defect: the run id is delivery identity.
 - `deduplication_id` = `digest([fingerprint, workflow, check_run_id, event_revision, observed_at])`
   — delivery identity, so a redelivered webhook is not a new defect.
 

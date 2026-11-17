@@ -37,6 +37,7 @@ def observation(**overrides):
         "subject": ("test_example", "test_it"),
         "observed_at": 1_000,
         "workflow": "Herdr contract",
+        "check_identity": "herdr-contract",
         "check_run_id": "run-1",
         "event_revision": "rev-1",
         "evidence_sha256": ("d" * 64,),
@@ -321,11 +322,28 @@ def test_one_check_redelivered_is_one_defect():
     assert first.deduplication_id == second.deduplication_id
 
 
-def test_distinct_check_runs_in_one_workflow_are_two_defects():
+def test_repeated_runs_of_one_check_are_one_defect():
+    """E4 P1: a run id is delivery identity, not semantic identity."""
+    first = observation(workflow="Herdr contract", check_identity="herdr-contract",
+                        check_run_id="run-1")
+    second = observation(workflow="Herdr contract", check_identity="herdr-contract",
+                         check_run_id="run-2")
+    assert first.fingerprint == second.fingerprint
+    assert first.deduplication_id != second.deduplication_id
+
+
+def test_two_distinct_checks_in_one_workflow_are_two_defects():
     """E4 P1: workflow alone is not a stable check identity."""
-    first = observation(workflow="Herdr contract", check_run_id="run-1")
-    second = observation(workflow="Herdr contract", check_run_id="run-2")
+    first = observation(workflow="Herdr contract", check_identity="herdr-contract",
+                        check_run_id="run-1")
+    second = observation(workflow="Herdr contract", check_identity="herdr-security",
+                         check_run_id="run-2")
     assert first.fingerprint != second.fingerprint
+
+
+def test_ci_observation_requires_a_stable_check_identity():
+    with pytest.raises(DefectError):
+        observation(source=DefectSource.CI_CHECK, check_identity="")
 
 
 def test_unhandled_context_states_fail_closed():
@@ -416,6 +434,14 @@ def test_admit_payload_is_immutable_after_validation():
     with pytest.raises(TypeError):
         decision.proposal["authorizes_execution"] = True  # type: ignore[index]
     assert decision.proposal["authorizes_execution"] is False
+
+
+def test_nested_admit_payload_is_immutable_after_validation():
+    """E4 P1: freezing only the top map leaves nested limits mutable."""
+    decision = decide_defect_admission(observation(), context())
+    with pytest.raises(TypeError):
+        decision.proposal["graph"]["node_count"] = 999  # type: ignore[index]
+    assert decision.proposal["graph"]["node_count"] == 1  # type: ignore[index]
 
 
 def test_admit_payload_cannot_be_reassigned():

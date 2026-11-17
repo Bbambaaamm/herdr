@@ -93,6 +93,15 @@ SOURCE_CATEGORIES: dict[DefectSource, frozenset[DefectCategory]] = {
 HUMAN_CATEGORIES = frozenset({DefectCategory.SECURITY_FINDING})
 
 
+def _freeze(value):
+    """Recursively immobilize a payload so post-validation mutation is impossible."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise DefectError(message)
@@ -115,6 +124,7 @@ class DefectObservation:
     subject: tuple[str, ...]
     observed_at: int
     evidence_sha256: tuple[str, ...] = ()
+    check_identity: str = ""
     workflow: str = ""
     check_run_id: str = ""
     event_revision: str = ""
@@ -142,6 +152,14 @@ class DefectObservation:
             _token(ref, re.compile(r"[a-f0-9]{64}"))
         for value in (self.workflow, self.check_run_id):
             _require(type(value) is str and len(value) <= 128, "invalid identifier field")
+        _require(type(self.check_identity) is str, "invalid check identity")
+        if self.source is DefectSource.CI_CHECK:
+            # A CI observation must name the stable check it came from; a bare
+            # run id would make every re-run look like a new defect.
+            _require(_TOKEN.fullmatch(self.check_identity) is not None,
+                     "CI observation requires a stable check identity")
+        else:
+            _require(len(self.check_identity) <= 64, "invalid check identity")
         _require(type(self.event_revision) is str and 0 < len(self.event_revision) <= MAX_REVISION,
                  "invalid event revision")
 
@@ -149,15 +167,16 @@ class DefectObservation:
     def fingerprint(self) -> str:
         """Semantic defect identity.
 
-        ``workflow`` and ``check_run_id`` participate because the #100 CI adapter
-        proves only "this exact revision failed a required check": two different
-        required checks failing on the same revision are two distinct defects and
-        must not be collapsed into one durable record.  Redelivery of one check
-        run still maps to one identity.
+        ``workflow`` and ``check_identity`` participate because the #100 CI
+        adapter proves only "this exact revision failed a required check": two
+        different required checks failing on the same revision are two distinct
+        defects and must not be collapsed into one durable record.  Re-running
+        one check (new ``check_run_id``) is still the same defect, because the
+        run id is delivery identity, not semantic identity.
         """
         return digest([SCHEMA, self.source, self.repository, self.commit_sha,
                        self.category, self.subject, self.workflow,
-                       self.check_run_id])
+                       self.check_identity])
 
     @property
     def deduplication_id(self) -> str:
@@ -217,7 +236,7 @@ class DefectDecision:
         _require(type(self.reasons) is tuple, "invalid reasons")
         # Deep-freeze the payload: a later mutation must not be able to turn a
         # validated proposal into an authorization.
-        object.__setattr__(self, "proposal", MappingProxyType(dict(self.proposal)))
+        object.__setattr__(self, "proposal", _freeze(dict(self.proposal)))
         if self.disposition is DefectDisposition.ADMIT:
             # The ADMIT contract is part of the payload, not just the summary:
             # a proposal never authorizes execution, submits a task or spends.
