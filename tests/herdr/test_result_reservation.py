@@ -137,8 +137,8 @@ def test_complete_reserved_result_launcher_reaches_exec_with_exact_plan(tmp_path
         mounts = fixture_mount_arguments(profile)
         command = command_for(sandbox, profile, descriptors=entries, opts=mounts)
         argv = command[6:]
-        at = argv.index("--unshare-pid") + 1
-        argv[at:at] = ["--unshare-net"]
+        # The launcher now supplies private network isolation itself; injecting
+        # a second --unshare-net would fail the exactly-once lifetime check.
         at = argv.index("--remount-ro")
         argv[at:at] = ["--dir", str(work), "--chdir", str(work),
                        "--bind-fd", str(workspace.fd), str(work),

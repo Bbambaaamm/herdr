@@ -456,7 +456,7 @@ def physical(live, monkeypatch):
     argv = ["/usr/bin/bwrap", "--tmpfs", "/",
             *(part for name in sorted(credential_isolation.SYSTEM_RUNTIME_FILES)
               for part in ("--ro-bind", name, name)),
-            "--dev", "/dev", "--unshare-user", "--unshare-pid", "--die-with-parent",
+            "--dev", "/dev", "--unshare-user", "--unshare-pid", "--unshare-net", "--die-with-parent",
             "--disable-userns", "--cap-drop", "ALL",
             "--tmpfs", "/tmp", "--tmpfs", "/home/agentops", "--proc", "/proc", "--chdir", grant.workspace_root,
             "--tmpfs", "/home/agentops/.config/herdr", "--tmpfs", "/opt/agent-platform", "--tmpfs", "/run"]
@@ -869,11 +869,18 @@ def test_actual_host_factory_uses_protected_issuer_timeout(tmp_path, monkeypatch
         assert protected == [True]
 
 
-def test_automatic_native_grammar_denies_private_network_namespace(physical):
+def test_automatic_native_grammar_accepts_single_private_network_namespace(physical):
     argv = list(physical.argv)
-    argv.insert(argv.index("--"), "--unshare-net")
     plan = request_for(physical.grant.identity, physical.plan["descriptors"], argv)
-    with pytest.raises(SecurityError, match="unsupported automatic mount operation"):
+    issuer._argv(plan, argv, physical.grant.workspace_root, physical.profile)
+
+
+def test_automatic_native_grammar_denies_duplicate_private_network_namespace(physical):
+    argv = list(physical.argv)
+    at = argv.index("--unshare-pid") + 1
+    argv[at:at] = ["--unshare-net"]
+    plan = request_for(physical.grant.identity, physical.plan["descriptors"], argv)
+    with pytest.raises(SecurityError, match="duplicate namespace operation"):
         issuer._argv(plan, argv, physical.grant.workspace_root, physical.profile)
 
 
