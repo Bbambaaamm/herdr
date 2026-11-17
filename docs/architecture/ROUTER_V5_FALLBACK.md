@@ -224,8 +224,16 @@ dispatch.
 | --- | --- |
 | P1: `"unknown"` did not enforce refusal | `ManagedExecutionHandoff.waits_for_provider` is set by every fallback decision; `assert_dispatchable` raises `handoff_wait_unknown` when the boundary is missing, and `from_audit_event` marks legacy handoffs the same way. Verified: both reviewer reproductions now refuse dispatch |
 
-Cumulative: all five rounds of findings are fixed. The local routing/
-namespace/security set is 270 passed, 1 skipped, exit 0, and
+Round 6 at HEAD `de6510d` — a record written before `waits_for_provider` existed
+re-decided into `fallback replay conflict`, because the normalizer did not drop
+the new enforcement field.
+
+| Finding | Fix |
+| --- | --- |
+| P1: legacy handoff without `waits_for_provider` conflicted | `normalize_transition_event` also drops `waits_for_provider` (enforcement metadata, not decision identity). Regression test `test_previous_format_without_wait_flag_replays_without_conflict` |
+
+Cumulative: all six rounds of findings are fixed. The local routing/
+namespace/security set is 271 passed, 1 skipped, exit 0, and
 `scripts/validate_repo.py` reports `HERDR_REPOSITORY_CONTRACT_OK`.
 
 ## 12. Remaining blockers and next step
