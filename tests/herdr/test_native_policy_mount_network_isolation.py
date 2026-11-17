@@ -9,7 +9,7 @@ import pytest
 import subprocess
 import sys
 
-from tests.herdr.test_policy_launch import mount, cleanup
+from tests.herdr.test_policy_launch import mount, cleanup, isolated_runtime_destinations
 
 @pytest.mark.skipif(not Path("/usr/bin/bwrap").is_file(), reason="Bubblewrap unavailable")
 def test_real_policy_mount_verify_mounted_with_separate_network(tmp_path):
@@ -28,6 +28,7 @@ time.sleep(5)
         "--disable-userns", "--cap-drop", "ALL",
         "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run",
         "--dir", "/run/herdr", "--dir", "/run/herdr-policy",
+        *isolated_runtime_destinations(),
     ]
     for row in descriptors:
         argv.extend(["--ro-bind-fd", str(row["fd"]), row["target"]])

@@ -97,8 +97,15 @@ def wiring(monkeypatch, tmp_path, *, private=True, outcome=None, fault=None):
     reference_module.__file__ = str(reference_path)
     reference_module.HostReferenceDenied = type("HostReferenceDenied", (ValueError,), {})
     reference_module.HostCredentialReference = lambda **fields: SimpleNamespace(**fields)
+    reference_module.arm_host_reference_process = lambda binding: events.append("reference-armed")
     binding_module = ModuleType("herdr.hermes_cli_identity")
     binding_module.__file__ = str(policy_root / "herdr/hermes_cli_identity.py")
+    egress_module = ModuleType("herdr.host_reference_egress")
+    egress_module.__file__ = str(policy_root / "herdr/host_reference_egress.py")
+    def require_network_isolated(grant):
+        assert grant is not None
+        events.append("egress-checked")
+    egress_module.require_network_isolated_host_reference = require_network_isolated
     class CLIInvocationBinding:
         def __init__(self, bound_guard):
             assert bound_guard.grant is grant
@@ -157,7 +164,8 @@ def wiring(monkeypatch, tmp_path, *, private=True, outcome=None, fault=None):
                "herdr.hermes_terminal_transport": transport_module, "cli": cli_module,
                "herdr.credential_isolation": observation_module,
                "herdr.policy_launch": policy_launch, "agent.host_reference": reference_module,
-               "herdr.hermes_cli_identity": binding_module, "run_agent": agent_module}
+               "herdr.hermes_cli_identity": binding_module, "run_agent": agent_module,
+               "herdr.host_reference_egress": egress_module}
     def import_module(name):
         imports.append(name)
         if name in ("cli", "herdr.hermes_terminal_transport"):

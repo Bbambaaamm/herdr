@@ -101,6 +101,44 @@ def cleanup(item):
     for tree in (item.code, *item.runtime):
         tree.cleanup_after_pane_closed()
 
+
+def isolated_runtime_destinations():
+    """Writable isolated destinations for the absolute immutable runtime targets.
+
+    RUNTIME_TARGETS are absolute staging paths. On a host without that layout
+    bwrap cannot create them under `--ro-bind / /`, so shadow /home with a
+    tmpfs and pre-create the exact destination directories before the read-only
+    FD binds. The host home is never exposed or modified, and the bound trees
+    keep their exact target identities and read-only protection. On a host that
+    already has the staging layout this is a no-op.
+    """
+    if all(target.parent.is_dir() for target in RUNTIME_TARGETS):
+        return []
+    # Shadow /home so the absolute destinations can be created, then restore
+    # the checkout (and the interpreter when it lives under /home) read-only:
+    # `--ro-bind / /` already exposes both, so nothing new is revealed.
+    repo = Path(__file__).resolve().parents[2]
+    setup = ["--tmpfs", "/home", "--ro-bind", str(repo), str(repo)]
+    executable = Path(sys.executable).resolve()
+    if executable.is_relative_to("/home"):
+        setup += ["--ro-bind", str(executable), str(executable)]
+    for target in sorted(RUNTIME_TARGETS):
+        setup += ["--dir", str(target)]
+    return setup
+
+def test_isolated_runtime_destinations_create_writable_targets_without_host_layout(monkeypatch):
+    import sys
+    fake = {Path("/nonexistent-herdr/home/agentops/.hermes/hermes-agent"),
+            Path("/nonexistent-herdr/home/agentops/.local/share/uv/python/cpython-3.11.16-linux-x86_64-gnu")}
+    monkeypatch.setattr(sys.modules[__name__], "RUNTIME_TARGETS", fake)
+    argv = isolated_runtime_destinations()
+    assert argv[:2] == ["--tmpfs", "/home"]
+    repo = str(Path(__file__).resolve().parents[2])
+    assert ["--ro-bind", repo] in [argv[i:i + 2] for i in range(len(argv) - 1)]
+    assert [argv[i + 1] for i, part in enumerate(argv) if part == "--dir"] == \
+        [str(target) for target in sorted(fake)]
+
+
 def test_policy_mount_requires_both_exact_runtime_snapshots(tmp_path):
     item = mount(tmp_path)
     try:

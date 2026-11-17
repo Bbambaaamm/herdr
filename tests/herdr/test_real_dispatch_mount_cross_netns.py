@@ -20,7 +20,7 @@ from herdr.work_authority import dispatch_work_connection
 from tests.herdr.test_work_contract_host import factory_fixture
 from herdr.work_contract_host import HostWorkContractFactory
 from test_work_cycle import seal
-from tests.herdr.test_policy_launch import mount as synthetic_mount, cleanup
+from tests.herdr.test_policy_launch import mount as synthetic_mount, cleanup, isolated_runtime_destinations
 
 @pytest.mark.skipif(not Path("/usr/bin/bwrap").is_file(), reason="Bubblewrap unavailable")
 def test_real_dispatch_with_actual_mount_verifier_across_netns(tmp_path):
@@ -108,6 +108,7 @@ print('REAL_HOST_DISPATCH_IPC_OK')
         "--disable-userns", "--cap-drop", "ALL",
         "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
         "--tmpfs", "/run", "--dir", "/run/herdr", "--dir", "/run/herdr-policy",
+        *isolated_runtime_destinations(),
         *(argument for row in descriptors
           for argument in ("--ro-bind-fd", str(row["fd"]), row["target"])),
         "--ro-bind-fd", str(pinned), "/run/herdr-policy/bootstrap-authority.sock",
