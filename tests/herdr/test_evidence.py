@@ -256,6 +256,25 @@ sys.stdout.buffer.write(sys.stdin.buffer.read() + b"filter-executed")
         assert accepted["level"] == "verified_worker_result"
         assert target.read_text() == "original"
 
+def test_actual_read_only_git_reaches_workspace_below_shadowed_tmp():
+    from herdr.evidence import read_only_git
+    import tempfile
+    if not shutil.which("bwrap") or not os.access("/tmp", os.W_OK):
+        pytest.skip("physical artifact verifier or writable /tmp is unavailable")
+    with tempfile.TemporaryDirectory(prefix="herdr-shadowed-worktree-", dir="/tmp") as directory:
+        workspace = Path(directory)
+        run_git(workspace, "init", "-q")
+        (workspace / "result.txt").write_text("bounded\n")
+        run_git(workspace, "add", "result.txt")
+        run_git(workspace, "-c", "user.email=test@example.invalid",
+                "-c", "user.name=test", "commit", "-qm", "init")
+        try:
+            listed = read_only_git(workspace)(["ls-files", "-z", "--cached", "--others"])
+            assert listed.split("\0")[0] == "result.txt"
+        except EvidenceUnavailable:
+            pytest.skip("this test host cannot execute the read-only verifier namespace")
+
+
 def typed_fixture(tmp_path, kind, fault=None):
     task, result, plan, store, path, proof = fixture(tmp_path)
     report_path = f"reports/{kind}/report.json"

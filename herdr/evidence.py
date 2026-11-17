@@ -295,7 +295,13 @@ def read_only_git(root: Path):
         command = [
             str(bwrap), "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
             "--unshare-pid", "--unshare-net", "--seccomp", str(seccomp_fd),
-            "--tmpfs", "/tmp", "--clearenv",
+            # /tmp stays visible but read-only: the verified worktree may
+            # itself live below /tmp (for example a CI evidence boundary), and
+            # shadowing it would make linked-worktree object alternates
+            # unreachable. The untrusted verifier still gets no writable host
+            # mount.
+            "--ro-bind", "/tmp", "/tmp",
+            "--clearenv",
             "--setenv", "PATH", "/usr/bin:/bin", "--setenv", "HOME", "/tmp",
             "--", str(git), "--no-optional-locks", "--no-replace-objects",
             "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
