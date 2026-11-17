@@ -55,7 +55,7 @@ def test_retry_after_accepts_http_date():
     assert parse_retry_after(format_datetime(target, usegmt=True), at=AT) == pytest.approx(45.0)
 
 
-@pytest.mark.parametrize("value", [None, "", "   ", "soon", "1e9", "-5", True, 901, "999999"])
+@pytest.mark.parametrize("value", [None, "", "   ", "soon", "1e9", "-5", True])
 def test_retry_after_rejects_unusable_values(value):
     assert parse_retry_after(value, at=AT) is None
 
@@ -64,9 +64,15 @@ def test_retry_after_past_date_is_unusable_not_negative():
     assert parse_retry_after("Mon, 01 Jan 1990 00:00:00 GMT", at=AT) is None
 
 
-def test_retry_after_is_capped():
+def test_retry_after_is_returned_unbounded():
+    """The cap is applied by plan_retry, never by the parser.
+
+    Returning a shortened wait here would turn an over-cap provider hint into an
+    earlier, unauthorised attempt.
+    """
     assert parse_retry_after(str(int(RETRY_WAIT_CAP_SECONDS)), at=AT) == RETRY_WAIT_CAP_SECONDS
-    assert parse_retry_after(str(int(RETRY_WAIT_CAP_SECONDS) + 1), at=AT) is None
+    assert parse_retry_after("901", at=AT) == 901.0
+    assert parse_retry_after("999999", at=AT) == 999999.0
 
 
 # --- reset timestamp normalization -------------------------------------------
@@ -329,7 +335,9 @@ def test_managed_fallback_terminates_when_guidance_exceeds_deadline(tmp_path):
     transition, _ = _decision(tmp_path, retry_after="600", deadline=deadline)
     assert transition.action is RecoveryAction.TERMINATE
     assert transition.handoff is None
-    assert transition.retry is None
+    assert transition.retry is not None
+    assert transition.retry.retryable is False
+    assert transition.retry.source == "deadline_exceeded"
 
 
 def test_managed_fallback_waits_when_guidance_fits_deadline(tmp_path):
@@ -346,7 +354,15 @@ def test_managed_fallback_waits_when_guidance_fits_deadline(tmp_path):
 
 
 def test_managed_fallback_retry_survives_audit_round_trip(tmp_path):
-    transition, _ = _decision(tmp_path, reset_at="2026-11-17T00:01:00Z")
+    from datetime import UTC, datetime, timedelta
+
+    transition, kwargs = _decision(tmp_path)
+    base = datetime.fromisoformat(kwargs["at"].replace("Z", "+00:00"))
+    reset_iso = (base + timedelta(seconds=45)).isoformat()
+    transition, _ = _decision(tmp_path, reset_at=reset_iso)
+    assert transition.action is RecoveryAction.FALLBACK
+    assert transition.retry is not None
+    assert transition.retry.wait_seconds == pytest.approx(45.0)
     restored = type(transition).from_audit_event(transition.audit_event())
     assert restored.retry == transition.retry
     assert restored.action is RecoveryAction.FALLBACK
@@ -358,3 +374,166 @@ def test_managed_fallback_without_timing_uses_bounded_backoff(tmp_path):
     assert transition.retry is not None
     assert transition.retry.source == "backoff"
     assert 0.0 < transition.retry.wait_seconds <= 61.0
+
+
+# --- E4 review regressions ---------------------------------------------------
+
+
+def test_over_cap_retry_after_is_terminal_not_shortened():
+    """A 901 s hint must not become a 1 s attempt."""
+    guidance = plan_retry(
+        failure=FailureKind.RATE_LIMITED,
+        retry_after="901",
+        at=AT,
+        attempt=1,
+        deadline=AT + 1000.0,
+    )
+    assert guidance.retryable is False
+    assert guidance.wait_seconds is None
+    assert guidance.source == "deadline_exceeded"
+
+
+def test_over_deadline_retry_after_is_terminal():
+    guidance = plan_retry(
+        failure=FailureKind.RATE_LIMITED,
+        retry_after="60",
+        at=AT,
+        attempt=1,
+        deadline=AT + 30.0,
+    )
+    assert guidance.retryable is False
+    assert guidance.source == "deadline_exceeded"
+
+
+def test_over_cap_reset_hint_is_terminal_even_inside_a_deadline():
+    """The truncated value must not become an earlier attempt (E4 P1)."""
+    guidance = plan_retry(
+        failure=FailureKind.RATE_LIMITED,
+        reset_at=AT + 4500.0,
+        at=AT,
+        attempt=1,
+        deadline=AT + 1000.0,
+    )
+    assert guidance.retryable is False
+    assert guidance.source == "deadline_exceeded"
+
+
+def test_retry_after_preferred_over_reset_timestamp():
+    guidance = plan_retry(
+        failure=FailureKind.RATE_LIMITED,
+        retry_after="60",
+        reset_at=AT + 300.0,
+        at=AT,
+        attempt=1,
+    )
+    assert guidance.retryable is True
+    assert guidance.source == "retry_after"
+    assert guidance.wait_seconds == pytest.approx(60.0)
+
+
+def test_retry_guidance_from_json_rejects_string_boolean():
+    with pytest.raises(RoutingError):
+        RetryGuidance.from_json({"retryable": "false", "wait_seconds": None, "source": "none"})
+    with pytest.raises(RoutingError):
+        RetryGuidance.from_json({"retryable": True, "wait_seconds": "5", "source": "backoff"})
+
+
+def test_retry_guidance_rejects_non_retryable_wait():
+    with pytest.raises(RoutingError):
+        RetryGuidance(False, 5.0, "none")
+
+
+def test_breaker_rejects_non_finite_reference_time():
+    from herdr.security import ProviderCircuitBreaker, SecurityError
+
+    breaker = ProviderCircuitBreaker()
+    with pytest.raises(SecurityError):
+        breaker.open("openai", "rate_limited", now=float("nan"))
+    assert breaker.reason("openai") is None
+
+
+def test_handoff_refuses_dispatch_before_not_before_and_allows_after():
+    from herdr.scheduler_routing import ManagedExecutionHandoff, RoutingIntegrationError
+
+    base = dict(
+        version=1, task_id="task-1", run_token="run-1", attempt=2, fencing_token=1,
+        consumer="github:r", agent_id="agent-1", parent_task_id=None, parent_agent_id=None,
+        policy_profile="herdr-tenant", policy_version="v1",
+        decision_sha256="a" * 64, selected_executor="e", selected_provider="p",
+        selected_model="m", registry_hash="b" * 64, requirement_hash="c" * 64,
+        parent_scope_hash="d" * 64, policy_hash="d" * 64, budget_allocation_id="e" * 64,
+    )
+    handoff = ManagedExecutionHandoff(**base, not_before="2030-01-01T00:00:30+00:00")
+    with pytest.raises(RoutingIntegrationError):
+        handoff.assert_dispatchable("2030-01-01T00:00:00+00:00")
+    handoff.assert_dispatchable("2030-01-01T00:00:30+00:00")
+    handoff.assert_dispatchable("2030-01-01T00:01:00+00:00")
+    legacy = ManagedExecutionHandoff(**base)
+    legacy.assert_dispatchable("2030-01-01T00:00:00+00:00")
+
+
+def test_managed_fallback_records_not_before_on_handoff(tmp_path):
+    from herdr.scheduler_routing import RoutingIntegrationError
+
+    transition, _ = _decision(tmp_path, retry_after="60")
+    assert transition.handoff is not None
+    assert transition.handoff.not_before is not None
+    with pytest.raises(RoutingIntegrationError):
+        transition.handoff.assert_dispatchable("2000-01-01T00:00:00+00:00")
+
+
+def test_managed_fallback_terminates_on_over_cap_hint(tmp_path):
+    transition, _ = _decision(tmp_path, retry_after="4500")
+    assert transition.action is RecoveryAction.TERMINATE
+    assert transition.retry is not None
+    assert transition.retry.retryable is False
+
+
+def test_legacy_audit_event_without_retry_replays_without_conflict(tmp_path):
+    from herdr.fallback_recovery import normalize_transition_event
+    from herdr.scheduler import AuditLog
+
+    log = AuditLog(tmp_path / "audit.jsonl")
+    identity = (
+        "event", "task_id", "run_token", "attempt",
+        "failed_executor", "source_decision_sha256",
+    )
+    legacy = {
+        "event": "managed_fallback_transition",
+        "task_id": "task-legacy",
+        "run_token": "run-legacy",
+        "attempt": 2,
+        "failed_executor": "exec-legacy",
+        "source_decision_sha256": "a" * 64,
+        "handoff": None,
+    }
+    log.append_or_get_strict(legacy, identity_fields=identity)
+    modern = normalize_transition_event(legacy)
+    assert modern["retry"] is None
+    assert modern["handoff"] is None
+    assert log.append_or_get_strict(modern, identity_fields=identity, normalize=normalize_transition_event) == legacy
+
+
+def test_different_retry_guidance_still_conflicts(tmp_path):
+    from herdr.fallback_recovery import normalize_transition_event
+    from herdr.scheduler import AuditLog
+
+    log = AuditLog(tmp_path / "audit.jsonl")
+    identity = (
+        "event", "task_id", "run_token", "attempt",
+        "failed_executor", "source_decision_sha256",
+    )
+    stored = normalize_transition_event({
+        "event": "managed_fallback_transition",
+        "task_id": "task-x",
+        "run_token": "run-x",
+        "attempt": 2,
+        "failed_executor": "exec-x",
+        "source_decision_sha256": "a" * 64,
+        "handoff": None,
+    })
+    log.append_or_get_strict(stored, identity_fields=identity)
+    changed = dict(stored)
+    changed["retry"] = RetryGuidance(True, 60.0, "retry_after", raw="60").to_json()
+    with pytest.raises(Exception):
+        log.append_or_get_strict(changed, identity_fields=identity, normalize=normalize_transition_event)

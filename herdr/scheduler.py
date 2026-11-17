@@ -27,7 +27,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, ClassVar, Protocol
+from typing import Any, Callable, ClassVar, Protocol
 
 from herdr.telemetry import CostUnknownReason, EventType, TelemetryStore, new_event
 from herdr.taskgraph import (
@@ -478,6 +478,7 @@ class AuditLog:
         event: dict[str, object],
         *,
         identity_fields: tuple[str, ...],
+        normalize: Callable[[dict[str, object]], dict[str, object]] | None = None,
     ) -> dict[str, object]:
         """Atomically append or return the exact durable event.
 
@@ -496,7 +497,9 @@ class AuditLog:
                 matches = [candidate for candidate in self._disk_events_unlocked() if same(candidate)]
                 matches.extend(candidate for candidate in self._buffer if same(candidate))
                 if matches:
-                    if any(candidate != matches[0] for candidate in matches[1:]) or matches[0] != event:
+                    canonical = normalize if normalize is not None else (lambda item: dict(item))
+                    if (any(canonical(candidate) != canonical(matches[0]) for candidate in matches[1:])
+                            or canonical(matches[0]) != canonical(event)):
                         raise SchedulerError("audit identity conflict")
                     return dict(matches[0])
                 self._buffer.append(event)
@@ -1009,7 +1012,8 @@ class DynamicChildScheduler:
         )
 
     def prepare_managed_execution_handoff(self, route, *, identity, registry,
-                                          requirement, policy, budget_gate):
+                                          requirement, policy, budget_gate,
+                                          not_before=None):
         """Bind a selected route to the existing host-controlled executor gate."""
         from .scheduler_routing import build_execution_handoff
         return build_execution_handoff(
@@ -1020,6 +1024,7 @@ class DynamicChildScheduler:
             requirement=requirement,
             policy=policy,
             budget_gate=budget_gate,
+            not_before=not_before,
         )
 
     def graph_dimensions(self) -> tuple[int, int, int]:

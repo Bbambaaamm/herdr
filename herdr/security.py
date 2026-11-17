@@ -1099,6 +1099,11 @@ class ProviderRequest:
 _BREAKER_COOLDOWN_CAP_SECONDS = 900.0
 
 
+def _finite(value: float) -> bool:
+    """True only for a real, non-NaN, non-infinite number."""
+    return value == value and value not in (float("inf"), float("-inf"))
+
+
 class ProviderCircuitBreaker:
     """Small per-provider isolation primitive; one open provider does not stop peers.
 
@@ -1109,7 +1114,7 @@ class ProviderCircuitBreaker:
     def __init__(self, *, default_cooldown_seconds: float = 60.0) -> None:
         self._open: dict[str, tuple[str, float]] = {}
         seconds = float(default_cooldown_seconds)
-        if not 0.0 <= seconds <= _BREAKER_COOLDOWN_CAP_SECONDS:
+        if not _finite(seconds) or not 0.0 <= seconds <= _BREAKER_COOLDOWN_CAP_SECONDS:
             raise SecurityError("breaker_cooldown_out_of_range")
         self._default_cooldown = seconds
 
@@ -1124,9 +1129,11 @@ class ProviderCircuitBreaker:
         token = _token(provider, "provider")
         _token(reason, "breaker reason")
         seconds = self._default_cooldown if cooldown_seconds is None else float(cooldown_seconds)
-        if not 0.0 <= seconds <= _BREAKER_COOLDOWN_CAP_SECONDS:
+        if not _finite(seconds) or not 0.0 <= seconds <= _BREAKER_COOLDOWN_CAP_SECONDS:
             raise SecurityError("breaker_cooldown_out_of_range")
         current = time.time() if now is None else float(now)
+        if not _finite(current):
+            raise SecurityError("breaker_reference_time_invalid")
         self._open[token] = (reason, current + seconds)
 
     def close(self, provider: str) -> None:

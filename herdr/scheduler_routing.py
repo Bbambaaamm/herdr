@@ -25,6 +25,22 @@ _SHA = re.compile(r"^[0-9a-f]{64}$")
 _TOKEN = re.compile(r"^[A-Za-z0-9._:/@+-]{1,256}$")
 
 
+def _parse_iso8601(value: str) -> float | None:
+    """Parse a timezone-carrying ISO-8601 timestamp to a POSIX epoch."""
+    from datetime import datetime
+
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.timestamp()
+
+
 class RoutingIntegrationError(ValueError):
     """A managed routing input or handoff is invalid."""
 
@@ -302,6 +318,7 @@ class ManagedExecutionHandoff:
     parent_scope_hash: str
     policy_hash: str
     budget_allocation_id: str
+    not_before: str | None = None
 
     def __post_init__(self) -> None:
         if self.version != 1:
@@ -324,6 +341,20 @@ class ManagedExecutionHandoff:
             raise RoutingIntegrationError("handoff fencing token must be positive")
         if self.policy_hash != self.parent_scope_hash:
             raise RoutingIntegrationError("handoff policy hash is not the parent scope hash")
+        if self.not_before is not None:
+            if not isinstance(self.not_before, str) or _parse_iso8601(self.not_before) is None:
+                raise RoutingIntegrationError("handoff not_before must be a zoned ISO-8601 timestamp")
+
+    def assert_dispatchable(self, at: str) -> None:
+        """Refuse dispatch before the honoured provider wait has elapsed."""
+        if self.not_before is None:
+            return
+        moment = _parse_iso8601(at)
+        if moment is None:
+            raise RoutingIntegrationError("dispatch reference time must be zoned ISO-8601")
+        boundary = _parse_iso8601(self.not_before)
+        if boundary is not None and moment < boundary:
+            raise RoutingIntegrationError("handoff_not_ready")
 
     def authorize_identity(
         self,
@@ -374,6 +405,7 @@ def build_execution_handoff(
     requirement: CapabilityRequirement,
     policy: CapabilityScope,
     budget_gate: BudgetGate,
+    not_before: str | None = None,
 ) -> ManagedExecutionHandoff:
     """Bind one selected route to an existing scheduler record and budget gate."""
     record = scheduler.record_for(route.routing_input.task_id)
@@ -434,6 +466,7 @@ def build_execution_handoff(
         parent_scope_hash=route.routing_input.parent_scope_hash,
         policy_hash=policy.hash,
         budget_allocation_id=route.routing_input.budget_allocation_id,
+        not_before=not_before,
     )
 
 

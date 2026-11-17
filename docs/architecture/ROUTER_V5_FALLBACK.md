@@ -171,3 +171,30 @@ is input-token cost and must be recorded by the existing usage observation
 - Staging capacity: BLOCKED (2.0 GB free of 75 GB).
 - Live provider probes: not authorized.
 - New provider accounts: not authorized.
+
+## 11. E4 independent review and remediation
+
+Review by `quantlab-codex` at HEAD `88daac00` returned **E4 FAIL** with three
+P1 and two P2 findings. All five were reproduced and fixed.
+
+| Finding | Fix |
+| --- | --- |
+| P1: the declared wait was never enforced at dispatch | `ManagedExecutionHandoff.not_before` + `assert_dispatchable()`; `WorkInvocationGuard.authorize_routing_model` calls it on every model authorisation |
+| P1: an over-cap hint was shortened into an earlier attempt | parsers return unbounded waits; `plan_retry` fails closed (`deadline_exceeded`) when a hint exceeds the cap or the deadline |
+| P1: the new `retry` field broke replay of older durable events | `normalize_transition_event()` + `AuditLog.append_or_get_strict(normalize=...)`; legacy payloads compare equal, genuinely different transitions still conflict |
+| P2: `from_json` coerced `"false"` to `True` | strict JSON type checks; non-retryable guidance may not carry a wait |
+| P2: `open(now=nan)` stored a NaN expiry forever | non-finite cooldown/reference times rejected |
+
+Regression tests for every finding are in
+`tests/herdr/test_router_retry_backoff.py`; the routing/namespace/security set
+is 265 passed, 1 skipped.
+
+## 12. Remaining blockers and next step
+
+- Cross-task durable provider cooldown: BLOCKED on the capacity/observability
+  lane (no new store, no parallel truth).
+- Provider portfolio beyond OpenAI/Codex/Anthropic/Nous: BLOCKED on explicit
+  operator approval (credentials, terms, spend authority).
+- Live fallback pilot: NOT RUN — `AWAITING_EXPLICIT_OPERATOR_APPROVAL`.
+- Independent re-review of the remediation: required before this PR is
+  undrafted; not yet requested.

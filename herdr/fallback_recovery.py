@@ -10,11 +10,18 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 import re
-from typing import Any
+from typing import Any, Mapping
 
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _TOKEN = re.compile(r"^[A-Za-z0-9._:/@+-]{1,256}$")
 _EPOCH = re.compile(r"^[0-9]+(\.[0-9]+)?$")
+
+
+def _iso(epoch: float) -> str:
+    """Render a POSIX epoch as a UTC ISO-8601 timestamp with second precision."""
+    from datetime import UTC, datetime
+
+    return datetime.fromtimestamp(epoch, tz=UTC).isoformat()
 
 
 def _epoch(value: str) -> float:
@@ -51,6 +58,23 @@ class RecoveryAction(StrEnum):
     RECONCILE = "reconcile"
     BLOCK = "block"
     TERMINATE = "terminate"
+
+
+def normalize_transition_event(event: Mapping[str, Any]) -> dict[str, Any]:
+    """Canonicalize a durable fallback transition for identity comparison.
+
+    The transition payload grew optional timing fields.  Events written before
+    that change must still compare equal when the decision is unchanged, while
+    a genuinely different transition still conflicts.
+    """
+    canonical = dict(event)
+    canonical.setdefault("retry", None)
+    handoff = canonical.get("handoff")
+    if isinstance(handoff, dict):
+        repaired = dict(handoff)
+        repaired.setdefault("not_before", None)
+        canonical["handoff"] = repaired
+    return canonical
 
 
 @dataclass(frozen=True)
@@ -363,6 +387,7 @@ def decide_managed_fallback(
             1, RecoveryAction.TERMINATE, task_id, identity.run_token, route.routing_input.attempt,
             identity.fencing_token, observation.executor_id, failure,
             FailureScope.CANDIDATE_LOCAL, fallback_count, max_fallbacks, False, source_digest,
+            None, None, guidance,
         )
     else:
         next_route = scheduler.select_managed_route(
@@ -383,6 +408,11 @@ def decide_managed_fallback(
             scope_attestations={observation.executor_id: observation.scope_attestation},
             attempt=route.routing_input.attempt + 1,
         )
+        not_before = (
+            _iso(now + guidance.wait_seconds)
+            if guidance.retryable and guidance.wait_seconds is not None
+            else None
+        )
         handoff = scheduler.prepare_managed_execution_handoff(
             next_route,
             identity=identity,
@@ -390,6 +420,7 @@ def decide_managed_fallback(
             requirement=requirement,
             policy=policy,
             budget_gate=budget_gate,
+            not_before=not_before,
         )
         transition = FallbackTransition(
             1, RecoveryAction.FALLBACK, task_id, identity.run_token,
@@ -406,10 +437,11 @@ def decide_managed_fallback(
                 "event", "task_id", "run_token", "attempt",
                 "failed_executor", "source_decision_sha256",
             ),
+            normalize=normalize_transition_event,
         )
     except Exception as exc:
         raise RoutingIntegrationError("fallback replay conflict") from exc
-    if authoritative_event != event:
+    if normalize_transition_event(authoritative_event) != normalize_transition_event(event):
         # A concurrent/restarted caller receives only the durable authoritative
         # result; it cannot publish a newly computed conflicting transition.
         return FallbackTransition.from_audit_event(authoritative_event)

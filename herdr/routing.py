@@ -632,7 +632,6 @@ def bounded_fallback(
 RETRY_WAIT_CAP_SECONDS = 900.0
 _BACKOFF_BASE_SECONDS = 1.0
 _BACKOFF_CAP_SECONDS = 60.0
-_MAX_SKEW_SECONDS = 3600.0
 
 
 @dataclass(frozen=True)
@@ -652,6 +651,8 @@ class RetryGuidance:
         if self.wait_seconds is not None:
             if type(self.wait_seconds) is not float or not 0.0 <= self.wait_seconds <= RETRY_WAIT_CAP_SECONDS:
                 raise RoutingError("retry wait must be a bounded float")
+        if not self.retryable and self.wait_seconds is not None:
+            raise RoutingError("non-retryable guidance cannot carry a wait")
         if self.source not in ("none", "retry_after", "reset_timestamp", "backoff", "deadline_exceeded"):
             raise RoutingError("unknown retry guidance source")
 
@@ -665,52 +666,76 @@ class RetryGuidance:
 
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> "RetryGuidance":
-        return cls(
-            retryable=bool(value["retryable"]),
-            wait_seconds=value.get("wait_seconds"),
-            source=str(value["source"]),
-            raw=value.get("raw"),
-        )
+        retryable = value.get("retryable")
+        if type(retryable) is not bool:
+            raise RoutingError("retryable must be a JSON boolean")
+        wait = value.get("wait_seconds")
+        if wait is not None and type(wait) is not float:
+            raise RoutingError("wait_seconds must be a JSON number or null")
+        source = value.get("source")
+        if not isinstance(source, str):
+            raise RoutingError("retry source must be text")
+        raw = value.get("raw")
+        if raw is not None and not isinstance(raw, str):
+            raise RoutingError("retry raw hint must be text or null")
+        return cls(retryable=retryable, wait_seconds=wait, source=source, raw=raw)
 
 
 def parse_retry_after(value: Any, *, at: float) -> float | None:
-    """Normalize a Retry-After header (delta-seconds or HTTP date) to seconds."""
+    """Normalize a Retry-After header (delta-seconds or HTTP date) to seconds.
+
+    The returned value is deliberately *unbounded*: whether the wait is legal is
+    decided by ``plan_retry`` against the retry cap and the task deadline, so an
+    over-cap hint can never be silently shortened into an earlier attempt.
+    """
+    raw = _parse_retry_after_raw(value, at=at)
+    return raw
+
+
+def _parse_retry_after_raw(value: Any, *, at: float) -> float | None:
     if value is None:
         return None
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         seconds = float(value)
-        return seconds if 0.0 <= seconds <= RETRY_WAIT_CAP_SECONDS else None
+        return seconds if seconds >= 0.0 else None
     if not isinstance(value, str):
         return None
     text = value.strip()
     if not text:
         return None
     if re.fullmatch(r"[0-9]+", text):
-        seconds = float(text)
-        return seconds if 0.0 <= seconds <= RETRY_WAIT_CAP_SECONDS else None
+        return float(text)
     parsed = _parse_http_date(text)
     if parsed is None:
         return None
-    return _clamp_wait(parsed - at)
+    delta = parsed - at
+    return delta if delta >= 0.0 else None
 
 
 def normalize_reset_timestamp(value: Any, *, at: float) -> float | None:
-    """Normalize a provider reset hint (epoch seconds or ISO-8601) to seconds."""
+    """Normalize a provider reset hint (epoch seconds or ISO-8601) to seconds.
+
+    Unbounded for the same reason as ``parse_retry_after``; a timezone-naive
+    timestamp is rejected rather than silently assumed to be UTC.
+    """
     if value is None:
         return None
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return _clamp_wait(float(value) - at)
+        delta = float(value) - at
+        return delta if delta >= 0.0 else None
     if not isinstance(value, str):
         return None
     text = value.strip()
     if not text:
         return None
     if re.fullmatch(r"[0-9]+(\.[0-9]+)?", text):
-        return _clamp_wait(float(text) - at)
+        delta = float(text) - at
+        return delta if delta >= 0.0 else None
     parsed = _parse_iso8601(text)
     if parsed is None:
         return None
-    return _clamp_wait(parsed - at)
+    delta = parsed - at
+    return delta if delta >= 0.0 else None
 
 
 def bounded_backoff(attempt: int, *, seed: str = "") -> float:
@@ -739,9 +764,11 @@ def plan_retry(
     """Choose one legal wait for a failed attempt, or declare it terminal.
 
     Explicit provider guidance wins; a normalized reset timestamp is honoured
-    next; otherwise a bounded backoff is used.  The wait is always clamped to
-    the task deadline so a misread reset timestamp cannot create an unbounded
-    retry loop.
+    next; otherwise a bounded backoff is used.  A hint that exceeds the retry
+    cap is *not* shortened: without a durable deferral store the only legal
+    outcomes are waiting the full capped time inside the deadline or
+    terminating, so an over-cap hint fails closed instead of producing an
+    earlier attempt.
     """
     if type(at) is not float or not 0.0 < at < 4102444800.0:
         raise RoutingError("retry reference time must be a POSIX epoch float")
@@ -753,27 +780,26 @@ def plan_retry(
         remaining = deadline - at
     else:
         remaining = RETRY_WAIT_CAP_SECONDS
-    wait = parse_retry_after(retry_after, at=at)
-    if wait is not None:
-        if wait > remaining:
-            return RetryGuidance(False, None, "deadline_exceeded", raw=str(retry_after))
-        return RetryGuidance(True, wait, "retry_after", raw=str(retry_after))
-    wait = normalize_reset_timestamp(reset_at, at=at)
-    if wait is not None:
-        if wait > remaining:
-            return RetryGuidance(False, None, "deadline_exceeded", raw=str(reset_at))
-        return RetryGuidance(True, wait, "reset_timestamp", raw=str(reset_at))
+    for source, raw_value in (
+        ("retry_after", retry_after),
+        ("reset_timestamp", reset_at),
+    ):
+        if raw_value is None:
+            continue
+        wait = (
+            parse_retry_after(raw_value, at=at)
+            if source == "retry_after"
+            else normalize_reset_timestamp(raw_value, at=at)
+        )
+        if wait is None:
+            continue
+        if wait > RETRY_WAIT_CAP_SECONDS or wait > remaining:
+            return RetryGuidance(False, None, "deadline_exceeded", raw=str(raw_value))
+        return RetryGuidance(True, wait, source, raw=str(raw_value))
     wait = min(bounded_backoff(attempt, seed=seed), remaining)
     if wait <= 0.0:
         return RetryGuidance(False, None, "deadline_exceeded")
     return RetryGuidance(True, wait, "backoff")
-
-
-def _clamp_wait(seconds: float) -> float | None:
-    """Return a bounded positive wait, or None when the hint is unusable."""
-    if seconds != seconds or seconds < 0.0 or seconds > RETRY_WAIT_CAP_SECONDS + _MAX_SKEW_SECONDS:
-        return None
-    return min(seconds, RETRY_WAIT_CAP_SECONDS)
 
 
 def _parse_http_date(value: str) -> float | None:

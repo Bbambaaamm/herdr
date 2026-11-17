@@ -13,6 +13,13 @@ from .scheduler import AuditLog
 from .work_cycle import WorkCycle, WorkPhase, WorkPlan, require
 from .check_runner import CheckEnvironment, HostCheckRunner
 
+
+def _utc_now_iso() -> str:
+    """Current UTC time as a timezone-carrying ISO-8601 timestamp."""
+    from datetime import UTC, datetime
+
+    return datetime.now(tz=UTC).isoformat()
+
 class HostWorkContractFactory:
     def __init__(self, *, approve, environment, storage, audit_log, git=None, budget_authority=None, budget_binding=None,
                  check_storage=None, commit_runtime_storage=None):
@@ -323,7 +330,7 @@ class WorkInvocationGuard(InvocationGuard):
             raise PolicyDenied("routing_handoff_identity_mismatch") from exc
         self._routing_handoff = handoff
 
-    def authorize_routing_model(self, provider, model):
+    def authorize_routing_model(self, provider, model, at=None):
         handoff = self._routing_handoff
         if handoff is None:
             return True
@@ -336,6 +343,8 @@ class WorkInvocationGuard(InvocationGuard):
                 provider=provider,
                 model=model,
             )
+            reference = at if at is not None else _utc_now_iso()
+            handoff.assert_dispatchable(reference)
         except RoutingIntegrationError as exc:
             raise PolicyDenied("routing_handoff_model_mismatch") from exc
         return True
