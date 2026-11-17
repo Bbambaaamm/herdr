@@ -198,8 +198,16 @@ Round 2 at HEAD `9107ade` — two further P1, both in durable replay.
 | P1: a restored handoff lost `not_before`, so replay made an unready route dispatchable | `audit_event()` now serializes `not_before`; regression test asserts the round trip refuses early dispatch |
 | P1: a genuine older FALLBACK event without `retry` still raised an audit identity conflict | `normalize_transition_event()` drops the *derived* timing fields (`retry`, `handoff.not_before`) before comparison; replay of an unchanged decision succeeds while a genuinely different transition still conflicts |
 
-The reviewer's independent run outside the sandbox reported 265 passed,
-1 skipped. A final verification pass at HEAD `476e9ba` is pending.
+Round 3 at HEAD `894ec6c` — one further P1: a re-decision with a weaker
+Retry-After (120 s → 0 s) produced a second durable record for the same source
+attempt, and the later handoff was immediately dispatchable.
+
+| Finding | Fix |
+| --- | --- |
+| P1: a later weaker hint could open an earlier retry window | the wait is *not* part of the decision identity; a re-decision replays the durable record (`authoritative_event != event` returns the stored transition), so the first recorded boundary governs. The conflict check stays normalized so derived timing never masquerades as a different decision. Regression test `test_changed_wait_replays_the_durable_boundary` |
+
+Cumulative: all three rounds of findings are fixed. The local routing/
+namespace/security set is 268 passed, 1 skipped, exit 0.
 
 ## 12. Remaining blockers and next step
 
