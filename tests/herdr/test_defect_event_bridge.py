@@ -15,6 +15,7 @@ from herdr.defect_admission import (
     DefectContext,
     DefectError,
     DefectObservation,
+    decide_defect_admission,
 )
 from herdr.defect_event_bridge import (
     DEFECT_CATEGORY,
@@ -30,9 +31,11 @@ from herdr.operational_incidents import (
     Detail,
     IncidentType,
     Observation,
+    OperationalIncident,
     Scope,
     Source,
     State,
+    correlate,
 )
 
 HEAD = "a" * 40
@@ -115,7 +118,7 @@ def test_open_ci_observation_translates_to_a_defect():
     assert defect.repository == PROJECT
     assert defect.commit_sha == HEAD
     assert defect.ref == "refs/pull/237/head"
-    assert defect.finding_identity == ci_observation().correlation_id
+    assert defect.finding_identity == f"ci-{ci_observation().correlation_id[:16]}-{EVIDENCE[:12]}"
 
 
 def test_resolved_ci_observation_is_not_a_defect():
@@ -248,9 +251,14 @@ def journal(tmp_path):
     return DecisionJournal(AuditLog(str(tmp_path / "defect.jsonl")))
 
 
+def envelope(observation=None):
+    """Build a #100 envelope the way ``correlate`` does from the durable log."""
+    return next(iter(correlate([ci_observation() if observation is None else observation])))
+
+
 def test_admit_path_never_authorizes_execution(tmp_path):
     proposal = admission_proposal(
-        ci_observation(), context(), control(tmp_path), host_usage(),
+        envelope(), context(), control(tmp_path), host_usage(),
         pin=EVIDENCE, journal=journal(tmp_path),
     )
     assert proposal["eligible"] is True
@@ -278,7 +286,7 @@ def test_non_defect_observation_is_not_eligible(tmp_path):
         facts=(("available_bytes", 1),),
     )
     proposal = admission_proposal(
-        observation, context(), control(tmp_path), host_usage(),
+        envelope(observation), context(), control(tmp_path), host_usage(),
         pin="c" * 64, journal=journal(tmp_path),
     )
     assert proposal["eligible"] is False
@@ -289,26 +297,27 @@ def test_non_defect_observation_is_not_eligible(tmp_path):
 def test_redelivery_is_deduplicated_before_the_swarm_gate(tmp_path):
     """E4 round 8 P1-1: a redelivered event must not re-enter the gate."""
     first = admission_proposal(
-        ci_observation(), context(), control(tmp_path), host_usage(),
+        envelope(), context(), control(tmp_path), host_usage(),
         pin=EVIDENCE, journal=journal(tmp_path),
     )
     second = admission_proposal(
-        ci_observation(), context(), control(tmp_path), host_usage(),
+        envelope(), context(), control(tmp_path), host_usage(),
         pin=EVIDENCE, journal=journal(tmp_path),
     )
     assert first["admission"]["denied"] is False
     assert second["deduplicated"] is True
-    assert second["admission"]["denied"] is True
-    # exactly one swarm-gate decision, one durable defect record
+    assert second["admission"]["denied"] is False
+    # exactly one swarm-gate decision; the defect log holds decision + verdict
     rows = (tmp_path / "admission.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(rows) == 1
-    assert len((tmp_path / "defect.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+    defect_rows = (tmp_path / "defect.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(defect_rows) == 2
 
 
 def test_forged_gate_is_rejected(tmp_path):
     with pytest.raises(DefectError):
         admission_proposal(
-            ci_observation(), context(), object(), host_usage(),
+            envelope(), context(), object(), host_usage(),
             pin=EVIDENCE, journal=journal(tmp_path),
         )
 
@@ -316,7 +325,7 @@ def test_forged_gate_is_rejected(tmp_path):
 def test_missing_journal_is_rejected(tmp_path):
     with pytest.raises(DefectError):
         admission_proposal(
-            ci_observation(), context(), control(tmp_path), host_usage(),
+            envelope(), context(), control(tmp_path), host_usage(),
             pin=EVIDENCE, journal=None,
         )
 
@@ -324,14 +333,14 @@ def test_missing_journal_is_rejected(tmp_path):
 def test_unpinned_observation_is_rejected(tmp_path):
     with pytest.raises(DefectError):
         admission_proposal(
-            ci_observation(), context(), control(tmp_path), host_usage(),
+            envelope(), context(), control(tmp_path), host_usage(),
             pin="e" * 64, journal=journal(tmp_path),
         )
 
 
 def test_defect_gate_denial_is_propagated_without_consulting_the_swarm_gate(tmp_path):
     proposal = admission_proposal(
-        ci_observation(), context(budget_state="EXHAUSTED"), control(tmp_path), host_usage(),
+        envelope(), context(budget_state="EXHAUSTED"), control(tmp_path), host_usage(),
         pin=EVIDENCE, journal=journal(tmp_path),
     )
     assert proposal["disposition"] == "BLOCKED"
@@ -341,7 +350,7 @@ def test_defect_gate_denial_is_propagated_without_consulting_the_swarm_gate(tmp_
 
 def test_swarm_gate_denial_is_propagated(tmp_path):
     proposal = admission_proposal(
-        ci_observation(), context(), control(tmp_path), host_usage(active_agents=4),
+        envelope(), context(), control(tmp_path), host_usage(active_agents=4),
         pin=EVIDENCE, journal=journal(tmp_path),
     )
     assert proposal["admission"]["denied"] is True
@@ -350,20 +359,96 @@ def test_swarm_gate_denial_is_propagated(tmp_path):
 
 def test_existing_gate_audits_its_own_decision(tmp_path):
     admission_proposal(
-        ci_observation(), context(), control(tmp_path), host_usage(),
+        envelope(), context(), control(tmp_path), host_usage(),
         pin=EVIDENCE, journal=journal(tmp_path),
     )
     rows = (tmp_path / "admission.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(rows) == 1
     assert '"event": "allow"' in rows[0]
-    assert len((tmp_path / "defect.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+    defect_rows = (tmp_path / "defect.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(defect_rows) == 2
 
 
 def test_denied_defect_never_reaches_the_swarm_gate(tmp_path):
     admission_proposal(
-        ci_observation(), context(budget_state="EXHAUSTED"), control(tmp_path), host_usage(),
+        envelope(), context(budget_state="EXHAUSTED"), control(tmp_path), host_usage(),
         pin=EVIDENCE, journal=journal(tmp_path),
     )
     assert not (tmp_path / "admission.jsonl").exists()
     # but the durable defect decision is still recorded
     assert len((tmp_path / "defect.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+
+
+# --- E4 round 9 ------------------------------------------------------------ #
+
+
+def test_bare_observation_is_not_an_envelope(tmp_path):
+    """E4 r9 P1-3: the bridge input must be a #100 envelope, not a bare value."""
+    with pytest.raises(DefectError):
+        admission_proposal(
+            ci_observation(), context(), control(tmp_path), host_usage(),
+            pin=EVIDENCE, journal=journal(tmp_path),
+        )
+
+
+def test_denied_gate_verdict_is_retryable(tmp_path):
+    """E4 r9 P1-1: a gate denial must not wedge the repair forever."""
+    first = admission_proposal(
+        envelope(), context(), control(tmp_path), host_usage(active_agents=4),
+        pin=EVIDENCE, journal=journal(tmp_path),
+    )
+    assert first["admission"]["denied"] is True
+    assert first["deduplicated"] is False
+    # capacity frees up: the same defect is evaluated again
+    second = admission_proposal(
+        envelope(), context(), control(tmp_path), host_usage(),
+        pin=EVIDENCE, journal=journal(tmp_path),
+    )
+    assert second["deduplicated"] is False
+    assert second["admission"]["denied"] is False
+    assert len((tmp_path / "admission.jsonl").read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_pending_gate_verdict_is_retryable(tmp_path):
+    """E4 r9 P1-1: a crash before the gate must not wedge the repair."""
+    defect = defect_from_observation(ci_observation())
+    decision = decide_defect_admission(defect, context())
+    journal(tmp_path).record(decision)
+    assert journal(tmp_path).gate_outcome(decision) is None
+    proposal = admission_proposal(
+        envelope(), context(), control(tmp_path), host_usage(),
+        pin=EVIDENCE, journal=journal(tmp_path),
+    )
+    assert proposal["deduplicated"] is False
+    assert proposal["admission"]["denied"] is False
+
+
+def test_recorded_allow_is_idempotent(tmp_path):
+    admission_proposal(
+        envelope(), context(), control(tmp_path), host_usage(),
+        pin=EVIDENCE, journal=journal(tmp_path),
+    )
+    again = admission_proposal(
+        envelope(), context(), control(tmp_path), host_usage(),
+        pin=EVIDENCE, journal=journal(tmp_path),
+    )
+    assert again["deduplicated"] is True
+    assert len((tmp_path / "admission.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_two_pinned_outputs_are_two_defects():
+    """E4 r9 P1-2: two #100 outputs with one run but different jobs stay distinct."""
+    first = defect_from_observation(
+        ci_observation(evidence_sha256=("d" * 64,), facts=(("head", HEAD), ("run_id", 11), ("job_id", 22)))
+    )
+    second = defect_from_observation(
+        ci_observation(evidence_sha256=("e" * 64,), facts=(("head", HEAD), ("run_id", 11), ("job_id", 23)))
+    )
+    assert first.fingerprint != second.fingerprint
+    assert first.deduplication_id != second.deduplication_id
+
+
+def test_same_pinned_output_redelivered_is_one_defect():
+    first = defect_from_observation(ci_observation())
+    second = defect_from_observation(ci_observation())
+    assert first.fingerprint == second.fingerprint

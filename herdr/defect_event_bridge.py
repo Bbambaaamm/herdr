@@ -35,7 +35,14 @@ from herdr.defect_admission import (
     DecisionJournal,
     decide_defect_admission,
 )
-from herdr.operational_incidents import Detail, IncidentType, Observation, Source, State
+from herdr.operational_incidents import (
+    Detail,
+    IncidentType,
+    Observation,
+    OperationalIncident,
+    Source,
+    State,
+)
 
 __all__ = [
     "DEFECT_CATEGORY",
@@ -95,6 +102,7 @@ def defect_from_observation(observation: Observation) -> DefectObservation | Non
     if len(subject) < 2:
         raise DefectError("CI observation subject does not carry pr and workflow")
     pr, workflow = subject[0], subject[1]
+    evidence = observation.evidence_sha256[0]
     return DefectObservation(
         source=DefectSource.CI_CHECK,
         category=category,
@@ -102,11 +110,14 @@ def defect_from_observation(observation: Observation) -> DefectObservation | Non
         commit_sha=head,
         ref=f"refs/pull/{pr}/head",
         subject=(f"pr-{pr}", f"workflow-{workflow}"),
-        # #100's own correlation identity (source + scope + subject) is the only
-        # stable check identity available today: the adapter's ``job_id`` is a
-        # per-run instance id and would fragment one red PR into N defects.  A
-        # per-check split needs #100 to expose the workflow job definition id.
-        finding_identity=observation.correlation_id,
+        # #100 exposes no stable workflow-job *definition* id today: its
+        # ``job_id`` is a per-run instance and its ``correlation_id`` covers the
+        # whole (source, scope, subject) group.  Collapsing by correlation alone
+        # would hide a second failing job, so the pinned evidence digest of the
+        # individual #100 output participates in the identity.  That errs on the
+        # side of reporting distinct failures; a stable definition id from #100
+        # would replace it.
+        finding_identity=f"ci-{observation.correlation_id[:16]}-{evidence[:12]}",
         workflow=workflow,
         check_run_id=str(run_id),
         event_revision=observation.revision,
@@ -140,7 +151,7 @@ def agent_identity(defect: DefectObservation) -> AgentIdentity:
 
 
 def admission_proposal(
-    observation: Observation,
+    envelope: OperationalIncident,
     context,
     control: AdmissionControl,
     usage: ResourceUsage,
@@ -150,16 +161,24 @@ def admission_proposal(
 ) -> dict:
     """Run the full proposal path against the EXISTING admission gate.
 
-    ``pin`` is the #100 evidence digest that the observation was built from; it
-    must match one of the observation's own evidence digests, so a fabricated
-    observation cannot be paired with someone else's pinned evidence.
+    The input must be a #100 ``OperationalIncident`` envelope (produced by
+    ``correlate`` from the durable incident log), not a bare observation and
+    never a raw webhook.  ``pin`` must be one of the envelope's own evidence
+    digests.  Provenance beyond that is #100's EventEnvelope boundary, not this
+    module's: the bridge never authenticates its input, it only refuses input
+    that did not come from the #100 fabric.
 
-    ``journal`` is mandatory: without a durable dedup record a redelivered event
-    would re-enter the swarm gate and produce a second allow.
+    ``journal`` is mandatory.  The defect decision is recorded durably, and the
+    gate verdict separately.  Only a recorded ALLOW makes the proposal
+    idempotent: a pending verdict (crash between the two writes) or a denied one
+    stays re-evaluable, so a transient gate denial can never wedge a repair.
 
     The result carries ``authorizes_execution=False`` and no economic effect:
     it is a proposal for #8 to accept or deny, not permission to act.
     """
+    if type(envelope) is not OperationalIncident:
+        raise DefectError("not a #100 incident envelope")
+    observation = envelope.current
     if type(observation) is not Observation:
         raise DefectError("not an operational observation")
     if type(control) is not AdmissionControl:
@@ -167,7 +186,7 @@ def admission_proposal(
     if type(journal) is not DecisionJournal:
         raise DefectError("durable dedup journal is required")
     if type(pin) is not str or pin not in observation.evidence_sha256:
-        raise DefectError("observation is not pinned to the supplied evidence")
+        raise DefectError("envelope is not pinned to the supplied evidence")
     defect = defect_from_observation(observation)
     if defect is None:
         return {
@@ -178,10 +197,10 @@ def admission_proposal(
             "budget_operations": 0,
         }
     decision: DefectDecision = decide_defect_admission(defect, context)
-    _, recorded = journal.record(decision)
-    if not recorded:
-        # Durable dedup hit: this exact decision already exists.  Do not ask
-        # the swarm gate again.
+    journal.record(decision)
+    outcome = journal.gate_outcome(decision)
+    if outcome is not None and outcome.get("denied") is False:
+        # A real allow already exists for this exact defect: idempotent.
         return {
             "eligible": True,
             "fingerprint": defect.fingerprint,
@@ -192,17 +211,19 @@ def admission_proposal(
             "authorizes_execution": False,
             "task_proposals_submitted": 0,
             "budget_operations": 0,
-            "admission": {"denied": True, "reason": "deduplicated",
-                          "detail": "decision already recorded durably"},
+            "admission": {"denied": False, "reason": "ALLOWED",
+                          "detail": "gate already allowed this defect"},
         }
     if decision.disposition is DefectDisposition.ADMIT:
         verdict = control.check(
             agent_identity(defect), task_graph_spec(), usage, tuple(sorted(repair_tools()))
         )
         reason = getattr(verdict, "reason", None)
+        reason_text = str(reason) if reason is not None else "ALLOWED"
+        journal.record_gate(decision, denied=bool(verdict.denied), reason=reason_text)
         admission = {
             "denied": bool(verdict.denied),
-            "reason": str(reason) if reason is not None else "ALLOWED",
+            "reason": reason_text,
             "detail": str(getattr(verdict, "detail", "")),
         }
     else:

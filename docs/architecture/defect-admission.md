@@ -153,23 +153,28 @@ is a pure translator between them and adds no authority:
   `Source.CI` / `CI_VALIDATION_FAILED` observation is a code defect. Capacity,
   backup and worker incidents belong to their own operational owners and are
   never routed into a repair backlog.
-- `defect_from_observation()` derives `commit_sha` from the #100 `head` fact,
-  `finding_identity` from #100's own `correlation_id`, and keeps `run_id` /
-  `revision` as delivery identity only. The adapter's `job_id` is a per-run
-  instance id and would fragment one red PR into N defects; a per-check split
-  requires #100 to expose the workflow job *definition* id, which it does not
-  today. Only an open observation reporting an actual `CI_FAILURE` is a defect.
+- `defect_from_observation()` derives `commit_sha` from the #100 `head` fact
+  and `finding_identity` from #100's `correlation_id` plus the pinned evidence
+  digest of the individual #100 output. #100 exposes no stable workflow-job
+  *definition* id: its `job_id` is a per-run instance and its `correlation_id`
+  covers the whole group, so collapsing on correlation alone would hide a second
+  failing job. The digest errs on the side of reporting distinct failures; a
+  stable definition id from #100 would replace it. Only an open observation
+  reporting an actual `CI_FAILURE` is a defect.
 - `repair_tools()` reuses `ROLE_TOOL_ALLOWLIST["writer"]`; `git_push`,
   `deploy` and `git_merge` stay out of reach.
 - `task_graph_spec()` is a single-node plan; `AdmissionControl` still applies
   its own ceilings and its own consumer policy.
-- `admission_proposal()` requires the caller to supply the #100 evidence
-  `pin`, which must match the observation's own evidence digests, and a
-  mandatory durable `DecisionJournal`. The decision is recorded before the
-  swarm gate is consulted, so a redelivered event returns a deduplicated
-  proposal and never re-enters the gate. The gate object must be the real
-  `AdmissionControl`.
-- The returned proposal carries `authorizes_execution=False`,
+- `admission_proposal()` takes a #100 `OperationalIncident` envelope, never a
+  bare observation or a raw webhook, and requires the caller's `pin` to be one
+  of the envelope's own evidence digests. Provenance beyond that is #100's
+  EventEnvelope boundary, not the bridge's.
+- The defect decision is recorded durably, and the gate verdict separately
+  (`defect_admission_gate`). Only a recorded ALLOW makes the proposal
+  idempotent: a pending verdict (a crash between the two writes) or a denied one
+  stays re-evaluable, so a transient gate denial can never wedge a repair.
+- The gate object must be the real `AdmissionControl`; the journal is
+  mandatory. The returned proposal carries `authorizes_execution=False`,
   `task_proposals_submitted=0` and `budget_operations=0`. When the defect gate
   denies, the swarm gate is not consulted at all.
 

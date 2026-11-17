@@ -317,6 +317,7 @@ class DecisionJournal:
     """
 
     EVENT = "defect_admission_decision"
+    EVENT_GATE = "defect_admission_gate"
 
     def __init__(self, log: AuditLog) -> None:
         self._log = log
@@ -363,6 +364,45 @@ class DecisionJournal:
         latest = None
         for row in self._log.replay():
             if row.get("event") == self.EVENT and row.get("fingerprint") == fingerprint:
+                latest = row
+        return latest
+
+    def record_gate(self, decision: DefectDecision, *, denied: bool, reason: str) -> dict:
+        """Record the OUTCOME of the existing #8 gate for this decision.
+
+        Separated from ``record`` because a decision alone is not a terminal
+        state: a pending or denied gate verdict must stay re-evaluable, while a
+        crash between the decision write and the gate must not wedge the defect
+        forever.  Only a real allow makes the proposal idempotent.
+        """
+        _require(type(denied) is bool, "invalid gate outcome")
+        _token(reason, re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}"))
+        path = self._log.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = path.parent / f".{path.name}.lock"
+        with lock_path.open("a+b") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                prior = self.gate_outcome(decision)
+                if prior is not None:
+                    return prior
+                return self._log.append({
+                    "event": self.EVENT_GATE,
+                    "fingerprint": decision.fingerprint,
+                    "commit_sha": decision.commit_sha,
+                    "denied": denied,
+                    "reason": reason,
+                })
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def gate_outcome(self, decision: DefectDecision) -> dict | None:
+        latest = None
+        for row in self._log.replay():
+            if row.get("event") != self.EVENT_GATE:
+                continue
+            if (row.get("fingerprint") == decision.fingerprint
+                    and row.get("commit_sha") == decision.commit_sha):
                 latest = row
         return latest
 
