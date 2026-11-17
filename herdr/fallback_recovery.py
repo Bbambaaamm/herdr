@@ -211,8 +211,19 @@ class FallbackTransition:
             if not isinstance(handoff_payload, dict):
                 raise RoutingIntegrationError("fallback replay handoff malformed")
             handoff = ManagedExecutionHandoff(**handoff_payload)
+        retry = RetryGuidance.from_json(event["retry"]) if event.get("retry") else None
+        action = RecoveryAction(event["action"])
+        if action is RecoveryAction.FALLBACK and (
+            retry is None
+            or retry.retryable and (handoff is None or handoff.not_before is None)
+        ):
+            # A durable record written before retry timing existed, or one whose
+            # handoff lost its boundary, cannot prove the wait elapsed.  Replay
+            # it as "re-decide required" instead of handing the caller an
+            # immediately dispatchable fallback.
+            retry = RetryGuidance(False, None, "unknown")
         return cls(
-            version=event["version"], action=event["action"], task_id=event["task_id"],
+            version=event["version"], action=action, task_id=event["task_id"],
             run_token=event["run_token"], attempt=event["attempt"],
             fencing_token=event["fencing_token"], failed_executor=event["failed_executor"],
             failure=event["failure"], failure_scope=event["failure_scope"],
@@ -220,7 +231,7 @@ class FallbackTransition:
             reconciliation_required=event["reconciliation_required"],
             source_decision_sha256=event["source_decision_sha256"],
             next_decision_sha256=event.get("next_decision_sha256"), handoff=handoff,
-            retry=RetryGuidance.from_json(event["retry"]) if event.get("retry") else None,
+            retry=retry,
         )
 
 

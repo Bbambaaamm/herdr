@@ -550,6 +550,36 @@ def test_different_transition_still_conflicts(tmp_path):
         log.append_or_get_strict(changed, identity_fields=identity, normalize=normalize_transition_event)
 
 
+def test_legacy_fallback_event_without_retry_replays_as_redecide(tmp_path):
+    """E4 P1: a pre-timing durable fallback must not crash or dispatch."""
+    transition, _ = _decision(tmp_path, retry_after="60")
+    legacy = transition.audit_event()
+    legacy.pop("retry", None)
+    legacy.pop("not_before", None)
+    legacy["handoff"] = {
+        key: value for key, value in legacy["handoff"].items() if key != "not_before"
+    }
+    restored = type(transition).from_audit_event(legacy)
+    assert restored.action is RecoveryAction.FALLBACK
+    assert restored.retry is not None
+    assert restored.retry.retryable is False
+    assert restored.retry.source == "unknown"
+
+
+def test_retry_without_boundary_replays_as_redecide(tmp_path):
+    """E4 P1: a retryable hint with no boundary cannot prove the wait elapsed."""
+    transition, _ = _decision(tmp_path, retry_after="60")
+    event = transition.audit_event()
+    event.pop("not_before", None)
+    event["handoff"] = {
+        key: value for key, value in event["handoff"].items() if key != "not_before"
+    }
+    restored = type(transition).from_audit_event(event)
+    assert restored.retry is not None
+    assert restored.retry.retryable is False
+    assert restored.retry.source == "unknown"
+
+
 def test_changed_wait_replays_the_durable_boundary(tmp_path):
     """E4 P1: a later weaker hint must not open an earlier retry window."""
     from herdr.fallback_recovery import ProviderFailureObservation, decide_managed_fallback

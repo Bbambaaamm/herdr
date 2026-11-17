@@ -653,7 +653,10 @@ class RetryGuidance:
                 raise RoutingError("retry wait must be a bounded float")
         if not self.retryable and self.wait_seconds is not None:
             raise RoutingError("non-retryable guidance cannot carry a wait")
-        if self.source not in ("none", "retry_after", "reset_timestamp", "backoff", "deadline_exceeded"):
+        if self.source not in (
+            "none", "retry_after", "reset_timestamp", "backoff",
+            "deadline_exceeded", "unknown",
+        ):
             raise RoutingError("unknown retry guidance source")
 
     def to_json(self) -> dict[str, Any]:
