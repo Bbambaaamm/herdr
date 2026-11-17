@@ -144,6 +144,30 @@ the authenticated #100 source nor obtain `DefectContext` values from the
 authoritative runtime, so their provenance cannot be proven by this PR. The
 PASS does not extend to that future integration.
 
+## Event Fabric bridge (`herdr/defect_event_bridge.py`)
+
+`#100` owns the single Event/Trigger surface; `#53` owns the backlog. The bridge
+is a pure translator between them and adds no authority:
+
+- `DEFECT_CATEGORY` is the whole translation table — only an **open**
+  `Source.CI` / `CI_VALIDATION_FAILED` observation is a code defect. Capacity,
+  backup and worker incidents belong to their own operational owners and are
+  never routed into a repair backlog.
+- `defect_from_observation()` derives `commit_sha` from the #100 `head` fact,
+  `finding_identity` from the stable workflow/job pair, and keeps `run_id` /
+  `revision` as delivery identity only.
+- `repair_tools()` reuses `ROLE_TOOL_ALLOWLIST["writer"]`; `git_push`,
+  `deploy` and `git_merge` stay out of reach.
+- `task_graph_spec()` is a single-node plan; `AdmissionControl` still applies
+  its own ceilings and its own consumer policy.
+- `admission_proposal()` runs the EXISTING `#8` gate and returns a proposal
+  that carries `authorizes_execution=False`, `task_proposals_submitted=0` and
+  `budget_operations=0`. When the defect gate denies, the swarm gate is not
+  consulted at all.
+
+Ownership is unchanged: `#100` produces the observation, `#8` admits or denies
+the spawn, `#53` owns the backlog, `#82` the durable task identity.
+
 ## Out of scope
 
 Live model calls, merges, deployments, credential creation, budget changes and
