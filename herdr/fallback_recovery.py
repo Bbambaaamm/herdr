@@ -63,16 +63,20 @@ class RecoveryAction(StrEnum):
 def normalize_transition_event(event: Mapping[str, Any]) -> dict[str, Any]:
     """Canonicalize a durable fallback transition for identity comparison.
 
-    The transition payload grew optional timing fields.  Events written before
-    that change must still compare equal when the decision is unchanged, while
-    a genuinely different transition still conflicts.
+    Retry timing (``retry`` and the handoff's ``not_before``) is *derived* from
+    the failure observation and the retry policy; it is not part of the routing
+    decision.  Comparing it would make a policy change look like a different
+    decision and would break replay of pre-timing durable events, so it is
+    dropped before comparison.  Everything that defines the decision — action,
+    identity, failure, scope, counts, digests and the selected route — is kept,
+    so a genuinely different transition still conflicts.
     """
     canonical = dict(event)
-    canonical.setdefault("retry", None)
+    canonical.pop("retry", None)
     handoff = canonical.get("handoff")
     if isinstance(handoff, dict):
         repaired = dict(handoff)
-        repaired.setdefault("not_before", None)
+        repaired.pop("not_before", None)
         canonical["handoff"] = repaired
     return canonical
 
@@ -172,7 +176,7 @@ class FallbackTransition:
                     "policy_profile", "policy_version", "decision_sha256",
                     "selected_executor", "selected_provider", "selected_model",
                     "registry_hash", "requirement_hash", "parent_scope_hash",
-                    "policy_hash", "budget_allocation_id",
+                    "policy_hash", "budget_allocation_id", "not_before",
                 )
             }
         return {

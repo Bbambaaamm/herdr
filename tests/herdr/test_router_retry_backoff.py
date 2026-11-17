@@ -509,12 +509,23 @@ def test_legacy_audit_event_without_retry_replays_without_conflict(tmp_path):
     }
     log.append_or_get_strict(legacy, identity_fields=identity)
     modern = normalize_transition_event(legacy)
-    assert modern["retry"] is None
-    assert modern["handoff"] is None
+    assert modern == legacy
     assert log.append_or_get_strict(modern, identity_fields=identity, normalize=normalize_transition_event) == legacy
 
 
-def test_different_retry_guidance_still_conflicts(tmp_path):
+def test_restored_handoff_preserves_not_before(tmp_path):
+    """Replay must not make an unready handoff dispatchable (E4 P1)."""
+    from herdr.scheduler_routing import RoutingIntegrationError
+
+    transition, _ = _decision(tmp_path, retry_after="120")
+    restored = type(transition).from_audit_event(transition.audit_event())
+    assert restored.handoff is not None
+    assert restored.handoff.not_before == transition.handoff.not_before
+    with pytest.raises(RoutingIntegrationError):
+        restored.handoff.assert_dispatchable("2000-01-01T00:00:00+00:00")
+
+
+def test_different_transition_still_conflicts(tmp_path):
     from herdr.fallback_recovery import normalize_transition_event
     from herdr.scheduler import AuditLog
 
@@ -534,6 +545,33 @@ def test_different_retry_guidance_still_conflicts(tmp_path):
     })
     log.append_or_get_strict(stored, identity_fields=identity)
     changed = dict(stored)
-    changed["retry"] = RetryGuidance(True, 60.0, "retry_after", raw="60").to_json()
+    changed["action"] = "terminate"
     with pytest.raises(Exception):
         log.append_or_get_strict(changed, identity_fields=identity, normalize=normalize_transition_event)
+
+
+def test_retry_policy_change_does_not_break_replay(tmp_path):
+    """Derived timing is not part of the decision identity (E4 P1)."""
+    from herdr.fallback_recovery import normalize_transition_event
+    from herdr.scheduler import AuditLog
+
+    log = AuditLog(tmp_path / "audit.jsonl")
+    identity = (
+        "event", "task_id", "run_token", "attempt",
+        "failed_executor", "source_decision_sha256",
+    )
+    legacy = {
+        "event": "managed_fallback_transition",
+        "task_id": "task-legacy",
+        "run_token": "run-legacy",
+        "attempt": 2,
+        "failed_executor": "exec-legacy",
+        "source_decision_sha256": "a" * 64,
+        "handoff": None,
+    }
+    log.append_or_get_strict(legacy, identity_fields=identity)
+    retried = dict(legacy)
+    retried["retry"] = RetryGuidance(True, 300.0, "retry_after", raw="300").to_json()
+    assert log.append_or_get_strict(
+        retried, identity_fields=identity, normalize=normalize_transition_event
+    ) == legacy
