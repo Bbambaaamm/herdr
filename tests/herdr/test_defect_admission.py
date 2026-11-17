@@ -12,6 +12,7 @@ from herdr.defect_admission import (
     DecisionJournal,
     DefectCategory,
     DefectContext,
+    DefectDecision,
     DefectDisposition,
     DefectError,
     DefectObservation,
@@ -29,7 +30,7 @@ SHA_C = "c" * 40
 def observation(**overrides):
     payload = {
         "source": DefectSource.CI_CHECK,
-        "category": DefectCategory.TEST_REGRESSION,
+        "category": DefectCategory.VALIDATION_FAILURE,
         "repository": "Bbambaaamm/herdr",
         "commit_sha": SHA_A,
         "ref": "feat/example",
@@ -62,12 +63,14 @@ def context(**overrides):
 def test_a_new_ci_regression_is_admitted_as_a_proposal():
     decision = decide_defect_admission(observation(), context())
     assert decision.disposition is DefectDisposition.ADMIT
-    assert decision.task_class == "test_regression"
+    assert decision.task_class == "validation_failure"
     assert decision.proposal["graph"] == {
         "node_count": 1, "max_depth": 1, "max_fanout": 0, "root_task": "defect-repair",
     }
     assert decision.proposal["paper_only"] is True
     assert decision.proposal["authorizes_execution"] is False
+    assert decision.proposal["task_proposals_submitted"] == 0
+    assert decision.proposal["budget_operations"] == 0
 
 
 # --- §8 B: a duplicate CI event creates no second record -------------------- #
@@ -296,3 +299,85 @@ def test_summary_reports_unparsed_as_unknown_not_zero():
     summary = admission_summary([object()])
     assert summary["unparsed"] == "UNKNOWN"
     assert summary["budget_operations"] == 0
+
+
+# --- E4 round 1 remediation ------------------------------------------------- #
+
+
+def test_two_distinct_checks_on_one_revision_are_two_defects():
+    """E4 P1: the journal must not collapse distinct required checks."""
+    first = observation(workflow="Herdr contract", check_run_id="run-1")
+    second = observation(workflow="Herdr security", check_run_id="run-2")
+    assert first.fingerprint != second.fingerprint
+
+
+def test_one_check_redelivered_is_one_defect():
+    first = observation(check_run_id="run-1", event_revision="rev-1")
+    second = observation(check_run_id="run-1", event_revision="rev-1")
+    assert first.fingerprint == second.fingerprint
+    assert first.deduplication_id == second.deduplication_id
+
+
+def test_unhandled_context_states_fail_closed():
+    with pytest.raises(DefectError):
+        context(budget_state="MISSING")
+    with pytest.raises(DefectError):
+        context(credentials_state="EXHAUSTED")
+
+
+@pytest.mark.parametrize("overrides", [
+    {"ref": "feat/ex\nline"},
+    {"ref": ""},
+    {"observed_at": 2 ** 100},
+    {"evidence_sha256": ()},
+])
+def test_unbounded_or_empty_observation_fields_fail_closed(overrides):
+    with pytest.raises(DefectError):
+        observation(**overrides)
+
+
+def test_untrusted_text_may_carry_no_evidence():
+    obs = observation(source=DefectSource.UNTRUSTED_TEXT,
+                      category=DefectCategory.UNCLASSIFIED,
+                      evidence_sha256=())
+    assert obs.evidence_sha256 == ()
+
+
+def test_admit_payload_cannot_drop_the_proposal_only_contract():
+    good = decide_defect_admission(observation(), context()).proposal
+    broken = dict(good, authorizes_execution=True)
+    with pytest.raises(DefectError):
+        DefectDecision(DefectDisposition.ADMIT, "e" * 64, SHA_A, ("eligible",),
+                       task_class="validation_failure", proposal=broken)
+
+
+def test_concurrent_delivery_creates_one_durable_record(tmp_path):
+    """E4 P1: record() must be atomic across concurrent callers."""
+    import threading
+
+    log_path = tmp_path / "audit.jsonl"
+    decision = decide_defect_admission(observation(), context())
+    created: list[bool] = []
+    barrier = threading.Barrier(8)
+
+    def deliver():
+        barrier.wait()
+        created.append(DecisionJournal(AuditLog(log_path)).record(decision)[1])
+
+    threads = [threading.Thread(target=deliver) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(created) == 8
+    assert created.count(True) == 1
+    assert created.count(False) == 7
+    assert len(AuditLog(log_path).replay()) == 1
+
+
+def test_ci_check_cannot_claim_a_test_regression_without_evidence():
+    """E4 P2: the #100 CI adapter proves a check failure, not a test regression."""
+    with pytest.raises(DefectError):
+        observation(source=DefectSource.CI_CHECK,
+                    category=DefectCategory.TEST_REGRESSION)

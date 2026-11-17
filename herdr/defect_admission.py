@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+import fcntl
 import re
 
 from .admission import AuditLog
@@ -27,6 +28,7 @@ DEFAULT_MAX_REPAIRS = 3
 _SHA = re.compile(r"[a-f0-9]{40}")
 _REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}/[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./@-]{0,127}")
 
 
 class DefectError(ValueError):
@@ -68,9 +70,11 @@ class DefectDisposition(StrEnum):
 # A source may only carry categories it can actually observe.  Anything else is
 # a forged/misrouted observation and is denied, not silently re-labelled.
 SOURCE_CATEGORIES: dict[DefectSource, frozenset[DefectCategory]] = {
+    # A CI observation from the #100 adapter only proves "this exact revision
+    # failed a required check"; it does not prove a test regression without
+    # per-test evidence, so that category is not claimable here.
     DefectSource.CI_CHECK: frozenset({
-        DefectCategory.TEST_REGRESSION, DefectCategory.VALIDATION_FAILURE,
-        DefectCategory.DEPENDENCY_CONFLICT,
+        DefectCategory.VALIDATION_FAILURE, DefectCategory.DEPENDENCY_CONFLICT,
     }),
     DefectSource.REVIEW_COMMENT: frozenset({DefectCategory.REVIEW_FINDING}),
     DefectSource.VALIDATION: frozenset({
@@ -122,14 +126,18 @@ class DefectObservation:
                  "source cannot observe this category")
         _token(self.repository, _REPO)
         _token(self.commit_sha, _SHA)
-        _require(type(self.ref) is str and 0 < len(self.ref) <= 128, "invalid ref")
+        _require(type(self.ref) is str and _REF.fullmatch(self.ref) is not None,
+                 "invalid ref")
         _require(type(self.subject) is tuple and 1 <= len(self.subject) <= MAX_SUBJECT,
                  "invalid subject")
         for part in self.subject:
             _token(part)
-        _require(type(self.observed_at) is int and self.observed_at >= 0, "invalid timestamp")
+        _require(type(self.observed_at) is int and 0 <= self.observed_at <= 253402300799,
+                 "invalid timestamp")
         _require(type(self.evidence_sha256) is tuple
                  and len(self.evidence_sha256) <= MAX_EVIDENCE, "invalid evidence")
+        _require(bool(self.evidence_sha256) or self.source is DefectSource.UNTRUSTED_TEXT,
+                 "known defect requires evidence")
         for ref in self.evidence_sha256:
             _token(ref, re.compile(r"[a-f0-9]{64}"))
         for value in (self.workflow, self.check_run_id):
@@ -139,9 +147,16 @@ class DefectObservation:
 
     @property
     def fingerprint(self) -> str:
-        """Semantic defect identity: same defect on a new revision is a new id."""
+        """Semantic defect identity.
+
+        ``workflow`` participates because the #100 CI adapter proves only "this
+        exact revision failed a required check": two different required checks
+        failing on the same revision are two distinct defects and must not be
+        collapsed into one durable record.  Redelivery of one check still maps
+        to one identity.
+        """
         return digest([SCHEMA, self.source, self.repository, self.commit_sha,
-                       self.category, self.subject])
+                       self.category, self.subject, self.workflow])
 
     @property
     def deduplication_id(self) -> str:
@@ -168,9 +183,11 @@ class DefectContext:
         _require(type(self.repository_authorized) is bool
                  and type(self.already_resolved) is bool
                  and type(self.capacity_ok) is bool, "invalid flag")
-        for name in ("budget_state", "credentials_state"):
-            _require(getattr(self, name) in {"OK", "EXHAUSTED", "MISSING", "UNKNOWN"},
-                     f"invalid {name}")
+        for name, allowed in (("budget_state", {"OK", "EXHAUSTED", "UNKNOWN"}),
+                              ("credentials_state", {"OK", "MISSING", "UNKNOWN"})):
+            # Only states with an explicit decision branch are accepted; an
+            # unhandled state must fail closed rather than fall through to ADMIT.
+            _require(getattr(self, name) in allowed, f"invalid {name}")
         _require(type(self.active_repairs) is int and self.active_repairs >= 0, "invalid repair count")
         _require(type(self.repeat_count) is int and self.repeat_count >= 0, "invalid repeat count")
         _require(type(self.max_repairs) is int and self.max_repairs > 0, "invalid repair ceiling")
@@ -192,6 +209,13 @@ class DefectDecision:
         _token(self.fingerprint, re.compile(r"[a-f0-9]{64}"))
         _token(self.commit_sha, _SHA)
         _require(type(self.reasons) is tuple, "invalid reasons")
+        if self.disposition is DefectDisposition.ADMIT:
+            # The ADMIT contract is part of the payload, not just the summary:
+            # a proposal never authorizes execution, submits a task or spends.
+            _require(self.proposal.get("authorizes_execution") is False
+                     and self.proposal.get("task_proposals_submitted") == 0
+                     and self.proposal.get("budget_operations") == 0,
+                     "ADMIT proposal violates the proposal-only contract")
 
 
 def decide_defect_admission(
@@ -240,6 +264,8 @@ def decide_defect_admission(
             "role": "repair",
             "paper_only": True,
             "authorizes_execution": False,
+            "task_proposals_submitted": 0,
+            "budget_operations": 0,
         },
     )
 
@@ -258,18 +284,31 @@ class DecisionJournal:
         self._log = log
 
     def record(self, decision: DefectDecision) -> tuple[dict, bool]:
-        prior = self.prior(decision)
-        if prior is not None:
-            return prior, False
-        record = self._log.append({
-            "event": self.EVENT,
-            "fingerprint": decision.fingerprint,
-            "commit_sha": decision.commit_sha,
-            "disposition": decision.disposition.value,
-            "reasons": list(decision.reasons),
-            "task_class": decision.task_class,
-        })
-        return record, True
+        """Append-if-absent under an inter-process lock.
+
+        Concurrent deliveries of the same decision must yield exactly one
+        durable record, not one per caller.
+        """
+        path = self._log.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = path.parent / f".{path.name}.lock"
+        with lock_path.open("a+b") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                prior = self.prior(decision)
+                if prior is not None:
+                    return prior, False
+                record = self._log.append({
+                    "event": self.EVENT,
+                    "fingerprint": decision.fingerprint,
+                    "commit_sha": decision.commit_sha,
+                    "disposition": decision.disposition.value,
+                    "reasons": list(decision.reasons),
+                    "task_class": decision.task_class,
+                })
+                return record, True
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
     def prior(self, decision: DefectDecision) -> dict | None:
         latest = None

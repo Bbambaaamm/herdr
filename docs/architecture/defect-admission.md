@@ -34,15 +34,20 @@ revision:
 | `evidence_sha256` | ≤4 bounded evidence digests; `UNKNOWN` requires evidence |
 | `workflow` / `check_run_id` / `event_revision` | delivery identity |
 
-Fail-closed validation: malformed SHA/repo/subject/timestamp/evidence raises
+Fail-closed validation: malformed SHA/repo/ref/subject/timestamp/evidence raises
 `DefectError` rather than being coerced. A source may only carry categories it
 can actually observe (`SOURCE_CATEGORIES`); anything else is rejected, not
-re-labelled.
+re-labelled. A known defect must carry at least one evidence digest — a CI
+observation from the #100 adapter proves only "this exact revision failed a
+required check", so `CI_CHECK` may not claim `TEST_REGRESSION` without per-test
+evidence.
 
 ## Identity
 
-- `fingerprint` = `digest([SCHEMA, source, repository, commit_sha, category, subject])`
-  — semantic defect identity. A regression on a new revision is a new identity.
+- `fingerprint` = `digest([SCHEMA, source, repository, commit_sha, category, subject, workflow])`
+  — semantic defect identity. A regression on a new revision is a new identity,
+  and two distinct required checks failing on one revision are two defects
+  rather than one collapsed record.
 - `deduplication_id` = `digest([fingerprint, workflow, check_run_id, event_revision, observed_at])`
   — delivery identity, so a redelivered webhook is not a new defect.
 
@@ -66,7 +71,9 @@ Unknown economic state is never treated as zero and never as permission.
 ## Durable dedup
 
 `DecisionJournal` writes through the existing `admission.AuditLog`
-(append-only JSONL, mode 0640). The dedup key is
+(append-only JSONL, mode 0640) and serializes the check-then-append under an
+inter-process `flock`, so concurrent deliveries of one decision produce exactly
+one durable record. The dedup key is
 `(fingerprint, commit_sha, disposition)`:
 
 - the same event redelivered (restart, retry, duplicate webhook) creates no
