@@ -37,6 +37,7 @@ from herdr.defect_admission import (
 )
 from herdr.operational_incidents import (
     Detail,
+    IncidentError,
     IncidentType,
     Observation,
     OperationalIncident,
@@ -91,31 +92,49 @@ def defect_from_observation(observation: Observation) -> DefectObservation | Non
     raises :class:`DefectError` for a real CI failure whose defect identity the
     bridge cannot establish.
 
-    #100 publishes no stable identity of the *defined* check: its ``job_id`` is a
-    per-run instance, its per-run evidence digest changes on every run, and its
-    ``correlation_id`` covers the whole (source, scope, subject) group.  None of
-    those is a defensible identity for one CI defect — the first two fragment a
-    red PR into N records, the third silently collapses N distinct failing checks
-    into one and would dedup away a second, unrelated error.
-
-    So the bridge refuses rather than guess.  A CI observation becomes a defect
-    only once #100 publishes a stable per-check identity; this is a hard
-    dependency on #100, not a convenience.
+    #100 publishes a stable identity of the *defined* check
+    (``Observation.check_id``, derived from the workflow definition and the job's
+    defined name).  That is what makes this translation sound: #100's ``job_id``
+    is a per-run instance, its per-run evidence digest changes on every run, and
+    its ``correlation_id`` covers the whole (source, scope, subject) group.  None
+    of those identifies one CI defect — the first two fragment a red PR into N
+    records, the third silently collapses N distinct failing checks into one and
+    would dedup away a second, unrelated error.  A CI observation from an older
+    #100 shape that carries no defined check name is therefore refused, not
+    guessed at.
     """
     category = defect_category(observation)
     if category is None:
         return None
     facts = dict(observation.facts)
-    head, run_id = facts.get("head"), facts.get("run_id")
-    if type(head) is not str or type(run_id) is not int:
+    head, run_id, job_id = facts.get("head"), facts.get("run_id"), facts.get("job_id")
+    if type(head) is not str or type(run_id) is not int or type(job_id) is not int:
         # The #100 CI adapter requires these facts, but a bridged observation
         # must not silently repair a missing identity.
         raise DefectError("CI observation lacks the head/run facts")
     subject = observation.subject
     if len(subject) < 2:
         raise DefectError("CI observation subject does not carry pr and workflow")
-    raise DefectError(
-        "no stable check identity from #100: refusing to identify a CI defect"
+    try:
+        finding_identity = observation.check_id
+    except IncidentError as exc:
+        raise DefectError(
+            "no stable check identity from #100: refusing to identify a CI defect"
+        ) from exc
+    pr, workflow = subject[0], subject[1]
+    return DefectObservation(
+        source=DefectSource.CI_CHECK,
+        category=category,
+        repository=observation.scope.project,
+        commit_sha=head,
+        ref=f"refs/pull/{pr}/head",
+        subject=(f"pr-{pr}", f"workflow-{workflow}"),
+        observed_at=observation.observed_at,
+        evidence_sha256=observation.evidence_sha256,
+        finding_identity=finding_identity,
+        workflow=workflow,
+        check_run_id=str(job_id),
+        event_revision=observation.revision,
     )
 
 
@@ -163,11 +182,14 @@ def admission_proposal(
     module's: the bridge never authenticates its input, it only refuses input
     that did not come from the #100 fabric.
 
-    A CI observation is refused with ``reason="unverified-check-identity"``
-    until #100 publishes a stable per-check identity: #100's ``job_id`` is a
-    per-run instance, its per-run evidence digest changes on every run, and its
+    A CI observation is refused with a :class:`DefectError` when it carries no
+    stable identity of the *defined* check: #100's ``job_id`` is a per-run
+    instance, its per-run evidence digest changes on every run, and its
     ``correlation_id`` covers the whole group, so none of them identifies one
     defect without either fragmenting a red PR or collapsing distinct checks.
+    #100 now publishes ``Observation.check_id`` (workflow definition + defined
+    job name); an observation from an older shape is still refused rather than
+    guessed at.
 
     ``journal`` is mandatory.  The defect decision is recorded durably, and the
     gate verdict separately.  Only a recorded ALLOW makes the proposal
@@ -188,14 +210,6 @@ def admission_proposal(
         raise DefectError("durable dedup journal is required")
     if type(pin) is not str or pin not in observation.evidence_sha256:
         raise DefectError("envelope is not pinned to the supplied evidence")
-    if defect_category(observation) is not None:
-        return {
-            "eligible": False,
-            "reason": "unverified-check-identity",
-            "authorizes_execution": False,
-            "task_proposals_submitted": 0,
-            "budget_operations": 0,
-        }
     defect = defect_from_observation(observation)
     if defect is None:
         return {

@@ -3,11 +3,11 @@
 Every proposal here ends at the EXISTING AdmissionControl; none of these tests
 dispatch work, spend budget, or write outside their own tmp_path audit sink.
 
-The bridge's translation is deliberately REFUSING today: #100 publishes no
-stable identity of the *defined* CI check, so a CI observation cannot be
-identified as one defect.  The durable journal and the gate underneath are
-still exercised directly, because they must be correct the day #100 publishes
-that identity.
+The bridge translates an open CI failure only when #100 publishes a stable
+identity of the *defined* check (``Observation.check_id``); an older observation
+shape with no defined check name is still refused rather than guessed.  The
+durable journal and the gate underneath are exercised directly throughout,
+because they must be correct regardless of the translation outcome.
 """
 
 from __future__ import annotations
@@ -69,7 +69,8 @@ def ci_observation(**overrides):
         "state": State.OPEN,
         "detail": Detail.CI_FAILURE,
         "evidence_sha256": (EVIDENCE,),
-        "facts": (("head", HEAD), ("run_id", 11), ("job_id", 22)),
+        "facts": (("head", HEAD), ("run_id", 11), ("job_id", 22),
+                  ("job_name", "Validate Python dashboard and telemetry")),
     }
     payload.update(overrides)
     return Observation(**payload)
@@ -152,14 +153,59 @@ def repair_identity(defect_observation):
     )
 
 
-# --- translation: refusing rather than guessing ----------------------------- #
+# --- translation: the defined check identity ------------------------------- #
 
 
 def test_open_ci_failure_is_refused_without_a_stable_check_identity():
-    """#100 publishes no stable per-check id, so the bridge must not guess one."""
+    """An older #100 shape with no defined check name must not be guessed."""
+    observation = ci_observation(facts=(("head", HEAD), ("run_id", 11), ("job_id", 22)))
     with pytest.raises(DefectError) as raised:
-        defect_from_observation(ci_observation())
+        defect_from_observation(observation)
     assert "stable check identity" in str(raised.value)
+
+
+def test_open_ci_failure_translates_with_the_defined_check_identity():
+    """The #100 check_id becomes the defect's stable finding identity."""
+    defect = defect_from_observation(ci_observation())
+    assert defect is not None
+    assert defect.finding_identity == ci_observation().check_id
+    assert defect.workflow == "12345"
+    assert defect.check_run_id == "22"
+    assert defect.commit_sha == HEAD
+    assert defect.repository == PROJECT
+    assert defect.subject == ("pr-237", "workflow-12345")
+
+
+def test_repeated_ci_runs_are_one_defect():
+    """A re-run (new run/job id) keeps the semantic identity."""
+    first = defect_from_observation(ci_observation())
+    assert first is not None
+    second = defect_from_observation(ci_observation(
+        facts=(("head", HEAD), ("run_id", 99), ("job_id", 1234),
+               ("job_name", "Validate Python dashboard and telemetry"))))
+    assert second is not None
+    assert first.fingerprint == second.fingerprint
+    assert first.deduplication_id != second.deduplication_id
+
+
+def test_two_defined_checks_are_two_defects():
+    """Two failing checks on one revision must not collapse into one record."""
+    base = defect_from_observation(ci_observation())
+    other = defect_from_observation(ci_observation(
+        facts=(("head", HEAD), ("run_id", 11), ("job_id", 23),
+               ("job_name", "Run the offline repository contract"))))
+    assert base is not None and other is not None
+    assert other.fingerprint != base.fingerprint
+
+
+def test_a_new_source_revision_is_a_new_defect():
+    base = defect_from_observation(ci_observation())
+    changed = defect_from_observation(ci_observation(
+        revision="rev-2",
+        facts=(("head", "f" * 40), ("run_id", 11), ("job_id", 22),
+               ("job_name", "Validate Python dashboard and telemetry"))))
+    assert base is not None and changed is not None
+    assert changed.fingerprint != base.fingerprint
 
 
 def test_resolved_ci_observation_is_not_a_defect():
@@ -234,19 +280,31 @@ def test_only_open_ci_failure_maps_to_a_defect_category():
 # --- proposal contract ----------------------------------------------------- #
 
 
-def test_proposal_refuses_ci_until_a_stable_check_identity_exists(tmp_path):
+def test_proposal_refuses_a_ci_observation_without_a_stable_check_identity(tmp_path):
+    """An older #100 shape is refused before anything is written anywhere."""
+    observation = ci_observation(facts=(("head", HEAD), ("run_id", 11), ("job_id", 22)))
+    with pytest.raises(DefectError):
+        admission_proposal(
+            envelope(observation), context(), control(tmp_path), host_usage(),
+            pin=EVIDENCE, journal=journal(tmp_path),
+        )
+    assert not (tmp_path / "admission.jsonl").exists()
+    assert not (tmp_path / "defect.jsonl").exists()
+
+
+def test_proposal_admits_an_identified_ci_defect(tmp_path):
     proposal = admission_proposal(
         envelope(), context(), control(tmp_path), host_usage(),
         pin=EVIDENCE, journal=journal(tmp_path),
     )
-    assert proposal["eligible"] is False
-    assert proposal["reason"] == "unverified-check-identity"
+    assert proposal["eligible"] is True
+    assert proposal["reason"] != "unverified-check-identity"
     assert proposal["authorizes_execution"] is False
     assert proposal["task_proposals_submitted"] == 0
     assert proposal["budget_operations"] == 0
-    # refused before anything is written anywhere
-    assert not (tmp_path / "admission.jsonl").exists()
-    assert not (tmp_path / "defect.jsonl").exists()
+    expected = defect_from_observation(ci_observation())
+    assert expected is not None
+    assert proposal["fingerprint"] == expected.fingerprint
 
 
 def test_non_defect_observation_is_not_eligible(tmp_path):

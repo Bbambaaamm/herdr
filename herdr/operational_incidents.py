@@ -12,6 +12,9 @@ from .evidence import canonical, digest
 SCHEMA = "herdr-operational-incidents-1"
 MAX_EVENTS = 4096
 _NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}")
+_CHECK_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+_CHECK_SLUG = re.compile(r"[^A-Za-z0-9_.-]+")
+_CHECK_NAME_MAX = 128
 _SHA = re.compile(r"[a-f0-9]{64}")
 _REPO = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}")
 
@@ -69,6 +72,27 @@ def token(value, pattern=_NAME):
 def epoch(value):
     require(type(value) is int and 0 <= value <= 253402300799, "invalid timestamp")
     return value
+
+
+def check_identity(scope, subject, job_name):
+    """Stable identity of one *defined* CI check.
+
+    Derived from the workflow definition and the job's defined name only.  Never
+    from the per-run ``job_id``/``run_id`` (those fragment one red PR into N
+    records) and never from the per-run evidence digest (it changes on every
+    run).  A re-run of the same check keeps its identity, and two different
+    checks cannot collide.
+    """
+    require(type(scope) is Scope, "invalid check scope")
+    require(type(subject) is tuple and len(subject) >= 2, "invalid check subject")
+    require(type(job_name) is str and 0 < len(job_name) <= _CHECK_NAME_MAX,
+            "invalid CI check name")
+    slug = _CHECK_SLUG.sub("-", job_name).strip("-") or "check"
+    if len(slug) > 40:
+        slug = slug[:40] + "-" + digest(job_name)[:8]
+    token = f"gha-{subject[1]}-{slug}"
+    require(_CHECK_TOKEN.fullmatch(token) is not None, "invalid CI check identity")
+    return token
 
 
 def timestamp(seconds):
@@ -142,7 +166,7 @@ class Observation:
             token(self.task_id)
         allowed = {
             Source.CAPACITY: {"available_bytes", "required_bytes", "build_count", "build_visibility"},
-            Source.CI: {"head", "run_id", "job_id"},
+            Source.CI: {"head", "run_id", "job_id", "job_name"},
             Source.BACKUP: set(), Source.WORKER: set(),
         }[self.source]
         require(type(self.facts) is tuple and len(self.facts) <= len(allowed), "invalid facts")
@@ -156,6 +180,9 @@ class Observation:
                 require(value in ("UNKNOWN", "PARTIAL", "OBSERVED"), "invalid visibility")
             elif key == "head":
                 token(value, re.compile(r"[a-f0-9]{40}"))
+            elif key == "job_name":
+                require(type(value) is str and 0 < len(value) <= _CHECK_NAME_MAX,
+                        "invalid CI check name")
             else:
                 require(type(value) is int and 0 <= value < 2**63, "invalid fact counter")
 
@@ -166,6 +193,21 @@ class Observation:
     @property
     def incident_id(self):
         return digest([self.correlation_id, self.kind, self.revision])
+
+    @property
+    def check_id(self):
+        """Stable identity of the *defined* CI check (CI observations only).
+
+        ``incident_id`` and ``correlation_id`` are intentionally untouched: the
+        first stays the per-source state transition, the second the whole
+        (source, scope, subject) group.  Neither identifies one failing check.
+        """
+        if self.source is not Source.CI:
+            raise IncidentError("check identity requires a CI observation")
+        facts = dict(self.facts)
+        if "job_name" not in facts:
+            raise IncidentError("CI observation lacks a stable check name")
+        return check_identity(self.scope, self.subject, facts["job_name"])
 
     @property
     def event_id(self):
@@ -190,6 +232,8 @@ class OperationalIncident:
                        history=[{"event_id": row.event_id, "event_at": timestamp(row.event_at),
                                  "state": row.state, "detail": row.detail,
                                  "evidence_sha256": row.evidence_sha256} for row in self.history])
+        if current.source is Source.CI:
+            payload["check_id"] = current.check_id
         return payload
 
 

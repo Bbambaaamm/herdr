@@ -155,16 +155,16 @@ is a pure translator between them and adds no authority:
   never routed into a repair backlog.
 - `defect_from_observation()` returns `None` for anything that is not an open
   CI failure, and **refuses** (raises) for a real CI failure whose defect
-  identity it cannot establish. #100 publishes no stable identity of the
-  *defined* check: its `job_id` is a per-run instance, its per-run evidence
-  digest changes on every run, and its `correlation_id` covers the whole
-  (source, scope, subject) group. None of those identifies one CI defect — the
-  first two fragment a red PR into N records, the third silently collapses N
-  distinct failing checks into one and would dedup away a second, unrelated
-  error. `admission_proposal` reports this as
-  `eligible=False, reason="unverified-check-identity"` and writes nothing.
-  **This is a hard, open dependency on #100**: the bridge becomes useful the day
-  #100 publishes a stable per-check identity.
+  identity it cannot establish. #100 publishes the stable identity of the
+  *defined* check as `Observation.check_id`, derived from the workflow
+  definition and the job's defined name. Its `job_id` is a per-run instance, its
+  per-run evidence digest changes on every run, and its `correlation_id` covers
+  the whole (source, scope, subject) group — none of those identifies one CI
+  defect: the first two fragment a red PR into N records, the third silently
+  collapses N distinct failing checks into one and would dedup away a second,
+  unrelated error. A CI observation from an older #100 shape with no defined
+  check name is still refused; `admission_proposal` then raises and writes
+  nothing.
 - `repair_tools()` reuses `ROLE_TOOL_ALLOWLIST["writer"]`; `git_push`,
   `deploy` and `git_merge` stay out of reach.
 - `task_graph_spec()` is a single-node plan; `AdmissionControl` still applies
@@ -203,10 +203,25 @@ The bridge can require a #100 `OperationalIncident` envelope and a matching
 evidence `pin`, but it cannot *authenticate* that envelope: both values arrive
 from the same caller, and #100 exposes no signature or independently-verified
 record primitive today. End-to-end provenance is therefore #100's
-EventEnvelope boundary. Closing it needs a #100-side primitive (a durable
-per-check identity plus an independently verifiable envelope digest); until
-then the bridge must not be wired to any consumer that treats its proposal as
-authenticated input.
+EventEnvelope boundary; until it is closed the bridge must not be wired to any
+consumer that treats its proposal as authenticated input.
+
+### Published check identity
+
+The bridge refuses to identify a CI defect without a stable identity of the
+*defined* check. #100 now publishes exactly that, as `Observation.check_id` on a
+CI observation:
+
+- derived from the workflow definition and the job's defined name — never from
+  the per-run `job_id`/`run_id` (those fragment one red PR into N records) and
+  never from the per-run evidence digest (it changes on every run);
+- exported on the CI incident as `check_id`;
+- `correlation_id` and `incident_id` are unchanged: the first is still the whole
+  (source, scope, subject) group, the second the per-source state transition.
+  Neither identifies one check, which is why the bridge does not reuse them.
+
+A CI observation from an older #100 shape that carries no defined check name is
+still refused rather than guessed at.
 
 Ownership is unchanged: `#100` produces the observation, `#8` admits or denies
 the spawn, `#53` owns the backlog, `#82` the durable task identity.

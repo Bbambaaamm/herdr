@@ -96,7 +96,8 @@ def test_untrusted_prompt_and_forged_pin_rejected():
                                          ("unavailable", "UNKNOWN"), ("success", "RESOLVED")])
 def test_ci_state_and_exact_head(result, state):
     row = {"repo": SCOPE.project, "pr": 225, "head": "a"*40, "run_id": 1,
-           "workflow_id": 2, "job_id": 3, "at": NOW, "result": result}
+           "workflow_id": 2, "job_id": 3, "job_name": "Validate Python dashboard and telemetry",
+           "at": NOW, "result": result}
     raw, sha = pack(row)
     finding = github_ci(raw, sha, SCOPE, expected_head=row["head"], expected_pr=225, now=NOW)
     assert finding.state == state
@@ -106,6 +107,70 @@ def test_ci_state_and_exact_head(result, state):
     assert changed.correlation_id == finding.correlation_id
     with pytest.raises(IncidentError, match="HEAD"):
         github_ci(raw, sha, SCOPE, expected_head="b"*40, expected_pr=225, now=NOW)
+
+
+def ci_row(**overrides):
+    row = {"repo": SCOPE.project, "pr": 225, "head": "a"*40, "run_id": 1,
+           "workflow_id": 2, "job_id": 3, "job_name": "Validate Python dashboard and telemetry",
+           "at": NOW, "result": "failure"}
+    row.update(overrides)
+    return row
+
+
+def test_ci_check_identity_is_stable_across_runs():
+    """A re-run keeps the defined check's identity; only the state moves."""
+    row = ci_row()
+    raw, sha = pack(row)
+    first = github_ci(raw, sha, SCOPE, expected_head=row["head"], expected_pr=225, now=NOW)
+    rerun = ci_row(run_id=9, job_id=10, at=NOW + 60)
+    raw, sha = pack(rerun)
+    second = github_ci(raw, sha, SCOPE, expected_head=row["head"], expected_pr=225, now=NOW + 60)
+    assert second.check_id == first.check_id
+    assert second.incident_id != first.incident_id
+    assert second.correlation_id == first.correlation_id
+
+
+def test_two_defined_checks_do_not_collide():
+    row = ci_row()
+    raw, sha = pack(row)
+    first = github_ci(raw, sha, SCOPE, expected_head=row["head"], expected_pr=225, now=NOW)
+    other = ci_row(job_id=4, job_name="Run the offline repository contract")
+    raw, sha = pack(other)
+    second = github_ci(raw, sha, SCOPE, expected_head=row["head"], expected_pr=225, now=NOW)
+    assert second.check_id != first.check_id
+
+
+def test_ci_check_identity_ignores_the_source_revision():
+    """The check identity is the definition, not the revision it failed on."""
+    row = ci_row()
+    raw, sha = pack(row)
+    first = github_ci(raw, sha, SCOPE, expected_head=row["head"], expected_pr=225, now=NOW)
+    moved = ci_row(head="b"*40, run_id=9, job_id=10, at=NOW + 60)
+    raw, sha = pack(moved)
+    second = github_ci(raw, sha, SCOPE, expected_head="b"*40, expected_pr=225, now=NOW + 60)
+    assert second.check_id == first.check_id
+    assert second.incident_id != first.incident_id
+
+
+def test_ci_evidence_requires_a_defined_check_name():
+    row = ci_row()
+    del row["job_name"]
+    raw, sha = pack(row)
+    with pytest.raises(IncidentError, match="fields"):
+        github_ci(raw, sha, SCOPE, expected_head=row["head"], expected_pr=225, now=NOW)
+
+
+def test_non_ci_observation_has_no_check_identity():
+    with pytest.raises(IncidentError, match="CI"):
+        capacity_batch()[0].check_id
+
+
+def test_ci_report_carries_the_check_identity():
+    row = ci_row()
+    raw, sha = pack(row)
+    finding = github_ci(raw, sha, SCOPE, expected_head=row["head"], expected_pr=225, now=NOW)
+    item = outcome(finding)["incidents"][0]["incident"]
+    assert item["check_id"] == finding.check_id
 
 
 @pytest.mark.parametrize("fence,expires,ack,expected", [
