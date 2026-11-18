@@ -91,7 +91,10 @@ def check_identity(scope, subject, job_name):
     well formed by construction.
     """
     require(type(scope) is Scope, "invalid check scope")
-    require(type(subject) is tuple and len(subject) >= 2, "invalid check subject")
+    # Exactly two parts: the pull request and the workflow definition.  Extra
+    # parts would be silently dropped from the identity, so two hand-built
+    # observations could share one check_id and one defect fingerprint.
+    require(type(subject) is tuple and len(subject) == 2, "invalid check subject")
     pr, workflow = subject[0], subject[1]
     require(type(pr) is str and _CHECK_ID.fullmatch(pr) is not None,
             "invalid check pull request")

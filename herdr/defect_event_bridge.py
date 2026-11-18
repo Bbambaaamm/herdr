@@ -114,7 +114,7 @@ def defect_from_observation(observation: Observation) -> DefectObservation | Non
         # must not silently repair a missing identity.
         raise DefectError("CI observation lacks the head/run facts")
     subject = observation.subject
-    if len(subject) < 2:
+    if len(subject) != 2:
         raise DefectError("CI observation subject does not carry pr and workflow")
     try:
         finding_identity = observation.check_id

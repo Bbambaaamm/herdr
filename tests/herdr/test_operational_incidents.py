@@ -197,6 +197,12 @@ def test_check_identity_rejects_a_missing_check_name():
         check_identity(SCOPE, ("225", "12345"), "")
 
 
+def test_check_identity_rejects_extra_subject_parts():
+    """Extra parts would be dropped from the identity, merging two checks."""
+    with pytest.raises(IncidentError, match="subject"):
+        check_identity(SCOPE, ("225", "12345", "extra"), "job")
+
+
 def test_ci_check_identity_distinguishes_scope_and_pull_request():
     row = ci_row()
     raw, sha = pack(row)

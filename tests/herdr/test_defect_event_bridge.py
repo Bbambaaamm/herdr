@@ -268,6 +268,12 @@ def test_bridge_refuses_a_non_numeric_pull_request():
         defect_from_observation(ci_observation(subject=("not-a-number", "12345")))
 
 
+def test_bridge_refuses_an_over_long_ci_subject():
+    """Extra subject parts are dropped by check_identity; refuse instead."""
+    with pytest.raises(DefectError):
+        defect_from_observation(ci_observation(subject=("237", "12345", "extra")))
+
+
 def test_short_ci_subject_is_rejected():
     with pytest.raises(DefectError):
         defect_from_observation(ci_observation(subject=("237",)))
