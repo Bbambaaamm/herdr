@@ -17,6 +17,17 @@ mission requires:
 Real model execution, real GitHub publication and real merge authority are out of
 scope here and remain NOT_VERIFIED.  Nothing in this file dispatches work, calls
 a model, writes outside its own tmp_path, or touches the network.
+
+Known P2s surfaced by E4 review (not defects of this change, recorded for the
+next round):
+- ``herdr.defect_event_bridge.agent_identity()`` derives the handle
+  ``defect-<hex>``; the scheduler's ``CanonicalParentAdmission`` requires
+  ``repo#<issue>``.  The simulation therefore derives its own canonical handle
+  from the pull request; the production bridge still has to adopt one.
+- ``task_graph_spec()`` reports ``max_fanout=0`` (no fanout at all) while
+  ``TaskGraphEnvelope`` cannot express 0 (floor 1).  A single-node graph with
+  ``max_nodes=1`` cannot exceed either bound, so the difference is about the
+  meaning of the two fields and deserves a comment, not a silent widening.
 """
 
 from __future__ import annotations
@@ -83,10 +94,21 @@ class StubOutcome:
     draft: DraftPullRequest
 
 
-def build_task(defect, identity) -> TaskGraph:
-    """One real, validated TaskGraph node for the admitted defect."""
+def canonical_issue(defect) -> str:
+    """The canonical ``repo#<issue>`` handle the scheduler parent needs."""
+    pull_request = defect.subject[0].removeprefix("pr-")
+    return f"{defect.repository}#{pull_request}"
+
+
+def build_task(defect, identity, issue: str) -> TaskGraph:
+    """One real, validated TaskGraph node for the admitted defect.
+
+    ``issue`` must be in the canonical ``repo#<issue>`` form the scheduler's
+    parent admission requires; a bare ``defect-<hex>`` handle is not accepted
+    there (see the P2 note in the module docstring).
+    """
     envelope = TaskGraphEnvelope(
-        issue=f"defect-{defect.fingerprint[:12]}",
+        issue=issue,
         spec_hash=defect.fingerprint,
         graph_version=GRAPH_VERSION,
         created_at=datetime.now(UTC).isoformat(),
@@ -211,7 +233,7 @@ def run_chain(tmp_path, workspace, **observation_overrides) -> dict:
     )
     spec = task_graph_spec()
     identity = agent_identity(defect)
-    graph = build_task(defect, identity)
+    graph = build_task(defect, identity, canonical_issue(defect))
     return {"defect": defect, "proposal": proposal, "spec": spec,
             "identity": identity, "graph": graph, "evidence": pinned["sha"]}
 
@@ -237,6 +259,8 @@ def test_ci_failure_becomes_exactly_one_task_and_one_draft_pr(tmp_path):
     assert first["spec"].max_depth == 1
     assert first["spec"].max_fanout == 0
     assert graph.envelope.graph_version == GRAPH_VERSION
+    assert graph.envelope.issue == canonical_issue(defect)
+    assert graph.envelope.issue.startswith(f"{defect.repository}#")
     assert len(graph.nodes) == 1
     assert graph.nodes[0].parent_id is None
     assert graph.nodes[0].dependencies == ()
@@ -289,6 +313,33 @@ def test_two_independent_checks_are_two_tasks(tmp_path):
     assert second["proposal"]["deduplicated"] is False
     assert {node.id for node in first["graph"].nodes}.isdisjoint(
         {node.id for node in second["graph"].nodes})
+
+
+def test_the_single_task_passes_canonical_scheduler_admission(tmp_path):
+    """The built graph survives the scheduler's own parent admission."""
+    from herdr.scheduler import CanonicalParentAdmission
+    from herdr.security import InvocationIdentity
+
+    first = run_chain(tmp_path, "237")
+    graph = first["graph"]
+    node = graph.nodes[0]
+    repo = first["defect"].repository
+    issue = first["defect"].subject[0].removeprefix("pr-")
+    parent = CanonicalParentAdmission(
+        graph=graph,
+        graph_sha256=graph.graph_hash(),
+        identity=InvocationIdentity(consumer=f"github:{repo}",
+                                    agent_id="herdr-defect-admission",
+                                    parent_agent_id="herdr-defect-admission",
+                                    parent_task_id=node.id, task_id=node.id,
+                                    run_token="sim-run-token", fencing_token=1),
+        idempotency_key=f"defect-{first['defect'].fingerprint[:12]}",
+        repo=repo, issue=issue, pane_id="sim-pane", marker="sim-marker",
+    )
+    canonical = parent.to_json()
+    assert canonical["graph_sha256"] == graph.graph_hash()
+    assert canonical["graph"]["envelope"]["issue"] == f"{repo}#{issue}"
+    assert canonical["identity"]["task_id"] == node.id
 
 
 def test_a_re_run_of_the_same_check_is_the_same_defect(tmp_path):
