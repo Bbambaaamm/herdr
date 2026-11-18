@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import pytest
 
@@ -39,6 +40,7 @@ from herdr.defect_event_bridge import (
 from herdr.defect_admission import DecisionJournal, DefectContext
 from herdr.operational_adapters import github_ci
 from herdr.operational_incidents import Scope, correlate
+from herdr.taskgraph import GRAPH_VERSION, TaskGraph, TaskGraphEnvelope, TaskNode
 
 PROJECT = "Bbambaaamm/herdr"
 SCOPE = Scope("herdr", PROJECT)
@@ -52,22 +54,73 @@ NOW = 1_700_000_000
 
 
 @dataclass(frozen=True)
+class DraftPullRequest:
+    """The record a repair worker must leave behind.  Not a real publication."""
+
+    repository: str
+    base_branch: str
+    head_branch: str
+    draft: bool
+    merged: bool
+    deployed: bool
+    review: str
+    task_id: str
+    evidence_sha256: str
+
+    def __post_init__(self) -> None:
+        assert self.draft is True, "a repair must publish a draft, never a ready PR"
+        assert self.merged is False, "a worker must never merge"
+        assert self.deployed is False, "a worker must never deploy"
+
+
+@dataclass(frozen=True)
 class StubOutcome:
     """What a bounded worker would have to return.  No model is invoked."""
 
     reproduced: bool
     tests_pass: bool
     review: str
-    draft_pr: str
-    merge: bool = False
-    deploy: bool = False
+    draft: DraftPullRequest
 
 
-def stub_worker(defect, workspace: str) -> StubOutcome:
+def build_task(defect, identity) -> TaskGraph:
+    """One real, validated TaskGraph node for the admitted defect."""
+    envelope = TaskGraphEnvelope(
+        issue=f"defect-{defect.fingerprint[:12]}",
+        spec_hash=defect.fingerprint,
+        graph_version=GRAPH_VERSION,
+        created_at=datetime.now(UTC).isoformat(),
+        planner="herdr-defect-admission",
+        max_nodes=1,
+        max_depth=1,
+        # The envelope cannot express 0 (HARD_MAX_FANOUT floor is 1); the policy
+        # spec the gate checked is stricter: no fanout at all.
+        max_fanout=1,
+    )
+    node = TaskNode(
+        id=f"repair-{defect.fingerprint[:12]}",
+        parent_id=None,
+        type="repair",
+        role=identity.role,
+        objective=f"Repair the admitted CI defect {defect.finding_identity}",
+        inputs=({"fingerprint": defect.fingerprint, "commit_sha": defect.commit_sha,
+                 "ref": defect.ref, "workflow": defect.workflow},),
+        expected_outputs=({"draft_pr": "string", "tests": "pass"},),
+        dependencies=(),
+        priority=1,
+        resource_class="paper",
+        model_policy={"provider": "nous", "paper_only": True},
+        tools=tuple(repair_tools()),
+        permissions=(),
+    )
+    return TaskGraph.from_planner_output(envelope, [node.to_json()])
+
+
+def stub_worker(defect, workspace: str, graph: TaskGraph) -> StubOutcome:
     """Deterministic stand-in for one bounded repair worker.
 
     It writes a marker file into ``workspace`` and runs a fixed local check, so
-    the *plumbing* (one task, one attempt, one review, one draft PR) is
+    the *plumbing* (one task, one attempt, one review, one draft PR record) is
     exercised without claiming that a model produced the fix.
     """
     from pathlib import Path
@@ -79,7 +132,17 @@ def stub_worker(defect, workspace: str) -> StubOutcome:
         reproduced=True,
         tests_pass=(root / "fix.txt").read_text(encoding="utf-8").strip() == defect.fingerprint,
         review="PASS P0 0 / P1 0",
-        draft_pr=f"draft-pr-{defect.fingerprint[:12]}",
+        draft=DraftPullRequest(
+            repository=defect.repository,
+            base_branch="main",
+            head_branch=f"defect/{defect.fingerprint[:12]}",
+            draft=True,
+            merged=False,
+            deployed=False,
+            review="PASS P0 0 / P1 0",
+            task_id=graph.nodes[0].id,
+            evidence_sha256=defect.evidence_sha256[0],
+        ),
     )
 
 
@@ -148,8 +211,9 @@ def run_chain(tmp_path, workspace, **observation_overrides) -> dict:
     )
     spec = task_graph_spec()
     identity = agent_identity(defect)
+    graph = build_task(defect, identity)
     return {"defect": defect, "proposal": proposal, "spec": spec,
-            "identity": identity, "evidence": pinned["sha"]}
+            "identity": identity, "graph": graph, "evidence": pinned["sha"]}
 
 
 # --- the simulation -------------------------------------------------------- #
@@ -167,22 +231,36 @@ def test_ci_failure_becomes_exactly_one_task_and_one_draft_pr(tmp_path):
     assert proposal["budget_operations"] == 0
     assert proposal["admission"]["denied"] is False
 
-    # exactly one bounded task
+    # exactly one bounded task, as a real validated TaskGraph
+    graph = first["graph"]
     assert first["spec"].node_count == 1
     assert first["spec"].max_depth == 1
     assert first["spec"].max_fanout == 0
+    assert graph.envelope.graph_version == GRAPH_VERSION
+    assert len(graph.nodes) == 1
+    assert graph.nodes[0].parent_id is None
+    assert graph.nodes[0].dependencies == ()
+    assert graph.nodes[0].tools == tuple(repair_tools())
     assert first["identity"].role == "writer"
     assert first["identity"].paper_only is True
     assert "git_push" not in repair_tools()
     assert "git_merge" not in repair_tools()
     assert "deploy" not in repair_tools()
 
-    outcome = stub_worker(defect, workspace)
+    outcome = stub_worker(defect, workspace, graph)
     assert outcome.reproduced is True
     assert outcome.tests_pass is True
     assert outcome.review == "PASS P0 0 / P1 0"
-    assert outcome.draft_pr == f"draft-pr-{defect.fingerprint[:12]}"
-    assert outcome.merge is False and outcome.deploy is False
+    draft = outcome.draft
+    assert draft.draft is True
+    assert draft.merged is False
+    assert draft.deployed is False
+    assert draft.task_id == graph.nodes[0].id
+    assert draft.base_branch == "main"
+    assert draft.head_branch.startswith("defect/")
+    assert draft.head_branch != draft.base_branch
+    assert draft.repository == defect.repository
+    assert draft.evidence_sha256 == defect.evidence_sha256[0]
     assert not (tmp_path / "merged").exists()
 
 
@@ -209,6 +287,8 @@ def test_two_independent_checks_are_two_tasks(tmp_path):
                        job_name="Run the offline repository contract")
     assert first["proposal"]["fingerprint"] != second["proposal"]["fingerprint"]
     assert second["proposal"]["deduplicated"] is False
+    assert {node.id for node in first["graph"].nodes}.isdisjoint(
+        {node.id for node in second["graph"].nodes})
 
 
 def test_a_re_run_of_the_same_check_is_the_same_defect(tmp_path):
