@@ -53,7 +53,6 @@ def _bind_probe_routing_handoff(guard, *, provider, model, allocation_id=None):
 def _probe_installed_work_budget(grant, workspace, outside, middleware):
     """Real installed SDK middleware; host admission/transport is an explicit fixture."""
     import threading
-    import time
     from dataclasses import asdict
     from types import SimpleNamespace
     from herdr.capability import DataClass, Egress, Retention, Training
@@ -65,16 +64,19 @@ def _probe_installed_work_budget(grant, workspace, outside, middleware):
     from herdr.work_cycle import WorkPhase, WorkContractError
     from herdr.hermes_guard import install_hermes_guard, _ACTIVE_AGENT
     from agent import turn_api_call
-    provider="budget-fixture"
-    route=ProviderRoute(provider,"https://budget-fixture.invalid/v1","chat_completions",
+    provider="nous"
+    route=ProviderRoute(provider,"https://inference-api.nousresearch.com/v1","chat_completions",
         ("eu-central",),(DataClass.INTERNAL,),Egress.NONE,Retention.ZERO,Training.EXCLUDED)
     grant=replace(grant,scope=replace(grant.scope,providers=(provider,)),provider_routes=(route,))
     allocation=BudgetAllocation(digest("sdk-budget-allocation"),grant.identity.consumer,
         digest("sdk-stable-work"),digest("sdk-lineage"),digest("sdk-host-approval"),
         BudgetLimits(100000,100000,3,20000,0,1,0,1,1))
-    quote={"provider":provider,"model":"text-fixture","api_mode":route.api_mode,"base_url":route.base_url,
+    quote={"provider":provider,"model":"probe-host-model:free","api_mode":route.api_mode,"base_url":route.base_url,
            "max_request_bytes":4096,"max_output_tokens":100,"max_tokens":5000,
-           "max_cost_microusd":0,"max_work_ms":30}
+           "max_cost_microusd":0,"max_work_ms":1000}
+    # Keep SDK import overhead outside the bounded model-effect interval.
+    from openai.types.chat import ChatCompletion
+    assert ChatCompletion is not None
     cycle=SimpleNamespace(plan=SimpleNamespace(hash=digest("fixture-plan"),grant_sha256=grant.hash),
                           phase=WorkPhase.WORK)
     # Only protected admission/phase is supplied by this fixture. Quote parser,
@@ -86,6 +88,8 @@ def _probe_installed_work_budget(grant, workspace, outside, middleware):
                         "model_quotes":[quote]},storage=storage,writable_roots=(workspace,))
     class HostBudgetTransportFixture:
         deny_status=False
+        host_calls=[]
+        unknown_ids=set()
         def __call__(self,identity,grant_hash,**kwargs):
             assert identity==grant.identity and grant_hash==grant.hash
             return True
@@ -95,6 +99,17 @@ def _probe_installed_work_budget(grant, workspace, outside, middleware):
                 if self.deny_status:raise PolicyDenied("fixture_status_unavailable")
                 return {"required":True}
             return model_effect(factory,identity,grant_hash,action,payload)
+        def model_transport(self,identity,grant_hash,request_id,receipt,payload):
+            assert identity==grant.identity and grant_hash==grant.hash
+            assert payload["model"]==quote["model"] and receipt["operation_id"]
+            self.host_calls.append(request_id)
+            if request_id in self.unknown_ids:
+                return {"kind":"unknown","http_status":None,"error_type":"TimeoutError"}
+            return {"kind":"http_response","http_status":200,"body":{
+                "id":"chatcmpl-offline-probe","object":"chat.completion","created":0,
+                "model":quote["model"],"choices":[{"index":0,"message":{
+                    "role":"assistant","content":"offline host response"},"finish_reason":"stop"}],
+            }}
     transport=HostBudgetTransportFixture()
     guard=WorkInvocationGuard(grant,work_authority=transport)
     _bind_probe_routing_handoff(guard, provider=provider, model=quote["model"],
@@ -103,29 +118,55 @@ def _probe_installed_work_budget(grant, workspace, outside, middleware):
     agent=SimpleNamespace(provider=provider,model=quote["model"],api_mode=route.api_mode,
         base_url=route.base_url,api_key=None,client=SimpleNamespace(max_retries=0),_disable_streaming=False)
     request={"model":agent.model,"messages":[{"role":"user","content":"bounded fixture text"}],"max_tokens":50}
-    calls=[]
-    def returned(payload):
-        state=factory.budget_authority.snapshot(allocation.allocation_id)
-        assert state["inflight"]==1 and state["charged_upper_bounds"]["model_calls"]==1
-        calls.append("returned")
-        return {"fixture":"response"}
+    direct_calls=[]
+    def direct_transport(payload):
+        direct_calls.append(payload)
+        raise AssertionError("protected host route reached the direct SDK transport")
     token=_ACTIVE_AGENT.set(agent)
     try:
-        middleware.run_llm_execution_middleware(request,returned,api_request_id="sdk:original:1")
+        handoff=guard._routing_handoff
+        state=factory.budget_authority.snapshot(allocation.allocation_id)
+        assert state["charged_upper_bounds"]["model_calls"]==0
+        agent.model="substitute-model:free"
+        try:middleware.run_llm_execution_middleware(request,direct_transport,api_request_id="sdk:denied:model")
+        except PolicyDenied as exc:assert exc.reason=="routing_handoff_model_mismatch"
+        else:raise AssertionError("substituted model passed the SDK routing handoff")
+        agent.model=quote["model"]
+        guard._routing_handoff=None
+        try:middleware.run_llm_execution_middleware(request,direct_transport,api_request_id="sdk:denied:unbound")
+        except PolicyDenied as exc:assert exc.reason=="routing_handoff_missing"
+        else:raise AssertionError("unbound guard passed the SDK routing handoff")
+        guard.bind_routing_handoff(handoff)
+        for boundary,reason in (("2999-01-01T00:00:00+00:00","handoff_not_ready"),
+                                (None,"handoff_wait_unknown")):
+            guard._routing_handoff=replace(handoff,not_before=boundary)
+            try:middleware.run_llm_execution_middleware(request,direct_transport,
+                api_request_id="sdk:denied:"+reason)
+            except PolicyDenied as exc:
+                assert exc.reason=="routing_handoff_model_mismatch"
+                assert reason in str(exc.__cause__)
+            else:raise AssertionError("unready handoff passed the SDK wait boundary")
+        guard._routing_handoff=handoff
+        assert factory.budget_authority.snapshot(allocation.allocation_id)["charged_upper_bounds"]["model_calls"]==0
+        response=middleware.run_llm_execution_middleware(request,direct_transport,api_request_id="sdk:original:1")
+        assert response.choices[0].message.content=="offline host response"
+        assert transport.host_calls==["sdk:original:1"] and direct_calls==[]
         state=factory.budget_authority.snapshot(allocation.allocation_id)
         assert state["inflight"]==0 and state["charged_upper_bounds"]["tokens"]==5000
-        def slow(payload):
-            state=factory.budget_authority.snapshot(allocation.allocation_id)
-            assert state["inflight"]==1 and state["charged_upper_bounds"]["model_calls"]==2
-            calls.append("timeout");time.sleep(1)
-        try:middleware.run_llm_execution_middleware(request,slow,api_request_id="sdk:original:2")
-        except PolicyDenied as exc:assert "reconcile_original" in exc.reason
-        else:raise AssertionError("SDK callback deadline must stop")
-        try:middleware.run_llm_execution_middleware(request,returned,api_request_id="renamed:session:1")
-        except WorkContractError as exc:assert "uncertain" in str(exc)
-        else:raise AssertionError("renamed session cannot refill unknown reservation")
-        assert calls==["returned","timeout"]
-        assert factory.budget_authority.snapshot(allocation.allocation_id)["inflight"]==1
+        transport.unknown_ids.add("sdk:original:2")
+        try:middleware.run_llm_execution_middleware(request,direct_transport,api_request_id="sdk:original:2")
+        except PolicyDenied as exc:assert exc.reason=="host_model_delivery_unknown_reconcile_original"
+        else:raise AssertionError("uncertain host delivery must hold the original reservation")
+        assert transport.host_calls==["sdk:original:1","sdk:original:2"] and direct_calls==[]
+        state=factory.budget_authority.snapshot(allocation.allocation_id)
+        assert state["inflight"]==1 and state["charged_upper_bounds"]["model_calls"]==2
+        for replay_id in ("sdk:original:2","renamed:session:1"):
+            try:middleware.run_llm_execution_middleware(request,direct_transport,api_request_id=replay_id)
+            except WorkContractError as exc:assert "original reconciliation" in str(exc)
+            else:raise AssertionError("uncertain delivery was re-reserved")
+        assert transport.host_calls==["sdk:original:1","sdk:original:2"] and direct_calls==[]
+        state=factory.budget_authority.snapshot(allocation.allocation_id)
+        assert state["inflight"]==1 and state["charged_upper_bounds"]["model_calls"]==2
         try:guard.deny_unbudgeted_auxiliary()
         except PolicyDenied as exc:assert exc.reason=="auxiliary_budget_profile_unsupported"
         else:raise AssertionError("unsupported auxiliary must stop before callback")
