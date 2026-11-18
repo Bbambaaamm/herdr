@@ -20,12 +20,6 @@ a model, writes outside its own tmp_path, or touches the network.
 
 Known P2s surfaced by E4 review (not defects of this change, recorded for the
 next round):
-- ``agent_identity()`` emits ``defect-<hash>``, which
-  ``CanonicalParentAdmission`` rejects (it needs ``repo#<issue>``).  Using the
-  pull request instead would collapse two distinct failing checks on one PR:
-  ``AdmissionControl`` reconciles an ALLOW by ``(repo, issue, ...)``, so the
-  second repair would be silently dropped.  The correct fix is a per-defect
-  issue number, which needs an external action and is out of scope here.
 - ``task_graph_spec()`` reports ``max_fanout=0`` (no fanout at all) while
   ``TaskGraphEnvelope`` cannot express 0 (floor 1).  A single-node graph with
   ``max_nodes=1`` cannot exceed either bound, so the difference is about the
@@ -97,9 +91,8 @@ class StubOutcome:
 
 
 def canonical_issue(defect) -> str:
-    """The canonical ``repo#<issue>`` handle the scheduler parent needs."""
-    pull_request = defect.subject[0].removeprefix("pr-")
-    return f"{defect.repository}#{pull_request}"
+    """The envelope handle, derived from the bridge's own identity."""
+    return f"{defect.repository}#{agent_identity(defect).issue}"
 
 
 def build_task(defect, identity, issue: str) -> TaskGraph:
@@ -326,7 +319,7 @@ def test_the_single_task_passes_canonical_scheduler_admission(tmp_path):
     graph = first["graph"]
     node = graph.nodes[0]
     repo = first["defect"].repository
-    issue = first["defect"].subject[0].removeprefix("pr-")
+    issue = first["identity"].issue
     parent = CanonicalParentAdmission(
         graph=graph,
         graph_sha256=graph.graph_hash(),
@@ -344,18 +337,19 @@ def test_the_single_task_passes_canonical_scheduler_admission(tmp_path):
     assert canonical["identity"]["task_id"] == node.id
 
 
-def test_the_bridge_handle_is_not_yet_scheduler_canonical(tmp_path):
-    """Open gap, pinned so it cannot be papered over silently.
+def test_the_identity_is_handed_off_to_the_scheduler(tmp_path):
+    """The envelope handle is built from the gate's own identity.
 
-    ``CanonicalParentAdmission`` needs ``repo#<issue>``; the bridge emits a
-    defect-scoped handle instead.  Closing this needs a per-defect issue number,
-    which is an external action (creating a GitHub issue) and is deliberately
-    out of scope for this change.
+    ``CanonicalParentAdmission`` requires ``graph.envelope.issue`` to be
+    ``repo + "#" + identity.issue``.  Deriving the envelope handle from
+    ``agent_identity(defect)`` proves the two gates share one identity instead
+    of the test inventing a second one.
     """
     first = run_chain(tmp_path, "237")
     identity = first["identity"]
-    assert identity.issue.startswith("defect-")
-    assert identity.issue != canonical_issue(first["defect"])
+    assert identity.issue == f"defect-{first['defect'].fingerprint[:12]}"
+    assert first["graph"].envelope.issue == canonical_issue(first["defect"])
+    assert first["graph"].envelope.issue == f"{first['defect'].repository}#{identity.issue}"
 
 
 def test_a_re_run_of_the_same_check_is_the_same_defect(tmp_path):

@@ -152,12 +152,12 @@ def task_graph_spec() -> TaskGraphSpec:
 def agent_identity(defect: DefectObservation, **overrides) -> AgentIdentity:
     """Identity for the repair proposal, derived from the defect identity.
 
-    The handle is deliberately defect-scoped, not the canonical
-    ``repo#<issue>`` form: ``AdmissionControl`` reconciles an ALLOW by
-    ``(repo, issue, ...)``, so a PR-scoped handle would make the second distinct
-    failing check on the same PR reconcile against the first one's ALLOW and
-    silently drop the repair.  A per-defect issue number would fix both, but
-    creating one is an external action and stays out of scope here.
+    The handle is deliberately defect-scoped, not pull-request-scoped:
+    ``AdmissionControl`` reconciles an ALLOW by ``(repo, issue, ...)``, so a
+    PR-scoped handle would make the second distinct failing check on the same PR
+    reconcile against the first one's ALLOW and silently drop the repair.  The
+    scheduler's envelope handle is ``repo + "#" + identity.issue``, so the
+    defect-scoped handle is sufficient on both sides.
     """
     if type(defect) is not DefectObservation:
         raise DefectError("not a defect observation")
