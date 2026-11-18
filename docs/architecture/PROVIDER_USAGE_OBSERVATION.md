@@ -69,9 +69,11 @@ Invariants enforced in `__post_init__`:
    mode) plus explicit unknown reasons; it contributes **no** token totals to the
    aggregate (a missing bucket is not 0).  `input_tokens` may be missing when
    chat/codex cache metadata is incomplete and uncached input cannot be derived;
-   the directly reported output and cache buckets remain valid evidence.
+   the directly reported output and cache buckets remain valid evidence. A
+   confirmed `actual_cost_microusd` still contributes to the aggregate.
 3. `UNKNOWN` carries no token buckets and an explicit reason.  Malformed evidence
    (`provider_malformed`) always degrades the whole observation to `UNKNOWN`.
+   It rejects a claimed confirmed actual cost until delivery is reconciled.
 4. `NON_BILLABLE` remains a reserved schema status. The adapter currently rejects
    it because no verified route authority is available. A caller-supplied route
    label cannot establish a concrete zero cost.

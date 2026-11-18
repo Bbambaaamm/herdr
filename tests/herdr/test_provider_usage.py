@@ -331,6 +331,27 @@ def test_aggregate_separates_partial_and_unknown_coverage():
     assert aggregate.unknown_cost_observations == 2
 
 
+def test_partial_confirmed_cost_is_not_lost_when_token_buckets_are_incomplete():
+    observed = observe_usage(
+        provider="anthropic", model="claude-opus-4-6", api_mode="anthropic_messages",
+        request_id="req-partial-cost", pricing=PRICING,
+        usage=load_fixture("anthropic_missing_cache.json")["usage"],
+        actual_cost_microusd=42)
+    aggregate = UsageAggregate().add(observed)
+    assert observed.status is UsageStatus.PARTIAL
+    assert observed.actual_cost_microusd == billable_cost_microusd(observed) == aggregate.actual_cost_microusd == 42
+    assert aggregate.unknown_cost_observations == 0
+    assert aggregate.input_tokens == aggregate.output_tokens == 0
+
+
+def test_unknown_delivery_rejects_a_claimed_confirmed_cost():
+    with pytest.raises(UsageFieldError, match="unknown observation cannot carry confirmed actual cost"):
+        observe_usage(
+            provider="anthropic", model="claude-opus-4-6", api_mode="anthropic_messages",
+            request_id="req-unknown-cost", pricing=PRICING, usage=None,
+            delivery=DeliveryOutcome.UNCERTAIN, actual_cost_microusd=42)
+
+
 def test_unknown_reasons_and_notes_are_closed_and_bounded():
     with pytest.raises(UsageFieldError):
         observe_usage(

@@ -340,6 +340,8 @@ class UsageObservation:
                 raise UsageFieldError("non-billable observation cannot carry a non-zero actual cost")
             if self.estimated_cost_microusd is not None and self.estimated_cost_microusd != 0:
                 raise UsageFieldError("non-billable observation cannot carry a non-zero estimated cost")
+        if self.status is UsageStatus.UNKNOWN and self.actual_cost_microusd is not None:
+            raise UsageFieldError("unknown observation cannot carry confirmed actual cost")
         if self.actual_cost_microusd is not None:
             if self.cost_unknown_reason is not None:
                 raise UsageFieldError("known actual cost cannot carry cost_unknown_reason")
@@ -506,6 +508,8 @@ class UsageAggregate:
                 partial_observations=self.partial_observations + 1,
                 billable_attempts=self.billable_attempts + int(
                     observation.delivery is DeliveryOutcome.DELIVERED),
+                actual_cost_microusd=self.actual_cost_microusd
+                + (observation.actual_cost_microusd or 0),
                 unknown_cost_observations=self.unknown_cost_observations
                 + int(observation.actual_cost_microusd is None
                       and observation.cost_unknown_reason is not CostUnknownReason.NON_BILLABLE),
