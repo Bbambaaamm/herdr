@@ -20,10 +20,12 @@ a model, writes outside its own tmp_path, or touches the network.
 
 Known P2s surfaced by E4 review (not defects of this change, recorded for the
 next round):
-- ``herdr.defect_event_bridge.agent_identity()`` derives the handle
-  ``defect-<hex>``; the scheduler's ``CanonicalParentAdmission`` requires
-  ``repo#<issue>``.  The simulation therefore derives its own canonical handle
-  from the pull request; the production bridge still has to adopt one.
+- ``agent_identity()`` emits ``defect-<hash>``, which
+  ``CanonicalParentAdmission`` rejects (it needs ``repo#<issue>``).  Using the
+  pull request instead would collapse two distinct failing checks on one PR:
+  ``AdmissionControl`` reconciles an ALLOW by ``(repo, issue, ...)``, so the
+  second repair would be silently dropped.  The correct fix is a per-defect
+  issue number, which needs an external action and is out of scope here.
 - ``task_graph_spec()`` reports ``max_fanout=0`` (no fanout at all) while
   ``TaskGraphEnvelope`` cannot express 0 (floor 1).  A single-node graph with
   ``max_nodes=1`` cannot exceed either bound, so the difference is about the
@@ -340,6 +342,20 @@ def test_the_single_task_passes_canonical_scheduler_admission(tmp_path):
     assert canonical["graph_sha256"] == graph.graph_hash()
     assert canonical["graph"]["envelope"]["issue"] == f"{repo}#{issue}"
     assert canonical["identity"]["task_id"] == node.id
+
+
+def test_the_bridge_handle_is_not_yet_scheduler_canonical(tmp_path):
+    """Open gap, pinned so it cannot be papered over silently.
+
+    ``CanonicalParentAdmission`` needs ``repo#<issue>``; the bridge emits a
+    defect-scoped handle instead.  Closing this needs a per-defect issue number,
+    which is an external action (creating a GitHub issue) and is deliberately
+    out of scope for this change.
+    """
+    first = run_chain(tmp_path, "237")
+    identity = first["identity"]
+    assert identity.issue.startswith("defect-")
+    assert identity.issue != canonical_issue(first["defect"])
 
 
 def test_a_re_run_of_the_same_check_is_the_same_defect(tmp_path):
