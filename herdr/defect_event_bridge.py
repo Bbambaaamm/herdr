@@ -108,7 +108,8 @@ def defect_from_observation(observation: Observation) -> DefectObservation | Non
         return None
     facts = dict(observation.facts)
     head, run_id, job_id = facts.get("head"), facts.get("run_id"), facts.get("job_id")
-    if type(head) is not str or type(run_id) is not int or type(job_id) is not int:
+    if (type(head) is not str or type(run_id) is not int or run_id <= 0
+            or type(job_id) is not int or job_id <= 0):
         # The #100 CI adapter requires these facts, but a bridged observation
         # must not silently repair a missing identity.
         raise DefectError("CI observation lacks the head/run facts")

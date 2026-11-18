@@ -13,7 +13,7 @@ SCHEMA = "herdr-operational-incidents-1"
 MAX_EVENTS = 4096
 _NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}")
 _CHECK_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
-_CHECK_SLUG = re.compile(r"[^A-Za-z0-9_.-]+")
+_CHECK_ID = re.compile(r"[1-9][0-9]{0,18}")
 _CHECK_NAME_MAX = 128
 _SHA = re.compile(r"[a-f0-9]{64}")
 _REPO = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}")
@@ -77,22 +77,31 @@ def epoch(value):
 def check_identity(scope, subject, job_name):
     """Stable identity of one *defined* CI check.
 
-    Derived from the workflow definition and the job's defined name only.  Never
-    from the per-run ``job_id``/``run_id`` (those fragment one red PR into N
-    records) and never from the per-run evidence digest (it changes on every
-    run).  A re-run of the same check keeps its identity, and two different
-    checks cannot collide.
+    Derived from the scope, the pull request, the workflow definition and the
+    job's defined name only — never from the per-run ``job_id``/``run_id`` (those
+    fragment one red PR into N records) and never from the per-run evidence
+    digest (it changes on every run).  A re-run of the same check keeps its
+    identity, and two different checks cannot collide.
+
+    A full SHA-256 over the canonical inputs is used rather than a readable
+    slug: job names are free text, so any rendering ("unit tests" vs
+    "unit-tests", or two long names sharing a prefix) can collide, while a
+    digest cannot.  The pull request and workflow are required to be canonical
+    positive integers, which is what makes the bridge's ``refs/pull/<pr>/head``
+    well formed by construction.
     """
     require(type(scope) is Scope, "invalid check scope")
     require(type(subject) is tuple and len(subject) >= 2, "invalid check subject")
+    pr, workflow = subject[0], subject[1]
+    require(type(pr) is str and _CHECK_ID.fullmatch(pr) is not None,
+            "invalid check pull request")
+    require(type(workflow) is str and _CHECK_ID.fullmatch(workflow) is not None,
+            "invalid check workflow")
     require(type(job_name) is str and 0 < len(job_name) <= _CHECK_NAME_MAX,
             "invalid CI check name")
-    slug = _CHECK_SLUG.sub("-", job_name).strip("-") or "check"
-    if len(slug) > 40:
-        slug = slug[:40] + "-" + digest(job_name)[:8]
-    token = f"gha-{subject[1]}-{slug}"
-    require(_CHECK_TOKEN.fullmatch(token) is not None, "invalid CI check identity")
-    return token
+    value = digest([SCHEMA, "ci-check", asdict(scope), pr, workflow, job_name])
+    require(_CHECK_TOKEN.fullmatch(value) is not None, "invalid CI check identity")
+    return value
 
 
 def timestamp(seconds):

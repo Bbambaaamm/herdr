@@ -156,10 +156,11 @@ is a pure translator between them and adds no authority:
 - `defect_from_observation()` returns `None` for anything that is not an open
   CI failure, and **refuses** (raises) for a real CI failure whose defect
   identity it cannot establish. #100 publishes the stable identity of the
-  *defined* check as `Observation.check_id`, derived from the workflow
-  definition and the job's defined name. Its `job_id` is a per-run instance, its
-  per-run evidence digest changes on every run, and its `correlation_id` covers
-  the whole (source, scope, subject) group — none of those identifies one CI
+  *defined* check as `Observation.check_id` — a full SHA-256 over the scope, the
+  pull request, the workflow definition and the job's defined name. Its `job_id`
+  is a per-run instance, its per-run evidence digest changes on every run, and
+  its `correlation_id` covers the whole (source, scope, subject) group — none of
+  those identifies one CI
   defect: the first two fragment a red PR into N records, the third silently
   collapses N distinct failing checks into one and would dedup away a second,
   unrelated error. A CI observation from an older #100 shape with no defined
@@ -212,9 +213,12 @@ The bridge refuses to identify a CI defect without a stable identity of the
 *defined* check. #100 now publishes exactly that, as `Observation.check_id` on a
 CI observation:
 
-- derived from the workflow definition and the job's defined name — never from
-  the per-run `job_id`/`run_id` (those fragment one red PR into N records) and
-  never from the per-run evidence digest (it changes on every run);
+- derived from the scope, the pull request, the workflow definition and the
+  job's defined name — never from the per-run `job_id`/`run_id` (those fragment
+  one red PR into N records) and never from the per-run evidence digest (it
+  changes on every run).  A full SHA-256 over the canonical inputs is used
+  rather than a readable slug, because free-text job names render to colliding
+  slugs ("unit tests" vs "unit-tests", or two long names sharing a prefix);
 - exported on the CI incident as `check_id`;
 - `correlation_id` and `incident_id` are unchanged: the first is still the whole
   (source, scope, subject) group, the second the per-source state transition.

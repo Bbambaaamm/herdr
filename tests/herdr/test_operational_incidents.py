@@ -9,7 +9,13 @@ import pytest
 from herdr import operation_readiness
 from herdr.evidence import EvidenceStore, EvidenceUnavailable
 from herdr.operational_adapters import backup, capacity_snapshot, github_ci, read_capacity, worker
-from herdr.operational_incidents import IncidentError, Scope, report, publish_report
+from herdr.operational_incidents import (
+    IncidentError,
+    Scope,
+    check_identity,
+    report,
+    publish_report,
+)
 
 
 SCOPE = Scope("herdr", "Bbambaaamm/herdr")
@@ -150,6 +156,60 @@ def test_ci_check_identity_ignores_the_source_revision():
     second = github_ci(raw, sha, SCOPE, expected_head="b"*40, expected_pr=225, now=NOW + 60)
     assert second.check_id == first.check_id
     assert second.incident_id != first.incident_id
+
+
+def ci_finding(**overrides):
+    row = ci_row(**overrides)
+    raw, sha = pack(row)
+    return github_ci(raw, sha, SCOPE, expected_head=row["head"], expected_pr=225, now=NOW)
+
+
+def test_ci_check_identity_has_no_slug_collision():
+    """Free-text job names must not collapse into one readable slug."""
+    assert ci_finding(job_name="unit-tests").check_id != ci_finding(job_name="unit tests").check_id
+
+
+def test_ci_check_identity_survives_long_names_sharing_a_prefix():
+    first = "Validate " + "a" * 80
+    second = "Validate " + "b" * 80
+    assert ci_finding(job_name=first).check_id != ci_finding(job_name=second).check_id
+
+
+def test_ci_check_identity_accepts_the_maximum_allowed_inputs():
+    """workflow_id and job_name at the adapter's own bounds must still work."""
+    finding = ci_finding(workflow_id=12345678901, job_name="a" * 41)
+    assert len(finding.check_id) <= 64
+    assert finding.check_id == ci_finding(workflow_id=12345678901, job_name="a" * 41).check_id
+
+
+def test_check_identity_rejects_a_non_numeric_pull_request():
+    with pytest.raises(IncidentError, match="pull request"):
+        check_identity(SCOPE, ("not-a-number", "12345"), "job")
+
+
+def test_check_identity_rejects_a_non_numeric_workflow():
+    with pytest.raises(IncidentError, match="workflow"):
+        check_identity(SCOPE, ("225", "nope"), "job")
+
+
+def test_check_identity_rejects_a_missing_check_name():
+    with pytest.raises(IncidentError, match="check name"):
+        check_identity(SCOPE, ("225", "12345"), "")
+
+
+def test_ci_check_identity_distinguishes_scope_and_pull_request():
+    row = ci_row()
+    raw, sha = pack(row)
+    here = github_ci(raw, sha, SCOPE, expected_head=row["head"], expected_pr=225, now=NOW)
+    other_row = ci_row(repo="other/repo")
+    other_raw, other_sha = pack(other_row)
+    there = github_ci(other_raw, other_sha, Scope("herdr", "other/repo"),
+                      expected_head=other_row["head"], expected_pr=225, now=NOW)
+    moved_row = ci_row(pr=226)
+    moved_raw, moved_sha = pack(moved_row)
+    moved = github_ci(moved_raw, moved_sha, SCOPE,
+                      expected_head=moved_row["head"], expected_pr=226, now=NOW)
+    assert len({here.check_id, there.check_id, moved.check_id}) == 3
 
 
 def test_ci_evidence_requires_a_defined_check_name():

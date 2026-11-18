@@ -262,6 +262,12 @@ def test_missing_ci_facts_are_rejected_not_guessed():
         defect_from_observation(observation)
 
 
+def test_bridge_refuses_a_non_numeric_pull_request():
+    """The ref is built from subject[0]; a non-numeric value must not reach it."""
+    with pytest.raises(DefectError):
+        defect_from_observation(ci_observation(subject=("not-a-number", "12345")))
+
+
 def test_short_ci_subject_is_rejected():
     with pytest.raises(DefectError):
         defect_from_observation(ci_observation(subject=("237",)))
