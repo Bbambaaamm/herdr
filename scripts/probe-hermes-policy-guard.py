@@ -16,6 +16,39 @@ from dataclasses import replace
 from pathlib import Path
 
 
+def _bind_probe_routing_handoff(guard, *, provider, model, allocation_id=None):
+    """Bind an offline Router v5 fixture before exercising the SDK model path."""
+    from herdr.evidence import digest
+    from herdr.scheduler_routing import ManagedExecutionHandoff
+
+    identity = guard.grant.identity
+    policy_hash = digest("probe-routing-policy")
+    guard.bind_routing_handoff(ManagedExecutionHandoff(
+        version=1,
+        task_id=identity.task_id,
+        run_token=identity.run_token,
+        attempt=1,
+        fencing_token=identity.fencing_token,
+        consumer=identity.consumer,
+        agent_id=identity.agent_id,
+        parent_task_id=identity.parent_task_id,
+        parent_agent_id=identity.parent_agent_id,
+        policy_profile="probe",
+        policy_version="router-v5-probe",
+        decision_sha256=digest("probe-routing-decision"),
+        selected_executor="hermes-v0.21.5",
+        selected_provider=provider,
+        selected_model=model,
+        registry_hash=digest("probe-routing-registry"),
+        requirement_hash=digest("probe-routing-requirement"),
+        parent_scope_hash=policy_hash,
+        policy_hash=policy_hash,
+        budget_allocation_id=allocation_id or digest("probe-routing-allocation"),
+        not_before="2000-01-01T00:00:00+00:00",
+        waits_for_provider=True,
+    ))
+    assert guard.authorize_routing_model(provider, model)
+
 
 def _probe_installed_work_budget(grant, workspace, outside, middleware):
     """Real installed SDK middleware; host admission/transport is an explicit fixture."""
@@ -64,6 +97,8 @@ def _probe_installed_work_budget(grant, workspace, outside, middleware):
             return model_effect(factory,identity,grant_hash,action,payload)
     transport=HostBudgetTransportFixture()
     guard=WorkInvocationGuard(grant,work_authority=transport)
+    _bind_probe_routing_handoff(guard, provider=provider, model=quote["model"],
+                                allocation_id=allocation.allocation_id)
     installation=install_hermes_guard(guard)
     agent=SimpleNamespace(provider=provider,model=quote["model"],api_mode=route.api_mode,
         base_url=route.base_url,api_key=None,client=SimpleNamespace(max_retries=0),_disable_streaming=False)
@@ -438,6 +473,7 @@ def main() -> int:
                 return self.outcomes[request_id]
         authority = HostTransportFixture()
         phase_guard = WorkInvocationGuard(work_grant, work_authority=authority)
+        _bind_probe_routing_handoff(phase_guard, provider="probe-provider", model="probe-model")
         old_env = {key:os.environ.get(key) for key in (*IDENTITY_ENV.values(),"HERDR_DURABLE_SANDBOX")}
         for field,key in IDENTITY_ENV.items():os.environ[key]=str(getattr(identity,field))
         os.environ["HERDR_DURABLE_SANDBOX"]="1"

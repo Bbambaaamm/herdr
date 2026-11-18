@@ -333,7 +333,7 @@ class WorkInvocationGuard(InvocationGuard):
     def authorize_routing_model(self, provider, model, at=None):
         handoff = self._routing_handoff
         if handoff is None:
-            return True
+            raise PolicyDenied("routing_handoff_missing")
         from .scheduler_routing import ManagedExecutionHandoff, RoutingIntegrationError
         if not isinstance(handoff, ManagedExecutionHandoff):
             raise PolicyDenied("routing_handoff_untrusted_type")
