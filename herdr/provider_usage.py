@@ -11,9 +11,9 @@ Contract invariants:
 * ``UNKNOWN`` never becomes zero.  Every token/cost field is ``None`` unless the
   provider genuinely reported it, and the aggregate projection keeps a separate
   unknown counter instead of adding ``0``.
-* ``NON_BILLABLE`` is the only status that permits a concrete zero cost, and it
-  must be justified by the provider (an included/subscription route), not by a
-  missing measurement.
+* ``NON_BILLABLE`` is reserved for a verified route authority. This adapter has
+  no such authority yet, so a caller-supplied flag or label is rejected and an
+  unknown charge cannot become a concrete zero.
 * ``PARTIAL`` is reported whenever some buckets are measured and some are not;
   the per-field ``coverage`` map makes the gap explicit.
 * Retry, fallback, timeout and uncertain-delivery reconciliation is keyed by
@@ -255,6 +255,8 @@ class UsageObservation:
             object.__setattr__(self, "status", UsageStatus(self.status))
         except ValueError as exc:
             raise UsageFieldError("usage observation enum outside closed contract") from exc
+        if self.status is UsageStatus.NON_BILLABLE:
+            raise UsageFieldError("non-billable route authority is unavailable")
         if type(self.attempt_index) is not int or isinstance(self.attempt_index, bool) or self.attempt_index < 0:
             raise UsageFieldError("attempt_index must be a non-negative integer")
         for name in TOKEN_FIELDS:
@@ -330,6 +332,8 @@ class UsageObservation:
                 continue
             if type(value) is not int or isinstance(value, bool) or not 0 <= value <= 10**15:
                 raise UsageFieldError(f"{name} must be a bounded non-negative integer")
+            if value == 0 and self.status is not UsageStatus.NON_BILLABLE:
+                raise UsageFieldError("zero cost requires verified non-billable route authority")
         if self.status is UsageStatus.NON_BILLABLE:
             # A concrete zero is only permitted when the provider says the route is included.
             if self.actual_cost_microusd is not None and self.actual_cost_microusd != 0:
@@ -346,6 +350,8 @@ class UsageObservation:
                 object.__setattr__(self, "cost_unknown_reason", CostUnknownReason(self.cost_unknown_reason))
             except ValueError as exc:
                 raise UsageFieldError("cost unknown reason outside closed contract") from exc
+            if self.cost_unknown_reason is CostUnknownReason.NON_BILLABLE:
+                raise UsageFieldError("non-billable route authority is unavailable")
         if (self.actual_cost_microusd is not None or self.estimated_cost_microusd is not None):
             if self.pricing is None:
                 raise UsageFieldError("known or estimated cost requires pinned pricing")
@@ -463,6 +469,7 @@ class UsageAggregate:
     cache_write_coverage: int = 0
 
     seen_observation_ids: frozenset[str] = frozenset()
+    seen_attempts: frozenset[tuple[str, int, str]] = frozenset()
 
     def add(self, observation: UsageObservation) -> "UsageAggregate":
         # Replay protection: re-ingesting the same evidence event must be a no-op.
@@ -471,13 +478,18 @@ class UsageAggregate:
         identity = observation.observation_id
         if identity in self.seen_observation_ids:
             return self
+        attempt_key = (observation.request_id, observation.attempt_index)
+        if any((request_id, attempt_index) == attempt_key
+               for request_id, attempt_index, _ in self.seen_attempts):
+            raise UsageFieldError("conflicting observation for transport attempt")
         seen = self.seen_observation_ids | {identity}
+        attempts = self.seen_attempts | {(*attempt_key, identity)}
         if observation.status is UsageStatus.NON_BILLABLE:
-            return replace(self, seen_observation_ids=seen,
+            return replace(self, seen_observation_ids=seen, seen_attempts=attempts,
                            observations=self.observations + 1,
                            non_billable_observations=self.non_billable_observations + 1)
         if observation.status is UsageStatus.UNKNOWN:
-            return replace(self, seen_observation_ids=seen,
+            return replace(self, seen_observation_ids=seen, seen_attempts=attempts,
                            observations=self.observations + 1,
                            unknown_observations=self.unknown_observations + 1,
                            unknown_cost_observations=self.unknown_cost_observations + 1)
@@ -489,6 +501,7 @@ class UsageAggregate:
             return replace(
                 self,
                 seen_observation_ids=seen,
+                seen_attempts=attempts,
                 observations=self.observations + 1,
                 partial_observations=self.partial_observations + 1,
                 billable_attempts=self.billable_attempts + int(
@@ -506,6 +519,7 @@ class UsageAggregate:
         return replace(
             self,
             seen_observation_ids=seen,
+            seen_attempts=attempts,
             observations=self.observations + 1,
             measured_observations=self.measured_observations
             + int(observation.status is UsageStatus.MEASURED),
@@ -581,18 +595,13 @@ def observe_usage(
     nothing).  Nothing is inferred from prefixes, hashes or prior requests: a
     missing field stays ``None`` and produces an explicit unknown reason.
 
-    ``non_billable`` may only be asserted together with an explicit route label
-    (``non_billable_route``): a bare boolean is untrusted input and could turn an
-    unknown charge into a zero.  The label is carried in ``notes`` so the zero is
-    always attributable to a named route contract.
+    No verified non-billable route authority is available in this adapter. A
+    caller-supplied flag or route label cannot turn an unknown charge into zero.
     """
-    if non_billable:
-        if (not isinstance(non_billable_route, str) or not non_billable_route.strip()
-                or len(non_billable_route) > 128
-                or any(character.isspace() and character != " "
-                       for character in non_billable_route)):
-            raise UsageFieldError(
-                "non-billable status requires an explicit bounded route label")
+    if type(non_billable) is not bool or non_billable or non_billable_route is not None:
+        raise UsageFieldError("non-billable route authority is unavailable")
+    if cost_unknown_reason == CostUnknownReason.NON_BILLABLE:
+        raise UsageFieldError("non-billable route authority is unavailable")
     mode = ApiMode(api_mode)
     outcome = DeliveryOutcome(delivery)
     reasons = list(unknown_reasons)
@@ -784,28 +793,23 @@ def billable_cost_microusd(observation: UsageObservation) -> int | None:
     return observation.estimated_cost_microusd
 
 
-def select_billable(observations: Iterable[UsageObservation]) -> dict[str, UsageObservation]:
-    """Reconcile attempts of one economic request; only delivered attempts bill.
+def select_billable(
+    observations: Iterable[UsageObservation],
+) -> dict[tuple[str, int], UsageObservation]:
+    """Keep every transport attempt for economic reconciliation.
 
-    The first ``DELIVERED`` attempt wins; retries and fallbacks of the same
-    ``request_id`` are superseded, and an uncertain delivery never becomes a
-    second charge.  Non-billable routes are dropped from the billable set.
-
-    The returned observation keeps its own ``cost_state``: an uncertain delivery
-    that never got a delivered fallback stays ``cost_state="unknown"`` with
-    ``actual_cost_microusd=None``.  Use :func:`billable_cost_microusd` to read the
-    cost; never substitute zero for the ``None`` it returns.
+    A delivered retry can be charged separately from an earlier delivered
+    attempt. An uncertain attempt remains unknown even when a later fallback
+    delivers. The caller must reconcile each attempt with provider evidence;
+    this read-only projection never assumes a superseded attempt was free.
     """
-    billable: dict[str, UsageObservation] = {}
+    billable: dict[tuple[str, int], UsageObservation] = {}
     for observation in observations:
         if observation.status is UsageStatus.NON_BILLABLE:
             continue
-        current = billable.get(observation.request_id)
-        if current is None:
-            billable[observation.request_id] = observation
-            continue
-        if current.delivery is DeliveryOutcome.DELIVERED:
-            continue
-        if observation.delivery is DeliveryOutcome.DELIVERED:
-            billable[observation.request_id] = observation
+        key = (observation.request_id, observation.attempt_index)
+        current = billable.get(key)
+        if current is not None and current != observation:
+            raise UsageFieldError("conflicting observation for transport attempt")
+        billable[key] = observation
     return billable

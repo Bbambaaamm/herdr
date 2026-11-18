@@ -111,7 +111,7 @@ def test_timeout_is_unknown_and_never_zero_tokens():
     assert observed.unknown_reasons == ("transport_failed",)
 
 
-def test_retry_superseded_attempt_is_not_billed_twice():
+def test_retry_keeps_both_attempts_and_marks_only_delivered_as_billable():
     first = observe_usage(
         provider="anthropic", model="claude-opus-4-6", api_mode="anthropic_messages",
         request_id="req-5", attempt_index=0, delivery="timeout", usage=None, pricing=PRICING)
@@ -120,16 +120,16 @@ def test_retry_superseded_attempt_is_not_billed_twice():
         request_id="req-5", attempt_index=1,
         usage=load_fixture("anthropic_success.json")["usage"], pricing=PRICING)
     billable = select_billable([first, second])
-    assert list(billable) == ["req-5"]
-    assert billable["req-5"].attempt_index == 1
-    assert billable["req-5"].status is UsageStatus.MEASURED
+    assert set(billable) == {("req-5", 0), ("req-5", 1)}
+    assert billable[("req-5", 0)].cost_state == "unknown"
+    assert billable[("req-5", 1)].status is UsageStatus.MEASURED
     aggregate = UsageAggregate().add(first).add(second)
     assert aggregate.observations == 2
     assert aggregate.measured_observations == 1
     assert aggregate.billable_attempts == 1
 
 
-def test_fallback_supersedes_the_original_route_only_after_delivery():
+def test_fallback_keeps_original_attempt_and_delivered_route():
     original = observe_usage(
         provider="anthropic", model="claude-opus-4-6", api_mode="anthropic_messages",
         request_id="req-6", attempt_index=0, delivery="timeout", usage=None, pricing=PRICING)
@@ -138,11 +138,13 @@ def test_fallback_supersedes_the_original_route_only_after_delivery():
         request_id="req-6", attempt_index=1,
         usage=load_fixture("openai_success.json")["usage"], pricing=PRICING)
     billable = select_billable([original, fallback])
-    assert billable["req-6"].provider == "openai"
-    assert billable["req-6"].status is UsageStatus.MEASURED
+    assert set(billable) == {("req-6", 0), ("req-6", 1)}
+    assert billable[("req-6", 0)].provider == "anthropic"
+    assert billable[("req-6", 1)].provider == "openai"
+    assert billable[("req-6", 1)].status is UsageStatus.MEASURED
 
 
-def test_uncertain_delivery_is_never_counted_as_a_second_charge():
+def test_uncertain_delivery_remains_visible_after_a_delivered_retry():
     uncertain = observe_usage(
         provider="anthropic", model="claude-opus-4-6", api_mode="anthropic_messages",
         request_id="req-7", attempt_index=0, delivery="uncertain_delivery",
@@ -155,8 +157,9 @@ def test_uncertain_delivery_is_never_counted_as_a_second_charge():
     assert uncertain.delivery is DeliveryOutcome.UNCERTAIN
     assert uncertain.unknown_reasons == ("delivery_uncertain",)
     billable = select_billable([uncertain, delivered])
-    assert list(billable) == ["req-7"]
-    assert billable["req-7"].attempt_index == 1
+    assert set(billable) == {("req-7", 0), ("req-7", 1)}
+    assert billable[("req-7", 0)].cost_state == "unknown"
+    assert billable[("req-7", 1)].delivery is DeliveryOutcome.DELIVERED
 
 
 def test_missing_cache_metadata_is_partial_and_explicit():
@@ -176,21 +179,24 @@ def test_missing_cache_metadata_is_partial_and_explicit():
     assert observed.estimated_cost_microusd is None
 
 
-def test_non_billable_route_keeps_a_concrete_zero_and_no_unknown_tokens():
+def test_unverified_non_billable_route_cannot_turn_missing_usage_into_zero():
+    with pytest.raises(UsageFieldError, match="non-billable route authority"):
+        observe_usage(
+            provider="anthropic", model="claude-opus-4-6", api_mode="anthropic_messages",
+            request_id="req-9", usage=None, pricing=PRICING, non_billable=True,
+            non_billable_route="internal-shadow",
+        )
     observed = observe_usage(
         provider="anthropic", model="claude-opus-4-6", api_mode="anthropic_messages",
-        request_id="req-9", usage=None, pricing=PRICING, non_billable=True,
-        non_billable_route="internal-shadow",
+        request_id="req-9", usage=None, pricing=PRICING,
     )
-    assert observed.status is UsageStatus.NON_BILLABLE
-    assert observed.actual_cost_microusd == 0
-    assert observed.estimated_cost_microusd == 0
-    assert observed.cost_unknown_reason is None
-    assert observed.unknown_reasons == ("non_billable_route",)
+    assert observed.status is UsageStatus.UNKNOWN
+    assert observed.actual_cost_microusd is None
+    assert observed.estimated_cost_microusd is None
     aggregate = UsageAggregate().add(observed)
-    assert aggregate.non_billable_observations == 1
+    assert aggregate.unknown_observations == 1
     assert aggregate.input_tokens == 0
-    assert aggregate.unknown_cost_observations == 0
+    assert aggregate.unknown_cost_observations == 1
 
 
 # ------------------------------------------------------------- closed contract
@@ -423,8 +429,8 @@ def test_uncertain_delivery_cost_is_unknown_never_zero():
         request_id="req-uncertain", attempt_index=0, pricing=PRICING,
         usage=usage, delivery=DeliveryOutcome.UNCERTAIN)
     billable = select_billable([uncertain])
-    assert set(billable) == {"req-uncertain"}
-    row = billable["req-uncertain"]
+    assert set(billable) == {("req-uncertain", 0)}
+    row = billable[("req-uncertain", 0)]
     assert row.status is UsageStatus.UNKNOWN
     assert row.cost_state == "unknown"
     assert row.actual_cost_microusd is None
@@ -435,20 +441,19 @@ def test_uncertain_delivery_cost_is_unknown_never_zero():
     assert payload["actual_cost_microusd"] is None
 
 
-def test_billable_cost_helper_keeps_measured_and_non_billable_distinct():
+def test_billable_cost_helper_keeps_measured_and_unknown_distinct():
     usage = {"prompt_tokens": 10, "completion_tokens": 1,
              "prompt_tokens_details": {"cached_tokens": 0},
              "cache_write_tokens": 0}
     measured = observe_usage(
         provider="openai", model="gpt-5.3-codex", api_mode="chat_completions",
         request_id="req-cost-1", pricing=PRICING, usage=usage)
-    non_billable = observe_usage(
+    unknown = observe_usage(
         provider="openai", model="gpt-5.3-codex", api_mode="chat_completions",
-        request_id="req-cost-2", pricing=PRICING, usage=usage, non_billable=True,
-        non_billable_route="internal-shadow")
+        request_id="req-cost-2", pricing=PRICING, usage=None)
     assert billable_cost_microusd(measured) == measured.estimated_cost_microusd
-    assert billable_cost_microusd(non_billable) == 0
-    assert non_billable.cost_state == "non_billable"
+    assert billable_cost_microusd(unknown) is None
+    assert unknown.cost_state == "unknown"
 
 
 def test_uncertain_delivery_never_suppresses_a_delivered_fallback_cost():
@@ -464,14 +469,15 @@ def test_uncertain_delivery_never_suppresses_a_delivered_fallback_cost():
         request_id="req-uncertain-fallback", attempt_index=1, pricing=PRICING,
         usage=usage, delivery=DeliveryOutcome.DELIVERED)
     billable = select_billable([uncertain, delivered])
-    assert billable["req-uncertain-fallback"].delivery is DeliveryOutcome.DELIVERED
-    assert billable_cost_microusd(billable["req-uncertain-fallback"]) == (
+    assert set(billable) == {("req-uncertain-fallback", 0), ("req-uncertain-fallback", 1)}
+    assert billable[("req-uncertain-fallback", 0)].cost_state == "unknown"
+    assert billable[("req-uncertain-fallback", 1)].delivery is DeliveryOutcome.DELIVERED
+    assert billable_cost_microusd(billable[("req-uncertain-fallback", 1)]) == (
         1000 * 3_000_000 + 10 * 15_000_000 + 999_999) // 1_000_000
 
 
-def test_non_billable_requires_an_explicit_route_label():
-    # A bare non_billable boolean is untrusted input: it must not be able to turn
-    # an unknown charge into a concrete zero.
+def test_non_billable_requires_verified_route_authority():
+    # No named route in this adapter is an authenticated non-billable grant.
     with pytest.raises(UsageFieldError):
         observe_usage(provider="openai", model="gpt-5.3-codex",
                       api_mode="chat_completions", request_id="req-nb",
@@ -482,18 +488,36 @@ def test_non_billable_requires_an_explicit_route_label():
                       api_mode="chat_completions", request_id="req-nb",
                       pricing=PRICING, usage={"prompt_tokens": 10, "completion_tokens": 1},
                       non_billable=True, non_billable_route="   ")
+    with pytest.raises(UsageFieldError, match="non-billable route authority"):
+        observe_usage(provider="openai", model="gpt-5.3-codex",
+                      api_mode="chat_completions", request_id="req-nb",
+                      pricing=PRICING, usage=None, non_billable=True,
+                      non_billable_route="internal-shadow", delivery=DeliveryOutcome.UNCERTAIN)
 
 
-def test_non_billable_route_label_is_attributed_in_notes():
-    observed = observe_usage(
-        provider="openai", model="gpt-5.3-codex", api_mode="chat_completions",
-        request_id="req-nb2", pricing=PRICING,
-        usage={"prompt_tokens": 10, "completion_tokens": 1,
-               "prompt_tokens_details": {"cached_tokens": 0}},
-        non_billable=True, non_billable_route="internal-shadow")
-    assert observed.cost_state == "non_billable"
-    assert billable_cost_microusd(observed) == 0
-    assert "non_billable_route=internal-shadow" in observed.notes
+def test_non_billable_cannot_override_positive_cost_or_uncertain_delivery():
+    base = dict(provider="openai", model="gpt-5.3-codex",
+                api_mode="chat_completions", request_id="req-nb2", pricing=PRICING,
+                usage={"prompt_tokens": 10, "completion_tokens": 1,
+                       "prompt_tokens_details": {"cached_tokens": 0},
+                       "cache_write_tokens": 0})
+    with pytest.raises(UsageFieldError, match="non-billable route authority"):
+        observe_usage(**base, actual_cost_microusd=42, non_billable=True,
+                      non_billable_route="internal-shadow")
+    with pytest.raises(UsageFieldError, match="non-billable route authority"):
+        observe_usage(**base, delivery=DeliveryOutcome.UNCERTAIN,
+                      non_billable=True, non_billable_route="internal-shadow")
+    with pytest.raises(UsageFieldError, match="non-billable route authority"):
+        UsageObservation(
+            schema_version="provider-usage-observation-1", provider="openai",
+            model="gpt-5.3-codex", api_mode="chat_completions", request_id="req-nb2",
+            attempt_index=0, delivery=DeliveryOutcome.DELIVERED,
+            status=UsageStatus.NON_BILLABLE, unknown_reasons=("non_billable_route",),
+        )
+    with pytest.raises(UsageFieldError, match="zero cost requires"):
+        observe_usage(**base, actual_cost_microusd=0)
+    with pytest.raises(UsageFieldError, match="non-billable route authority"):
+        observe_usage(**base, cost_unknown_reason=CostUnknownReason.NON_BILLABLE)
 
 
 def test_replayed_observation_is_idempotent():
@@ -517,6 +541,61 @@ def test_replayed_observation_is_idempotent():
                "prompt_tokens_details": {"cached_tokens": 0},
                "cache_write_tokens": 0})
     assert twice.add(other).observations == 2
+
+
+def test_conflicting_observations_for_one_transport_attempt_fail_closed():
+    base = dict(provider="openai", model="gpt-5.3-codex",
+                api_mode="chat_completions", request_id="req-conflict",
+                attempt_index=0, pricing=PRICING,
+                usage={"prompt_tokens": 10, "completion_tokens": 5,
+                       "prompt_tokens_details": {"cached_tokens": 0},
+                       "cache_write_tokens": 0})
+    first = observe_usage(**base, actual_cost_microusd=15)
+    revised = observe_usage(**base, actual_cost_microusd=16)
+    once = UsageAggregate().add(first)
+    assert once.add(first) == once
+    with pytest.raises(UsageFieldError, match="conflicting observation"):
+        once.add(revised)
+    with pytest.raises(UsageFieldError, match="conflicting observation"):
+        select_billable([first, revised])
+
+
+def test_two_delivered_attempts_are_both_retained_independent_of_input_order():
+    base = dict(provider="openai", model="gpt-5.3-codex",
+                api_mode="chat_completions", request_id="req-two-delivered",
+                pricing=PRICING,
+                usage={"prompt_tokens": 10, "completion_tokens": 5,
+                       "prompt_tokens_details": {"cached_tokens": 0},
+                       "cache_write_tokens": 0})
+    first = observe_usage(**base, attempt_index=0, actual_cost_microusd=15)
+    second = observe_usage(**base, attempt_index=1, actual_cost_microusd=20)
+    selected = select_billable([first, second])
+    assert selected == select_billable([second, first])
+    assert set(selected) == {("req-two-delivered", 0), ("req-two-delivered", 1)}
+    aggregate = UsageAggregate().add(selected[("req-two-delivered", 0)]).add(
+        selected[("req-two-delivered", 1)])
+    assert aggregate.billable_attempts == 2
+    assert aggregate.actual_cost_microusd == 35
+
+
+def test_uncertain_attempt_remains_unknown_after_known_cost_fallback():
+    base = dict(provider="openai", model="gpt-5.3-codex",
+                api_mode="chat_completions", request_id="req-uncertain-known",
+                pricing=PRICING)
+    uncertain = observe_usage(**base, attempt_index=0,
+                              delivery=DeliveryOutcome.UNCERTAIN)
+    delivered = observe_usage(
+        **base, attempt_index=1, actual_cost_microusd=15,
+        usage={"prompt_tokens": 10, "completion_tokens": 5,
+               "prompt_tokens_details": {"cached_tokens": 0},
+               "cache_write_tokens": 0})
+    selected = select_billable([uncertain, delivered])
+    assert set(selected) == {("req-uncertain-known", 0), ("req-uncertain-known", 1)}
+    aggregate = UsageAggregate().add(selected[("req-uncertain-known", 0)]).add(
+        selected[("req-uncertain-known", 1)])
+    assert aggregate.actual_cost_microusd == 15
+    assert aggregate.unknown_cost_observations == 1
+    assert aggregate.unknown_observations == 1
 
 
 def test_from_json_rejects_tampered_derived_fields():

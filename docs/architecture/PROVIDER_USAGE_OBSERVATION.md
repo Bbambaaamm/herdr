@@ -52,12 +52,12 @@ never invents a rate and never invents a cost.
   existing `PricingRegistry` (`from_registry`) or supplied by the caller.
 - `DeliveryOutcome`: `DELIVERED`, `TIMEOUT`, `RETRY_SUPERSEDED`,
   `FALLBACK_SUPERSEDED`, `UNCERTAIN`, `FAILED`.
-- `UsageAggregate`: per-task projection that keeps unknown and non-billable
-  separate from measured totals.
+- `UsageAggregate`: per-task projection that keeps unknown separate from measured
+  totals and rejects conflicting observations for one transport attempt.
 - `observe_usage(...)`: the single normalization entry point.
-- `select_billable(...)`: reconciles attempts of one economic `request_id`;
-  only a `DELIVERED` attempt bills, so retries/fallbacks/uncertain delivery are
-  never charged twice.
+- `select_billable(...)`: returns observations keyed by
+  `(request_id, attempt_index)`; every delivered attempt and unresolved delivery
+  state remains visible. Conflicting records for one attempt fail closed.
 - `billable_cost_microusd(...)`: returns a known cost or `None`. `None` is the only
   representation of an unknown cost; it must never be coerced to zero.
 
@@ -72,8 +72,9 @@ Invariants enforced in `__post_init__`:
    the directly reported output and cache buckets remain valid evidence.
 3. `UNKNOWN` carries no token buckets and an explicit reason.  Malformed evidence
    (`provider_malformed`) always degrades the whole observation to `UNKNOWN`.
-4. `NON_BILLABLE` is the only status that may carry a concrete zero cost, and only
-   with `non_billable_route`.
+4. `NON_BILLABLE` remains a reserved schema status. The adapter currently rejects
+   it because no verified route authority is available. A caller-supplied route
+   label cannot establish a concrete zero cost.
 5. A cache bucket that exceeds the provider-reported input total is malformed
    evidence, not a clamped number.  The comparison is against that total: the
    chat/codex prompt total, and `input + cache_read + cache_write` for Anthropic.
@@ -90,8 +91,9 @@ Invariants enforced in `__post_init__`:
 `anthropic_success.json`, `openai_success.json`, `codex_success.json`,
 `anthropic_missing_cache.json` — synthetic provider JSON covering successful
 calls and missing cache metadata. The scenarios timeout, retry, fallback,
-uncertain delivery and non-billable are produced by the adapter's
-`DeliveryOutcome` / `non_billable` inputs, not by network fixtures.
+uncertain delivery is produced by the adapter's `DeliveryOutcome` input, not by
+network fixtures. A non-billable fixture is deliberately rejected until a
+verified route authority exists.
 
 ## 5. Boundaries (unchanged)
 
@@ -126,16 +128,16 @@ uncertain delivery and non-billable are produced by the adapter's
   cache_read*cache_read_rate + cache_write*cache_write_rate + output*output_rate`.
   Parametric tests cover cache hit 0 % / 50 % / 90 % / 100 % for chat, codex and
   Anthropic, including Anthropic cache-write.
-- **Uncertain delivery is never a zero.** `select_billable` keeps the first
-  `DELIVERED` attempt per `request_id`; an uncertain attempt without a delivered
-  fallback stays `cost_state="unknown"` with `actual_cost_microusd=None`.
-  `billable_cost_microusd()` returns `None` for it — never `0`.
-- **Non-billable requires a named route.** `observe_usage(..., non_billable=True)`
-  is rejected unless `non_billable_route` is supplied; the label is recorded in
-  `notes`. A bare boolean cannot turn an unknown charge into a concrete zero.
-- **Idempotent projection.** `UsageAggregate.add()` deduplicates on the derived
-  `observation_id`; replaying the same evidence event is a no-op, so a replayed
-  ledger entry cannot inflate token or cost totals. No second budget settlement
-  is introduced.
+- **Uncertain delivery is never a zero.** An uncertain attempt remains in
+  `select_billable` alongside any later delivered attempt. Its cost stays
+  unknown until provider evidence resolves it; the later attempt cannot erase it.
+- **Non-billable needs verified route authority.** Neither a boolean nor a
+  caller-supplied route name proves that a provider waived the charge. The
+  adapter rejects both, and also rejects direct `NON_BILLABLE` records, until an
+  existing host authority can supply a verifiable route contract.
+- **Idempotent projection.** `UsageAggregate.add()` treats
+  `(request_id, attempt_index)` as transport identity. Identical replay is a
+  no-op; different content for the same identity is a conflict, never a second
+  token or cost addition. No second budget settlement is introduced.
 - **Derived fields are not trusted input.** `from_json` recomputes `coverage` and
   `cost_state` and rejects a payload whose supplied values disagree.
