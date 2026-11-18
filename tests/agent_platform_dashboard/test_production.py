@@ -1089,9 +1089,12 @@ def test_herdr_sanitizer_skips_unnamed_agent_entries():
 
 def test_herdr_sanitizer_still_fails_closed_when_configured_agent_is_unnamed():
     # Skipping unnamed entries must not weaken the binding contract: a configured
-    # binding that has no matching named row still fails closed.
+    # binding that has no matching named row still fails closed. The entry omits
+    # the name key entirely, exactly like the live entry that caused exit 78, so
+    # this test also fails on the pre-fix KeyError instead of only on the
+    # coverage check.
     raw = dict(id='cli:agent:list', result=dict(type='agent_list', agents=[
-        dict(name=None, pane_id='p1'),
+        dict(pane_id='p1'),
     ]))
     with pytest.raises(ValueError):
         sanitize(json.dumps(raw).encode(), 100,
