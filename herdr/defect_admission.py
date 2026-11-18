@@ -435,6 +435,20 @@ class DecisionJournal:
                 return {"deduplicated": True, "denied": False,
                         "reason": "ALLOWED",
                         "detail": "gate already allowed this defect"}
+            # Reconcile against #8's own durable record first: a crash between
+            # the gate's ALLOW write and this journal's verdict write leaves no
+            # verdict here, and asking again would spawn the same repair twice.
+            if control.has_allow(identity, spec):
+                self._append_locked({
+                    "event": self.EVENT_GATE,
+                    "fingerprint": decision.fingerprint,
+                    "commit_sha": decision.commit_sha,
+                    "denied": False,
+                    "reason": "RECONCILED",
+                })
+                return {"deduplicated": True, "denied": False,
+                        "reason": "RECONCILED",
+                        "detail": "gate already allowed this defect in its own audit log"}
             verdict = control.check(identity, spec, usage, tools)
             reason = getattr(verdict, "reason", None)
             reason_text = str(reason) if reason is not None else "ALLOWED"

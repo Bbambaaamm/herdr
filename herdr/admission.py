@@ -336,6 +336,40 @@ class AdmissionControl:
         return decision
 
     # -- public API -------------------------------------------------------- #
+    @staticmethod
+    def _audit_ctx(identity: AgentIdentity, spec: TaskGraphSpec,
+                   child_tools: Sequence[str]) -> dict[str, object]:
+        return {
+            "role": identity.role,
+            "repo": identity.repo,
+            "issue": identity.issue,
+            "node_count": spec.node_count,
+            "max_depth": spec.max_depth,
+            "max_fanout": spec.max_fanout,
+            "child_tools_count": len(child_tools),
+        }
+
+    def has_allow(self, identity: AgentIdentity, spec: TaskGraphSpec) -> bool:
+        """True when this gate already durably recorded an ALLOW for this proposal.
+
+        Read-only reconciliation for a crash between the gate decision and the
+        caller's own verdict write: the two logs are not one transaction, so a
+        redelivery must consult #8's durable record before asking again.
+        """
+        if self.audit_log is None:
+            return False
+        for row in self.audit_log.replay():
+            if row.get("event") != "allow":
+                continue
+            if (row.get("admit:role") == identity.role
+                    and row.get("admit:repo") == identity.repo
+                    and row.get("admit:issue") == identity.issue
+                    and row.get("admit:node_count") == spec.node_count
+                    and row.get("admit:max_depth") == spec.max_depth
+                    and row.get("admit:max_fanout") == spec.max_fanout):
+                return True
+        return False
+
     def check(
         self,
         identity: AgentIdentity,
@@ -349,15 +383,7 @@ class AdmissionControl:
         DenyDecision; success returns an AllowDecision. A planner cannot bypass
         limits by emitting a larger graph.
         """
-        audit_ctx = {
-            "role": identity.role,
-            "repo": identity.repo,
-            "issue": identity.issue,
-            "node_count": spec.node_count,
-            "max_depth": spec.max_depth,
-            "max_fanout": spec.max_fanout,
-            "child_tools_count": len(child_tools),
-        }
+        audit_ctx = self._audit_ctx(identity, spec, child_tools)
 
         # 1. Planner/graph limits — malformed dimensions fail closed.
         if spec.node_count <= 0 or spec.max_depth <= 0 or spec.max_fanout < 0:

@@ -154,14 +154,13 @@ is a pure translator between them and adds no authority:
   backup and worker incidents belong to their own operational owners and are
   never routed into a repair backlog.
 - `defect_from_observation()` derives `commit_sha` from the #100 `head` fact
-  and requires a caller-supplied `check_id`: the stable identity of the
-  *defined* check, taken from #100's durable record. The bridge will not invent
-  one. #100 exposes no such id today — its `job_id` is a per-run instance and
-  its `correlation_id` covers the whole group — so a missing or malformed
-  `check_id` refuses the translation rather than silently changing what "the
-  same defect" means (either fragmenting one red PR or collapsing two distinct
-  checks). Only an open observation reporting an actual `CI_FAILURE` is a
-  defect.
+  and uses #100's own `correlation_id` as the finding identity — computed from
+  #100's pinned (source, scope, subject) payload, so it is verifiable, stable and
+  exactly #100's correlation granularity. No caller-chosen string is used as
+  identity. #100 publishes no finer stable id today (`job_id` is a per-run
+  instance), so distinct jobs inside one workflow are one defect; a finer split
+  needs #100 to publish the workflow job definition id. Only an open observation
+  reporting an actual `CI_FAILURE` is a defect.
 - `repair_tools()` reuses `ROLE_TOOL_ALLOWLIST["writer"]`; `git_push`,
   `deploy` and `git_merge` stay out of reach.
 - `task_graph_spec()` is a single-node plan; `AdmissionControl` still applies
@@ -177,6 +176,11 @@ is a pure translator between them and adds no authority:
   later ALLOW replaces an older DENY, so the durable last word is never a stale
   denial. The claim, the gate call and the verdict write share one advisory
   lock, so concurrent deliveries of one defect cannot both reach the gate.
+- Before asking again, the journal reconciles with the gate's own durable audit
+  log (`AdmissionControl.has_allow`): an ALLOW recorded there with no verdict
+  here is a crash between the two writes, and is deduplicated rather than
+  re-requested. The two logs are not one transaction, so this is the only place
+  the crash window is closed.
 - The defect gate's own verdict is authoritative for its disposition: a
   BLOCKED defect stays blocked even if an earlier delivery of the same
   fingerprint was allowed by the swarm gate.
