@@ -455,6 +455,63 @@ def test_reconciliation_requires_the_same_tool_set(tmp_path):
     assert len((tmp_path / "admission.jsonl").read_text(encoding="utf-8").splitlines()) == 2
 
 
+def test_reconciliation_requires_the_same_policy_identity(tmp_path):
+    """E4 r13: paper-only mode and parent authority are part of the ALLOW."""
+    gate = control(tmp_path)
+    strict = agent_identity(defect(), paper_only=False)
+    identity, spec = agent_identity(defect()), task_graph_spec()
+    tools = tuple(sorted(repair_tools()))
+    gate.check(identity, spec, host_usage(), tools)  # paper_only=True
+    assert len((tmp_path / "admission.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+    verdict = journal(tmp_path).evaluate(
+        decide_defect_admission(defect(), context()),
+        control=gate, usage=host_usage(), spec=spec, identity=strict, tools=tools,
+    )
+    assert verdict["deduplicated"] is False
+    assert verdict["denied"] is True
+    assert len((tmp_path / "admission.jsonl").read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_reconciliation_requires_the_same_parent_authority(tmp_path):
+    gate = control(tmp_path)
+    identity, spec = agent_identity(defect()), task_graph_spec()
+    tools = tuple(sorted(repair_tools()))
+    gate.check(identity, spec, host_usage(), tools)
+    delegated = agent_identity(defect(), parent_role="writer")
+    verdict = journal(tmp_path).evaluate(
+        decide_defect_admission(defect(), context()),
+        control=gate, usage=host_usage(), spec=spec, identity=delegated, tools=tools,
+    )
+    assert verdict["deduplicated"] is False
+    assert len((tmp_path / "admission.jsonl").read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_incomplete_older_audit_row_is_not_evidence(tmp_path):
+    """An ALLOW recorded before these fields existed must not reconcile."""
+    path = tmp_path / "admission.jsonl"
+    path.write_text(
+        '{"event": "allow", "admit:role": "writer", "admit:repo": "'
+        + PROJECT
+        + '", "admit:issue": "defect-'
+        + defect().fingerprint[:12]
+        + '"}\n',
+        encoding="utf-8",
+    )
+    gate = AdmissionControl(
+        budget=PlanBudget(),
+        audit_log=AuditLog(str(path)),
+        consumer_policy_hook=quantlab_paper_policy,
+    )
+    identity, spec = agent_identity(defect()), task_graph_spec()
+    tools = tuple(sorted(repair_tools()))
+    assert gate.has_allow(identity, spec, tools) is False
+    verdict = journal(tmp_path).evaluate(
+        decide_defect_admission(defect(), context()),
+        control=gate, usage=host_usage(), spec=spec, identity=identity, tools=tools,
+    )
+    assert verdict["deduplicated"] is False
+
+
 def test_blocked_disposition_is_a_defect_gate_denial(tmp_path):
     decision = decide_defect_admission(defect(), context(budget_state="EXHAUSTED"))
     assert decision.disposition.value == "BLOCKED"

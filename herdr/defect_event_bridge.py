@@ -129,18 +129,20 @@ def task_graph_spec() -> TaskGraphSpec:
     return TaskGraphSpec(node_count=1, max_depth=1, max_fanout=0)
 
 
-def agent_identity(defect: DefectObservation) -> AgentIdentity:
+def agent_identity(defect: DefectObservation, **overrides) -> AgentIdentity:
     """Identity for the repair proposal, derived from the defect identity."""
     if type(defect) is not DefectObservation:
         raise DefectError("not a defect observation")
-    return AgentIdentity(
-        role="writer",
-        repo=defect.repository,
-        issue=f"defect-{defect.fingerprint[:12]}",
-        parent_role=None,
-        parent_tools=frozenset(),
-        paper_only=True,
-    )
+    payload = {
+        "role": "writer",
+        "repo": defect.repository,
+        "issue": f"defect-{defect.fingerprint[:12]}",
+        "parent_role": None,
+        "parent_tools": frozenset(),
+        "paper_only": True,
+    }
+    payload.update(overrides)
+    return AgentIdentity(**payload)
 
 
 def admission_proposal(

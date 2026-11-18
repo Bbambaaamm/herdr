@@ -181,12 +181,14 @@ is a pure translator between them and adds no authority:
   denial. The claim, the gate call and the verdict write share one advisory
   lock, so concurrent deliveries of one defect cannot both reach the gate.
 - Before asking again, the journal reconciles with the gate's own durable audit
-  log (`AdmissionControl.has_allow`), comparing identity, graph dimensions **and
-  the exact tool set**: a narrower earlier ALLOW can never be reconciled as
-  authority for a wider request. An ALLOW recorded there with no verdict here is
-  a crash between the two writes, and is deduplicated rather than re-requested.
-  The two logs are not one transaction, so this is the only place the crash
-  window is closed.
+  log (`AdmissionControl.has_allow`), comparing the whole policy identity —
+  role/repo/issue, `paper_only`, parent role and parent tools, graph dimensions
+  **and the exact tool set**. A narrower earlier ALLOW can never be reconciled as
+  authority for a wider request, and an audit row predating any of these fields is
+  skipped rather than treated as evidence. An ALLOW recorded there with no
+  verdict here is a crash between the two writes, and is deduplicated rather than
+  re-requested. The two logs are not one transaction, so this is the only place
+  the crash window is closed.
 - The defect gate's own verdict is authoritative for its disposition: a
   BLOCKED defect stays blocked even if an earlier delivery of the same
   fingerprint was allowed by the swarm gate.
