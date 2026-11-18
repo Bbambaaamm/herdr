@@ -438,7 +438,7 @@ class DecisionJournal:
             # Reconcile against #8's own durable record first: a crash between
             # the gate's ALLOW write and this journal's verdict write leaves no
             # verdict here, and asking again would spawn the same repair twice.
-            if control.has_allow(identity, spec):
+            if control.has_allow(identity, spec, tools):
                 self._append_locked({
                     "event": self.EVENT_GATE,
                     "fingerprint": decision.fingerprint,

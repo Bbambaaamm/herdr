@@ -153,14 +153,18 @@ is a pure translator between them and adds no authority:
   `Source.CI` / `CI_VALIDATION_FAILED` observation is a code defect. Capacity,
   backup and worker incidents belong to their own operational owners and are
   never routed into a repair backlog.
-- `defect_from_observation()` derives `commit_sha` from the #100 `head` fact
-  and uses #100's own `correlation_id` as the finding identity — computed from
-  #100's pinned (source, scope, subject) payload, so it is verifiable, stable and
-  exactly #100's correlation granularity. No caller-chosen string is used as
-  identity. #100 publishes no finer stable id today (`job_id` is a per-run
-  instance), so distinct jobs inside one workflow are one defect; a finer split
-  needs #100 to publish the workflow job definition id. Only an open observation
-  reporting an actual `CI_FAILURE` is a defect.
+- `defect_from_observation()` returns `None` for anything that is not an open
+  CI failure, and **refuses** (raises) for a real CI failure whose defect
+  identity it cannot establish. #100 publishes no stable identity of the
+  *defined* check: its `job_id` is a per-run instance, its per-run evidence
+  digest changes on every run, and its `correlation_id` covers the whole
+  (source, scope, subject) group. None of those identifies one CI defect — the
+  first two fragment a red PR into N records, the third silently collapses N
+  distinct failing checks into one and would dedup away a second, unrelated
+  error. `admission_proposal` reports this as
+  `eligible=False, reason="unverified-check-identity"` and writes nothing.
+  **This is a hard, open dependency on #100**: the bridge becomes useful the day
+  #100 publishes a stable per-check identity.
 - `repair_tools()` reuses `ROLE_TOOL_ALLOWLIST["writer"]`; `git_push`,
   `deploy` and `git_merge` stay out of reach.
 - `task_graph_spec()` is a single-node plan; `AdmissionControl` still applies
@@ -177,10 +181,12 @@ is a pure translator between them and adds no authority:
   denial. The claim, the gate call and the verdict write share one advisory
   lock, so concurrent deliveries of one defect cannot both reach the gate.
 - Before asking again, the journal reconciles with the gate's own durable audit
-  log (`AdmissionControl.has_allow`): an ALLOW recorded there with no verdict
-  here is a crash between the two writes, and is deduplicated rather than
-  re-requested. The two logs are not one transaction, so this is the only place
-  the crash window is closed.
+  log (`AdmissionControl.has_allow`), comparing identity, graph dimensions **and
+  the exact tool set**: a narrower earlier ALLOW can never be reconciled as
+  authority for a wider request. An ALLOW recorded there with no verdict here is
+  a crash between the two writes, and is deduplicated rather than re-requested.
+  The two logs are not one transaction, so this is the only place the crash
+  window is closed.
 - The defect gate's own verdict is authoritative for its disposition: a
   BLOCKED defect stays blocked even if an earlier delivery of the same
   fingerprint was allowed by the swarm gate.

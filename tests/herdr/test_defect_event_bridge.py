@@ -2,9 +2,17 @@
 
 Every proposal here ends at the EXISTING AdmissionControl; none of these tests
 dispatch work, spend budget, or write outside their own tmp_path audit sink.
+
+The bridge's translation is deliberately REFUSING today: #100 publishes no
+stable identity of the *defined* CI check, so a CI observation cannot be
+identified as one defect.  The durable journal and the gate underneath are
+still exercised directly, because they must be correct the day #100 publishes
+that identity.
 """
 
 from __future__ import annotations
+
+import threading
 
 import pytest
 
@@ -15,6 +23,7 @@ from herdr.defect_admission import (
     DefectContext,
     DefectError,
     DefectObservation,
+    DefectSource,
     decide_defect_admission,
 )
 from herdr.defect_event_bridge import (
@@ -66,6 +75,11 @@ def ci_observation(**overrides):
     return Observation(**payload)
 
 
+def envelope(observation=None):
+    """Build a #100 envelope the way ``correlate`` does from the durable log."""
+    return next(iter(correlate([ci_observation() if observation is None else observation])))
+
+
 def context(**overrides):
     payload = {
         "repository_authorized": True,
@@ -81,12 +95,35 @@ def context(**overrides):
     return DefectContext(**payload)
 
 
+def defect(**overrides):
+    payload = {
+        "source": DefectSource.CI_CHECK,
+        "category": DefectCategory.VALIDATION_FAILURE,
+        "repository": PROJECT,
+        "commit_sha": HEAD,
+        "ref": "refs/pull/237/head",
+        "subject": ("pr-237", "workflow-12345"),
+        "finding_identity": "ci-12345",
+        "workflow": "12345",
+        "check_run_id": "11",
+        "event_revision": "rev-1",
+        "observed_at": 1_700_000_000,
+        "evidence_sha256": (EVIDENCE,),
+    }
+    payload.update(overrides)
+    return DefectObservation(**payload)
+
+
 def control(tmp_path):
     return AdmissionControl(
         budget=PlanBudget(),
         audit_log=AuditLog(str(tmp_path / "admission.jsonl")),
         consumer_policy_hook=quantlab_paper_policy,
     )
+
+
+def journal(tmp_path):
+    return DecisionJournal(AuditLog(str(tmp_path / "defect.jsonl")))
 
 
 def host_usage(**overrides):
@@ -107,18 +144,22 @@ def host_usage(**overrides):
     return ResourceUsage(**payload)
 
 
-# --- translation ----------------------------------------------------------- #
+def repair_identity(defect_observation):
+    return (
+        agent_identity(defect_observation),
+        task_graph_spec(),
+        tuple(sorted(repair_tools())),
+    )
 
 
-def test_open_ci_observation_translates_to_a_defect():
-    defect = defect_from_observation(ci_observation())
-    assert isinstance(defect, DefectObservation)
-    assert defect.source.value == "github-actions-check"
-    assert defect.category is DefectCategory.VALIDATION_FAILURE
-    assert defect.repository == PROJECT
-    assert defect.commit_sha == HEAD
-    assert defect.ref == "refs/pull/237/head"
-    assert defect.finding_identity == ci_observation().correlation_id
+# --- translation: refusing rather than guessing ----------------------------- #
+
+
+def test_open_ci_failure_is_refused_without_a_stable_check_identity():
+    """#100 publishes no stable per-check id, so the bridge must not guess one."""
+    with pytest.raises(DefectError) as raised:
+        defect_from_observation(ci_observation())
+    assert "stable check identity" in str(raised.value)
 
 
 def test_resolved_ci_observation_is_not_a_defect():
@@ -161,19 +202,23 @@ def test_capacity_incident_is_not_routed_to_a_repair_backlog():
     assert DEFECT_CATEGORY.get((Source.CAPACITY, IncidentType.CAPACITY_BELOW_FLOOR)) is None
 
 
+def test_open_success_is_a_contradictory_record_not_a_defect():
+    assert defect_from_observation(ci_observation(detail=Detail.CI_SUCCESS)) is None
+
+
+def test_open_skipped_is_not_a_defect():
+    assert defect_from_observation(ci_observation(detail=Detail.CI_SKIPPED)) is None
+
+
 def test_missing_ci_facts_are_rejected_not_guessed():
     observation = ci_observation(facts=(("run_id", 11), ("job_id", 22)))
     with pytest.raises(DefectError):
         defect_from_observation(observation)
 
 
-def test_open_success_is_a_contradictory_record_not_a_defect():
-    observation = ci_observation(detail=Detail.CI_SUCCESS)
-    assert defect_from_observation(observation) is None
-
-
-def test_open_skipped_is_not_a_defect():
-    assert defect_from_observation(ci_observation(detail=Detail.CI_SKIPPED)) is None
+def test_short_ci_subject_is_rejected():
+    with pytest.raises(DefectError):
+        defect_from_observation(ci_observation(subject=("237",)))
 
 
 def test_non_observation_input_is_rejected():
@@ -181,93 +226,27 @@ def test_non_observation_input_is_rejected():
         defect_category(object())
 
 
-def test_open_state_is_the_only_defect_state():
+def test_only_open_ci_failure_maps_to_a_defect_category():
     assert defect_category(ci_observation()) is DefectCategory.VALIDATION_FAILURE
     assert defect_category(ci_observation(state=State.RESOLVED)) is None
 
 
-# --- identity -------------------------------------------------------------- #
+# --- proposal contract ----------------------------------------------------- #
 
 
-def test_repeated_run_of_one_check_is_one_defect():
-    first = defect_from_observation(ci_observation(facts=(("head", HEAD), ("run_id", 11), ("job_id", 22))))
-    second = defect_from_observation(ci_observation(facts=(("head", HEAD), ("run_id", 999), ("job_id", 22))))
-    assert first.fingerprint == second.fingerprint
-    # Delivery identity still differs, so dedup keeps a separate event row.
-    assert first.deduplication_id != second.deduplication_id
-
-
-def test_two_job_instances_of_one_workflow_are_one_defect():
-    """job_id is a per-run instance id; it must not fragment one red PR."""
-    first = defect_from_observation(ci_observation(facts=(("head", HEAD), ("run_id", 11), ("job_id", 22))))
-    second = defect_from_observation(ci_observation(facts=(("head", HEAD), ("run_id", 11), ("job_id", 23))))
-    assert first.fingerprint == second.fingerprint
-
-
-def test_two_workflows_on_one_pr_are_two_defects():
-    first = defect_from_observation(ci_observation(subject=("237", "12345")))
-    second = defect_from_observation(ci_observation(subject=("237", "67890")))
-    assert first.fingerprint != second.fingerprint
-
-
-def test_new_revision_of_one_check_is_the_same_defect():
-    first = defect_from_observation(ci_observation(revision="rev-1"))
-    second = defect_from_observation(ci_observation(revision="rev-2"))
-    assert first.fingerprint == second.fingerprint
-    assert first.deduplication_id != second.deduplication_id
-
-
-# --- proposal shape -------------------------------------------------------- #
-
-
-def test_repair_tools_reuse_the_writer_allowlist_without_operator_tools():
-    tools = repair_tools()
-    assert "patch" in tools and "write_file" in tools
-    assert "git_push" not in tools and "deploy" not in tools and "git_merge" not in tools
-
-
-def test_task_graph_spec_is_a_single_node_plan():
-    spec = task_graph_spec()
-    assert spec.node_count == 1 and spec.max_depth == 1 and spec.max_fanout == 0
-
-
-def test_identity_is_paper_only_and_bound_to_the_repository():
-    identity = agent_identity(defect_from_observation(ci_observation()))
-    assert identity.role == "writer"
-    assert identity.repo == PROJECT
-    assert identity.paper_only is True
-    assert identity.parent_role is None
-
-
-def test_identity_input_is_validated():
-    with pytest.raises(DefectError):
-        agent_identity(object())
-
-
-# --- end to end against the existing gate ---------------------------------- #
-
-
-def journal(tmp_path):
-    return DecisionJournal(AuditLog(str(tmp_path / "defect.jsonl")))
-
-
-def envelope(observation=None):
-    """Build a #100 envelope the way ``correlate`` does from the durable log."""
-    return next(iter(correlate([ci_observation() if observation is None else observation])))
-
-
-def test_admit_path_never_authorizes_execution(tmp_path):
+def test_proposal_refuses_ci_until_a_stable_check_identity_exists(tmp_path):
     proposal = admission_proposal(
         envelope(), context(), control(tmp_path), host_usage(),
-        pin=EVIDENCE, journal=journal(tmp_path))
-    assert proposal["eligible"] is True
-    assert proposal["disposition"] == "ADMIT"
-    assert proposal["deduplicated"] is False
+        pin=EVIDENCE, journal=journal(tmp_path),
+    )
+    assert proposal["eligible"] is False
+    assert proposal["reason"] == "unverified-check-identity"
     assert proposal["authorizes_execution"] is False
     assert proposal["task_proposals_submitted"] == 0
     assert proposal["budget_operations"] == 0
-    # #8 is the only gate that may allow a spawn, and it did.
-    assert proposal["admission"]["denied"] is False
+    # refused before anything is written anywhere
+    assert not (tmp_path / "admission.jsonl").exists()
+    assert not (tmp_path / "defect.jsonl").exists()
 
 
 def test_non_defect_observation_is_not_eligible(tmp_path):
@@ -286,225 +265,150 @@ def test_non_defect_observation_is_not_eligible(tmp_path):
     )
     proposal = admission_proposal(
         envelope(observation), context(), control(tmp_path), host_usage(),
-        pin="c" * 64, journal=journal(tmp_path))
+        pin="c" * 64, journal=journal(tmp_path),
+    )
     assert proposal["eligible"] is False
+    assert proposal["reason"] == "not-a-code-defect"
     assert proposal["authorizes_execution"] is False
     assert not (tmp_path / "defect.jsonl").exists()
 
 
-def test_redelivery_is_deduplicated_before_the_swarm_gate(tmp_path):
-    """E4 round 8 P1-1: a redelivered event must not re-enter the gate."""
-    first = admission_proposal(
-        envelope(), context(), control(tmp_path), host_usage(),
-        pin=EVIDENCE, journal=journal(tmp_path))
-    second = admission_proposal(
-        envelope(), context(), control(tmp_path), host_usage(),
-        pin=EVIDENCE, journal=journal(tmp_path))
-    assert first["admission"]["denied"] is False
-    assert second["deduplicated"] is True
-    assert second["admission"]["denied"] is False
-    # exactly one swarm-gate decision; the defect log holds decision + verdict
-    rows = (tmp_path / "admission.jsonl").read_text(encoding="utf-8").splitlines()
-    assert len(rows) == 1
-    defect_rows = (tmp_path / "defect.jsonl").read_text(encoding="utf-8").splitlines()
-    assert len(defect_rows) == 2
-
-
-def test_forged_gate_is_rejected(tmp_path):
-    with pytest.raises(DefectError):
-        admission_proposal(
-            envelope(), context(), object(), host_usage(),
-            pin=EVIDENCE, journal=journal(tmp_path))
-
-
-def test_missing_journal_is_rejected(tmp_path):
-    with pytest.raises(DefectError):
-        admission_proposal(
-            envelope(), context(), control(tmp_path), host_usage(),
-            pin=EVIDENCE, journal=None)
-
-
-def test_unpinned_observation_is_rejected(tmp_path):
-    with pytest.raises(DefectError):
-        admission_proposal(
-            envelope(), context(), control(tmp_path), host_usage(),
-            pin="e" * 64, journal=journal(tmp_path))
-
-
-def test_defect_gate_denial_is_propagated_without_consulting_the_swarm_gate(tmp_path):
-    proposal = admission_proposal(
-        envelope(), context(budget_state="EXHAUSTED"), control(tmp_path), host_usage(),
-        pin=EVIDENCE, journal=journal(tmp_path))
-    assert proposal["disposition"] == "BLOCKED"
-    assert proposal["admission"]["denied"] is True
-    assert proposal["admission"]["reason"] == "defect-admission"
-
-
-def test_swarm_gate_denial_is_propagated(tmp_path):
-    proposal = admission_proposal(
-        envelope(), context(), control(tmp_path), host_usage(active_agents=4),
-        pin=EVIDENCE, journal=journal(tmp_path))
-    assert proposal["admission"]["denied"] is True
-    assert proposal["admission"]["reason"] == "global_agent_limit"
-
-
-def test_existing_gate_audits_its_own_decision(tmp_path):
-    admission_proposal(
-        envelope(), context(), control(tmp_path), host_usage(),
-        pin=EVIDENCE, journal=journal(tmp_path))
-    rows = (tmp_path / "admission.jsonl").read_text(encoding="utf-8").splitlines()
-    assert len(rows) == 1
-    assert '"event": "allow"' in rows[0]
-    defect_rows = (tmp_path / "defect.jsonl").read_text(encoding="utf-8").splitlines()
-    assert len(defect_rows) == 2
-
-
-def test_denied_defect_never_reaches_the_swarm_gate(tmp_path):
-    admission_proposal(
-        envelope(), context(budget_state="EXHAUSTED"), control(tmp_path), host_usage(),
-        pin=EVIDENCE, journal=journal(tmp_path))
-    assert not (tmp_path / "admission.jsonl").exists()
-    # but the durable defect decision is still recorded
-    assert len((tmp_path / "defect.jsonl").read_text(encoding="utf-8").splitlines()) == 1
-
-
-# --- E4 round 9 ------------------------------------------------------------ #
-
-
-def test_bare_observation_is_not_an_envelope(tmp_path):
-    """E4 r9 P1-3: the bridge input must be a #100 envelope, not a bare value."""
+def test_proposal_requires_a_100_envelope(tmp_path):
     with pytest.raises(DefectError):
         admission_proposal(
             ci_observation(), context(), control(tmp_path), host_usage(),
-            pin=EVIDENCE, journal=journal(tmp_path))
+            pin=EVIDENCE, journal=journal(tmp_path),
+        )
 
 
-def test_denied_gate_verdict_is_retryable(tmp_path):
-    """E4 r9 P1-1: a gate denial must not wedge the repair forever."""
-    first = admission_proposal(
-        envelope(), context(), control(tmp_path), host_usage(active_agents=4),
-        pin=EVIDENCE, journal=journal(tmp_path))
-    assert first["admission"]["denied"] is True
-    assert first["deduplicated"] is False
-    # capacity frees up: the same defect is evaluated again
-    second = admission_proposal(
-        envelope(), context(), control(tmp_path), host_usage(),
-        pin=EVIDENCE, journal=journal(tmp_path))
-    assert second["deduplicated"] is False
-    assert second["admission"]["denied"] is False
-    assert len((tmp_path / "admission.jsonl").read_text(encoding="utf-8").splitlines()) == 2
+def test_proposal_requires_the_real_gate(tmp_path):
+    with pytest.raises(DefectError):
+        admission_proposal(
+            envelope(), context(), object(), host_usage(),
+            pin=EVIDENCE, journal=journal(tmp_path),
+        )
 
 
-def test_pending_gate_verdict_is_retryable(tmp_path):
-    """E4 r9 P1-1: a crash before the gate must not wedge the repair."""
-    defect = defect_from_observation(ci_observation())
-    decision = decide_defect_admission(defect, context())
-    journal(tmp_path).record(decision)
-    assert journal(tmp_path).gate_outcome(decision) is None
+def test_proposal_requires_a_journal(tmp_path):
+    with pytest.raises(DefectError):
+        admission_proposal(
+            envelope(), context(), control(tmp_path), host_usage(),
+            pin=EVIDENCE, journal=object(),
+        )
+
+
+def test_proposal_requires_the_pinned_evidence_digest(tmp_path):
+    with pytest.raises(DefectError):
+        admission_proposal(
+            envelope(), context(), control(tmp_path), host_usage(),
+            pin="e" * 64, journal=journal(tmp_path),
+        )
+    with pytest.raises(DefectError):
+        admission_proposal(
+            envelope(), context(), control(tmp_path), host_usage(),
+            pin=object(), journal=journal(tmp_path),
+        )
+
+
+def test_proposal_never_authorizes_execution(tmp_path):
     proposal = admission_proposal(
         envelope(), context(), control(tmp_path), host_usage(),
-        pin=EVIDENCE, journal=journal(tmp_path))
-    assert proposal["deduplicated"] is False
-    assert proposal["admission"]["denied"] is False
+        pin=EVIDENCE, journal=journal(tmp_path),
+    )
+    assert proposal["authorizes_execution"] is False
+
+
+def test_repair_tools_exclude_operator_tools():
+    tools = repair_tools()
+    assert "herdr_verify_work" in tools
+    assert "patch" in tools and "write_file" in tools
+    for forbidden in ("git_push", "deploy", "git_merge", "herdr_operator"):
+        assert forbidden not in tools
+
+
+def test_task_graph_spec_is_a_single_node_plan():
+    spec = task_graph_spec()
+    assert spec.node_count == 1 and spec.max_depth == 1 and spec.max_fanout == 0
+
+
+def test_identity_is_paper_only_and_bound_to_the_repository():
+    identity = agent_identity(defect())
+    assert identity.role == "writer"
+    assert identity.repo == PROJECT
+    assert identity.paper_only is True
+    assert identity.parent_role is None
+
+
+def test_identity_input_is_validated():
+    with pytest.raises(DefectError):
+        agent_identity(object())
+
+
+# --- durable journal + the existing gate ----------------------------------- #
 
 
 def test_recorded_allow_is_idempotent(tmp_path):
-    admission_proposal(
-        envelope(), context(), control(tmp_path), host_usage(),
-        pin=EVIDENCE, journal=journal(tmp_path))
-    again = admission_proposal(
-        envelope(), context(), control(tmp_path), host_usage(),
-        pin=EVIDENCE, journal=journal(tmp_path))
-    assert again["deduplicated"] is True
-    assert len((tmp_path / "admission.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+    j = journal(tmp_path)
+    decision = decide_defect_admission(defect(), context())
+    assert j.record(decision)[1] is True
+    assert j.record(decision)[1] is False
 
 
-def test_two_workflows_are_two_defects():
-    """E4 r11: the identity is #100's correlation id, so distinct workflows split."""
-    first = defect_from_observation(ci_observation(subject=("237", "11111")))
-    second = defect_from_observation(ci_observation(subject=("237", "22222")))
-    assert first is not None and second is not None
-    assert first.fingerprint != second.fingerprint
-
-
-def test_unstable_run_fields_are_not_defect_identity():
-    """E4 r11: repeated runs of one correlation stay one defect."""
-    first = defect_from_observation(ci_observation(evidence_sha256=("d" * 64,), facts=(("head", HEAD), ("run_id", 11), ("job_id", 22))))
-    second = defect_from_observation(ci_observation(evidence_sha256=("e" * 64,), facts=(("head", HEAD), ("run_id", 99), ("job_id", 88))))
-    assert first.fingerprint == second.fingerprint
-    assert first.deduplication_id != second.deduplication_id
-
-
-def test_crash_after_allow_is_reconciled(tmp_path):
-    """E4 r11 P1: an ALLOW in #8's log without a verdict here must not re-spawn."""
+def test_denied_verdict_is_retryable(tmp_path):
+    j = journal(tmp_path)
+    decision = decide_defect_admission(defect(), context())
+    identity, spec, tools = repair_identity(defect())
     gate = control(tmp_path)
-    defect = defect_from_observation(ci_observation())
-    assert defect is not None
-    identity, spec = agent_identity(defect), task_graph_spec()
-    gate.check(identity, spec, host_usage(), tuple(sorted(repair_tools())))
-    assert len((tmp_path / "admission.jsonl").read_text(encoding="utf-8").splitlines()) == 1
-    # simulate the crash: #8 allowed, this journal recorded no verdict
-    verdict = DecisionJournal(AuditLog(str(tmp_path / "defect.jsonl"))).evaluate(
-        decide_defect_admission(defect, context()),
-        control=gate, usage=host_usage(), spec=spec, identity=identity,
-        tools=tuple(sorted(repair_tools())))
-    assert verdict["deduplicated"] is True
-    assert verdict["denied"] is False
-    assert len((tmp_path / "admission.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+    first = j.evaluate(decision, control=gate, usage=host_usage(active_agents=4),
+                       spec=spec, identity=identity, tools=tools)
+    assert first["denied"] is True and first["deduplicated"] is False
+    second = j.evaluate(decision, control=gate, usage=host_usage(),
+                        spec=spec, identity=identity, tools=tools)
+    assert second["denied"] is False and second["deduplicated"] is False
 
 
-def test_same_pinned_output_redelivered_is_one_defect():
-    first = defect_from_observation(ci_observation())
-    second = defect_from_observation(ci_observation())
-    assert first.fingerprint == second.fingerprint
-
-
-# --- E4 round 10 ----------------------------------------------------------- #
-
-
-def test_blocked_disposition_overrides_a_recorded_allow(tmp_path):
-    """E4 r10 P1-1: the defect gate's current verdict wins over an old ALLOW."""
-    gate, usage = control(tmp_path), host_usage()
-    first = admission_proposal(
-        envelope(), context(), gate, usage, pin=EVIDENCE, journal=journal(tmp_path))
-    assert first["admission"]["denied"] is False
-    second = admission_proposal(
-        envelope(), context(budget_state="EXHAUSTED"), gate, usage, pin=EVIDENCE,
-        journal=journal(tmp_path))
-    assert second["disposition"] == "BLOCKED"
-    assert second["admission"]["denied"] is True
-    assert second["deduplicated"] is False
+def test_pending_verdict_is_retryable(tmp_path):
+    """A crash before the verdict write must leave the defect re-evaluable."""
+    j = journal(tmp_path)
+    decision = decide_defect_admission(defect(), context())
+    j.record(decision)
+    assert j.gate_outcome(decision) is None
+    verdict = j.evaluate(decision, control=control(tmp_path), usage=host_usage(),
+                         spec=task_graph_spec(), identity=agent_identity(defect()),
+                         tools=tuple(sorted(repair_tools())))
+    assert verdict["deduplicated"] is False and verdict["denied"] is False
 
 
 def test_deny_then_allow_is_recorded(tmp_path):
-    """E4 r10 P1-2: a later ALLOW must not be swallowed by an older DENY."""
-    gate, usage = control(tmp_path), host_usage()
-    denied = admission_proposal(
-        envelope(), context(), gate, host_usage(active_agents=4), pin=EVIDENCE,
-        journal=journal(tmp_path))
-    assert denied["admission"]["denied"] is True
-    allowed = admission_proposal(
-        envelope(), context(), gate, usage, pin=EVIDENCE, journal=journal(tmp_path))
-    assert allowed["admission"]["denied"] is False
-    assert allowed["deduplicated"] is False
+    j = journal(tmp_path)
+    decision = decide_defect_admission(defect(), context())
+    identity, spec, tools = repair_identity(defect())
+    gate = control(tmp_path)
+    j.evaluate(decision, control=gate, usage=host_usage(active_agents=4),
+               spec=spec, identity=identity, tools=tools)
+    j.evaluate(decision, control=gate, usage=host_usage(),
+               spec=spec, identity=identity, tools=tools)
+    final = j.gate_outcome(decision)
+    assert final is not None
+    assert final["denied"] is False
 
 
 def test_concurrent_deliveries_reach_the_gate_once(tmp_path):
-    """E4 r10 P1-3: the claim, the gate call and the verdict write are atomic."""
-    import threading
-
-    gate, usage = control(tmp_path), host_usage()
+    """The claim, the gate call and the verdict write are one atomic claim."""
+    gate = control(tmp_path)
+    j = journal(tmp_path)
+    decision = decide_defect_admission(defect(), context())
+    identity, spec, tools = repair_identity(defect())
     results, errors = [], []
 
-    def run():
+    def deliver():
         try:
-            results.append(admission_proposal(
-                envelope(), context(), gate, usage, pin=EVIDENCE,
-                journal=journal(tmp_path)))
+            results.append(j.evaluate(decision, control=gate, usage=host_usage(),
+                                      spec=spec, identity=identity, tools=tools))
         except BaseException as exc:  # noqa: BLE001 - surfaced by the assertion
             errors.append(exc)
 
-    threads = [threading.Thread(target=run) for _ in range(6)]
+    threads = [threading.Thread(target=deliver) for _ in range(6)]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -512,7 +416,46 @@ def test_concurrent_deliveries_reach_the_gate_once(tmp_path):
 
     assert not errors, errors
     assert len(results) == 6
-    assert sum(1 for r in results if r["admission"]["denied"] is False) == 6
-    assert sum(1 for r in results if r["deduplicated"]) == 5
+    assert sum(1 for row in results if row["deduplicated"]) == 5
+    assert sum(1 for row in results if row["denied"] is False) == 6
     rows = (tmp_path / "admission.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(rows) == 1
+
+
+def test_crash_after_allow_is_reconciled(tmp_path):
+    """An ALLOW in #8's log without a verdict here must not re-spawn."""
+    gate = control(tmp_path)
+    identity, spec, tools = repair_identity(defect())
+    gate.check(identity, spec, host_usage(), tools)
+    assert len((tmp_path / "admission.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+    verdict = journal(tmp_path).evaluate(
+        decide_defect_admission(defect(), context()),
+        control=gate, usage=host_usage(), spec=spec, identity=identity, tools=tools,
+    )
+    assert verdict["deduplicated"] is True
+    assert verdict["denied"] is False
+    assert len((tmp_path / "admission.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_reconciliation_requires_the_same_tool_set(tmp_path):
+    """A narrower earlier ALLOW must not authorize a wider request (E4 r12)."""
+    gate = control(tmp_path)
+    identity, spec = agent_identity(defect()), task_graph_spec()
+    narrow = tuple(sorted(repair_tools()))
+    wide = narrow + ("git_push",)
+    gate.check(identity, spec, host_usage(), narrow)
+    assert len((tmp_path / "admission.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+    verdict = journal(tmp_path).evaluate(
+        decide_defect_admission(defect(), context()),
+        control=gate, usage=host_usage(), spec=spec, identity=identity, tools=wide,
+    )
+    assert verdict["deduplicated"] is False
+    assert verdict["denied"] is True
+    # the gate was consulted again: one #8 decision per distinct request
+    assert len((tmp_path / "admission.jsonl").read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_blocked_disposition_is_a_defect_gate_denial(tmp_path):
+    decision = decide_defect_admission(defect(), context(budget_state="EXHAUSTED"))
+    assert decision.disposition.value == "BLOCKED"
+    assert decision.reasons

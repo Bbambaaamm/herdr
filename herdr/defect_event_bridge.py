@@ -87,14 +87,20 @@ def defect_category(observation: Observation) -> DefectCategory | None:
 def defect_from_observation(observation: Observation) -> DefectObservation | None:
     """Translate an open #100 CI observation into the defect contract.
 
-    Returns ``None`` for anything that is not an open CI validation failure.
+    Returns ``None`` for anything that is not an open CI validation failure, and
+    raises :class:`DefectError` for a real CI failure whose defect identity the
+    bridge cannot establish.
 
-    The identity is #100's own ``correlation_id`` — computed from #100's pinned
-    (source, scope, subject) payload, so it is verifiable and stable and it is
-    exactly #100's correlation granularity.  No caller-chosen string is used.
-    #100 publishes no finer stable id today (``job_id`` is a per-run instance),
-    so distinct jobs inside one workflow are one defect; a finer split needs #100
-    to publish the workflow job definition id.
+    #100 publishes no stable identity of the *defined* check: its ``job_id`` is a
+    per-run instance, its per-run evidence digest changes on every run, and its
+    ``correlation_id`` covers the whole (source, scope, subject) group.  None of
+    those is a defensible identity for one CI defect — the first two fragment a
+    red PR into N records, the third silently collapses N distinct failing checks
+    into one and would dedup away a second, unrelated error.
+
+    So the bridge refuses rather than guess.  A CI observation becomes a defect
+    only once #100 publishes a stable per-check identity; this is a hard
+    dependency on #100, not a convenience.
     """
     category = defect_category(observation)
     if category is None:
@@ -108,27 +114,8 @@ def defect_from_observation(observation: Observation) -> DefectObservation | Non
     subject = observation.subject
     if len(subject) < 2:
         raise DefectError("CI observation subject does not carry pr and workflow")
-    pr, workflow = subject[0], subject[1]
-    return DefectObservation(
-        source=DefectSource.CI_CHECK,
-        category=category,
-        repository=observation.scope.project,
-        commit_sha=head,
-        ref=f"refs/pull/{pr}/head",
-        subject=(f"pr-{pr}", f"workflow-{workflow}"),
-        # The identity is #100's own ``correlation_id`` — computed by #100 from
-        # its pinned (source, scope, subject) payload, so it is verifiable and
-        # stable, and it is exactly #100's correlation granularity. No
-        # caller-chosen string is used as identity. #100 exposes no finer stable
-        # id today (``job_id`` is a per-run instance), so distinct jobs inside
-        # one workflow are one defect — a finer split requires #100 to publish
-        # the workflow job definition id.
-        finding_identity=observation.correlation_id,
-        workflow=workflow,
-        check_run_id=str(run_id),
-        event_revision=observation.revision,
-        observed_at=observation.event_at,
-        evidence_sha256=observation.evidence_sha256,
+    raise DefectError(
+        "no stable check identity from #100: refusing to identify a CI defect"
     )
 
 
@@ -174,10 +161,11 @@ def admission_proposal(
     module's: the bridge never authenticates its input, it only refuses input
     that did not come from the #100 fabric.
 
-    ``check_id`` is the stable identity of the *defined* check, supplied by the
-    caller from #100's durable record.  The bridge will not invent one: neither
-    #100's per-run ``job_id`` nor its per-run evidence digest is stable, and
-    using either silently changes what "the same defect" means.
+    A CI observation is refused with ``reason="unverified-check-identity"``
+    until #100 publishes a stable per-check identity: #100's ``job_id`` is a
+    per-run instance, its per-run evidence digest changes on every run, and its
+    ``correlation_id`` covers the whole group, so none of them identifies one
+    defect without either fragmenting a red PR or collapsing distinct checks.
 
     ``journal`` is mandatory.  The defect decision is recorded durably, and the
     gate verdict separately.  Only a recorded ALLOW makes the proposal
@@ -198,6 +186,14 @@ def admission_proposal(
         raise DefectError("durable dedup journal is required")
     if type(pin) is not str or pin not in observation.evidence_sha256:
         raise DefectError("envelope is not pinned to the supplied evidence")
+    if defect_category(observation) is not None:
+        return {
+            "eligible": False,
+            "reason": "unverified-check-identity",
+            "authorizes_execution": False,
+            "task_proposals_submitted": 0,
+            "budget_operations": 0,
+        }
     defect = defect_from_observation(observation)
     if defect is None:
         return {

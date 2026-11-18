@@ -347,10 +347,16 @@ class AdmissionControl:
             "max_depth": spec.max_depth,
             "max_fanout": spec.max_fanout,
             "child_tools_count": len(child_tools),
+            "child_tools": sorted(child_tools),
         }
 
-    def has_allow(self, identity: AgentIdentity, spec: TaskGraphSpec) -> bool:
+    def has_allow(self, identity: AgentIdentity, spec: TaskGraphSpec,
+                  child_tools: Sequence[str]) -> bool:
         """True when this gate already durably recorded an ALLOW for this proposal.
+
+        The comparison covers the *whole* proposal — identity, graph dimensions
+        and the exact tool set — so a narrower earlier ALLOW can never be
+        reconciled as authority for a wider request.
 
         Read-only reconciliation for a crash between the gate decision and the
         caller's own verdict write: the two logs are not one transaction, so a
@@ -358,6 +364,7 @@ class AdmissionControl:
         """
         if self.audit_log is None:
             return False
+        wanted = sorted(child_tools)
         for row in self.audit_log.replay():
             if row.get("event") != "allow":
                 continue
@@ -366,7 +373,8 @@ class AdmissionControl:
                     and row.get("admit:issue") == identity.issue
                     and row.get("admit:node_count") == spec.node_count
                     and row.get("admit:max_depth") == spec.max_depth
-                    and row.get("admit:max_fanout") == spec.max_fanout):
+                    and row.get("admit:max_fanout") == spec.max_fanout
+                    and row.get("admit:child_tools") == wanted):
                 return True
         return False
 
