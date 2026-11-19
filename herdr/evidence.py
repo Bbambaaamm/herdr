@@ -281,13 +281,21 @@ def network_denial_filter(*, deny_process_creation=False):
 
 
 def _authorized_readonly_mounts(root: Path, git: Path) -> list[tuple[str, str]]:
-    """Host-side discovery of the authorized worktree and its Git object stores.
+    """Host-side discovery of the one authorized worktree subtree.
 
-    Only these subtrees are exposed to the untrusted verifier below the private
-    /tmp scratch mount; every other host temporary file stays hidden. Discovery
-    itself runs on the host with the trusted Git binary and read-only flags.
+    Only the trusted worktree is re-exposed below the private /tmp scratch
+    mount; every other host temporary file stays hidden. Git store discovery
+    itself runs on the host with the trusted Git binary and read-only flags,
+    but a discovered store is mounted only when it is inside the trusted
+    worktree. Stores outside /tmp stay reachable through the pre-existing
+    read-only host-root bind, so verifier capability is unchanged, while a
+    store hidden below /tmp is untrusted scratch and must stay invisible.
     """
-    paths = [root]
+    try:
+        trusted_root = root.resolve()
+    except OSError:
+        trusted_root = root.absolute()
+    paths = [trusted_root]
     try:
         resolved = subprocess.run(
             [str(git), "-C", str(root), "--no-optional-locks", "--no-replace-objects",
@@ -309,7 +317,7 @@ def _authorized_readonly_mounts(root: Path, git: Path) -> list[tuple[str, str]]:
                 # `--git-common-dir` is relative to the invocation directory
                 # in some Git versions and to the git dir in others; accept
                 # whichever candidate actually exists on the host.
-                for candidate in (root / common, git_dir / common):
+                for candidate in (trusted_root / common, git_dir / common):
                     if candidate.is_dir():
                         paths.append(candidate)
                         break
@@ -326,6 +334,12 @@ def _authorized_readonly_mounts(root: Path, git: Path) -> list[tuple[str, str]]:
         try:
             resolved_path = path.resolve()
         except OSError:
+            continue
+        # Bounded allowlist: reject the shadowed scratch, any ancestor mount
+        # (such as /tmp or /), and every Git store outside the trusted
+        # worktree. Only the worktree subtree is re-exposed below the private
+        # /tmp mount.
+        if resolved_path != trusted_root and not resolved_path.is_relative_to(trusted_root):
             continue
         if resolved_path not in unique:
             unique.append(resolved_path)

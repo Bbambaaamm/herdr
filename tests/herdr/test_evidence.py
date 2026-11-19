@@ -304,6 +304,44 @@ def test_actual_read_only_git_exposes_only_authorized_subtrees(monkeypatch, tmp_
     assert "/etc" not in exposed and "/home" not in exposed
 
 
+def test_actual_read_only_git_rejects_untrusted_alternates(monkeypatch, tmp_path):
+    import herdr.evidence as evidence
+    if not shutil.which("bwrap"):
+        pytest.skip("physical artifact verifier is unavailable")
+    captured = {}
+
+    def fake_command(argv, **kwargs):
+        captured["argv"] = list(argv)
+        return b""
+
+    monkeypatch.setattr(evidence, "artifact_command", fake_command)
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    run_git(workspace, "init")
+    (workspace / "result.txt").write_text("bounded\n")
+    run_git(workspace, "add", "result.txt")
+    run_git(workspace, "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-m", "init")
+    outside = tmp_path / "outside-objects"
+    outside.mkdir()
+    alternates = workspace / ".git" / "objects" / "info" / "alternates"
+    alternates.parent.mkdir(parents=True, exist_ok=True)
+    # Untrusted alternates: the shadowed scratch and a sibling object store
+    # outside the worktree. Neither may be remounted for the verifier.
+    alternates.write_text("/tmp\n" + str(outside) + "\n")
+    evidence.read_only_git(workspace)(["ls-files", "-z", "--cached", "--others"])
+    argv = captured["argv"]
+    scratch_index = argv.index("--tmpfs")
+    pairs = [(argv[index + 1], argv[index + 2])
+             for index, part in enumerate(argv)
+             if part == "--ro-bind" and index > scratch_index]
+    exposed = {source for source, _ in pairs}
+    root = workspace.resolve()
+    assert str(root) in exposed
+    assert "/tmp" not in exposed
+    assert str(outside.resolve()) not in exposed
+    assert all(Path(source).is_relative_to(root) for source in exposed)
+
+
 def typed_fixture(tmp_path, kind, fault=None):
     task, result, plan, store, path, proof = fixture(tmp_path)
     report_path = f"reports/{kind}/report.json"
