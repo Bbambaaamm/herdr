@@ -139,11 +139,22 @@ class Boundary:
     def metadata_launch(self, argv, *, limit, timeout, pass_fds):
         assert limit == 2_000_000 and 0 < timeout <= 30 and len(pass_fds) == 1
         fd = pass_fds[0];assert fd in self.filters
-        prefix = ["/usr/bin/bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
-            "--unshare-pid", "--unshare-net", "--seccomp", str(fd), "--tmpfs", "/tmp", "--clearenv",
-            "--setenv", "PATH", "/usr/bin:/bin", "--setenv", "HOME", "/tmp", "--"]
-        assert argv[:len(prefix)] == prefix
-        inner = argv[len(prefix):]
+        head = ["/usr/bin/bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+            "--unshare-pid", "--unshare-net", "--seccomp", str(fd), "--tmpfs", "/tmp"]
+        tail = ["--clearenv", "--setenv", "PATH", "/usr/bin:/bin", "--setenv", "HOME", "/tmp"]
+        assert argv[:len(head)] == head
+        separator = argv.index("--", len(head))
+        inner = argv[separator + 1:]
+        middle = argv[len(head):separator]
+        assert middle[-len(tail):] == tail
+        binds = middle[:len(middle) - len(tail)]
+        assert binds and len(binds) % 3 == 0
+        exposed = []
+        for index in range(0, len(binds), 3):
+            assert binds[index] == "--ro-bind" and binds[index + 1] == binds[index + 2]
+            exposed.append(binds[index + 1])
+        # The worktree itself is the first authorized subtree; no general /tmp.
+        assert exposed[0] == inner[10]
         assert inner[:9] == [GIT, "--no-optional-locks", "--no-replace-objects", "-c", "core.fsmonitor=false",
             "-c", "core.hooksPath=/dev/null", "-c", "diff.external="]
         assert inner[9] == "-C";self.owned(inner[10])

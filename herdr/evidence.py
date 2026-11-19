@@ -27,6 +27,10 @@ EVIDENCE_VERSION = 2
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+# Untrusted Git alternates are bounded before parsing: an oversized file or an
+# unbounded entry list must never be read into memory or expanded into mounts.
+ALTERNATES_MAX_BYTES = 65_536
+ALTERNATES_MAX_ENTRIES = 64
 
 
 class EvidenceError(RuntimeError):
@@ -280,6 +284,96 @@ def network_denial_filter(*, deny_process_creation=False):
             lib.seccomp_release(ctx)
 
 
+def _authorized_readonly_mounts(root: Path, git: Path) -> list[tuple[str, str]]:
+    """Host-side discovery of the one authorized worktree subtree.
+
+    Only the trusted worktree is re-exposed below the private /tmp scratch
+    mount; every other host temporary file stays hidden. Git store discovery
+    itself runs on the host with the trusted Git binary and read-only flags,
+    but a discovered store is mounted only when it is inside the trusted
+    worktree. Stores outside /tmp stay reachable through the pre-existing
+    read-only host-root bind, so verifier capability is unchanged, while a
+    store hidden below /tmp is untrusted scratch and must stay invisible.
+    """
+    try:
+        trusted_root = root.resolve()
+    except OSError:
+        trusted_root = root.absolute()
+    paths = [trusted_root]
+    try:
+        resolved = subprocess.run(
+            [str(git), "-C", str(root), "--no-optional-locks", "--no-replace-objects",
+             "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+             "-c", "diff.external=", "rev-parse", "--absolute-git-dir", "--git-common-dir"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30, check=False,
+        ).stdout.splitlines()
+    except (OSError, subprocess.SubprocessError):
+        resolved = []
+    values = [line.strip() for line in resolved if line.strip()]
+    if values:
+        git_dir = Path(values[0])
+        paths.append(git_dir)
+        if len(values) > 1:
+            common = Path(values[1])
+            if common.is_absolute():
+                paths.append(common)
+            else:
+                # `--git-common-dir` is relative to the invocation directory
+                # in some Git versions and to the git dir in others; accept
+                # whichever candidate actually exists on the host.
+                for candidate in (trusted_root / common, git_dir / common):
+                    if candidate.is_dir():
+                        paths.append(candidate)
+                        break
+    for base in list(paths):
+        alternates = base / "objects" / "info" / "alternates"
+        try:
+            # Open the untrusted file once without following a final symlink
+            # and without blocking on a FIFO, then bound the same descriptor
+            # with fstat. A separate stat() + read_text() pair is bypassable:
+            # a FIFO reports size zero and then blocks in read.
+            fd = os.open(alternates, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            continue
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > ALTERNATES_MAX_BYTES:
+                continue
+            chunks: list[bytes] = []
+            remaining = ALTERNATES_MAX_BYTES + 1
+            while remaining > 0:
+                chunk = os.read(fd, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            entries = b"".join(chunks).decode("utf-8").split()
+        except (OSError, ValueError):
+            continue
+        finally:
+            os.close(fd)
+        if len(entries) > ALTERNATES_MAX_ENTRIES:
+            continue
+        for entry in entries:
+            target = Path(entry)
+            paths.append(target if target.is_absolute() else base / "objects" / target)
+    unique: list[Path] = []
+    for path in paths:
+        try:
+            resolved_path = path.resolve()
+        except OSError:
+            continue
+        # Bounded allowlist: reject the shadowed scratch, any ancestor mount
+        # (such as /tmp or /), and every Git store outside the trusted
+        # worktree. Only the worktree subtree is re-exposed below the private
+        # /tmp mount.
+        if resolved_path != trusted_root and not resolved_path.is_relative_to(trusted_root):
+            continue
+        if resolved_path not in unique:
+            unique.append(resolved_path)
+    return [(str(path), str(path)) for path in unique]
+
+
 def read_only_git(root: Path):
     """Untrusted worktree Git configuration never runs in the host namespace.
 
@@ -295,7 +389,14 @@ def read_only_git(root: Path):
         command = [
             str(bwrap), "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
             "--unshare-pid", "--unshare-net", "--seccomp", str(seccomp_fd),
-            "--tmpfs", "/tmp", "--clearenv",
+            # Private writable scratch. The host /tmp stays hidden; only the
+            # authorized worktree and its Git object stores are re-exposed
+            # read-only, so a worktree below /tmp (for example a CI evidence
+            # boundary) remains verifiable without granting a general /tmp read.
+            "--tmpfs", "/tmp",
+            *(part for source, target in _authorized_readonly_mounts(root, git)
+              for part in ("--ro-bind", source, target)),
+            "--clearenv",
             "--setenv", "PATH", "/usr/bin:/bin", "--setenv", "HOME", "/tmp",
             "--", str(git), "--no-optional-locks", "--no-replace-objects",
             "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
