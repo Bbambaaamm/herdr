@@ -342,6 +342,52 @@ def test_actual_read_only_git_rejects_untrusted_alternates(monkeypatch, tmp_path
     assert all(Path(source).is_relative_to(root) for source in exposed)
 
 
+def test_actual_read_only_git_bounds_untrusted_alternates(monkeypatch, tmp_path):
+    import herdr.evidence as evidence
+    if not shutil.which("bwrap"):
+        pytest.skip("physical artifact verifier is unavailable")
+    captured = {}
+
+    def fake_command(argv, **kwargs):
+        captured["argv"] = list(argv)
+        return b""
+
+    monkeypatch.setattr(evidence, "artifact_command", fake_command)
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    run_git(workspace, "init")
+    (workspace / "result.txt").write_text("bounded\n")
+    run_git(workspace, "add", "result.txt")
+    run_git(workspace, "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-m", "init")
+    alternates = workspace / ".git" / "objects" / "info" / "alternates"
+    alternates.parent.mkdir(parents=True, exist_ok=True)
+    root = workspace.resolve()
+    store = workspace / "objects-store"
+    store.mkdir()
+
+    def exposed_mounts():
+        evidence.read_only_git(workspace)(["ls-files", "-z", "--cached", "--others"])
+        argv = captured["argv"]
+        scratch_index = argv.index("--tmpfs")
+        pairs = [(argv[index + 1], argv[index + 2])
+                 for index, part in enumerate(argv)
+                 if part == "--ro-bind" and index > scratch_index]
+        return {source for source, _ in pairs}
+
+    def assert_store_ignored(exposed):
+        assert str(root) in exposed
+        assert str(store.resolve()) not in exposed
+        assert all(Path(source).is_relative_to(root) for source in exposed)
+
+    # More entries than the bound: the whole file is ignored, not expanded.
+    alternates.write_text("\n".join([str(store)] * (evidence.ALTERNATES_MAX_ENTRIES + 1)))
+    assert_store_ignored(exposed_mounts())
+
+    # Larger than the byte bound: the file is rejected before it is read.
+    alternates.write_text(str(store) + "\n" + "x" * evidence.ALTERNATES_MAX_BYTES)
+    assert_store_ignored(exposed_mounts())
+
+
 def typed_fixture(tmp_path, kind, fault=None):
     task, result, plan, store, path, proof = fixture(tmp_path)
     report_path = f"reports/{kind}/report.json"

@@ -27,6 +27,10 @@ EVIDENCE_VERSION = 2
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+# Untrusted Git alternates are bounded before parsing: an oversized file or an
+# unbounded entry list must never be read into memory or expanded into mounts.
+ALTERNATES_MAX_BYTES = 65_536
+ALTERNATES_MAX_ENTRIES = 64
 
 
 class EvidenceError(RuntimeError):
@@ -322,9 +326,14 @@ def _authorized_readonly_mounts(root: Path, git: Path) -> list[tuple[str, str]]:
                         paths.append(candidate)
                         break
     for base in list(paths):
+        alternates = base / "objects" / "info" / "alternates"
         try:
-            entries = (base / "objects" / "info" / "alternates").read_text().split()
-        except OSError:
+            if alternates.stat().st_size > ALTERNATES_MAX_BYTES:
+                continue
+            entries = alternates.read_text().split()
+        except (OSError, ValueError):
+            continue
+        if len(entries) > ALTERNATES_MAX_ENTRIES:
             continue
         for entry in entries:
             target = Path(entry)
