@@ -28,6 +28,13 @@ LOG = STATE / "maintenance.log"
 CAPACITY_FLOOR_BYTES = MIN_ROOT_FREE_BYTES
 CAPACITY_START_GUARD_BYTES = 128 * 1024**2
 CAPACITY_WARNING_MARGIN_BYTES = 256 * 1024**2
+# Distinct readiness of the local reserve and of the most expensive write: the
+# audit must not call a cycle READY while the archive it is meant to enable would
+# still be admitted away. Both derive from the same observation, never from a guess.
+CAPACITY_BASE_READY = "capacity_ready"
+CAPACITY_BASE_INSUFFICIENT = "capacity_insufficient"
+CAPACITY_BACKUP_READY = "backup_capacity_ready"
+CAPACITY_BACKUP_INSUFFICIENT = "backup_capacity_insufficient"
 # The ZIP is rewritten through an atomic sibling, then the off-site plain and
 # encrypted archives coexist before the plain copy is removed.
 BACKUP_BASE_BYTES = 512 * 1024**2
@@ -76,7 +83,10 @@ def observe_capacity(preparation_peak=0):
                         start_guard=CAPACITY_START_GUARD_BYTES,
                         preparation_peak=preparation_peak, growth_allowance=0,
                         warning_margin=CAPACITY_WARNING_MARGIN_BYTES)
-    decision["reason"] = "capacity_insufficient" if not decision["ready"] else "capacity_ready"
+    if not decision["ready"]:
+        decision["reason"] = CAPACITY_BACKUP_INSUFFICIENT if preparation_peak else CAPACITY_BASE_INSUFFICIENT
+    else:
+        decision["reason"] = CAPACITY_BACKUP_READY if preparation_peak else CAPACITY_BASE_READY
     return decision
 
 def backup_preparation_peak():
@@ -135,37 +145,59 @@ def admit_expensive_write(step):
                                                decision["required_bytes"],
                                                decision["margin_bytes"], peak))
         return True
-    state = _read_capacity_state()
+    state = _read_capacity_state() or {}
     held = _held_steps(state)
     if step not in held:
         log("capacity HOLD %s: reason=%s available_bytes=%d required_bytes=%d "
             "missing_bytes=%d floor_bytes=%d preparation_peak_bytes=%d"
             % (step, decision["reason"], decision["available_bytes"], decision["required_bytes"],
                decision["missing_bytes"], CAPACITY_FLOOR_BYTES, peak))
-        _write_capacity_state({
-            "ready": False, "reason": decision["reason"],
-            "available_bytes": decision["available_bytes"],
-            "required_bytes": decision["required_bytes"], "held": held + [step]})
+        # Only the hold ledger changes here; the diagnostic fields written by
+        # capacity_diagnostic() must survive so the next cycle compares like with
+        # like instead of seeing a missing backup level and logging again.
+        updated = dict(state)
+        updated["held"] = held + [step]
+        _write_capacity_state(updated)
     return False
 
 def capacity_diagnostic():
     """Log the reserve state only on change, on the existing watchdog path.
 
     The watchdog invokes maintenance every minute, so a transition below the
-    reserve is reported within one cycle instead of after a failed archive.
+    reserve is reported within one cycle instead of after a failed archive. The
+    base decision (floor + guard only) is kept separate from the backup decision
+    (the same reserve plus the archive's transient peak): one ``ready`` flag that
+    meant both previously made the audit claim READY while the backup was still
+    admitted away. Each level transitions and is logged on its own, and a held
+    step is retained until the level that holds it actually recovers.
     """
-    decision = observe_capacity()
+    peak = backup_preparation_peak()
+    base = observe_capacity()
+    backup = observe_capacity(peak)
     previous = _read_capacity_state()
-    if previous is None or previous.get("ready") is not decision["ready"]:
-        log("capacity %s: reason=%s available_bytes=%d required_bytes=%d missing_bytes=%d"
-            % ("READY" if decision["ready"] else "NOT_READY", decision["reason"],
-               decision["available_bytes"], decision["required_bytes"], decision["missing_bytes"]))
-        held = [] if decision["ready"] else _held_steps(previous)
+    prior_base = previous.get("ready") if previous else None
+    prior_backup = previous.get("backup_ready") if previous else None
+    changed = []
+    if prior_base is not base["ready"]:
+        changed.append("base")
+    if prior_backup is not backup["ready"]:
+        changed.append("backup")
+    if changed:
+        log("capacity %s: reason=%s available_bytes=%d required_bytes=%d missing_bytes=%d; "
+            "backup %s: reason=%s required_bytes=%d missing_bytes=%d preparation_peak_bytes=%d"
+            % ("READY" if base["ready"] else "NOT_READY", base["reason"], base["available_bytes"],
+               base["required_bytes"], base["missing_bytes"],
+               "READY" if backup["ready"] else "NOT_READY", backup["reason"],
+               backup["required_bytes"], backup["missing_bytes"], peak))
+        held = [] if backup["ready"] else _held_steps(previous)
         _write_capacity_state({
-            "ready": decision["ready"], "reason": decision["reason"],
-            "available_bytes": decision["available_bytes"],
-            "required_bytes": decision["required_bytes"], "held": held})
-    return decision
+            "ready": base["ready"], "reason": base["reason"],
+            "available_bytes": base["available_bytes"],
+            "required_bytes": base["required_bytes"],
+            "backup_ready": backup["ready"], "backup_reason": backup["reason"],
+            "backup_required_bytes": backup["required_bytes"],
+            "preparation_peak_bytes": peak, "held": held})
+    return base
 
 def due(name, seconds):
     p = STAMPS / name
@@ -354,10 +386,18 @@ def daily_audit():
         lines.append(f"{label}={rc == 0 and output.strip() in ('enabled', 'active')}")
     lines.append("maintenance_trigger=systemd_watchdog_with_due_stamps")
     capacity_status = observe_capacity()
+    peak = backup_preparation_peak()
+    backup_status = observe_capacity(peak)
     lines.append(f"capacity_ready={capacity_status['ready']}")
     lines.append(f"capacity_reason={capacity_status['reason']}")
     lines.append(f"capacity_available_bytes={capacity_status['available_bytes']}")
     lines.append(f"capacity_required_bytes={capacity_status['required_bytes']}")
+    # The audit must not report READY while the write it describes would still be
+    # admitted away, so the backup view is recorded next to the base reserve view.
+    lines.append(f"backup_ready={backup_status['ready']}")
+    lines.append(f"backup_reason={backup_status['reason']}")
+    lines.append(f"backup_required_bytes={backup_status['required_bytes']}")
+    lines.append(f"backup_preparation_peak_bytes={peak}")
     for stamp_name in ("backup", "offsite-prepare", "offsite-sync", "self-review"):
         stamp_path = STAMPS / stamp_name
         stamp_value = (

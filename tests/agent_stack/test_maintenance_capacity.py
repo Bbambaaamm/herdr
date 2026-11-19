@@ -164,17 +164,71 @@ def test_capacity_diagnostic_logs_only_on_state_change(monkeypatch, tmp_path):
     set_free(module, monkeypatch, 4 * GIB)
     module.capacity_diagnostic()
     module.capacity_diagnostic()
-    assert read_log(module).count("capacity NOT_READY") == 1
+    text = read_log(module)
+    assert text.count("capacity NOT_READY") == 1
+    assert text.count("backup NOT_READY") == 1
     set_free(module, monkeypatch, 20 * GIB)
     module.capacity_diagnostic()
     module.capacity_diagnostic()
     text = read_log(module)
     assert text.count("capacity NOT_READY") == 1
     assert text.count("capacity READY") == 1
+    assert text.count("backup NOT_READY") == 1
+    assert text.count("backup READY") == 1
     state = json.loads((module.STATE / "capacity-diagnostic.json").read_text(encoding="utf-8"))
-    assert state == {"ready": True, "reason": "capacity_ready", "held": [],
+    assert state == {"ready": True, "reason": module.CAPACITY_BASE_READY, "held": [],
                      "available_bytes": 20 * GIB,
-                     "required_bytes": module.CAPACITY_FLOOR_BYTES + module.CAPACITY_START_GUARD_BYTES}
+                     "required_bytes": module.CAPACITY_FLOOR_BYTES + module.CAPACITY_START_GUARD_BYTES,
+                     "backup_ready": True, "backup_reason": module.CAPACITY_BACKUP_READY,
+                     "backup_required_bytes": module.CAPACITY_FLOOR_BYTES
+                     + module.CAPACITY_START_GUARD_BYTES + module.backup_preparation_peak(),
+                     "preparation_peak_bytes": module.backup_preparation_peak()}
+
+
+def test_two_watchdog_cycles_at_11_gib_hold_backup_and_report_both_levels(monkeypatch, tmp_path):
+    """11 GiB is above floor+guard but below the backup threshold: two cycles.
+
+    The first cycle must already see base READY and backup NOT_READY, keep the
+    step held, and log nothing on the second identical cycle. The audit must then
+    report base ready while the backup is still admitted away, instead of a single
+    ``ready`` flag that flips to READY and wipes the hold every minute.
+    """
+    module = load_module(monkeypatch, tmp_path)
+    peak = module.backup_preparation_peak()
+    base_required = module.CAPACITY_FLOOR_BYTES + module.CAPACITY_START_GUARD_BYTES
+    assert 11 * GIB > base_required
+    assert 11 * GIB < required_bytes(module, peak)
+    set_free(module, monkeypatch, 11 * GIB)
+    monkeypatch.setattr(module, "run", lambda *args, **kwargs: (0, ""))
+    for _ in range(2):
+        module.capacity_diagnostic()
+        module.daily_backup()
+    text = read_log(module)
+    assert text.count("capacity READY") == 1
+    assert text.count("capacity NOT_READY") == 0
+    assert text.count("backup READY") == 0
+    assert text.count("backup NOT_READY") == 1
+    assert text.count("capacity HOLD backup") == 1
+    assert "backup OK" not in text
+    assert not (module.STAMPS / "backup").exists()
+    state = json.loads((module.STATE / "capacity-diagnostic.json").read_text(encoding="utf-8"))
+    assert state["ready"] is True
+    assert state["reason"] == module.CAPACITY_BASE_READY
+    assert state["backup_ready"] is False
+    assert state["backup_reason"] == module.CAPACITY_BACKUP_INSUFFICIENT
+    assert state["held"] == ["backup"]
+    assert state["preparation_peak_bytes"] == peak
+    monkeypatch.setattr(module, "command_report", lambda wrapper: "")
+    monkeypatch.setattr(module, "run", lambda *args, **kwargs: (127, ""))
+    module.daily_audit()
+    posture = next(module.AUDITS.glob("*/backup-posture.txt"))
+    body = posture.read_text(encoding="utf-8")
+    assert "capacity_ready=True" in body
+    assert f"capacity_reason={module.CAPACITY_BASE_READY}" in body
+    assert f"capacity_required_bytes={base_required}" in body
+    assert "backup_ready=False" in body
+    assert f"backup_reason={module.CAPACITY_BACKUP_INSUFFICIENT}" in body
+    assert f"backup_required_bytes={required_bytes(module, peak)}" in body
 
 
 def test_hold_is_reported_once_per_step_per_episode(monkeypatch, tmp_path):
@@ -203,8 +257,10 @@ def test_audit_posture_records_the_capacity_decision(monkeypatch, tmp_path):
     posture = next(module.AUDITS.glob("*/backup-posture.txt"))
     text = posture.read_text(encoding="utf-8")
     assert "capacity_ready=False" in text
-    assert "capacity_reason=capacity_insufficient" in text
+    assert f"capacity_reason={module.CAPACITY_BASE_INSUFFICIENT}" in text
     assert f"capacity_available_bytes={4 * GIB}" in text
+    assert "backup_ready=False" in text
+    assert f"backup_reason={module.CAPACITY_BACKUP_INSUFFICIENT}" in text
 
 
 def test_main_runs_the_capacity_diagnostic_before_the_expensive_steps(monkeypatch, tmp_path):
