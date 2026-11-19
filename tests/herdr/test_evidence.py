@@ -388,6 +388,55 @@ def test_actual_read_only_git_bounds_untrusted_alternates(monkeypatch, tmp_path)
     assert_store_ignored(exposed_mounts())
 
 
+def test_actual_read_only_git_rejects_blocking_alternates(monkeypatch, tmp_path):
+    import os
+    import signal
+
+    import herdr.evidence as evidence
+    if not shutil.which("bwrap") or not hasattr(signal, "SIGALRM"):
+        pytest.skip("physical artifact verifier or SIGALRM unavailable")
+    captured = {}
+
+    def fake_command(argv, **kwargs):
+        captured["argv"] = list(argv)
+        return b""
+
+    monkeypatch.setattr(evidence, "artifact_command", fake_command)
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    run_git(workspace, "init")
+    (workspace / "result.txt").write_text("bounded\n")
+    run_git(workspace, "add", "result.txt")
+    run_git(workspace, "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-m", "init")
+    alternates = workspace / ".git" / "objects" / "info" / "alternates"
+    alternates.parent.mkdir(parents=True, exist_ok=True)
+    store = workspace / "objects-store"
+    store.mkdir()
+    # A FIFO reports size zero, so a stat()+read_text() pair would pass the
+    # size bound and then block forever in the read.
+    os.mkfifo(alternates)
+
+    def blocked(signum, frame):
+        raise TimeoutError("untrusted alternates read blocked")
+
+    previous = signal.signal(signal.SIGALRM, blocked)
+    signal.alarm(5)
+    try:
+        evidence.read_only_git(workspace)(["ls-files", "-z", "--cached", "--others"])
+        argv = captured["argv"]
+        scratch_index = argv.index("--tmpfs")
+        pairs = [(argv[index + 1], argv[index + 2])
+                 for index, part in enumerate(argv)
+                 if part == "--ro-bind" and index > scratch_index]
+        exposed = {source for source, _ in pairs}
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+    root = workspace.resolve()
+    assert str(root) in exposed
+    assert str(store.resolve()) not in exposed
+
+
 def typed_fixture(tmp_path, kind, fault=None):
     task, result, plan, store, path, proof = fixture(tmp_path)
     report_path = f"reports/{kind}/report.json"

@@ -328,11 +328,30 @@ def _authorized_readonly_mounts(root: Path, git: Path) -> list[tuple[str, str]]:
     for base in list(paths):
         alternates = base / "objects" / "info" / "alternates"
         try:
-            if alternates.stat().st_size > ALTERNATES_MAX_BYTES:
+            # Open the untrusted file once without following a final symlink
+            # and without blocking on a FIFO, then bound the same descriptor
+            # with fstat. A separate stat() + read_text() pair is bypassable:
+            # a FIFO reports size zero and then blocks in read.
+            fd = os.open(alternates, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            continue
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > ALTERNATES_MAX_BYTES:
                 continue
-            entries = alternates.read_text().split()
+            chunks: list[bytes] = []
+            remaining = ALTERNATES_MAX_BYTES + 1
+            while remaining > 0:
+                chunk = os.read(fd, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            entries = b"".join(chunks).decode("utf-8").split()
         except (OSError, ValueError):
             continue
+        finally:
+            os.close(fd)
         if len(entries) > ALTERNATES_MAX_ENTRIES:
             continue
         for entry in entries:
