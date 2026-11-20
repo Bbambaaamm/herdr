@@ -151,6 +151,19 @@ def test_mountinfo_scoped_detection_remains_non_authoritative(tmp_path):
     assert other["cleanup_authorized"] is False
 
 
+def test_double_slash_root_is_normalized_for_mount_comparison(tmp_path):
+    # POSIX permits exactly two leading slashes and Path preserves them, while
+    # mountinfo uses a single leading slash.  The accepted root must not be able
+    # to suppress the mount observation for the same directory.
+    path = tmp_path / "herdr-hermes-build-case1"
+    path.mkdir()
+    mountinfo = f"50 40 8:1 / {path} rw,relatime - ext4 /dev/sda1 rw\n"
+    row = h.inspect_mount_boundary(Path("//" + str(path)), mountinfo=mountinfo)
+    assert row["state"] == "MOUNT_FOUND"
+    assert row["matches"] == [str(path)]
+    assert row["cleanup_authorized"] is False
+
+
 def test_real_root_scan_blocks_missing_trust_and_no_authority(tmp_path):
     root = tmp_path / "scratch"
     root.mkdir(mode=0o700)
@@ -209,6 +222,26 @@ def test_process_reference_detector_observes_open_fd(tmp_path):
     (pid / "root").symlink_to("/")
     (fd / "7").symlink_to(path / "artifact.txt")
     result = h.inspect_process_references(path, proc=proc)
+    assert result["state"] == "REFERENCES_OBSERVED"
+    assert result["references"] == [{"pid": 12345, "via": "fd"}]
+    assert result["cleanup_authorized"] is False
+
+
+def test_double_slash_root_is_normalized_for_process_comparison(tmp_path):
+    # A root spelled with a leading double slash must still match the single
+    # slash spelling used by /proc cwd/root/fd links.
+    base = tmp_path / "scratch"
+    base.mkdir()
+    path = base / "herdr-hermes-build-case1"
+    path.mkdir()
+    proc = tmp_path / "proc"
+    pid = proc / "12345"
+    fd = pid / "fd"
+    fd.mkdir(parents=True)
+    (pid / "cwd").symlink_to("/unrelated")
+    (pid / "root").symlink_to("/")
+    (fd / "7").symlink_to(path / "artifact.txt")
+    result = h.inspect_process_references(Path("//" + str(path)), proc=proc)
     assert result["state"] == "REFERENCES_OBSERVED"
     assert result["references"] == [{"pid": 12345, "via": "fd"}]
     assert result["cleanup_authorized"] is False

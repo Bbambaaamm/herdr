@@ -200,6 +200,21 @@ def read_root_envelope(path: Path) -> dict[str, Any]:
     return value
 
 
+def _normalized_root_text(path: Path) -> str:
+    """Collapse a leading POSIX double slash so kernel paths compare equal.
+
+    POSIX permits exactly two leading slashes and ``Path`` preserves them, while
+    /proc links and mountinfo use a single leading slash.  An accepted root
+    spelled ``//x`` would otherwise silently suppress mount and process
+    observations for ``/x``.  Normalization keeps the read-only evidence correct
+    and changes nothing about what is authorized (nothing).
+    """
+    text = str(path)
+    if text.startswith("//"):
+        return "/" + text.lstrip("/")
+    return text
+
+
 def inspect_mount_boundary(path: Path, *, mountinfo: str | None = None) -> dict[str, Any]:
     """Detect known mount boundaries; never assert mount absence authority.
 
@@ -217,7 +232,7 @@ def inspect_mount_boundary(path: Path, *, mountinfo: str | None = None) -> dict[
             return {"state": "UNKNOWN", "matches": [], "cleanup_authorized": False}
     if type(mountinfo) is not str or len(mountinfo) > 2_097_152:
         return {"state": "UNKNOWN", "matches": [], "cleanup_authorized": False}
-    path_text = str(path)
+    path_text = _normalized_root_text(path)
     matches = []
 
     def unescape_mountpoint(value: str) -> str:
@@ -252,7 +267,7 @@ def inspect_process_references(
     if (type(max_pids) is not int or not 1 <= max_pids <= 16384
             or type(max_fds) is not int or not 1 <= max_fds <= 4096):
         raise BuildHostEvidenceError("PROCESS_SCAN_BOUNDS_INVALID")
-    base = str(path)
+    base = _normalized_root_text(path)
     references = []
     incomplete = False
     try:
