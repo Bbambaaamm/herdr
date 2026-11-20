@@ -256,6 +256,187 @@ sys.stdout.buffer.write(sys.stdin.buffer.read() + b"filter-executed")
         assert accepted["level"] == "verified_worker_result"
         assert target.read_text() == "original"
 
+def test_actual_read_only_git_reaches_workspace_below_shadowed_tmp():
+    from herdr.evidence import read_only_git
+    import tempfile
+    if not shutil.which("bwrap") or not os.access("/tmp", os.W_OK):
+        pytest.skip("physical artifact verifier or writable /tmp is unavailable")
+    with tempfile.TemporaryDirectory(prefix="herdr-shadowed-worktree-", dir="/tmp") as directory:
+        workspace = Path(directory)
+        run_git(workspace, "init", "-q")
+        (workspace / "result.txt").write_text("bounded\n")
+        run_git(workspace, "add", "result.txt")
+        run_git(workspace, "-c", "user.email=test@example.invalid",
+                "-c", "user.name=test", "commit", "-qm", "init")
+        try:
+            listed = read_only_git(workspace)(["ls-files", "-z", "--cached", "--others"])
+            assert listed.split("\0")[0] == "result.txt"
+        except EvidenceUnavailable:
+            pytest.skip("this test host cannot execute the read-only verifier namespace")
+
+
+def test_actual_read_only_git_exposes_only_authorized_subtrees(monkeypatch, tmp_path):
+    import herdr.evidence as evidence
+    if not shutil.which("bwrap"):
+        pytest.skip("physical artifact verifier is unavailable")
+    captured = {}
+
+    def fake_command(argv, **kwargs):
+        captured["argv"] = list(argv)
+        return b""
+
+    monkeypatch.setattr(evidence, "artifact_command", fake_command)
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    run_git(workspace, "init")
+    (workspace / "result.txt").write_text("bounded\n")
+    run_git(workspace, "add", "result.txt")
+    run_git(workspace, "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-m", "init")
+    evidence.read_only_git(workspace)(["ls-files", "-z", "--cached", "--others"])
+    argv = captured["argv"]
+    assert argv[argv.index("--tmpfs") + 1] == "/tmp"
+    pairs = [(argv[index + 1], argv[index + 2])
+             for index, part in enumerate(argv) if part == "--ro-bind"]
+    assert ("/tmp", "/tmp") not in pairs
+    assert all(source == target for source, target in pairs)
+    exposed = {source for source, _ in pairs}
+    assert str(workspace.resolve()) in exposed
+    assert "/etc" not in exposed and "/home" not in exposed
+
+
+def test_actual_read_only_git_rejects_untrusted_alternates(monkeypatch, tmp_path):
+    import herdr.evidence as evidence
+    if not shutil.which("bwrap"):
+        pytest.skip("physical artifact verifier is unavailable")
+    captured = {}
+
+    def fake_command(argv, **kwargs):
+        captured["argv"] = list(argv)
+        return b""
+
+    monkeypatch.setattr(evidence, "artifact_command", fake_command)
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    run_git(workspace, "init")
+    (workspace / "result.txt").write_text("bounded\n")
+    run_git(workspace, "add", "result.txt")
+    run_git(workspace, "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-m", "init")
+    outside = tmp_path / "outside-objects"
+    outside.mkdir()
+    alternates = workspace / ".git" / "objects" / "info" / "alternates"
+    alternates.parent.mkdir(parents=True, exist_ok=True)
+    # Untrusted alternates: the shadowed scratch and a sibling object store
+    # outside the worktree. Neither may be remounted for the verifier.
+    alternates.write_text("/tmp\n" + str(outside) + "\n")
+    evidence.read_only_git(workspace)(["ls-files", "-z", "--cached", "--others"])
+    argv = captured["argv"]
+    scratch_index = argv.index("--tmpfs")
+    pairs = [(argv[index + 1], argv[index + 2])
+             for index, part in enumerate(argv)
+             if part == "--ro-bind" and index > scratch_index]
+    exposed = {source for source, _ in pairs}
+    root = workspace.resolve()
+    assert str(root) in exposed
+    assert "/tmp" not in exposed
+    assert str(outside.resolve()) not in exposed
+    assert all(Path(source).is_relative_to(root) for source in exposed)
+
+
+def test_actual_read_only_git_bounds_untrusted_alternates(monkeypatch, tmp_path):
+    import herdr.evidence as evidence
+    if not shutil.which("bwrap"):
+        pytest.skip("physical artifact verifier is unavailable")
+    captured = {}
+
+    def fake_command(argv, **kwargs):
+        captured["argv"] = list(argv)
+        return b""
+
+    monkeypatch.setattr(evidence, "artifact_command", fake_command)
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    run_git(workspace, "init")
+    (workspace / "result.txt").write_text("bounded\n")
+    run_git(workspace, "add", "result.txt")
+    run_git(workspace, "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-m", "init")
+    alternates = workspace / ".git" / "objects" / "info" / "alternates"
+    alternates.parent.mkdir(parents=True, exist_ok=True)
+    root = workspace.resolve()
+    store = workspace / "objects-store"
+    store.mkdir()
+
+    def exposed_mounts():
+        evidence.read_only_git(workspace)(["ls-files", "-z", "--cached", "--others"])
+        argv = captured["argv"]
+        scratch_index = argv.index("--tmpfs")
+        pairs = [(argv[index + 1], argv[index + 2])
+                 for index, part in enumerate(argv)
+                 if part == "--ro-bind" and index > scratch_index]
+        return {source for source, _ in pairs}
+
+    def assert_store_ignored(exposed):
+        assert str(root) in exposed
+        assert str(store.resolve()) not in exposed
+        assert all(Path(source).is_relative_to(root) for source in exposed)
+
+    # More entries than the bound: the whole file is ignored, not expanded.
+    alternates.write_text("\n".join([str(store)] * (evidence.ALTERNATES_MAX_ENTRIES + 1)))
+    assert_store_ignored(exposed_mounts())
+
+    # Larger than the byte bound: the file is rejected before it is read.
+    alternates.write_text(str(store) + "\n" + "x" * evidence.ALTERNATES_MAX_BYTES)
+    assert_store_ignored(exposed_mounts())
+
+
+def test_actual_read_only_git_rejects_blocking_alternates(monkeypatch, tmp_path):
+    import os
+    import signal
+
+    import herdr.evidence as evidence
+    if not shutil.which("bwrap") or not hasattr(signal, "SIGALRM"):
+        pytest.skip("physical artifact verifier or SIGALRM unavailable")
+    captured = {}
+
+    def fake_command(argv, **kwargs):
+        captured["argv"] = list(argv)
+        return b""
+
+    monkeypatch.setattr(evidence, "artifact_command", fake_command)
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    run_git(workspace, "init")
+    (workspace / "result.txt").write_text("bounded\n")
+    run_git(workspace, "add", "result.txt")
+    run_git(workspace, "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-m", "init")
+    alternates = workspace / ".git" / "objects" / "info" / "alternates"
+    alternates.parent.mkdir(parents=True, exist_ok=True)
+    store = workspace / "objects-store"
+    store.mkdir()
+    # A FIFO reports size zero, so a stat()+read_text() pair would pass the
+    # size bound and then block forever in the read.
+    os.mkfifo(alternates)
+
+    def blocked(signum, frame):
+        raise TimeoutError("untrusted alternates read blocked")
+
+    previous = signal.signal(signal.SIGALRM, blocked)
+    signal.alarm(5)
+    try:
+        evidence.read_only_git(workspace)(["ls-files", "-z", "--cached", "--others"])
+        argv = captured["argv"]
+        scratch_index = argv.index("--tmpfs")
+        pairs = [(argv[index + 1], argv[index + 2])
+                 for index, part in enumerate(argv)
+                 if part == "--ro-bind" and index > scratch_index]
+        exposed = {source for source, _ in pairs}
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+    root = workspace.resolve()
+    assert str(root) in exposed
+    assert str(store.resolve()) not in exposed
+
+
 def typed_fixture(tmp_path, kind, fault=None):
     task, result, plan, store, path, proof = fixture(tmp_path)
     report_path = f"reports/{kind}/report.json"
