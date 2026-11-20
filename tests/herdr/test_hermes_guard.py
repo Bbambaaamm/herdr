@@ -518,6 +518,64 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
         assert host_calls[0][2]["max_tokens"] == 100
         assert [row[0] for row in effects[-2:]] == ["start", "returned"]
         assert len(network_requests) == network_before
+        # Exercise the real Router v5 authorization method at the fake SDK seam.
+        # The transport is still the protected host path, never the SDK client.
+        from dataclasses import replace
+        from herdr.security import InvocationIdentity
+        from herdr.scheduler_routing import ManagedExecutionHandoff
+        from herdr.work_contract_host import WorkInvocationGuard
+        policy.grant.identity = InvocationIdentity(
+            consumer="writer", agent_id="agent", parent_agent_id="parent",
+            parent_task_id="parent-task", task_id="task", run_token="run",
+            fencing_token=1,
+        )
+        policy._routing_handoff = None
+        policy.bind_routing_handoff = types.MethodType(WorkInvocationGuard.bind_routing_handoff, policy)
+        policy.authorize_routing_model = types.MethodType(
+            WorkInvocationGuard.authorize_routing_model, policy)
+        handoff = ManagedExecutionHandoff(
+            version=1, task_id="task", run_token="run", attempt=1,
+            fencing_token=1, consumer="writer", agent_id="agent",
+            parent_task_id="parent-task", parent_agent_id="parent",
+            policy_profile="probe", policy_version="v1", decision_sha256="a"*64,
+            selected_executor="executor", selected_provider="nous",
+            selected_model=agent.model, registry_hash="b"*64,
+            requirement_hash="c"*64, parent_scope_hash="d"*64,
+            policy_hash="d"*64, budget_allocation_id="e"*64,
+            not_before="2000-01-01T00:00:00+00:00", waits_for_provider=True,
+        )
+        before_handoff = (len(effects), len(host_calls), len(network_requests))
+        with pytest.raises(PolicyDenied, match="routing_handoff_missing"):
+            loop.perform_api_call(agent)
+        assert (len(effects), len(host_calls), len(network_requests)) == before_handoff
+        policy.bind_routing_handoff(handoff)
+        agent.model = "substituted:free"
+        with pytest.raises(PolicyDenied, match="routing_handoff_model_mismatch"):
+            loop.perform_api_call(agent)
+        agent.model = handoff.selected_model
+        for blocked, reason in (
+            (replace(handoff, not_before="2999-01-01T00:00:00+00:00"), "handoff_not_ready"),
+            (replace(handoff, not_before=None), "handoff_wait_unknown"),
+        ):
+            policy._routing_handoff = blocked
+            with pytest.raises(PolicyDenied, match="routing_handoff_model_mismatch") as denied:
+                loop.perform_api_call(agent)
+            assert reason in str(denied.value.__cause__)
+        assert (len(effects), len(host_calls), len(network_requests)) == before_handoff
+        policy._routing_handoff = handoff
+        assert loop.perform_api_call(agent).choices
+        assert len(host_calls) == before_handoff[1] + 1
+        assert len(network_requests) == network_before
+        # An uncertain host response must leave the reservation without a
+        # returned effect; the SDK's direct transport remains unreachable.
+        answer = {"kind": "unknown", "http_status": None, "error_type": "TimeoutError"}
+        effects_before = len(effects)
+        with pytest.raises(PolicyDenied, match="host_model_delivery_unknown_reconcile_original"):
+            loop.perform_api_call(agent)
+        assert [row[0] for row in effects[effects_before:]] == ["start"]
+        assert len(network_requests) == network_before
+        del policy.authorize_routing_model
+        del policy.bind_routing_handoff
         answer = {"kind": "unknown", "http_status": None, "error_type": "TimeoutError"}
         effects_before = len(effects)
         with pytest.raises(PolicyDenied, match="delivery_unknown"):
