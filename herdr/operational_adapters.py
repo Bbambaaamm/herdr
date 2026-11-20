@@ -129,7 +129,7 @@ def backup(raw, pin, scope, *, target, revision, now):
 
 
 def github_ci(raw, pin, scope, *, expected_head, expected_pr, now):
-    fields = {"repo", "pr", "head", "workflow_id", "run_id", "job_id", "at", "result"}
+    fields = {"repo", "pr", "head", "workflow_id", "run_id", "job_id", "job_name", "at", "result"}
     row, sha = _pinned(raw, pin, fields)
     require(row["repo"] == scope.project and row["head"] == expected_head
             and row["pr"] == expected_pr, "CI scope or HEAD mismatch")
@@ -138,6 +138,11 @@ def github_ci(raw, pin, scope, *, expected_head, expected_pr, now):
             "invalid CI commit")
     for k in ("pr", "workflow_id", "run_id", "job_id"):
         require(type(row[k]) is int and 0 < row[k] < 2**63, "invalid CI object ID")
+    # The job's DEFINED name is the stable check identity; the numeric job_id is
+    # a per-run instance and must never become the defect identity.
+    job_name = row["job_name"]
+    require(type(job_name) is str and 0 < len(job_name) <= 128,
+            "invalid CI check name")
     results = {
         "failure": (State.OPEN, Detail.CI_FAILURE), "success": (State.RESOLVED, Detail.CI_SUCCESS),
         "skipped": (State.UNKNOWN, Detail.CI_SKIPPED), "cancelled": (State.UNKNOWN, Detail.CI_CANCELLED),
@@ -149,7 +154,8 @@ def github_ci(raw, pin, scope, *, expected_head, expected_pr, now):
     return _observation(Source.CI, Kind.CI_VALIDATION_FAILED, scope,
                         (str(expected_pr), str(row["workflow_id"])), rev,
                         row["at"], now, state, detail, (sha,),
-                        facts=(("head", expected_head), ("run_id", row["run_id"]), ("job_id", row["job_id"])))
+                        facts=(("head", expected_head), ("run_id", row["run_id"]),
+                               ("job_id", row["job_id"]), ("job_name", job_name)))
 
 
 def worker(raw, pin, scope, *, task_id, expected_fence, now):

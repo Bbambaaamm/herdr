@@ -9,7 +9,13 @@ import pytest
 from herdr import operation_readiness
 from herdr.evidence import EvidenceStore, EvidenceUnavailable
 from herdr.operational_adapters import backup, capacity_snapshot, github_ci, read_capacity, worker
-from herdr.operational_incidents import IncidentError, Scope, report, publish_report
+from herdr.operational_incidents import (
+    IncidentError,
+    Scope,
+    check_identity,
+    report,
+    publish_report,
+)
 
 
 SCOPE = Scope("herdr", "Bbambaaamm/herdr")
@@ -96,7 +102,8 @@ def test_untrusted_prompt_and_forged_pin_rejected():
                                          ("unavailable", "UNKNOWN"), ("success", "RESOLVED")])
 def test_ci_state_and_exact_head(result, state):
     row = {"repo": SCOPE.project, "pr": 225, "head": "a"*40, "run_id": 1,
-           "workflow_id": 2, "job_id": 3, "at": NOW, "result": result}
+           "workflow_id": 2, "job_id": 3, "job_name": "Validate Python dashboard and telemetry",
+           "at": NOW, "result": result}
     raw, sha = pack(row)
     finding = github_ci(raw, sha, SCOPE, expected_head=row["head"], expected_pr=225, now=NOW)
     assert finding.state == state
@@ -106,6 +113,130 @@ def test_ci_state_and_exact_head(result, state):
     assert changed.correlation_id == finding.correlation_id
     with pytest.raises(IncidentError, match="HEAD"):
         github_ci(raw, sha, SCOPE, expected_head="b"*40, expected_pr=225, now=NOW)
+
+
+def ci_row(**overrides):
+    row = {"repo": SCOPE.project, "pr": 225, "head": "a"*40, "run_id": 1,
+           "workflow_id": 2, "job_id": 3, "job_name": "Validate Python dashboard and telemetry",
+           "at": NOW, "result": "failure"}
+    row.update(overrides)
+    return row
+
+
+def test_ci_check_identity_is_stable_across_runs():
+    """A re-run keeps the defined check's identity; only the state moves."""
+    row = ci_row()
+    raw, sha = pack(row)
+    first = github_ci(raw, sha, SCOPE, expected_head=row["head"], expected_pr=225, now=NOW)
+    rerun = ci_row(run_id=9, job_id=10, at=NOW + 60)
+    raw, sha = pack(rerun)
+    second = github_ci(raw, sha, SCOPE, expected_head=row["head"], expected_pr=225, now=NOW + 60)
+    assert second.check_id == first.check_id
+    assert second.incident_id != first.incident_id
+    assert second.correlation_id == first.correlation_id
+
+
+def test_two_defined_checks_do_not_collide():
+    row = ci_row()
+    raw, sha = pack(row)
+    first = github_ci(raw, sha, SCOPE, expected_head=row["head"], expected_pr=225, now=NOW)
+    other = ci_row(job_id=4, job_name="Run the offline repository contract")
+    raw, sha = pack(other)
+    second = github_ci(raw, sha, SCOPE, expected_head=row["head"], expected_pr=225, now=NOW)
+    assert second.check_id != first.check_id
+
+
+def test_ci_check_identity_ignores_the_source_revision():
+    """The check identity is the definition, not the revision it failed on."""
+    row = ci_row()
+    raw, sha = pack(row)
+    first = github_ci(raw, sha, SCOPE, expected_head=row["head"], expected_pr=225, now=NOW)
+    moved = ci_row(head="b"*40, run_id=9, job_id=10, at=NOW + 60)
+    raw, sha = pack(moved)
+    second = github_ci(raw, sha, SCOPE, expected_head="b"*40, expected_pr=225, now=NOW + 60)
+    assert second.check_id == first.check_id
+    assert second.incident_id != first.incident_id
+
+
+def ci_finding(**overrides):
+    row = ci_row(**overrides)
+    raw, sha = pack(row)
+    return github_ci(raw, sha, SCOPE, expected_head=row["head"], expected_pr=225, now=NOW)
+
+
+def test_ci_check_identity_has_no_slug_collision():
+    """Free-text job names must not collapse into one readable slug."""
+    assert ci_finding(job_name="unit-tests").check_id != ci_finding(job_name="unit tests").check_id
+
+
+def test_ci_check_identity_survives_long_names_sharing_a_prefix():
+    first = "Validate " + "a" * 80
+    second = "Validate " + "b" * 80
+    assert ci_finding(job_name=first).check_id != ci_finding(job_name=second).check_id
+
+
+def test_ci_check_identity_accepts_the_maximum_allowed_inputs():
+    """workflow_id and job_name at the adapter's own bounds must still work."""
+    finding = ci_finding(workflow_id=12345678901, job_name="a" * 41)
+    assert len(finding.check_id) <= 64
+    assert finding.check_id == ci_finding(workflow_id=12345678901, job_name="a" * 41).check_id
+
+
+def test_check_identity_rejects_a_non_numeric_pull_request():
+    with pytest.raises(IncidentError, match="pull request"):
+        check_identity(SCOPE, ("not-a-number", "12345"), "job")
+
+
+def test_check_identity_rejects_a_non_numeric_workflow():
+    with pytest.raises(IncidentError, match="workflow"):
+        check_identity(SCOPE, ("225", "nope"), "job")
+
+
+def test_check_identity_rejects_a_missing_check_name():
+    with pytest.raises(IncidentError, match="check name"):
+        check_identity(SCOPE, ("225", "12345"), "")
+
+
+def test_check_identity_rejects_extra_subject_parts():
+    """Extra parts would be dropped from the identity, merging two checks."""
+    with pytest.raises(IncidentError, match="subject"):
+        check_identity(SCOPE, ("225", "12345", "extra"), "job")
+
+
+def test_ci_check_identity_distinguishes_scope_and_pull_request():
+    row = ci_row()
+    raw, sha = pack(row)
+    here = github_ci(raw, sha, SCOPE, expected_head=row["head"], expected_pr=225, now=NOW)
+    other_row = ci_row(repo="other/repo")
+    other_raw, other_sha = pack(other_row)
+    there = github_ci(other_raw, other_sha, Scope("herdr", "other/repo"),
+                      expected_head=other_row["head"], expected_pr=225, now=NOW)
+    moved_row = ci_row(pr=226)
+    moved_raw, moved_sha = pack(moved_row)
+    moved = github_ci(moved_raw, moved_sha, SCOPE,
+                      expected_head=moved_row["head"], expected_pr=226, now=NOW)
+    assert len({here.check_id, there.check_id, moved.check_id}) == 3
+
+
+def test_ci_evidence_requires_a_defined_check_name():
+    row = ci_row()
+    del row["job_name"]
+    raw, sha = pack(row)
+    with pytest.raises(IncidentError, match="fields"):
+        github_ci(raw, sha, SCOPE, expected_head=row["head"], expected_pr=225, now=NOW)
+
+
+def test_non_ci_observation_has_no_check_identity():
+    with pytest.raises(IncidentError, match="CI"):
+        capacity_batch()[0].check_id
+
+
+def test_ci_report_carries_the_check_identity():
+    row = ci_row()
+    raw, sha = pack(row)
+    finding = github_ci(raw, sha, SCOPE, expected_head=row["head"], expected_pr=225, now=NOW)
+    item = outcome(finding)["incidents"][0]["incident"]
+    assert item["check_id"] == finding.check_id
 
 
 @pytest.mark.parametrize("fence,expires,ack,expected", [
