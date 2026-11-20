@@ -212,21 +212,41 @@ def capacity(available, *, floor, start_guard, preparation_peak=0, growth_allowa
 
 def read_protected(path, *, owner=0, limit=1048576):
     """No writable or symlinked ancestor; snapshot the final regular file once."""
+    return _read_protected(path, owner=owner, limit=limit)
+
+
+def read_capacity_report():
+    """Read the installed, agentops-owned capacity watcher publication."""
+    return _read_protected(
+        "/var/lib/herdr-capacity-watch/status.json", owner=0, publisher=1001, limit=4096,
+    )
+
+
+def _read_protected(path, *, owner, limit, publisher=None):
     path = Path(path)
-    require(path.is_absolute() and ".." not in path.parts, "absolute_protected_path_required")
+    require(path.is_absolute() and len(path.parts) > 1 and ".." not in path.parts,
+            "absolute_protected_path_required")
     fd = os.open("/", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    parent = None
     try:
         for index, part in enumerate(path.parts[1:]):
             info = os.fstat(fd)
-            require(info.st_uid == owner and not info.st_mode & 0o022, "protected_ancestry_required")
             last = index == len(path.parts) - 2
+            expected = {owner, publisher} if last and publisher is not None else {owner}
+            require(info.st_uid in expected and not info.st_mode & 0o022,
+                    "protected_ancestry_required")
             flags = os.O_RDONLY | os.O_NONBLOCK if last else os.O_PATH | os.O_DIRECTORY
             nxt = os.open(part, flags | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
-            os.close(fd)
+            if last and publisher is not None:
+                parent = fd
+            else:
+                os.close(fd)
             fd = nxt
         before = os.fstat(fd)
-        require(stat.S_ISREG(before.st_mode) and before.st_uid == owner and before.st_nlink == 1
-                and not before.st_mode & 0o222 and 0 < before.st_size <= limit, "protected_file_required")
+        writer = owner if publisher is None else publisher
+        forbidden = 0o222 if publisher is None else 0o022
+        require(stat.S_ISREG(before.st_mode) and before.st_uid == writer and before.st_nlink == 1
+                and not before.st_mode & forbidden and 0 < before.st_size <= limit, "protected_file_required")
         body = bytearray()
         while len(body) < before.st_size:
             block = os.read(fd, min(1048576, before.st_size - len(body)))
@@ -235,9 +255,14 @@ def read_protected(path, *, owner=0, limit=1048576):
         stamp=lambda info:(info.st_dev,info.st_ino,info.st_uid,info.st_gid,info.st_mode,info.st_nlink,
                            info.st_size,info.st_mtime_ns,info.st_ctime_ns)
         require(not os.read(fd, 1) and stamp(before) == stamp(os.fstat(fd)), "protected_snapshot_changed")
+        if parent is not None:
+            require(stamp(before) == stamp(os.stat(path.name, dir_fd=parent, follow_symlinks=False)),
+                    "protected_snapshot_changed")
         return bytes(body)
     finally:
         os.close(fd)
+        if parent is not None:
+            os.close(parent)
 
 
 def load_composition(path, expected_sha256):

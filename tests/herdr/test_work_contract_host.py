@@ -27,6 +27,12 @@ def factory_fixture(tmp_path):
         storage=tmp_path/"host"/"checks",audit_log=log,git=trusted_git(root))
     return factory,root,plan,planned,log
 
+def test_unbound_work_guard_denies_model_authorization(tmp_path):
+    factory,_,_,planned,_=factory_fixture(tmp_path)
+    guard=WorkInvocationGuard(planned,work_authority=factory.require_model_work)
+    with pytest.raises(PolicyDenied, match="routing_handoff_missing"):
+        guard.authorize_routing_model("provider-a", "model-a")
+
 def test_actual_baseline_check_pass_model_stop_commit_and_crash_handoff(tmp_path):
     factory,root,plan,planned,log=factory_fixture(tmp_path)
     cycle=factory.prepare(identity=planned.identity,workspace=root,grant=planned,spec_sha256=plan.spec_sha256)
