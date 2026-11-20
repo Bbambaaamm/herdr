@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import os
 import re
 import shutil
@@ -9,7 +10,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from herdr.autonomy_gate import MIN_ROOT_FREE_BYTES
 from herdr.launch_environment import sanitize_environment
+from herdr.operation_readiness import capacity
 
 HOME = Path("/home/agentops")
 BIN = Path(__file__).resolve().parent
@@ -18,6 +21,25 @@ BACKUPS = HOME / "backups/hermes"
 AUDITS = STATE / "audits"
 STAMPS = STATE / "stamps"
 LOG = STATE / "maintenance.log"
+
+# Reserve for expensive local writes (#126). The floor is the existing autonomy
+# admission floor, reused here so a backup can never spend the reserve that the
+# intake gate protects. The threshold is deliberately not lowered.
+CAPACITY_FLOOR_BYTES = MIN_ROOT_FREE_BYTES
+CAPACITY_START_GUARD_BYTES = 128 * 1024**2
+CAPACITY_WARNING_MARGIN_BYTES = 256 * 1024**2
+# Distinct readiness of the local reserve and of the most expensive write: the
+# audit must not call a cycle READY while the archive it is meant to enable would
+# still be admitted away. Both derive from the same observation, never from a guess.
+CAPACITY_BASE_READY = "capacity_ready"
+CAPACITY_BASE_INSUFFICIENT = "capacity_insufficient"
+CAPACITY_BACKUP_READY = "backup_capacity_ready"
+CAPACITY_BACKUP_INSUFFICIENT = "backup_capacity_insufficient"
+# The ZIP is rewritten through an atomic sibling, then the off-site plain and
+# encrypted archives coexist before the plain copy is removed.
+BACKUP_BASE_BYTES = 512 * 1024**2
+BACKUP_PEAK_FACTOR = 3
+BACKUP_SAFETY_RESERVE_BYTES = 1024 * 1024**2
 
 ENV = os.environ.copy()
 ENV["HOME"] = str(HOME)
@@ -31,8 +53,151 @@ os.umask(0o077)
 
 def log(msg):
     line = f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} {msg}"
-    with LOG.open("a", encoding="utf-8") as fh:
-        fh.write(line + "\n")
+    try:
+        with LOG.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        # A full disk must not turn a capacity diagnostic into a crash.
+        pass
+
+def statvfs_free_bytes():
+    """Available non-reserved bytes on /; None when the observation is untrustworthy."""
+    try:
+        disk = os.statvfs("/")
+        fragment, available = disk.f_frsize, disk.f_bavail
+    except (OSError, AttributeError, TypeError, ValueError, OverflowError):
+        return None
+    if type(fragment) is not int or type(available) is not int or fragment <= 0 or available < 0:
+        return None
+    return available * fragment
+
+def observe_capacity(preparation_peak=0):
+    """Read-only capacity decision for one expensive write. Fails closed."""
+    required = CAPACITY_FLOOR_BYTES + CAPACITY_START_GUARD_BYTES + preparation_peak
+    free = statvfs_free_bytes()
+    if free is None:
+        return {"ready": False, "reason": "capacity_unavailable", "available_bytes": 0,
+                "required_bytes": required, "missing_bytes": required, "margin_bytes": -required,
+                "capacity_warning": True}
+    decision = capacity(free, floor=CAPACITY_FLOOR_BYTES,
+                        start_guard=CAPACITY_START_GUARD_BYTES,
+                        preparation_peak=preparation_peak, growth_allowance=0,
+                        warning_margin=CAPACITY_WARNING_MARGIN_BYTES)
+    if not decision["ready"]:
+        decision["reason"] = CAPACITY_BACKUP_INSUFFICIENT if preparation_peak else CAPACITY_BASE_INSUFFICIENT
+    else:
+        decision["reason"] = CAPACITY_BACKUP_READY if preparation_peak else CAPACITY_BASE_READY
+    return decision
+
+def backup_preparation_peak():
+    """Transient bytes the local ZIP plus the off-site plain/encrypted pair can need."""
+    base = BACKUP_BASE_BYTES
+    candidates = list(BACKUPS.glob("hermes-backup-auto-*.zip"))
+    if candidates:
+        try:
+            newest = max(candidates, key=lambda path: path.stat().st_mtime)
+            base = max(base, newest.stat().st_size)
+        except OSError:
+            pass
+    return base * BACKUP_PEAK_FACTOR + BACKUP_SAFETY_RESERVE_BYTES
+
+def _capacity_state_path():
+    return STATE / "capacity-diagnostic.json"
+
+
+def _read_capacity_state():
+    try:
+        state = json.loads(_capacity_state_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def _held_steps(state):
+    held = state.get("held") if state else None
+    return list(held) if isinstance(held, list) else []
+
+
+def _write_capacity_state(record):
+    state_path = _capacity_state_path()
+    try:
+        temporary = state_path.with_name(state_path.name + ".tmp")
+        temporary.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, state_path)
+    except OSError:
+        pass
+
+
+def admit_expensive_write(step):
+    """Admit one expensive write only when the reserve survives its transient peak.
+
+    Never cleans and never lowers the floor: a refused step is skipped, its due
+    stamp is left untouched, and the retry happens once capacity returns. The
+    refusal is reported once per episode, not on every watchdog cycle.
+    """
+    peak = backup_preparation_peak()
+    decision = observe_capacity(peak)
+    if decision["ready"]:
+        if decision["capacity_warning"]:
+            log("capacity WARN %s: available_bytes=%d required_bytes=%d margin_bytes=%d "
+                "preparation_peak_bytes=%d" % (step, decision["available_bytes"],
+                                               decision["required_bytes"],
+                                               decision["margin_bytes"], peak))
+        return True
+    state = _read_capacity_state() or {}
+    held = _held_steps(state)
+    if step not in held:
+        log("capacity HOLD %s: reason=%s available_bytes=%d required_bytes=%d "
+            "missing_bytes=%d floor_bytes=%d preparation_peak_bytes=%d"
+            % (step, decision["reason"], decision["available_bytes"], decision["required_bytes"],
+               decision["missing_bytes"], CAPACITY_FLOOR_BYTES, peak))
+        # Only the hold ledger changes here; the diagnostic fields written by
+        # capacity_diagnostic() must survive so the next cycle compares like with
+        # like instead of seeing a missing backup level and logging again.
+        updated = dict(state)
+        updated["held"] = held + [step]
+        _write_capacity_state(updated)
+    return False
+
+def capacity_diagnostic():
+    """Log the reserve state only on change, on the existing watchdog path.
+
+    The watchdog invokes maintenance every minute, so a transition below the
+    reserve is reported within one cycle instead of after a failed archive. The
+    base decision (floor + guard only) is kept separate from the backup decision
+    (the same reserve plus the archive's transient peak): one ``ready`` flag that
+    meant both previously made the audit claim READY while the backup was still
+    admitted away. Each level transitions and is logged on its own, and a held
+    step is retained until the level that holds it actually recovers.
+    """
+    peak = backup_preparation_peak()
+    base = observe_capacity()
+    backup = observe_capacity(peak)
+    previous = _read_capacity_state()
+    prior_base = previous.get("ready") if previous else None
+    prior_backup = previous.get("backup_ready") if previous else None
+    changed = []
+    if prior_base is not base["ready"]:
+        changed.append("base")
+    if prior_backup is not backup["ready"]:
+        changed.append("backup")
+    if changed:
+        log("capacity %s: reason=%s available_bytes=%d required_bytes=%d missing_bytes=%d; "
+            "backup %s: reason=%s required_bytes=%d missing_bytes=%d preparation_peak_bytes=%d"
+            % ("READY" if base["ready"] else "NOT_READY", base["reason"], base["available_bytes"],
+               base["required_bytes"], base["missing_bytes"],
+               "READY" if backup["ready"] else "NOT_READY", backup["reason"],
+               backup["required_bytes"], backup["missing_bytes"], peak))
+        held = [] if backup["ready"] else _held_steps(previous)
+        _write_capacity_state({
+            "ready": base["ready"], "reason": base["reason"],
+            "available_bytes": base["available_bytes"],
+            "required_bytes": base["required_bytes"],
+            "backup_ready": backup["ready"], "backup_reason": backup["reason"],
+            "backup_required_bytes": backup["required_bytes"],
+            "preparation_peak_bytes": peak, "held": held})
+    return base
 
 def due(name, seconds):
     p = STAMPS / name
@@ -86,6 +251,8 @@ def codex_usage_snapshot():
 def daily_backup():
     if not due("backup", 24 * 3600):
         return
+    if not admit_expensive_write("backup"):
+        return
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     out = BACKUPS / f"hermes-backup-auto-{ts}.zip"
     rc, text = run([HOME / ".local/bin/hermes", "backup", "-o", out, "-k", "3"], 300)
@@ -97,6 +264,8 @@ def daily_backup():
 
 def daily_offsite_prepare():
     if not due("offsite-prepare", 24 * 3600):
+        return
+    if not admit_expensive_write("offsite-prepare"):
         return
     script = BIN / "hermes-offsite-prepare"
     rc, text = run([script], 900)
@@ -216,6 +385,19 @@ def daily_audit():
         rc, output = run(args, 30)
         lines.append(f"{label}={rc == 0 and output.strip() in ('enabled', 'active')}")
     lines.append("maintenance_trigger=systemd_watchdog_with_due_stamps")
+    capacity_status = observe_capacity()
+    peak = backup_preparation_peak()
+    backup_status = observe_capacity(peak)
+    lines.append(f"capacity_ready={capacity_status['ready']}")
+    lines.append(f"capacity_reason={capacity_status['reason']}")
+    lines.append(f"capacity_available_bytes={capacity_status['available_bytes']}")
+    lines.append(f"capacity_required_bytes={capacity_status['required_bytes']}")
+    # The audit must not report READY while the write it describes would still be
+    # admitted away, so the backup view is recorded next to the base reserve view.
+    lines.append(f"backup_ready={backup_status['ready']}")
+    lines.append(f"backup_reason={backup_status['reason']}")
+    lines.append(f"backup_required_bytes={backup_status['required_bytes']}")
+    lines.append(f"backup_preparation_peak_bytes={peak}")
     for stamp_name in ("backup", "offsite-prepare", "offsite-sync", "self-review"):
         stamp_path = STAMPS / stamp_name
         stamp_value = (
@@ -295,6 +477,7 @@ def agent_task_maintenance():
 
 def main():
     security_guard()
+    capacity_diagnostic()
     agent_task_maintenance()
     codex_usage_snapshot()
     daily_backup()
