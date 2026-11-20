@@ -832,3 +832,112 @@ def _parse_iso8601(value: str) -> float | None:
     if parsed.tzinfo is None:
         return None
     return parsed.timestamp()
+
+
+@dataclass(frozen=True)
+class ShadowCostComparison:
+    """Read-only price/quality probe, NEVER an executable RoutingDecision.
+
+    All quality flags are caller-declared synthetic evidence. No provider
+    request, reservation, charging, or scheduler handoff is authorized here.
+    """
+    registry_hash: str
+    requirement_hash: str
+    baseline_decision_sha256: str
+    baseline_executor_id: str | None
+    baseline_quote_microusd: int | None
+    shadow_executor_id: str | None
+    shadow_quote_microusd: int | None
+    hypothetical_quote_gap_microusd: int | None
+    status: str
+    quality_basis: str = "synthetic_declared_only"
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "schema_version": "herdr-router-v5-cost-shadow-1",
+            "registry_hash": self.registry_hash,
+            "requirement_hash": self.requirement_hash,
+            "baseline_decision_sha256": self.baseline_decision_sha256,
+            "baseline_executor_id": self.baseline_executor_id,
+            "baseline_quote_microusd": self.baseline_quote_microusd,
+            "shadow_executor_id": self.shadow_executor_id,
+            "shadow_quote_microusd": self.shadow_quote_microusd,
+            "hypothetical_quote_gap_microusd": self.hypothetical_quote_gap_microusd,
+            "status": self.status,
+            "quality_basis": self.quality_basis,
+            "actual_token_savings": None,
+            "actual_cost_savings_microusd": None,
+            "quality_verified_live": False,
+            "may_execute": False,
+        }
+
+
+def compare_cost_aware_shadow(
+    registry: CapabilityRegistry,
+    requirement: CapabilityRequirement,
+    policy: CapabilityScope,
+    runtime_state: Sequence[RuntimeStateSnapshot],
+    *,
+    at: str,
+    policy_version: str,
+    synthetic_quality_pass: Mapping[str, bool],
+) -> ShadowCostComparison:
+    """Compare cheapest *eligible* synthetic quote without granting a route.
+
+    Reuses exactly the existing capability/privacy/availability/budget filter.
+    The default select_route remains completely unchanged. A missing/stale
+    quote or incomplete quality declarations blocks this shadow comparison,
+    rather than being interpreted as zero cost or acceptable quality.
+    """
+    baseline = select_route(
+        registry, requirement, policy, runtime_state,
+        at=at, policy_version=policy_version,
+    )
+    eligible = registry.candidates(
+        requirement, policy, tuple(runtime_state), at=at,
+    )
+    ids = {match.executor_id for match in eligible.matches}
+    if not isinstance(synthetic_quality_pass, Mapping):
+        raise RoutingError("shadow quality declarations must be a mapping")
+    if set(synthetic_quality_pass) != ids or any(
+        type(value) is not bool for value in synthetic_quality_pass.values()
+    ):
+        raise RoutingError("synthetic quality declarations must exactly cover eligible executors")
+    states = {state.executor_id: state for state in runtime_state}
+    prices: dict[str, int] = {}
+    for match in eligible.matches:
+        state = states[match.executor_id]
+        price = state.estimated_cost_microusd
+        if (state.requirement_hash != requirement.hash or type(price) is not int
+                or price < 0):
+            return ShadowCostComparison(
+                eligible.registry_hash, requirement.hash, baseline.digest,
+                baseline.selected_executor, None, None, None, None,
+                "BLOCKED_UNKNOWN_QUOTE",
+            )
+        prices[match.executor_id] = price
+    if baseline.selected_executor is None or baseline.selected_executor not in prices:
+        return ShadowCostComparison(
+            eligible.registry_hash, requirement.hash, baseline.digest,
+            baseline.selected_executor, None, None, None, None,
+            "BLOCKED_NO_BASELINE",
+        )
+    baseline_price = prices[baseline.selected_executor]
+    quality_pass = [
+        executor_id for executor_id in sorted(ids)
+        if synthetic_quality_pass[executor_id]
+    ]
+    if not quality_pass:
+        return ShadowCostComparison(
+            eligible.registry_hash, requirement.hash, baseline.digest,
+            baseline.selected_executor, baseline_price, None, None, None,
+            "BLOCKED_NO_QUALITY_PASS",
+        )
+    cheapest = min(quality_pass, key=lambda executor_id: (prices[executor_id], executor_id))
+    price = prices[cheapest]
+    return ShadowCostComparison(
+        eligible.registry_hash, requirement.hash, baseline.digest,
+        baseline.selected_executor, baseline_price, cheapest, price,
+        baseline_price - price,
+        "SYNTHETIC_COMPARISON_ONLY",
+    )
