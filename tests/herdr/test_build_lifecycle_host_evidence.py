@@ -158,7 +158,7 @@ def test_double_slash_root_is_normalized_for_mount_comparison(tmp_path):
     path = tmp_path / "herdr-hermes-build-case1"
     path.mkdir()
     mountinfo = f"50 40 8:1 / {path} rw,relatime - ext4 /dev/sda1 rw\n"
-    row = h.inspect_mount_boundary(Path("//" + str(path)), mountinfo=mountinfo)
+    row = h.inspect_mount_boundary(Path("/" + str(path)), mountinfo=mountinfo)
     assert row["state"] == "MOUNT_FOUND"
     assert row["matches"] == [str(path)]
     assert row["cleanup_authorized"] is False
@@ -241,10 +241,38 @@ def test_double_slash_root_is_normalized_for_process_comparison(tmp_path):
     (pid / "cwd").symlink_to("/unrelated")
     (pid / "root").symlink_to("/")
     (fd / "7").symlink_to(path / "artifact.txt")
-    result = h.inspect_process_references(Path("//" + str(path)), proc=proc)
+    result = h.inspect_process_references(Path("/" + str(path)), proc=proc)
     assert result["state"] == "REFERENCES_OBSERVED"
     assert result["references"] == [{"pid": 12345, "via": "fd"}]
     assert result["cleanup_authorized"] is False
+
+
+def test_relative_root_fails_closed_to_unknown(tmp_path):
+    # A non-absolute root cannot match absolute host paths; reporting "no
+    # reference" would be a false absence, so both probes return UNKNOWN.
+    path = tmp_path / "herdr-hermes-build-case1"
+    path.mkdir()
+    mount = h.inspect_mount_boundary(Path(path.name), mountinfo="")
+    assert mount["state"] == "UNKNOWN"
+    assert mount["cleanup_authorized"] is False
+    proc = tmp_path / "proc"
+    (proc / "12345" / "fd").mkdir(parents=True)
+    (proc / "12345" / "cwd").symlink_to("/")
+    (proc / "12345" / "root").symlink_to("/")
+    process = h.inspect_process_references(Path(path.name), proc=proc)
+    assert process["state"] == "UNKNOWN"
+    assert process["incomplete"] is True
+    assert process["cleanup_authorized"] is False
+
+
+def test_root_slash_matches_descendant_mount(tmp_path):
+    path = tmp_path / "herdr-hermes-build-case1"
+    path.mkdir()
+    mountinfo = f"50 40 8:1 / {path} rw,relatime - ext4 /dev/sda1 rw\n"
+    row = h.inspect_mount_boundary(Path("/"), mountinfo=mountinfo)
+    assert row["state"] == "MOUNT_FOUND"
+    assert row["matches"] == [str(path)]
+    assert row["cleanup_authorized"] is False
 
 
 def test_process_reference_detector_unknown_when_pid_inaccessible(tmp_path):

@@ -200,16 +200,19 @@ def read_root_envelope(path: Path) -> dict[str, Any]:
     return value
 
 
-def _normalized_root_text(path: Path) -> str:
+def _normalized_root_text(path: Path) -> str | None:
     """Collapse a leading POSIX double slash so kernel paths compare equal.
 
     POSIX permits exactly two leading slashes and ``Path`` preserves them, while
     /proc links and mountinfo use a single leading slash.  An accepted root
     spelled ``//x`` would otherwise silently suppress mount and process
-    observations for ``/x``.  Normalization keeps the read-only evidence correct
-    and changes nothing about what is authorized (nothing).
+    observations for ``/x``.  A non-absolute root returns ``None`` so both
+    probes fail closed to UNKNOWN instead of reporting a false absence.
+    Normalization changes nothing about what is authorized (nothing).
     """
     text = str(path)
+    if not text.startswith("/"):
+        return None
     if text.startswith("//"):
         return "/" + text.lstrip("/")
     return text
@@ -232,7 +235,10 @@ def inspect_mount_boundary(path: Path, *, mountinfo: str | None = None) -> dict[
             return {"state": "UNKNOWN", "matches": [], "cleanup_authorized": False}
     if type(mountinfo) is not str or len(mountinfo) > 2_097_152:
         return {"state": "UNKNOWN", "matches": [], "cleanup_authorized": False}
-    path_text = _normalized_root_text(path)
+    normalized_root = _normalized_root_text(path)
+    if normalized_root is None:
+        return {"state": "UNKNOWN", "matches": [], "cleanup_authorized": False}
+    path_text = normalized_root
     matches = []
 
     def unescape_mountpoint(value: str) -> str:
@@ -244,7 +250,7 @@ def inspect_mount_boundary(path: Path, *, mountinfo: str | None = None) -> dict[
         if not sep or len(fields) < 6 or any(not part for part in fields[:6]):
             return {"state": "UNKNOWN", "matches": [], "cleanup_authorized": False}
         point = unescape_mountpoint(fields[4])
-        if point == path_text or point.startswith(path_text + "/"):
+        if path_text == "/" or point == path_text or point.startswith(path_text + "/"):
             matches.append(point)
     return {
         "state": "MOUNT_FOUND" if matches else "NO_MOUNT_IN_OWN_NAMESPACE_ONLY",
@@ -267,7 +273,13 @@ def inspect_process_references(
     if (type(max_pids) is not int or not 1 <= max_pids <= 16384
             or type(max_fds) is not int or not 1 <= max_fds <= 4096):
         raise BuildHostEvidenceError("PROCESS_SCAN_BOUNDS_INVALID")
-    base = _normalized_root_text(path)
+    normalized_root = _normalized_root_text(path)
+    if normalized_root is None:
+        return {
+            "state": "UNKNOWN", "references": [],
+            "incomplete": True, "cleanup_authorized": False,
+        }
+    base = normalized_root
     references = []
     incomplete = False
     try:
@@ -290,7 +302,7 @@ def inspect_process_references(
     def hit(value: str) -> bool:
         # A deleted cwd/fd may still hold blocks; retain its path observation.
         value = value.removesuffix(" (deleted)")
-        return value == base or value.startswith(base + "/")
+        return base == "/" or value == base or value.startswith(base + "/")
 
     for pid in entries:
         directory = proc / pid
