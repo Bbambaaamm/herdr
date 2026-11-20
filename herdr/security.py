@@ -17,6 +17,7 @@ import os
 import re
 import stat
 import socket
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -1095,23 +1096,66 @@ class ProviderRequest:
             _credential_ref(self.credential_ref, "credential_ref")
 
 
+_BREAKER_COOLDOWN_CAP_SECONDS = 900.0
+
+
+def _finite(value: float) -> bool:
+    """True only for a real, non-NaN, non-infinite number."""
+    return value == value and value not in (float("inf"), float("-inf"))
+
+
 class ProviderCircuitBreaker:
-    """Small per-provider isolation primitive; one open provider does not stop peers."""
+    """Small per-provider isolation primitive; one open provider does not stop peers.
 
-    def __init__(self) -> None:
-        self._open: dict[str, str] = {}
+    A cooldown always expires.  The breaker never permanently removes a provider
+    and never widens the cooldown to unrelated providers.
+    """
 
-    def open(self, provider: str, reason: str) -> None:
-        self._open[_token(provider, "provider")] = _token(reason, "breaker reason")
+    def __init__(self, *, default_cooldown_seconds: float = 60.0) -> None:
+        self._open: dict[str, tuple[str, float]] = {}
+        seconds = float(default_cooldown_seconds)
+        if not _finite(seconds) or not 0.0 <= seconds <= _BREAKER_COOLDOWN_CAP_SECONDS:
+            raise SecurityError("breaker_cooldown_out_of_range")
+        self._default_cooldown = seconds
+
+    def open(
+        self,
+        provider: str,
+        reason: str,
+        *,
+        cooldown_seconds: float | None = None,
+        now: float | None = None,
+    ) -> None:
+        token = _token(provider, "provider")
+        _token(reason, "breaker reason")
+        seconds = self._default_cooldown if cooldown_seconds is None else float(cooldown_seconds)
+        if not _finite(seconds) or not 0.0 <= seconds <= _BREAKER_COOLDOWN_CAP_SECONDS:
+            raise SecurityError("breaker_cooldown_out_of_range")
+        current = time.time() if now is None else float(now)
+        if not _finite(current):
+            raise SecurityError("breaker_reference_time_invalid")
+        self._open[token] = (reason, current + seconds)
 
     def close(self, provider: str) -> None:
         self._open.pop(_token(provider, "provider"), None)
 
-    def reason(self, provider: str) -> str | None:
-        return self._open.get(_token(provider, "provider"))
+    def eligible_at(self, provider: str, *, now: float | None = None) -> float | None:
+        entry = self._open.get(_token(provider, "provider"))
+        return None if entry is None else entry[1]
 
-    def require_closed(self, provider: str) -> None:
-        reason = self.reason(provider)
+    def reason(self, provider: str, *, now: float | None = None) -> str | None:
+        token = _token(provider, "provider")
+        entry = self._open.get(token)
+        if entry is None:
+            return None
+        current = time.time() if now is None else float(now)
+        if current >= entry[1]:
+            del self._open[token]
+            return None
+        return entry[0]
+
+    def require_closed(self, provider: str, *, now: float | None = None) -> None:
+        reason = self.reason(provider, now=now)
         if reason is not None:
             raise PolicyDenied("provider_isolated", reason)
 
