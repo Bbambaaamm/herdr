@@ -106,6 +106,18 @@ verified route authority exists.
   has no socket, subprocess, file-write or SDK dependency.
 - No model call, router change, budget change, deployment or restart was made.
 
+## 5a. Telemetry bridge identity guard
+
+`herdr/usage_telemetry.py` is the measurement-only projection seam.  Its
+`telemetry_usage_fields` / `usage_telemetry_event` require the projected
+`provider` and `model` to satisfy the *telemetry* token contract
+(`herdr.telemetry._TOKEN`, the closed class `[A-Za-z0-9._:/@+-]`), not merely the
+adapter's `_token`, which rejects only empty, whitespace, backslash and NUL.
+An identifier such as `provider;evil` passes the adapter but is outside the
+telemetry character class; the bridge fails closed with `TelemetryError` instead
+of letting the closed telemetry contract drop or misattribute the row.  This
+reuses `herdr.telemetry._token` verbatim, so the two contracts cannot drift.
+
 ## 6. Follow-up required before this can be wired in
 
 1. Telemetry event needs cache-read/cache-write fields (or a bounded

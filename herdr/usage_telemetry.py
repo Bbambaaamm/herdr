@@ -22,6 +22,12 @@ Projection rules (fail-closed):
 * ``NON_BILLABLE`` is the only state allowed a concrete zero.  The adapter
   cannot currently produce it because no verified non-billable route authority
   exists, so the bridge keeps the same fail-closed guard.
+* ``provider``/``model`` must satisfy the *telemetry* token contract
+  (``herdr.telemetry._TOKEN``), not merely the adapter's looser ``_token``.  The
+  adapter rejects only whitespace, backslash and NUL; telemetry additionally
+  rejects empty values and any character outside ``[A-Za-z0-9._:/@+-]``.  A
+  value the adapter accepts but telemetry would reject fails closed here, at the
+  boundary, instead of being silently dropped or coerced into another row.
 """
 from __future__ import annotations
 
@@ -30,6 +36,7 @@ from typing import Any, Mapping
 
 from .provider_usage import UsageObservation, UsageStatus
 from .telemetry import CostUnknownReason, EventType, TelemetryError, TelemetryEvent
+from .telemetry import _token as _telemetry_token
 
 USAGE_TELEMETRY_VERSION = "usage-telemetry-bridge-1"
 
@@ -214,8 +221,23 @@ def project_usage_telemetry(observation: UsageObservation) -> UsageTelemetry:
 
 
 def telemetry_usage_fields(observation: UsageObservation) -> dict[str, Any]:
-    """Return the exact TelemetryEvent kwargs owned by this bridge."""
+    """Return the exact TelemetryEvent kwargs owned by this bridge.
+
+    The provider/model pair must satisfy the *telemetry* token contract, not just
+    the adapter's.  The adapter's ``_token`` rejects only whitespace, backslash
+    and NUL, so it accepts identifiers that ``herdr.telemetry`` would reject;
+    projecting those would either be silently dropped by the closed telemetry
+    contract or coerce the row into an unrelated identity.  Fail closed here.
+    """
     projection = project_usage_telemetry(observation)
+    try:
+        _telemetry_token(projection.provider, "provider", required=True)
+        _telemetry_token(projection.model, "model", required=True)
+    except TelemetryError as exc:
+        raise TelemetryError(
+            f"usage observation {projection.observation_id!r} cannot be projected"
+            f" into telemetry: {exc}"
+        ) from exc
     return {name: getattr(projection, name) for name in TELEMETRY_USAGE_FIELDS}
 
 
