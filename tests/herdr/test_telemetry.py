@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 
@@ -232,6 +233,38 @@ def test_ordering_fails_closed() -> None:
     events = [replace(event(), sequence=2), replace(event(), sequence=1)]
     with pytest.raises(TelemetryError, match="strictly increasing"):
         materialize(events)
+
+
+def test_absent_optional_reference_keeps_legacy_canonical_payload() -> None:
+    """An event without the reference must serialize exactly as before it existed.
+
+    Emitting an explicit null would change the canonical payload and therefore
+    the event_id of every row persisted before the optional field was added, so
+    those logs would stop replaying and the append-only store could not be read.
+    """
+    legacy = event().to_json()
+    assert "usage_observation_id" not in legacy
+    # Recompute the id over the payload that actually feeds it: it must match.
+    payload = {k: v for k, v in legacy.items() if k != "event_id"}
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    assert legacy["event_id"] == hashlib.sha256(raw).hexdigest()
+    # A pre-reference persisted record still replays and keeps its identity.
+    restored = TelemetryEvent.from_json(legacy)
+    assert restored.usage_observation_id is None
+    assert restored.event_id == legacy["event_id"]
+
+
+def test_reference_row_keeps_its_identity_and_still_replays(tmp_path) -> None:
+    reference = "a" * 64
+    store = TelemetryStore(tmp_path / "telemetry.jsonl")
+    plain = store.append(event())
+    referenced = store.append(event(usage_observation_id=reference))
+    assert "usage_observation_id" not in plain.to_json()
+    assert referenced.to_json()["usage_observation_id"] == reference
+    assert store.read() == (plain, referenced)
+    # Appending to a log that mixes legacy and referenced rows still reads first.
+    third = store.append(event(state="done"))
+    assert [e.sequence for e in store.read()] == [1, 2, 3]
 
 
 def test_read_since_and_sse_are_bounded_read_only_stream(tmp_path) -> None:
