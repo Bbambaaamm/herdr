@@ -20,6 +20,7 @@ from typing import Iterable, Mapping
 
 _TOKEN = re.compile(r"^[A-Za-z0-9._:/@+-]{1,256}$")
 _SHA = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_EVENTS_READ = 10_000
 
 
@@ -71,6 +72,20 @@ def _sha(value: str | None, field_name: str) -> str | None:
         return None
     if not isinstance(value, str) or not _SHA.fullmatch(value):
         raise TelemetryError(f"{field_name} must be a lowercase 40/64-char hex digest")
+    return value
+
+
+def _sha256(value: str | None, field_name: str) -> str | None:
+    """Validate an exact SHA-256 hex digest (64 lowercase hex characters).
+
+    Git object names may be 40 or 64 hex characters, but a content digest
+    reference is always a full SHA-256.  Using the Git ``_sha`` rule here would
+    silently accept a 40-character value that is not the promised digest.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _SHA256.fullmatch(value):
+        raise TelemetryError(f"{field_name} must be a lowercase 64-char SHA-256 hex digest")
     return value
 
 
@@ -227,7 +242,7 @@ class TelemetryEvent:
             raise TelemetryError("branch is invalid")
         _sha(self.base_sha, "base_sha")
         _sha(self.result_sha, "result_sha")
-        _sha(self.usage_observation_id, "usage_observation_id")
+        _sha256(self.usage_observation_id, "usage_observation_id")
         if self.currency != "USD":
             raise TelemetryError("currency must be USD")
         if self.actual_cost_microusd is None and self.cost_unknown_reason is None:

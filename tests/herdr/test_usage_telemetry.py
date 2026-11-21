@@ -394,10 +394,12 @@ def test_malformed_usage_reference_fails_closed_at_both_boundaries():
         request_id="req-34", pricing=PRICING, usage=usage,
     )
     fields = telemetry_usage_fields(observed)
-    # Direct construction of the projection with a non-digest reference fails.
+    # Direct construction of an otherwise valid projection with a non-digest
+    # reference fails.  ``cost_unknown_reason`` is supplied so the failure is
+    # caused by the reference guard itself, not by an unrelated validation.
     from herdr.usage_telemetry import UsageTelemetry
-    with pytest.raises(TelemetryError):
-        UsageTelemetry(
+    def projection(reference):
+        return UsageTelemetry(
             observation_id=observed.observation_id,
             provider=observed.provider,
             model=observed.model,
@@ -407,8 +409,17 @@ def test_malformed_usage_reference_fails_closed_at_both_boundaries():
             delivery=observed.delivery.value,
             status=observed.status.value,
             cost_state=observed.cost_state,
-            usage_observation_id="not-a-digest",
+            cost_unknown_reason=CostUnknownReason.PROVIDER_NOT_REPORTED,
+            usage_observation_id=reference,
         )
+
+    valid = projection(observed.observation_id)
+    assert valid.to_json()["usage_observation_id"] == observed.observation_id
+    with pytest.raises(TelemetryError):
+        projection("not-a-digest")
+    # A 40-char Git-style hex value is not a SHA-256 digest and must fail too.
+    with pytest.raises(TelemetryError):
+        projection("a" * 40)
     # Direct construction of the telemetry event with a non-digest fails too.
     with pytest.raises(TelemetryError):
         TelemetryEvent(
@@ -421,6 +432,19 @@ def test_malformed_usage_reference_fails_closed_at_both_boundaries():
             agent_id="agent-1",
             role="coding",
             **{**fields, "usage_observation_id": "../escape"},
+        )
+    # The event boundary enforces the same exact SHA-256 rule.
+    with pytest.raises(TelemetryError):
+        TelemetryEvent(
+            sequence=1,
+            timestamp="2026-11-21T00:00:00Z",
+            event_type=EventType.MODEL_ROUTE,
+            issue="53",
+            task_id="task-1",
+            attempt=0,
+            agent_id="agent-1",
+            role="coding",
+            **{**fields, "usage_observation_id": "a" * 40},
         )
     # An absent reference stays valid (optional field; omission is not a failure).
     absent = TelemetryEvent(

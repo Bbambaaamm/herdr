@@ -36,7 +36,7 @@ from typing import Any, Mapping
 
 from .provider_usage import UsageObservation, UsageStatus
 from .telemetry import CostUnknownReason, EventType, TelemetryError, TelemetryEvent
-from .telemetry import _sha as _telemetry_sha
+from .telemetry import _sha256 as _telemetry_sha256
 from .telemetry import _token as _telemetry_token
 
 USAGE_TELEMETRY_VERSION = "usage-telemetry-bridge-1"
@@ -109,7 +109,7 @@ class UsageTelemetry:
                 and not self.pricing_version:
             raise TelemetryError("projected known/estimated cost requires pricing_version")
         if self.usage_observation_id is not None:
-            _telemetry_sha(self.usage_observation_id, "usage_observation_id")
+            _telemetry_sha256(self.usage_observation_id, "usage_observation_id")
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -134,6 +134,7 @@ class UsageTelemetry:
                 self.cost_unknown_reason.value if self.cost_unknown_reason is not None else None
             ),
             "pricing_version": self.pricing_version,
+            "usage_observation_id": self.usage_observation_id,
             "coverage": dict(self.coverage or {}),
             "unknown_reasons": list(self.unknown_reasons),
         }
