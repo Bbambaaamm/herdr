@@ -269,6 +269,13 @@ def inspect_process_references(
     claim that a build is inactive. An inaccessible fd, cwd or PID races to
     UNKNOWN, and even a scan with no matches is scoped to the *current*
     namespace/instant only (not a lease/fencing or future-use assertion).
+
+    A scan that observed at least one reference but could not inspect every
+    reachable PID/fd must not report ``REFERENCES_OBSERVED`` alone: a second
+    process holding the build could sit in the unread part of ``/proc``.  The
+    observation is therefore demoted to ``UNKNOWN`` with ``incomplete=True``,
+    and the caller adds ``PROCESS_VISIBILITY_INCOMPLETE``.  Nothing becomes
+    authorized either way.
     """
     if (type(max_pids) is not int or not 1 <= max_pids <= 16384
             or type(max_fds) is not int or not 1 <= max_fds <= 4096):
@@ -348,9 +355,13 @@ def inspect_process_references(
             incomplete = True
             break
     return {
-        "state": ("REFERENCES_OBSERVED" if references
-                  else "UNKNOWN" if incomplete
-                  else "NO_REFERENCE_IN_VISIBLE_NAMESPACE_ONLY"),
+        # A partial scan can never positively assert "references observed":
+        # the unread remainder of /proc may hold another process.  Only a
+        # complete scan may report the two positive/no-reference states.
+        "state": ("REFERENCES_OBSERVED" if references and not incomplete
+                  else "NO_REFERENCE_IN_VISIBLE_NAMESPACE_ONLY"
+                  if not incomplete
+                  else "UNKNOWN"),
         "references": references,
         "incomplete": incomplete,
         "cleanup_authorized": False,
