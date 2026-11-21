@@ -15,12 +15,15 @@ from pathlib import Path
 import pytest
 
 from herdr.provider_usage import (
+    ApiMode,
+    DeliveryOutcome,
     PricingObservation,
     UsageFieldError,
+    UsageObservation,
     UsageStatus,
     observe_usage,
 )
-from herdr.telemetry import CostUnknownReason, TelemetryEvent
+from herdr.telemetry import CostUnknownReason, TelemetryError, TelemetryEvent
 from herdr.usage_telemetry import (
     TELEMETRY_USAGE_FIELDS,
     project_usage_telemetry,
@@ -233,3 +236,99 @@ def test_non_billable_route_authority_remains_unavailable():
             provider="anthropic", model="claude-opus-4-6", api_mode="anthropic_messages",
             request_id="req-11", pricing=PRICING, usage=None, non_billable=True,
         )
+
+
+# ------------------------------------------------- telemetry identity contract
+# The adapter's provider token (herdr/provider_usage.py ``_token``) rejects only
+# empty, whitespace, backslash and NUL; the telemetry contract
+# (herdr/telemetry.py ``_TOKEN``) is the closed character class
+# ``[A-Za-z0-9._:/@+-]``.  Identifiers such as ``provider;evil`` therefore pass
+# the adapter but are rejected by telemetry: a provider/model that the adapter
+# accepts but telemetry rejects must fail closed at the bridge, never be silently
+# dropped or coerced into another row.
+_ADAPTER_ONLY_PROVIDER = "provider;evil"
+_ADAPTER_ONLY_MODEL = "model;evil"
+
+
+def test_adapter_only_identity_is_rejected_at_the_telemetry_boundary():
+    usage = load_fixture("anthropic_success.json")["usage"]
+    observed = observe_usage(
+        provider=_ADAPTER_ONLY_PROVIDER, model=_ADAPTER_ONLY_MODEL,
+        api_mode="anthropic_messages", request_id="req-20", pricing=PRICING, usage=usage,
+    )
+    # The adapter accepted the identifier; telemetry must reject the projection.
+    assert observed.provider == _ADAPTER_ONLY_PROVIDER
+    assert observed.model == _ADAPTER_ONLY_MODEL
+    with pytest.raises(TelemetryError):
+        telemetry_usage_fields(observed)
+    with pytest.raises(TelemetryError):
+        make_event(observed)
+
+
+def test_adapter_only_identity_is_rejected_for_every_observed_status():
+    for kwargs in (
+        {"usage": None},
+        {"usage": load_fixture("codex_success.json")["usage"]},
+        {"usage": load_fixture("anthropic_success.json")["usage"]},
+    ):
+        observed = observe_usage(
+            provider=_ADAPTER_ONLY_PROVIDER, model=_ADAPTER_ONLY_MODEL,
+            api_mode="anthropic_messages", request_id="req-21", pricing=PRICING, **kwargs,
+        )
+        with pytest.raises(TelemetryError):
+            make_event(observed)
+
+
+def test_adapter_only_identity_is_rejected_in_direct_construction():
+    # A caller can build UsageObservation directly (it is a public dataclass), so
+    # the bridge guard must not depend on observe_usage having normalized it.
+    observed = UsageObservation(
+        schema_version="provider-usage-observation-1",
+        provider=_ADAPTER_ONLY_PROVIDER,
+        model=_ADAPTER_ONLY_MODEL,
+        api_mode=ApiMode.ANTHROPIC_MESSAGES,
+        request_id="req-22",
+        attempt_index=0,
+        delivery=DeliveryOutcome.DELIVERED,
+        status=UsageStatus.MEASURED,
+        input_tokens=1,
+        output_tokens=1,
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+        pricing=PRICING,
+        estimated_cost_microusd=1,
+        cost_unknown_reason=CostUnknownReason.PROVIDER_NOT_REPORTED,
+    )
+    with pytest.raises(TelemetryError):
+        make_event(observed)
+
+
+def test_telemetry_safe_identity_still_projects():
+    usage = load_fixture("anthropic_success.json")["usage"]
+    observed = observe_usage(
+        provider="anthropic", model="claude-opus-4-6", api_mode="anthropic_messages",
+        request_id="req-23", pricing=PRICING, usage=usage,
+    )
+    event = make_event(observed)
+    assert event.provider == "anthropic"
+    assert event.model == "claude-opus-4-6"
+
+
+def test_adapter_only_identity_is_rejected_by_direct_projection_not_only_the_event_path():
+    # Independent exact-head review finding: ``telemetry_usage_fields`` was
+    # guarded, but ``project_usage_telemetry`` still returned a UsageTelemetry
+    # whose ``to_json()`` emitted the same adapter-only identity.  The projection
+    # value object itself must fail closed, so a direct caller cannot serialize a
+    # row that telemetry would reject.
+    usage = load_fixture("anthropic_success.json")["usage"]
+    observed = observe_usage(
+        provider=_ADAPTER_ONLY_PROVIDER,
+        model=_ADAPTER_ONLY_MODEL,
+        api_mode="anthropic_messages",
+        request_id="req-24",
+        pricing=PRICING,
+        usage=usage,
+    )
+    assert observed.provider == _ADAPTER_ONLY_PROVIDER
+    with pytest.raises(TelemetryError):
+        project_usage_telemetry(observed)
