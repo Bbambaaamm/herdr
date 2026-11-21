@@ -23,7 +23,7 @@ from herdr.provider_usage import (
     UsageStatus,
     observe_usage,
 )
-from herdr.telemetry import CostUnknownReason, TelemetryError, TelemetryEvent
+from herdr.telemetry import CostUnknownReason, EventType, TelemetryError, TelemetryEvent
 from herdr.usage_telemetry import (
     TELEMETRY_USAGE_FIELDS,
     project_usage_telemetry,
@@ -332,3 +332,107 @@ def test_adapter_only_identity_is_rejected_by_direct_projection_not_only_the_eve
     assert observed.provider == _ADAPTER_ONLY_PROVIDER
     with pytest.raises(TelemetryError):
         project_usage_telemetry(observed)
+
+
+# ------------------------------------------------- bounded observation reference
+# Follow-up #1 of docs/architecture/PROVIDER_USAGE_OBSERVATION.md section 6: a
+# usage row must be addressable without a prompt, response, credential or free
+# text.  The closed telemetry schema therefore carries an optional bounded
+# ``usage_observation_id`` digest reference, populated by the bridge from the
+# source observation.  It never widens the schema to arbitrary metadata and it
+# never changes budget/settlement/routing authority.
+
+def test_telemetry_usage_fields_expose_the_bounded_observation_reference():
+    usage = load_fixture("anthropic_success.json")["usage"]
+    observed = observe_usage(
+        provider="anthropic", model="claude-opus-4-6", api_mode="anthropic_messages",
+        request_id="req-30", pricing=PRICING, usage=usage,
+    )
+    fields = telemetry_usage_fields(observed)
+    assert fields["usage_observation_id"] == observed.observation_id
+    assert len(fields["usage_observation_id"]) == 64
+    # No prompt, response or free-text field enters the reference contract.
+    assert set(fields) == set(TELEMETRY_USAGE_FIELDS)
+
+
+def test_usage_reference_is_present_for_partial_and_unknown_rows():
+    partial = observe_usage(
+        provider="anthropic", model="claude-opus-4-6", api_mode="anthropic_messages",
+        request_id="req-31", pricing=PRICING,
+        usage=load_fixture("anthropic_missing_cache.json")["usage"],
+    )
+    unknown = observe_usage(
+        provider="anthropic", model="claude-opus-4-6", api_mode="anthropic_messages",
+        request_id="req-32", pricing=PRICING, usage=None,
+    )
+    assert partial.status is not None and partial.observation_id
+    for observed in (partial, unknown):
+        projection = project_usage_telemetry(observed)
+        assert projection.usage_observation_id == observed.observation_id
+        event = make_event(observed)
+        assert event.usage_observation_id == observed.observation_id
+
+
+def test_usage_reference_round_trips_through_the_telemetry_event():
+    usage = load_fixture("openai_success.json")["usage"]
+    observed = observe_usage(
+        provider="openai", model="gpt-5.3-codex", api_mode="chat_completions",
+        request_id="req-33", pricing=PRICING, usage=usage,
+    )
+    event = make_event(observed)
+    raw = event.to_json()
+    assert raw["usage_observation_id"] == observed.observation_id
+    restored = TelemetryEvent.from_json(raw)
+    assert restored.usage_observation_id == observed.observation_id
+    assert restored.event_id == event.event_id
+
+
+def test_malformed_usage_reference_fails_closed_at_both_boundaries():
+    usage = load_fixture("anthropic_success.json")["usage"]
+    observed = observe_usage(
+        provider="anthropic", model="claude-opus-4-6", api_mode="anthropic_messages",
+        request_id="req-34", pricing=PRICING, usage=usage,
+    )
+    fields = telemetry_usage_fields(observed)
+    # Direct construction of the projection with a non-digest reference fails.
+    from herdr.usage_telemetry import UsageTelemetry
+    with pytest.raises(TelemetryError):
+        UsageTelemetry(
+            observation_id=observed.observation_id,
+            provider=observed.provider,
+            model=observed.model,
+            api_mode=observed.api_mode.value,
+            request_id=observed.request_id,
+            attempt_index=observed.attempt_index,
+            delivery=observed.delivery.value,
+            status=observed.status.value,
+            cost_state=observed.cost_state,
+            usage_observation_id="not-a-digest",
+        )
+    # Direct construction of the telemetry event with a non-digest fails too.
+    with pytest.raises(TelemetryError):
+        TelemetryEvent(
+            sequence=1,
+            timestamp="2026-11-21T00:00:00Z",
+            event_type=EventType.MODEL_ROUTE,
+            issue="53",
+            task_id="task-1",
+            attempt=0,
+            agent_id="agent-1",
+            role="coding",
+            **{**fields, "usage_observation_id": "../escape"},
+        )
+    # An absent reference stays valid (optional field; omission is not a failure).
+    absent = TelemetryEvent(
+        sequence=1,
+        timestamp="2026-11-21T00:00:00Z",
+        event_type=EventType.MODEL_ROUTE,
+        issue="53",
+        task_id="task-1",
+        attempt=0,
+        agent_id="agent-1",
+        role="coding",
+        **{k: v for k, v in fields.items() if k != "usage_observation_id"},
+    )
+    assert absent.usage_observation_id is None
+    assert TelemetryEvent.from_json(absent.to_json()).usage_observation_id is None

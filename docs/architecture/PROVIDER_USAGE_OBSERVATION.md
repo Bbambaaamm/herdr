@@ -126,6 +126,13 @@ reject; `telemetry_usage_fields` / `usage_telemetry_event` inherit it.
 
 1. Telemetry event needs cache-read/cache-write fields (or a bounded
    `usage_observation_id` reference) — a separate contract change.
+   **Partially landed:** the telemetry schema now carries an optional bounded
+   `usage_observation_id` digest reference (`herdr/telemetry.py`, validated with
+   the existing `_sha`), and the bridge populates it from the source observation
+   (`herdr/usage_telemetry.py`, `TELEMETRY_USAGE_FIELDS`).  A usage row is now
+   addressable without a prompt, response, credential or free text.  Cache-read
+   and cache-write remain telemetry fields owned by the existing contract; this
+   reference does not add them and does not change any economic authority.
 2. `prompt_runtime.py` / `context.py` placeholders need a bounded reference to an
    observation id rather than free text.
 3. `host_model_transport.py` offline fixture usage lacks cache metadata, so a

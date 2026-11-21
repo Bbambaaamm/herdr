@@ -188,6 +188,11 @@ class TelemetryEvent:
     blocker: str | None = None
     cpu_millis: int | None = None
     max_rss_bytes: int | None = None
+    # Bounded reference to a provider usage observation (canonical SHA-256 of the
+    # observation payload, no prompt/response/credential).  Optional: a telemetry
+    # event that carries usage fields may reference the exact observation it came
+    # from, so the row is addressable without widening the closed schema.
+    usage_observation_id: str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.sequence, bool) or not isinstance(self.sequence, int) or self.sequence < 0:
@@ -222,6 +227,7 @@ class TelemetryEvent:
             raise TelemetryError("branch is invalid")
         _sha(self.base_sha, "base_sha")
         _sha(self.result_sha, "result_sha")
+        _sha(self.usage_observation_id, "usage_observation_id")
         if self.currency != "USD":
             raise TelemetryError("currency must be USD")
         if self.actual_cost_microusd is None and self.cost_unknown_reason is None:

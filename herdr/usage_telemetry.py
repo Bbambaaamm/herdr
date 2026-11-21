@@ -36,6 +36,7 @@ from typing import Any, Mapping
 
 from .provider_usage import UsageObservation, UsageStatus
 from .telemetry import CostUnknownReason, EventType, TelemetryError, TelemetryEvent
+from .telemetry import _sha as _telemetry_sha
 from .telemetry import _token as _telemetry_token
 
 USAGE_TELEMETRY_VERSION = "usage-telemetry-bridge-1"
@@ -52,6 +53,7 @@ TELEMETRY_USAGE_FIELDS = (
     "actual_cost_microusd",
     "cost_unknown_reason",
     "pricing_version",
+    "usage_observation_id",
 )
 
 
@@ -79,6 +81,8 @@ class UsageTelemetry:
     pricing_version: str | None = None
     coverage: Mapping[str, bool] | None = None
     unknown_reasons: tuple[str, ...] = ()
+    # Bounded digest reference to the source observation; no prompt/response body.
+    usage_observation_id: str | None = None
 
     def __post_init__(self) -> None:
         # The telemetry token contract is the closed class
@@ -104,6 +108,8 @@ class UsageTelemetry:
         if (self.actual_cost_microusd is not None or self.estimated_cost_microusd is not None) \
                 and not self.pricing_version:
             raise TelemetryError("projected known/estimated cost requires pricing_version")
+        if self.usage_observation_id is not None:
+            _telemetry_sha(self.usage_observation_id, "usage_observation_id")
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -172,6 +178,7 @@ def project_usage_telemetry(observation: UsageObservation) -> UsageTelemetry:
             pricing_version=pricing_version,
             coverage=observation.coverage,
             unknown_reasons=observation.unknown_reasons,
+            usage_observation_id=observation.observation_id,
         )
     if observation.status is UsageStatus.NON_BILLABLE:
         # Unreachable through observe_usage today; kept fail-closed so a future
@@ -200,6 +207,7 @@ def project_usage_telemetry(observation: UsageObservation) -> UsageTelemetry:
             pricing_version=pricing_version,
             coverage=observation.coverage,
             unknown_reasons=observation.unknown_reasons,
+            usage_observation_id=observation.observation_id,
         )
     # PARTIAL and UNKNOWN: no token totals, no estimated cost, unknown cost stays
     # None.  A confirmed actual cost on a PARTIAL row is preserved.
@@ -230,6 +238,7 @@ def project_usage_telemetry(observation: UsageObservation) -> UsageTelemetry:
         pricing_version=pricing_version,
         coverage=observation.coverage,
         unknown_reasons=observation.unknown_reasons,
+        usage_observation_id=observation.observation_id,
     )
 
 
