@@ -268,6 +268,12 @@ class TelemetryEvent:
         )
         data["fallback_chain"] = list(self.fallback_chain)
         data["tool_names"] = list(self.tool_names)
+        # The optional reference is omitted when absent.  Emitting an explicit
+        # null would change the canonical payload and therefore every event_id
+        # written before the field existed, so persisted pre-reference logs
+        # could no longer be replayed or appended to.
+        if self.usage_observation_id is None:
+            data.pop("usage_observation_id", None)
         if include_event_id:
             data["event_id"] = self.event_id
         return data

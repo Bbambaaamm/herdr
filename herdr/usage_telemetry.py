@@ -134,7 +134,13 @@ class UsageTelemetry:
                 self.cost_unknown_reason.value if self.cost_unknown_reason is not None else None
             ),
             "pricing_version": self.pricing_version,
-            "usage_observation_id": self.usage_observation_id,
+            # Omitted when absent so a projection without a reference keeps the
+            # exact canonical shape it had before the field existed.
+            **(
+                {"usage_observation_id": self.usage_observation_id}
+                if self.usage_observation_id is not None
+                else {}
+            ),
             "coverage": dict(self.coverage or {}),
             "unknown_reasons": list(self.unknown_reasons),
         }
