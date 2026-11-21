@@ -1074,6 +1074,33 @@ def test_herdr_sanitizer_uses_explicit_pane_binding_and_drops_raw():
         sanitize(json.dumps(raw).encode(), 100, binding)
 
 
+def test_herdr_sanitizer_skips_unnamed_agent_entries():
+    # A live agent-list entry without a usable name is not a configured binding.
+    # It must be skipped, not crash the whole bridge (regression: KeyError -> exit 78).
+    raw = dict(id='cli:agent:list', result=dict(type='agent_list', agents=[
+        dict(pane_id='w5:p2', terminal_id='term_65f8bbfa4319529'),
+        dict(name=None, pane_id='w5:p2'),
+        dict(name='majak-hermes', agent_status='working', pane_id='p1'),
+    ]))
+    binding = {'majak-hermes': dict(profile='majak', pane_id='p1')}
+    result = sanitize(json.dumps(raw).encode(), 100, binding)
+    assert result['agents'] == [dict(agent='majak-hermes', status='working')]
+
+
+def test_herdr_sanitizer_still_fails_closed_when_configured_agent_is_unnamed():
+    # Skipping unnamed entries must not weaken the binding contract: a configured
+    # binding that has no matching named row still fails closed. The entry omits
+    # the name key entirely, exactly like the live entry that caused exit 78, so
+    # this test also fails on the pre-fix KeyError instead of only on the
+    # coverage check.
+    raw = dict(id='cli:agent:list', result=dict(type='agent_list', agents=[
+        dict(pane_id='p1'),
+    ]))
+    with pytest.raises(ValueError):
+        sanitize(json.dumps(raw).encode(), 100,
+                 {'majak-hermes': dict(profile='majak', pane_id='p1')})
+
+
 def test_command_output_bound_timeout_and_clean_environment():
     assert sources.command(['/usr/bin/printf', 'ok']) == b'ok'
     with pytest.raises(ValueError):
