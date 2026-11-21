@@ -387,6 +387,36 @@ def test_usage_reference_round_trips_through_the_telemetry_event():
     assert restored.event_id == event.event_id
 
 
+def test_projection_without_reference_omits_the_key_from_its_payload():
+    """A projection with no reference keeps the pre-reference canonical shape.
+
+    Serializing an explicit null would change the payload a consumer hashed
+    before the optional field existed.  This covers the UsageTelemetry boundary
+    specifically, so removing its omission guard cannot pass unnoticed.
+    """
+    from herdr.usage_telemetry import UsageTelemetry
+    usage = load_fixture("anthropic_success.json")["usage"]
+    observed = observe_usage(
+        provider="anthropic", model="claude-opus-4-6", api_mode="anthropic_messages",
+        request_id="req-35", pricing=PRICING, usage=usage,
+    )
+    projection = UsageTelemetry(
+        observation_id=observed.observation_id,
+        provider=observed.provider,
+        model=observed.model,
+        api_mode=observed.api_mode.value,
+        request_id=observed.request_id,
+        attempt_index=observed.attempt_index,
+        delivery=observed.delivery.value,
+        status=observed.status.value,
+        cost_state=observed.cost_state,
+        cost_unknown_reason=CostUnknownReason.PROVIDER_NOT_REPORTED,
+        usage_observation_id=None,
+    )
+    assert projection.usage_observation_id is None
+    assert "usage_observation_id" not in projection.to_json()
+
+
 def test_malformed_usage_reference_fails_closed_at_both_boundaries():
     usage = load_fixture("anthropic_success.json")["usage"]
     observed = observe_usage(
