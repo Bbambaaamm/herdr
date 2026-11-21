@@ -286,6 +286,63 @@ def test_process_reference_detector_unknown_when_pid_inaccessible(tmp_path):
     assert result["cleanup_authorized"] is False
 
 
+def test_partial_scan_with_a_reference_is_unknown_not_positive(tmp_path):
+    # A reference found in the readable part of /proc must not be reported as
+    # a complete positive observation while another PID is unreadable: that
+    # second process could also hold the build.  The state must be UNKNOWN
+    # with incomplete=True, so host_evidence_scan records
+    # PROCESS_VISIBILITY_INCOMPLETE instead of PROCESS_REFERENCE_OBSERVED.
+    path = tmp_path / "herdr-hermes-build-case1"
+    path.mkdir()
+    proc = tmp_path / "proc"
+    pid = proc / "12345"
+    fd = pid / "fd"
+    fd.mkdir(parents=True)
+    (pid / "cwd").symlink_to("/unrelated")
+    (pid / "root").symlink_to("/")
+    (fd / "7").symlink_to(path / "artifact.txt")
+    (proc / "99999").mkdir(parents=True)
+    result = h.inspect_process_references(path, proc=proc)
+    assert result["references"] == [{"pid": 12345, "via": "fd"}]
+    assert result["incomplete"] is True
+    assert result["state"] == "UNKNOWN"
+    assert result["cleanup_authorized"] is False
+
+
+def test_complete_scan_with_a_reference_stays_positive(tmp_path):
+    # The regression guard: a complete scan must keep the positive state, so
+    # the new demotion does not weaken the working detection path.
+    path = tmp_path / "herdr-hermes-build-case1"
+    path.mkdir()
+    proc = tmp_path / "proc"
+    pid = proc / "12345"
+    fd = pid / "fd"
+    fd.mkdir(parents=True)
+    (pid / "cwd").symlink_to("/unrelated")
+    (pid / "root").symlink_to("/")
+    (fd / "7").symlink_to(path / "artifact.txt")
+    result = h.inspect_process_references(path, proc=proc)
+    assert result["references"] == [{"pid": 12345, "via": "fd"}]
+    assert result["incomplete"] is False
+    assert result["state"] == "REFERENCES_OBSERVED"
+    assert result["cleanup_authorized"] is False
+
+
+def test_complete_scan_without_a_reference_is_scoped_absence(tmp_path):
+    path = tmp_path / "herdr-hermes-build-case1"
+    path.mkdir()
+    proc = tmp_path / "proc"
+    pid = proc / "12345"
+    (pid / "fd").mkdir(parents=True)
+    (pid / "cwd").symlink_to("/unrelated")
+    (pid / "root").symlink_to("/")
+    result = h.inspect_process_references(path, proc=proc)
+    assert result["references"] == []
+    assert result["incomplete"] is False
+    assert result["state"] == "NO_REFERENCE_IN_VISIBLE_NAMESPACE_ONLY"
+    assert result["cleanup_authorized"] is False
+
+
 def test_process_reference_detector_limits_are_fail_closed(tmp_path):
     path = tmp_path / "herdr-hermes-build-case1"
     path.mkdir()
