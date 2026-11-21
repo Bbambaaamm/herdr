@@ -312,3 +312,23 @@ def test_telemetry_safe_identity_still_projects():
     event = make_event(observed)
     assert event.provider == "anthropic"
     assert event.model == "claude-opus-4-6"
+
+
+def test_adapter_only_identity_is_rejected_by_direct_projection_not_only_the_event_path():
+    # Independent exact-head review finding: ``telemetry_usage_fields`` was
+    # guarded, but ``project_usage_telemetry`` still returned a UsageTelemetry
+    # whose ``to_json()`` emitted the same adapter-only identity.  The projection
+    # value object itself must fail closed, so a direct caller cannot serialize a
+    # row that telemetry would reject.
+    usage = load_fixture("anthropic_success.json")["usage"]
+    observed = observe_usage(
+        provider=_ADAPTER_ONLY_PROVIDER,
+        model=_ADAPTER_ONLY_MODEL,
+        api_mode="anthropic_messages",
+        request_id="req-24",
+        pricing=PRICING,
+        usage=usage,
+    )
+    assert observed.provider == _ADAPTER_ONLY_PROVIDER
+    with pytest.raises(TelemetryError):
+        project_usage_telemetry(observed)

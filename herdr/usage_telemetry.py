@@ -81,6 +81,19 @@ class UsageTelemetry:
     unknown_reasons: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        # The telemetry token contract is the closed class
+        # ``[A-Za-z0-9._:/@+-]``.  Enforce it on the value object itself so every
+        # projection path -- not only ``telemetry_usage_fields`` -- fails closed;
+        # a direct ``project_usage_telemetry`` caller must not be able to build a
+        # serializable row whose provider/model telemetry would reject.
+        try:
+            _telemetry_token(self.provider, "provider", required=True)
+            _telemetry_token(self.model, "model", required=True)
+        except TelemetryError as exc:
+            raise TelemetryError(
+                f"usage observation {self.observation_id!r} cannot be projected"
+                f" into telemetry: {exc}"
+            ) from exc
         if self.input_tokens is not None and self.cached_tokens is not None:
             if self.cached_tokens > self.input_tokens:
                 raise TelemetryError("projected cached_tokens cannot exceed input_tokens")

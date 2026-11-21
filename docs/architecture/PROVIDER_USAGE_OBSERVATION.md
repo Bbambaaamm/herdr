@@ -117,6 +117,10 @@ An identifier such as `provider;evil` passes the adapter but is outside the
 telemetry character class; the bridge fails closed with `TelemetryError` instead
 of letting the closed telemetry contract drop or misattribute the row.  This
 reuses `herdr.telemetry._token` verbatim, so the two contracts cannot drift.
+The same guard lives in the `UsageTelemetry` value object (`__post_init__`), so
+it covers every projection path — a direct `project_usage_telemetry` call cannot
+build (or serialize via `to_json`) a row whose provider/model telemetry would
+reject; `telemetry_usage_fields` / `usage_telemetry_event` inherit it.
 
 ## 6. Follow-up required before this can be wired in
 
