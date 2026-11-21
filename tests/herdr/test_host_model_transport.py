@@ -369,3 +369,41 @@ def test_unverified_or_credential_exposed_runtime_cannot_use_host_transport(tmp_
     owner.launch.grant=replace(owner.launch.grant,runtime_assurance=RuntimeAssurance(False,None,NetworkAccess.NONE,(),False))
     with pytest.raises(WorkContractError,match='verified credential-isolated'):
         transport.execute_host_model(owner,header,body,perform=lambda *args:pytest.fail('unverified runtime reached provider'))
+
+
+def test_offline_fixture_usage_is_cache_complete_and_projects_measured():
+    """Offline transport fixture carries cache metadata (design-doc follow-up #3).
+
+    A fixture-driven adapter run over the transport's own offline response must
+    report MEASURED, not PARTIAL: the prompt total is normalized to uncached input
+    only when both cache buckets are present, and no token is double counted.
+    """
+    from herdr.provider_usage import (DeliveryOutcome, PricingObservation, UsageStatus,
+                                      observe_usage)
+    from herdr.usage_telemetry import project_usage_telemetry
+    pricing = PricingObservation(pricing_version="offline-fixture-2026-11-21",
+                                 input_microusd_per_million=1_000_000,
+                                 output_microusd_per_million=1_000_000,
+                                 cache_read_microusd_per_million=100_000,
+                                 cache_write_microusd_per_million=1_000_000)
+    tools = [{"type": "function", "function": {"name": name}} for name in
+             ("read_file", "write_file", "herdr_verify_work", "herdr_submit_result")]
+    answer = transport._fixture_response({"tools": tools}, "child", {}, 5,
+                                         "/tmp/offline-fixture-workspace")
+    usage = answer["body"]["usage"]
+    assert usage["prompt_tokens_details"]["cached_tokens"] == 0
+    assert usage["cache_write_tokens"] == 0
+    observed = observe_usage(provider="nous", model=transport._FIXTURE_MODEL,
+                             api_mode="chat_completions", request_id="offline-fixture",
+                             delivery=DeliveryOutcome.DELIVERED, usage=usage,
+                             pricing=pricing)
+    assert observed.status is UsageStatus.MEASURED
+    assert (observed.input_tokens, observed.output_tokens) == (1, 1)
+    assert (observed.cache_read_tokens, observed.cache_write_tokens) == (0, 0)
+    projected = project_usage_telemetry(observed)
+    assert projected.status == UsageStatus.MEASURED
+    assert projected.input_tokens == 1
+    assert projected.output_tokens == 1
+    assert projected.cached_tokens == 0
+    assert projected.cache_read_tokens == 0
+    assert projected.cache_write_tokens == 0

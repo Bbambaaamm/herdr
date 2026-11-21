@@ -141,6 +141,9 @@ reject; `telemetry_usage_fields` / `usage_telemetry_event` inherit it.
    observation id rather than free text.
 3. `host_model_transport.py` offline fixture usage lacks cache metadata, so a
    fixture-driven adapter run reports `PARTIAL`, not `MEASURED`.
+   **Landed:** the offline fixture now carries `prompt_tokens_details.cached_tokens`
+   and `cache_write_tokens`; `tests/herdr/test_host_model_transport.py` proves a
+   fixture-driven adapter run projects `MEASURED` with no double-counted token.
 4. Pricing version must be pinned per route from `work_budget_configuration`
    `model_quotes`; the adapter accepts it but does not invent it.
 
