@@ -46,8 +46,8 @@ def _bundle():
         "schema_version": audit.SCHEMA_ACTION_TRACE,
         "graph_sha256": _digest(graph),
         "steps": [
-            {"seq": 0, "node_id": "parent", "tool": "terminal",
-             "args_sha256": "e" * 64, "risk_class": "EXTERNAL_SIDE_EFFECT",
+            {"seq": 1, "node_id": "parent", "tool": "terminal",
+             "args_sha256": "e" * 64, "risk_class": "external_side_effect",
              "write_paths": ["/ws/out"]},
         ],
     }
@@ -56,7 +56,7 @@ def _bundle():
         "graph_sha256": _digest(graph),
         "entries": [
             {"approval_id": "ap-parent", "node_id": "parent", "tool": "terminal",
-             "args_sha256": "e" * 64, "seq": 0, "consumed": True,
+             "args_sha256": "e" * 64, "seq": 2, "consumed": True,
              "grant_sha256": parent_grant},
         ],
     }
@@ -179,7 +179,7 @@ def test_child_scope_must_be_a_subset_of_parent_scope():
 
 def test_approval_must_precede_the_action_it_authorizes():
     bundle = _bundle()
-    bundle["approval_ledger"]["entries"][0]["seq"] = 9
+    bundle["approval_ledger"]["entries"][0]["seq"] = 0
     out = _audit(bundle)
     assert out.status == "VIOLATION"
     assert "approval_after_action" in out.violations
@@ -259,3 +259,129 @@ def test_incomplete_structure_is_unknown_not_safe():
     out = _audit(bundle)
     assert out.status in ("UNKNOWN", "VIOLATION")
     assert out.status != "COVERED"
+
+
+def test_path_traversal_cannot_escape_a_granted_root():
+    bundle = _bundle()
+    bundle["action_trace"]["steps"].append(
+        {"seq": 1, "node_id": "child", "tool": "write_file",
+         "args_sha256": "2" * 64, "risk_class": "workspace_write",
+         "write_paths": ["/ws/../etc/passwd"]})
+    bundle["evidence"]["action_trace_sha256"] = _digest(bundle["action_trace"])
+    out = _audit(bundle)
+    assert out.status == "VIOLATION"
+    assert "composed_write_scope_exceeded" in out.violations
+
+
+def test_ambiguous_normalized_write_path_is_rejected():
+    bundle = _bundle()
+    bundle["action_trace"]["steps"].append(
+        {"seq": 1, "node_id": "child", "tool": "write_file",
+         "args_sha256": "3" * 64, "risk_class": "workspace_write",
+         "write_paths": ["/ws/../ws/out"]})
+    bundle["evidence"]["action_trace_sha256"] = _digest(bundle["action_trace"])
+    out = _audit(bundle)
+    assert out.status == "VIOLATION"
+    assert "composed_write_scope_exceeded" in out.violations
+
+
+def test_unconsumed_approval_is_a_violation():
+    bundle = _bundle()
+    bundle["approval_ledger"]["entries"][0]["consumed"] = False
+    out = _audit(bundle)
+    assert out.status == "VIOLATION"
+    assert "approval_not_consumed" in out.violations
+
+
+def test_approval_seq_equal_to_action_seq_is_rejected():
+    bundle = _bundle()
+    bundle["approval_ledger"]["entries"][0]["seq"] = 0
+    out = _audit(bundle)
+    assert out.status == "VIOLATION"
+    assert "approval_after_action" in out.violations
+
+
+def test_one_approval_cannot_cover_two_actions():
+    bundle = _bundle()
+    bundle["action_trace"]["steps"].append(
+        {"seq": 2, "node_id": "parent", "tool": "terminal",
+         "args_sha256": "e" * 64, "risk_class": "external_side_effect",
+         "write_paths": ["/ws/out2"]})
+    bundle["evidence"]["action_trace_sha256"] = _digest(bundle["action_trace"])
+    out = _audit(bundle)
+    assert out.status == "VIOLATION"
+    assert "approval_after_action" in out.violations
+
+
+def test_one_approval_entry_bound_to_two_actions_is_over_covered():
+    bundle = _bundle()
+    bundle["action_trace"]["steps"].append(
+        {"seq": 2, "node_id": "parent", "tool": "terminal",
+         "args_sha256": "e" * 64, "risk_class": "external_side_effect",
+         "write_paths": ["/ws/out2"]})
+    bundle["approval_ledger"]["entries"].append(
+        {"approval_id": "ap-parent", "node_id": "parent", "tool": "terminal",
+         "args_sha256": "e" * 64, "seq": 3, "consumed": True,
+         "grant_sha256": bundle["graph"]["nodes"][0]["grant_sha256"]})
+    bundle["evidence"]["action_trace_sha256"] = _digest(bundle["action_trace"])
+    out = _audit(bundle)
+    assert out.status == "VIOLATION"
+    assert "replayed_approval" in out.violations
+
+
+def test_distinct_approval_ids_for_two_identical_actions():
+    bundle = _bundle()
+    bundle["action_trace"]["steps"].append(
+        {"seq": 2, "node_id": "parent", "tool": "terminal",
+         "args_sha256": "e" * 64, "risk_class": "external_side_effect",
+         "write_paths": ["/ws/out2"]})
+    parent_grant = bundle["graph"]["nodes"][0]["grant_sha256"]
+    bundle["policy"]["grants"][parent_grant]["approvals"].append(
+        {"approval_id": "ap-parent-2", "tool": "terminal"})
+    bundle["graph"]["policy_sha256"] = _digest(bundle["policy"])
+    bundle["action_trace"]["graph_sha256"] = _digest(bundle["graph"])
+    bundle["approval_ledger"]["graph_sha256"] = _digest(bundle["graph"])
+    bundle["approval_ledger"]["entries"].append(
+        {"approval_id": "ap-parent-2", "node_id": "parent", "tool": "terminal",
+         "args_sha256": "e" * 64, "seq": 3, "consumed": True,
+         "grant_sha256": parent_grant})
+    bundle["evidence"]["action_trace_sha256"] = _digest(bundle["action_trace"])
+    out = _audit(bundle)
+    assert out.status == "VIOLATION"
+    assert "approval_bound_to_multiple_actions" in out.violations
+
+
+def test_unknown_risk_class_is_not_silently_unapproved():
+    bundle = _bundle()
+    bundle["approval_ledger"]["entries"] = []
+    bundle["action_trace"]["steps"][0]["risk_class"] = "UNCLASSIFIED"
+    bundle["evidence"]["action_trace_sha256"] = _digest(bundle["action_trace"])
+    out = _audit(bundle)
+    assert out.status == "VIOLATION"
+    assert "unknown_risk_class" in out.violations
+
+
+def test_missing_risk_class_is_not_silently_unapproved():
+    bundle = _bundle()
+    bundle["approval_ledger"]["entries"] = []
+    del bundle["action_trace"]["steps"][0]["risk_class"]
+    bundle["evidence"]["action_trace_sha256"] = _digest(bundle["action_trace"])
+    out = _audit(bundle)
+    assert out.status == "VIOLATION"
+    assert "unknown_risk_class" in out.violations
+
+
+def test_every_known_risk_class_requires_approval():
+    bundle = _bundle()
+    for risk in ("read", "workspace_write", "delegation", "result_submission",
+                 "process", "external_side_effect", "credential_use", "physical"):
+        step = {"seq": 0, "node_id": "parent", "tool": "terminal",
+                "args_sha256": "e" * 64, "risk_class": risk,
+                "write_paths": ["/ws/out"]}
+        local = copy.deepcopy(bundle)
+        local["action_trace"]["steps"] = [step]
+        local["approval_ledger"]["entries"] = []
+        local["evidence"]["action_trace_sha256"] = _digest(local["action_trace"])
+        out = _audit(local)
+        assert out.status == "VIOLATION", risk
+        assert "high_risk_action_without_approval" in out.violations, risk

@@ -25,6 +25,7 @@ are optional keyword arguments; a caller that supplies digests only receives
 """
 from __future__ import annotations
 
+import posixpath
 import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping
@@ -41,8 +42,22 @@ SCHEMA_EVIDENCE = "herdr-composed-boundary-evidence-1"
 
 ARTIFACTS = ("graph", "policy", "action_trace", "approval_ledger", "evidence")
 
+# Approval requirement follows the known RiskClass set in ``herdr/security.py``
+# (``RiskClass`` is a ``StrEnum`` of lowercase values); anything outside it is
+# evidence we cannot classify, so it is never silently treated as a low-risk
+# action that needs no approval.
+APPROVAL_RISK_CLASSES = frozenset((
+    "read",
+    "workspace_write",
+    "delegation",
+    "result_submission",
+    "process",
+    "external_side_effect",
+    "credential_use",
+    "physical",
+))
+
 _SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
-_HIGH_RISK = frozenset(("EXTERNAL_SIDE_EFFECT", "CREDENTIAL_USE", "PHYSICAL"))
 
 
 @dataclass(frozen=True)
@@ -85,17 +100,44 @@ def _sha(value: Any) -> bool:
     return isinstance(value, str) and bool(_SHA256.match(value))
 
 
+def _normalize_abs_path(path: str) -> str | None:
+    """Canonical absolute POSIX path, or ``None`` for ambiguous/escaping input.
+
+    Only lexical normalization is performed; no filesystem is consulted.  A
+    path that is not absolute, that contains a ``..`` segment, a NUL byte, a
+    repeated separator or a trailing separator is rejected rather than
+    silently reduced to an equivalent-looking path.
+    """
+    if not path.startswith("/") or "\x00" in path:
+        return None
+    if "//" in path or path.endswith("/") and path != "/":
+        return None
+    parts = path.split("/")[1:]
+    if ".." in parts or "" in parts:
+        return None
+    return "/" + "/".join(parts)
+
+
 def _path_within(path: Any, roots: Any) -> bool:
-    """POSIX path containment; only absolute granted roots are honored."""
-    if not isinstance(path, str) or not path.startswith("/"):
+    """POSIX path containment; only absolute granted roots are honored.
+
+    Both the candidate path and every root are lexically normalized first, so
+    ``/ws/../etc/passwd`` can never be presented as contained in a grant of
+    ``/ws``.
+    """
+    if not isinstance(path, str):
         return False
-    target = path.rstrip("/") or "/"
-    if not isinstance(roots, (list, tuple, set)):
+    target = _normalize_abs_path(path)
+    if target is None:
+        return False
+    if not isinstance(roots, (list, tuple, set, frozenset)):
         return False
     for root in roots:
-        if not isinstance(root, str) or not root.startswith("/"):
+        if not isinstance(root, str):
             continue
-        base = root.rstrip("/") or "/"
+        base = _normalize_abs_path(root)
+        if base is None:
+            continue
         if target == base or target.startswith(base + "/"):
             return True
     return False
@@ -288,10 +330,11 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
     if conflicts:
         bad.append("concurrent_interacting_writes")
 
-    # Approvals must exist, precede the action, be bound to the acting grant and
-    # be single-use; a second consumption of one approval id is a replay.
+    # Approval ledger: entries must be well formed, bound to a recorded grant,
+    # declared by the grant's own approval inventory, and consumed exactly once.
     by_approval: dict[str, int] = {}
-    approved_keys: set[tuple[str, str, str]] = set()
+    consumed: dict[str, bool] = {}
+    consent_seq: set[int] = set()
     for entry in entries:
         approval_id = _text(entry.get("approval_id"), "entry.approval_id")
         node_id = _text(entry.get("node_id"), "entry.node_id")
@@ -312,15 +355,32 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
         if approval_id not in known:
             bad.append("false_accepted_approval")
         by_approval[approval_id] = by_approval.get(approval_id, 0) + 1
-        approved_keys.add((node_id, tool, args))
+        if entry.get("consumed") is True:
+            consumed[approval_id] = True
+        if entry.get("consent_mode") == "pre_authorized":
+            consent_seq.add(seq)
     false_approvals = sum(1 for code in bad if code == "false_accepted_approval")
     replays = sum(1 for count in by_approval.values() if count > 1)
     if replays:
         bad.append("replayed_approval")
+    unconsumed = sum(1 for approval_id in by_approval if not consumed.get(approval_id))
+    if unconsumed:
+        bad.append("approval_not_consumed")
+
+    # A high-risk action must be covered by exactly one approval entry that is
+    # bound to it and whose recorded ``seq`` strictly precedes the action.
+    # An approval at the same ``seq`` cannot demonstrate ordering, so it is a
+    # violation unless the entry explicitly declares a pre-authorization
+    # consent mode; the grant itself may not waive the ordering requirement.
     missing = 0
     reordered = 0
+    over_covered = 0
     for step in steps:
-        if step.get("risk_class") not in _HIGH_RISK:
+        risk = step.get("risk_class")
+        if risk not in APPROVAL_RISK_CLASSES:
+            # Unknown risk class: the ledger cannot prove this action was
+            # authorized, so it is never treated as a no-approval action.
+            bad.append("unknown_risk_class")
             continue
         key = (step["node_id"], step.get("tool"), step.get("args_sha256"))
         matching = [entry for entry in entries
@@ -328,12 +388,27 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
         if not matching:
             missing += 1
             continue
-        if all(entry.get("seq", -1) > step["seq"] for entry in matching):
-            reordered += 1
+        if len(matching) > 1:
+            over_covered += 1
+        preceding = [entry for entry in matching
+                     if isinstance(entry.get("seq"), int)
+                     and not isinstance(entry.get("seq"), bool)
+                     and entry["seq"] > step["seq"]]
+        if len(preceding) != 1:
+            same_seq = [entry for entry in matching
+                        if isinstance(entry.get("seq"), int)
+                        and not isinstance(entry.get("seq"), bool)
+                        and entry["seq"] == step["seq"]]
+            declared = [entry for entry in same_seq
+                        if entry.get("consent_mode") == "pre_authorized"]
+            if len(preceding) + len(declared) != 1:
+                reordered += 1
     if missing:
         bad.append("high_risk_action_without_approval")
     if reordered:
         bad.append("approval_after_action")
+    if over_covered:
+        bad.append("approval_bound_to_multiple_actions")
 
     metrics = {
         "nodes_total": len(nodes),
@@ -342,6 +417,8 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
         "cross_branch_write_conflicts": conflicts,
         "missing_approvals": missing,
         "replayed_approvals": replays,
+        "unconsumed_approvals": unconsumed,
+        "over_covered_actions": over_covered,
         "false_approvals": false_approvals,
         "additional_review": len(bad),
     }
