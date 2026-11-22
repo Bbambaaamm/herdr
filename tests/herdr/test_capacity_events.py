@@ -16,14 +16,26 @@ SCOPE = Scope("herdr", "Bbambaaamm/herdr")
 DEVICE = 2049
 INODE = 2
 ATTESTOR = capacity_attestor.AttestorPolicy(
-    "quantlab-staging-01", SCOPE, floor=200, start_guard=0,
+    "quantlab-staging-01", SCOPE,
     expected_device=DEVICE, expected_inode=INODE)
 POLICY = bridge.CapacityPolicy("quantlab-staging-01", SCOPE, attestor=ATTESTOR)
+# Canonical installed watcher threshold. A report whose required_bytes falls
+# below this is a publisher report the host policy must reject; the fixtures
+# must therefore speak the installed threshold, never a weaker one.
+FLOOR = capacity_attestor.DEFAULT_FLOOR
+GUARD = capacity_attestor.DEFAULT_START_GUARD
+# Canonical required_bytes: available must reach this to be RESOLVED.
+REQUIRED = FLOOR + GUARD
 
 
-def report(at=NOW - 1, available=100):
+def report(at=NOW - 1, available=FLOOR - 1, floor=FLOOR, start_guard=GUARD):
+    required = floor + start_guard
     return canonical({
-        **bridge.readiness.capacity(available, floor=200, start_guard=0),
+        "ready": available >= required, "available_bytes": available,
+        "required_bytes": required,
+        "missing_bytes": max(0, required - available),
+        "margin_bytes": available - required,
+        "capacity_warning": available < required + 268435456,
         "checked_at_epoch": at + .25, "model_calls": 0, "cleanup_performed": False,
     })
 
@@ -48,7 +60,12 @@ def measurement(available):
 
 @pytest.fixture
 def host(monkeypatch):
-    data = [report(), None]
+    # The canonical host policy requires available_bytes >= DEFAULT_FLOOR +
+    # DEFAULT_START_GUARD. The initial report is below that threshold, so the
+    # incident opens; later replay steps publish explicit above-threshold
+    # reports through the same fixture.
+    data = [report(available=bridge.capacity_attestor.DEFAULT_FLOOR
+                   + bridge.capacity_attestor.DEFAULT_START_GUARD - 1), None]
     data[1] = receipt(data[0])
 
     def read_protected(path, *, limit):
@@ -189,7 +206,7 @@ def test_filesystem_identity_mismatch_falls_back_to_untrusted(host, monkeypatch)
     pinned = bridge.CapacityPolicy(
         POLICY.server, POLICY.scope,
         attestor=capacity_attestor.AttestorPolicy(
-            POLICY.server, POLICY.scope, floor=200, start_guard=0,
+            POLICY.server, POLICY.scope,
             expected_device=DEVICE, expected_inode=INODE))
 
     def foreign(path=capacity_attestor.MEASURE_PATH):
@@ -207,19 +224,24 @@ def test_filesystem_identity_mismatch_falls_back_to_untrusted(host, monkeypatch)
 @pytest.mark.skipif(os.name != "posix", reason="protected evidence store requires POSIX")
 def test_replay_recovery_and_conflict(host, tmp_path):
     store = EvidenceStore(tmp_path)
+    # Původní semantika: první záznam je OPEN (pod kanonickým práhem), pak
+    # starší RESOLVED, pak čerstvý RESOLVED. Konflikt je jiný obsah ve stejném
+    # event sec (slot) — attestation je platná, digest se liší.
+    initial = report(NOW - 1, available=REQUIRED - 1)
+    host[:] = [initial, receipt(initial, NOW - 1)]
     first_key = bridge.record_host_observation(store, POLICY, now=NOW)
     assert bridge.record_host_observation(store, POLICY, now=NOW) == first_key
     first = bridge.replay_recorded(EvidenceStore(tmp_path), POLICY, now=NOW)
     assert first == bridge.canary(POLICY, now=NOW)
-    changed = report(available=110)
-    host[:] = [changed, receipt(changed)]
+    changed = report(NOW - 1, available=REQUIRED - 2)
+    host[:] = [changed, receipt(changed, NOW - 1)]
     with pytest.raises(EvidenceError):
         bridge.record_host_observation(store, POLICY, now=NOW)
-    recovered = report(NOW - 2, available=300)
+    recovered = report(NOW - 2, available=REQUIRED + 1)
     host[:] = [recovered, receipt(recovered, NOW - 2)]
     bridge.record_host_observation(store, POLICY, now=NOW)
     assert bridge.replay_recorded(store, POLICY, now=NOW)["incident"]["state"] == "OPEN"
-    recovered = report(NOW, available=300)
+    recovered = report(NOW, available=REQUIRED + 1)
     host[:] = [recovered, receipt(recovered, NOW)]
     bridge.record_host_observation(store, POLICY, now=NOW + 1)
     final = bridge.replay_recorded(EvidenceStore(tmp_path), POLICY, now=NOW + 1)

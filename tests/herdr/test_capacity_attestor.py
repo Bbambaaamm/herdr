@@ -332,6 +332,38 @@ def test_report_floor_mismatch_blocked(feed, measured, policy):
         attestor.verify(policy, now=NOW)
 
 
+def test_policy_cannot_lower_canonical_floor_or_guard():
+    """A host-selected policy may not weaken the installed watcher threshold."""
+    with pytest.raises(attestor.AttestationError, match="below the installed watcher floor"):
+        attestor.AttestorPolicy(SERVER, SCOPE, floor=FLOOR - 1, start_guard=GUARD)
+    with pytest.raises(attestor.AttestationError, match="below the installed watcher floor"):
+        attestor.AttestorPolicy(SERVER, SCOPE, floor=FLOOR, start_guard=0)
+    # The canonical values remain accepted.
+    assert attestor.AttestorPolicy(SERVER, SCOPE, floor=FLOOR, start_guard=GUARD).floor == FLOOR
+
+
+def test_attest_refuses_to_overwrite_newer_receipt_with_older(feed, measured, policy, monkeypatch):
+    """An older report must not replace a fresher protected receipt."""
+    install(feed, 10 ** 11)
+    measured["available"] = 10 ** 11
+    written = {}
+
+    def write_owned_json(path, value, *, owner=0, group=1001, mode=0o444,
+                         protected_ancestry=False):
+        written.update(path=path, value=value)
+
+    monkeypatch.setattr(attestor.readiness, "write_owned_json", write_owned_json)
+    newer = attestor.attest(SERVER, SCOPE, policy=policy, now=NOW)
+    assert newer["event_at"] == NOW - 1
+    # A stale report (older event_at) must not overwrite the newer receipt.
+    stale = install(feed, 10 ** 11, at=NOW - 5)
+    feed["receipt"] = canonical(newer)
+    assert json.loads(stale)["checked_at_epoch"] < newer["event_at"]
+    with pytest.raises(attestor.AttestationError, match="older than the protected receipt"):
+        attestor.attest(SERVER, SCOPE, policy=policy, now=NOW)
+    assert written["value"]["event_at"] == NOW - 1
+
+
 def test_report_changed_during_attestation_blocked(feed, measured, policy):
     install(feed, 10 ** 11)
     measured["available"] = 10 ** 11

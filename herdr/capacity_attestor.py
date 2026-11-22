@@ -123,8 +123,13 @@ class AttestorPolicy:
                 "invalid expected mount", require_result=True), "invalid expected mount")
         _closed(type(self.max_age) is int and 0 < self.max_age <= MAX_AGE_SECONDS,
                 "invalid capacity freshness policy")
-        _closed(_counter(self.floor) and _counter(self.start_guard),
-                "invalid capacity floor policy")
+        # The installed watcher floor/guard is the canonical host threshold. A
+        # caller-supplied policy may never lower it: the watcher report is
+        # account-writable, so a weaker floor would make the attestation trust a
+        # threshold the host did not install.
+        _closed(_counter(self.floor) and self.floor >= DEFAULT_FLOOR
+                and _counter(self.start_guard) and self.start_guard >= DEFAULT_START_GUARD,
+                "capacity floor policy below the installed watcher floor")
 
 
 @dataclass(frozen=True)
@@ -398,6 +403,13 @@ def attest(server, scope, *, policy=None, now=None):
             "capacity report disagrees with independent host measurement")
     _closed(readiness.read_capacity_report() == raw,
             "capacity report changed during attestation")
+    previous = _read_receipt()
+    if previous is not None:
+        _closed(type(previous) is bytes and len(previous) <= MAX_RECEIPT_BYTES,
+                "invalid capacity receipt size")
+        existing, _ = _object(previous, RECEIPT_FIELDS)
+        _closed(type(existing["event_at"]) is int and existing["event_at"] <= int(checked),
+                "capacity receipt older than the protected receipt already installed")
     value = {
         "schema_version": RECEIPT_SCHEMA, "method": "host-fstatvfs-exact",
         "filesystem": MEASURE_PATH, "server": server,
