@@ -270,6 +270,23 @@ def telemetry_usage_fields(observation: UsageObservation) -> dict[str, Any]:
     return {name: getattr(projection, name) for name in TELEMETRY_USAGE_FIELDS}
 
 
+def usage_observation_reference(observation: UsageObservation | None) -> str | None:
+    """Bounded reference to a usage observation for host traces.
+
+    Returns the exact 64-character lowercase SHA-256 digest the append-only
+    telemetry event carries, or ``None`` when no observation exists.  The value
+    is validated with the telemetry ``_sha256`` contract, so a host trace can
+    never carry free text, a prompt/response body or an over-long identifier.
+    """
+    if observation is None:
+        return None
+    if not isinstance(observation, UsageObservation):
+        raise TypeError("usage_observation_reference requires a UsageObservation or None")
+    reference = observation.observation_id
+    _telemetry_sha256(reference, "usage_observation_id")
+    return reference
+
+
 def usage_telemetry_event(
     observation: UsageObservation,
     *,

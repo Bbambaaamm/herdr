@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 
 from .capability import DataClass, Egress, Modality, Retention, Training
 from .skills import PolicyLayers, SkillBundle, SkillNodeContext
+from .usage_telemetry import usage_observation_reference
 
 VERSION = "1.0.0"
 MAX_BYTES = 262_144
@@ -525,7 +526,12 @@ class ContextCompiler:
         return executor, cap, provider, raw, budget
 
     def compile(self, plan: ContextPlan, *, executor_id, counter: TokenCounter, loader: Callable,
-                renderer="messages", envelope=None, input_token_limit=None,allowed_data_classes=None):
+                renderer="messages", envelope=None, input_token_limit=None,allowed_data_classes=None,
+                usage_observation=None):
+        try:
+            usage_reference = usage_observation_reference(usage_observation)
+        except TypeError as exc:
+            raise ContextError("context_usage_observation_type") from exc
         executor, cap, provider, raw, budget = self.preflight(
             plan, executor_id=executor_id, counter=counter, renderer=renderer,
             allowed_data_classes=allowed_data_classes)
@@ -614,7 +620,7 @@ class ContextCompiler:
         trace = canonical({"plan_hash": plan.hash, "binding": raw["binding"], "executor_id": executor.id,
                            "provider_id": provider.id, "tokenizer_version": counter.tokenizer_version,
                            "tokenizer_input_tokens": counter.measure(measured(wire)),
-                            **({"measurement":"host_envelope","measurement_bytes":len(measured(wire))} if envelope is not None else {}), "provider_usage": "unmeasured", "input_bytes": len(wire),
+                            **({"measurement":"host_envelope","measurement_bytes":len(measured(wire))} if envelope is not None else {}), "provider_usage": usage_reference if usage_reference is not None else "unmeasured", "input_bytes": len(wire),
                            "stable_prefix_hash": digest(raw["stable_prefix"]),
                            "cache_evidence": "unmeasured", "selection_hash": raw["selection_hash"],
                            "selection_reason": raw["selection_reason"], "previous_selection_hash": raw["previous_selection_hash"],
