@@ -22,6 +22,12 @@ Projection rules (fail-closed):
 * ``NON_BILLABLE`` is the only state allowed a concrete zero.  The adapter
   cannot currently produce it because no verified non-billable route authority
   exists, so the bridge keeps the same fail-closed guard.
+* ``provider``/``model`` must satisfy the *telemetry* token contract
+  (``herdr.telemetry._TOKEN``), not merely the adapter's looser ``_token``.  The
+  adapter rejects only whitespace, backslash and NUL; telemetry additionally
+  rejects empty values and any character outside ``[A-Za-z0-9._:/@+-]``.  A
+  value the adapter accepts but telemetry would reject fails closed here, at the
+  boundary, instead of being silently dropped or coerced into another row.
 """
 from __future__ import annotations
 
@@ -30,6 +36,8 @@ from typing import Any, Mapping
 
 from .provider_usage import UsageObservation, UsageStatus
 from .telemetry import CostUnknownReason, EventType, TelemetryError, TelemetryEvent
+from .telemetry import _sha256 as _telemetry_sha256
+from .telemetry import _token as _telemetry_token
 
 USAGE_TELEMETRY_VERSION = "usage-telemetry-bridge-1"
 
@@ -45,6 +53,7 @@ TELEMETRY_USAGE_FIELDS = (
     "actual_cost_microusd",
     "cost_unknown_reason",
     "pricing_version",
+    "usage_observation_id",
 )
 
 
@@ -72,8 +81,23 @@ class UsageTelemetry:
     pricing_version: str | None = None
     coverage: Mapping[str, bool] | None = None
     unknown_reasons: tuple[str, ...] = ()
+    # Bounded digest reference to the source observation; no prompt/response body.
+    usage_observation_id: str | None = None
 
     def __post_init__(self) -> None:
+        # The telemetry token contract is the closed class
+        # ``[A-Za-z0-9._:/@+-]``.  Enforce it on the value object itself so every
+        # projection path -- not only ``telemetry_usage_fields`` -- fails closed;
+        # a direct ``project_usage_telemetry`` caller must not be able to build a
+        # serializable row whose provider/model telemetry would reject.
+        try:
+            _telemetry_token(self.provider, "provider", required=True)
+            _telemetry_token(self.model, "model", required=True)
+        except TelemetryError as exc:
+            raise TelemetryError(
+                f"usage observation {self.observation_id!r} cannot be projected"
+                f" into telemetry: {exc}"
+            ) from exc
         if self.input_tokens is not None and self.cached_tokens is not None:
             if self.cached_tokens > self.input_tokens:
                 raise TelemetryError("projected cached_tokens cannot exceed input_tokens")
@@ -84,6 +108,8 @@ class UsageTelemetry:
         if (self.actual_cost_microusd is not None or self.estimated_cost_microusd is not None) \
                 and not self.pricing_version:
             raise TelemetryError("projected known/estimated cost requires pricing_version")
+        if self.usage_observation_id is not None:
+            _telemetry_sha256(self.usage_observation_id, "usage_observation_id")
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -108,6 +134,13 @@ class UsageTelemetry:
                 self.cost_unknown_reason.value if self.cost_unknown_reason is not None else None
             ),
             "pricing_version": self.pricing_version,
+            # Omitted when absent so a projection without a reference keeps the
+            # exact canonical shape it had before the field existed.
+            **(
+                {"usage_observation_id": self.usage_observation_id}
+                if self.usage_observation_id is not None
+                else {}
+            ),
             "coverage": dict(self.coverage or {}),
             "unknown_reasons": list(self.unknown_reasons),
         }
@@ -152,6 +185,7 @@ def project_usage_telemetry(observation: UsageObservation) -> UsageTelemetry:
             pricing_version=pricing_version,
             coverage=observation.coverage,
             unknown_reasons=observation.unknown_reasons,
+            usage_observation_id=observation.observation_id,
         )
     if observation.status is UsageStatus.NON_BILLABLE:
         # Unreachable through observe_usage today; kept fail-closed so a future
@@ -180,6 +214,7 @@ def project_usage_telemetry(observation: UsageObservation) -> UsageTelemetry:
             pricing_version=pricing_version,
             coverage=observation.coverage,
             unknown_reasons=observation.unknown_reasons,
+            usage_observation_id=observation.observation_id,
         )
     # PARTIAL and UNKNOWN: no token totals, no estimated cost, unknown cost stays
     # None.  A confirmed actual cost on a PARTIAL row is preserved.
@@ -210,12 +245,28 @@ def project_usage_telemetry(observation: UsageObservation) -> UsageTelemetry:
         pricing_version=pricing_version,
         coverage=observation.coverage,
         unknown_reasons=observation.unknown_reasons,
+        usage_observation_id=observation.observation_id,
     )
 
 
 def telemetry_usage_fields(observation: UsageObservation) -> dict[str, Any]:
-    """Return the exact TelemetryEvent kwargs owned by this bridge."""
+    """Return the exact TelemetryEvent kwargs owned by this bridge.
+
+    The provider/model pair must satisfy the *telemetry* token contract, not just
+    the adapter's.  The adapter's ``_token`` rejects only whitespace, backslash
+    and NUL, so it accepts identifiers that ``herdr.telemetry`` would reject;
+    projecting those would either be silently dropped by the closed telemetry
+    contract or coerce the row into an unrelated identity.  Fail closed here.
+    """
     projection = project_usage_telemetry(observation)
+    try:
+        _telemetry_token(projection.provider, "provider", required=True)
+        _telemetry_token(projection.model, "model", required=True)
+    except TelemetryError as exc:
+        raise TelemetryError(
+            f"usage observation {projection.observation_id!r} cannot be projected"
+            f" into telemetry: {exc}"
+        ) from exc
     return {name: getattr(projection, name) for name in TELEMETRY_USAGE_FIELDS}
 
 

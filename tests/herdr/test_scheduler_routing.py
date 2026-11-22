@@ -446,6 +446,10 @@ def test_execution_handoff_binds_dispatched_record_and_rechecks_budget(tmp_path:
     host_guard = object.__new__(WorkInvocationGuard)
     host_guard.grant = SimpleNamespace(identity=route_args["identity"])
     host_guard._routing_handoff = None
+    with pytest.raises(PolicyDenied, match="routing_handoff_missing"):
+        host_guard.authorize_routing_model(
+            route.decision.selected_provider, route.decision.selected_model
+        )
     host_guard.bind_routing_handoff(handoff)
     assert host_guard.authorize_routing_model(
         route.decision.selected_provider, route.decision.selected_model

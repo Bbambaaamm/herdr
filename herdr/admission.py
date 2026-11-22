@@ -336,6 +336,61 @@ class AdmissionControl:
         return decision
 
     # -- public API -------------------------------------------------------- #
+    @staticmethod
+    def _audit_ctx(identity: AgentIdentity, spec: TaskGraphSpec,
+                   child_tools: Sequence[str]) -> dict[str, object]:
+        return {
+            "role": identity.role,
+            "repo": identity.repo,
+            "issue": identity.issue,
+            "parent_role": identity.parent_role,
+            "parent_tools": sorted(identity.parent_tools),
+            "paper_only": identity.paper_only,
+            "node_count": spec.node_count,
+            "max_depth": spec.max_depth,
+            "max_fanout": spec.max_fanout,
+            "child_tools_count": len(child_tools),
+            "child_tools": sorted(child_tools),
+        }
+
+    def has_allow(self, identity: AgentIdentity, spec: TaskGraphSpec,
+                  child_tools: Sequence[str]) -> bool:
+        """True when this gate already durably recorded an ALLOW for this proposal.
+
+        The comparison covers the *whole* proposal — identity, parent authority,
+        paper-only mode, graph dimensions and the exact tool set — so a narrower
+        earlier ALLOW can never be reconciled as authority for a wider request.
+
+        An older audit row that predates any of these fields is not evidence for
+        anything and is skipped.
+
+        Read-only reconciliation for a crash between the gate decision and the
+        caller's own verdict write: the two logs are not one transaction, so a
+        redelivery must consult #8's durable record before asking again.
+        """
+        if self.audit_log is None:
+            return False
+        required = ("admit:paper_only", "admit:parent_role", "admit:parent_tools",
+                    "admit:child_tools", "admit:node_count")
+        wanted = sorted(child_tools)
+        for row in self.audit_log.replay():
+            if row.get("event") != "allow":
+                continue
+            if any(key not in row for key in required):
+                continue
+            if (row.get("admit:role") == identity.role
+                    and row.get("admit:repo") == identity.repo
+                    and row.get("admit:issue") == identity.issue
+                    and row.get("admit:paper_only") is identity.paper_only
+                    and row.get("admit:parent_role") == identity.parent_role
+                    and row.get("admit:parent_tools") == sorted(identity.parent_tools)
+                    and row.get("admit:node_count") == spec.node_count
+                    and row.get("admit:max_depth") == spec.max_depth
+                    and row.get("admit:max_fanout") == spec.max_fanout
+                    and row.get("admit:child_tools") == wanted):
+                return True
+        return False
+
     def check(
         self,
         identity: AgentIdentity,
@@ -349,15 +404,7 @@ class AdmissionControl:
         DenyDecision; success returns an AllowDecision. A planner cannot bypass
         limits by emitting a larger graph.
         """
-        audit_ctx = {
-            "role": identity.role,
-            "repo": identity.repo,
-            "issue": identity.issue,
-            "node_count": spec.node_count,
-            "max_depth": spec.max_depth,
-            "max_fanout": spec.max_fanout,
-            "child_tools_count": len(child_tools),
-        }
+        audit_ctx = self._audit_ctx(identity, spec, child_tools)
 
         # 1. Planner/graph limits — malformed dimensions fail closed.
         if spec.node_count <= 0 or spec.max_depth <= 0 or spec.max_fanout < 0:
