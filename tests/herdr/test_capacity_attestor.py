@@ -216,6 +216,73 @@ def test_expired_receipt_blocked(feed, measured, policy):
         attestor.verify(policy, now=NOW)
 
 
+def test_freshness_capped_at_canonical_attestation_age(feed, measured, policy):
+    """Host-owned evidence is never usable beyond the canonical 30s window."""
+    install(feed, 10 ** 11, at=NOW - attestor.MAX_ATTESTATION_AGE)
+    measured["available"] = 10 ** 11
+    assert attestor.verify(policy, now=NOW).trust == "HOST_OWNED"
+    install(feed, 10 ** 11, at=NOW - attestor.MAX_ATTESTATION_AGE - 1)
+    with pytest.raises(attestor.AttestationError, match="receipt expired"):
+        attestor.verify(policy, now=NOW)
+
+
+def test_report_stale_beyond_canonical_attestation_age(feed, measured, policy):
+    install(feed, 10 ** 11, at=NOW - attestor.MAX_ATTESTATION_AGE - 1, with_receipt=False)
+    measured["available"] = 10 ** 11
+    with pytest.raises(attestor.AttestationError, match="report stale"):
+        attestor.verify(policy, now=NOW)
+
+
+def test_malformed_observation_time_fails_closed(feed, measured, policy):
+    raw = install(feed, 10 ** 11)
+    row = json.loads(raw)
+    row["checked_at_epoch"] = "not-a-number"
+    raw = canonical(row)
+    feed["report"] = raw
+    feed["receipt"] = receipt(raw)
+    measured["available"] = 10 ** 11
+    with pytest.raises(attestor.AttestationError, match="observation time"):
+        attestor.verify(policy, now=NOW)
+
+
+def test_attest_publishes_receipt_that_verify_accepts(feed, measured, policy, monkeypatch):
+    install(feed, 10 ** 11)
+    measured["available"] = 10 ** 11
+    written = {}
+
+    def write_owned_json(path, value, *, owner=0, group=1001, mode=0o444,
+                         protected_ancestry=False):
+        written.update(path=path, value=value, owner=owner, group=group,
+                       protected_ancestry=protected_ancestry)
+
+    monkeypatch.setattr(attestor.readiness, "write_owned_json", write_owned_json)
+    value = attestor.attest(SERVER, SCOPE, policy=policy, now=NOW)
+    assert written["path"] == attestor.RECEIPT_PATH
+    assert written["owner"] == 0 and written["group"] == 0
+    assert written["protected_ancestry"] is True
+    assert value == written["value"]
+    feed["receipt"] = canonical(value)
+    result = attestor.verify(policy, now=NOW)
+    assert result.trust == "HOST_OWNED"
+    assert result.receipt_sha256 == digest(value)
+
+
+def test_attest_requires_host_owned_execution(feed, measured, policy, monkeypatch):
+    install(feed, 10 ** 11)
+    measured["available"] = 10 ** 11
+    monkeypatch.setattr(attestor, "host_identity",
+                        lambda: attestor.HostIdentity(SERVER, 1001))
+    with pytest.raises(attestor.AttestationError, match="host identity mismatch"):
+        attestor.attest(SERVER, SCOPE, policy=policy, now=NOW)
+
+
+def test_module_cli_help_exits_zero(capsys):
+    with pytest.raises(SystemExit) as exc:
+        attestor.main(["--help"])
+    assert exc.value.code == 0
+    assert "usage" in capsys.readouterr().out
+
+
 def test_receipt_digest_mismatch_blocked(feed, measured, policy):
     raw = install(feed, 10 ** 11)
     feed["receipt"] = receipt(raw, source_sha256="0" * 64)

@@ -186,7 +186,9 @@ def _fold(policy, samples, *, now):
         return _blocked()
     latest = slots[max(slots)]
     current = latest.row
-    usable = latest.receipt is not None and epoch(now) - current.event_at <= policy.max_age
+    usable = (latest.receipt is not None
+              and epoch(now) - current.event_at <= min(policy.max_age,
+                                                       capacity_attestor.MAX_ATTESTATION_AGE))
     history = [item.row for _, item in sorted(slots.items()) if item.receipt is not None
                and item.row.event_at < current.event_at]
     if not usable:
@@ -239,7 +241,9 @@ def canary(policy, *, now, build=None):
 def record_host_observation(store, policy, *, now, build=None):
     """Explicit opt-in for the existing protected EvidenceStore, never used by canary."""
     sample = _read_sample(policy, now, build)
-    require(sample.receipt is not None and now - sample.row.event_at <= policy.max_age,
+    require(sample.receipt is not None
+            and now - sample.row.event_at <= min(policy.max_age,
+                                                capacity_attestor.MAX_ATTESTATION_AGE),
             "fresh host receipt required for durable capacity publication")
     require(sample.attestation is not None and sample.attestation.trust == "HOST_OWNED",
             "host-owned capacity attestation required for durable publication")

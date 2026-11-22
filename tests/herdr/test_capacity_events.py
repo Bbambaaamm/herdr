@@ -126,6 +126,30 @@ def test_stale_observation(host):
     assert result["task_proposal"] is None
 
 
+def test_fold_usability_capped_at_canonical_attestation_age():
+    """A receipt older than the canonical 30s window cannot yield a proposal."""
+    at = NOW - capacity_attestor.MAX_ATTESTATION_AGE
+    raw = report(available=100, at=at)
+    sample = bridge._sample(POLICY, raw, receipt(raw, at=at), now=NOW)
+    assert bridge._fold(POLICY, (sample,), now=NOW)["status"] == "READ_ONLY_PROPOSAL"
+    at = NOW - capacity_attestor.MAX_ATTESTATION_AGE - 1
+    raw = report(available=100, at=at)
+    sample = bridge._sample(POLICY, raw, receipt(raw, at=at), now=NOW)
+    result = bridge._fold(POLICY, (sample,), now=NOW)
+    assert result["status"] == bridge.BLOCKED
+    assert result["task_proposal"] is None
+
+
+def test_record_host_observation_capped_at_canonical_attestation_age(tmp_path, monkeypatch):
+    store = EvidenceStore(tmp_path)
+    at = NOW - capacity_attestor.MAX_ATTESTATION_AGE - 1
+    raw = report(available=100, at=at)
+    sample = bridge._sample(POLICY, raw, receipt(raw, at=at), now=NOW)
+    monkeypatch.setattr(bridge, "_read_sample", lambda policy, now, build=None: sample)
+    with pytest.raises(IncidentError, match="fresh host receipt"):
+        bridge.record_host_observation(store, POLICY, now=NOW)
+
+
 @pytest.mark.parametrize("hint", ["ACTIVE_LEASE", "PARENT_ACK_PENDING"])
 def test_lifecycle_metadata_cannot_grant_cleanup_or_dispatch(host, hint):
     build = canonical({

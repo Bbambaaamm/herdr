@@ -21,6 +21,7 @@ canonical contract; no drift or slack tolerance is adopted.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import argparse
 import errno
 import math
 import os
@@ -28,11 +29,12 @@ from pathlib import Path
 import re
 import socket
 import stat
+import time
 
 from . import operation_readiness as readiness
 from .evidence import digest
 from .operational_adapters import _object
-from .operational_incidents import Scope, epoch, token
+from .operational_incidents import IncidentError, Scope, epoch, token
 
 SCHEMA = "herdr-capacity-attestation-1"
 RECEIPT_SCHEMA = "herdr-capacity-receipt-2"
@@ -40,6 +42,10 @@ REPORT_PATH = "/var/lib/herdr-capacity-watch/status.json"
 RECEIPT_PATH = "/run/herdr/capacity-exporter/receipt.json"
 MAX_RECEIPT_BYTES = 4096
 MAX_AGE_SECONDS = 900
+# Canonical host-owned receipt/report freshness bound from the #231 contract.
+# ``max_age`` is the host-selected policy upper bound; host-owned evidence is
+# never usable beyond this window.
+MAX_ATTESTATION_AGE = 30
 PUBLISHER_UID = 1001
 MEASURE_PATH = "/"
 
@@ -288,9 +294,9 @@ def verify(policy: AttestorPolicy, *, now, host=None, measurement=None,
         report = readiness.read_capacity_report()
     row, report_sha256 = _object(report, REPORT_FIELDS)
     checked = row["checked_at_epoch"]
-    event_at = int(checked)
     _closed(type(checked) in (int, float) and math.isfinite(checked) and 0 <= checked <= now,
             "invalid capacity report observation time")
+    event_at = int(checked)
     _closed(type(row["ready"]) is bool and type(row["capacity_warning"]) is bool
             and type(row["model_calls"]) is int and row["model_calls"] == 0
             and row["cleanup_performed"] is False, "invalid capacity report flags")
@@ -320,10 +326,12 @@ def verify(policy: AttestorPolicy, *, now, host=None, measurement=None,
         } and all(type(data[key]) is int for key in
                  ("event_at", "available_bytes", "required_bytes")),
             "capacity receipt identity, digest or exact counter binding mismatch")
-        _closed(0 <= now - data["event_at"] <= policy.max_age, "capacity receipt expired")
+        _closed(0 <= now - data["event_at"] <= min(policy.max_age, MAX_ATTESTATION_AGE),
+                "capacity receipt expired")
         receipt_sha256 = digest(data)
 
-    _closed(0 <= now - int(checked) <= policy.max_age, "capacity report stale")
+    _closed(0 <= now - int(checked) <= min(policy.max_age, MAX_ATTESTATION_AGE),
+            "capacity report stale")
     _closed(readiness.read_capacity_report() == report,
             "capacity report changed during attestation")
     current = measurement if measurement is not None else measure_filesystem(policy.measure_path)
@@ -353,3 +361,68 @@ def verify(policy: AttestorPolicy, *, now, host=None, measurement=None,
 def attestation_digest(attestation: Attestation) -> str:
     """Digest of the verified attestation, for evidence refs and replay checks."""
     return digest(attestation.to_dict())
+
+
+def attest(server, scope, *, policy=None, now=None):
+    """Publish the v2 receipt once at the reserved host path.
+
+    Host-owned execution is required. The receipt binds the report digest and
+    the exact counters to the independent host measurement; it conveys no
+    execution authority.
+    """
+    token(server)
+    _closed(type(scope) is Scope, "capacity scope required")
+    if policy is None:
+        policy = AttestorPolicy(server, scope)
+    _closed(type(policy) is AttestorPolicy and policy.server == server
+            and policy.scope == scope, "capacity attestor policy mismatch")
+    identity = host_identity()
+    _closed(identity.hostname == server and identity.euid == 0,
+            "capacity host identity mismatch")
+    raw = readiness.read_capacity_report()
+    started = epoch(int(time.time())) if now is None else epoch(now)
+    row, report_sha256 = _object(raw, REPORT_FIELDS)
+    checked = row["checked_at_epoch"]
+    _closed(type(checked) in (int, float) and math.isfinite(checked) and 0 <= checked <= started,
+            "invalid capacity report observation time")
+    _closed(started - int(checked) <= min(policy.max_age, MAX_ATTESTATION_AGE),
+            "capacity report outside attestation window")
+    measured = measure_filesystem(policy.measure_path)
+    _require_filesystem_identity(policy, measured)
+    required_bytes = readiness.capacity(
+        measured.available_bytes, floor=policy.floor, start_guard=policy.start_guard,
+    )["required_bytes"]
+    _closed(row["required_bytes"] == required_bytes,
+            "capacity report required bytes disagree with host policy")
+    _closed(measured.available_bytes == row["available_bytes"],
+            "capacity report disagrees with independent host measurement")
+    _closed(readiness.read_capacity_report() == raw,
+            "capacity report changed during attestation")
+    value = {
+        "schema_version": RECEIPT_SCHEMA, "method": "host-fstatvfs-exact",
+        "filesystem": MEASURE_PATH, "server": server,
+        "consumer": scope.consumer, "project": scope.project,
+        "event_at": int(checked), "source_sha256": report_sha256,
+        "available_bytes": row["available_bytes"],
+        "required_bytes": row["required_bytes"],
+    }
+    readiness.write_owned_json(RECEIPT_PATH, value, group=0, protected_ancestry=True)
+    return value
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--server", required=True)
+    parser.add_argument("--consumer", required=True)
+    parser.add_argument("--project", required=True)
+    args = parser.parse_args(argv)
+    try:
+        attest(args.server, Scope(args.consumer, args.project))
+    except (OSError, AttributeError, AttestationError, IncidentError,
+            readiness.ReadinessError) as exc:
+        parser.exit(1, f"capacity attestation blocked: {exc}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
