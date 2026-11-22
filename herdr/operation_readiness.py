@@ -309,7 +309,7 @@ def host_action_command(python, script, composition_path, composition_sha256, re
             str(composition_path),composition_sha256,str(request),str(gh_fd),str(guard_fd)]
 
 
-def write_owned_json(path, value, *, owner=0, group=1001, mode=0o444):
+def write_owned_json(path, value, *, owner=0, group=1001, mode=0o444, protected_ancestry=False):
     """Atomic descriptor-relative writes; never follow a caller's temp alias."""
     path = Path(path)
     require(path.is_absolute() and ".." not in path.parts, "absolute_output_required")
@@ -319,6 +319,10 @@ def write_owned_json(path, value, *, owner=0, group=1001, mode=0o444):
     temporary = None
     try:
         for part in path.parts[1:-1]:
+            if protected_ancestry:
+                ancestor = os.fstat(directory)
+                require(ancestor.st_uid == owner and not ancestor.st_mode & 0o022,
+                        "protected_output_ancestry_required")
             child = os.open(part, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
             os.close(directory)
             directory = child
@@ -326,6 +330,15 @@ def write_owned_json(path, value, *, owner=0, group=1001, mode=0o444):
         require(info.st_uid == os.geteuid() and not info.st_mode & 0o022, "owned_output_directory_required")
         sync_fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=directory)
         try:
+            if protected_ancestry:
+                try:
+                    previous = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+                except FileNotFoundError:
+                    previous = None
+                if previous is not None:
+                    require(stat.S_ISREG(previous.st_mode) and previous.st_uid == owner
+                            and previous.st_nlink == 1 and not previous.st_mode & 0o222,
+                            "protected_output_file_required")
             temporary = ".herdr-json-" + os.urandom(16).hex()
             fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                          0o600, dir_fd=directory)
