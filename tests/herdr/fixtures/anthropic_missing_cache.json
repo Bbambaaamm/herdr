@@ -1,0 +1,7 @@
+{
+  "_comment": "Synthetic provider fixture: Anthropic Messages success without cache metadata (PARTIAL).",
+  "usage": {
+    "input_tokens": 700,
+    "output_tokens": 90
+  }
+}

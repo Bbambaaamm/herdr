@@ -1,0 +1,11 @@
+{
+  "_comment": "Synthetic provider fixture: OpenAI chat.completions success; prompt_tokens includes cached tokens and cache write is explicitly zero.",
+  "usage": {
+    "prompt_tokens": 1000,
+    "completion_tokens": 150,
+    "prompt_tokens_details": {
+      "cached_tokens": 200
+    },
+    "cache_write_tokens": 0
+  }
+}
