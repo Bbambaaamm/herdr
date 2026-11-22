@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -28,6 +29,7 @@ from herdr.usage_telemetry import (
     TELEMETRY_USAGE_FIELDS,
     project_usage_telemetry,
     telemetry_usage_fields,
+    usage_observation_reference,
     usage_telemetry_event,
 )
 
@@ -371,6 +373,22 @@ def test_usage_reference_is_present_for_partial_and_unknown_rows():
         assert projection.usage_observation_id == observed.observation_id
         event = make_event(observed)
         assert event.usage_observation_id == observed.observation_id
+
+
+def test_usage_observation_reference_is_bounded_and_absent_safe():
+    usage = load_fixture("anthropic_success.json")["usage"]
+    observed = observe_usage(
+        provider="anthropic", model="claude-opus-4-6", api_mode="anthropic_messages",
+        request_id="req-ref", pricing=PRICING, usage=usage,
+    )
+    reference = usage_observation_reference(observed)
+    assert reference is not None
+    assert reference == observed.observation_id
+    assert len(reference) == 64
+    assert all(character in "0123456789abcdef" for character in reference)
+    assert usage_observation_reference(None) is None
+    with pytest.raises(TypeError):
+        usage_observation_reference(cast(UsageObservation, "free-text"))
 
 
 def test_usage_reference_round_trips_through_the_telemetry_event():
