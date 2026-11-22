@@ -372,6 +372,7 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
     # An approval at the same ``seq`` cannot demonstrate ordering, so it is a
     # violation unless the entry explicitly declares a pre-authorization
     # consent mode; the grant itself may not waive the ordering requirement.
+    # Symmetrically, one approval entry must not cover two distinct actions.
     missing = 0
     reordered = 0
     over_covered = 0
@@ -403,6 +404,15 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
                         if entry.get("consent_mode") == "pre_authorized"]
             if len(preceding) + len(declared) != 1:
                 reordered += 1
+    # One entry matching several actions is the same over-coverage defect seen
+    # from the ledger side: a single recorded approval cannot authorize two
+    # distinct actions even when each action individually finds a match.
+    for entry in entries:
+        key = (entry.get("node_id"), entry.get("tool"), entry.get("args_sha256"))
+        covered = sum(1 for step in steps
+                      if (step["node_id"], step.get("tool"), step.get("args_sha256")) == key)
+        if covered > 1:
+            over_covered += 1
     if missing:
         bad.append("high_risk_action_without_approval")
     if reordered:

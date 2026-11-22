@@ -351,6 +351,18 @@ def test_distinct_approval_ids_for_two_identical_actions():
     assert "approval_bound_to_multiple_actions" in out.violations
 
 
+def test_single_approval_entry_matching_two_actions_is_rejected():
+    bundle = _bundle()
+    second = dict(bundle["action_trace"]["steps"][0])
+    second["seq"] = 0
+    second["write_paths"] = ["/ws/out2"]
+    bundle["action_trace"]["steps"].append(second)
+    bundle["evidence"]["action_trace_sha256"] = _digest(bundle["action_trace"])
+    out = _audit(bundle)
+    assert out.status == "VIOLATION"
+    assert "approval_bound_to_multiple_actions" in out.violations
+
+
 def test_unknown_risk_class_is_not_silently_unapproved():
     bundle = _bundle()
     bundle["approval_ledger"]["entries"] = []
