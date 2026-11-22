@@ -106,14 +106,44 @@ verified route authority exists.
   has no socket, subprocess, file-write or SDK dependency.
 - No model call, router change, budget change, deployment or restart was made.
 
+## 5a. Telemetry bridge identity guard
+
+`herdr/usage_telemetry.py` is the measurement-only projection seam.  Its
+`telemetry_usage_fields` / `usage_telemetry_event` require the projected
+`provider` and `model` to satisfy the *telemetry* token contract
+(`herdr.telemetry._TOKEN`, the closed class `[A-Za-z0-9._:/@+-]`), not merely the
+adapter's `_token`, which rejects only empty, whitespace, backslash and NUL.
+An identifier such as `provider;evil` passes the adapter but is outside the
+telemetry character class; the bridge fails closed with `TelemetryError` instead
+of letting the closed telemetry contract drop or misattribute the row.  This
+reuses `herdr.telemetry._token` verbatim, so the two contracts cannot drift.
+The same guard lives in the `UsageTelemetry` value object (`__post_init__`), so
+it covers every projection path — a direct `project_usage_telemetry` call cannot
+build (or serialize via `to_json`) a row whose provider/model telemetry would
+reject; `telemetry_usage_fields` / `usage_telemetry_event` inherit it.
+
 ## 6. Follow-up required before this can be wired in
 
 1. Telemetry event needs cache-read/cache-write fields (or a bounded
    `usage_observation_id` reference) — a separate contract change.
+   **Partially landed:** the telemetry schema now carries an optional bounded
+   `usage_observation_id` digest reference (`herdr/telemetry.py`, validated as an
+   exact 64-character lowercase SHA-256 digest by `_sha256`, not the 40/64-char
+   Git `_sha` rule), and the bridge populates it from the source observation
+   (`herdr/usage_telemetry.py`, `TELEMETRY_USAGE_FIELDS`).  A usage row is now
+   addressable without a prompt, response, credential or free text.  The field is
+   omitted from the canonical payload when absent, so rows persisted before it
+   existed keep their original `event_id` and the append-only store still
+   replays and appends to them.  Cache-read and cache-write remain telemetry
+   fields owned by the existing contract; this reference does not add them and
+   does not change any economic authority.
 2. `prompt_runtime.py` / `context.py` placeholders need a bounded reference to an
    observation id rather than free text.
 3. `host_model_transport.py` offline fixture usage lacks cache metadata, so a
    fixture-driven adapter run reports `PARTIAL`, not `MEASURED`.
+   **Landed:** the offline fixture now carries `prompt_tokens_details.cached_tokens`
+   and `cache_write_tokens`; `tests/herdr/test_host_model_transport.py` proves a
+   fixture-driven adapter run projects `MEASURED` with no double-counted token.
 4. Pricing version must be pinned per route from `work_budget_configuration`
    `model_quotes`; the adapter accepts it but does not invent it.
 
