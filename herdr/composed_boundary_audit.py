@@ -172,23 +172,46 @@ def _subtree(nodes: Mapping[str, Mapping[str, Any]], root: str) -> set[str]:
     return out
 
 
+def _has_cycle(nodes: Mapping[str, Mapping[str, Any]]) -> bool:
+    """True when some node's parent chain revisits itself.
+
+    A parent-child cycle makes ancestry and subtree scope ill-defined, so it is
+    a structural contradiction rather than an execution to be scored.
+    """
+    for node_id in nodes:
+        seen: set[str] = set()
+        current: str | None = node_id
+        while current is not None and current in nodes:
+            if current in seen:
+                return True
+            seen.add(current)
+            current = nodes[current].get("parent_id")
+    return False
+
+
 def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
-              declared: Mapping[str, str]) -> tuple[tuple[str, ...], dict[str, int]]:
-    """Structural and composition checks; every finding is a violation code."""
+              declared: Mapping[str, str]) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, int]]:
+    """Structural and composition checks.
+
+    ``violations`` are contradictions; ``unknowns`` record an effect the
+    artifacts do not describe.  Neither is a pass: an unknown never degrades
+    into ``COVERED``.
+    """
     bad: list[str] = []
+    unknowns: list[str] = []
 
     nodes_raw = graph.get("nodes")
     grants_raw = policy.get("grants")
     steps_raw = action_trace.get("steps")
     entries_raw = approval_ledger.get("entries")
     if not isinstance(nodes_raw, list) or not nodes_raw:
-        return (("graph_nodes_missing",), {})
+        return (("graph_nodes_missing",), (), {})
     if not isinstance(grants_raw, dict) or not grants_raw:
-        return (("policy_grants_missing",), {})
+        return (("policy_grants_missing",), (), {})
     if not isinstance(steps_raw, list):
-        return (("action_trace_steps_missing",), {})
+        return (("action_trace_steps_missing",), (), {})
     if not isinstance(entries_raw, list):
-        return (("approval_ledger_entries_missing",), {})
+        return (("approval_ledger_entries_missing",), (), {})
 
     nodes: dict[str, dict[str, Any]] = {}
     for row in nodes_raw:
@@ -220,7 +243,11 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
         if not _sha(grant) or grant not in grants:
             bad.append("node_grant_unbound")
     if bad:
-        return (tuple(bad), {})
+        return (tuple(bad), (), {})
+
+    if _has_cycle(nodes):
+        bad.append("graph_role_cycle")
+        return (tuple(bad), (), {})
 
     steps: list[dict[str, Any]] = []
     for row in steps_raw:
@@ -249,6 +276,18 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
         bad.append("approval_ledger_graph_reference_mismatch")
     if evidence.get("action_trace_sha256") != declared["action_trace"]:
         bad.append("evidence_action_trace_reference_mismatch")
+    # Reviewer evidence must record an independent review and its result, and
+    # must be bound to the approval ledger it vouches for; otherwise a mutated
+    # ledger could be evaluated against evidence that never reviewed it.
+    if evidence.get("approval_ledger_sha256") != declared["approval_ledger"]:
+        bad.append("evidence_approval_ledger_reference_mismatch")
+    reviewer = evidence.get("reviewer")
+    if not isinstance(reviewer, dict) or _text(reviewer.get("actor_id"), "evidence.reviewer.actor_id") is None:
+        bad.append("evidence_reviewer_invalid")
+    elif reviewer.get("independent") is not True:
+        bad.append("evidence_reviewer_not_independent")
+    if not _sha(evidence.get("artifact_result_sha256")):
+        bad.append("evidence_review_result_invalid")
 
     graph_epoch = graph.get("epoch")
     policy_epoch = policy.get("epoch")
@@ -293,7 +332,7 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
         if step["node_id"] not in nodes:
             bad.append("action_step_unknown_node")
     if bad:
-        return (tuple(bad), {})
+        return (tuple(bad), (), {})
 
     # Individually permitted writes can still compose into a wider blast radius:
     # the union of a subtree's recorded writes must stay inside that subtree
@@ -302,6 +341,9 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
     for step in steps:
         paths = step.get("write_paths")
         if paths is None:
+            # A step that does not declare its write effect cannot be checked
+            # for scope; that is missing evidence, not a recorded no-write.
+            unknowns.append("action_step_write_paths_missing")
             continue
         if not isinstance(paths, list) or any(not isinstance(p, str) or not p for p in paths):
             bad.append("action_step_write_paths_invalid")
@@ -422,7 +464,7 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
         "false_approvals": false_approvals,
         "additional_review": len(bad),
     }
-    return (tuple(bad), metrics)
+    return (tuple(bad), tuple(unknowns), metrics)
 
 
 def audit_composed_boundaries(graph_sha256, policy_sha256, action_trace_sha256,
@@ -471,10 +513,15 @@ def audit_composed_boundaries(graph_sha256, policy_sha256, action_trace_sha256,
         return _result("VIOLATION", violations=violations)
 
     try:
-        found, metrics = _evaluate(dict(graph), dict(policy), dict(action_trace),
+        found, unknowns, metrics = _evaluate(dict(graph), dict(policy), dict(action_trace),
                                    dict(approval_ledger), dict(evidence), declared)
     except (KeyError, TypeError, ValueError, AttributeError, SecurityError):
         # Incomplete evidence must never degrade into a pass.
         return _result("UNKNOWN", unknowns=("artifact_structure_incomplete",))
-    status = "VIOLATION" if found else "COVERED"
-    return _result(status, violations=found, **metrics)
+    if found:
+        status = "VIOLATION"
+    elif unknowns:
+        status = "UNKNOWN"
+    else:
+        status = "COVERED"
+    return _result(status, violations=found, unknowns=unknowns, **metrics)
