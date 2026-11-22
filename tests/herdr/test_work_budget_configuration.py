@@ -44,6 +44,11 @@ def test_real_baseline_budget_and_pre_effect_model_reservation_survive_restart(t
     state=factory.budget_authority.snapshot(allocation.allocation_id)
     assert state["implementation_attempts"]==1 and state["charged_upper_bounds"]["work_ms"]>0
     first=factory.budget_effect(grant.identity,grant.hash,"start",model_request(quote))
+    held=factory.budget_authority.snapshot(allocation.allocation_id)
+    assert held["inflight"]==1
+    with pytest.raises((BudgetBlocked,WorkContractError),match="original reconciliation"):
+        factory.budget_effect(grant.identity,grant.hash,"start",model_request(quote))
+    assert factory.budget_authority.snapshot(allocation.allocation_id)==held
     with pytest.raises((BudgetBlocked,WorkContractError),match="uncertain"):
         factory.budget_effect(grant.identity,grant.hash,"start",model_request(quote,"new-session:1"))
     from herdr.work_contract_host import HostWorkContractFactory
