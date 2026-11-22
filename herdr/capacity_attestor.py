@@ -12,7 +12,10 @@ Trust model:
 - host identity is the kernel hostname plus host-owned (root) execution;
 - filesystem identity is the device/inode/mount of a no-follow directory
   snapshot, pinned by host policy when the measurement is not the host root;
-- the measurement is taken by this module, never copied from the report.
+- the measurement is taken by this module, never copied from the report;
+- the protected-receipt freshness check and its replacement write are one
+  host-lock-guarded critical section, so concurrent issuers cannot leave an
+  older receipt installed.
 
 Every check fails closed with :class:`AttestationError`. The v2 receipt remains
 byte-exact bound to the report and to the exact capacity counters, as in the
@@ -22,7 +25,9 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import argparse
+import contextlib
 import errno
+import fcntl
 import math
 import os
 from pathlib import Path
@@ -274,6 +279,33 @@ def _read_receipt():
         return None
 
 
+@contextlib.contextmanager
+def _receipt_lock():
+    """Serialize the protected-receipt check and write across host issuers.
+
+    The check of the installed receipt and the write that replaces it must be
+    one critical section: otherwise two issuers can both read the same older
+    state, both pass the freshness comparison and the later write can leave a
+    receipt older than the one already installed. The lock file lives in the
+    root-owned receipt directory, so only host-owned execution can create it;
+    a foreign owner, a link or a group/other-writable mode fails closed.
+    """
+    fd = os.open(RECEIPT_PATH + ".lock",
+                 os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        info = os.fstat(fd)
+        _closed(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
+                and info.st_nlink == 1 and not info.st_mode & 0o022,
+                "capacity receipt lock is not host-owned")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def verify(policy: AttestorPolicy, *, now, host=None, measurement=None,
            report=None, receipt=None) -> Attestation:
     """Verify host identity, filesystem identity, publisher report and receipt.
@@ -403,22 +435,24 @@ def attest(server, scope, *, policy=None, now=None):
             "capacity report disagrees with independent host measurement")
     _closed(readiness.read_capacity_report() == raw,
             "capacity report changed during attestation")
-    previous = _read_receipt()
-    if previous is not None:
-        _closed(type(previous) is bytes and len(previous) <= MAX_RECEIPT_BYTES,
-                "invalid capacity receipt size")
-        existing, _ = _object(previous, RECEIPT_FIELDS)
-        _closed(type(existing["event_at"]) is int and existing["event_at"] <= int(checked),
-                "capacity receipt older than the protected receipt already installed")
-    value = {
-        "schema_version": RECEIPT_SCHEMA, "method": "host-fstatvfs-exact",
-        "filesystem": MEASURE_PATH, "server": server,
-        "consumer": scope.consumer, "project": scope.project,
-        "event_at": int(checked), "source_sha256": report_sha256,
-        "available_bytes": row["available_bytes"],
-        "required_bytes": row["required_bytes"],
-    }
-    readiness.write_owned_json(RECEIPT_PATH, value, group=0, protected_ancestry=True)
+    with _receipt_lock():
+        previous = _read_receipt()
+        if previous is not None:
+            _closed(type(previous) is bytes and len(previous) <= MAX_RECEIPT_BYTES,
+                    "invalid capacity receipt size")
+            existing, _ = _object(previous, RECEIPT_FIELDS)
+            _closed(type(existing["event_at"]) is int
+                    and existing["event_at"] <= int(checked),
+                    "capacity receipt older than the protected receipt already installed")
+        value = {
+            "schema_version": RECEIPT_SCHEMA, "method": "host-fstatvfs-exact",
+            "filesystem": MEASURE_PATH, "server": server,
+            "consumer": scope.consumer, "project": scope.project,
+            "event_at": int(checked), "source_sha256": report_sha256,
+            "available_bytes": row["available_bytes"],
+            "required_bytes": row["required_bytes"],
+        }
+        readiness.write_owned_json(RECEIPT_PATH, value, group=0, protected_ancestry=True)
     return value
 
 

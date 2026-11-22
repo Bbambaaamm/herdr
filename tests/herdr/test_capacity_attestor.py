@@ -3,6 +3,9 @@ from dataclasses import replace
 import hashlib
 import json
 import os
+from pathlib import Path
+import threading
+import time
 
 import pytest
 
@@ -48,8 +51,11 @@ def measurement(available, *, path=attestor.MEASURE_PATH, device=DEVICE, inode=I
 
 
 @pytest.fixture
-def feed(monkeypatch):
+def feed(monkeypatch, tmp_path):
     state = {"report": None, "receipt": None, "reads": 0}
+    # The reserved receipt path lives in a root-owned directory; point it at a
+    # writable fixture path so the host lock can be created by the test process.
+    monkeypatch.setattr(attestor, "RECEIPT_PATH", str(tmp_path / "receipt.json"))
 
     def read_capacity_report():
         state["reads"] += 1
@@ -362,6 +368,79 @@ def test_attest_refuses_to_overwrite_newer_receipt_with_older(feed, measured, po
     with pytest.raises(attestor.AttestationError, match="older than the protected receipt"):
         attestor.attest(SERVER, SCOPE, policy=policy, now=NOW)
     assert written["value"]["event_at"] == NOW - 1
+
+
+def test_concurrent_attest_cannot_leave_an_older_receipt(measured, policy, monkeypatch, tmp_path):
+    """Two racing host issuers must never leave the older receipt installed.
+
+    The check of the installed receipt and the write that replaces it are one
+    host-lock-guarded critical section; without it both issuers can read the
+    same older state, both pass the freshness comparison and the slower write
+    can leave a receipt older than the one already installed.
+    """
+    receipt_path = tmp_path / "receipt.json"
+    monkeypatch.setattr(attestor, "RECEIPT_PATH", str(receipt_path))
+
+    def read_protected(path, *, owner=0, limit=1048576):
+        assert (path, owner, limit) == (str(receipt_path), 0, attestor.MAX_RECEIPT_BYTES)
+        try:
+            return receipt_path.read_bytes()
+        except FileNotFoundError:
+            raise FileNotFoundError(path)
+
+    def write_owned_json(path, value, *, owner=0, group=1001, mode=0o444,
+                         protected_ancestry=False):
+        assert path == str(receipt_path) and owner == 0 and group == 0
+        assert protected_ancestry is True
+        # A slow host write widens the check-then-write window this test targets.
+        time.sleep(0.005)
+        raw = (json.dumps(value, sort_keys=True) + "\n").encode()
+        temporary = receipt_path.with_name(receipt_path.name + ".tmp")
+        temporary.write_bytes(raw)
+        os.replace(temporary, receipt_path)
+
+    monkeypatch.setattr(attestor.readiness, "read_protected", read_protected)
+    monkeypatch.setattr(attestor.readiness, "write_owned_json", write_owned_json)
+
+    newer = report(10 ** 11, at=NOW - 1)
+    older = report(10 ** 11, at=NOW - 5)
+    measured["available"] = 10 ** 11
+    side = threading.local()
+
+    def read_capacity_report():
+        return newer if getattr(side, "value", None) == "newer" else older
+
+    monkeypatch.setattr(attestor.readiness, "read_capacity_report", read_capacity_report)
+
+    def run(name):
+        side.value = name
+        barrier.wait()
+        try:
+            attestor.attest(SERVER, SCOPE, policy=policy, now=NOW)
+        except attestor.AttestationError:
+            pass
+
+    for _ in range(12):
+        receipt_path.unlink(missing_ok=True)
+        barrier = threading.Barrier(2)
+        threads = [threading.Thread(target=run, args=(name,))
+                   for name in ("older", "newer")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert json.loads(receipt_path.read_bytes())["event_at"] == NOW - 1
+
+
+def test_receipt_lock_fails_closed_for_non_host_owned_lock(feed, measured, policy):
+    """A lock file the host does not own must block publication."""
+    install(feed, 10 ** 11)
+    measured["available"] = 10 ** 11
+    lock_path = Path(attestor.RECEIPT_PATH + ".lock")
+    lock_path.write_text("")
+    os.chmod(lock_path, 0o666)
+    with pytest.raises(attestor.AttestationError, match="receipt lock is not host-owned"):
+        attestor.attest(SERVER, SCOPE, policy=policy, now=NOW)
 
 
 def test_report_changed_during_attestation_blocked(feed, measured, policy):
