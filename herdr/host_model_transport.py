@@ -442,7 +442,9 @@ def _fixture_response(payload, role, definition, ordinal, workspace):
             "object": "chat.completion", "created": 1, "model": _FIXTURE_MODEL,
             "choices": [{"index": 0, "message": message,
                          "finish_reason": "tool_calls" if calls else "stop"}],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}}
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2,
+                      "prompt_tokens_details": {"cached_tokens": 0},
+                      "cache_write_tokens": 0}}}
 
 
 def _perform_fixture(factory, identity, grant, payload, operation_id):
