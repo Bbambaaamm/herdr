@@ -6,15 +6,17 @@ import hashlib
 import os
 import socket
 
+from . import capacity_attestor
 from . import operation_readiness as readiness
-from .capacity_attestor import MAX_ATTESTATION_AGE, MAX_RECEIPT_BYTES, RECEIPT_PATH, verify_receipt
 from .evidence import canonical, digest
-from .operational_adapters import MAX_INPUT_BYTES, capacity_snapshot
+from .operational_adapters import MAX_INPUT_BYTES, _object, capacity_snapshot
 from .operational_incidents import (
     Detail, IncidentError, IncidentType, Observation, Scope, State, correlate, epoch, require,
     timestamp, token,
 )
 
+RECEIPT_PATH = capacity_attestor.RECEIPT_PATH
+RECEIPT_SCHEMA = capacity_attestor.RECEIPT_SCHEMA
 EVENT_SCHEMA = "herdr-capacity-event-1"
 RECORD_SCHEMA = "herdr-capacity-record-1"
 RECORD_KIND = "capacity-observation"
@@ -31,11 +33,24 @@ class CapacityPolicy:
     server: str
     scope: Scope
     max_age: int = MAX_AGE_SECONDS
+    attestor: capacity_attestor.AttestorPolicy | None = None
 
     def __post_init__(self):
         token(self.server)
         require(type(self.scope) is Scope and type(self.max_age) is int
                 and 0 < self.max_age <= MAX_AGE_SECONDS, "invalid capacity event policy")
+        if self.attestor is not None:
+            require(type(self.attestor) is capacity_attestor.AttestorPolicy
+                    and self.attestor.server == self.server
+                    and self.attestor.scope == self.scope,
+                    "capacity attestor policy mismatch")
+
+
+def _attestor_policy(policy):
+    if policy.attestor is not None:
+        return policy.attestor
+    return capacity_attestor.AttestorPolicy(policy.server, policy.scope,
+                                            max_age=policy.max_age)
 
 
 @dataclass(frozen=True)
@@ -92,49 +107,69 @@ class _Sample:
     raw: bytes
     receipt: bytes | None
     build: tuple[bytes, str] | None
+    attestation: capacity_attestor.Attestation | None = None
 
 
 def _slot(policy, at):
     return digest([RECORD_SCHEMA, policy.server, asdict(policy.scope), at])
 
 
-def _sample(policy, raw, receipt, *, now, build=None):
+def _sample(policy, raw, receipt, *, now, build=None, attestation=None):
     """Decode already-read bytes. Receipt provenance comes from the enclosing read boundary."""
     row, _ = capacity_snapshot(raw, policy.scope, now=now, max_age=policy.max_age,
                                build_input=build)
     raw_hash = hashlib.sha256(raw).hexdigest()
-    trusted = receipt is not None
+    facts = dict(row.facts)
     refs = row.evidence_sha256
-    if trusted:
-        data = verify_receipt(receipt, raw, row.event_at, dict(row.facts), policy.server, policy.scope)
+    if receipt is not None:
+        fields = {"schema_version", "method", "filesystem", "server", "consumer", "project",
+                  "event_at", "source_sha256", "available_bytes", "required_bytes"}
+        data, _ = _object(receipt, fields)
+        require(data == {
+            "schema_version": RECEIPT_SCHEMA, "method": "host-fstatvfs-exact",
+            "filesystem": capacity_attestor.MEASURE_PATH, "server": policy.server,
+            **asdict(policy.scope), "event_at": row.event_at, "source_sha256": raw_hash,
+            "available_bytes": facts["available_bytes"],
+            "required_bytes": facts["required_bytes"],
+        } and type(data["event_at"]) is int, "capacity receipt identity or digest mismatch")
         receipt = canonical(data)
         refs = (*refs, digest(data))
-    # Freshness is a property of the projection. Preserve the measured state
-    # in history when replaying an older, previously verified observation.
-    below_floor = dict(row.facts)["available_bytes"] < dict(row.facts)["required_bytes"]
+    if attestation is not None:
+        require(type(attestation) is capacity_attestor.Attestation
+                and attestation.report_sha256 == raw_hash,
+                "capacity attestation does not bind this report")
+        facts = tuple(item for item in row.facts
+                      if item[0] not in ("available_bytes", "required_bytes"))
+        row = replace(row, facts=(*facts, ("available_bytes", attestation.available_bytes),
+                                  ("required_bytes", attestation.required_bytes)))
+        below_floor = attestation.available_bytes < attestation.required_bytes
+        trust = attestation.trust
+    else:
+        below_floor = int(facts["available_bytes"]) < int(facts["required_bytes"])
+        trust = "HOST_OWNED" if receipt is not None else "PUBLISHER_OBSERVED"
     row = replace(row, subject=("root-filesystem", policy.server),
                   observed_at=row.event_at, evidence_sha256=refs,
                   state=State.OPEN if below_floor else State.RESOLVED,
                   detail=Detail.BELOW_FLOOR if below_floor else Detail.READY)
     correlation = digest([EVENT_SCHEMA, policy.server, row.correlation_id])
     envelope = EventEnvelope(policy.server, row.scope, row.kind, row.event_at, raw_hash, refs,
-                             correlation, "HOST_OWNED" if trusted else "PUBLISHER_OBSERVED")
-    return _Sample(row, envelope, raw, receipt, build)
+                             correlation, trust)
+    return _Sample(row, envelope, raw, receipt, build, attestation)
 
 
 def _read_sample(policy, now, build=None):
     require(socket.gethostname() == policy.server, "capacity host identity mismatch")
-    raw = readiness.read_capacity_report()
     try:
-        receipt = readiness.read_protected(RECEIPT_PATH, limit=MAX_RECEIPT_BYTES)
-    except (OSError, readiness.ReadinessError):
-        receipt = None
-    try:
-        return _sample(policy, raw, receipt, now=now, build=build)
-    except IncidentError:
-        if receipt is None:
-            raise
-        return _sample(policy, raw, None, now=now, build=build)
+        attestation = capacity_attestor.verify(_attestor_policy(policy), now=now)
+    except (IncidentError, capacity_attestor.AttestationError, OSError,
+            readiness.ReadinessError):
+        # Fail closed: a failed host attestation is publisher-observed only and
+        # can never grant HOST_OWNED or a proposal.
+        attestation = None
+    if attestation is None:
+        return _sample(policy, readiness.read_capacity_report(), None, now=now, build=build)
+    return _sample(policy, attestation.report_bytes, attestation.receipt_bytes,
+                   now=now, build=build, attestation=attestation)
 
 
 def _fold(policy, samples, *, now):
@@ -152,7 +187,8 @@ def _fold(policy, samples, *, now):
     latest = slots[max(slots)]
     current = latest.row
     usable = (latest.receipt is not None
-              and epoch(now) - current.event_at <= min(policy.max_age, MAX_ATTESTATION_AGE))
+              and epoch(now) - current.event_at <= min(policy.max_age,
+                                                       capacity_attestor.MAX_ATTESTATION_AGE))
     history = [item.row for _, item in sorted(slots.items()) if item.receipt is not None
                and item.row.event_at < current.event_at]
     if not usable:
@@ -205,8 +241,12 @@ def canary(policy, *, now, build=None):
 def record_host_observation(store, policy, *, now, build=None):
     """Explicit opt-in for the existing protected EvidenceStore, never used by canary."""
     sample = _read_sample(policy, now, build)
-    require(sample.receipt is not None and now - sample.row.event_at <= min(policy.max_age, MAX_ATTESTATION_AGE),
+    require(sample.receipt is not None
+            and now - sample.row.event_at <= min(policy.max_age,
+                                                capacity_attestor.MAX_ATTESTATION_AGE),
             "fresh host receipt required for durable capacity publication")
+    require(sample.attestation is not None and sample.attestation.trust == "HOST_OWNED",
+            "host-owned capacity attestation required for durable publication")
     key = _slot(policy, sample.row.event_at)
     payload = {
         "schema_version": RECORD_SCHEMA, "server": policy.server, "scope": asdict(policy.scope),
@@ -237,7 +277,8 @@ def replay_recorded(store, policy, *, now):
         if data["server"] != policy.server or data["scope"] != asdict(policy.scope):
             continue
         require(type(data["raw"]) is str and 0 < len(data["raw"]) <= 2 * MAX_INPUT_BYTES
-                and type(data["receipt"]) is str and 0 < len(data["receipt"]) <= 2 * MAX_RECEIPT_BYTES,
+                and type(data["receipt"]) is str
+                and 0 < len(data["receipt"]) <= 2 * capacity_attestor.MAX_RECEIPT_BYTES,
                 "invalid stored capacity evidence")
         raw, receipt = (bytes.fromhex(data[name]) for name in ("raw", "receipt"))
         build = data["build"]

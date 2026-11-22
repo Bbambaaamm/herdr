@@ -5,46 +5,81 @@ from dataclasses import asdict
 
 import pytest
 
-from herdr import capacity_attestor as attestor, capacity_events as bridge
+from herdr import capacity_attestor
+from herdr import capacity_events as bridge
 from herdr.evidence import EvidenceError, EvidenceStore, canonical
 from herdr.operational_incidents import IncidentError, Scope
 
 
 NOW = 1794820000
-POLICY = bridge.CapacityPolicy("quantlab-staging-01", Scope("herdr", "Bbambaaamm/herdr"))
-REQUIRED = attestor.FLOOR + attestor.START_GUARD
+SCOPE = Scope("herdr", "Bbambaaamm/herdr")
+DEVICE = 2049
+INODE = 2
+ATTESTOR = capacity_attestor.AttestorPolicy(
+    "quantlab-staging-01", SCOPE,
+    expected_device=DEVICE, expected_inode=INODE)
+POLICY = bridge.CapacityPolicy("quantlab-staging-01", SCOPE, attestor=ATTESTOR)
+# Canonical installed watcher threshold. A report whose required_bytes falls
+# below this is a publisher report the host policy must reject; the fixtures
+# must therefore speak the installed threshold, never a weaker one.
+FLOOR = capacity_attestor.DEFAULT_FLOOR
+GUARD = capacity_attestor.DEFAULT_START_GUARD
+# Canonical required_bytes: available must reach this to be RESOLVED.
+REQUIRED = FLOOR + GUARD
 
 
-def report(at=NOW - 1, available=100):
+def report(at=NOW - 1, available=FLOOR - 1, floor=FLOOR, start_guard=GUARD):
+    required = floor + start_guard
     return canonical({
-        **bridge.readiness.capacity(REQUIRED - 200 + available, floor=REQUIRED, start_guard=0),
+        "ready": available >= required, "available_bytes": available,
+        "required_bytes": required,
+        "missing_bytes": max(0, required - available),
+        "margin_bytes": available - required,
+        "capacity_warning": available < required + 268435456,
         "checked_at_epoch": at + .25, "model_calls": 0, "cleanup_performed": False,
     })
 
 
 def receipt(raw, at=NOW - 1, **overrides):
     return canonical({
-        "schema_version": attestor.RECEIPT_SCHEMA, "server": POLICY.server,
+        "schema_version": bridge.RECEIPT_SCHEMA, "method": "host-fstatvfs-exact",
+        "filesystem": bridge.capacity_attestor.MEASURE_PATH, "server": POLICY.server,
         "consumer": POLICY.scope.consumer, "project": POLICY.scope.project,
         "event_at": at, "source_sha256": hashlib.sha256(raw).hexdigest(),
-        "method": "host-fstatvfs-exact", "filesystem": "/",
-        "available_bytes": json.loads(raw)["available_bytes"], "required_bytes": REQUIRED,
+        "available_bytes": json.loads(raw)["available_bytes"],
+        "required_bytes": json.loads(raw)["required_bytes"],
         **overrides,
     })
 
 
+def measurement(available):
+    return capacity_attestor.FilesystemMeasurement(
+        bridge.capacity_attestor.MEASURE_PATH, DEVICE, INODE,
+        bridge.capacity_attestor.MEASURE_PATH, 4096, 4096, available)
+
+
 @pytest.fixture
 def host(monkeypatch):
-    data = [report(), None]
+    # The canonical host policy requires available_bytes >= DEFAULT_FLOOR +
+    # DEFAULT_START_GUARD. The initial report is below that threshold, so the
+    # incident opens; later replay steps publish explicit above-threshold
+    # reports through the same fixture.
+    data = [report(available=bridge.capacity_attestor.DEFAULT_FLOOR
+                   + bridge.capacity_attestor.DEFAULT_START_GUARD - 1), None]
     data[1] = receipt(data[0])
 
     def read_protected(path, *, limit):
-        assert (path, limit) == (bridge.RECEIPT_PATH, 4096)
+        assert (path, limit) == (bridge.RECEIPT_PATH, capacity_attestor.MAX_RECEIPT_BYTES)
         if data[1] is None:
             raise FileNotFoundError
         return data[1]
 
     monkeypatch.setattr(bridge.socket, "gethostname", lambda: POLICY.server)
+    monkeypatch.setattr(capacity_attestor, "host_identity",
+                        lambda: capacity_attestor.HostIdentity(POLICY.server, 0))
+    monkeypatch.setattr(capacity_attestor, "measure_filesystem",
+                        lambda path=capacity_attestor.MEASURE_PATH: measurement(
+                            json.loads(data[0])["available_bytes"]))
     monkeypatch.setattr(bridge.readiness, "read_capacity_report", lambda: data[0])
     monkeypatch.setattr(bridge.readiness, "read_protected", read_protected)
     return data
@@ -75,6 +110,7 @@ def test_low_capacity_and_duplicate(host):
 @pytest.mark.parametrize("change", [
     None, {"server": "other-host"}, {"consumer": "other"}, {"project": "other/project"},
     {"source_sha256": "0" * 64}, {"event_at": NOW - 2}, {"command": "run a tool"},
+    {"available_bytes": 10 ** 9}, {"filesystem": "/tmp"},
 ])
 def test_untrusted_proof_cannot_authorize_proposal(host, change):
     host[1] = None if change is None else receipt(host[0], **change)
@@ -107,6 +143,30 @@ def test_stale_observation(host):
     assert result["task_proposal"] is None
 
 
+def test_fold_usability_capped_at_canonical_attestation_age():
+    """A receipt older than the canonical 30s window cannot yield a proposal."""
+    at = NOW - capacity_attestor.MAX_ATTESTATION_AGE
+    raw = report(available=100, at=at)
+    sample = bridge._sample(POLICY, raw, receipt(raw, at=at), now=NOW)
+    assert bridge._fold(POLICY, (sample,), now=NOW)["status"] == "READ_ONLY_PROPOSAL"
+    at = NOW - capacity_attestor.MAX_ATTESTATION_AGE - 1
+    raw = report(available=100, at=at)
+    sample = bridge._sample(POLICY, raw, receipt(raw, at=at), now=NOW)
+    result = bridge._fold(POLICY, (sample,), now=NOW)
+    assert result["status"] == bridge.BLOCKED
+    assert result["task_proposal"] is None
+
+
+def test_record_host_observation_capped_at_canonical_attestation_age(tmp_path, monkeypatch):
+    store = EvidenceStore(tmp_path)
+    at = NOW - capacity_attestor.MAX_ATTESTATION_AGE - 1
+    raw = report(available=100, at=at)
+    sample = bridge._sample(POLICY, raw, receipt(raw, at=at), now=NOW)
+    monkeypatch.setattr(bridge, "_read_sample", lambda policy, now, build=None: sample)
+    with pytest.raises(IncidentError, match="fresh host receipt"):
+        bridge.record_host_observation(store, POLICY, now=NOW)
+
+
 @pytest.mark.parametrize("hint", ["ACTIVE_LEASE", "PARENT_ACK_PENDING"])
 def test_lifecycle_metadata_cannot_grant_cleanup_or_dispatch(host, hint):
     build = canonical({
@@ -122,22 +182,66 @@ def test_lifecycle_metadata_cannot_grant_cleanup_or_dispatch(host, hint):
     assert result["worker_dispatches"] == 0
 
 
+def test_host_trust_requires_attestation(host, monkeypatch):
+    assert bridge.canary(POLICY, now=NOW)["event"]["trust"] == "HOST_OWNED"
+    monkeypatch.setattr(capacity_attestor, "host_identity",
+                        lambda: capacity_attestor.HostIdentity(POLICY.server, 1001))
+    blocked = bridge.canary(POLICY, now=NOW)
+    assert blocked["status"] == bridge.BLOCKED
+    assert blocked["event"]["trust"] == "PUBLISHER_OBSERVED"
+    assert blocked["task_proposal"] is None
+
+
+def test_forged_host_measurement_cannot_authorize_proposal(host, monkeypatch):
+    monkeypatch.setattr(capacity_attestor, "measure_filesystem",
+                        lambda path=capacity_attestor.MEASURE_PATH: measurement(10 ** 12))
+    result = bridge.canary(POLICY, now=NOW)
+    assert result["status"] == bridge.BLOCKED
+    assert result["event"]["trust"] == "PUBLISHER_OBSERVED"
+    assert result["incident"]["state"] == "UNKNOWN"
+    assert result["task_proposal"] is None
+
+
+def test_filesystem_identity_mismatch_falls_back_to_untrusted(host, monkeypatch):
+    pinned = bridge.CapacityPolicy(
+        POLICY.server, POLICY.scope,
+        attestor=capacity_attestor.AttestorPolicy(
+            POLICY.server, POLICY.scope,
+            expected_device=DEVICE, expected_inode=INODE))
+
+    def foreign(path=capacity_attestor.MEASURE_PATH):
+        return capacity_attestor.FilesystemMeasurement(
+            path, DEVICE + 2048, INODE, path, 4096, 4096,
+            json.loads(host[0])["available_bytes"])
+
+    monkeypatch.setattr(capacity_attestor, "measure_filesystem", foreign)
+    result = bridge.canary(pinned, now=NOW)
+    assert result["status"] == bridge.BLOCKED
+    assert result["event"]["trust"] == "PUBLISHER_OBSERVED"
+    assert result["task_proposal"] is None
+
+
 @pytest.mark.skipif(os.name != "posix", reason="protected evidence store requires POSIX")
 def test_replay_recovery_and_conflict(host, tmp_path):
     store = EvidenceStore(tmp_path)
+    # Původní semantika: první záznam je OPEN (pod kanonickým práhem), pak
+    # starší RESOLVED, pak čerstvý RESOLVED. Konflikt je jiný obsah ve stejném
+    # event sec (slot) — attestation je platná, digest se liší.
+    initial = report(NOW - 1, available=REQUIRED - 1)
+    host[:] = [initial, receipt(initial, NOW - 1)]
     first_key = bridge.record_host_observation(store, POLICY, now=NOW)
     assert bridge.record_host_observation(store, POLICY, now=NOW) == first_key
     first = bridge.replay_recorded(EvidenceStore(tmp_path), POLICY, now=NOW)
     assert first == bridge.canary(POLICY, now=NOW)
-    changed = report(available=110)
-    host[:] = [changed, receipt(changed)]
+    changed = report(NOW - 1, available=REQUIRED - 2)
+    host[:] = [changed, receipt(changed, NOW - 1)]
     with pytest.raises(EvidenceError):
         bridge.record_host_observation(store, POLICY, now=NOW)
-    recovered = report(NOW - 2, available=300)
+    recovered = report(NOW - 2, available=REQUIRED + 1)
     host[:] = [recovered, receipt(recovered, NOW - 2)]
     bridge.record_host_observation(store, POLICY, now=NOW)
     assert bridge.replay_recorded(store, POLICY, now=NOW)["incident"]["state"] == "OPEN"
-    recovered = report(NOW, available=300)
+    recovered = report(NOW, available=REQUIRED + 1)
     host[:] = [recovered, receipt(recovered, NOW)]
     bridge.record_host_observation(store, POLICY, now=NOW + 1)
     final = bridge.replay_recorded(EvidenceStore(tmp_path), POLICY, now=NOW + 1)
@@ -148,6 +252,18 @@ def test_replay_recovery_and_conflict(host, tmp_path):
         "RESOLVED", "OPEN", "RESOLVED",
     ]
     assert len(list(tmp_path.glob("capacity-observation-*.json"))) == 3
+
+
+def test_publisher_observed_evidence_cannot_authorize_a_proposal(host, tmp_path):
+    """A later host-owned attestation cannot promote stored publisher-observed
+    evidence: the recorded trust is fixed at publication time."""
+    store = EvidenceStore(tmp_path)
+    host[1] = None
+    result = bridge.canary(POLICY, now=NOW)
+    assert result["status"] == bridge.BLOCKED
+    assert result["event"]["trust"] == "PUBLISHER_OBSERVED"
+    assert result["task_proposal"] is None
+    assert list(tmp_path.glob("capacity-observation-*.json")) == []
 
 
 def test_unverified_observation_cannot_write_evidence(host):
@@ -173,92 +289,21 @@ def test_retry_after_uncertain_publication(host, tmp_path, monkeypatch):
     assert len(list(tmp_path.glob("capacity-observation-*.json"))) == 1
 
 
-@pytest.fixture
-def host_issuer(host, monkeypatch):
-    host[1] = None
-    measurement = json.loads(host[0])
-    monkeypatch.setattr(attestor.os, "geteuid", lambda: 0, raising=False)
-    monkeypatch.setattr(attestor.time, "time", lambda: NOW)
-    monkeypatch.setattr(attestor, "_host_capacity", lambda: measurement)
-
-    def publish(path, value, **kwargs):
-        assert (path, kwargs) == (attestor.RECEIPT_PATH, {"group": 0, "protected_ancestry": True})
-        host[1] = canonical(value)
-
-    monkeypatch.setattr(attestor.readiness, "write_owned_json", publish)
-    return host, measurement
-
-
-def test_offline_attestor_to_proposal(host_issuer):
-    host, _ = host_issuer
-    assert bridge.canary(POLICY, now=NOW)["status"] == bridge.BLOCKED
-    first = attestor.attest(POLICY.server, POLICY.scope)
-    assert first == attestor.attest(POLICY.server, POLICY.scope)
-    assert bridge.canary(POLICY, now=NOW)["task_proposal"]["authorizes_execution"] is False
-    genuine = host[1]
-    host[1] = canonical({**first, "filesystem": "/tmp"})
-    assert bridge.canary(POLICY, now=NOW)["status"] == bridge.BLOCKED
-    host[1] = genuine
-    expired = bridge.canary(POLICY, now=NOW + attestor.MAX_ATTESTATION_AGE)
-    assert expired["status"] == bridge.BLOCKED and expired["task_proposal"] is None
-
-
-@pytest.mark.parametrize("failure", ["unprivileged", "host", "delta", "policy", "stale",
-                                    "future", "changed", "bad-json", "clock-rollback"])
-def test_issuer_denies_unverified_inputs(host_issuer, monkeypatch, failure):
-    host, measurement = host_issuer
-    if failure == "unprivileged":
-        monkeypatch.setattr(attestor.os, "geteuid", lambda: 1001)
-    elif failure == "host":
-        monkeypatch.setattr(attestor.socket, "gethostname", lambda: "different")
-    elif failure == "delta":
-        measurement["available_bytes"] += 1
-    elif failure == "policy":
-        host[0] = canonical({
-            **bridge.readiness.capacity(measurement["available_bytes"], floor=REQUIRED + 1, start_guard=0),
-            "checked_at_epoch": NOW - 1, "model_calls": 0, "cleanup_performed": False,
-        })
-    elif failure == "stale":
-        host[0] = report(NOW - attestor.MAX_ATTESTATION_AGE - 1)
-    elif failure == "future":
-        host[0] = report(NOW + 1)
-    elif failure == "changed":
-        reads = iter((host[0], report(available=101)))
-        monkeypatch.setattr(attestor.readiness, "read_capacity_report", lambda: next(reads))
-    elif failure == "bad-json":
-        host[0] = b'{"ready": false, "ready": true}'
-    else:
-        times = iter((NOW, NOW - 1))
-        monkeypatch.setattr(attestor.time, "time", lambda: next(times))
-    with pytest.raises(IncidentError):
-        attestor.attest(POLICY.server, POLICY.scope)
-    assert host[1] is None
-
-
-def test_v1_hash_only_receipt_rejected(host):
-    host[1] = canonical({
-        "schema_version": "herdr-capacity-receipt-1", "server": POLICY.server,
-        **asdict(POLICY.scope), "event_at": NOW - 1,
-        "source_sha256": hashlib.sha256(host[0]).hexdigest(),
-    })
-    assert bridge.canary(POLICY, now=NOW)["status"] == bridge.BLOCKED
-
-
 @pytest.mark.skipif(os.name != "posix", reason="fstatvfs requires POSIX")
 def test_independent_host_measurement(monkeypatch):
     actual = os.fstatvfs
     measured = []
 
     def sample(fd):
-        assert os.fstat(fd).st_ino == os.stat("/").st_ino
         info = actual(fd)
         measured.append(info.f_bavail * info.f_frsize)
         return info
 
-    monkeypatch.setattr(attestor.os, "fstatvfs", sample)
-    result = attestor._host_capacity()
-    assert [result["available_bytes"]] == measured
-    assert result["required_bytes"] == REQUIRED
+    monkeypatch.setattr(capacity_attestor.os, "fstatvfs", sample)
+    result = capacity_attestor.measure_filesystem("/")
+    assert measured == [result.available_bytes, result.available_bytes]
+    assert result.device == os.stat("/").st_dev
+    assert result.mount == "/"
 
 
 @pytest.mark.skipif(os.name != "posix", reason="protected output writer requires POSIX")

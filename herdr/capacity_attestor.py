@@ -1,89 +1,471 @@
-"""One-shot attestation of the installed Capacity Watcher on its host."""
+"""Host-owned read-only capacity attestation over the existing protected reads.
+
+The account-writable watcher report is an untrusted observation. This module
+independently measures the host filesystem and binds that measurement to the
+report and to the optional root-owned receipt already produced by the v2 issuer.
+It never dispatches work, reserves budget, signs anything, or grants execution
+authority.
+
+Trust model:
+- publisher identity comes from ``operation_readiness.read_capacity_report``,
+  which only accepts an owner-0 ancestry with a publisher-1001 regular file;
+- host identity is the kernel hostname plus host-owned (root) execution;
+- filesystem identity is the device/inode/mount of a no-follow directory
+  snapshot, pinned by host policy when the measurement is not the host root;
+- the measurement is taken by this module, never copied from the report;
+- the protected-receipt freshness check and its replacement write are one
+  host-lock-guarded critical section, so concurrent issuers cannot leave an
+  older receipt installed.
+
+Every check fails closed with :class:`AttestationError`. The v2 receipt remains
+byte-exact bound to the report and to the exact capacity counters, as in the
+canonical contract; no drift or slack tolerance is adopted.
+"""
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass
 import argparse
-from dataclasses import asdict
-import hashlib
+import contextlib
+import errno
+import fcntl
+import math
 import os
+from pathlib import Path
+import re
 import socket
+import stat
 import time
 
 from . import operation_readiness as readiness
-from .operational_adapters import _object, capacity_snapshot
-from .operational_incidents import IncidentError, Scope, epoch, require, token
+from .evidence import digest
+from .operational_adapters import _object
+from .operational_incidents import IncidentError, Scope, epoch, token
 
-RECEIPT_PATH = "/run/herdr/capacity-exporter/receipt.json"
+SCHEMA = "herdr-capacity-attestation-1"
 RECEIPT_SCHEMA = "herdr-capacity-receipt-2"
+REPORT_PATH = "/var/lib/herdr-capacity-watch/status.json"
+RECEIPT_PATH = "/run/herdr/capacity-exporter/receipt.json"
 MAX_RECEIPT_BYTES = 4096
+MAX_AGE_SECONDS = 900
+# Canonical host-owned receipt/report freshness bound from the #231 contract.
+# ``max_age`` is the host-selected policy upper bound; host-owned evidence is
+# never usable beyond this window.
 MAX_ATTESTATION_AGE = 30
-FLOOR = 9663676416
-START_GUARD = 134217728
-FILESYSTEM = "/"
+PUBLISHER_UID = 1001
+MEASURE_PATH = "/"
+
+# Installed watcher floor/guard (deploy/herdr/check_capacity.py). The host policy
+# must agree with the installed watcher; a different floor is a blocker.
+DEFAULT_FLOOR = 9663676416
+DEFAULT_START_GUARD = 134217728
+
+REPORT_FIELDS = frozenset({
+    "ready", "available_bytes", "required_bytes", "missing_bytes", "margin_bytes",
+    "capacity_warning", "checked_at_epoch", "model_calls", "cleanup_performed",
+})
+RECEIPT_FIELDS = frozenset({
+    "schema_version", "method", "filesystem", "server", "consumer", "project",
+    "event_at", "source_sha256", "available_bytes", "required_bytes",
+})
+_MOUNT_RECORD = 2_097_152
 
 
-def _receipt(raw, event_at, facts, server, scope):
-    require(facts["required_bytes"] == FLOOR + START_GUARD, "capacity policy mismatch")
-    return {
-        "schema_version": RECEIPT_SCHEMA, "method": "host-fstatvfs-exact",
-        "filesystem": FILESYSTEM, "server": server, **asdict(scope),
-        "event_at": event_at, "source_sha256": hashlib.sha256(raw).hexdigest(),
-        "available_bytes": facts["available_bytes"], "required_bytes": facts["required_bytes"],
-    }
+class AttestationError(ValueError):
+    """A host capacity check failed closed; it conveys no execution authority."""
 
 
-def verify_receipt(body, raw, event_at, facts, server, scope):
-    """Verify a receipt already read through the protected host boundary."""
-    require(type(body) is bytes and len(body) <= MAX_RECEIPT_BYTES, "invalid capacity receipt size")
-    expected = _receipt(raw, event_at, facts, server, scope)
-    value, _ = _object(body, set(expected))
-    require(value == expected and all(type(value[key]) is int for key in
-                                     ("event_at", "available_bytes", "required_bytes")),
-            "capacity receipt binding mismatch")
-    return expected
+def _closed(condition, message):
+    """Fail closed: every denial is an AttestationError, never a silent value."""
+    if not condition:
+        raise AttestationError(message)
 
 
-def _host_capacity():
-    fd = os.open(FILESYSTEM, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+def _counter(value):
+    return type(value) is int and 0 <= value < 2 ** 63
+
+
+def _signed_counter(value):
+    return type(value) is int and -(2 ** 63) < value < 2 ** 63
+
+
+def _absolute_path(value, message, *, require_result=False):
+    ok = type(value) is str and value.startswith("/") and ".." not in Path(value).parts
+    if require_result:
+        return ok
+    _closed(ok, message)
+    return None
+
+
+@dataclass(frozen=True)
+class HostIdentity:
+    hostname: str
+    euid: int
+
+
+@dataclass(frozen=True)
+class AttestorPolicy:
+    """Host-selected measurement, identity pins and freshness bounds."""
+
+    server: str
+    scope: Scope
+    measure_path: str = MEASURE_PATH
+    expected_device: int | None = None
+    expected_inode: int | None = None
+    expected_mount: str | None = None
+    max_age: int = MAX_AGE_SECONDS
+    floor: int = DEFAULT_FLOOR
+    start_guard: int = DEFAULT_START_GUARD
+
+    def __post_init__(self):
+        token(self.server)
+        _closed(type(self.scope) is Scope, "invalid capacity attestor scope")
+        _absolute_path(self.measure_path, "invalid capacity measurement path")
+        _closed(self.expected_device is None or _counter(self.expected_device),
+                "invalid expected device")
+        _closed(self.expected_inode is None or _counter(self.expected_inode),
+                "invalid expected inode")
+        _closed(self.expected_mount is None or _absolute_path(self.expected_mount,
+                "invalid expected mount", require_result=True), "invalid expected mount")
+        _closed(type(self.max_age) is int and 0 < self.max_age <= MAX_AGE_SECONDS,
+                "invalid capacity freshness policy")
+        # The installed watcher floor/guard is the canonical host threshold. A
+        # caller-supplied policy may never lower it: the watcher report is
+        # account-writable, so a weaker floor would make the attestation trust a
+        # threshold the host did not install.
+        _closed(_counter(self.floor) and self.floor >= DEFAULT_FLOOR
+                and _counter(self.start_guard) and self.start_guard >= DEFAULT_START_GUARD,
+                "capacity floor policy below the installed watcher floor")
+
+
+@dataclass(frozen=True)
+class FilesystemMeasurement:
+    path: str
+    device: int
+    inode: int
+    mount: str
+    fragment_size: int
+    block_size: int
+    available_bytes: int
+
+
+@dataclass(frozen=True)
+class Attestation:
+    schema_version: str
+    server: str
+    scope: Scope
+    trust: str
+    available_bytes: int
+    required_bytes: int
+    ready: bool
+    measured_at: int
+    report_event_at: int
+    device: int
+    inode: int
+    mount: str
+    publisher_uid: int
+    report_path: str
+    receipt_path: str | None
+    report_sha256: str
+    receipt_sha256: str | None
+    evidence_sha256: tuple[str, ...]
+    report_bytes: bytes
+    receipt_bytes: bytes | None
+
+    def to_dict(self):
+        return {
+            "schema_version": self.schema_version, "server": self.server,
+            "scope": asdict(self.scope), "trust": self.trust,
+            "available_bytes": self.available_bytes, "required_bytes": self.required_bytes,
+            "ready": self.ready, "measured_at": self.measured_at,
+            "report_event_at": self.report_event_at, "device": self.device,
+            "inode": self.inode, "mount": self.mount, "publisher_uid": self.publisher_uid,
+            "report_path": self.report_path, "receipt_path": self.receipt_path,
+            "report_sha256": self.report_sha256, "receipt_sha256": self.receipt_sha256,
+            "evidence_sha256": self.evidence_sha256,
+        }
+
+
+def host_identity() -> HostIdentity:
+    """The calling process identity; root execution is required for host trust."""
+    return HostIdentity(socket.gethostname(), os.geteuid())
+
+
+def _stamp(info):
+    return (info.st_dev, info.st_ino, info.st_nlink, info.st_uid, info.st_gid,
+            info.st_mode, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _snapshot(path):
+    """One no-follow directory snapshot: identity plus filesystem counters."""
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
-        fs = os.fstatvfs(fd)
+        info = os.fstat(fd)
+        counters = os.fstatvfs(fd)
     finally:
         os.close(fd)
-    require(fs.f_frsize > 0 and 0 <= fs.f_bavail <= fs.f_blocks,
-            "invalid host filesystem counters")
-    return readiness.capacity(fs.f_bavail * fs.f_frsize, floor=FLOOR, start_guard=START_GUARD)
+    return info, counters
 
 
-def attest(server, scope):
-    """Publish once at the reserved path. Host policy supplies the expected identities."""
-    token(server)
-    require(type(scope) is Scope, "capacity scope required")
-    require(os.geteuid() == 0 and socket.gethostname() == server, "capacity host identity mismatch")
-    raw = readiness.read_capacity_report()
-    started = epoch(int(time.time()))
-    row, _ = capacity_snapshot(raw, scope, now=started, max_age=MAX_ATTESTATION_AGE)
-    measured = _host_capacity()
-    require(readiness.read_capacity_report() == raw, "capacity report changed during attestation")
-    now = epoch(int(time.time()))
-    require(started <= now <= row.event_at + MAX_ATTESTATION_AGE,
-            "capacity report outside attestation window")
-    require(socket.gethostname() == server, "capacity host identity changed")
-    facts = dict(row.facts)
-    require(all(facts[key] == measured[key] for key in ("available_bytes", "required_bytes")),
+def _mount_point(device, path):
+    """Nearest mount point for a device, from the host mount table only."""
+    expected = f"{os.major(device)}:{os.minor(device)}"
+    try:
+        with open("/proc/self/mountinfo", "r", encoding="utf-8") as stream:
+            text = stream.read(_MOUNT_RECORD + 1)
+    except (OSError, UnicodeError):
+        return "UNKNOWN"
+    if len(text) > _MOUNT_RECORD:
+        return "UNKNOWN"
+    matches = []
+    for line in text.splitlines():
+        prefix, separator, _suffix = line.partition(" - ")
+        fields = prefix.split(" ")
+        if not separator or len(fields) < 6 or any(not part for part in fields[:6]):
+            return "UNKNOWN"
+        if fields[2] != expected:
+            continue
+        point = re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), fields[4])
+        if path == point or path.startswith(point.rstrip("/") + "/"):
+            matches.append(point)
+    return max(matches, key=len) if matches else "UNKNOWN"
+
+
+def measure_filesystem(path: str = MEASURE_PATH) -> FilesystemMeasurement:
+    """Independently measure one directory's filesystem, or fail closed.
+
+    The path is opened no-follow twice so a symlink or a replacement between
+    the two snapshots is observable. This narrows, but cannot eliminate, the
+    remaining open-to-stat race; a pinned device/inode is still required.
+    """
+    if not (type(path) is str and path.startswith("/") and ".." not in Path(path).parts):
+        raise AttestationError("invalid capacity measurement path")
+    try:
+        first_info, first_counters = _snapshot(path)
+        second_info, _second_counters = _snapshot(path)
+    except OSError as exc:
+        # Linux reports ELOOP for O_NOFOLLOW, but ENOTDIR when O_DIRECTORY is
+        # combined with it; both deny a symlink measurement.
+        if exc.errno == errno.ELOOP or (
+                exc.errno == errno.ENOTDIR and os.path.islink(path)):
+            raise AttestationError("capacity measurement path is a symlink") from exc
+        raise AttestationError("capacity measurement path is unavailable") from exc
+    _closed(stat.S_ISDIR(first_info.st_mode), "capacity measurement path is not a directory")
+    _closed(_stamp(first_info) == _stamp(second_info), "capacity measurement inode race")
+    return FilesystemMeasurement(
+        path=path, device=first_info.st_dev, inode=first_info.st_ino,
+        mount=_mount_point(first_info.st_dev, path),
+        fragment_size=first_counters.f_frsize, block_size=first_counters.f_bsize,
+        available_bytes=first_counters.f_bavail * first_counters.f_frsize,
+    )
+
+
+def _require_filesystem_identity(policy, measurement):
+    _closed(type(measurement) is FilesystemMeasurement, "invalid capacity measurement")
+    if policy.expected_device is None:
+        _closed(policy.measure_path == MEASURE_PATH and measurement.mount == MEASURE_PATH,
+                "unpinned capacity measurement must be the host root filesystem")
+        return
+    _closed(measurement.device == policy.expected_device, "capacity filesystem device mismatch")
+    if policy.expected_inode is not None:
+        _closed(measurement.inode == policy.expected_inode, "capacity filesystem inode mismatch")
+    if policy.expected_mount is not None:
+        _closed(measurement.mount == policy.expected_mount, "capacity filesystem mount mismatch")
+
+
+def _read_receipt():
+    try:
+        return readiness.read_protected(RECEIPT_PATH, limit=MAX_RECEIPT_BYTES)
+    except (OSError, readiness.ReadinessError):
+        return None
+
+
+@contextlib.contextmanager
+def _receipt_lock():
+    """Serialize the protected-receipt check and write across host issuers.
+
+    The check of the installed receipt and the write that replaces it must be
+    one critical section: otherwise two issuers can both read the same older
+    state, both pass the freshness comparison and the later write can leave a
+    receipt older than the one already installed. The lock file lives in the
+    root-owned receipt directory, so only host-owned execution can create it;
+    a foreign owner, a link or a group/other-writable mode fails closed.
+    """
+    fd = os.open(RECEIPT_PATH + ".lock",
+                 os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        info = os.fstat(fd)
+        _closed(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
+                and info.st_nlink == 1 and not info.st_mode & 0o022,
+                "capacity receipt lock is not host-owned")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def verify(policy: AttestorPolicy, *, now, host=None, measurement=None,
+           report=None, receipt=None) -> Attestation:
+    """Verify host identity, filesystem identity, publisher report and receipt.
+
+    ``report``/``receipt`` default to the existing protected reads. Callers that
+    supply bytes must have read them through the same protected boundary.
+
+    The receipt keeps the canonical v2 binding: schema, host, scope, event
+    second, report digest, method, filesystem and the exact capacity counters.
+    The independent host measurement must equal the report counters exactly, so
+    no drift or slack tolerance exists. The report is re-read through the
+    protected boundary and must remain byte-identical to the report the receipt
+    and measurement were taken against.
+    """
+    _closed(type(policy) is AttestorPolicy, "invalid capacity attestor policy")
+    now = epoch(now)
+    identity = host if host is not None else host_identity()
+    _closed(type(identity) is HostIdentity and identity.hostname == policy.server,
+            "capacity host identity mismatch")
+    _closed(identity.euid == 0, "capacity attestor requires host-owned execution")
+
+    if report is None:
+        report = readiness.read_capacity_report()
+    row, report_sha256 = _object(report, REPORT_FIELDS)
+    checked = row["checked_at_epoch"]
+    _closed(type(checked) in (int, float) and math.isfinite(checked) and 0 <= checked <= now,
+            "invalid capacity report observation time")
+    event_at = int(checked)
+    _closed(type(row["ready"]) is bool and type(row["capacity_warning"]) is bool
+            and type(row["model_calls"]) is int and row["model_calls"] == 0
+            and row["cleanup_performed"] is False, "invalid capacity report flags")
+    for key in ("available_bytes", "required_bytes", "missing_bytes", "margin_bytes"):
+        _closed(_signed_counter(row[key]), "invalid capacity report counter")
+    expected_counters = readiness.capacity(
+        row["available_bytes"], floor=row["required_bytes"], start_guard=0,
+        warning_margin=268435456,
+    )
+    _closed(all(row[key] == value for key, value in expected_counters.items()
+                if key != "ready"), "capacity report counters are internally inconsistent")
+
+    receipt_sha256 = None
+    if receipt is None:
+        receipt = _read_receipt()
+    if receipt is not None:
+        _closed(type(receipt) is bytes and len(receipt) <= MAX_RECEIPT_BYTES,
+                "invalid capacity receipt size")
+        data, _ = _object(receipt, RECEIPT_FIELDS)
+        _closed(data == {
+            "schema_version": RECEIPT_SCHEMA, "method": "host-fstatvfs-exact",
+            "filesystem": MEASURE_PATH, "server": policy.server,
+            "consumer": policy.scope.consumer, "project": policy.scope.project,
+            "event_at": event_at, "source_sha256": report_sha256,
+            "available_bytes": row["available_bytes"],
+            "required_bytes": row["required_bytes"],
+        } and all(type(data[key]) is int for key in
+                 ("event_at", "available_bytes", "required_bytes")),
+            "capacity receipt identity, digest or exact counter binding mismatch")
+        _closed(0 <= now - data["event_at"] <= min(policy.max_age, MAX_ATTESTATION_AGE),
+                "capacity receipt expired")
+        receipt_sha256 = digest(data)
+
+    _closed(0 <= now - int(checked) <= min(policy.max_age, MAX_ATTESTATION_AGE),
+            "capacity report stale")
+    _closed(readiness.read_capacity_report() == report,
+            "capacity report changed during attestation")
+    current = measurement if measurement is not None else measure_filesystem(policy.measure_path)
+    _require_filesystem_identity(policy, current)
+    required_bytes = readiness.capacity(
+        current.available_bytes, floor=policy.floor, start_guard=policy.start_guard,
+    )["required_bytes"]
+    _closed(row["required_bytes"] == required_bytes,
+            "capacity report required bytes disagree with host policy")
+    _closed(current.available_bytes == row["available_bytes"],
             "capacity report disagrees with independent host measurement")
-    value = _receipt(raw, row.event_at, facts, server, scope)
-    readiness.write_owned_json(RECEIPT_PATH, value, group=0, protected_ancestry=True)
+
+    return Attestation(
+        schema_version=SCHEMA, server=policy.server, scope=policy.scope,
+        trust="HOST_OWNED" if receipt is not None else "PUBLISHER_OBSERVED",
+        available_bytes=current.available_bytes, required_bytes=required_bytes,
+        ready=current.available_bytes >= required_bytes, measured_at=now,
+        report_event_at=int(checked), device=current.device, inode=current.inode,
+        mount=current.mount, publisher_uid=PUBLISHER_UID, report_path=REPORT_PATH,
+        receipt_path=RECEIPT_PATH if receipt is not None else None,
+        report_sha256=report_sha256, receipt_sha256=receipt_sha256,
+        evidence_sha256=(report_sha256, receipt_sha256) if receipt_sha256 else (report_sha256,),
+        report_bytes=report, receipt_bytes=receipt,
+    )
+
+
+def attestation_digest(attestation: Attestation) -> str:
+    """Digest of the verified attestation, for evidence refs and replay checks."""
+    return digest(attestation.to_dict())
+
+
+def attest(server, scope, *, policy=None, now=None):
+    """Publish the v2 receipt once at the reserved host path.
+
+    Host-owned execution is required. The receipt binds the report digest and
+    the exact counters to the independent host measurement; it conveys no
+    execution authority.
+    """
+    token(server)
+    _closed(type(scope) is Scope, "capacity scope required")
+    if policy is None:
+        policy = AttestorPolicy(server, scope)
+    _closed(type(policy) is AttestorPolicy and policy.server == server
+            and policy.scope == scope, "capacity attestor policy mismatch")
+    identity = host_identity()
+    _closed(identity.hostname == server and identity.euid == 0,
+            "capacity host identity mismatch")
+    raw = readiness.read_capacity_report()
+    started = epoch(int(time.time())) if now is None else epoch(now)
+    row, report_sha256 = _object(raw, REPORT_FIELDS)
+    checked = row["checked_at_epoch"]
+    _closed(type(checked) in (int, float) and math.isfinite(checked) and 0 <= checked <= started,
+            "invalid capacity report observation time")
+    _closed(started - int(checked) <= min(policy.max_age, MAX_ATTESTATION_AGE),
+            "capacity report outside attestation window")
+    measured = measure_filesystem(policy.measure_path)
+    _require_filesystem_identity(policy, measured)
+    required_bytes = readiness.capacity(
+        measured.available_bytes, floor=policy.floor, start_guard=policy.start_guard,
+    )["required_bytes"]
+    _closed(row["required_bytes"] == required_bytes,
+            "capacity report required bytes disagree with host policy")
+    _closed(measured.available_bytes == row["available_bytes"],
+            "capacity report disagrees with independent host measurement")
+    _closed(readiness.read_capacity_report() == raw,
+            "capacity report changed during attestation")
+    with _receipt_lock():
+        previous = _read_receipt()
+        if previous is not None:
+            _closed(type(previous) is bytes and len(previous) <= MAX_RECEIPT_BYTES,
+                    "invalid capacity receipt size")
+            existing, _ = _object(previous, RECEIPT_FIELDS)
+            _closed(type(existing["event_at"]) is int
+                    and existing["event_at"] <= int(checked),
+                    "capacity receipt older than the protected receipt already installed")
+        value = {
+            "schema_version": RECEIPT_SCHEMA, "method": "host-fstatvfs-exact",
+            "filesystem": MEASURE_PATH, "server": server,
+            "consumer": scope.consumer, "project": scope.project,
+            "event_at": int(checked), "source_sha256": report_sha256,
+            "available_bytes": row["available_bytes"],
+            "required_bytes": row["required_bytes"],
+        }
+        readiness.write_owned_json(RECEIPT_PATH, value, group=0, protected_ancestry=True)
     return value
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", required=True)
     parser.add_argument("--consumer", required=True)
     parser.add_argument("--project", required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
         attest(args.server, Scope(args.consumer, args.project))
-    except (OSError, AttributeError, IncidentError, readiness.ReadinessError) as exc:
+    except (OSError, AttributeError, AttestationError, IncidentError,
+            readiness.ReadinessError) as exc:
         parser.exit(1, f"capacity attestation blocked: {exc}\n")
     return 0
 
