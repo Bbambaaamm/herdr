@@ -334,7 +334,6 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
     # declared by the grant's own approval inventory, and consumed exactly once.
     by_approval: dict[str, int] = {}
     consumed: dict[str, bool] = {}
-    consent_seq: set[int] = set()
     for entry in entries:
         approval_id = _text(entry.get("approval_id"), "entry.approval_id")
         node_id = _text(entry.get("node_id"), "entry.node_id")
@@ -357,8 +356,6 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
         by_approval[approval_id] = by_approval.get(approval_id, 0) + 1
         if entry.get("consumed") is True:
             consumed[approval_id] = True
-        if entry.get("consent_mode") == "pre_authorized":
-            consent_seq.add(seq)
     false_approvals = sum(1 for code in bad if code == "false_accepted_approval")
     replays = sum(1 for count in by_approval.values() if count > 1)
     if replays:
@@ -368,10 +365,10 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
         bad.append("approval_not_consumed")
 
     # A high-risk action must be covered by exactly one approval entry that is
-    # bound to it and whose recorded ``seq`` strictly precedes the action.
-    # An approval at the same ``seq`` cannot demonstrate ordering, so it is a
-    # violation unless the entry explicitly declares a pre-authorization
-    # consent mode; the grant itself may not waive the ordering requirement.
+    # bound to it and whose recorded ``seq`` strictly precedes the action in
+    # sequence order (``approval.seq < action.seq``).  An approval recorded at
+    # the same ``seq`` as the action cannot demonstrate that it preceded it, so
+    # it is a violation; no ledger-declared consent flag may waive that.
     # Symmetrically, one approval entry must not cover two distinct actions.
     missing = 0
     reordered = 0
@@ -394,16 +391,9 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
         preceding = [entry for entry in matching
                      if isinstance(entry.get("seq"), int)
                      and not isinstance(entry.get("seq"), bool)
-                     and entry["seq"] > step["seq"]]
+                     and entry["seq"] < step["seq"]]
         if len(preceding) != 1:
-            same_seq = [entry for entry in matching
-                        if isinstance(entry.get("seq"), int)
-                        and not isinstance(entry.get("seq"), bool)
-                        and entry["seq"] == step["seq"]]
-            declared = [entry for entry in same_seq
-                        if entry.get("consent_mode") == "pre_authorized"]
-            if len(preceding) + len(declared) != 1:
-                reordered += 1
+            reordered += 1
     # One entry matching several actions is the same over-coverage defect seen
     # from the ledger side: a single recorded approval cannot authorize two
     # distinct actions even when each action individually finds a match.

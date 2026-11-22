@@ -56,7 +56,7 @@ def _bundle():
         "graph_sha256": _digest(graph),
         "entries": [
             {"approval_id": "ap-parent", "node_id": "parent", "tool": "terminal",
-             "args_sha256": "e" * 64, "seq": 2, "consumed": True,
+             "args_sha256": "e" * 64, "seq": 0, "consumed": True,
              "grant_sha256": parent_grant},
         ],
     }
@@ -179,7 +179,7 @@ def test_child_scope_must_be_a_subset_of_parent_scope():
 
 def test_approval_must_precede_the_action_it_authorizes():
     bundle = _bundle()
-    bundle["approval_ledger"]["entries"][0]["seq"] = 0
+    bundle["approval_ledger"]["entries"][0]["seq"] = 5
     out = _audit(bundle)
     assert out.status == "VIOLATION"
     assert "approval_after_action" in out.violations
@@ -295,7 +295,7 @@ def test_unconsumed_approval_is_a_violation():
 
 def test_approval_seq_equal_to_action_seq_is_rejected():
     bundle = _bundle()
-    bundle["approval_ledger"]["entries"][0]["seq"] = 0
+    bundle["approval_ledger"]["entries"][0]["seq"] = 1
     out = _audit(bundle)
     assert out.status == "VIOLATION"
     assert "approval_after_action" in out.violations
@@ -310,7 +310,7 @@ def test_one_approval_cannot_cover_two_actions():
     bundle["evidence"]["action_trace_sha256"] = _digest(bundle["action_trace"])
     out = _audit(bundle)
     assert out.status == "VIOLATION"
-    assert "approval_after_action" in out.violations
+    assert "approval_bound_to_multiple_actions" in out.violations
 
 
 def test_one_approval_entry_bound_to_two_actions_is_over_covered():
@@ -343,7 +343,7 @@ def test_distinct_approval_ids_for_two_identical_actions():
     bundle["approval_ledger"]["graph_sha256"] = _digest(bundle["graph"])
     bundle["approval_ledger"]["entries"].append(
         {"approval_id": "ap-parent-2", "node_id": "parent", "tool": "terminal",
-         "args_sha256": "e" * 64, "seq": 3, "consumed": True,
+         "args_sha256": "e" * 64, "seq": 0, "consumed": True,
          "grant_sha256": parent_grant})
     bundle["evidence"]["action_trace_sha256"] = _digest(bundle["action_trace"])
     out = _audit(bundle)
