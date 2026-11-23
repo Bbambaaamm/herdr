@@ -62,12 +62,12 @@ def test_approved_bounded_paper_only_template_passes(tmp_path):
     ("outside", "quantlab_workspace_mismatch"),
     ("extra_permission", "quantlab_permissions_exceed_approved_scope"),
     ("paid", "quantlab_paid_execution_forbidden"),
-    ("provider", "quantlab_unapproved_provider_or_executor"),
+    ("provider", "malformed_quantlab_grant"),
     ("process", "quantlab_process_execution_forbidden"),
-    ("file_root", "quantlab_file_tool_root_excessive"),
+    ("file_root", "malformed_quantlab_grant"),
     ("result_root", "quantlab_result_root_excessive"),
     ("sandbox", "quantlab_unsandboxed_tool_forbidden"),
-    ("extra_tool", "quantlab_tool_scope_excessive"),
+    ("extra_tool", "malformed_quantlab_grant"),
     ("schema_bool", "unsupported_host_policy_schema"),
 ])
 def test_invalid_templates_denied_before_any_execution(tmp_path, fault, reason):
@@ -91,11 +91,9 @@ def test_invalid_templates_denied_before_any_execution(tmp_path, fault, reason):
             grant = replace(grant, scope=replace(grant.scope, permissions=("workspace-write", "external")))
         elif fault == "paid":
             grant = replace(grant, scope=replace(grant.scope, max_cost_microusd=100))
-        elif fault == "provider":
-            grant = replace(grant, scope=replace(grant.scope, providers=("nous", "other")))
         elif fault == "process":
             grant = replace(grant, process=replace(grant.process, enabled=True))
-        elif fault in ("file_root", "result_root", "sandbox"):
+        elif fault in ("result_root", "sandbox"):
             target = "read_file" if fault != "result_root" else "herdr_submit_result"
             rules = tuple(
                 replace(rule, allowed_roots=(str(tmp_path),))
@@ -105,9 +103,15 @@ def test_invalid_templates_denied_before_any_execution(tmp_path, fault, reason):
                 for rule in grant.tool_rules
             )
             grant = replace(grant, tool_rules=rules)
-        elif fault == "extra_tool":
-            grant = replace(grant, scope=replace(grant.scope, tools=grant.scope.tools + ("terminal",)))
         document["templates"][CONSUMER] = grant.to_json()
+        if fault == "provider":
+            document["templates"][CONSUMER]["scope"]["providers"].append("other")
+        elif fault == "file_root":
+            for rule in document["templates"][CONSUMER]["tool_rules"]:
+                if rule["tool"] == "read_file":
+                    rule["allowed_roots"] = [str(tmp_path)]
+        elif fault == "extra_tool":
+            document["templates"][CONSUMER]["scope"]["tools"].append("terminal")
     with pytest.raises(QuantLabPolicyDenied, match=reason):
         validate(document, workspace, results)
 
