@@ -64,7 +64,8 @@ def _bundle():
         "schema_version": audit.SCHEMA_EVIDENCE,
         "action_trace_sha256": _digest(action_trace),
         "approval_ledger_sha256": _digest(approval_ledger),
-        "reviewer": {"actor_id": "quantlab-codex", "independent": True},
+        "reviewer": {"actor_id": "quantlab-codex", "independent": True,
+                     "result": "accepted"},
         "artifact_result_sha256": "f" * 64,
     }
     return {
@@ -467,3 +468,185 @@ def test_role_graph_cycle_is_rejected():
     out = _audit(bundle)
     assert out.status == "VIOLATION"
     assert "graph_role_cycle" in out.violations
+
+
+@pytest.mark.parametrize("artifact,code", [
+    ("graph", "graph_node_identity_invalid"),
+    ("policy", "policy_grant_invalid"),
+])
+def test_malformed_structure_returns_specific_violation(artifact, code):
+    bundle = _bundle()
+    if artifact == "graph":
+        bundle["graph"]["nodes"].append({"id": "parent"})
+    else:
+        bundle["policy"]["grants"]["a" * 64] = "not-an-object"
+    bundle["graph"]["policy_sha256"] = _digest(bundle["policy"])
+    bundle["action_trace"]["graph_sha256"] = _digest(bundle["graph"])
+    bundle["approval_ledger"]["graph_sha256"] = _digest(bundle["graph"])
+    _rebind_evidence(bundle)
+    out = _audit(bundle)
+    assert out.status == "VIOLATION"
+    assert code in out.violations
+
+
+@pytest.mark.parametrize("artifact", audit.ARTIFACTS)
+@pytest.mark.parametrize("schema", [None, "foreign-schema"])
+def test_schema_version_is_required_and_supported(artifact, schema):
+    bundle = _bundle()
+    if schema is None:
+        del bundle[artifact]["schema_version"]
+    else:
+        bundle[artifact]["schema_version"] = schema
+    bundle["graph"]["policy_sha256"] = _digest(bundle["policy"])
+    bundle["action_trace"]["graph_sha256"] = _digest(bundle["graph"])
+    bundle["approval_ledger"]["graph_sha256"] = _digest(bundle["graph"])
+    _rebind_evidence(bundle)
+    out = _audit(bundle)
+    assert out.status == "UNKNOWN"
+    assert f"{artifact}_schema_unsupported" in out.unknowns
+
+
+@pytest.mark.parametrize("artifact", ["graph", "policy"])
+@pytest.mark.parametrize("epoch", [None, -1, True, "2"])
+def test_epoch_must_be_valid(artifact, epoch):
+    bundle = _bundle()
+    if epoch is None:
+        del bundle[artifact]["epoch"]
+    else:
+        bundle[artifact]["epoch"] = epoch
+    bundle["graph"]["policy_sha256"] = _digest(bundle["policy"])
+    bundle["action_trace"]["graph_sha256"] = _digest(bundle["graph"])
+    bundle["approval_ledger"]["graph_sha256"] = _digest(bundle["graph"])
+    _rebind_evidence(bundle)
+    out = _audit(bundle)
+    assert out.status == "UNKNOWN"
+    assert f"{artifact}_epoch_invalid" in out.unknowns
+
+
+def test_graph_policy_epoch_mismatch_is_a_violation():
+    bundle = _bundle()
+    bundle["policy"]["epoch"] = 2
+    bundle["graph"]["policy_sha256"] = _digest(bundle["policy"])
+    bundle["action_trace"]["graph_sha256"] = _digest(bundle["graph"])
+    bundle["approval_ledger"]["graph_sha256"] = _digest(bundle["graph"])
+    _rebind_evidence(bundle)
+    out = _audit(bundle)
+    assert out.status == "VIOLATION"
+    assert "graph_policy_epoch_mismatch" in out.violations
+
+
+@pytest.mark.parametrize("value,code", [
+    (None, "node_tools_missing"),
+    ("terminal", "node_tools_invalid"),
+    ([], "action_step_tool_not_permitted"),
+])
+def test_step_tool_must_be_in_node_tools(value, code):
+    bundle = _bundle()
+    if value is None:
+        del bundle["graph"]["nodes"][0]["tools"]
+    else:
+        bundle["graph"]["nodes"][0]["tools"] = value
+    bundle["action_trace"]["graph_sha256"] = _digest(bundle["graph"])
+    bundle["approval_ledger"]["graph_sha256"] = _digest(bundle["graph"])
+    _rebind_evidence(bundle)
+    out = _audit(bundle)
+    assert out.status == ("UNKNOWN" if value is None or value == "terminal" else "VIOLATION")
+    assert code in (out.unknowns + out.violations)
+
+
+def test_approval_inventory_must_bind_same_tool():
+    bundle = _bundle()
+    bundle["policy"]["grants"]["a" * 64]["approvals"][0]["tool"] = "shell"
+    bundle["graph"]["policy_sha256"] = _digest(bundle["policy"])
+    bundle["action_trace"]["graph_sha256"] = _digest(bundle["graph"])
+    bundle["approval_ledger"]["graph_sha256"] = _digest(bundle["graph"])
+    _rebind_evidence(bundle)
+    out = _audit(bundle)
+    assert out.status == "VIOLATION"
+    assert "approval_inventory_tool_mismatch" in out.violations
+
+
+def test_dot_alias_write_path_is_invalid():
+    bundle = _bundle()
+    bundle["action_trace"]["steps"][0]["write_paths"] = ["/ws/./out"]
+    _rebind_evidence(bundle)
+    out = _audit(bundle)
+    assert out.status == "VIOLATION"
+    assert "action_step_write_path_invalid" in out.violations
+
+
+def test_narrower_child_write_root_is_allowed():
+    bundle = _bundle()
+    bundle["policy"]["grants"]["b" * 64]["write_roots"] = ["/ws/sub"]
+    bundle["graph"]["policy_sha256"] = _digest(bundle["policy"])
+    bundle["action_trace"]["graph_sha256"] = _digest(bundle["graph"])
+    bundle["approval_ledger"]["graph_sha256"] = _digest(bundle["graph"])
+    _rebind_evidence(bundle)
+    out = _audit(bundle)
+    assert out.status == "COVERED"
+
+
+def test_child_root_is_within_filesystem_root():
+    bundle = _bundle()
+    bundle["policy"]["grants"]["a" * 64]["write_roots"] = ["/"]
+    bundle["graph"]["policy_sha256"] = _digest(bundle["policy"])
+    bundle["action_trace"]["graph_sha256"] = _digest(bundle["graph"])
+    bundle["approval_ledger"]["graph_sha256"] = _digest(bundle["graph"])
+    _rebind_evidence(bundle)
+    out = _audit(bundle)
+    assert out.status == "COVERED"
+
+
+@pytest.mark.parametrize("value,status,code", [
+    (None, "UNKNOWN", "review_result_missing"),
+    ("pending", "UNKNOWN", "review_result_invalid"),
+    ("rejected", "VIOLATION", "review_result_rejected"),
+])
+def test_reviewer_result_is_typed(value, status, code):
+    bundle = _bundle()
+    if value is None:
+        del bundle["evidence"]["reviewer"]["result"]
+    else:
+        bundle["evidence"]["reviewer"]["result"] = value
+    out = _audit(bundle)
+    assert out.status == status
+    assert code in (out.unknowns + out.violations)
+
+
+@pytest.mark.parametrize("artifact", ["action_trace", "approval_ledger"])
+@pytest.mark.parametrize("seq", [-1, True, "0"])
+def test_sequences_reject_negative_bool_and_noninteger(artifact, seq):
+    bundle = _bundle()
+    row = bundle[artifact]["steps" if artifact == "action_trace" else "entries"][0]
+    row["seq"] = seq
+    _rebind_evidence(bundle)
+    out = _audit(bundle)
+    code = "action_step_seq_invalid" if artifact == "action_trace" else "approval_entry_malformed"
+    assert out.status == "VIOLATION"
+    assert code in out.violations
+
+
+@pytest.mark.parametrize("artifact,field,code", [
+    ("policy", "identity_sha256", "grant_identity_sha256_invalid"),
+    ("policy", "credential_refs", "grant_credential_refs_invalid"),
+    ("policy", "write_roots", "grant_write_roots_invalid"),
+    ("policy", "risk_classes", "grant_risk_classes_invalid"),
+    ("policy", "approvals", "grant_approvals_invalid"),
+    ("graph", "role", "node_role_invalid"),
+    ("graph", "permissions", "node_permissions_invalid"),
+    ("action_trace", "tool", "action_step_tool_invalid"),
+    ("action_trace", "args_sha256", "action_step_args_sha256_invalid"),
+])
+def test_missing_required_field_is_never_covered(artifact, field, code):
+    bundle = _bundle()
+    row = (bundle["policy"]["grants"]["a" * 64] if artifact == "policy"
+           else bundle["graph"]["nodes"][0] if artifact == "graph"
+           else bundle["action_trace"]["steps"][0])
+    del row[field]
+    bundle["graph"]["policy_sha256"] = _digest(bundle["policy"])
+    bundle["action_trace"]["graph_sha256"] = _digest(bundle["graph"])
+    bundle["approval_ledger"]["graph_sha256"] = _digest(bundle["graph"])
+    _rebind_evidence(bundle)
+    out = _audit(bundle)
+    assert out.status != "COVERED"
+    assert code in (out.unknowns + out.violations)

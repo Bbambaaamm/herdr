@@ -25,7 +25,6 @@ are optional keyword arguments; a caller that supplies digests only receives
 """
 from __future__ import annotations
 
-import posixpath
 import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping
@@ -100,6 +99,14 @@ def _sha(value: Any) -> bool:
     return isinstance(value, str) and bool(_SHA256.match(value))
 
 
+def _strings(value: Any) -> bool:
+    return isinstance(value, list) and all(_text(item, "item") is not None for item in value)
+
+
+def _epoch(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 def _normalize_abs_path(path: str) -> str | None:
     """Canonical absolute POSIX path, or ``None`` for ambiguous/escaping input.
 
@@ -110,10 +117,12 @@ def _normalize_abs_path(path: str) -> str | None:
     """
     if not path.startswith("/") or "\x00" in path:
         return None
+    if path == "/":
+        return path
     if "//" in path or path.endswith("/") and path != "/":
         return None
     parts = path.split("/")[1:]
-    if ".." in parts or "" in parts:
+    if "." in parts or ".." in parts or "" in parts:
         return None
     return "/" + "/".join(parts)
 
@@ -138,7 +147,7 @@ def _path_within(path: Any, roots: Any) -> bool:
         base = _normalize_abs_path(root)
         if base is None:
             continue
-        if target == base or target.startswith(base + "/"):
+        if target == base or base == "/" or target.startswith(base + "/"):
             return True
     return False
 
@@ -200,6 +209,20 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
     bad: list[str] = []
     unknowns: list[str] = []
 
+    schemas = {
+        "graph": (graph, SCHEMA_GRAPH),
+        "policy": (policy, SCHEMA_POLICY),
+        "action_trace": (action_trace, SCHEMA_ACTION_TRACE),
+        "approval_ledger": (approval_ledger, SCHEMA_APPROVAL_LEDGER),
+        "evidence": (evidence, SCHEMA_EVIDENCE),
+    }
+    for name, (artifact, expected) in schemas.items():
+        if artifact.get("schema_version") != expected:
+            unknowns.append(f"{name}_schema_unsupported")
+    for name, artifact in (("graph", graph), ("policy", policy)):
+        if not _epoch(artifact.get("epoch")):
+            unknowns.append(f"{name}_epoch_invalid")
+
     nodes_raw = graph.get("nodes")
     grants_raw = policy.get("grants")
     steps_raw = action_trace.get("steps")
@@ -222,18 +245,45 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
         if node_id is None or node_id in nodes:
             bad.append("graph_node_identity_invalid")
             continue
+        if row.get("parent_id") is not None and _text(row.get("parent_id"), "node.parent_id") is None:
+            bad.append("graph_parent_invalid")
+        if _text(row.get("role"), "node.role") is None:
+            unknowns.append("node_role_invalid")
+        if "tools" not in row:
+            unknowns.append("node_tools_missing")
+        elif not _strings(row["tools"]):
+            unknowns.append("node_tools_invalid")
+        if not _strings(row.get("permissions")):
+            unknowns.append("node_permissions_invalid")
         nodes[node_id] = row
     if bad:
-        return (tuple(bad), {})
+        return (tuple(bad), tuple(unknowns), {})
 
     grants: dict[str, dict[str, Any]] = {}
     for key, row in grants_raw.items():
         if not isinstance(key, str) or not _sha(key) or not isinstance(row, dict):
             bad.append("policy_grant_invalid")
             continue
+        if not _sha(row.get("identity_sha256")):
+            unknowns.append("grant_identity_sha256_invalid")
+        if not _strings(row.get("credential_refs")):
+            unknowns.append("grant_credential_refs_invalid")
+        roots = row.get("write_roots")
+        if not _strings(roots) or any(_normalize_abs_path(root) is None for root in roots):
+            unknowns.append("grant_write_roots_invalid")
+        if not _strings(row.get("risk_classes")):
+            unknowns.append("grant_risk_classes_invalid")
+        approvals = row.get("approvals")
+        if not isinstance(approvals, list) or any(
+            not isinstance(item, dict)
+            or _text(item.get("approval_id"), "approval.id") is None
+            or _text(item.get("tool"), "approval.tool") is None
+            for item in approvals
+        ):
+            unknowns.append("grant_approvals_invalid")
         grants[key] = row
     if bad:
-        return (tuple(bad), {})
+        return (tuple(bad), tuple(unknowns), {})
 
     for node_id, row in nodes.items():
         parent = row.get("parent_id")
@@ -243,7 +293,11 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
         if not _sha(grant) or grant not in grants:
             bad.append("node_grant_unbound")
     if bad:
-        return (tuple(bad), (), {})
+        return (tuple(bad), tuple(unknowns), {})
+
+    # Later scope checks require all of these fields to have a known shape.
+    if unknowns:
+        return ((), tuple(unknowns), {})
 
     if _has_cycle(nodes):
         bad.append("graph_role_cycle")
@@ -258,11 +312,25 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
         if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
             bad.append("action_step_seq_invalid")
             continue
+        if _text(row.get("tool"), "step.tool") is None:
+            unknowns.append("action_step_tool_invalid")
+        if not _sha(row.get("args_sha256")):
+            unknowns.append("action_step_args_sha256_invalid")
         steps.append(row)
     entries: list[dict[str, Any]] = []
     for row in entries_raw:
         if not isinstance(row, dict):
             bad.append("approval_entry_invalid")
+            continue
+        if (any(_text(row.get(name), f"entry.{name}") is None
+                for name in ("approval_id", "node_id", "tool"))
+                or not _sha(row.get("args_sha256"))
+                or not _sha(row.get("grant_sha256"))
+                or isinstance(row.get("seq"), bool)
+                or not isinstance(row.get("seq"), int)
+                or row["seq"] < 0
+                or not isinstance(row.get("consumed"), bool)):
+            bad.append("approval_entry_malformed")
             continue
         entries.append(row)
 
@@ -286,15 +354,22 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
         bad.append("evidence_reviewer_invalid")
     elif reviewer.get("independent") is not True:
         bad.append("evidence_reviewer_not_independent")
+    if isinstance(reviewer, dict):
+        if "result" not in reviewer:
+            unknowns.append("review_result_missing")
+        elif reviewer["result"] == "rejected":
+            bad.append("review_result_rejected")
+        elif reviewer["result"] != "accepted":
+            unknowns.append("review_result_invalid")
     if not _sha(evidence.get("artifact_result_sha256")):
         bad.append("evidence_review_result_invalid")
 
     graph_epoch = graph.get("epoch")
     policy_epoch = policy.get("epoch")
-    if (isinstance(graph_epoch, int) and not isinstance(graph_epoch, bool)
-            and isinstance(policy_epoch, int) and not isinstance(policy_epoch, bool)
-            and policy_epoch > graph_epoch):
-        bad.append("stale_permission_epoch")
+    if graph_epoch != policy_epoch:
+        bad.append("graph_policy_epoch_mismatch")
+        if policy_epoch > graph_epoch:
+            bad.append("stale_permission_epoch")
 
     # Parent-child scope: a child may never hold credentials or write roots its
     # parent does not hold (grant scope is a mathematical subset).
@@ -310,7 +385,7 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
         parent_roots = set(parent_grant.get("write_roots") or ())
         if not child_creds <= parent_creds:
             bad.append("child_credential_scope_exceeds_parent")
-        if not child_roots <= parent_roots:
+        if any(not _path_within(root, parent_roots) for root in child_roots):
             bad.append("child_write_scope_exceeds_parent")
 
     # Credential confinement: one credential must not be usable from two
@@ -332,7 +407,11 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
         if step["node_id"] not in nodes:
             bad.append("action_step_unknown_node")
     if bad:
-        return (tuple(bad), (), {})
+        return (tuple(bad), tuple(unknowns), {})
+
+    for step in steps:
+        if step.get("tool") not in nodes[step["node_id"]]["tools"]:
+            bad.append("action_step_tool_not_permitted")
 
     # Individually permitted writes can still compose into a wider blast radius:
     # the union of a subtree's recorded writes must stay inside that subtree
@@ -348,6 +427,8 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
         if not isinstance(paths, list) or any(not isinstance(p, str) or not p for p in paths):
             bad.append("action_step_write_paths_invalid")
             continue
+        if any(_normalize_abs_path(path) is None for path in paths):
+            bad.append("action_step_write_path_invalid")
         writes_by_node.setdefault(step["node_id"], set()).update(paths)
     for node_id in nodes:
         allowed = set(grants[nodes[node_id]["grant_sha256"]].get("write_roots") or ())
@@ -384,17 +465,20 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
         grant = entry.get("grant_sha256")
         seq = entry.get("seq")
         if (approval_id is None or node_id is None or tool is None or not _sha(args)
-                or not _sha(grant) or isinstance(seq, bool) or not isinstance(seq, int)):
+                or not _sha(grant) or isinstance(seq, bool) or not isinstance(seq, int)
+                or seq < 0 or not isinstance(entry.get("consumed"), bool)):
             bad.append("approval_entry_malformed")
             continue
         if node_id not in nodes or grant != nodes[node_id]["grant_sha256"]:
             bad.append("approval_grant_mismatch")
         grant_row = grants.get(grant)
         recorded = grant_row.get("approvals") if isinstance(grant_row, dict) else None
-        known = ({item.get("approval_id") for item in recorded
-                  if isinstance(item, dict)} if isinstance(recorded, list) else set())
+        known = ({item["approval_id"]: item["tool"] for item in recorded}
+                 if isinstance(recorded, list) else {})
         if approval_id not in known:
             bad.append("false_accepted_approval")
+        elif known[approval_id] != tool:
+            bad.append("approval_inventory_tool_mismatch")
         by_approval[approval_id] = by_approval.get(approval_id, 0) + 1
         if entry.get("consumed") is True:
             consumed[approval_id] = True
