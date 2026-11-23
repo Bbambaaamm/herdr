@@ -35,7 +35,8 @@ def policy_fixture(tmp_path):
         workspace_root=str(workspace),
         identity=replace(base.identity, consumer=CONSUMER),
         tool_rules=rules,
-        scope=replace(base.scope, tools=base.scope.tools + ("herdr_delegate_child",)),
+        scope=replace(base.scope, tools=base.scope.tools + ("herdr_delegate_child",),
+                      executors=("hermes:0.21.5:sha256:" + "a" * 64,)),
         issued_at=(NOW - timedelta(minutes=5)).isoformat(),
         expires_at=(NOW + timedelta(hours=12)).isoformat(),
     )
@@ -186,3 +187,12 @@ def test_delta_blocks_unreviewed_grant_or_host_changes(tmp_path, change, reason)
         proposed["templates"]["github:Bbambaaamm/heating"] = {"retained": False}
     with pytest.raises(QuantLabPolicyDenied, match=reason):
         validate_policy_delta(current, proposed, at=NOW, workspace=workspace, results=results)
+
+
+@pytest.mark.parametrize("executor", ["hermes", "hermes:0.21.5:sha256:bad",
+    "hermes:0.21.5:sha256:" + "g"*64, "codex:0.21.5:sha256:" + "a"*64])
+def test_unpinned_or_non_hermes_executor_denied(tmp_path, executor):
+    document, workspace, results, grant = policy_fixture(tmp_path)
+    document["templates"][CONSUMER]["scope"]["executors"] = [executor]
+    with pytest.raises(QuantLabPolicyDenied, match="quantlab_unapproved_provider_or_executor"):
+        validate(document, workspace, results)

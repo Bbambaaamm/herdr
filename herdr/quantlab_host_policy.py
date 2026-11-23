@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+import re
 from typing import Any
 
 from herdr.security import SecurityGrant, SecurityError, RiskClass
@@ -16,6 +17,7 @@ CONSUMER = "github:Bbambaaamm/Autonomous-Quant-Lab"
 WORKSPACE = Path("/home/agentops/workspaces/quantlab")
 RESULTS = Path("/home/agentops/.local/state/agent-stack/tasks/results")
 MAX_GRANT_HOURS = 168
+PINNED_EXECUTOR = re.compile(r"^hermes:[0-9]+\.[0-9]+\.[0-9]+:sha256:[0-9a-f]{64}$")
 TOOLS = frozenset({
     "read_file", "search_files", "patch", "write_file",
     "herdr_delegate_child", "herdr_verify_work", "herdr_submit_result",
@@ -72,8 +74,9 @@ def validate_quantlab_template(
             "quantlab_permissions_exceed_approved_scope")
     require(set(grant.scope.tools) <= TOOLS, "quantlab_tool_scope_excessive")
     require(set(grant.scope.tools) == TOOLS, "quantlab_required_tools_missing")
-    require(set(grant.scope.providers) <= {"nous"}
-            and set(grant.scope.executors) <= {"hermes"},
+    require(set(grant.scope.providers) == {"nous"}
+            and len(grant.scope.executors) == 1
+            and PINNED_EXECUTOR.fullmatch(grant.scope.executors[0]) is not None,
             "quantlab_unapproved_provider_or_executor")
     require(grant.scope.max_cost_microusd == 0, "quantlab_paid_execution_forbidden")
     require(not grant.process.enabled, "quantlab_process_execution_forbidden")
