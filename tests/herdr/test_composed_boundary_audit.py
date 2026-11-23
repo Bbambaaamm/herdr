@@ -19,7 +19,7 @@ def _bundle():
             "identity_sha256": "c" * 64,
             "credential_refs": ["cred:workspace"],
             "write_roots": ["/ws"],
-            "risk_classes": ["EXTERNAL_SIDE_EFFECT"],
+            "risk_classes": ["external_side_effect"],
             "approvals": [{"approval_id": "ap-parent", "tool": "terminal"}],
         },
         child_grant: {
@@ -292,10 +292,14 @@ def test_reordered_cross_artifact_reference_is_detected():
 
 def test_incomplete_structure_is_unknown_not_safe():
     bundle = _bundle()
-    del bundle["graph"]["nodes"]
+    del bundle["policy"]["grants"]["a" * 64]["identity_sha256"]
+    bundle["graph"]["policy_sha256"] = _digest(bundle["policy"])
+    bundle["action_trace"]["graph_sha256"] = _digest(bundle["graph"])
+    bundle["approval_ledger"]["graph_sha256"] = _digest(bundle["graph"])
+    _rebind_evidence(bundle)
     out = _audit(bundle)
-    assert out.status in ("UNKNOWN", "VIOLATION")
-    assert out.status != "COVERED"
+    assert out.status == "UNKNOWN"
+    assert "grant_identity_sha256_invalid" in out.unknowns
 
 
 def test_path_traversal_cannot_escape_a_granted_root():
@@ -735,3 +739,72 @@ def test_covered_result_binds_all_five_declared_digests():
     assert out.status == "COVERED"
     assert out.digests == _digests(bundle)
     assert out.to_json()["digests"] == _digests(bundle)
+
+
+def test_grant_risk_classes_restrict_action_even_with_approval():
+    bundle = _bundle()
+    bundle["policy"]["grants"]["a" * 64]["risk_classes"] = ["read"]
+    bundle["graph"]["policy_sha256"] = _digest(bundle["policy"])
+    bundle["action_trace"]["graph_sha256"] = _digest(bundle["graph"])
+    bundle["approval_ledger"]["graph_sha256"] = _digest(bundle["graph"])
+    _rebind_evidence(bundle)
+    out = _audit(bundle)
+    assert out.status == "VIOLATION"
+    assert "action_step_risk_class_not_permitted" in out.violations
+    assert "high_risk_action_without_approval" not in out.violations
+
+
+@pytest.mark.parametrize("risk", ["EXTERNAL_SIDE_EFFECT", "foreign_risk"])
+def test_grant_risk_classes_require_canonical_names(risk):
+    bundle = _bundle()
+    bundle["policy"]["grants"]["a" * 64]["risk_classes"] = [risk]
+    bundle["graph"]["policy_sha256"] = _digest(bundle["policy"])
+    bundle["action_trace"]["graph_sha256"] = _digest(bundle["graph"])
+    bundle["approval_ledger"]["graph_sha256"] = _digest(bundle["graph"])
+    _rebind_evidence(bundle)
+    out = _audit(bundle)
+    assert out.status == "VIOLATION"
+    assert "grant_risk_class_invalid" in out.violations
+
+
+def test_empty_grant_risk_classes_are_unrestricted():
+    bundle = _bundle()
+    bundle["policy"]["grants"]["a" * 64]["risk_classes"] = []
+    bundle["graph"]["policy_sha256"] = _digest(bundle["policy"])
+    bundle["action_trace"]["graph_sha256"] = _digest(bundle["graph"])
+    bundle["approval_ledger"]["graph_sha256"] = _digest(bundle["graph"])
+    _rebind_evidence(bundle)
+    out = _audit(bundle)
+    assert out.status == "COVERED"
+
+
+@pytest.mark.parametrize("across_grants", [False, True])
+def test_approval_inventory_rejects_duplicate_ids(across_grants):
+    bundle = _bundle()
+    duplicate = {"approval_id": "ap-parent", "tool": "write_file"}
+    grant = "b" * 64 if across_grants else "a" * 64
+    bundle["policy"]["grants"][grant]["approvals"].append(duplicate)
+    bundle["graph"]["policy_sha256"] = _digest(bundle["policy"])
+    bundle["action_trace"]["graph_sha256"] = _digest(bundle["graph"])
+    bundle["approval_ledger"]["graph_sha256"] = _digest(bundle["graph"])
+    _rebind_evidence(bundle)
+    out = _audit(bundle)
+    assert out.status == "VIOLATION"
+    assert "approval_inventory_duplicate_approval_id" in out.violations
+
+
+def test_unknown_and_violation_results_bind_declared_digests():
+    bundle = _bundle()
+    digests = _digests(bundle)
+    unknown = audit.audit_composed_boundaries(
+        digests["graph"], digests["policy"], digests["action_trace"],
+        digests["approval_ledger"], digests["evidence"])
+    assert unknown.status == "UNKNOWN"
+    assert unknown.digests == digests
+
+    bundle["graph"]["nodes"][0]["role"] = "changed"
+    violation = audit.audit_composed_boundaries(
+        digests["graph"], digests["policy"], digests["action_trace"],
+        digests["approval_ledger"], digests["evidence"], **bundle)
+    assert violation.status == "VIOLATION"
+    assert violation.digests == digests

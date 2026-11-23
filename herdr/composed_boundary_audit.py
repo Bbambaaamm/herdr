@@ -15,6 +15,9 @@ Design bounds (issue #76 proposal comment 2026-11-22T07:55:27Z):
 * digests are recomputed over canonical JSON, so a mutated artifact cannot be
   presented under an older digest.
 
+In each grant, a nonempty ``risk_classes`` list is the exact set of permitted
+lowercase ``RiskClass`` values. An empty list leaves risk classes unrestricted.
+
 Interface (unchanged from the proposal):
 ``audit_composed_boundaries(graph_sha256, policy_sha256, action_trace_sha256,
 approval_ledger_sha256, evidence_sha256) -> ComposedSafetyCoverageV1``.
@@ -262,6 +265,7 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
         return (tuple(bad), tuple(unknowns), {})
 
     grants: dict[str, dict[str, Any]] = {}
+    approval_ids: set[str] = set()
     for key, row in grants_raw.items():
         if not isinstance(key, str) or not _sha(key) or not isinstance(row, dict):
             bad.append("policy_grant_invalid")
@@ -275,6 +279,8 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
             unknowns.append("grant_write_roots_invalid")
         if not _strings(row.get("risk_classes")):
             unknowns.append("grant_risk_classes_invalid")
+        elif any(risk not in APPROVAL_RISK_CLASSES for risk in row["risk_classes"]):
+            bad.append("grant_risk_class_invalid")
         approvals = row.get("approvals")
         if not isinstance(approvals, list) or any(
             not isinstance(item, dict)
@@ -283,6 +289,12 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
             for item in approvals
         ):
             unknowns.append("grant_approvals_invalid")
+        else:
+            for item in approvals:
+                approval_id = item["approval_id"]
+                if approval_id in approval_ids:
+                    bad.append("approval_inventory_duplicate_approval_id")
+                approval_ids.add(approval_id)
         grants[key] = row
     if bad:
         return (tuple(bad), tuple(unknowns), {})
@@ -420,6 +432,9 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
     for step in steps:
         if step.get("tool") not in nodes[step["node_id"]]["tools"]:
             bad.append("action_step_tool_not_permitted")
+        allowed_risks = grants[nodes[step["node_id"]]["grant_sha256"]]["risk_classes"]
+        if allowed_risks and step["risk_class"] not in allowed_risks:
+            bad.append("action_step_risk_class_not_permitted")
 
     # Individually permitted writes can still compose into a wider blast radius:
     # the union of a subtree's recorded writes must stay inside that subtree
@@ -594,7 +609,7 @@ def audit_composed_boundaries(graph_sha256, policy_sha256, action_trace_sha256,
         if supplied[name] is None:
             unknowns.append(f"{name}_artifact_missing")
     if unknowns:
-        return _result("UNKNOWN", unknowns=unknowns)
+        return _result("UNKNOWN", unknowns=unknowns, digests=dict(declared))
 
     violations: list[str] = []
     for name in ARTIFACTS:
@@ -610,14 +625,16 @@ def audit_composed_boundaries(graph_sha256, policy_sha256, action_trace_sha256,
         if observed != declared[name]:
             violations.append(f"{name}_digest_mismatch")
     if violations:
-        return _result("VIOLATION", violations=violations)
+        return _result("VIOLATION", violations=violations,
+                       digests=dict(declared))
 
     try:
         found, unknowns, metrics = _evaluate(dict(graph), dict(policy), dict(action_trace),
                                    dict(approval_ledger), dict(evidence), declared)
     except (KeyError, TypeError, ValueError, AttributeError, SecurityError):
         # Incomplete evidence must never degrade into a pass.
-        return _result("UNKNOWN", unknowns=("artifact_structure_incomplete",))
+        return _result("UNKNOWN", unknowns=("artifact_structure_incomplete",),
+                       digests=dict(declared))
     if found:
         status = "VIOLATION"
     elif unknowns:
