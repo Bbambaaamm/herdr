@@ -104,3 +104,21 @@ def validate_quantlab_template(
         elif name == "herdr_delegate_child":
             require(rule.risk == RiskClass.DELEGATION, "quantlab_delegation_risk_mismatch")
     return grant
+
+
+def main() -> int:
+    """Read-only preflight over the trusted, fixed, root-owned policy path."""
+    from herdr.host_configuration import HOST_POLICY_CONFIG, _read_configuration
+
+    try:
+        policy = _read_configuration(HOST_POLICY_CONFIG)
+        validated = validate_quantlab_template(policy)
+    except (SecurityError, OSError, ValueError, TypeError, KeyError):
+        print("QUANTLAB_HOST_POLICY_BLOCKED")
+        return 1
+    print("QUANTLAB_HOST_POLICY_VALID " + validated.hash)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

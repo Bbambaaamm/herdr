@@ -122,3 +122,20 @@ def test_no_authority_created_by_validating_other_consumers(tmp_path):
     with pytest.raises(QuantLabPolicyDenied, match="quantlab_template_missing"):
         validate(document, workspace, results)
     assert not (tmp_path / "policy-activation").exists()
+
+
+def test_trusted_cli_refuses_missing_template(monkeypatch, tmp_path, capsys):
+    from herdr import host_configuration, quantlab_host_policy
+    document, _, _, _ = policy_fixture(tmp_path)
+    document["templates"] = {}
+    monkeypatch.setattr(host_configuration, "_read_configuration", lambda path: document)
+    assert quantlab_host_policy.main() == 1
+    assert capsys.readouterr().out.strip() == "QUANTLAB_HOST_POLICY_BLOCKED"
+
+
+def test_trusted_cli_refuses_untrusted_policy_read(monkeypatch, capsys):
+    from herdr import host_configuration, quantlab_host_policy
+    monkeypatch.setattr(host_configuration, "_read_configuration",
+                        lambda path: (_ for _ in ()).throw(PermissionError("unsafe")))
+    assert quantlab_host_policy.main() == 1
+    assert capsys.readouterr().out.strip() == "QUANTLAB_HOST_POLICY_BLOCKED"
