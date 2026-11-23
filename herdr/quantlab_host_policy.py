@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 from typing import Any
 
-from herdr.security import SecurityGrant, SecurityError, RiskClass
+from herdr.security import SecurityGrant, SecurityError, RiskClass, NetworkAccess
 
 CONSUMER = "github:Bbambaaamm/Autonomous-Quant-Lab"
 WORKSPACE = Path("/home/agentops/workspaces/quantlab")
@@ -79,7 +79,15 @@ def validate_quantlab_template(
             and PINNED_EXECUTOR.fullmatch(grant.scope.executors[0]) is not None,
             "quantlab_unapproved_provider_or_executor")
     require(grant.scope.max_cost_microusd == 0, "quantlab_paid_execution_forbidden")
-    require(not grant.process.enabled, "quantlab_process_execution_forbidden")
+    require(not grant.process.enabled and not grant.process.tools
+            and grant.process.max_network == NetworkAccess.NONE
+            and not grant.process.writable_roots
+            and grant.process.require_credentials_isolated,
+            "quantlab_process_execution_forbidden")
+    require(not grant.runtime_assurance.sandbox_verified
+            and grant.runtime_assurance.network_access == NetworkAccess.NONE
+            and not grant.runtime_assurance.writable_roots,
+            "quantlab_untrusted_runtime_assurance")
     require(all(str(ref).startswith("pool:nous:") for ref in grant.credential_refs),
             "quantlab_credential_provider_unapproved")
     require(all(route.provider == "nous" for route in grant.provider_routes),

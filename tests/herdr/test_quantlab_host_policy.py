@@ -196,3 +196,21 @@ def test_unpinned_or_non_hermes_executor_denied(tmp_path, executor):
     document["templates"][CONSUMER]["scope"]["executors"] = [executor]
     with pytest.raises(QuantLabPolicyDenied, match="quantlab_unapproved_provider_or_executor"):
         validate(document, workspace, results)
+
+
+@pytest.mark.parametrize("change,reason", [
+    ("max_network", "malformed_quantlab_grant"),
+    ("writable_roots", "malformed_quantlab_grant"),
+    ("isolation", "quantlab_process_execution_forbidden"),
+])
+def test_disabled_process_must_still_have_zero_side_effect_ceiling(tmp_path, change, reason):
+    document, workspace, results, grant = policy_fixture(tmp_path)
+    data = document["templates"][CONSUMER]["process"]
+    if change == "max_network":
+        data["max_network"] = "global"
+    elif change == "writable_roots":
+        data["writable_roots"] = [str(workspace)]
+    else:
+        data["require_credentials_isolated"] = False
+    with pytest.raises(QuantLabPolicyDenied, match=reason):
+        validate(document, workspace, results)
