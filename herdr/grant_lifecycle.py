@@ -207,3 +207,44 @@ def assess_renewal_eligibility(policy: dict[str, Any], consumer: str,
     if current["status"] == "expiring":
         return "candidate_requires_active_preapproval"
     return "no_renewal_due"
+
+
+def schema2_fleet_preflight(policy: dict[str, Any], intake: dict[str, Any],
+                            issuer: dict[str, Any] | None, *,
+                            at: datetime | None = None) -> dict[str, Any]:
+    """Metadata-only fail-closed fleet readiness, never issuer approval.
+
+    `issuer` must be obtained by the trusted root-owned loader at the caller,
+    not from a repository document. This check cannot attest kernel/profile,
+    operator approval, signed issuance, root publication, or admission.
+    """
+    import hashlib
+    from .security import canonical_json_bytes
+
+    fleet = fleet_report(policy, intake, at=at)
+    blockers = []
+    if type(policy.get("schema_version")) is not int or policy["schema_version"] != 2:
+        blockers.append("schema2_host_policy_required")
+    private = policy.get("private_launch")
+    if type(private) is not dict:
+        blockers.append("trusted_private_launch_required")
+    elif type(private.get("runtime_publication")) is not dict:
+        blockers.append("runtime_publication_binding_required")
+    elif type(private.get("plan_handoff")) is not dict or private["plan_handoff"].get("automatic_issuer") is not True:
+        blockers.append("approved_automatic_issuer_opt_in_required")
+    if type(issuer) is not dict or issuer.get("schema_version") != "herdr-automatic-launch-plan-1":
+        blockers.append("trusted_issuer_policy_required")
+    else:
+        pinned = hashlib.sha256(canonical_json_bytes(policy)).hexdigest()
+        if issuer.get("host_policy_sha256") != pinned:
+            blockers.append("issuer_policy_hash_mismatch")
+    missing = [p["consumer"] for p in fleet["projects"]
+               if p["enabled"] and p["status"] != "current"]
+    if missing:
+        blockers.append("current_project_grants_missing_or_expiring")
+    if fleet["untracked_grants"]:
+        blockers.append("untracked_host_grants_require_review")
+    return {"status": "blocked" if blockers else "metadata_checks_pass_only",
+            "blockers": blockers, "project_gaps": missing,
+            "project_count": len(fleet["projects"]),
+            "not_authorization": True}

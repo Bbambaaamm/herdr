@@ -69,3 +69,9 @@ The preflight prints no secrets or credentials and performs no mutation. The obs
 ## Current decision
 
 **NO-GO for grant publication and autonomous Hermes dispatch.** This packet is ready for independent review and a privileged operator to gather/approve the missing trust evidence, not for unattended execution. Completion requires a separately approved, tested publisher and explicit operator acceptance of the final exact-hash candidate.
+
+## Schema-2 fleet metadata readiness (PR #251 follow-up)
+
+`schema2_fleet_preflight(policy, intake, issuer)` is a **read-only metadata guard** intended for a separately trusted root operator. Inputs MUST come from the approved, stable root-owned readers; **never** use a GitHub issue or writable workspace as a trusted issuer policy. It checks: schema 2, presence of runtime publication and issuer opt-in, exact issuer host-policy hash, and expiry/missing status of every enabled intake consumer. A passing metadata result (`metadata_checks_pass_only`) is **not permission to issue**; no cryptographic approval, kernel confinement, mutable-to-immutable release attestation, profile/provider credentials, operator signature or deployment readiness is established. Use the existing strict host configuration and publisher verification in addition.
+
+Known current result: schema-1 host policy, no three new consumer grants, two expired, therefore `blocked`. Do not copy historical schema-2 issuer-service-policy files into the active root configuration: their existence is not evidence of current root approval. This PR contains no issuer or root publication command. Independent review and specific operator authorization remain required.

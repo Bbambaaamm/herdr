@@ -120,3 +120,37 @@ def test_renewal_eligibility_requires_live_base_and_never_issues(tmp_path):
     assert assess_renewal_eligibility(current,consumer,at=NOW) == "candidate_requires_active_preapproval"
     current["templates"][consumer] = replace(old,expires_at=(NOW+timedelta(hours=5)).isoformat()).to_json()
     assert assess_renewal_eligibility(current,consumer,at=NOW) == "no_renewal_due"
+
+
+def test_schema2_fleet_preflight_denies_schema1_and_missing_root_issuer(tmp_path):
+    from herdr.grant_lifecycle import schema2_fleet_preflight
+    raw, _, _, _, consumer = fixtures(tmp_path)
+    inv={"schema_version":1,"consumers":[
+        {"consumer":"herdr","repository":"Bbambaaamm/herdr","enabled":True},
+        {"consumer":"quantlab","repository":"Bbambaaamm/Autonomous-Quant-Lab","enabled":True},
+    ]}
+    report=schema2_fleet_preflight(raw,inv,None,at=NOW)
+    assert report["status"] == "blocked"
+    assert "schema2_host_policy_required" in report["blockers"]
+    assert "trusted_issuer_policy_required" in report["blockers"]
+    assert "current_project_grants_missing_or_expiring" in report["blockers"]
+    assert report["not_authorization"] is True
+    assert consumer in report["project_gaps"]
+
+
+def test_schema2_fleet_hash_mismatch_fails_even_with_structural_opt_in(tmp_path):
+    from herdr.grant_lifecycle import schema2_fleet_preflight
+    current, _, old, _, consumer=fixtures(tmp_path)
+    current["schema_version"]=2
+    current["templates"][consumer]=replace(old,
+        issued_at=(NOW-timedelta(minutes=1)).isoformat(),
+        expires_at=(NOW+timedelta(days=4)).isoformat()).to_json()
+    current["private_launch"]={"runtime_publication":{"schema_version":"opaque"},
+        "plan_handoff":{"automatic_issuer":True}}
+    inv={"schema_version":1,"consumers":[
+        {"consumer":"herdr","repository":"Bbambaaamm/herdr","enabled":True}]}
+    issuer={"schema_version":"herdr-automatic-launch-plan-1", "host_policy_sha256":"0"*64}
+    report=schema2_fleet_preflight(current,inv,issuer,at=NOW)
+    assert report["status"] == "blocked"
+    assert report["blockers"] == ["issuer_policy_hash_mismatch"]
+    assert report["not_authorization"] is True
