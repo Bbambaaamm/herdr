@@ -9,6 +9,7 @@ from herdr.quantlab_host_policy import (
     CONSUMER, QuantLabPolicyDenied, validate_quantlab_template,
 )
 from tests.herdr.test_heating_activation import source_grant
+from herdr.security import ToolRule, RiskClass
 
 
 NOW = datetime(2026, 11, 23, 14, 0, tzinfo=UTC)
@@ -20,7 +21,11 @@ def policy_fixture(tmp_path):
     results = tmp_path / "results"
     results.mkdir()
     base = source_grant(str(workspace))
-    rules = tuple(
+    rules = (ToolRule(
+        "herdr_delegate_child", RiskClass.DELEGATION,
+        ("key", "role", "objective", "prompt", "tool", "permission", "cwd", "ownership", "model", "fallback_model"),
+        requires_sandbox=True,
+    ),) + tuple(
         replace(rule, allowed_roots=(str(results),))
         if rule.tool == "herdr_submit_result" else rule
         for rule in base.tool_rules
@@ -30,6 +35,7 @@ def policy_fixture(tmp_path):
         workspace_root=str(workspace),
         identity=replace(base.identity, consumer=CONSUMER),
         tool_rules=rules,
+        scope=replace(base.scope, tools=base.scope.tools + ("herdr_delegate_child",)),
         issued_at=(NOW - timedelta(minutes=5)).isoformat(),
         expires_at=(NOW + timedelta(hours=12)).isoformat(),
     )
@@ -68,6 +74,7 @@ def test_approved_bounded_paper_only_template_passes(tmp_path):
     ("result_root", "quantlab_result_root_excessive"),
     ("sandbox", "quantlab_unsandboxed_tool_forbidden"),
     ("extra_tool", "malformed_quantlab_grant"),
+    ("missing_delegation", "quantlab_required_tools_missing"),
     ("schema_bool", "unsupported_host_policy_schema"),
 ])
 def test_invalid_templates_denied_before_any_execution(tmp_path, fault, reason):
@@ -91,6 +98,11 @@ def test_invalid_templates_denied_before_any_execution(tmp_path, fault, reason):
             grant = replace(grant, scope=replace(grant.scope, permissions=("workspace-write", "external")))
         elif fault == "paid":
             grant = replace(grant, scope=replace(grant.scope, max_cost_microusd=100))
+        elif fault == "missing_delegation":
+            grant = replace(grant, tool_rules=tuple(rule for rule in grant.tool_rules
+                if rule.tool != "herdr_delegate_child"),
+                scope=replace(grant.scope,tools=tuple(tool for tool in grant.scope.tools
+                    if tool != "herdr_delegate_child")))
         elif fault == "process":
             grant = replace(grant, process=replace(grant.process, enabled=True))
         elif fault in ("result_root", "sandbox"):
@@ -139,3 +151,38 @@ def test_trusted_cli_refuses_untrusted_policy_read(monkeypatch, capsys):
                         lambda path: (_ for _ in ()).throw(PermissionError("unsafe")))
     assert quantlab_host_policy.main() == 1
     assert capsys.readouterr().out.strip() == "QUANTLAB_HOST_POLICY_BLOCKED"
+
+
+def test_delta_accepts_only_new_consumer_without_other_mutation(tmp_path):
+    from herdr.quantlab_host_policy import validate_policy_delta
+    document, workspace, results, grant = policy_fixture(tmp_path)
+    current = {**document, "templates": {}}
+    assert validate_policy_delta(current, document, at=NOW,
+                                 workspace=workspace, results=results).hash == grant.hash
+
+
+@pytest.mark.parametrize("change, reason", [
+    ("code", "unreviewed_host_policy_change"),
+    ("host_uid", "unreviewed_host_policy_change"),
+    ("other_consumer", "unreviewed_consumer_change"),
+    ("existing_grant", "existing_quantlab_grant_requires_explicit_renewal_review"),
+    ("changed_other_grant", "unreviewed_existing_consumer_change"),
+])
+def test_delta_blocks_unreviewed_grant_or_host_changes(tmp_path, change, reason):
+    from herdr.quantlab_host_policy import validate_policy_delta
+    document, workspace, results, grant = policy_fixture(tmp_path)
+    existing = {"github:Bbambaaamm/heating": {"retained": True}}
+    current = {**document, "templates": existing.copy()}
+    proposed = {**document, "templates": {**existing, **document["templates"]}}
+    if change == "code":
+        proposed["code"] = {"source": "/unreviewed/release"}
+    elif change == "host_uid":
+        proposed["host_uid"] = 0
+    elif change == "other_consumer":
+        proposed["templates"]["github:other"] = {}
+    elif change == "existing_grant":
+        current["templates"][CONSUMER] = grant.to_json()
+    elif change == "changed_other_grant":
+        proposed["templates"]["github:Bbambaaamm/heating"] = {"retained": False}
+    with pytest.raises(QuantLabPolicyDenied, match=reason):
+        validate_policy_delta(current, proposed, at=NOW, workspace=workspace, results=results)

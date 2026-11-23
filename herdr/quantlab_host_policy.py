@@ -71,9 +71,7 @@ def validate_quantlab_template(
     require(tuple(grant.scope.permissions) == ("workspace-write",),
             "quantlab_permissions_exceed_approved_scope")
     require(set(grant.scope.tools) <= TOOLS, "quantlab_tool_scope_excessive")
-    require(FILESYSTEM_TOOLS <= set(grant.scope.tools)
-            and "herdr_submit_result" in grant.scope.tools,
-            "quantlab_required_tools_missing")
+    require(set(grant.scope.tools) == TOOLS, "quantlab_required_tools_missing")
     require(set(grant.scope.providers) <= {"nous"}
             and set(grant.scope.executors) <= {"hermes"},
             "quantlab_unapproved_provider_or_executor")
@@ -104,6 +102,35 @@ def validate_quantlab_template(
         elif name == "herdr_delegate_child":
             require(rule.risk == RiskClass.DELEGATION, "quantlab_delegation_risk_mismatch")
     return grant
+
+
+def validate_policy_delta(current: dict[str, Any], proposed: dict[str, Any],
+                          *, at: datetime | None = None,
+                          workspace: Path = WORKSPACE,
+                          results: Path = RESULTS) -> SecurityGrant:
+    """Offline pre-publication gate: one added consumer, no policy-wide drift.
+
+    Does not attest administrator approval, immutable release provenance,
+    backup/rollback, or application to the root-owned path. Those remain
+    mandatory independent operator gates.
+    """
+    require(type(current) is dict and type(proposed) is dict,
+            "closed_policy_documents_required")
+    old_templates = current.get("templates")
+    new_templates = proposed.get("templates")
+    require(type(old_templates) is dict and type(new_templates) is dict,
+            "closed_host_policy_required")
+    require(CONSUMER not in old_templates,
+            "existing_quantlab_grant_requires_explicit_renewal_review")
+    require(set(new_templates) == set(old_templates) | {CONSUMER},
+            "unreviewed_consumer_change")
+    require({key: value for key, value in proposed.items() if key != "templates"}
+            == {key: value for key, value in current.items() if key != "templates"},
+            "unreviewed_host_policy_change")
+    require(all(new_templates[key] == value for key, value in old_templates.items()),
+            "unreviewed_existing_consumer_change")
+    return validate_quantlab_template(proposed, at=at, workspace=workspace,
+                                      results=results)
 
 
 def main() -> int:
