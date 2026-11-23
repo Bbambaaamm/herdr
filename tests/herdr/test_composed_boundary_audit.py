@@ -137,15 +137,25 @@ def test_tampered_artifact_cannot_reuse_an_old_digest():
     assert "graph_digest_mismatch" in out.violations
 
 
-def test_individually_permitted_writes_can_compose_out_of_scope():
+def test_approved_child_write_outside_composed_scope():
     bundle = _bundle()
     child_grant = bundle["graph"]["nodes"][1]["grant_sha256"]
     bundle["policy"]["grants"][child_grant]["write_roots"] = ["/ws"]
+    bundle["policy"]["grants"][child_grant]["risk_classes"] = ["workspace_write"]
+    bundle["policy"]["grants"][child_grant]["approvals"] = [
+        {"approval_id": "ap-child", "tool": "write_file"}]
+    bundle["graph"]["nodes"][1]["tools"] = ["write_file"]
+    bundle["graph"]["nodes"][1]["permissions"] = ["workspace_write"]
     bundle["action_trace"]["steps"].append(
-        {"seq": 1, "node_id": "child", "tool": "write_file",
-         "args_sha256": "1" * 64, "risk_class": "WORKSPACE_WRITE",
+        {"seq": 2, "node_id": "child", "tool": "write_file",
+         "args_sha256": "1" * 64, "risk_class": "workspace_write",
          "write_paths": ["/etc/other"]})
-    # Rebind the trace to the mutated policy so only the composition rule fires.
+    bundle["approval_ledger"]["entries"].append(
+        {"approval_id": "ap-child", "node_id": "child", "tool": "write_file",
+         "args_sha256": "1" * 64, "seq": 0, "consumed": True,
+         "grant_sha256": child_grant})
+    # The child action has a valid tool, risk class, and approval; its write
+    # still escapes the composed grant scope.
     bundle["graph"]["policy_sha256"] = _digest(bundle["policy"])
     bundle["action_trace"]["graph_sha256"] = _digest(bundle["graph"])
     bundle["approval_ledger"]["graph_sha256"] = _digest(bundle["graph"])
@@ -153,6 +163,9 @@ def test_individually_permitted_writes_can_compose_out_of_scope():
     out = _audit(bundle)
     assert out.status == "VIOLATION"
     assert "composed_write_scope_exceeded" in out.violations
+    assert "action_step_tool_not_permitted" not in out.violations
+    assert "unknown_risk_class" not in out.violations
+    assert "high_risk_action_without_approval" not in out.violations
 
 
 def test_credential_shared_by_independent_branches_is_a_leak():
@@ -222,21 +235,30 @@ def test_two_agents_with_interacting_writes_conflict():
     sibling_grant = "4" * 64
     bundle["policy"]["grants"][sibling_grant] = {
         "identity_sha256": "5" * 64, "credential_refs": [],
-        "write_roots": ["/ws"], "risk_classes": [], "approvals": []}
+        "write_roots": ["/ws"], "risk_classes": ["workspace_write"],
+        "approvals": [{"approval_id": "ap-sibling", "tool": "write_file"}]}
     bundle["graph"]["nodes"].append(
         {"id": "sibling", "parent_id": None, "role": "worker",
-         "grant_sha256": sibling_grant, "tools": [], "permissions": []})
+         "grant_sha256": sibling_grant, "tools": ["write_file"],
+         "permissions": ["workspace_write"]})
     bundle["graph"]["policy_sha256"] = _digest(bundle["policy"])
     bundle["action_trace"]["graph_sha256"] = _digest(bundle["graph"])
     bundle["approval_ledger"]["graph_sha256"] = _digest(bundle["graph"])
     bundle["action_trace"]["steps"].append(
-        {"seq": 1, "node_id": "sibling", "tool": "write_file",
-         "args_sha256": "6" * 64, "risk_class": "WORKSPACE_WRITE",
+        {"seq": 2, "node_id": "sibling", "tool": "write_file",
+         "args_sha256": "6" * 64, "risk_class": "workspace_write",
          "write_paths": ["/ws/out"]})
+    bundle["approval_ledger"]["entries"].append(
+        {"approval_id": "ap-sibling", "node_id": "sibling", "tool": "write_file",
+         "args_sha256": "6" * 64, "seq": 0, "consumed": True,
+         "grant_sha256": sibling_grant})
     _rebind_evidence(bundle)
     out = _audit(bundle)
     assert out.status == "VIOLATION"
     assert "concurrent_interacting_writes" in out.violations
+    assert "action_step_tool_not_permitted" not in out.violations
+    assert "unknown_risk_class" not in out.violations
+    assert "high_risk_action_without_approval" not in out.violations
 
 
 def test_false_accepted_approval_is_rejected():
@@ -399,7 +421,7 @@ def test_missing_risk_class_is_not_silently_unapproved():
     _rebind_evidence(bundle)
     out = _audit(bundle)
     assert out.status == "VIOLATION"
-    assert "unknown_risk_class" in out.violations
+    assert "action_step_risk_class_invalid" in out.violations
 
 
 def test_every_known_risk_class_requires_approval():
@@ -650,3 +672,66 @@ def test_missing_required_field_is_never_covered(artifact, field, code):
     out = _audit(bundle)
     assert out.status != "COVERED"
     assert code in (out.unknowns + out.violations)
+
+
+def test_consumed_approval_without_action_is_a_violation():
+    bundle = _bundle()
+    bundle["policy"]["grants"]["a" * 64]["approvals"].append(
+        {"approval_id": "ap-orphan", "tool": "terminal"})
+    bundle["approval_ledger"]["entries"].append(
+        {"approval_id": "ap-orphan", "node_id": "parent", "tool": "terminal",
+         "args_sha256": "1" * 64, "seq": 0, "consumed": True,
+         "grant_sha256": "a" * 64})
+    bundle["graph"]["policy_sha256"] = _digest(bundle["policy"])
+    bundle["action_trace"]["graph_sha256"] = _digest(bundle["graph"])
+    bundle["approval_ledger"]["graph_sha256"] = _digest(bundle["graph"])
+    _rebind_evidence(bundle)
+    out = _audit(bundle)
+    assert out.status == "VIOLATION"
+    assert "approval_consumed_without_action" in out.violations
+    assert "approval_not_consumed" not in out.violations
+    assert "replayed_approval" not in out.violations
+    assert "false_accepted_approval" not in out.violations
+
+
+def test_two_distinct_steps_cannot_share_sequence():
+    bundle = _bundle()
+    child_grant = "b" * 64
+    bundle["graph"]["nodes"][1]["tools"] = ["read_file"]
+    bundle["policy"]["grants"][child_grant]["approvals"] = [
+        {"approval_id": "ap-child", "tool": "read_file"}]
+    bundle["action_trace"]["steps"].append(
+        {"seq": 1, "node_id": "child", "tool": "read_file",
+         "args_sha256": "1" * 64, "risk_class": "read", "write_paths": []})
+    bundle["approval_ledger"]["entries"].append(
+        {"approval_id": "ap-child", "node_id": "child", "tool": "read_file",
+         "args_sha256": "1" * 64, "seq": 0, "consumed": True,
+         "grant_sha256": child_grant})
+    bundle["graph"]["policy_sha256"] = _digest(bundle["policy"])
+    bundle["action_trace"]["graph_sha256"] = _digest(bundle["graph"])
+    bundle["approval_ledger"]["graph_sha256"] = _digest(bundle["graph"])
+    _rebind_evidence(bundle)
+    out = _audit(bundle)
+    assert out.status == "VIOLATION"
+    assert "action_trace_seq_not_unique" in out.violations
+    assert "high_risk_action_without_approval" not in out.violations
+
+
+@pytest.mark.parametrize("risk", [None, "", [], {"risk": "read"}])
+def test_invalid_risk_class_has_specific_violation(risk):
+    bundle = _bundle()
+    bundle["action_trace"]["steps"][0]["risk_class"] = risk
+    bundle["approval_ledger"]["entries"] = []
+    _rebind_evidence(bundle)
+    out = _audit(bundle)
+    assert out.status == "VIOLATION"
+    assert "action_step_risk_class_invalid" in out.violations
+    assert "artifact_structure_incomplete" not in out.unknowns
+
+
+def test_covered_result_binds_all_five_declared_digests():
+    bundle = _bundle()
+    out = _audit(bundle)
+    assert out.status == "COVERED"
+    assert out.digests == _digests(bundle)
+    assert out.to_json()["digests"] == _digests(bundle)

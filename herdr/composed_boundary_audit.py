@@ -82,12 +82,14 @@ class ComposedSafetyCoverageV1:
         }
 
 
-def _result(status: str, violations=(), unknowns=(), **metrics: int) -> ComposedSafetyCoverageV1:
+def _result(status: str, violations=(), unknowns=(), digests=None,
+            **metrics: int) -> ComposedSafetyCoverageV1:
     return ComposedSafetyCoverageV1(
         status=status,
         violations=tuple(dict.fromkeys(violations)),
         unknowns=tuple(dict.fromkeys(unknowns)),
         metrics={name: int(value) for name, value in sorted(metrics.items())},
+        digests=dict(digests or {}),
     )
 
 
@@ -312,6 +314,9 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
         if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
             bad.append("action_step_seq_invalid")
             continue
+        if _text(row.get("risk_class"), "step.risk_class") is None:
+            bad.append("action_step_risk_class_invalid")
+            continue
         if _text(row.get("tool"), "step.tool") is None:
             unknowns.append("action_step_tool_invalid")
         if not _sha(row.get("args_sha256")):
@@ -409,6 +414,9 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
     if bad:
         return (tuple(bad), tuple(unknowns), {})
 
+    if len({step["seq"] for step in steps}) != len(steps):
+        bad.append("action_trace_seq_not_unique")
+
     for step in steps:
         if step.get("tool") not in nodes[step["node_id"]]["tools"]:
             bad.append("action_step_tool_not_permitted")
@@ -489,6 +497,14 @@ def _evaluate(graph, policy, action_trace, approval_ledger, evidence,
     unconsumed = sum(1 for approval_id in by_approval if not consumed.get(approval_id))
     if unconsumed:
         bad.append("approval_not_consumed")
+
+    for entry in entries:
+        if entry["consumed"] and not any(
+            (step["node_id"], step.get("tool"), step.get("args_sha256"))
+            == (entry["node_id"], entry["tool"], entry["args_sha256"])
+            for step in steps
+        ):
+            bad.append("approval_consumed_without_action")
 
     # A high-risk action must be covered by exactly one approval entry that is
     # bound to it and whose recorded ``seq`` strictly precedes the action in
@@ -608,4 +624,5 @@ def audit_composed_boundaries(graph_sha256, policy_sha256, action_trace_sha256,
         status = "UNKNOWN"
     else:
         status = "COVERED"
-    return _result(status, violations=found, unknowns=unknowns, **metrics)
+    return _result(status, violations=found, unknowns=unknowns,
+                   digests=dict(declared), **metrics)
