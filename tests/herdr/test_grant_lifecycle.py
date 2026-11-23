@@ -83,3 +83,40 @@ def test_bad_warning_or_clock_fails_closed(tmp_path):
     current,*_=fixtures(tmp_path)
     with pytest.raises(GrantLifecycleError):expiry_report(current,at=NOW.replace(tzinfo=None))
     with pytest.raises(GrantLifecycleError):expiry_report(current,at=NOW,warn_before=timedelta(days=100))
+
+
+def test_fleet_status_includes_missing_enabled_projects(tmp_path):
+    from herdr.grant_lifecycle import fleet_report
+    current, _, old, _, consumer = fixtures(tmp_path)
+    projects={"schema_version": 1, "consumers": [
+        {"consumer":"herdr", "repository":"Bbambaaamm/herdr", "enabled":True},
+        {"consumer":"quantlab", "repository":"Bbambaaamm/Autonomous-Quant-Lab", "enabled":True},
+        {"consumer":"majak", "repository":"Bbambaaamm/dotacni-majak", "enabled":False},
+    ]}
+    report=fleet_report(current,projects,at=NOW)
+    assert report["status"] == "action_required"
+    assert {x["project"]:x["status"] for x in report["projects"]} == {
+        "herdr":"expired", "quantlab":"missing", "majak":"missing"}
+    assert report["untracked_grants"] == []
+    assert consumer in {x["consumer"] for x in report["projects"]}
+
+
+def test_fleet_rejects_duplicate_intake_and_tracks_orphan_grants(tmp_path):
+    from herdr.grant_lifecycle import fleet_report
+    current, *_=fixtures(tmp_path)
+    p={"schema_version":1, "consumers": [{"consumer":"alpha", "repository":"Org/alpha","enabled":True}]}
+    assert fleet_report(current,p,at=NOW)["untracked_grants"] == ["github:Bbambaaamm/herdr"]
+    p["consumers"].append(dict(p["consumers"][0]))
+    with pytest.raises(GrantLifecycleError,match="duplicate_project_identity"):
+        fleet_report(current,p,at=NOW)
+
+
+def test_renewal_eligibility_requires_live_base_and_never_issues(tmp_path):
+    from herdr.grant_lifecycle import assess_renewal_eligibility
+    current, _, old, _, consumer=fixtures(tmp_path)
+    assert assess_renewal_eligibility(current,consumer,at=NOW) == "expired_requires_fresh_operator_authority"
+    assert assess_renewal_eligibility(current,"github:missing",at=NOW) == "missing_authority"
+    current["templates"][consumer] = replace(old,expires_at=(NOW+timedelta(minutes=20)).isoformat()).to_json()
+    assert assess_renewal_eligibility(current,consumer,at=NOW) == "candidate_requires_active_preapproval"
+    current["templates"][consumer] = replace(old,expires_at=(NOW+timedelta(hours=5)).isoformat()).to_json()
+    assert assess_renewal_eligibility(current,consumer,at=NOW) == "no_renewal_due"

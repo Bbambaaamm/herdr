@@ -30,3 +30,26 @@ At audit, `github:Bbambaaamm/herdr` expired 2026-10-15 and `github:Bbambaaamm/he
 4. Prove an end-to-end canary: warning -> human/operator approval -> secure renewal -> exact run-bound launch -> expiry refusal; confirm unrelated projects are unchanged.
 
 Until these gates pass: the system remains fail-closed and does not autonomously extend grants.
+
+## Single source of monitoring truth for all connected projects (Q3)
+
+`fleet_report(trusted_policy, intake_inventory)` overlays read-only intake registration onto the central, root-owned host-policy expiry report. It reports each enabled/disabled project as `current`, `expiring`, `expired`, or `missing`, and identifies existing grants with no matching intake consumer. **Intake metadata is never an authorization source:** an `enabled` project without an actual grant is `missing`, never `current`. Never include credentials or full grant material in the status output. Only use a trusted fixed-path loader to read live host grants; treat intake configuration as untrusted display metadata.
+
+For CI or deterministic offline analysis, use the bundled intake JSON as an *observed* inventory:
+
+```python
+import json
+from pathlib import Path
+from herdr.grant_lifecycle import fleet_report
+from herdr.host_configuration import HOST_POLICY_CONFIG, _read_configuration
+intake = json.loads(Path("agent-stack/config/github-intake-consumers.json").read_text())
+print(json.dumps(fleet_report(_read_configuration(HOST_POLICY_CONFIG), intake), sort_keys=True))
+```
+
+Once independently approved, wire only this read-only report into the *existing* `hermes-maintenance` path, deduplicate change events by consumer+expiry+status, and publish telemetry through the existing status bridge. Keep a single publisher and no new scheduler, issuer, agent run or queue.
+
+## Preapproved renewal design (Q2): bounded lease, not perpetual self-authorization
+
+A feasible future automated renewal protocol uses a **separately signed, root-owned operator authorization lease** created explicitly in advance, covering a specific consumer, immutable parent authority hash, precise scope/profile/provider/credential ceiling, fixed release/executor hash, validity window, maximum extension count and absolute expiration. The renewal worker may request a new shorter child/consumer grant *only while the operator authorization lease itself remains valid*. It must never bootstrap an expired or missing parent and may never rewrite its own lease. Issuer decisions must be bound to the current lock, runtime, policy SHA and fencing token, audited and idempotent per renewal key. On expiry, revoked approval, changed hash, excess budget, unavailable root authority or uncertain state, stop and notify the operator.
+
+The **read-only** `assess_renewal_eligibility(...)` distinguishes `no_renewal_due`, `candidate_requires_active_preapproval`, `expired_requires_fresh_operator_authority`, and `missing_authority`. It is deliberately **not** a cryptographic verifier or issuer. `validate_narrow_renewal` checks one same-or-narrower proposal, not its signer. Both checks can be integrated into the existing trusted root publisher only after separate design review and signature/revocation/lock/rollback tests. This PR neither creates the signed lease nor configures an unattended grant renewal. A perpetual renewal chain without periodic fresh operator trust evidence is not permitted.

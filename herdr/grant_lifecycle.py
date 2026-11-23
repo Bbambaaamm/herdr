@@ -138,3 +138,72 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def fleet_report(policy: dict[str, Any], intake: dict[str, Any], *,
+                 at: datetime | None = None) -> dict[str, Any]:
+    """Read-only cross-project observability; intake is NOT a grant authority.
+
+    Repository identities come from intake metadata only. Every missing grant
+    remains missing, even if a project was enabled or its issue was approved.
+    """
+    _require(type(intake) is dict and type(intake.get("consumers")) is list
+             and intake.get("schema_version") == 1,
+             "closed_intake_inventory_required")
+    rows = intake["consumers"]
+    _require(len(rows) <= 32, "bounded_intake_inventory_required")
+    base = expiry_report(policy, at=at)
+    grants = {row["consumer"]: row for row in base["consumers"]}
+    observed = set()
+    projects = []
+    for row in rows:
+        _require(type(row) is dict and type(row.get("enabled")) is bool
+                 and type(row.get("consumer")) is str
+                 and type(row.get("repository")) is str,
+                 "invalid_intake_project")
+        name = row["consumer"]
+        repository = row["repository"]
+        _require(name and repository.count("/") == 1
+                 and not any(char.isspace() for char in repository),
+                 "invalid_intake_project_identity")
+        canonical = "github:" + repository
+        _require(name not in observed and canonical not in observed,
+                 "duplicate_project_identity")
+        observed.update((name, canonical))
+        grant = grants.get(canonical)
+        projects.append({"project": name, "consumer": canonical,
+                         "enabled": row["enabled"],
+                         "status": grant["status"] if grant else "missing",
+                         "expires_at": grant["expires_at"] if grant else None})
+    projects.sort(key=lambda row: row["consumer"])
+    tracked = {row["consumer"] for row in projects}
+    orphan = sorted(set(grants) - tracked)
+    attention = any(row["enabled"] and row["status"] != "current"
+                    for row in projects) or bool(orphan)
+    return {"status": "action_required" if attention else "current",
+            "projects": projects, "untracked_grants": orphan}
+
+
+def assess_renewal_eligibility(policy: dict[str, Any], consumer: str,
+                               *, at: datetime | None = None,
+                               min_remaining: timedelta = timedelta(minutes=30)) -> str:
+    """Non-authoritative preflight before an independently approved renewal.
+
+    Returns status only. Eligibility CANNOT authorize issuance or publication.
+    Rejects a missing/expired base grant even when an old document exists.
+    """
+    moment = at if at is not None else datetime.now(UTC)
+    _require(type(consumer) is str and bool(consumer), "consumer_required")
+    _require(timedelta(0) < min_remaining <= timedelta(hours=48),
+             "bounded_renewal_window_required")
+    report = expiry_report(policy, at=moment,
+                           warn_before=min_remaining)
+    current = next((x for x in report["consumers"]
+                    if x["consumer"] == consumer), None)
+    if current is None:
+        return "missing_authority"
+    if current["status"] == "expired":
+        return "expired_requires_fresh_operator_authority"
+    if current["status"] == "expiring":
+        return "candidate_requires_active_preapproval"
+    return "no_renewal_due"
