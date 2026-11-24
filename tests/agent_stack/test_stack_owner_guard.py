@@ -750,7 +750,6 @@ def test_review_guard_precedes_healthy_short_circuit(guard, monkeypatch, tmp_pat
     ensure.STATE = tmp_path / "state"
     ensure.LOG = tmp_path / "ensure.log"
     ensure.GUARD_AUDIT_LOG = tmp_path / "audit.jsonl"
-    ensure.log = lambda message: None
     healthy = {"herdr-hermes", "herdr-codex"}
     ensure.list_agents = lambda: [
         {"name": name, "interactive_ready": True, "agent_status": "idle"}
@@ -809,18 +808,21 @@ def test_g11_herdr_block_is_isolated_from_other_consumers(guard, monkeypatch, tm
     ]
     started = set()
     calls = []
-    monkeypatch.setattr(ensure, "log", lambda message: None)
     monkeypatch.setattr(ensure, "STATE", tmp_path / "state")
     monkeypatch.setattr(ensure, "LOG", tmp_path / "ensure.log")
     monkeypatch.setattr(ensure, "GUARD_AUDIT_LOG", tmp_path / "audit.jsonl")
-    monkeypatch.setattr(ensure, "HERDR_BOOT_LOG", tmp_path / "herdr-autostart.log")
-    monkeypatch.setattr(ensure, "DC_BOOT_LOG",
-                        tmp_path / "desktop-commander-autostart.log")
-    seeded_state_marker = tmp_path / "seeded-majak-state.json"
+    ensure.STATE.mkdir(parents=True, exist_ok=True)
+    seeded_state_marker = ensure.STATE / "seeded-majak-state.json"
     seeded_state_marker.write_text('{"consumer":"majak","marker":"untouched"}\n',
                                    encoding="utf-8")
-    seeded_boot_marker = tmp_path / "seeded-majak-boot.log"
-    seeded_boot_marker.write_text("majak boot marker\n", encoding="utf-8")
+    seeded_herdr_boot = tmp_path / "herdr-autostart.log"
+    seeded_herdr_boot.write_text("majak-independent herdr boot marker\n",
+                                 encoding="utf-8")
+    seeded_dc_boot = tmp_path / "desktop-commander-autostart.log"
+    seeded_dc_boot.write_text("majak-independent dc boot marker\n",
+                              encoding="utf-8")
+    monkeypatch.setattr(ensure, "HERDR_BOOT_LOG", seeded_herdr_boot)
+    monkeypatch.setattr(ensure, "DC_BOOT_LOG", seeded_dc_boot)
     monkeypatch.setattr(ensure, "ensure_desktop_commander", lambda: None)
     monkeypatch.setattr(ensure, "ensure_herdr_server", lambda: None)
     monkeypatch.setattr(ensure, "ensure_repo_checkout", lambda *a: None)
@@ -856,7 +858,25 @@ def test_g11_herdr_block_is_isolated_from_other_consumers(guard, monkeypatch, tm
     assert ensure.DC_BOOT_LOG.parent == tmp_path
     assert seeded_state_marker.read_text() == \
         '{"consumer":"majak","marker":"untouched"}\n'
-    assert seeded_boot_marker.read_text() == "majak boot marker\n"
+    assert seeded_herdr_boot.read_text() == "majak-independent herdr boot marker\n"
+    assert seeded_dc_boot.read_text() == "majak-independent dc boot marker\n"
+
+    log_lines = (tmp_path / "ensure.log").read_text(encoding="utf-8").splitlines()
+    assert any("=== ensure start ===" in line for line in log_lines)
+    assert any("herdr-hermes: BLOCKED_RECONCILIATION_REQUIRED" in line
+               for line in log_lines)
+    assert not any("majak-" in line and ("BLOCKED_" in line or "owner_guard" in line)
+                   for line in log_lines)
+
+    audit_records = [json.loads(line) for line in
+                     (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+                     if line.strip()]
+    assert audit_records
+    assert {record["consumer"] for record in audit_records} == {"Herdr"}
+    assert all(record["operation"] == "agent.start" for record in audit_records)
+    blocked_events = [record for record in audit_records
+                      if record["event"] == guard.DECISION_BLOCKED_RECONCILIATION]
+    assert len(blocked_events) >= 2
 
     assert "herdr-hermes" not in started
     assert "herdr-codex" not in started
@@ -923,17 +943,21 @@ def test_g11_fake_cli_sandbox_isolates_consumers(guard, tmp_path):
             {"tab": "Hermes", "name": "herdr-hermes", "kind": "hermes",
              "args": ["-p", "quantlab", "chat"]}]},
     ]
-    ensure.log = lambda message: None
     ensure.STATE = tmp_path / "state"
     ensure.LOG = tmp_path / "ensure.log"
     ensure.GUARD_AUDIT_LOG = tmp_path / "audit.jsonl"
-    ensure.HERDR_BOOT_LOG = tmp_path / "herdr-autostart.log"
-    ensure.DC_BOOT_LOG = tmp_path / "desktop-commander-autostart.log"
-    seeded_state_marker = tmp_path / "seeded-majak-state.json"
+    ensure.STATE.mkdir(parents=True, exist_ok=True)
+    seeded_state_marker = ensure.STATE / "seeded-majak-state.json"
     seeded_state_marker.write_text('{"consumer":"majak","marker":"untouched"}\n',
                                    encoding="utf-8")
-    seeded_boot_marker = tmp_path / "seeded-majak-boot.log"
-    seeded_boot_marker.write_text("majak boot marker\n", encoding="utf-8")
+    seeded_herdr_boot = tmp_path / "herdr-autostart.log"
+    seeded_herdr_boot.write_text("majak-independent herdr boot marker\n",
+                                 encoding="utf-8")
+    seeded_dc_boot = tmp_path / "desktop-commander-autostart.log"
+    seeded_dc_boot.write_text("majak-independent dc boot marker\n",
+                              encoding="utf-8")
+    ensure.HERDR_BOOT_LOG = seeded_herdr_boot
+    ensure.DC_BOOT_LOG = seeded_dc_boot
     ensure.ensure_desktop_commander = lambda: None
     ensure.ensure_herdr_server = lambda: None
     ensure.ensure_repo_checkout = lambda *args: None
@@ -946,7 +970,24 @@ def test_g11_fake_cli_sandbox_isolates_consumers(guard, tmp_path):
     assert ensure.DC_BOOT_LOG.parent == tmp_path
     assert seeded_state_marker.read_text() == \
         '{"consumer":"majak","marker":"untouched"}\n'
-    assert seeded_boot_marker.read_text() == "majak boot marker\n"
+    assert seeded_herdr_boot.read_text() == "majak-independent herdr boot marker\n"
+    assert seeded_dc_boot.read_text() == "majak-independent dc boot marker\n"
+
+    log_lines = (tmp_path / "ensure.log").read_text(encoding="utf-8").splitlines()
+    assert any("=== ensure start ===" in line for line in log_lines)
+    assert any("herdr-codex: BLOCKED_RECONCILIATION_REQUIRED" in line
+               for line in log_lines)
+    assert not any("majak-" in line and ("BLOCKED_" in line or "owner_guard" in line)
+                   for line in log_lines)
+
+    audit_records = [json.loads(line) for line in
+                     (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+                     if line.strip()]
+    assert audit_records
+    assert {record["consumer"] for record in audit_records} == {"Herdr"}
+    blocked_events = [record for record in audit_records
+                      if record["event"] == guard.DECISION_BLOCKED_RECONCILIATION]
+    assert len(blocked_events) >= 2
 
     started = json.loads(state_file.read_text())["started"]
     assert "herdr-hermes" not in started
