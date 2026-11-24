@@ -1096,6 +1096,12 @@ def intervention_blocker(
         return task_id, str(task.get("verification_status") or "verification_pending")
     result = result_for(task_id)
     blocker = str(result.get("blocker") or "")
+    if blocker == "delivery_uncertain_requires_recovery":
+        # A historical ambiguous result is never a requeue permission. Only
+        # the exact protected, one-shot legacy retirement chain may clear it.
+        from herdr.legacy_unknown_retirement import retired as legacy_retired
+        if not legacy_retired(ROOT, task):
+            return task_id, "delivery_uncertain_requires_recovery"
     if blocker in {
         "github_write_auth_required",
         "user_action_required",

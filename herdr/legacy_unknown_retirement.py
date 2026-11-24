@@ -127,9 +127,9 @@ def retired(root: Path, task: dict, *, decisions: Path | None = None) -> bool:
 
 
 def applies(task: dict) -> bool:
-    return (isinstance(task, dict) and task.get("id") == TASK_ID
-            and task.get("repo") == "Bbambaaamm/herdr"
-            and task.get("attempt_state") == "blocked")
+    # Never let a corrupted legacy row silently lose its hold by changing
+    # attempt_state, repo or kind. Identity and evidence are checked separately.
+    return isinstance(task, dict) and task.get("id") == TASK_ID
 
 
 def _require_no_active_root(root: Path) -> None:
@@ -172,6 +172,12 @@ def apply(root: Path, *, active_workers, decisions: Path | None = None,
                     "task_outcome": "UNKNOWN", "accounting_mutated": False}
         if os.path.lexists(path):
             raise EvidenceError("legacy_retirement_conflicting_receipt")
+        # A different approval digest MUST NOT mint a second retirement event.
+        # A crash, replaced decision or forged sidecar may not create a fresh
+        # economic episode or change the original acceptance classification.
+        prior_receipts = sorted((root / "results").glob(RECEIPT_NAME + "*.json"))
+        if prior_receipts:
+            raise EvidenceError("legacy_retirement_conflicting_historical_receipt")
         if not decision["issued_at_epoch"] <= time.time() < decision["expires_at_epoch"]:
             raise EvidenceError("legacy_retirement_approval_expired")
         if active_workers():

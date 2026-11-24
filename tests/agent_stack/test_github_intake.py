@@ -908,6 +908,22 @@ class GitHubIntakeTests(unittest.TestCase):
         self.assertEqual(self.intake.queue_issue(consumer, {"number": 53}, []), first)
         self.assertEqual((path.read_bytes(), self.intake.STATE.read_bytes()), before)
 
+    def test_legacy_unknown_intake_requires_valid_retirement_chain(self):
+        from herdr.legacy_unknown_retirement import TASK_ID
+        task = {"id": TASK_ID, "repo": "Bbambaaamm/herdr",
+                "issue": 53, "attempt_state": "blocked"}
+        record = {"state": "blocked", "task": task, "mtime": 0}
+        result_path = self.intake.RESULTS / (TASK_ID + ".json")
+        result_path.write_text(json.dumps({
+            "task_id": TASK_ID, "status": "blocked",
+            "blocker": "delivery_uncertain_requires_recovery"
+        }))
+        with patch("herdr.legacy_unknown_retirement.retired", return_value=False):
+            blocker = self.intake.intervention_blocker([record])
+            self.assertEqual(blocker, (TASK_ID, "terminal_unknown_requires_operator_reconciliation"))
+        with patch("herdr.legacy_unknown_retirement.retired", return_value=True):
+            self.assertIsNone(self.intake.intervention_blocker([record]))
+
     def test_blocked_only_rows_report_existing_bounded_reason_without_touching_task_or_history(self):
         consumer = self.herdr_consumer();key = self.intake.state_key(consumer["repository"], 53)
         for reason, expected in [("delivery_uncertain_requires_recovery", "delivery_uncertain_requires_recovery"),

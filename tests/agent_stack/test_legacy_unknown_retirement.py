@@ -259,3 +259,23 @@ def test_non_object_active_inventory_denies(fx):
     (root / "pending" / "untrusted.json").write_bytes(b"[]")
     with pytest.raises(EvidenceError, match="active_inventory_invalid"):
         apply(fx)
+
+def test_new_approval_cannot_publish_second_retirement(fx):
+    root, files, original, decision, payload = fx
+    assert apply(fx)["status"] == "legacy_unknown_retired"
+    payload["approval_reference"] = "second-operator-approval"
+    decision.write_text(json.dumps(payload))
+    assert guarded.blocks_intake(root, json.loads(files[0].read_bytes()))
+    with pytest.raises(EvidenceError, match="conflicting_historical_receipt"):
+        apply(fx)
+    assert len(list((root / "results").glob(retired.RECEIPT_NAME + "*.json"))) == 1
+    assert all(p.read_bytes() == old for p, old in zip(files, original))
+
+def test_forged_receipt_before_approval_does_not_unlock(fx):
+    root, files, _, decision, payload = fx
+    digest = hashlib.sha256(decision.read_bytes()).hexdigest()
+    path = root / "results" / (retired.RECEIPT_NAME + digest + ".json")
+    path.write_text('{"task_outcome":"DONE"}')
+    assert guarded.blocks_intake(root, json.loads(files[0].read_bytes()))
+    with pytest.raises(EvidenceError, match="conflicting_receipt"):
+        apply(fx)
