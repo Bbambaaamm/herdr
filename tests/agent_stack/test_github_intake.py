@@ -908,6 +908,37 @@ class GitHubIntakeTests(unittest.TestCase):
         self.assertEqual(self.intake.queue_issue(consumer, {"number": 53}, []), first)
         self.assertEqual((path.read_bytes(), self.intake.STATE.read_bytes()), before)
 
+    def test_verified_legacy_retirement_exits_active_dedup_only_for_original(self):
+        from herdr.legacy_unknown_retirement import TASK_ID
+        consumer = self.herdr_consumer()
+        key = self.intake.state_key(consumer['repository'], 53)
+        task = {'id': TASK_ID, 'repo': consumer['repository'], 'issue': 53,
+                'attempt_state': 'blocked'}
+        old = {'state': 'blocked', 'task': task, 'mtime': 0}
+        indexed = {key: [old]}
+        issue = {'number': 53, 'title': 'HERDR CONTROL', 'updated_at': self.clock.isoformat()}
+        previous = {'used_approvals': {}}
+        with patch('herdr.legacy_unknown_retirement.retired', return_value=False), \
+                patch.object(self.intake, 'queue_issue') as queue:
+            _, row = self.intake._scan_issue(consumer, issue, indexed, previous)
+            self.assertEqual(row['scheduler_state'], 'blocked')
+            queue.assert_not_called()
+        with patch('herdr.legacy_unknown_retirement.retired', return_value=True), \
+                patch.object(self.intake, 'queue_issue',
+                    return_value='github-herdr-issue-53-approval-42') as queue:
+            _, row = self.intake._scan_issue(consumer, issue, indexed, previous)
+            self.assertEqual(row['scheduler_state'], 'queued')
+            queue.assert_called_once()
+        other = {'state': 'blocked', 'task': {'id': 'other-blocked',
+                 'repo': consumer['repository'], 'issue': 53,
+                 'attempt_state': 'blocked'}, 'mtime': 1}
+        indexed[key].append(other)
+        with patch('herdr.legacy_unknown_retirement.retired', return_value=True), \
+                patch.object(self.intake, 'queue_issue') as queue:
+            _, row = self.intake._scan_issue(consumer, issue, indexed, previous)
+            self.assertEqual(row['scheduler_state'], 'blocked')
+            queue.assert_not_called()
+
     def test_legacy_unknown_intake_requires_valid_retirement_chain(self):
         from herdr.legacy_unknown_retirement import TASK_ID
         task = {"id": TASK_ID, "repo": "Bbambaaamm/herdr",

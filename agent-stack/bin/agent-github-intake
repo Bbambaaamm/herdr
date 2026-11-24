@@ -463,7 +463,17 @@ def _scan_issue(consumer, issue, indexed, previous):
     repo = consumer["repository"]
     key = state_key(repo, number)
     records = indexed.get(key, [])
-    active = [record for record in records if record["state"] in ACTIVE_DIRS]
+    from herdr.legacy_unknown_retirement import applies as legacy_applies
+    from herdr.legacy_unknown_retirement import retired as legacy_retired
+    active = [
+        record for record in records
+        if record["state"] in ACTIVE_DIRS
+        and not (record["state"] == "blocked"
+                 and legacy_applies(record["task"])
+                 and legacy_retired(ROOT, record["task"]))
+    ]
+    # Only a verified exact-incident receipt removes the original legacy
+    # blocked row from dedup. Every other pending/running/blocked task holds.
     current = {"open": True, "consumer": consumer["consumer"], "repo": repo, "issue": number,
                "title": str(issue.get("title") or "")[:160],
                "remote_updated_at": str(issue.get("updated_at") or ""),

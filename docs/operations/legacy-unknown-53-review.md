@@ -40,6 +40,7 @@ Samotná konverzace s ChatGPT nebo GitHub komentář **není** root-owned schvá
 4. Pod existujícími recovery.lock, github-intake-state.lock, dispatcher.lock, worker.lock a worker.loop.lock transakce ověří task/result/log, root decision, absence aktivních úloh, přidá append-only receipt a znovu přečte originály.
 5. Kontrola stejného rozhodnutí při opakování pouze vrátí already_retired; nesmí vytvořit druhé spuštění, měnit budget ani přepisovat canonical výsledek.
 6. Ověřit záznam receipt, že stará úloha zůstává UNKNOWN a intake smí pouze zvažovat nové oprávněné maintainer-comment-v1 schválení.
+7. Nezávislý audit P1: GitHub intake má vlastní active/dedup bránu. Po validovaném retirement receipt musí odfiltrovat pouze tuto jednu přesně doloženou starou blocked úlohu, jinak by i přes ověřený receipt zůstal root trvale zablokovaný. Jakýkoli jiný blocked/pending/running úkol stále drží dedup bariéru. Regresní test pokrývá oba případy.
 
 ## Další nezávislé blokace
 
