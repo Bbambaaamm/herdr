@@ -54,9 +54,15 @@ DECISION_BLOCKED_POLICY = "BLOCKED_POLICY"
 DECISION_RESTORED_INTERACTIVE = "RESTORED_INTERACTIVE"
 
 SUPERVISOR_STATUSES = frozenset(
-    {"STARTING", "CONTINUE", "WAITING", "HUMAN_BLOCKED", "COMPLETE", "PAUSED", "ERROR"}
+    {"STARTING", "RUNNING", "CONTINUING", "WAITING",
+     "HUMAN_BLOCKED", "COMPLETE", "PAUSED", "ERROR"}
 )
-SUPERVISED_ACTIVE_STATES = frozenset({"STARTING", "CONTINUE", "WAITING"})
+# Live supervisor ownership states written by the existing supervisor.py:
+# STARTING before the first cycle, RUNNING while a cycle is active, and
+# CONTINUING between accepted non-terminal cycles. WAITING is also owned but
+# not actively executing (handled separately because cycle.lock is released).
+SUPERVISED_ACTIVE_STATES = frozenset({"STARTING", "RUNNING", "CONTINUING"})
+SUPERVISED_WAITING_STATES = frozenset({"WAITING"})
 RECONCILIATION_STATES = frozenset({"PAUSED", "HUMAN_BLOCKED", "COMPLETE"})
 UNKNOWN_STATES = frozenset({"ERROR"})
 
@@ -241,31 +247,44 @@ def _parse_consumer_policy(raw: bytes) -> dict:
     return values
 
 
+def _native_attempt_entry(directory: Path):
+    """Yield (name, task) for one inventory directory, failing closed."""
+    for path in sorted(directory.glob("*.json")):
+        if path.is_symlink() or not path.is_file():
+            raise GuardObservationError("native_attempt_entry_invalid")
+        _, task = read_bounded_json(path)
+        yield path.name, task
+
+
+def _native_inventory_dir(root: Path, name: str) -> Path:
+    directory = root / name
+    if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+        raise GuardObservationError("native_" + name + "_invalid")
+    if not directory.is_dir():
+        raise GuardObservationError("native_" + name + "_missing")
+    return directory
+
+
 def _native_attempt_hits(tasks_root: Path, repository: str) -> tuple:
-    """Existing durable admission evidence. No new queue, no retry."""
-    hits = []
+    """Existing durable admission evidence. No new queue, no retry.
+
+    Missing, unreadable, symlinked, oversized or malformed native inventory is
+    unknown owner evidence and fails closed instead of being skipped.
+    """
     root = Path(tasks_root)
+    if root.is_symlink() or (root.exists() and not root.is_dir()):
+        raise GuardObservationError("native_tasks_root_invalid")
+    if not root.is_dir():
+        raise GuardObservationError("native_tasks_root_missing")
+    hits = []
     for folder in ("pending", "running"):
-        directory = root / folder
-        if not directory.is_dir():
-            continue
-        for path in sorted(directory.glob("*.json")):
-            try:
-                _, task = read_bounded_json(path)
-            except GuardObservationError:
-                continue
+        for name, task in _native_attempt_entry(_native_inventory_dir(root, folder)):
             if task.get("repo") == repository:
-                hits.append(folder + "/" + path.name)
-    blocked = root / "blocked"
-    if blocked.is_dir():
-        for path in sorted(blocked.glob("*.json")):
-            try:
-                _, task = read_bounded_json(path)
-            except GuardObservationError:
-                continue
-            blob = canonical_json(task).lower()
-            if task.get("repo") == repository and ("uncertain" in blob or "unknown" in blob):
-                hits.append("blocked/" + path.name)
+                hits.append(folder + "/" + name)
+    for name, task in _native_attempt_entry(_native_inventory_dir(root, "blocked")):
+        blob = canonical_json(task).lower()
+        if task.get("repo") == repository and ("uncertain" in blob or "unknown" in blob):
+            hits.append("blocked/" + name)
     return tuple(hits)
 
 
@@ -407,6 +426,11 @@ def build_owner_evidence(observation: Mapping[str, Any]) -> OwnerEvidence:
     if supervised:
         if state in SUPERVISED_ACTIVE_STATES and observation.get("supervisor_alive") is True:
             owner = "supervised"
+        elif (
+            state in SUPERVISED_WAITING_STATES
+            and observation.get("supervisor_alive") is True
+        ):
+            owner = "supervised"
         elif state in RECONCILIATION_STATES:
             owner = "none"
         elif state in UNKNOWN_STATES:
@@ -524,13 +548,16 @@ def evaluate_ownership(evidence: OwnerEvidence) -> GuardDecision:
         return _decision(DECISION_BLOCKED_ATTEMPT, "live_side_child", evidence)
 
     if (
-        evidence.configured_consumer is not None
-        and evidence.configured_consumer != HERDR_CONFIG_CONSUMER
-    ) or (
-        evidence.configured_repository is not None
-        and evidence.configured_repository != HERDR_REPOSITORY
+        evidence.configured_consumer != HERDR_CONFIG_CONSUMER
+        or evidence.configured_repository != HERDR_REPOSITORY
     ):
-        return _decision(DECISION_BLOCKED_POLICY, "host_policy_identity_mismatch", evidence)
+        reason = (
+            "host_policy_identity_missing"
+            if evidence.configured_consumer is None
+            or evidence.configured_repository is None
+            else "host_policy_identity_mismatch"
+        )
+        return _decision(DECISION_BLOCKED_POLICY, reason, evidence)
     if evidence.expected_profile and evidence.policy_profile != evidence.expected_profile:
         return _decision(DECISION_BLOCKED_POLICY, "host_policy_profile_mismatch", evidence)
     if (
@@ -552,6 +579,11 @@ def evaluate_ownership(evidence: OwnerEvidence) -> GuardDecision:
             if supervisor_lock != "HELD":
                 return _decision(DECISION_BLOCKED_UNKNOWN, "supervisor_fence_not_held", evidence)
             return _decision(DECISION_SKIPPED_SUPERVISOR_OWNED, "supervisor_owns_consumer", evidence)
+        if state in SUPERVISED_WAITING_STATES:
+            if evidence.supervisor_alive is not True:
+                return _decision(DECISION_BLOCKED_UNKNOWN, "stale_supervisor_identity", evidence)
+            return _decision(
+                DECISION_SKIPPED_SUPERVISOR_OWNED, "supervisor_waiting", evidence)
         if supervisor_lock == "HELD":
             return _decision(DECISION_BLOCKED_UNKNOWN, "orphan_supervisor_fence", evidence)
         if state in UNKNOWN_STATES or state is None:

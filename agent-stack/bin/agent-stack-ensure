@@ -363,20 +363,18 @@ def decide_herdr_agent_start(spec, group):
 
 
 def ensure_agent(workspace_id, spec, group=None):
+    # Owner evaluation precedes the healthy short-circuit and covers every
+    # Herdr agent.start path (Hermes and Codex). It only skips a start; it
+    # never stops an existing healthy process.
+    if group is not None and group.get("label") == "Herdr":
+        decision = decide_herdr_agent_start(spec, group)
+        if str(decision.code) != owner_guard.DECISION_RESTORED_INTERACTIVE:
+            log(f"{spec['name']}: {decision.code} ({decision.reason}) "
+                f"owner_guard=no_start")
+            return decision.code
     if spec["name"] in healthy_agent_names():
         log(f"{spec['name']}: healthy")
         return "healthy"
-    if (
-        group is not None
-        and group.get("label") == "Herdr"
-        and spec.get("kind") == "hermes"
-    ):
-        decision = decide_herdr_agent_start(spec, group)
-        message = f"{spec['name']}: {decision.code} ({decision.reason})"
-        if str(decision.code).startswith("BLOCKED_"):
-            message += " owner_guard=no_start"
-        log(message)
-        return decision.code
     tabs = [t for t in list_tabs() if t.get("workspace_id") == workspace_id]
     tab = next((t for t in tabs if t.get("label") == spec["tab"]), None)
     if not tab:
@@ -408,7 +406,7 @@ def main():
         ensure_tabs(wid, group["cwd"], [spec["tab"] for spec in group["agents"]])
         for spec in group["agents"]:
             action = ensure_agent(wid, spec, group)
-            if str(action).startswith("BLOCKED_"):
+            if str(action).startswith(("BLOCKED_", "SKIPPED_")):
                 blocked.append((spec["name"], str(action)))
     names = sorted(a.get("name", "") for a in list_agents())
     missing = [s["name"] for g in DESIRED for s in g["agents"] if s["name"] not in names]

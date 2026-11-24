@@ -11,6 +11,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import threading
 from pathlib import Path
@@ -118,15 +119,17 @@ def write_policy(repo_root, profile="herdr-core", consumer="herdr",
                  repository="Bbambaaamm/herdr"):
     path = repo_root / "configs" / "consumers" / "herdr.yaml"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "schema_version: 1\n"
-        f"consumer: {consumer}\n"
-        f"repository: {repository}\n"
-        f"policy_profile: {profile}\n"
-        "hard_invariants:\n"
-        "  - no_direct_main_write\n",
-        encoding="utf-8",
-    )
+    lines = ["schema_version: 1"]
+    if consumer is not None:
+        lines.append(f"consumer: {consumer}")
+    if repository is not None:
+        lines.append(f"repository: {repository}")
+    lines.extend([
+        f"policy_profile: {profile}",
+        "hard_invariants:",
+        "  - no_direct_main_write",
+    ])
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     os.chmod(path, 0o600)
 
 
@@ -143,10 +146,10 @@ def held_lock(path):
             os.close(fd)
 
 
-def make_host(guard, tmp_path, *, state="CONTINUE", start_ticks=None,
+def make_host(guard, tmp_path, *, state="RUNNING", start_ticks=None,
               command_sha256=None, budget_seconds=1500, profile="herdr-core",
               consumer="herdr", repository="Bbambaaamm/herdr",
-              pending=(), uncertain_blocked=(), side_processes=(),
+              pending=(), running=(), uncertain_blocked=(), side_processes=(),
               checkpoint=b'{"task": "fixture"}'):
     """Build a synthetic but host-verified Herdr supervisor authority tree."""
     pid = os.getpid()
@@ -190,7 +193,8 @@ def make_host(guard, tmp_path, *, state="CONTINUE", start_ticks=None,
     repo_root = tmp_path / "repo"
     write_policy(repo_root, profile=profile, consumer=consumer, repository=repository)
     tasks_root = tmp_path / "tasks"
-    for folder, items in (("pending", pending), ("blocked", uncertain_blocked)):
+    for folder, items in (("pending", pending), ("running", running),
+                          ("blocked", uncertain_blocked)):
         directory = tasks_root / folder
         directory.mkdir(parents=True, exist_ok=True)
         for index, task in enumerate(items):
@@ -269,7 +273,7 @@ class FakeAtomicAuthority:
 
 
 def active_evidence(guard, **over):
-    values = dict(decision_state="CONTINUE", supervisor_alive=True,
+    values = dict(decision_state="RUNNING", supervisor_alive=True,
                   fence_states={"supervisor.lock": "HELD", "cycle.lock": "HELD",
                                 "bootstrap.lock": "FREE"})
     values.update(over)
@@ -352,7 +356,7 @@ def test_g1_real_host_paused_incident_blocks_and_preserves_evidence(guard, tmp_p
 # --------------------------------------------------------------------------
 
 def test_g2_active_supervisor_with_held_fence_is_skipped(guard, tmp_path):
-    host = make_host(guard, tmp_path, state="CONTINUE")
+    host = make_host(guard, tmp_path, state="RUNNING")
     with held_lock(host["state_dir"] / "supervisor.lock"):
         evidence = guard.get_execution_ownership(
             "Herdr", "Bbambaaamm/herdr", "herdr-hermes",
@@ -368,8 +372,8 @@ def test_g2_active_supervisor_with_held_fence_is_skipped(guard, tmp_path):
 def test_g2_ensure_skips_without_start(guard, monkeypatch, tmp_path):
     ensure = load_module("ensure_g2", ENSURE_PATH)
     monkeypatch.setattr(ensure.owner_guard, "collect_herdr_observation", lambda *a, **k: obs_dict(
-        guard, state="CONTINUE", supervisor_alive=True,
-        decision_state="CONTINUE",
+        guard, state="RUNNING", supervisor_alive=True,
+        decision_state="RUNNING",
         fence_states={"supervisor.lock": "HELD", "cycle.lock": "HELD",
                       "bootstrap.lock": "FREE"},
     ))
@@ -449,7 +453,7 @@ def test_g3_invalid_supervisor_evidence_fails_closed(guard, tmp_path):
 # --------------------------------------------------------------------------
 
 def test_g4_pending_durable_attempt_blocks(guard, tmp_path):
-    host = make_host(guard, tmp_path, state="CONTINUE",
+    host = make_host(guard, tmp_path, state="RUNNING",
                      pending=[{"id": "task-1", "repo": "Bbambaaamm/herdr"}])
     with held_lock(host["state_dir"] / "supervisor.lock"):
         decision = guard.decide_herdr_agent_start(
@@ -462,7 +466,7 @@ def test_g4_pending_durable_attempt_blocks(guard, tmp_path):
 
 
 def test_g4_live_side_child_blocks(guard, tmp_path):
-    host = make_host(guard, tmp_path, state="CONTINUE",
+    host = make_host(guard, tmp_path, state="RUNNING",
                      side_processes=[host_identity := guard.process_identity(os.getpid())])
     with held_lock(host["state_dir"] / "supervisor.lock"):
         decision = guard.decide_herdr_agent_start(
@@ -480,7 +484,7 @@ def test_g4_live_side_child_blocks(guard, tmp_path):
 # --------------------------------------------------------------------------
 
 def test_g5_stale_pid_with_wrong_start_ticks_is_not_authority(guard, tmp_path):
-    host = make_host(guard, tmp_path, state="CONTINUE", start_ticks="1")
+    host = make_host(guard, tmp_path, state="RUNNING", start_ticks="1")
     with held_lock(host["state_dir"] / "supervisor.lock"):
         decision = guard.decide_herdr_agent_start(
             "Herdr", "Bbambaaamm/herdr", "herdr-hermes",
@@ -592,7 +596,7 @@ def test_g9_hard_policy_budget_and_fence_mismatches_deny(guard, tmp_path):
         active_evidence(guard, budget_seconds=9999, expected_budget_seconds=1500))
     assert budget.code == guard.DECISION_BLOCKED_POLICY
 
-    wrong_policy_host = make_host(guard, tmp_path, state="CONTINUE",
+    wrong_policy_host = make_host(guard, tmp_path, state="RUNNING",
                                   repository="Other/repo")
     with held_lock(wrong_policy_host["state_dir"] / "supervisor.lock"):
         wrong_policy = guard.decide_herdr_agent_start(
@@ -606,14 +610,14 @@ def test_g9_hard_policy_budget_and_fence_mismatches_deny(guard, tmp_path):
     assert wrong_policy.reason == "host_policy_identity_mismatch"
 
     missing_fence = guard.evaluate_ownership(base_evidence(
-        guard, decision_state="CONTINUE", supervisor_alive=True,
+        guard, decision_state="RUNNING", supervisor_alive=True,
         fence_states={"supervisor.lock": "MISSING", "cycle.lock": "FREE",
                       "bootstrap.lock": "FREE"},
     ))
     assert missing_fence.code == guard.DECISION_BLOCKED_UNKNOWN
 
     not_held = guard.evaluate_ownership(base_evidence(
-        guard, decision_state="CONTINUE", supervisor_alive=True,
+        guard, decision_state="RUNNING", supervisor_alive=True,
         fence_states={"supervisor.lock": "FREE", "cycle.lock": "FREE",
                       "bootstrap.lock": "FREE"},
     ))
@@ -648,6 +652,135 @@ def test_g10_interactive_clean_authority_starts_once_then_zero(guard, tmp_path):
 
 
 # --------------------------------------------------------------------------
+# Independent review follow-ups: real supervisor states, negative inventory
+# fixtures, fail-closed missing evidence, exact policy identity and coverage
+# of every Herdr start path before the healthy short-circuit.
+# --------------------------------------------------------------------------
+
+def _review_decide(guard, host, audit_path):
+    return guard.decide_herdr_agent_start(
+        "Herdr", "Bbambaaamm/herdr", "herdr-hermes",
+        state_dir=host["state_dir"], repo_root=host["repo_root"],
+        tasks_root=host["tasks_root"], audit_path=audit_path)
+
+
+def test_review_running_and_continuing_are_real_end_to_end(guard, tmp_path):
+    for index, state in enumerate(("RUNNING", "CONTINUING")):
+        host = make_host(guard, tmp_path / f"state-{index}", state=state)
+        with held_lock(host["state_dir"] / "supervisor.lock"):
+            decision = _review_decide(guard, host, tmp_path / "audit.jsonl")
+        assert decision.code == guard.DECISION_SKIPPED_SUPERVISOR_OWNED
+        assert decision.reason == "supervisor_owns_consumer"
+
+
+def test_review_waiting_live_supervisor_is_owned(guard, tmp_path):
+    host = make_host(guard, tmp_path, state="WAITING")
+    with held_lock(host["state_dir"] / "supervisor.lock"):
+        decision = _review_decide(guard, host, tmp_path / "audit.jsonl")
+    assert decision.code == guard.DECISION_SKIPPED_SUPERVISOR_OWNED
+    assert decision.reason == "supervisor_waiting"
+
+
+def test_review_legacy_continue_state_fails_closed(guard, tmp_path):
+    host = make_host(guard, tmp_path)
+    write_json(host["state_dir"] / "supervisor.json", {
+        "supervisor": host["recorded"], "state": "CONTINUE",
+        "current_job": str(host["job"]),
+        "decision": {"status": "CONTINUE"},
+    })
+    with held_lock(host["state_dir"] / "supervisor.lock"):
+        decision = _review_decide(guard, host, tmp_path / "audit.jsonl")
+    assert decision.code == guard.DECISION_BLOCKED_UNKNOWN
+    assert str(decision.reason).startswith("observation_failed:")
+
+
+def test_review_unreadable_native_inventory_fails_closed(guard, tmp_path):
+    corrupt = make_host(guard, tmp_path / "corrupt")
+    (corrupt["tasks_root"] / "pending" / "bad.json").write_text(
+        "{not-json", encoding="utf-8")
+    symlinked = make_host(guard, tmp_path / "symlink")
+    target = symlinked["tasks_root"] / "pending" / "real.json"
+    target.write_text("{}", encoding="utf-8")
+    (symlinked["tasks_root"] / "pending" / "link.json").symlink_to(target)
+    missing = make_host(guard, tmp_path / "missing")
+    shutil.rmtree(missing["tasks_root"])
+    for host in (corrupt, symlinked, missing):
+        with held_lock(host["state_dir"] / "supervisor.lock"):
+            decision = _review_decide(guard, host, tmp_path / "audit.jsonl")
+        assert decision.code == guard.DECISION_BLOCKED_UNKNOWN
+        assert str(decision.reason).startswith("observation_failed:")
+
+
+def test_review_running_and_uncertain_blocked_negative_fixtures(guard, tmp_path):
+    running_host = make_host(guard, tmp_path / "running",
+                             running=[{"id": "task-r", "repo": "Bbambaaamm/herdr"}])
+    with held_lock(running_host["state_dir"] / "supervisor.lock"):
+        running = _review_decide(guard, running_host, tmp_path / "audit.jsonl")
+    assert running.code == guard.DECISION_BLOCKED_ATTEMPT
+    assert running.reason == "durable_active_attempt"
+
+    blocked_host = make_host(guard, tmp_path / "blocked", uncertain_blocked=[{
+        "id": "task-b", "repo": "Bbambaaamm/herdr", "state": "BLOCKED",
+        "diagnostics": {"watchdog_blocker": "uncertain"},
+    }])
+    with held_lock(blocked_host["state_dir"] / "supervisor.lock"):
+        blocked = _review_decide(guard, blocked_host, tmp_path / "audit.jsonl")
+    assert blocked.code == guard.DECISION_BLOCKED_ATTEMPT
+    assert blocked.reason == "durable_active_attempt"
+
+
+def test_review_host_policy_identity_missing_is_blocked(guard, tmp_path):
+    host = make_host(guard, tmp_path, consumer=None, repository=None)
+    with held_lock(host["state_dir"] / "supervisor.lock"):
+        decision = _review_decide(guard, host, tmp_path / "audit.jsonl")
+    assert decision.code == guard.DECISION_BLOCKED_POLICY
+    assert decision.reason == "host_policy_identity_missing"
+
+
+def test_review_guard_precedes_healthy_short_circuit(guard, monkeypatch, tmp_path):
+    ensure = load_module("ensure_g11_healthy", ENSURE_PATH)
+    ensure.STATE = tmp_path / "state"
+    ensure.LOG = tmp_path / "ensure.log"
+    ensure.GUARD_AUDIT_LOG = tmp_path / "audit.jsonl"
+    ensure.log = lambda message: None
+    healthy = {"herdr-hermes", "herdr-codex"}
+    ensure.list_agents = lambda: [
+        {"name": name, "interactive_ready": True, "agent_status": "idle"}
+        for name in healthy
+    ]
+    started = []
+
+    def fake_run(args, timeout=30):
+        started.append(list(args))
+        return ensure.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ensure, "run", fake_run)
+    monkeypatch.setattr(ensure.owner_guard, "collect_herdr_observation",
+                        lambda *a, **k: obs_dict(guard, state="PAUSED"))
+    codex_spec = {"tab": "Codex", "name": "herdr-codex", "kind": "codex", "args": []}
+    hermes_spec = {"tab": "Hermes", "name": "herdr-hermes", "kind": "hermes",
+                   "args": ["-p", "quantlab", "chat"]}
+    group = {"label": "Herdr", "cwd": "/tmp/herdr",
+             "repository": "Bbambaaamm/herdr", "agents": [codex_spec, hermes_spec]}
+    assert ensure.ensure_agent("wid", codex_spec, group) == \
+        guard.DECISION_BLOCKED_RECONCILIATION
+    assert ensure.ensure_agent("wid", hermes_spec, group) == \
+        guard.DECISION_BLOCKED_RECONCILIATION
+    assert started == []
+
+    def interactive_observation(*args, **kwargs):
+        return ensure.owner_guard.build_owner_evidence(obs_dict(
+            guard, supervised=False,
+            interactive_owner={"owner": "human"},
+            state=None, decision_state=None))
+
+    monkeypatch.setattr(ensure.owner_guard, "get_execution_ownership",
+                        interactive_observation)
+    assert ensure.ensure_agent("wid", hermes_spec, group) == "healthy"
+    assert started == []
+
+
+# --------------------------------------------------------------------------
 # G11: Herdr block does not stop independent consumers
 # --------------------------------------------------------------------------
 
@@ -669,6 +802,8 @@ def test_g11_herdr_block_is_isolated_from_other_consumers(guard, monkeypatch, tm
     started = set()
     calls = []
     monkeypatch.setattr(ensure, "log", lambda message: None)
+    monkeypatch.setattr(ensure, "STATE", tmp_path / "state")
+    monkeypatch.setattr(ensure, "LOG", tmp_path / "ensure.log")
     monkeypatch.setattr(ensure, "GUARD_AUDIT_LOG", tmp_path / "audit.jsonl")
     monkeypatch.setattr(ensure, "ensure_desktop_commander", lambda: None)
     monkeypatch.setattr(ensure, "ensure_herdr_server", lambda: None)
@@ -700,8 +835,9 @@ def test_g11_herdr_block_is_isolated_from_other_consumers(guard, monkeypatch, tm
     ensure.main()
 
     assert "herdr-hermes" not in started
-    assert {"majak-codex", "majak-hermes", "herdr-codex"} <= started
-    assert not any("herdr-hermes" in call for call in calls
+    assert "herdr-codex" not in started
+    assert {"majak-codex", "majak-hermes"} <= started
+    assert not any("herdr-" in call for call in calls
                    if "agent" in call and "start" in call)
 
 
@@ -764,6 +900,8 @@ def test_g11_fake_cli_sandbox_isolates_consumers(guard, tmp_path):
              "args": ["-p", "quantlab", "chat"]}]},
     ]
     ensure.log = lambda message: None
+    ensure.STATE = tmp_path / "state"
+    ensure.LOG = tmp_path / "ensure.log"
     ensure.GUARD_AUDIT_LOG = tmp_path / "audit.jsonl"
     ensure.ensure_desktop_commander = lambda: None
     ensure.ensure_herdr_server = lambda: None
@@ -772,13 +910,15 @@ def test_g11_fake_cli_sandbox_isolates_consumers(guard, tmp_path):
         lambda *args, **kwargs: obs_dict(guard, state="PAUSED"))
 
     ensure.main()
+    assert (tmp_path / "state").is_dir()
 
     started = json.loads(state_file.read_text())["started"]
     assert "herdr-hermes" not in started
-    assert {"majak-codex", "majak-hermes", "herdr-codex"} <= set(started)
+    assert "herdr-codex" not in started
+    assert {"majak-codex", "majak-hermes"} <= set(started)
     start_calls = [json.loads(line) for line in calls_file.read_text().splitlines()
                    if "start" in json.loads(line)]
-    assert all("herdr-hermes" not in call for call in start_calls)
+    assert all("herdr-" not in call for call in start_calls)
 
 
 # --------------------------------------------------------------------------
