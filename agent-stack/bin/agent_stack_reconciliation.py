@@ -80,26 +80,48 @@ def canonical_json(value: Any) -> bytes:
 
 
 def _value_depth(value: Any) -> int:
-    """Iterative depth walk with cycle and node budgets; never recurses."""
+    """Exact maximum path depth for dict/list DAGs, cycle-safe and iterative.
+
+    Shared (aliased) subtrees are re-explored when reached through a deeper
+    path, so a valid acyclic DAG is measured by its unfolded depth rather than
+    by its first-visited object depth.  Ancestor colours detect cycles, and a
+    visit/node budget keeps pathological sharing bounded.
+    """
+    WHITE, GRAY, BLACK = 0, 1, 2
+    colour: dict[int, int] = {}
+    best: dict[int, int] = {}
     max_depth = 0
-    seen: set[int] = set()
-    stack: list[tuple[Any, int]] = [(value, 1)]
+    visits = 0
+    stack: list[tuple[str, Any, int]] = [("enter", value, 1)]
     while stack:
-        current, depth = stack.pop()
+        action, current, depth = stack.pop()
+        if action == "exit":
+            colour[id(current)] = BLACK
+            continue
+        state = colour.get(id(current), WHITE)
+        if state == GRAY:
+            raise ReconciliationError("collection_cycle")
+        if state == BLACK and best.get(id(current), 0) >= depth:
+            continue
+        if depth > MAX_COLLECTION_DEPTH:
+            raise ReconciliationError("collection_too_deep")
+        colour[id(current)] = GRAY
+        visits += 1
+        if visits > MAX_COLLECTION_NODES:
+            raise ReconciliationError("collection_too_many_nodes")
         if depth > max_depth:
             max_depth = depth
-        if id(current) in seen:
-            continue
-        seen.add(id(current))
-        if len(seen) > MAX_COLLECTION_NODES:
-            raise ReconciliationError("collection_too_many_nodes")
-        children: list[Any] = []
+        if best.get(id(current), 0) < depth:
+            best[id(current)] = depth
+        stack.append(("exit", current, depth))
         if type(current) is dict:
-            children.extend(current.values())
+            children = list(current.values())
         elif type(current) in (list, tuple):
-            children.extend(current)
+            children = list(current)
+        else:
+            children = []
         for child in children:
-            stack.append((child, depth + 1))
+            stack.append(("enter", child, depth + 1))
     return max_depth
 
 
@@ -543,9 +565,15 @@ def evaluate_incident(
                 or not re.fullmatch(r"[0-9a-f]{64}", item["evidence_digest"]):
             return _blocked(BLOCKED_MALFORMED_EVIDENCE, checkpoint_sha256=checkpoint_sha256)
         if item.get("kind") == "admitted_proposal":
+            # The replayed digest must itself be a canonical typed value; an
+            # injected arbitrary object must never reach the decision output.
+            if type(item.get("proposal_digest")) is not str \
+                    or not re.fullmatch(r"[0-9a-f]{64}", item["proposal_digest"]):
+                return _blocked(BLOCKED_MALFORMED_EVIDENCE,
+                                checkpoint_sha256=checkpoint_sha256)
             proposals.append(item)
     for item in proposals:
-        if request_key is not None and item.get("request_key") == request_key:
+        if item.get("request_key") == request_key:
             if item.get("evidence_digest") == evidence_digest:
                 return ReconciliationDecision(
                     decision=REPLAY_IDENTICAL_NO_START, reason="replay_identical",

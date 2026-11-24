@@ -444,7 +444,8 @@ def test_replay_same_request_and_evidence_is_idempotent(rec):
         checkpoint_raw=checkpoint_raw, original_waiting_raw=waiting_raw,
         emergency_pause_raw=paused_raw, observed=observed)
     receipt = {"kind": "admitted_proposal", "request_key": "req-1",
-               "evidence_digest": evidence_digest}
+               "evidence_digest": evidence_digest,
+               "proposal_digest": "b" * 64}
     replay = rec.evaluate_incident(
         checkpoint_raw=checkpoint_raw, original_waiting_raw=waiting_raw,
         emergency_pause_raw=paused_raw, observed=observed,
@@ -458,7 +459,7 @@ def test_replay_same_request_with_changed_evidence_conflicts(rec):
     checkpoint_raw, waiting_raw, paused_raw, _ = _inputs()
     changed = _observed(operator_note="changed-after-receipt")
     receipt = {"kind": "admitted_proposal", "request_key": "req-1",
-               "evidence_digest": "0" * 64}
+               "evidence_digest": "0" * 64, "proposal_digest": "c" * 64}
     conflict = rec.evaluate_incident(
         checkpoint_raw=checkpoint_raw, original_waiting_raw=waiting_raw,
         emergency_pause_raw=paused_raw, observed=changed,
@@ -475,6 +476,7 @@ def test_concurrent_admission_after_proposal_blocks(rec):
         "evidence_digest": rec.derive_evidence_digest(
             checkpoint_raw=checkpoint_raw, original_waiting_raw=waiting_raw,
             emergency_pause_raw=paused_raw, observed=observed),
+        "proposal_digest": "d" * 64,
     }
     second = rec.evaluate_incident(
         checkpoint_raw=checkpoint_raw, original_waiting_raw=waiting_raw,
@@ -482,6 +484,46 @@ def test_concurrent_admission_after_proposal_blocks(rec):
         prior_receipts=(admitted,), request_key="req-2")
     assert second.reason == rec.BLOCKED_CONCURRENT_ADMISSION
     assert second.direct_worker_launch_authorized is False
+
+
+def test_review_injected_prior_receipt_digest_is_blocked(rec):
+    receipt = {"kind": "admitted_proposal", "request_key": "req-1",
+               "evidence_digest": "a" * 64,
+               "proposal_digest": {"injected": 1}}
+    decision = rec.evaluate_incident(
+        checkpoint_raw=_checkpoint_raw(),
+        original_waiting_raw=_waiting_raw(
+            hashlib.sha256(_checkpoint_raw()).hexdigest()),
+        emergency_pause_raw=_paused_raw(), observed=_observed(),
+        prior_receipts=(receipt,), request_key="req-1")
+    assert decision.reason == rec.BLOCKED_MALFORMED_EVIDENCE
+    assert decision.proposal_digest is None
+
+
+def test_review_request_key_none_replays_only_unbound_same_binding(rec):
+    checkpoint_raw = _checkpoint_raw()
+    waiting_raw = _waiting_raw(hashlib.sha256(checkpoint_raw).hexdigest())
+    paused_raw = _paused_raw()
+    observed = _observed()
+    common = dict(checkpoint_raw=checkpoint_raw, original_waiting_raw=waiting_raw,
+                  emergency_pause_raw=paused_raw, observed=observed)
+    proposal = rec.evaluate_incident(**common, request_key=None)
+    assert proposal.decision == rec.PROPOSE_OPERATOR_REVIEW_ONLY
+    evidence_digest = rec.derive_evidence_digest(**common)
+    unbound = {"kind": "admitted_proposal", "request_key": None,
+               "evidence_digest": evidence_digest,
+               "proposal_digest": proposal.proposal_digest}
+    replay = rec.evaluate_incident(**common, prior_receipts=(unbound,),
+                                   request_key=None)
+    assert replay.decision == rec.REPLAY_IDENTICAL_NO_START
+    assert isinstance(replay.proposal_digest, str) and len(replay.proposal_digest) == 64
+
+    bound = {"kind": "admitted_proposal", "request_key": "req-1",
+             "evidence_digest": evidence_digest,
+             "proposal_digest": proposal.proposal_digest}
+    cross = rec.evaluate_incident(**common, prior_receipts=(bound,),
+                                  request_key=None)
+    assert cross.reason == rec.BLOCKED_CONCURRENT_ADMISSION
 
 
 # Malformed evidence ---------------------------------------------------------
@@ -679,3 +721,18 @@ def test_review_deep_and_cyclic_inputs_are_blocked_not_recursion_errors(rec):
                 hashlib.sha256(_checkpoint_raw()).hexdigest()),
             emergency_pause_raw=_paused_raw(),
             observed={"deep": deep})
+
+
+def test_review_shared_dag_subtree_uses_unfolded_depth(rec):
+    shared = {"x": {"y": {"z": 1}}}
+    long_chain = shared
+    for _ in range(6):
+        long_chain = {"a": long_chain}
+    dag_observed = _observed(long=long_chain, short=shared)
+    decision = _evaluate(rec, observed=dag_observed)
+    assert decision.reason == rec.BLOCKED_MALFORMED_EVIDENCE
+    assert decision.direct_worker_launch_authorized is False
+
+    dag_receipts = ({"kind": "other", "long": long_chain, "short": shared},)
+    assert _evaluate(rec, prior_receipts=dag_receipts).reason \
+        == rec.BLOCKED_MALFORMED_EVIDENCE
