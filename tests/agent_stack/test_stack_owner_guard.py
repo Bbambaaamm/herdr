@@ -681,6 +681,14 @@ def test_review_waiting_live_supervisor_is_owned(guard, tmp_path):
     assert decision.reason == "supervisor_waiting"
 
 
+def test_review_waiting_live_pid_without_held_fence_fails_closed(guard, tmp_path):
+    host = make_host(guard, tmp_path / "waiting-free", state="WAITING")
+    # Recorded PID is live, but supervisor.lock is FREE: no owner claim.
+    decision = _review_decide(guard, host, tmp_path / "audit.jsonl")
+    assert decision.code == guard.DECISION_BLOCKED_UNKNOWN
+    assert decision.reason == "supervisor_fence_not_held"
+
+
 def test_review_legacy_continue_state_fails_closed(guard, tmp_path):
     host = make_host(guard, tmp_path)
     write_json(host["state_dir"] / "supervisor.json", {
@@ -805,6 +813,14 @@ def test_g11_herdr_block_is_isolated_from_other_consumers(guard, monkeypatch, tm
     monkeypatch.setattr(ensure, "STATE", tmp_path / "state")
     monkeypatch.setattr(ensure, "LOG", tmp_path / "ensure.log")
     monkeypatch.setattr(ensure, "GUARD_AUDIT_LOG", tmp_path / "audit.jsonl")
+    monkeypatch.setattr(ensure, "HERDR_BOOT_LOG", tmp_path / "herdr-autostart.log")
+    monkeypatch.setattr(ensure, "DC_BOOT_LOG",
+                        tmp_path / "desktop-commander-autostart.log")
+    seeded_state_marker = tmp_path / "seeded-majak-state.json"
+    seeded_state_marker.write_text('{"consumer":"majak","marker":"untouched"}\n',
+                                   encoding="utf-8")
+    seeded_boot_marker = tmp_path / "seeded-majak-boot.log"
+    seeded_boot_marker.write_text("majak boot marker\n", encoding="utf-8")
     monkeypatch.setattr(ensure, "ensure_desktop_commander", lambda: None)
     monkeypatch.setattr(ensure, "ensure_herdr_server", lambda: None)
     monkeypatch.setattr(ensure, "ensure_repo_checkout", lambda *a: None)
@@ -833,6 +849,14 @@ def test_g11_herdr_block_is_isolated_from_other_consumers(guard, monkeypatch, tm
 
     monkeypatch.setattr(ensure, "run", fake_run)
     ensure.main()
+
+    assert ensure.STATE == tmp_path / "state"
+    assert ensure.STATE.is_dir()
+    assert ensure.HERDR_BOOT_LOG.parent == tmp_path
+    assert ensure.DC_BOOT_LOG.parent == tmp_path
+    assert seeded_state_marker.read_text() == \
+        '{"consumer":"majak","marker":"untouched"}\n'
+    assert seeded_boot_marker.read_text() == "majak boot marker\n"
 
     assert "herdr-hermes" not in started
     assert "herdr-codex" not in started
@@ -903,6 +927,13 @@ def test_g11_fake_cli_sandbox_isolates_consumers(guard, tmp_path):
     ensure.STATE = tmp_path / "state"
     ensure.LOG = tmp_path / "ensure.log"
     ensure.GUARD_AUDIT_LOG = tmp_path / "audit.jsonl"
+    ensure.HERDR_BOOT_LOG = tmp_path / "herdr-autostart.log"
+    ensure.DC_BOOT_LOG = tmp_path / "desktop-commander-autostart.log"
+    seeded_state_marker = tmp_path / "seeded-majak-state.json"
+    seeded_state_marker.write_text('{"consumer":"majak","marker":"untouched"}\n',
+                                   encoding="utf-8")
+    seeded_boot_marker = tmp_path / "seeded-majak-boot.log"
+    seeded_boot_marker.write_text("majak boot marker\n", encoding="utf-8")
     ensure.ensure_desktop_commander = lambda: None
     ensure.ensure_herdr_server = lambda: None
     ensure.ensure_repo_checkout = lambda *args: None
@@ -911,6 +942,11 @@ def test_g11_fake_cli_sandbox_isolates_consumers(guard, tmp_path):
 
     ensure.main()
     assert (tmp_path / "state").is_dir()
+    assert ensure.HERDR_BOOT_LOG.parent == tmp_path
+    assert ensure.DC_BOOT_LOG.parent == tmp_path
+    assert seeded_state_marker.read_text() == \
+        '{"consumer":"majak","marker":"untouched"}\n'
+    assert seeded_boot_marker.read_text() == "majak boot marker\n"
 
     started = json.loads(state_file.read_text())["started"]
     assert "herdr-hermes" not in started

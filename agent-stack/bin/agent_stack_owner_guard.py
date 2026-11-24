@@ -582,6 +582,9 @@ def evaluate_ownership(evidence: OwnerEvidence) -> GuardDecision:
         if state in SUPERVISED_WAITING_STATES:
             if evidence.supervisor_alive is not True:
                 return _decision(DECISION_BLOCKED_UNKNOWN, "stale_supervisor_identity", evidence)
+            if supervisor_lock != "HELD":
+                return _decision(
+                    DECISION_BLOCKED_UNKNOWN, "supervisor_fence_not_held", evidence)
             return _decision(
                 DECISION_SKIPPED_SUPERVISOR_OWNED, "supervisor_waiting", evidence)
         if supervisor_lock == "HELD":
