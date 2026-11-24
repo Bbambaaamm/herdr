@@ -911,6 +911,10 @@ def main(argv=None) -> int:
     modes.add_argument("--inspect-terminal-unknown", metavar="TASK_ID")
     modes.add_argument("--inspect-legacy-unknown", metavar="TASK_ID",
                        help="read-only pinned review; never retires a legacy task")
+    modes.add_argument("--retire-legacy-unknown", metavar="TASK_ID",
+                       help="explicit host-approved one-shot retirement of pinned legacy UNKNOWN")
+    modes.add_argument("--check-legacy-retirement", metavar="TASK_ID",
+                       help="read-only full preflight of explicit legacy retirement decision")
     modes.add_argument("--apply-terminal-unknown", metavar="TASK_ID")
     modes.add_argument("--retire-terminal-unknown", metavar="TASK_ID")
     args = parser.parse_args([] if argv is None else argv)
@@ -933,6 +937,22 @@ def main(argv=None) -> int:
         except (EvidenceError, OSError, ValueError, TypeError):
             print(json.dumps({"status": "blocked",
                               "reason": "legacy_unknown_inspection_preconditions_unmet",
+                              "activation_performed": False}))
+            return 1
+    if args.retire_legacy_unknown or args.check_legacy_retirement:
+        from herdr import legacy_unknown_retirement
+        try:
+            target = args.retire_legacy_unknown or args.check_legacy_retirement
+            if target != legacy_unknown_retirement.TASK_ID:
+                raise EvidenceError("legacy_retirement_wrong_incident")
+            report = legacy_unknown_retirement.apply(
+                ROOT, active_workers=active_worker_tasks,
+                dry_run=bool(args.check_legacy_retirement))
+            print(json.dumps(report, sort_keys=True))
+            return 0
+        except (EvidenceError, OSError, ValueError, KeyError, TypeError):
+            print(json.dumps({"status": "blocked",
+                              "reason": "legacy_retirement_preconditions_unmet",
                               "activation_performed": False}))
             return 1
     if (args.inspect_terminal_unknown or args.apply_terminal_unknown

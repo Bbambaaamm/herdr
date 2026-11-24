@@ -143,7 +143,13 @@ def held(task):
 
 
 def blocks_intake(root, task):
-    """Release intake only while a complete protected retirement chain validates."""
+    """Release intake only after a fully verified administrative retirement."""
+    # The October 2 legacy attempt predates modern TaskGraph fencing. Preserve
+    # its blocked canonical task/result; accept only an explicitly approved,
+    # exact-incident receipt issued under the existing recovery locks.
+    from .legacy_unknown_retirement import applies, retired as legacy_retired
+    if applies(task):
+        return not legacy_retired(root, task)
     if not held(task):
         return False
     return not (retired(root, task) or late_evidence_reconciled(root, task))
