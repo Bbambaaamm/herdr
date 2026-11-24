@@ -915,6 +915,8 @@ def main(argv=None) -> int:
                        help="explicit host-approved one-shot retirement of pinned legacy UNKNOWN")
     modes.add_argument("--check-legacy-retirement", metavar="TASK_ID",
                        help="read-only full preflight of explicit legacy retirement decision")
+    modes.add_argument("--verify-legacy-activation", metavar="TASK_ID",
+                       help="read-only verification of independent root-owned activation")
     modes.add_argument("--apply-terminal-unknown", metavar="TASK_ID")
     modes.add_argument("--retire-terminal-unknown", metavar="TASK_ID")
     args = parser.parse_args([] if argv is None else argv)
@@ -937,6 +939,28 @@ def main(argv=None) -> int:
         except (EvidenceError, OSError, ValueError, TypeError):
             print(json.dumps({"status": "blocked",
                               "reason": "legacy_unknown_inspection_preconditions_unmet",
+                              "activation_performed": False}))
+            return 1
+    if args.verify_legacy_activation:
+        from herdr import legacy_unknown_retirement
+        from herdr import recovery_unknown
+        try:
+            if args.verify_legacy_activation != legacy_unknown_retirement.TASK_ID:
+                raise EvidenceError("legacy_activation_wrong_incident")
+            raw, _ = recovery_unknown.snapshot(
+                ROOT / "blocked" / (legacy_unknown_retirement.TASK_ID + ".json"),
+                maximum=1048576)
+            task = recovery_unknown._json(raw)
+            if not legacy_unknown_retirement.retired(ROOT, task):
+                raise EvidenceError("legacy_activation_not_verified")
+            print(json.dumps({"status": "legacy_unknown_retired_verified",
+                              "task_id": legacy_unknown_retirement.TASK_ID,
+                              "task_outcome": "UNKNOWN", "accounting": "preserved_unknown",
+                              "activation_performed": False}, sort_keys=True))
+            return 0
+        except (EvidenceError, OSError, ValueError, KeyError, TypeError):
+            print(json.dumps({"status": "blocked",
+                              "reason": "legacy_activation_not_verified",
                               "activation_performed": False}))
             return 1
     if args.retire_legacy_unknown or args.check_legacy_retirement:

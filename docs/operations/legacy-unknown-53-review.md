@@ -1,4 +1,4 @@
-# Legacy UNKNOWN #53 — schválené administrativní vyřazení
+# Legacy UNKNOWN #53 — dvoufázové administrativní vyřazení
 
 **Status: pouze draft PR, žádné schválení ani nasazení.** Tento dokument popisuje starý incident z 2. 10. 2026 a odděluje jej od novějšího PAUSED supervisora.
 
@@ -10,7 +10,8 @@ Původní blokovaná úloha github-herdr-issue-53-20261002T102240Z, její canoni
 
 - agent-stack-recovery --inspect-legacy-unknown TASK_ID: pouze čtení, ověření SHA256, vždy HUMAN_REVIEW_REQUIRED.
 - agent-stack-recovery --check-legacy-retirement TASK_ID: dry-run pod existujícími zámky; bez platného schválení vrací BLOCKED, se schválením pouze READY_FOR_SEPARATE_OPERATOR_APPLY.
-- agent-stack-recovery --retire-legacy-unknown TASK_ID: zápis jednorázového auditního receipt až po samostatném schválení operátorem; nikdy nespouští Hermese.
+- agent-stack-recovery --verify-legacy-activation TASK_ID: pouze čtení; ověřuje root-owned aktivační potvrzení a přesný receipt; před jeho zveřejněním vrací BLOCKED.
+- agent-stack-recovery --retire-legacy-unknown TASK_ID: po schválení připraví jednorázový receipt ve frontě, ale **sám NIKDY neuvolní intake**; čeká na následné root-owned potvrzení přesného receipt.
 
 Podporováno pouze přesné TASK_ID github-herdr-issue-53-20261002T102240Z.
 
@@ -24,7 +25,7 @@ Podporováno pouze přesné TASK_ID github-herdr-issue-53-20261002T102240Z.
 
 ## Host-owned operator decision
 
-Pouze oprávněný operátor po externím review připraví root-owned regular file (bez symlink/hardlink, bez group/world write) na cestě:
+Pouze oprávněný operátor po externím review připraví root-owned regular file na cestě níže. Doporučená práva: root:root 0644, nadřazená složka root:root 0755; bez symlinků, hardlinků či group/world write. Soubor musí být **čitelný host UID agentops**, protože recovery a queue lock nemohou běžet jako root:
 
 `/etc/herdr/recovery-terminal-unknown/github-herdr-issue-53-20261002T102240Z.legacy-retirement.json`
 
@@ -38,9 +39,10 @@ Samotná konverzace s ChatGPT nebo GitHub komentář **není** root-owned schvá
 2. Spustit --inspect-legacy-unknown, potom po vydání rozhodnutí --check-legacy-retirement. Dry-run nesmí vytvořit receipt.
 3. Teprve po samostatném potvrzení operátora jednou spustit --retire-legacy-unknown.
 4. Pod existujícími recovery.lock, github-intake-state.lock, dispatcher.lock, worker.lock a worker.loop.lock transakce ověří task/result/log, root decision, absence aktivních úloh, přidá append-only receipt a znovu přečte originály.
-5. Kontrola stejného rozhodnutí při opakování pouze vrátí already_retired; nesmí vytvořit druhé spuštění, měnit budget ani přepisovat canonical výsledek.
-6. Ověřit záznam receipt, že stará úloha zůstává UNKNOWN a intake smí pouze zvažovat nové oprávněné maintainer-comment-v1 schválení.
-7. Nezávislý audit P1: GitHub intake má vlastní active/dedup bránu. Po validovaném retirement receipt musí odfiltrovat pouze tuto jednu přesně doloženou starou blocked úlohu, jinak by i přes ověřený receipt zůstal root trvale zablokovaný. Jakýkoli jiný blocked/pending/running úkol stále drží dedup bariéru. Regresní test pokrývá oba případy.
+5. Kontrola stejného rozhodnutí při opakování pouze vrátí already_prepared_pending_root_activation; nesmí vytvořit druhé spuštění, měnit budget ani přepisovat canonical výsledek. Platný připravený receipt vzniká pod agentops UID a **sám nesmí uvolnit GitHub intake**.
+6. Jiný **nezávislý root operátor až PO ověření existujícího receipt, účtování a absence aktivních workerů** publikuje samostatný root-owned aktivační soubor na cestě `/etc/herdr/recovery-terminal-unknown/github-herdr-issue-53-20261002T102240Z.legacy-activation.json` (root:root 0644). Uzavřená pole: `schema_version=herdr-legacy-unknown-activation-v1`, `action=activate_verified_legacy_retirement`, přesné `task_id`, `decision_sha256`, `receipt_sha256`, `original_task_sha256`, `original_result_sha256`, `issued_at_epoch` (po přípravě receipt), skutečné `verification_reference` a `accounting=preserved_unknown`. Soubor musí být root-owned a chráněný, pracovní účet jej nesmí umět vytvořit ani změnit.
+7. Teprve po **platném root-owned post-apply potvrzení** je vyřazení aktivní. Nejprve read-only spustit `--verify-legacy-activation TASK_ID`: očekává se `legacy_unknown_retired_verified`, stále s `task_outcome=UNKNOWN`. Intake ověřuje root-owned potvrzení spolu s přesnou původní úlohou, rozhodnutím a receiptem. Neplatná/změněná/chybějící aktivace znamená BLOCKED. Pak smí zvažovat nové oprávněné maintainer-comment-v1 schválení.
+8. Nezávislý audit P1: GitHub intake má vlastní active/dedup bránu. Po validovaném retirement receipt musí odfiltrovat pouze tuto jednu přesně doloženou starou blocked úlohu, jinak by i přes ověřený receipt zůstal root trvale zablokovaný. Jakýkoli jiný blocked/pending/running úkol stále drží dedup bariéru. Regresní test pokrývá oba případy.
 
 ## Další nezávislé blokace
 

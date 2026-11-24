@@ -49,7 +49,8 @@ def fx(tmp_path, monkeypatch):
     old_snapshot = guarded.snapshot
 
     def snapshot(path, **kwargs):
-        if Path(path) == decisions / retired.DECISION_FILE:
+        if Path(path) in (decisions / retired.DECISION_FILE,
+                          decisions / retired.ACTIVATION_FILE):
             kwargs["owner"] = os.geteuid()
             kwargs["protected"] = False
         return old_snapshot(path, **kwargs)
@@ -72,13 +73,37 @@ def fx(tmp_path, monkeypatch):
     }
     decision = decisions / retired.DECISION_FILE
     decision.write_bytes(json.dumps(proposal, sort_keys=True).encode())
-    decision.chmod(0o600)
+    decision.chmod(0o644)  # Production root-owned 0644: queue UID can read, never write.
     return root, files, originals, decision, proposal
 
 
 def apply(fx):
     root, *_ = fx
     return retired.apply(root, active_workers=lambda: set())
+
+
+def activate(fx):
+    """Synthetic root-post-apply attestation. Never tests a real protected host."""
+    root, _, _, decision, proposal = fx
+    dsha = hashlib.sha256(decision.read_bytes()).hexdigest()
+    receipt = root / "results" / (retired.RECEIPT_NAME + dsha + ".json")
+    raw = receipt.read_bytes()
+    activation = {
+        "schema_version": "herdr-legacy-unknown-activation-v1",
+        "action": "activate_verified_legacy_retirement",
+        "task_id": retired.TASK_ID,
+        "decision_sha256": dsha,
+        "receipt_sha256": hashlib.sha256(raw).hexdigest(),
+        "original_task_sha256": retired.TASK_SHA256,
+        "original_result_sha256": retired.RESULT_SHA256,
+        "issued_at_epoch": int(time.time()),
+        "verification_reference": "separate-host-operator-confirmation",
+        "accounting": "preserved_unknown",
+    }
+    path = decision.parent / retired.ACTIVATION_FILE
+    path.write_bytes(json.dumps(activation, sort_keys=True).encode())
+    path.chmod(0o644)
+    return path
 
 
 def test_missing_operator_approval_keeps_blocker(fx):
@@ -95,9 +120,13 @@ def test_approved_retirement_is_one_shot_and_originals_unchanged(fx):
     task = json.loads(files[0].read_bytes())
     assert guarded.blocks_intake(root, task)
     first = apply(fx)
-    assert first["status"] == "legacy_unknown_retired"
+    assert first["status"] == "legacy_unknown_prepared_pending_root_activation"
     assert first["task_outcome"] == "UNKNOWN"
     assert first["accounting_mutated"] is False
+    assert not retired.retired(root, task)
+    assert guarded.blocks_intake(root, task)
+    assert apply(fx)["status"] == "already_prepared_pending_root_activation"
+    activate(fx)
     assert retired.retired(root, task)
     assert guarded.blocks_intake(root, task) is False
     second = apply(fx)
@@ -188,7 +217,9 @@ def test_interrupted_before_completion_replays_existing_receipt(fx, monkeypatch)
     with pytest.raises(EvidenceError, match="simulated_after_fsync_crash"):
         apply(fx)
     monkeypatch.setattr(retired, "_evidence", original_evidence)
-    assert apply(fx)["status"] == "already_retired"
+    assert apply(fx)["status"] == "already_prepared_pending_root_activation"
+    assert guarded.blocks_intake(root, json.loads(files[0].read_bytes()))
+    activate(fx)
     assert guarded.blocks_intake(root, json.loads(files[0].read_bytes())) is False
 
 
@@ -224,16 +255,16 @@ def test_no_foreign_episode_is_blocked(fx):
     other["repo"] = "other/repository"
     other["issue"] = 53
     (root / "pending" / "other-repo-task.json").write_bytes(json.dumps(other).encode())
-    assert apply(fx)["status"] == "legacy_unknown_retired"
+    assert apply(fx)["status"] == "legacy_unknown_prepared_pending_root_activation"
 
 
 def test_replayed_approved_retirement_never_republishes(fx, monkeypatch):
     root, *_ = fx
-    assert apply(fx)["status"] == "legacy_unknown_retired"
+    assert apply(fx)["status"] == "legacy_unknown_prepared_pending_root_activation"
     def forbidden(*_args, **_kwargs):
         raise AssertionError("existing receipt must not be written again")
     monkeypatch.setattr(guarded, "_write", forbidden)
-    assert apply(fx)["status"] == "already_retired"
+    assert apply(fx)["status"] == "already_prepared_pending_root_activation"
 
 
 def test_full_dry_run_is_read_only_and_does_not_unlock_intake(fx):
@@ -262,7 +293,7 @@ def test_non_object_active_inventory_denies(fx):
 
 def test_new_approval_cannot_publish_second_retirement(fx):
     root, files, original, decision, payload = fx
-    assert apply(fx)["status"] == "legacy_unknown_retired"
+    assert apply(fx)["status"] == "legacy_unknown_prepared_pending_root_activation"
     payload["approval_reference"] = "second-operator-approval"
     decision.write_text(json.dumps(payload))
     assert guarded.blocks_intake(root, json.loads(files[0].read_bytes()))
@@ -279,3 +310,44 @@ def test_forged_receipt_before_approval_does_not_unlock(fx):
     assert guarded.blocks_intake(root, json.loads(files[0].read_bytes()))
     with pytest.raises(EvidenceError, match="conflicting_receipt"):
         apply(fx)
+
+def test_queue_owned_receipt_without_root_activation_cannot_release_intake(fx):
+    root, files, *_ = fx
+    task = json.loads(files[0].read_bytes())
+    assert apply(fx)['status'] == 'legacy_unknown_prepared_pending_root_activation'
+    assert guarded.blocks_intake(root, task)
+    assert not retired.retired(root, task)
+
+def test_root_activation_wrong_receipt_digest_fails_closed(fx):
+    root, files, *_ = fx
+    apply(fx)
+    activation = activate(fx)
+    data = json.loads(activation.read_bytes())
+    data['receipt_sha256'] = 'e' * 64
+    activation.write_text(json.dumps(data))
+    assert guarded.blocks_intake(root, json.loads(files[0].read_bytes()))
+
+def test_root_activation_wrong_action_fails_closed(fx):
+    root, files, *_ = fx
+    apply(fx)
+    activation = activate(fx)
+    data = json.loads(activation.read_bytes())
+    data['action'] = 'force_retry'
+    activation.write_text(json.dumps(data))
+    assert guarded.blocks_intake(root, json.loads(files[0].read_bytes()))
+
+def test_root_activation_must_be_after_receipt(fx):
+    root, files, *_ = fx
+    apply(fx)
+    activation = activate(fx)
+    receipt = next((root / 'results').glob(retired.RECEIPT_NAME + '*.json'))
+    os.utime(activation, ns=(receipt.stat().st_mtime_ns - 1000000000,
+                             receipt.stat().st_mtime_ns - 1000000000))
+    assert guarded.blocks_intake(root, json.loads(files[0].read_bytes()))
+
+def test_root_decision_and_activation_fixtures_are_readable(fx):
+    root, _, _, decision, _ = fx
+    assert decision.stat().st_mode & 0o777 == 0o644
+    apply(fx)
+    activation = activate(fx)
+    assert activation.stat().st_mode & 0o777 == 0o644

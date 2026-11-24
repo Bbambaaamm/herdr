@@ -23,6 +23,7 @@ SCHEMA = "herdr-legacy-unknown-retirement-v1"
 RECEIPT_SCHEMA = "herdr-legacy-unknown-retirement-receipt-v1"
 REVIEW_EVIDENCE_SHA256 = "c017dd6c579a4db6b986119e922fe96903e1fc9c2a3f257ed454ac2eb5f0e062"
 DECISION_FILE = TASK_ID + ".legacy-retirement.json"
+ACTIVATION_FILE = TASK_ID + ".legacy-activation.json"
 RECEIPT_NAME = TASK_ID + ".legacy-unknown-retirement-"
 HASH = re.compile(r"[0-9a-f]{64}\Z")
 LOCKS = ("recovery.lock", "github-intake-state.lock", "dispatcher.lock",
@@ -110,6 +111,48 @@ def _validated_receipt(root: Path, decisions: Path, report: dict) -> dict | None
         return None
 
 
+def _activated(root: Path, decisions: Path, report: dict) -> bool:
+    """Only a separately published ROOT-OWNED post-apply attestation unlocks intake.
+
+    The worker's writable results receipt is insufficient on its own: the
+    queue UID could forge it without holding the admission/recovery locks.
+    """
+    try:
+        decision, digest = _decision(decisions)
+        receipt_raw, receipt_stat = guarded.snapshot(
+            _receipt_path(root, digest), maximum=131072)
+        receipt = guarded._json(receipt_raw)
+        if receipt != _receipt_payload(digest, decision, report):
+            return False
+        activation_raw, activation_stat = guarded.snapshot(
+            decisions / ACTIVATION_FILE, owner=0, maximum=131072, protected=True)
+        activation = guarded._json(activation_raw)
+        if (type(activation) is not dict
+                or set(activation) != {
+                    "schema_version", "action", "task_id", "decision_sha256",
+                    "receipt_sha256", "original_task_sha256",
+                    "original_result_sha256", "issued_at_epoch",
+                    "verification_reference", "accounting"
+                }
+                or activation["schema_version"] != "herdr-legacy-unknown-activation-v1"
+                or activation["action"] != "activate_verified_legacy_retirement"
+                or activation["task_id"] != TASK_ID
+                or activation["decision_sha256"] != digest
+                or activation["receipt_sha256"] != _sha(receipt_raw)
+                or activation["original_task_sha256"] != TASK_SHA256
+                or activation["original_result_sha256"] != RESULT_SHA256
+                or activation["accounting"] != "preserved_unknown"
+                or type(activation["issued_at_epoch"]) is not int
+                or activation["issued_at_epoch"] < decision["issued_at_epoch"]
+                or not isinstance(activation["verification_reference"], str)
+                or not 8 <= len(activation["verification_reference"]) <= 128
+                or activation_stat.st_mtime_ns < receipt_stat.st_mtime_ns):
+            return False
+        return True
+    except (EvidenceError, FileNotFoundError, OSError, TypeError, ValueError, KeyError):
+        return False
+
+
 def retired(root: Path, task: dict, *, decisions: Path | None = None) -> bool:
     """Read-only intake visibility; no canonical task mutation or minted authority."""
     if not isinstance(task, dict) or task.get("id") != TASK_ID:
@@ -121,7 +164,7 @@ def retired(root: Path, task: dict, *, decisions: Path | None = None) -> bool:
         # blocked task, not merely reuse its id.
         if task != guarded._json(originals[0]):
             return False
-        return _validated_receipt(Path(root), Path(decisions), report) is not None
+        return _activated(Path(root), Path(decisions), report)
     except (EvidenceError, FileNotFoundError, OSError, TypeError, ValueError):
         return False
 
@@ -168,8 +211,10 @@ def apply(root: Path, *, active_workers, decisions: Path | None = None,
         path = _receipt_path(root, digest)
         existing = _validated_receipt(root, decisions, report)
         if existing is not None:
-            return {"status": "already_retired", "task_id": TASK_ID,
-                    "task_outcome": "UNKNOWN", "accounting_mutated": False}
+            return {"status": ("already_retired" if _activated(root, decisions, report)
+                               else "already_prepared_pending_root_activation"),
+                    "task_id": TASK_ID, "task_outcome": "UNKNOWN",
+                    "accounting_mutated": False, "activation_performed": False}
         if os.path.lexists(path):
             raise EvidenceError("legacy_retirement_conflicting_receipt")
         # A different approval digest MUST NOT mint a second retirement event.
@@ -197,6 +242,7 @@ def apply(root: Path, *, active_workers, decisions: Path | None = None,
         current, _, _ = _evidence(root)
         if current != originals:
             raise EvidenceError("legacy_retirement_input_changed_after_publication")
-        return {"status": "legacy_unknown_retired", "task_id": TASK_ID,
-                "task_outcome": "UNKNOWN", "accounting_mutated": False,
+        return {"status": "legacy_unknown_prepared_pending_root_activation",
+                "task_id": TASK_ID, "task_outcome": "UNKNOWN",
+                "activation_performed": False, "accounting_mutated": False,
                 "automatic_retry_allowed": False, "receipt_sha256": _sha(raw_bytes)}
