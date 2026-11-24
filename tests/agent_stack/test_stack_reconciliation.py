@@ -434,6 +434,22 @@ def _inputs():
     return checkpoint_raw, waiting_raw, _paused_raw(), _observed()
 
 
+def _parts(checkpoint_raw, waiting_raw, paused_raw, decision):
+    return dict(
+        checkpoint_sha256=decision.checkpoint_sha256,
+        checkpoint_commit=decision.checkpoint_commit,
+        current_head=decision.current_head,
+        original_waiting_sha256=hashlib.sha256(waiting_raw).hexdigest(),
+        emergency_pause_sha256=hashlib.sha256(paused_raw).hexdigest())
+
+
+def _receipt(rec, parts, request_key, evidence_digest):
+    return {"kind": "admitted_proposal", "request_key": request_key,
+            "evidence_digest": evidence_digest,
+            "proposal_digest": rec.derive_proposal_digest(
+                request_key=request_key, evidence_digest=evidence_digest, **parts)}
+
+
 def test_replay_same_request_and_evidence_is_idempotent(rec):
     checkpoint_raw, waiting_raw, paused_raw, observed = _inputs()
     proposal = rec.evaluate_incident(
@@ -443,23 +459,26 @@ def test_replay_same_request_and_evidence_is_idempotent(rec):
     evidence_digest = rec.derive_evidence_digest(
         checkpoint_raw=checkpoint_raw, original_waiting_raw=waiting_raw,
         emergency_pause_raw=paused_raw, observed=observed)
-    receipt = {"kind": "admitted_proposal", "request_key": "req-1",
-               "evidence_digest": evidence_digest,
-               "proposal_digest": "b" * 64}
+    receipt = _receipt(rec, _parts(checkpoint_raw, waiting_raw, paused_raw, proposal),
+                       "req-1", evidence_digest)
     replay = rec.evaluate_incident(
         checkpoint_raw=checkpoint_raw, original_waiting_raw=waiting_raw,
         emergency_pause_raw=paused_raw, observed=observed,
         prior_receipts=(receipt,), request_key="req-1")
     assert replay.decision == rec.REPLAY_IDENTICAL_NO_START
     assert replay.replay is True
+    assert replay.proposal_digest == proposal.proposal_digest
     assert replay.direct_worker_launch_authorized is False
 
 
 def test_replay_same_request_with_changed_evidence_conflicts(rec):
     checkpoint_raw, waiting_raw, paused_raw, _ = _inputs()
     changed = _observed(operator_note="changed-after-receipt")
-    receipt = {"kind": "admitted_proposal", "request_key": "req-1",
-               "evidence_digest": "0" * 64, "proposal_digest": "c" * 64}
+    baseline = rec.evaluate_incident(
+        checkpoint_raw=checkpoint_raw, original_waiting_raw=waiting_raw,
+        emergency_pause_raw=paused_raw, observed=_observed(), request_key="req-1")
+    parts = _parts(checkpoint_raw, waiting_raw, paused_raw, baseline)
+    receipt = _receipt(rec, parts, "req-1", "0" * 64)
     conflict = rec.evaluate_incident(
         checkpoint_raw=checkpoint_raw, original_waiting_raw=waiting_raw,
         emergency_pause_raw=paused_raw, observed=changed,
@@ -468,16 +487,58 @@ def test_replay_same_request_with_changed_evidence_conflicts(rec):
     assert conflict.direct_worker_launch_authorized is False
 
 
+@pytest.mark.parametrize("order", ["matching_first", "conflicting_first"])
+def test_review_conflicting_duplicate_receipts_block_in_any_order(rec, order):
+    checkpoint_raw, waiting_raw, paused_raw, observed = _inputs()
+    baseline = rec.evaluate_incident(
+        checkpoint_raw=checkpoint_raw, original_waiting_raw=waiting_raw,
+        emergency_pause_raw=paused_raw, observed=observed, request_key="req-1")
+    parts = _parts(checkpoint_raw, waiting_raw, paused_raw, baseline)
+    matching_digest = rec.derive_evidence_digest(
+        checkpoint_raw=checkpoint_raw, original_waiting_raw=waiting_raw,
+        emergency_pause_raw=paused_raw, observed=observed)
+    matching = _receipt(rec, parts, "req-1", matching_digest)
+    conflicting = _receipt(rec, parts, "req-1", "1" * 64)
+    receipts = (matching, conflicting) if order == "matching_first" \
+        else (conflicting, matching)
+    decision = rec.evaluate_incident(
+        checkpoint_raw=checkpoint_raw, original_waiting_raw=waiting_raw,
+        emergency_pause_raw=paused_raw, observed=observed,
+        prior_receipts=receipts, request_key="req-1")
+    assert decision.reason == rec.BLOCKED_REPLAY_CONFLICT
+    assert decision.proposal_digest is None
+
+
+@pytest.mark.parametrize("fake_digest", ["0" * 64, "f" * 64])
+def test_review_arbitrary_valid_length_receipt_digest_never_replays(rec, fake_digest):
+    checkpoint_raw, waiting_raw, paused_raw, observed = _inputs()
+    baseline = rec.evaluate_incident(
+        checkpoint_raw=checkpoint_raw, original_waiting_raw=waiting_raw,
+        emergency_pause_raw=paused_raw, observed=observed, request_key="req-1")
+    parts = _parts(checkpoint_raw, waiting_raw, paused_raw, baseline)
+    evidence_digest = rec.derive_evidence_digest(
+        checkpoint_raw=checkpoint_raw, original_waiting_raw=waiting_raw,
+        emergency_pause_raw=paused_raw, observed=observed)
+    receipt = {"kind": "admitted_proposal", "request_key": "req-1",
+               "evidence_digest": evidence_digest,
+               "proposal_digest": fake_digest}
+    decision = rec.evaluate_incident(
+        checkpoint_raw=checkpoint_raw, original_waiting_raw=waiting_raw,
+        emergency_pause_raw=paused_raw, observed=observed,
+        prior_receipts=(receipt,), request_key="req-1")
+    assert decision.reason == rec.BLOCKED_MALFORMED_EVIDENCE
+    assert decision.proposal_digest is None
+
+
 def test_concurrent_admission_after_proposal_blocks(rec):
     checkpoint_raw, waiting_raw, paused_raw, observed = _inputs()
-    admitted = {
-        "kind": "admitted_proposal",
-        "request_key": "req-1",
-        "evidence_digest": rec.derive_evidence_digest(
-            checkpoint_raw=checkpoint_raw, original_waiting_raw=waiting_raw,
-            emergency_pause_raw=paused_raw, observed=observed),
-        "proposal_digest": "d" * 64,
-    }
+    baseline = rec.evaluate_incident(
+        checkpoint_raw=checkpoint_raw, original_waiting_raw=waiting_raw,
+        emergency_pause_raw=paused_raw, observed=observed, request_key="req-2")
+    parts = _parts(checkpoint_raw, waiting_raw, paused_raw, baseline)
+    admitted = _receipt(rec, parts, "req-1", rec.derive_evidence_digest(
+        checkpoint_raw=checkpoint_raw, original_waiting_raw=waiting_raw,
+        emergency_pause_raw=paused_raw, observed=observed))
     second = rec.evaluate_incident(
         checkpoint_raw=checkpoint_raw, original_waiting_raw=waiting_raw,
         emergency_pause_raw=paused_raw, observed=observed,
@@ -510,17 +571,14 @@ def test_review_request_key_none_replays_only_unbound_same_binding(rec):
     proposal = rec.evaluate_incident(**common, request_key=None)
     assert proposal.decision == rec.PROPOSE_OPERATOR_REVIEW_ONLY
     evidence_digest = rec.derive_evidence_digest(**common)
-    unbound = {"kind": "admitted_proposal", "request_key": None,
-               "evidence_digest": evidence_digest,
-               "proposal_digest": proposal.proposal_digest}
+    parts = _parts(checkpoint_raw, waiting_raw, paused_raw, proposal)
+    unbound = _receipt(rec, parts, None, evidence_digest)
     replay = rec.evaluate_incident(**common, prior_receipts=(unbound,),
                                    request_key=None)
     assert replay.decision == rec.REPLAY_IDENTICAL_NO_START
     assert isinstance(replay.proposal_digest, str) and len(replay.proposal_digest) == 64
 
-    bound = {"kind": "admitted_proposal", "request_key": "req-1",
-             "evidence_digest": evidence_digest,
-             "proposal_digest": proposal.proposal_digest}
+    bound = _receipt(rec, parts, "req-1", evidence_digest)
     cross = rec.evaluate_incident(**common, prior_receipts=(bound,),
                                   request_key=None)
     assert cross.reason == rec.BLOCKED_CONCURRENT_ADMISSION

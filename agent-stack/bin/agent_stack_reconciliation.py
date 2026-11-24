@@ -368,6 +368,32 @@ def validate_operator_review(operator: Any, current_head: str,
     return expires > now
 
 
+def build_admitted_proposal(*, request_key, evidence_digest,
+                            checkpoint_sha256, checkpoint_commit, current_head,
+                            original_waiting_sha256, emergency_pause_sha256) -> dict:
+    """Canonical admitted-proposal document shared by issue and replay."""
+    return {
+        "kind": "admitted_proposal",
+        "request_key": request_key,
+        "evidence_digest": evidence_digest,
+        "checkpoint_sha256": checkpoint_sha256,
+        "checkpoint_commit": checkpoint_commit,
+        "current_head": current_head,
+        "original_waiting_sha256": original_waiting_sha256,
+        "emergency_pause_sha256": emergency_pause_sha256,
+        "max_parent_cycles": 1,
+        "requires_new_evidence_after": True,
+        "interactive_panel_start_during_cycle": False,
+        "direct_worker_launch_authorized": False,
+        "requires_fresh_operator_acceptance": True,
+    }
+
+
+def derive_proposal_digest(**document_parts) -> str:
+    """Deterministic digest of the canonical admitted-proposal document."""
+    return digest(canonical_json(build_admitted_proposal(**document_parts)))
+
+
 def derive_evidence_digest(
     *,
     checkpoint_raw: bytes,
@@ -553,6 +579,15 @@ def evaluate_incident(
         return _blocked(BLOCKED_MALFORMED_EVIDENCE, checkpoint_sha256=checkpoint_sha256)
     if not isinstance(prior_receipts, (list, tuple)):
         return _blocked(BLOCKED_MALFORMED_EVIDENCE, checkpoint_sha256=checkpoint_sha256)
+    waiting_sha256 = digest(original_waiting_raw) if original_waiting_raw is not None else None
+    pause_sha256 = digest(emergency_pause_raw)
+    proposal_parts = {
+        "checkpoint_sha256": checkpoint_sha256,
+        "checkpoint_commit": checkpoint_commit,
+        "current_head": current_head,
+        "original_waiting_sha256": waiting_sha256,
+        "emergency_pause_sha256": pause_sha256,
+    }
     proposals = []
     for item in prior_receipts:
         if not isinstance(item, Mapping):
@@ -565,45 +600,44 @@ def evaluate_incident(
                 or not re.fullmatch(r"[0-9a-f]{64}", item["evidence_digest"]):
             return _blocked(BLOCKED_MALFORMED_EVIDENCE, checkpoint_sha256=checkpoint_sha256)
         if item.get("kind") == "admitted_proposal":
-            # The replayed digest must itself be a canonical typed value; an
-            # injected arbitrary object must never reach the decision output.
-            if type(item.get("proposal_digest")) is not str \
-                    or not re.fullmatch(r"[0-9a-f]{64}", item["proposal_digest"]):
+            # Recompute the canonical proposal from this exact request and
+            # evidence; a valid-length but arbitrary digest must never replay.
+            expected = derive_proposal_digest(
+                request_key=item.get("request_key"),
+                evidence_digest=item["evidence_digest"],
+                **proposal_parts)
+            if item.get("proposal_digest") != expected:
                 return _blocked(BLOCKED_MALFORMED_EVIDENCE,
                                 checkpoint_sha256=checkpoint_sha256)
             proposals.append(item)
-    for item in proposals:
-        if item.get("request_key") == request_key:
-            if item.get("evidence_digest") == evidence_digest:
-                return ReconciliationDecision(
-                    decision=REPLAY_IDENTICAL_NO_START, reason="replay_identical",
-                    checkpoint_sha256=checkpoint_sha256, checkpoint_commit=checkpoint_commit,
-                    current_head=current_head, proposal_digest=item.get("proposal_digest"),
-                    direct_worker_launch_authorized=False,
-                    requires_fresh_operator_acceptance=False,
-                    max_parent_cycles=None, replay=True)
-            return _blocked(BLOCKED_REPLAY_CONFLICT, checkpoint_sha256=checkpoint_sha256,
-                            checkpoint_commit=checkpoint_commit, current_head=current_head)
+    matched = [item for item in proposals
+               if item.get("request_key") == request_key]
+    if matched:
+        # Order-independent: conflicting duplicate bindings are rejected no
+        # matter which receipt appears first in the bounded inventory.
+        if len({item["evidence_digest"] for item in matched}) > 1 \
+                or any(item["evidence_digest"] != evidence_digest for item in matched):
+            return _blocked(BLOCKED_REPLAY_CONFLICT,
+                            checkpoint_sha256=checkpoint_sha256,
+                            checkpoint_commit=checkpoint_commit,
+                            current_head=current_head)
+        replay_digest = derive_proposal_digest(
+            request_key=request_key, evidence_digest=evidence_digest,
+            **proposal_parts)
+        return ReconciliationDecision(
+            decision=REPLAY_IDENTICAL_NO_START, reason="replay_identical",
+            checkpoint_sha256=checkpoint_sha256, checkpoint_commit=checkpoint_commit,
+            current_head=current_head, proposal_digest=replay_digest,
+            direct_worker_launch_authorized=False,
+            requires_fresh_operator_acceptance=False,
+            max_parent_cycles=None, replay=True)
     if proposals:
         return _blocked(BLOCKED_CONCURRENT_ADMISSION, checkpoint_sha256=checkpoint_sha256,
                         checkpoint_commit=checkpoint_commit, current_head=current_head)
 
-    proposal = {
-        "kind": "admitted_proposal",
-        "request_key": request_key,
-        "evidence_digest": evidence_digest,
-        "checkpoint_sha256": checkpoint_sha256,
-        "checkpoint_commit": checkpoint_commit,
-        "current_head": current_head,
-        "original_waiting_sha256": digest(original_waiting_raw) if original_waiting_raw is not None else None,
-        "emergency_pause_sha256": digest(emergency_pause_raw),
-        "max_parent_cycles": 1,
-        "requires_new_evidence_after": True,
-        "interactive_panel_start_during_cycle": False,
-        "direct_worker_launch_authorized": False,
-        "requires_fresh_operator_acceptance": True,
-    }
-    proposal_digest = digest(canonical_json(proposal))
+    proposal_digest = derive_proposal_digest(
+        request_key=request_key, evidence_digest=evidence_digest,
+        **proposal_parts)
     return ReconciliationDecision(
         decision=PROPOSE_OPERATOR_REVIEW_ONLY, reason="eligible_for_operator_review",
         checkpoint_sha256=checkpoint_sha256, checkpoint_commit=checkpoint_commit,
