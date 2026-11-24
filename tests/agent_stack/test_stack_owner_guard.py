@@ -1,0 +1,833 @@
+"""Fail-closed owner-guard regression suite for issue #53 (G1-G12).
+
+The first dependency-safe slice covers the Herdr supervised-consumer gate in
+agent-stack-ensure. Production recovery/reconciliation (R1-R8) is deliberately
+not implemented here and is not claimed by these tests.
+"""
+import contextlib
+import fcntl
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[2]
+GUARD_PATH = ROOT / "agent-stack" / "bin" / "agent_stack_owner_guard.py"
+ENSURE_PATH = ROOT / "agent-stack" / "bin" / "agent-stack-ensure"
+HERDR_STATE = Path("/home/agentops/.local/state/agent-stack/herdr-development")
+
+_counter = 0
+
+
+def load_module(name, path):
+    global _counter
+    _counter += 1
+    unique = f"{name}_{_counter}"
+    loader = importlib.machinery.SourceFileLoader(unique, str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    loader.exec_module(module)
+    return module
+
+
+@pytest.fixture()
+def guard():
+    return load_module("owner_guard_test", GUARD_PATH)
+
+
+def base_evidence(guard, **over):
+    values = dict(
+        consumer="Herdr",
+        repo_identity="Bbambaaamm/herdr",
+        execution_owner="none",
+        supervised=True,
+        supervisor_alive=False,
+        decision_state="PAUSED",
+        policy_hash="c" * 64,
+        policy_profile=guard.HERDR_POLICY_PROFILE,
+        expected_profile=guard.HERDR_POLICY_PROFILE,
+        configured_consumer="herdr",
+        configured_repository="Bbambaaamm/herdr",
+        budget_seconds=1500,
+        expected_budget_seconds=1500,
+        fence_states={
+            "supervisor.lock": "FREE",
+            "cycle.lock": "FREE",
+            "bootstrap.lock": "FREE",
+        },
+        active_attempts=(),
+        live_side_children=(),
+        checkpoint_digest="a" * 64,
+        sampled_at="2026-11-24T00:00:00+00:00",
+        source_digest="b" * 64,
+        fence="supervisor.lock=FREE;cycle.lock=FREE;bootstrap.lock=FREE",
+    )
+    values.update(over)
+    return guard.OwnerEvidence(**values)
+
+
+def obs_dict(guard, **over):
+    """Internal observation shape consumed by build_owner_evidence."""
+    values = dict(
+        agent_id="herdr-hermes",
+        consumer="Herdr",
+        repository="Bbambaaamm/herdr",
+        supervised=True,
+        state="PAUSED",
+        supervisor_alive=False,
+        recorded_identity=None,
+        observed_identity=None,
+        decision_state=None,
+        checkpoint_digest="a" * 64,
+        fence_states={
+            "supervisor.lock": "FREE",
+            "cycle.lock": "FREE",
+            "bootstrap.lock": "FREE",
+        },
+        budget_seconds=1500,
+        expected_budget_seconds=1500,
+        policy_hash="c" * 64,
+        policy_profile=guard.HERDR_POLICY_PROFILE,
+        expected_profile=guard.HERDR_POLICY_PROFILE,
+        configured_consumer="herdr",
+        configured_repository="Bbambaaamm/herdr",
+        active_attempts=(),
+        live_side_children=(),
+        interactive_owner=None,
+        sampled_at="2026-11-24T00:00:00+00:00",
+    )
+    values.update(over)
+    return values
+
+
+def write_json(path, value, mode=0o600):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+    os.chmod(path, mode)
+
+
+def write_policy(repo_root, profile="herdr-core", consumer="herdr",
+                 repository="Bbambaaamm/herdr"):
+    path = repo_root / "configs" / "consumers" / "herdr.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "schema_version: 1\n"
+        f"consumer: {consumer}\n"
+        f"repository: {repository}\n"
+        f"policy_profile: {profile}\n"
+        "hard_invariants:\n"
+        "  - no_direct_main_write\n",
+        encoding="utf-8",
+    )
+    os.chmod(path, 0o600)
+
+
+@contextlib.contextmanager
+def held_lock(path):
+    fd = os.open(str(path), os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def make_host(guard, tmp_path, *, state="CONTINUE", start_ticks=None,
+              command_sha256=None, budget_seconds=1500, profile="herdr-core",
+              consumer="herdr", repository="Bbambaaamm/herdr",
+              pending=(), uncertain_blocked=(), side_processes=(),
+              checkpoint=b'{"task": "fixture"}'):
+    """Build a synthetic but host-verified Herdr supervisor authority tree."""
+    pid = os.getpid()
+    identity = guard.process_identity(pid)
+    if identity is None:
+        pytest.skip("no live process identity available")
+    recorded = {
+        "pid": pid,
+        "start_ticks": identity["start_ticks"],
+        "command_sha256": identity["command_sha256"],
+        "session": identity["session"],
+    }
+    if start_ticks is not None:
+        recorded["start_ticks"] = str(start_ticks)
+    if command_sha256 is not None:
+        recorded["command_sha256"] = str(command_sha256)
+
+    state_dir = tmp_path / "state"
+    job = state_dir / "20260101T000000000000Z"
+    job.mkdir(parents=True, mode=0o700)
+    (job / "checkpoint.json").write_bytes(checkpoint)
+    os.chmod(job / "checkpoint.json", 0o600)
+    checkpoint_sha = hashlib.sha256(checkpoint).hexdigest()
+    write_json(state_dir / "supervisor.json", {
+        "supervisor": recorded,
+        "state": state,
+        "current_job": str(job),
+        "decision": {"status": state, "checkpoint_sha256": checkpoint_sha},
+    })
+    write_json(job / "launch.json", {
+        "budget_seconds": budget_seconds,
+        "max_turns": 120,
+        "side_processes": list(side_processes),
+        "exit_code": 0,
+    })
+    for name in guard.SUPERVISOR_LOCK_NAMES:
+        lock = state_dir / name
+        lock.write_bytes(b"")
+        os.chmod(lock, 0o600)
+
+    repo_root = tmp_path / "repo"
+    write_policy(repo_root, profile=profile, consumer=consumer, repository=repository)
+    tasks_root = tmp_path / "tasks"
+    for folder, items in (("pending", pending), ("blocked", uncertain_blocked)):
+        directory = tasks_root / folder
+        directory.mkdir(parents=True, exist_ok=True)
+        for index, task in enumerate(items):
+            write_json(directory / f"task-{index}.json", task)
+    return {
+        "state_dir": state_dir,
+        "job": job,
+        "repo_root": repo_root,
+        "tasks_root": tasks_root,
+        "identity": identity,
+        "recorded": recorded,
+    }
+
+
+class FakeAtomicAuthority:
+    """Reference implementation of the atomic reservation seam for fixtures.
+
+    The production slice supplies no authority, so real reservation calls deny.
+    This fake exists only to prove the guard contract (one token, generation
+    binding, replay idempotency) and is not deployed.
+    """
+
+    def __init__(self, root, approved_token="owner-token"):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.fence = self.root / "interactive.start.fence"
+        self.receipts = self.root / "receipts.json"
+        self.approved = approved_token
+        self.current_generation = "gen-1"
+
+    def reserve(self, *, consumer, repository, observed_generation, operator_authority):
+        fd = os.open(str(self.fence), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            receipts = {}
+            if self.receipts.exists():
+                receipts = json.loads(self.receipts.read_text(encoding="utf-8"))
+            request = hashlib.sha256(json.dumps({
+                "consumer": consumer, "repository": repository,
+                "observed_generation": observed_generation,
+                "operator_authority": operator_authority,
+            }, sort_keys=True).encode("utf-8")).hexdigest()
+            if observed_generation != self.current_generation:
+                return SimpleNamespace(
+                    granted=False, token=None, replay=False,
+                    reason="generation_changed", observed_generation=observed_generation,
+                )
+            if request in receipts:
+                stored = receipts[request]
+                return SimpleNamespace(
+                    granted=True, token=stored["token"], replay=True,
+                    reason="already_reserved", observed_generation=observed_generation,
+                )
+            if operator_authority != self.approved:
+                return SimpleNamespace(
+                    granted=False, token=None, replay=False,
+                    reason="operator_authority_rejected",
+                    observed_generation=observed_generation,
+                )
+            token = "tok-" + hashlib.sha256(
+                (request + str(len(receipts))).encode("utf-8")
+            ).hexdigest()[:16]
+            receipts[request] = {"token": token, "observed_generation": observed_generation}
+            temporary = self.receipts.with_suffix(".tmp")
+            temporary.write_text(json.dumps(receipts), encoding="utf-8")
+            os.replace(temporary, self.receipts)
+            return SimpleNamespace(
+                granted=True, token=token, replay=False,
+                reason="reserved", observed_generation=observed_generation,
+            )
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+def active_evidence(guard, **over):
+    values = dict(decision_state="CONTINUE", supervisor_alive=True,
+                  fence_states={"supervisor.lock": "HELD", "cycle.lock": "HELD",
+                                "bootstrap.lock": "FREE"})
+    values.update(over)
+    return base_evidence(guard, **values)
+
+
+def interactive_evidence(guard):
+    return base_evidence(
+        guard,
+        supervised=False,
+        execution_owner="interactive",
+        decision_state=None,
+        expected_profile=None,
+        fence_states={},
+    )
+
+
+# --------------------------------------------------------------------------
+# G1: PAUSED + panel absent => BLOCKED_RECONCILIATION_REQUIRED, agent.start 0x
+# --------------------------------------------------------------------------
+
+def test_g1_paused_is_reconciliation_not_start(guard):
+    decision = guard.evaluate_ownership(base_evidence(guard))
+    assert decision.code == guard.DECISION_BLOCKED_RECONCILIATION
+    assert guard.plan_agent_start(base_evidence(guard), None) == guard.DECISION_BLOCKED_RECONCILIATION
+
+
+def test_g1_ensure_calls_agent_start_zero_times(guard, monkeypatch, tmp_path):
+    ensure = load_module("ensure_g1", ENSURE_PATH)
+    monkeypatch.setattr(ensure.owner_guard, "collect_herdr_observation",
+                        lambda *a, **k: obs_dict(guard))
+    monkeypatch.setattr(ensure, "list_agents", lambda: [])
+    monkeypatch.setattr(ensure, "log", lambda message: None)
+    monkeypatch.setattr(ensure, "GUARD_AUDIT_LOG", tmp_path / "audit.jsonl")
+    calls = []
+
+    def fake_run(args, timeout=30):
+        calls.append(list(args))
+        return ensure.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ensure, "run", fake_run)
+    group = {"label": "Herdr", "repository": "Bbambaaamm/herdr"}
+    spec = {"tab": "Hermes", "name": "herdr-hermes", "kind": "hermes",
+            "args": ["-p", "quantlab", "chat"]}
+    action = ensure.ensure_agent("w4", spec, group)
+    assert action == guard.DECISION_BLOCKED_RECONCILIATION
+    assert not any("agent" in call and "start" in call for call in calls)
+
+
+@pytest.mark.skipif(not (HERDR_STATE / "supervisor.json").exists(),
+                    reason="real Herdr supervisor state is host-specific")
+def test_g1_real_host_paused_incident_blocks_and_preserves_evidence(guard, tmp_path):
+    job = HERDR_STATE / "20261122T170339139503Z"
+    protected = ("checkpoint.json", "continuation.json",
+                 "unaccepted-continuation.json", "return-code.json")
+    before = {name: hashlib.sha256((job / name).read_bytes()).hexdigest()
+              for name in protected if (job / name).exists()}
+
+    decision = guard.decide_herdr_agent_start(
+        "Herdr", "Bbambaaamm/herdr", "herdr-hermes",
+        audit_path=tmp_path / "audit.jsonl",
+    )
+
+    after = {name: hashlib.sha256((job / name).read_bytes()).hexdigest()
+             for name in protected if (job / name).exists()}
+    assert before == after
+    assert decision.code == guard.DECISION_BLOCKED_RECONCILIATION
+    assert decision.evidence.checkpoint_digest == before.get("checkpoint.json")
+    records = [json.loads(line) for line in
+               (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert records[-1]["event"] == guard.DECISION_BLOCKED_RECONCILIATION
+    assert records[-1]["consumer"] == "Herdr"
+    assert records[-1]["operation"] == "agent.start"
+    assert records[-1]["actor"] == "agent-stack-watchdog"
+    assert records[-1]["decision_digest"]
+
+
+# --------------------------------------------------------------------------
+# G2: supervisor RUNNING + panel absent => SKIPPED_SUPERVISOR_OWNED, 0x
+# --------------------------------------------------------------------------
+
+def test_g2_active_supervisor_with_held_fence_is_skipped(guard, tmp_path):
+    host = make_host(guard, tmp_path, state="CONTINUE")
+    with held_lock(host["state_dir"] / "supervisor.lock"):
+        evidence = guard.get_execution_ownership(
+            "Herdr", "Bbambaaamm/herdr", "herdr-hermes",
+            state_dir=host["state_dir"], repo_root=host["repo_root"],
+            tasks_root=host["tasks_root"],
+        )
+        decision = guard.evaluate_ownership(evidence)
+    assert evidence.execution_owner == "supervised"
+    assert evidence.supervisor_alive is True
+    assert decision.code == guard.DECISION_SKIPPED_SUPERVISOR_OWNED
+
+
+def test_g2_ensure_skips_without_start(guard, monkeypatch, tmp_path):
+    ensure = load_module("ensure_g2", ENSURE_PATH)
+    monkeypatch.setattr(ensure.owner_guard, "collect_herdr_observation", lambda *a, **k: obs_dict(
+        guard, state="CONTINUE", supervisor_alive=True,
+        decision_state="CONTINUE",
+        fence_states={"supervisor.lock": "HELD", "cycle.lock": "HELD",
+                      "bootstrap.lock": "FREE"},
+    ))
+    monkeypatch.setattr(ensure, "list_agents", lambda: [])
+    monkeypatch.setattr(ensure, "log", lambda message: None)
+    monkeypatch.setattr(ensure, "GUARD_AUDIT_LOG", tmp_path / "audit.jsonl")
+    calls = []
+
+    def fake_run(args, timeout=30):
+        calls.append(list(args))
+        return ensure.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ensure, "run", fake_run)
+    group = {"label": "Herdr", "repository": "Bbambaaamm/herdr"}
+    spec = {"tab": "Hermes", "name": "herdr-hermes", "kind": "hermes", "args": []}
+    action = ensure.ensure_agent("w4", spec, group)
+    assert action == guard.DECISION_SKIPPED_SUPERVISOR_OWNED
+    assert calls == []
+
+
+# --------------------------------------------------------------------------
+# G3: missing/corrupt/symlink/oversize authority evidence => fail closed, 0x
+# --------------------------------------------------------------------------
+
+def test_g3_invalid_supervisor_evidence_fails_closed(guard, tmp_path):
+    repo_root = tmp_path / "repo"
+    write_policy(repo_root)
+    tasks_root = tmp_path / "tasks"
+    tasks_root.mkdir()
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    with pytest.raises(guard.GuardObservationError):
+        guard.get_execution_ownership(
+            "Herdr", "Bbambaaamm/herdr", "herdr-hermes",
+            state_dir=state_dir, repo_root=repo_root, tasks_root=tasks_root,
+        )
+    assert guard.decide_herdr_agent_start(
+        "Herdr", "Bbambaaamm/herdr", "herdr-hermes",
+        state_dir=state_dir, repo_root=repo_root, tasks_root=tasks_root,
+        audit_path=tmp_path / "audit.jsonl",
+    ).code == guard.DECISION_BLOCKED_UNKNOWN
+
+    corrupt = state_dir / "corrupt.json"
+    corrupt.write_bytes(b"this is not json")
+    os.symlink(corrupt, state_dir / "supervisor.json")
+    with pytest.raises(guard.GuardObservationError) as symlink_error:
+        guard.get_execution_ownership(
+            "Herdr", "Bbambaaamm/herdr", "herdr-hermes",
+            state_dir=state_dir, repo_root=repo_root, tasks_root=tasks_root,
+        )
+    assert symlink_error.value.reason == "symlink"
+    state_dir.joinpath("supervisor.json").unlink()
+
+    oversize = tmp_path / "oversize.json"
+    oversize.write_bytes(b"x" * (guard.BOUNDED_BYTES_LIMIT + 1))
+    os.replace(oversize, state_dir / "supervisor.json")
+    with pytest.raises(guard.GuardObservationError) as oversize_error:
+        guard.get_execution_ownership(
+            "Herdr", "Bbambaaamm/herdr", "herdr-hermes",
+            state_dir=state_dir, repo_root=repo_root, tasks_root=tasks_root,
+        )
+    assert oversize_error.value.reason == "oversize"
+    state_dir.joinpath("supervisor.json").unlink()
+
+    write_json(state_dir / "supervisor.json", {"state": "NOT_A_STATE"})
+    with pytest.raises(guard.GuardObservationError) as state_error:
+        guard.get_execution_ownership(
+            "Herdr", "Bbambaaamm/herdr", "herdr-hermes",
+            state_dir=state_dir, repo_root=repo_root, tasks_root=tasks_root,
+        )
+    assert state_error.value.reason == "supervisor_state_invalid"
+
+
+# --------------------------------------------------------------------------
+# G4: pending/running/uncertain durable task or live side child => 0x
+# --------------------------------------------------------------------------
+
+def test_g4_pending_durable_attempt_blocks(guard, tmp_path):
+    host = make_host(guard, tmp_path, state="CONTINUE",
+                     pending=[{"id": "task-1", "repo": "Bbambaaamm/herdr"}])
+    with held_lock(host["state_dir"] / "supervisor.lock"):
+        decision = guard.decide_herdr_agent_start(
+            "Herdr", "Bbambaaamm/herdr", "herdr-hermes",
+            state_dir=host["state_dir"], repo_root=host["repo_root"],
+            tasks_root=host["tasks_root"], audit_path=tmp_path / "audit.jsonl",
+        )
+    assert decision.code == guard.DECISION_BLOCKED_ATTEMPT
+    assert decision.evidence.active_attempts
+
+
+def test_g4_live_side_child_blocks(guard, tmp_path):
+    host = make_host(guard, tmp_path, state="CONTINUE",
+                     side_processes=[host_identity := guard.process_identity(os.getpid())])
+    with held_lock(host["state_dir"] / "supervisor.lock"):
+        decision = guard.decide_herdr_agent_start(
+            "Herdr", "Bbambaaamm/herdr", "herdr-hermes",
+            state_dir=host["state_dir"], repo_root=host["repo_root"],
+            tasks_root=host["tasks_root"], audit_path=tmp_path / "audit.jsonl",
+        )
+    assert decision.code == guard.DECISION_BLOCKED_ATTEMPT
+    assert str(os.getpid()) in decision.evidence.live_side_children
+    assert host_identity is not None
+
+
+# --------------------------------------------------------------------------
+# G5: stale PID identity is never accepted as the supervisor
+# --------------------------------------------------------------------------
+
+def test_g5_stale_pid_with_wrong_start_ticks_is_not_authority(guard, tmp_path):
+    host = make_host(guard, tmp_path, state="CONTINUE", start_ticks="1")
+    with held_lock(host["state_dir"] / "supervisor.lock"):
+        decision = guard.decide_herdr_agent_start(
+            "Herdr", "Bbambaaamm/herdr", "herdr-hermes",
+            state_dir=host["state_dir"], repo_root=host["repo_root"],
+            tasks_root=host["tasks_root"], audit_path=tmp_path / "audit.jsonl",
+        )
+    assert decision.code == guard.DECISION_BLOCKED_UNKNOWN
+    assert decision.reason == "stale_supervisor_identity"
+    assert decision.evidence.supervisor_alive is False
+
+
+def test_g5_command_sha_mismatch_is_not_authority(guard, tmp_path):
+    host = make_host(guard, tmp_path, state="WAITING", command_sha256="0" * 64)
+    with held_lock(host["state_dir"] / "supervisor.lock"):
+        decision = guard.decide_herdr_agent_start(
+            "Herdr", "Bbambaaamm/herdr", "herdr-hermes",
+            state_dir=host["state_dir"], repo_root=host["repo_root"],
+            tasks_root=host["tasks_root"], audit_path=tmp_path / "audit.jsonl",
+        )
+    assert decision.code == guard.DECISION_BLOCKED_UNKNOWN
+    assert guard.identity_matches(host["recorded"], host["identity"]) is False
+    assert guard.identity_matches(
+        {**host["recorded"], "command_sha256": host["identity"]["command_sha256"]},
+        host["identity"],
+    ) is True
+
+
+# --------------------------------------------------------------------------
+# G6-G8: atomic reservation seam (fake existing authority in fixtures)
+# --------------------------------------------------------------------------
+
+def test_g6_concurrent_watchdog_runs_grant_one_token(guard, tmp_path):
+    authority = FakeAtomicAuthority(tmp_path / "authority")
+    barrier = threading.Barrier(2)
+    results = []
+
+    def worker():
+        barrier.wait()
+        results.append(guard.reserve_interactive_start(
+            "OtherConsumer", "org/repo", "gen-1", "owner-token", authority=authority,
+        ))
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert len(results) == 2
+    tokens = {result.token for result in results if result.granted}
+    assert len(tokens) == 1
+    evidence = interactive_evidence(guard)
+    plans = [guard.plan_agent_start(evidence, result) for result in results]
+    assert plans.count("start") == 1
+    assert plans.count("already-reserved") == 1
+
+
+def test_g7_snapshot_to_reserve_generation_race_denies(guard, tmp_path):
+    authority = FakeAtomicAuthority(tmp_path / "authority")
+    granted = guard.reserve_interactive_start(
+        "OtherConsumer", "org/repo", "gen-1", "owner-token", authority=authority,
+    )
+    assert granted.granted is True
+    authority.current_generation = "gen-2"
+    raced = guard.reserve_interactive_start(
+        "OtherConsumer", "org/repo", "gen-1", "owner-token", authority=authority,
+    )
+    assert raced.granted is False
+    assert guard.plan_agent_start(interactive_evidence(guard), raced) != "start"
+
+
+def test_g8_replay_same_request_after_restart_does_not_start_twice(guard, tmp_path):
+    authority = FakeAtomicAuthority(tmp_path / "authority")
+    first = guard.reserve_interactive_start(
+        "OtherConsumer", "org/repo", "gen-1", "owner-token", authority=authority,
+    )
+    replay = guard.reserve_interactive_start(
+        "OtherConsumer", "org/repo", "gen-1", "owner-token", authority=authority,
+    )
+    assert first.granted and replay.granted
+    assert first.token == replay.token
+    assert replay.replay is True
+    evidence = interactive_evidence(guard)
+    plans = [guard.plan_agent_start(evidence, first),
+             guard.plan_agent_start(evidence, replay)]
+    assert plans.count("start") == 1
+    assert plans.count("already-reserved") == 1
+
+
+def test_g8_no_atomic_authority_api_denies_instead_of_improvising(guard, tmp_path):
+    denied = guard.reserve_interactive_start(
+        "Herdr", "Bbambaaamm/herdr", "gen-1", "owner-token",
+        audit_path=tmp_path / "audit.jsonl",
+    )
+    assert denied.granted is False
+    assert denied.code == guard.DECISION_BLOCKED_UNKNOWN
+    assert denied.reason == "no_atomic_authority_api"
+
+
+# --------------------------------------------------------------------------
+# G9: hard policy/budget/fence mismatch => deny, no fallback model
+# --------------------------------------------------------------------------
+
+def test_g9_hard_policy_budget_and_fence_mismatches_deny(guard, tmp_path):
+    profile = guard.evaluate_ownership(
+        active_evidence(guard, policy_profile="other-profile"))
+    assert profile.code == guard.DECISION_BLOCKED_POLICY
+
+    budget = guard.evaluate_ownership(
+        active_evidence(guard, budget_seconds=9999, expected_budget_seconds=1500))
+    assert budget.code == guard.DECISION_BLOCKED_POLICY
+
+    wrong_policy_host = make_host(guard, tmp_path, state="CONTINUE",
+                                  repository="Other/repo")
+    with held_lock(wrong_policy_host["state_dir"] / "supervisor.lock"):
+        wrong_policy = guard.decide_herdr_agent_start(
+            "Herdr", "Bbambaaamm/herdr", "herdr-hermes",
+            state_dir=wrong_policy_host["state_dir"],
+            repo_root=wrong_policy_host["repo_root"],
+            tasks_root=wrong_policy_host["tasks_root"],
+            audit_path=tmp_path / "audit.jsonl",
+        )
+    assert wrong_policy.code == guard.DECISION_BLOCKED_POLICY
+    assert wrong_policy.reason == "host_policy_identity_mismatch"
+
+    missing_fence = guard.evaluate_ownership(base_evidence(
+        guard, decision_state="CONTINUE", supervisor_alive=True,
+        fence_states={"supervisor.lock": "MISSING", "cycle.lock": "FREE",
+                      "bootstrap.lock": "FREE"},
+    ))
+    assert missing_fence.code == guard.DECISION_BLOCKED_UNKNOWN
+
+    not_held = guard.evaluate_ownership(base_evidence(
+        guard, decision_state="CONTINUE", supervisor_alive=True,
+        fence_states={"supervisor.lock": "FREE", "cycle.lock": "FREE",
+                      "bootstrap.lock": "FREE"},
+    ))
+    assert not_held.code == guard.DECISION_BLOCKED_UNKNOWN
+
+    orphan = guard.evaluate_ownership(base_evidence(
+        guard, decision_state="ERROR", supervisor_alive=False,
+        fence_states={"supervisor.lock": "HELD", "cycle.lock": "FREE",
+                      "bootstrap.lock": "FREE"},
+    ))
+    assert orphan.code == guard.DECISION_BLOCKED_UNKNOWN
+
+    for decision in (profile, budget, wrong_policy, missing_fence, not_held, orphan):
+        assert guard.plan_agent_start(decision.evidence, None) != "start"
+
+
+# --------------------------------------------------------------------------
+# G10: clean interactive authority + acquired fence => exactly one start
+# --------------------------------------------------------------------------
+
+def test_g10_interactive_clean_authority_starts_once_then_zero(guard, tmp_path):
+    authority = FakeAtomicAuthority(tmp_path / "authority")
+    evidence = interactive_evidence(guard)
+    decision = guard.evaluate_ownership(evidence)
+    assert decision.code == guard.DECISION_RESTORED_INTERACTIVE
+    reservation = guard.reserve_interactive_start(
+        "OtherConsumer", "org/repo", "gen-1", "owner-token", authority=authority,
+    )
+    assert reservation.granted is True
+    assert guard.plan_agent_start(evidence, reservation, agent_present=False) == "start"
+    assert guard.plan_agent_start(evidence, reservation, agent_present=True) == "healthy"
+
+
+# --------------------------------------------------------------------------
+# G11: Herdr block does not stop independent consumers
+# --------------------------------------------------------------------------
+
+def test_g11_herdr_block_is_isolated_from_other_consumers(guard, monkeypatch, tmp_path):
+    ensure = load_module("ensure_g11", ENSURE_PATH)
+    ensure.DESIRED = [
+        {"label": "Majak", "cwd": "/tmp/majak", "agents": [
+            {"tab": "Codex", "name": "majak-codex", "kind": "codex", "args": []},
+            {"tab": "Hermes", "name": "majak-hermes", "kind": "hermes",
+             "args": ["-p", "majak", "chat"]},
+        ]},
+        {"label": "Herdr", "cwd": "/tmp/herdr", "repository": "Bbambaaamm/herdr",
+         "repo_url": "https://github.com/Bbambaaamm/herdr.git", "agents": [
+            {"tab": "Codex", "name": "herdr-codex", "kind": "codex", "args": []},
+            {"tab": "Hermes", "name": "herdr-hermes", "kind": "hermes",
+             "args": ["-p", "quantlab", "chat"]},
+        ]},
+    ]
+    started = set()
+    calls = []
+    monkeypatch.setattr(ensure, "log", lambda message: None)
+    monkeypatch.setattr(ensure, "GUARD_AUDIT_LOG", tmp_path / "audit.jsonl")
+    monkeypatch.setattr(ensure, "ensure_desktop_commander", lambda: None)
+    monkeypatch.setattr(ensure, "ensure_herdr_server", lambda: None)
+    monkeypatch.setattr(ensure, "ensure_repo_checkout", lambda *a: None)
+    monkeypatch.setattr(ensure, "ensure_workspace", lambda label, cwd: "wid")
+    monkeypatch.setattr(ensure, "ensure_tabs", lambda *a: None)
+    monkeypatch.setattr(ensure, "list_agents", lambda: [
+        {"name": name, "interactive_ready": True, "agent_status": "idle"}
+        for name in started
+    ])
+    monkeypatch.setattr(ensure, "list_tabs", lambda: [
+        {"workspace_id": "wid", "label": "Codex", "tab_id": "t1"},
+        {"workspace_id": "wid", "label": "Hermes", "tab_id": "t2"},
+    ])
+    monkeypatch.setattr(ensure, "list_panes", lambda workspace_id: [
+        {"tab_id": "t1", "pane_id": "p1"},
+        {"tab_id": "t2", "pane_id": "p2"},
+    ])
+    monkeypatch.setattr(ensure.owner_guard, "collect_herdr_observation",
+                        lambda *a, **k: obs_dict(guard, state="PAUSED"))
+
+    def fake_run(args, timeout=30):
+        calls.append(list(args))
+        if "agent" in args and "start" in args:
+            started.add(args[args.index("start") + 1])
+        return ensure.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ensure, "run", fake_run)
+    ensure.main()
+
+    assert "herdr-hermes" not in started
+    assert {"majak-codex", "majak-hermes", "herdr-codex"} <= started
+    assert not any("herdr-hermes" in call for call in calls
+                   if "agent" in call and "start" in call)
+
+
+def test_g11_fake_cli_sandbox_isolates_consumers(guard, tmp_path):
+    """M2: exercise the real subprocess path against a fake Herdr CLI."""
+    ensure = load_module("ensure_g11_cli", ENSURE_PATH)
+    cli = tmp_path / "herdr-fake"
+    state_file = tmp_path / "fake-state.json"
+    calls_file = tmp_path / "fake-calls.jsonl"
+    cli.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "args = sys.argv[1:]\n"
+        "Path(os.environ['FAKE_CALLS']).open('a').write(json.dumps(args) + '\\n')\n"
+        "state_path = Path(os.environ['FAKE_STATE'])\n"
+        "state = json.loads(state_path.read_text()) if state_path.exists() else {'started': []}\n"
+        "def emit(obj):\n"
+        "    print(json.dumps(obj))\n"
+        "if args[:2] == ['workspace', 'list']:\n"
+        "    emit({'result': {'workspaces': [\n"
+        "        {'workspace_id': 'w4', 'label': 'Majak'},\n"
+        "        {'workspace_id': 'w4', 'label': 'Herdr'},\n"
+        "    ]}})\n"
+        "elif args[:2] == ['tab', 'list']:\n"
+        "    emit({'result': {'tabs': [\n"
+        "        {'workspace_id': 'w4', 'label': 'Codex', 'tab_id': 't1'},\n"
+        "        {'workspace_id': 'w4', 'label': 'Hermes', 'tab_id': 't2'},\n"
+        "    ]}})\n"
+        "elif args[:2] == ['pane', 'list']:\n"
+        "    emit({'result': {'panes': [\n"
+        "        {'workspace_id': 'w4', 'tab_id': 't1', 'pane_id': 'p1'},\n"
+        "        {'workspace_id': 'w4', 'tab_id': 't2', 'pane_id': 'p2'},\n"
+        "    ]}})\n"
+        "elif args[:2] == ['agent', 'list']:\n"
+        "    emit({'result': {'agents': [\n"
+        "        {'name': n, 'interactive_ready': True, 'agent_status': 'idle'}\n"
+        "        for n in state.get('started', [])]}})\n"
+        "elif 'start' in args:\n"
+        "    name = args[args.index('start') + 1]\n"
+        "    state.setdefault('started', []).append(name)\n"
+        "    state_path.write_text(json.dumps(state))\n"
+        "    print('')\n"
+        "else:\n"
+        "    print('')\n",
+        encoding="utf-8",
+    )
+    os.chmod(cli, 0o755)
+    ensure.HERDR = cli
+    ensure.ENV = dict(ensure.ENV, FAKE_STATE=str(state_file), FAKE_CALLS=str(calls_file))
+    ensure.DESIRED = [
+        {"label": "Majak", "cwd": "/tmp/majak", "agents": [
+            {"tab": "Codex", "name": "majak-codex", "kind": "codex", "args": []},
+            {"tab": "Hermes", "name": "majak-hermes", "kind": "hermes",
+             "args": ["-p", "majak", "chat"]}]},
+        {"label": "Herdr", "cwd": "/tmp/herdr", "repository": "Bbambaaamm/herdr",
+         "repo_url": "https://github.com/Bbambaaamm/herdr.git", "agents": [
+            {"tab": "Codex", "name": "herdr-codex", "kind": "codex", "args": []},
+            {"tab": "Hermes", "name": "herdr-hermes", "kind": "hermes",
+             "args": ["-p", "quantlab", "chat"]}]},
+    ]
+    ensure.log = lambda message: None
+    ensure.GUARD_AUDIT_LOG = tmp_path / "audit.jsonl"
+    ensure.ensure_desktop_commander = lambda: None
+    ensure.ensure_herdr_server = lambda: None
+    ensure.ensure_repo_checkout = lambda *args: None
+    ensure.owner_guard.collect_herdr_observation = (
+        lambda *args, **kwargs: obs_dict(guard, state="PAUSED"))
+
+    ensure.main()
+
+    started = json.loads(state_file.read_text())["started"]
+    assert "herdr-hermes" not in started
+    assert {"majak-codex", "majak-hermes", "herdr-codex"} <= set(started)
+    start_calls = [json.loads(line) for line in calls_file.read_text().splitlines()
+                   if "start" in json.loads(line)]
+    assert all("herdr-hermes" not in call for call in start_calls)
+
+
+# --------------------------------------------------------------------------
+# G12: active release path is the deployment boundary
+# --------------------------------------------------------------------------
+
+def test_g12_real_active_release_path_and_nonactive_copy(guard):
+    active = Path("/opt/herdr/current/agent-stack/bin/agent-stack-ensure")
+    if not active.is_file():
+        pytest.skip("active /opt/herdr/current release is host-specific")
+    release_dir = Path("/opt/herdr/current").resolve()
+    assert release_dir.is_dir()
+    assert str(release_dir).startswith("/opt/herdr/releases/")
+
+    expected = None
+    for line in (release_dir / "MANIFEST.sha256").read_text(
+            encoding="utf-8").splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[1].strip() == "agent-stack/bin/agent-stack-ensure":
+            expected = parts[0]
+    assert expected is not None
+    active_sha = hashlib.sha256(active.read_bytes()).hexdigest()
+    assert active_sha == expected
+
+    # Owner-verified RC6 payload identity, pinned independently of the branch
+    # manifest so a development checkout cannot masquerade as deployment.
+    release_json = json.loads((release_dir / "RELEASE.json").read_text(encoding="utf-8"))
+    assert release_json["tag"] == "v0.3.0-router-v5-p1d-rc6"
+    assert release_json["commit"] == "8d8ad50375557b7ac77348e6475cb455682f4a9a"
+
+    watchdog = (ROOT / "agent-stack" / "bin" / "agent-stack-watchdog").read_text(encoding="utf-8")
+    assert 'BIN_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"' in watchdog
+    assert 'ENSURE="$BIN_DIR/agent-stack-ensure"' in watchdog
+
+    local = Path("/home/agentops/.local/bin/agent-stack-ensure")
+    assert local.exists()
+    assert local.resolve() != active.resolve()
+    assert hashlib.sha256(local.resolve().read_bytes()).hexdigest() != active_sha
+
+    # A guard-only command through a non-active copy must not deploy anything.
+    before = hashlib.sha256(active.read_bytes()).hexdigest()
+    decision = guard.evaluate_ownership(base_evidence(guard))
+    after = hashlib.sha256(active.read_bytes()).hexdigest()
+    assert decision.code == guard.DECISION_BLOCKED_RECONCILIATION
+    assert before == after == active_sha
+
+
+def test_scope_ensure_has_no_generic_resume_or_checkpoint_writer():
+    source = ENSURE_PATH.read_text(encoding="utf-8").lower()
+    assert "resume" not in source
+    assert "--resume-reviewed" not in source
+    assert "checkpoint.json" not in source

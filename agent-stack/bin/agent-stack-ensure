@@ -13,6 +13,7 @@ HERDR = HOME / ".local/bin/herdr"
 DC = HOME / ".local/desktop-commander/node_modules/.bin/desktop-commander"
 STATE = HOME / ".local/state/agent-stack"
 LOG = STATE / "ensure.log"
+GUARD_AUDIT_LOG = STATE / "owner-guard-audit.jsonl"
 HERDR_BOOT_LOG = STATE / "herdr-autostart.log"
 DC_BOOT_LOG = STATE / "desktop-commander-autostart.log"
 CHECKOUT_CLONE_TIMEOUT_SECONDS = 60
@@ -20,6 +21,27 @@ AGENT_START_TIMEOUT_SECONDS = 70
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from herdr.launch_environment import sanitize_environment
+
+# The execution-ownership guard ships beside this entrypoint. A missing guard
+# fails closed instead of silently restoring the old unguarded start path.
+GUARD_PATH = Path(__file__).resolve().parent / "agent_stack_owner_guard.py"
+
+
+def _load_owner_guard():
+    import importlib.machinery
+    import importlib.util
+
+    loader = importlib.machinery.SourceFileLoader("agent_stack_owner_guard", str(GUARD_PATH))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    loader.exec_module(module)
+    return module
+
+
+if not GUARD_PATH.is_file():
+    raise RuntimeError("owner guard module missing next to agent-stack-ensure")
+owner_guard = _load_owner_guard()
 
 ENV = os.environ.copy()
 ENV["HOME"] = str(HOME)
@@ -323,10 +345,38 @@ def pane_for_tab(workspace_id, tab_id):
         raise RuntimeError(f"No pane found for {tab_id}")
     return panes[0]["pane_id"]
 
-def ensure_agent(workspace_id, spec):
+def decide_herdr_agent_start(spec, group):
+    """Fail-closed ownership check for the supervised Herdr Hermes consumer.
+
+    Only this consumer has an existing supervisor/admission authority in the
+    first dependency-safe slice. Other consumers keep their previous behavior.
+    """
+    repository = str(group.get("repository") or "Bbambaaamm/herdr")
+    return owner_guard.decide_herdr_agent_start(
+        "Herdr",
+        repository,
+        spec["name"],
+        audit_path=GUARD_AUDIT_LOG,
+        actor="agent-stack-watchdog",
+        operation="agent.start",
+    )
+
+
+def ensure_agent(workspace_id, spec, group=None):
     if spec["name"] in healthy_agent_names():
         log(f"{spec['name']}: healthy")
-        return
+        return "healthy"
+    if (
+        group is not None
+        and group.get("label") == "Herdr"
+        and spec.get("kind") == "hermes"
+    ):
+        decision = decide_herdr_agent_start(spec, group)
+        message = f"{spec['name']}: {decision.code} ({decision.reason})"
+        if str(decision.code).startswith("BLOCKED_"):
+            message += " owner_guard=no_start"
+        log(message)
+        return decision.code
     tabs = [t for t in list_tabs() if t.get("workspace_id") == workspace_id]
     tab = next((t for t in tabs if t.get("label") == spec["tab"]), None)
     if not tab:
@@ -342,23 +392,32 @@ def ensure_agent(workspace_id, spec):
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or proc.stdout).strip())
     log(f"{spec['name']}: restored in {pane}")
+    return "restored"
+
 
 def main():
     STATE.mkdir(parents=True, exist_ok=True)
     log("=== ensure start ===")
     ensure_desktop_commander()
     ensure_herdr_server()
+    blocked = []
     for group in DESIRED:
         if group.get("repository"):
             ensure_repo_checkout(group["cwd"], group["repository"], group["repo_url"])
         wid = ensure_workspace(group["label"], group["cwd"])
         ensure_tabs(wid, group["cwd"], [spec["tab"] for spec in group["agents"]])
         for spec in group["agents"]:
-            ensure_agent(wid, spec)
+            action = ensure_agent(wid, spec, group)
+            if str(action).startswith("BLOCKED_"):
+                blocked.append((spec["name"], str(action)))
     names = sorted(a.get("name", "") for a in list_agents())
     missing = [s["name"] for g in DESIRED for s in g["agents"] if s["name"] not in names]
-    if missing:
-        raise RuntimeError("Missing after ensure: " + ", ".join(missing))
+    guarded_names = {name for name, _ in blocked}
+    unresolved = [name for name in missing if name not in guarded_names]
+    if unresolved:
+        raise RuntimeError("Missing after ensure: " + ", ".join(unresolved))
+    if blocked:
+        log("Guarded (no start): " + ", ".join(f"{n}={code}" for n, code in blocked))
     log("Stack ready: " + ", ".join(n for n in names if n))
     log("=== ensure complete ===")
 
