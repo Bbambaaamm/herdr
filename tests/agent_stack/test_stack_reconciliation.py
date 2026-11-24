@@ -419,6 +419,22 @@ def test_review_invalid_request_keys_are_blocked(rec):
     assert decision.reason == rec.BLOCKED_MALFORMED_EVIDENCE
 
 
+@pytest.mark.parametrize("blank_key", ["", " ", "\t", "\n", "\u00a0\u2003",
+                                       " \t\r\n "], ids=["empty", "space", "tab",
+                                                        "newline", "unicode-space",
+                                                        "mixed"])
+def test_review_blank_request_keys_block_at_entry_and_receipt(rec, blank_key):
+    entry = _evaluate(rec, request_key=blank_key)
+    assert entry.reason == rec.BLOCKED_MALFORMED_EVIDENCE
+    assert entry.proposal_digest is None
+
+    receipt = {"kind": "admitted_proposal", "request_key": blank_key,
+               "evidence_digest": "0" * 64, "proposal_digest": "0" * 64}
+    replay = _evaluate(rec, prior_receipts=(receipt,), request_key="req-1")
+    assert replay.reason == rec.BLOCKED_MALFORMED_EVIDENCE
+    assert replay.proposal_digest is None
+
+
 # R8 -------------------------------------------------------------------------
 def test_r8_positive_proposal_plans_exactly_one_parent_cycle(rec):
     decision = _evaluate(rec)

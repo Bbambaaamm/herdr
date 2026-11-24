@@ -435,7 +435,8 @@ def evaluate_incident(
     facts listed below.  Missing facts are failures, not defaults.
     """
     if request_key is not None and (type(request_key) is not str
-                                    or len(request_key) > BOUND_STRING_MAX):
+                                    or len(request_key) > BOUND_STRING_MAX
+                                    or not request_key.strip()):
         return _blocked(BLOCKED_MALFORMED_EVIDENCE)
     try:
         validate_observed_bounds(observed)
@@ -599,7 +600,8 @@ def evaluate_incident(
             return _blocked(BLOCKED_MALFORMED_EVIDENCE, checkpoint_sha256=checkpoint_sha256)
         if item.get("request_key") is not None and (
                 type(item.get("request_key")) is not str
-                or len(item["request_key"]) > BOUND_STRING_MAX):
+                or len(item["request_key"]) > BOUND_STRING_MAX
+                or not item["request_key"].strip()):
             return _blocked(BLOCKED_MALFORMED_EVIDENCE, checkpoint_sha256=checkpoint_sha256)
         if type(item.get("evidence_digest")) is not str \
                 or not re.fullmatch(r"[0-9a-f]{64}", item["evidence_digest"]):
