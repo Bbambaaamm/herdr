@@ -244,23 +244,24 @@ def test_r6_crash_before_claim_can_be_proposed_with_fresh_acceptance(rec):
     assert decision.requires_fresh_operator_acceptance is True
 
 
-def test_r6_crash_after_claim_before_start_blocks_until_resolved(rec):
-    blocked = _evaluate(rec, crash_window="after_claim_before_start")
-    assert blocked.reason == rec.BLOCKED_CRASH_WINDOW
-
-    released = _evaluate(
+@pytest.mark.parametrize("receipt_hash", ["c" * 64, "d" * 64])
+def test_r6_crash_after_claim_before_start_is_always_blocked(rec, receipt_hash):
+    receipt = {
+        "claim_id": "claim-1",
+        "checkpoint_sha256": hashlib.sha256(_checkpoint_raw()).hexdigest(),
+        "state": "consumed",
+        "receipt_sha256": receipt_hash,
+        "request_key": "req-crash-1",
+        "incident_id": "incident-53",
+        "no_start_verified": True,
+    }
+    decision = _evaluate(
         rec, crash_window="after_claim_before_start",
         request_key="req-crash-1",
-        observed=_observed(incident_id="incident-53", claim_receipt={
-            "claim_id": "claim-1",
-            "checkpoint_sha256": hashlib.sha256(_checkpoint_raw()).hexdigest(),
-            "state": "consumed",
-            "receipt_sha256": "c" * 64,
-            "request_key": "req-crash-1",
-            "incident_id": "incident-53",
-            "no_start_verified": True,
-        }))
-    assert released.decision == rec.PROPOSE_OPERATOR_REVIEW_ONLY
+        observed=_observed(incident_id="incident-53", claim_receipt=receipt))
+    assert decision.decision == "BLOCKED"
+    assert decision.reason == rec.BLOCKED_CRASH_WINDOW
+    assert decision.direct_worker_launch_authorized is False
 
 
 def test_r6_crash_window_value_is_validated(rec):
@@ -646,3 +647,35 @@ def test_review_observed_and_receipt_bounds_are_pre_serialization(rec):
 
     assert _evaluate(rec, prior_receipts=(["not", "a", "mapping"],)).reason \
         == rec.BLOCKED_MALFORMED_EVIDENCE
+
+
+def test_review_deep_and_cyclic_inputs_are_blocked_not_recursion_errors(rec):
+    deep = "leaf"
+    for _ in range(1200):
+        deep = {"v": deep}
+    decision = _evaluate(rec, observed={"deep": deep})
+    assert decision.reason == rec.BLOCKED_MALFORMED_EVIDENCE
+
+    deep_receipts = ({"kind": "other", "nested": deep},)
+    assert _evaluate(rec, prior_receipts=deep_receipts).reason \
+        == rec.BLOCKED_MALFORMED_EVIDENCE
+
+    cyclic = {}
+    cyclic["self"] = cyclic
+    assert _evaluate(rec, observed=cyclic).reason == rec.BLOCKED_MALFORMED_EVIDENCE
+
+    cyclic_receipt = {"kind": "other"}
+    cyclic_receipt["self"] = cyclic_receipt
+    assert _evaluate(rec, prior_receipts=(cyclic_receipt,)).reason \
+        == rec.BLOCKED_MALFORMED_EVIDENCE
+
+    assert _evaluate(rec, observed={"blob": object()}).reason \
+        == rec.BLOCKED_MALFORMED_EVIDENCE
+
+    with pytest.raises(rec.ReconciliationError):
+        rec.derive_evidence_digest(
+            checkpoint_raw=_checkpoint_raw(),
+            original_waiting_raw=_waiting_raw(
+                hashlib.sha256(_checkpoint_raw()).hexdigest()),
+            emergency_pause_raw=_paused_raw(),
+            observed={"deep": deep})

@@ -36,6 +36,7 @@ BOUND_STRING_MAX = 8192
 MAX_OBSERVED_KEYS = 200
 MAX_RECEIPTS = 100
 MAX_COLLECTION_DEPTH = 8
+MAX_COLLECTION_NODES = 50000
 
 # Proposal/decision codes.  These describe eligibility only.
 PROPOSE_OPERATOR_REVIEW_ONLY = "PROPOSE_OPERATOR_REVIEW_ONLY"
@@ -79,11 +80,27 @@ def canonical_json(value: Any) -> bytes:
 
 
 def _value_depth(value: Any) -> int:
-    if type(value) is dict:
-        return 1 + max((_value_depth(item) for item in value.values()), default=0)
-    if type(value) in (list, tuple):
-        return 1 + max((_value_depth(item) for item in value), default=0)
-    return 0
+    """Iterative depth walk with cycle and node budgets; never recurses."""
+    max_depth = 0
+    seen: set[int] = set()
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > max_depth:
+            max_depth = depth
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if len(seen) > MAX_COLLECTION_NODES:
+            raise ReconciliationError("collection_too_many_nodes")
+        children: list[Any] = []
+        if type(current) is dict:
+            children.extend(current.values())
+        elif type(current) in (list, tuple):
+            children.extend(current)
+        for child in children:
+            stack.append((child, depth + 1))
+    return max_depth
 
 
 def validate_observed_bounds(observed: Any) -> None:
@@ -94,11 +111,15 @@ def validate_observed_bounds(observed: Any) -> None:
         raise ReconciliationError("observed_too_many_keys")
     if any(type(key) is not str for key in observed):
         raise ReconciliationError("observed_key_not_string")
-    if _value_depth(observed) > MAX_COLLECTION_DEPTH:
+    try:
+        depth = _value_depth(observed)
+    except RecursionError as exc:
+        raise ReconciliationError("observed_too_deep") from exc
+    if depth > MAX_COLLECTION_DEPTH:
         raise ReconciliationError("observed_too_deep")
     try:
         encoded = canonical_json(observed)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, RecursionError) as exc:
         raise ReconciliationError("observed_not_serializable") from exc
     if len(encoded) > MAX_BYTES:
         raise ReconciliationError("observed_too_large")
@@ -115,11 +136,15 @@ def validate_receipt_bounds(prior_receipts: Any) -> None:
             raise ReconciliationError("receipt_not_object")
         if any(type(key) is not str for key in item):
             raise ReconciliationError("receipt_key_not_string")
-        if _value_depth(item) > MAX_COLLECTION_DEPTH:
+        try:
+            depth = _value_depth(item)
+        except RecursionError as exc:
+            raise ReconciliationError("receipt_too_deep") from exc
+        if depth > MAX_COLLECTION_DEPTH:
             raise ReconciliationError("receipt_too_deep")
     try:
         encoded = canonical_json(list(prior_receipts))
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, RecursionError) as exc:
         raise ReconciliationError("receipts_not_serializable") from exc
     if len(encoded) > MAX_BYTES:
         raise ReconciliationError("receipts_too_large")
@@ -170,7 +195,7 @@ def _bounded_json(raw: bytes, label: str) -> Mapping[str, Any]:
         raise ReconciliationError(label + "_too_large")
     try:
         value = json.loads(bytes(raw))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise ReconciliationError(label + "_malformed") from exc
     if type(value) is not dict:
         raise ReconciliationError(label + "_not_object")
@@ -321,38 +346,6 @@ def validate_operator_review(operator: Any, current_head: str,
     return expires > now
 
 
-def validate_claim_receipt(receipt: Any, *, checkpoint_sha256: str,
-                           request_key: str | None, incident_id: str | None) -> None:
-    """A crash-window receipt must be a trusted released/no-start proof.
-
-    It has to bind the exact checkpoint raw digest, the incident id and the
-    reconciliation request key, and carry an explicit verified no-start flag.
-    An arbitrary 64-hex placeholder or ``state=consumed`` alone proves nothing.
-    """
-    if type(receipt) is not dict:
-        raise ReconciliationError("claim_receipt_not_object")
-    claim_id = receipt.get("claim_id")
-    if type(claim_id) is not str or not claim_id.strip() or len(claim_id) > BOUND_STRING_MAX:
-        raise ReconciliationError("claim_receipt_id_invalid")
-    if receipt.get("checkpoint_sha256") != checkpoint_sha256:
-        raise ReconciliationError("claim_receipt_checkpoint_mismatch")
-    if receipt.get("state") not in ("released", "consumed"):
-        raise ReconciliationError("claim_receipt_state_invalid")
-    if type(receipt.get("receipt_sha256")) is not str \
-            or not HEX64.fullmatch(receipt["receipt_sha256"]):
-        raise ReconciliationError("claim_receipt_hash_invalid")
-    if type(request_key) is not str or not request_key.strip():
-        raise ReconciliationError("claim_receipt_request_unbound")
-    if receipt.get("request_key") != request_key:
-        raise ReconciliationError("claim_receipt_request_mismatch")
-    if type(incident_id) is not str or not incident_id.strip():
-        raise ReconciliationError("claim_receipt_incident_unbound")
-    if receipt.get("incident_id") != incident_id:
-        raise ReconciliationError("claim_receipt_incident_mismatch")
-    if receipt.get("no_start_verified") is not True:
-        raise ReconciliationError("claim_receipt_no_start_unverified")
-
-
 def derive_evidence_digest(
     *,
     checkpoint_raw: bytes,
@@ -362,7 +355,10 @@ def derive_evidence_digest(
     crash_window: str | None = None,
 ) -> str:
     """Canonical evidence digest used for idempotent replay receipts."""
-    validate_observed_bounds(observed)
+    try:
+        validate_observed_bounds(observed)
+    except RecursionError as exc:
+        raise ReconciliationError("observed_too_deep") from exc
     return digest(canonical_json({
         "checkpoint_sha256": digest(checkpoint_raw),
         "checkpoint_commit": validate_checkpoint(_bounded_json(checkpoint_raw, "checkpoint")),
@@ -392,14 +388,15 @@ def evaluate_incident(
     """
     try:
         validate_observed_bounds(observed)
-    except ReconciliationError as exc:
+    except (ReconciliationError, RecursionError) as exc:
         code = (BLOCKED_MISSING_OBSERVED_EVIDENCE
-                if exc.args and exc.args[0] == "observed_not_object"
+                if isinstance(exc, ReconciliationError)
+                and exc.args and exc.args[0] == "observed_not_object"
                 else BLOCKED_MALFORMED_EVIDENCE)
         return _blocked(code)
     try:
         validate_receipt_bounds(prior_receipts)
-    except ReconciliationError:
+    except (ReconciliationError, RecursionError):
         return _blocked(BLOCKED_MALFORMED_EVIDENCE)
     if original_waiting_raw is None:
         return _blocked(BLOCKED_ORIGINAL_WAITING_INVALID)
@@ -407,7 +404,7 @@ def evaluate_incident(
         checkpoint = _bounded_json(checkpoint_raw, "checkpoint")
         paused = _bounded_json(emergency_pause_raw, "emergency_pause")
         waiting = _bounded_json(original_waiting_raw, "original_waiting")
-    except ReconciliationError:
+    except (ReconciliationError, RecursionError):
         return _blocked(BLOCKED_MALFORMED_EVIDENCE)
 
     checkpoint_sha256 = digest(checkpoint_raw)
@@ -493,15 +490,13 @@ def evaluate_incident(
             return _blocked(BLOCKED_UNKNOWN_SIDE_EFFECT, checkpoint_sha256=checkpoint_sha256,
                             checkpoint_commit=checkpoint_commit, current_head=current_head)
         if crash_window == "after_claim_before_start":
-            try:
-                validate_claim_receipt(
-                    observed.get("claim_receipt"),
-                    checkpoint_sha256=checkpoint_sha256,
-                    request_key=request_key,
-                    incident_id=observed.get("incident_id"))
-            except ReconciliationError:
-                return _blocked(BLOCKED_CRASH_WINDOW, checkpoint_sha256=checkpoint_sha256,
-                                checkpoint_commit=checkpoint_commit, current_head=current_head)
+            # No trusted host authority currently supplies a verifiable
+            # released/no-start proof bound to this exact incident/request and
+            # raw evidence. Caller booleans or hex-shaped placeholders are not
+            # authority, so this window stays fail-closed until a protected
+            # root-owned receipt exists; it must never propose a resume here.
+            return _blocked(BLOCKED_CRASH_WINDOW, checkpoint_sha256=checkpoint_sha256,
+                            checkpoint_commit=checkpoint_commit, current_head=current_head)
         elif crash_window != "before_claim":
             return _blocked(BLOCKED_MALFORMED_EVIDENCE, checkpoint_sha256=checkpoint_sha256,
                             checkpoint_commit=checkpoint_commit, current_head=current_head)
