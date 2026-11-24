@@ -178,17 +178,29 @@ def applies(task: dict) -> bool:
 def _require_no_active_root(root: Path) -> None:
     """No new/equal root issue may be active while legacy retirement is applied."""
     for folder in ("pending", "running"):
-        candidates = sorted((root / folder).glob("*.json"))
-        if len(candidates) > 1024:
-            raise EvidenceError("legacy_retirement_active_inventory_unbounded")
-        for path in candidates:
-            raw, _ = guarded.snapshot(path, maximum=1048576)
-            entry = guarded._json(raw)
-            if type(entry) is not dict:
-                raise EvidenceError("legacy_retirement_active_inventory_invalid")
-            if (entry.get("repo") == "Bbambaaamm/herdr"
-                    and str(entry.get("issue")) == "53"):
-                raise EvidenceError("legacy_retirement_parallel_root_work")
+        directory = root / folder
+        # Path.glob may silently hide PermissionError; explicit no-follow
+        # open/scandir is required before "no active task" can be concluded.
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY |
+                     os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            candidates = []
+            with os.scandir(fd) as entries:
+                for entry in entries:
+                    if entry.name.endswith(".json"):
+                        candidates.append(entry.name)
+                        if len(candidates) > 1024:
+                            raise EvidenceError("legacy_retirement_active_inventory_unbounded")
+            for name in sorted(candidates):
+                raw, _ = guarded.snapshot(directory / name, maximum=1048576)
+                task = guarded._json(raw)
+                if type(task) is not dict:
+                    raise EvidenceError("legacy_retirement_active_inventory_invalid")
+                if (task.get("repo") == "Bbambaaamm/herdr"
+                        and str(task.get("issue")) == "53"):
+                    raise EvidenceError("legacy_retirement_parallel_root_work")
+        finally:
+            os.close(fd)
 
 
 def apply(root: Path, *, active_workers, decisions: Path | None = None,

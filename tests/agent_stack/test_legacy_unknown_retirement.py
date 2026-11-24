@@ -351,3 +351,25 @@ def test_root_decision_and_activation_fixtures_are_readable(fx):
     apply(fx)
     activation = activate(fx)
     assert activation.stat().st_mode & 0o777 == 0o644
+
+@pytest.mark.parametrize('folder', ['pending', 'running'])
+def test_unreadable_active_inventory_fails_closed(fx, monkeypatch, folder):
+    root, *_ = fx
+    true_scandir = os.scandir
+    def deny(fd):
+        if isinstance(fd, int):
+            raise PermissionError('simulated unreadable inventory')
+        return true_scandir(fd)
+    monkeypatch.setattr(os, 'scandir', deny)
+    with pytest.raises(PermissionError):
+        apply(fx)
+    assert not list((root / 'results').glob(retired.RECEIPT_NAME + '*.json'))
+
+@pytest.mark.parametrize('folder', ['pending', 'running'])
+def test_inventory_symlink_rejected(fx, folder):
+    root, *_ = fx
+    moved = root / (folder + '-real')
+    (root / folder).rename(moved)
+    (root / folder).symlink_to(moved)
+    with pytest.raises(OSError):
+        apply(fx)
