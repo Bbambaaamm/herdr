@@ -403,6 +403,22 @@ def test_malformed_prior_receipts_block(rec, receipts):
     assert decision.reason == rec.BLOCKED_MALFORMED_EVIDENCE
 
 
+def test_review_invalid_request_keys_are_blocked(rec):
+    cyclic = {}
+    cyclic["self"] = cyclic
+    for bad_key in (object(), "k" * 8193, {"a": 1}, cyclic):
+        decision = _evaluate(rec, request_key=bad_key)
+        assert decision.reason == rec.BLOCKED_MALFORMED_EVIDENCE
+        assert decision.proposal_digest is None
+
+    bad_receipt = {"kind": "admitted_proposal",
+                   "request_key": "r" * 8193,
+                   "evidence_digest": "0" * 64,
+                   "proposal_digest": "0" * 64}
+    decision = _evaluate(rec, prior_receipts=(bad_receipt,), request_key="req-1")
+    assert decision.reason == rec.BLOCKED_MALFORMED_EVIDENCE
+
+
 # R8 -------------------------------------------------------------------------
 def test_r8_positive_proposal_plans_exactly_one_parent_cycle(rec):
     decision = _evaluate(rec)

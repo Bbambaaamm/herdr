@@ -434,6 +434,9 @@ def evaluate_incident(
     exact-head, lineage, CI/review, process, lock, capacity and side-effect
     facts listed below.  Missing facts are failures, not defaults.
     """
+    if request_key is not None and (type(request_key) is not str
+                                    or len(request_key) > BOUND_STRING_MAX):
+        return _blocked(BLOCKED_MALFORMED_EVIDENCE)
     try:
         validate_observed_bounds(observed)
     except (ReconciliationError, RecursionError) as exc:
@@ -594,7 +597,9 @@ def evaluate_incident(
             return _blocked(BLOCKED_MALFORMED_EVIDENCE, checkpoint_sha256=checkpoint_sha256)
         if type(item.get("kind")) is not str:
             return _blocked(BLOCKED_MALFORMED_EVIDENCE, checkpoint_sha256=checkpoint_sha256)
-        if item.get("request_key") is not None and type(item.get("request_key")) is not str:
+        if item.get("request_key") is not None and (
+                type(item.get("request_key")) is not str
+                or len(item["request_key"]) > BOUND_STRING_MAX):
             return _blocked(BLOCKED_MALFORMED_EVIDENCE, checkpoint_sha256=checkpoint_sha256)
         if type(item.get("evidence_digest")) is not str \
                 or not re.fullmatch(r"[0-9a-f]{64}", item["evidence_digest"]):
@@ -602,10 +607,14 @@ def evaluate_incident(
         if item.get("kind") == "admitted_proposal":
             # Recompute the canonical proposal from this exact request and
             # evidence; a valid-length but arbitrary digest must never replay.
-            expected = derive_proposal_digest(
-                request_key=item.get("request_key"),
-                evidence_digest=item["evidence_digest"],
-                **proposal_parts)
+            try:
+                expected = derive_proposal_digest(
+                    request_key=item.get("request_key"),
+                    evidence_digest=item["evidence_digest"],
+                    **proposal_parts)
+            except (ReconciliationError, TypeError, ValueError):
+                return _blocked(BLOCKED_MALFORMED_EVIDENCE,
+                                checkpoint_sha256=checkpoint_sha256)
             if item.get("proposal_digest") != expected:
                 return _blocked(BLOCKED_MALFORMED_EVIDENCE,
                                 checkpoint_sha256=checkpoint_sha256)
@@ -621,9 +630,13 @@ def evaluate_incident(
                             checkpoint_sha256=checkpoint_sha256,
                             checkpoint_commit=checkpoint_commit,
                             current_head=current_head)
-        replay_digest = derive_proposal_digest(
-            request_key=request_key, evidence_digest=evidence_digest,
-            **proposal_parts)
+        try:
+            replay_digest = derive_proposal_digest(
+                request_key=request_key, evidence_digest=evidence_digest,
+                **proposal_parts)
+        except (ReconciliationError, TypeError, ValueError):
+            return _blocked(BLOCKED_MALFORMED_EVIDENCE,
+                            checkpoint_sha256=checkpoint_sha256)
         return ReconciliationDecision(
             decision=REPLAY_IDENTICAL_NO_START, reason="replay_identical",
             checkpoint_sha256=checkpoint_sha256, checkpoint_commit=checkpoint_commit,
@@ -635,9 +648,13 @@ def evaluate_incident(
         return _blocked(BLOCKED_CONCURRENT_ADMISSION, checkpoint_sha256=checkpoint_sha256,
                         checkpoint_commit=checkpoint_commit, current_head=current_head)
 
-    proposal_digest = derive_proposal_digest(
-        request_key=request_key, evidence_digest=evidence_digest,
-        **proposal_parts)
+    try:
+        proposal_digest = derive_proposal_digest(
+            request_key=request_key, evidence_digest=evidence_digest,
+            **proposal_parts)
+    except (ReconciliationError, TypeError, ValueError):
+        return _blocked(BLOCKED_MALFORMED_EVIDENCE,
+                        checkpoint_sha256=checkpoint_sha256)
     return ReconciliationDecision(
         decision=PROPOSE_OPERATOR_REVIEW_ONLY, reason="eligible_for_operator_review",
         checkpoint_sha256=checkpoint_sha256, checkpoint_commit=checkpoint_commit,
