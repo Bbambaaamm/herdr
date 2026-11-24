@@ -70,9 +70,10 @@ def _waiting_raw(checkpoint_sha256: str) -> bytes:
     return json.dumps(waiting, sort_keys=True).encode("utf-8")
 
 
-def _paused_raw(checkpoint_sha256: str | None = None) -> bytes:
-    if checkpoint_sha256 is None:
-        checkpoint_sha256 = hashlib.sha256(_checkpoint_raw()).hexdigest()
+def _paused_raw(_legacy_checkpoint_sha: str | None = None) -> bytes:
+    # Mirrors the real supervisor emergency-checkpoint.json: no checkpoint hash.
+    # The legacy argument is accepted and ignored so fixtures never rewrite the
+    # original artifact schema.
     paused = {
         "status": "PAUSED",
         "safe_to_continue": False,
@@ -80,9 +81,19 @@ def _paused_raw(checkpoint_sha256: str | None = None) -> bytes:
         "next_action": "reconcile before explicit restart",
         "progress_key": "supervisor-paused:emergency",
         "source": "supervisor_emergency_checkpoint",
-        "checkpoint_sha256": checkpoint_sha256,
     }
     return json.dumps(paused, sort_keys=True).encode("utf-8")
+
+
+def _default_binding():
+    checkpoint_raw = _checkpoint_raw()
+    waiting_raw = _waiting_raw(hashlib.sha256(checkpoint_raw).hexdigest())
+    paused_raw = _paused_raw()
+    return {
+        "checkpoint": hashlib.sha256(checkpoint_raw).hexdigest(),
+        "waiting": hashlib.sha256(waiting_raw).hexdigest(),
+        "pause": hashlib.sha256(paused_raw).hexdigest(),
+    }
 
 
 def _observed(**overrides):
@@ -111,6 +122,7 @@ def _observed(**overrides):
         "one_shot_admission_verified": True,
         "fence_budget_current": True,
         "now_epoch": 1800000000,
+        "original_artifact_sha256": _default_binding(),
     }
     observed.update(overrides)
     return observed
@@ -238,11 +250,15 @@ def test_r6_crash_after_claim_before_start_blocks_until_resolved(rec):
 
     released = _evaluate(
         rec, crash_window="after_claim_before_start",
-        observed=_observed(claim_receipt={
+        request_key="req-crash-1",
+        observed=_observed(incident_id="incident-53", claim_receipt={
             "claim_id": "claim-1",
             "checkpoint_sha256": hashlib.sha256(_checkpoint_raw()).hexdigest(),
             "state": "consumed",
             "receipt_sha256": "c" * 64,
+            "request_key": "req-crash-1",
+            "incident_id": "incident-53",
+            "no_start_verified": True,
         }))
     assert released.decision == rec.PROPOSE_OPERATOR_REVIEW_ONLY
 
@@ -345,15 +361,16 @@ def test_exact_incident_requires_original_waiting_bytes(rec):
     assert decision.reason == rec.BLOCKED_ORIGINAL_WAITING_INVALID
 
 
-def test_emergency_pause_must_bind_checkpoint_digest(rec):
+def test_emergency_pause_does_not_require_invented_checkpoint_field(rec):
     checkpoint_raw = _checkpoint_raw()
-    paused = json.loads(_paused_raw(hashlib.sha256(checkpoint_raw).hexdigest()))
-    paused["checkpoint_sha256"] = "0" * 64
+    digest = hashlib.sha256(checkpoint_raw).hexdigest()
+    paused = json.loads(_paused_raw())
+    assert "checkpoint_sha256" not in paused
     decision = rec.evaluate_incident(
         checkpoint_raw=checkpoint_raw,
-        original_waiting_raw=_waiting_raw(hashlib.sha256(checkpoint_raw).hexdigest()),
-        emergency_pause_raw=json.dumps(paused).encode(), observed=_observed())
-    assert decision.reason == rec.BLOCKED_CHECKPOINT_INVALID
+        original_waiting_raw=_waiting_raw(digest),
+        emergency_pause_raw=_paused_raw(), observed=_observed())
+    assert decision.decision == rec.PROPOSE_OPERATOR_REVIEW_ONLY
 
 
 @pytest.mark.parametrize("receipt", [
@@ -517,3 +534,115 @@ def test_wrong_emergency_source_blocks(rec):
         original_waiting_raw=_waiting_raw(digest),
         emergency_pause_raw=json.dumps(paused).encode(), observed=_observed())
     assert decision.reason == rec.BLOCKED_CHECKPOINT_INVALID
+
+
+# Review regressions (offline-reconcile-independent-review-1c1459c) -----------
+def test_review_real_paused_schema_is_not_rewritten_and_binds_separately(rec):
+    paused = json.loads(_paused_raw())
+    assert "checkpoint_sha256" not in paused
+
+    checkpoint_raw = _checkpoint_raw()
+    checkpoint_sha = hashlib.sha256(checkpoint_raw).hexdigest()
+    waiting_raw = _waiting_raw(checkpoint_sha)
+    paused_raw = _paused_raw()
+    observed = _observed(original_artifact_sha256={
+        "checkpoint": checkpoint_sha,
+        "waiting": hashlib.sha256(waiting_raw).hexdigest(),
+        "pause": hashlib.sha256(paused_raw).hexdigest(),
+    })
+    assert rec.evaluate_incident(
+        checkpoint_raw=checkpoint_raw, original_waiting_raw=waiting_raw,
+        emergency_pause_raw=paused_raw, observed=observed
+    ).decision == rec.PROPOSE_OPERATOR_REVIEW_ONLY
+
+    binding = dict(observed["original_artifact_sha256"])
+    binding["pause"] = "0" * 64
+    assert rec.evaluate_incident(
+        checkpoint_raw=checkpoint_raw, original_waiting_raw=waiting_raw,
+        emergency_pause_raw=paused_raw,
+        observed=_observed(original_artifact_sha256=binding)).reason \
+        == rec.BLOCKED_MISSING_OBSERVED_EVIDENCE
+
+    without = {k: v for k, v in observed.items() if k != "original_artifact_sha256"}
+    assert rec.evaluate_incident(
+        checkpoint_raw=checkpoint_raw, original_waiting_raw=waiting_raw,
+        emergency_pause_raw=paused_raw, observed=without).reason \
+        == rec.BLOCKED_MISSING_OBSERVED_EVIDENCE
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda w: w.pop("reason"),
+    lambda w: w.update(reason="   "),
+    lambda w: w.update(next_action=""),
+    lambda w: w.pop("progress_key"),
+    lambda w: w.update(reason="r" * 8193),
+])
+def test_review_waiting_required_fields_fail_closed(rec, mutate):
+    checkpoint_raw = _checkpoint_raw()
+    digest = hashlib.sha256(checkpoint_raw).hexdigest()
+    waiting = json.loads(_waiting_raw(digest))
+    mutate(waiting)
+    decision = rec.evaluate_incident(
+        checkpoint_raw=checkpoint_raw,
+        original_waiting_raw=json.dumps(waiting).encode(),
+        emergency_pause_raw=_paused_raw(), observed=_observed())
+    assert decision.reason == rec.BLOCKED_CHECKPOINT_INVALID
+
+
+@pytest.mark.parametrize("receipt", [
+    {"claim_id": "claim-1", "state": "consumed", "receipt_sha256": "c" * 64},
+    {"claim_id": "claim-1",
+     "checkpoint_sha256": hashlib.sha256(_checkpoint_raw()).hexdigest(),
+     "state": "consumed", "receipt_sha256": "c" * 64,
+     "request_key": "req-crash-2", "incident_id": "incident-53"},
+    {"claim_id": "claim-1",
+     "checkpoint_sha256": hashlib.sha256(_checkpoint_raw()).hexdigest(),
+     "state": "consumed", "receipt_sha256": "c" * 64,
+     "request_key": "req-crash-2", "incident_id": "other-incident",
+     "no_start_verified": True},
+    {"claim_id": "claim-1",
+     "checkpoint_sha256": hashlib.sha256(_checkpoint_raw()).hexdigest(),
+     "state": "consumed", "receipt_sha256": "c" * 64,
+     "request_key": "req-crash-2", "incident_id": "incident-53",
+     "no_start_verified": False},
+])
+def test_review_placeholder_claim_receipt_does_not_prove_no_start(rec, receipt):
+    decision = _evaluate(
+        rec, crash_window="after_claim_before_start",
+        request_key="req-crash-2",
+        observed=_observed(incident_id="incident-53", claim_receipt=receipt))
+    assert decision.reason == rec.BLOCKED_CRASH_WINDOW
+    assert decision.direct_worker_launch_authorized is False
+
+
+@pytest.mark.parametrize("bad", [None, ["fact"], "text", 7])
+def test_review_non_mapping_observed_returns_blocked(rec, bad):
+    decision = rec.evaluate_incident(
+        checkpoint_raw=_checkpoint_raw(),
+        original_waiting_raw=_waiting_raw(hashlib.sha256(_checkpoint_raw()).hexdigest()),
+        emergency_pause_raw=_paused_raw(), observed=bad)
+    assert decision.decision == "BLOCKED"
+    assert decision.reason == rec.BLOCKED_MISSING_OBSERVED_EVIDENCE
+
+
+def test_review_observed_and_receipt_bounds_are_pre_serialization(rec):
+    many_keys = {f"k{index}": True for index in range(rec.MAX_OBSERVED_KEYS + 1)}
+    assert _evaluate(rec, observed=many_keys).reason == rec.BLOCKED_MALFORMED_EVIDENCE
+
+    deep = "leaf"
+    for _ in range(rec.MAX_COLLECTION_DEPTH + 1):
+        deep = {"v": deep}
+    assert _evaluate(rec, observed={"deep": deep}).reason == rec.BLOCKED_MALFORMED_EVIDENCE
+
+    huge_value = {"blob": "x" * (rec.MAX_BYTES + 1)}
+    assert _evaluate(rec, observed=huge_value).reason == rec.BLOCKED_MALFORMED_EVIDENCE
+
+    too_many = tuple({"kind": "other", "evidence_digest": "0" * 64}
+                     for _ in range(rec.MAX_RECEIPTS + 1))
+    assert _evaluate(rec, prior_receipts=too_many).reason == rec.BLOCKED_MALFORMED_EVIDENCE
+
+    huge_receipt = ({"kind": "other", "blob": "y" * (rec.MAX_BYTES + 1)},)
+    assert _evaluate(rec, prior_receipts=huge_receipt).reason == rec.BLOCKED_MALFORMED_EVIDENCE
+
+    assert _evaluate(rec, prior_receipts=(["not", "a", "mapping"],)).reason \
+        == rec.BLOCKED_MALFORMED_EVIDENCE

@@ -31,6 +31,11 @@ from typing import Any, Iterable, Mapping, Sequence
 
 MAX_BYTES = 4 * 1024 * 1024
 SHA40 = re.compile(r"[0-9a-f]{40}\Z")
+HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+BOUND_STRING_MAX = 8192
+MAX_OBSERVED_KEYS = 200
+MAX_RECEIPTS = 100
+MAX_COLLECTION_DEPTH = 8
 
 # Proposal/decision codes.  These describe eligibility only.
 PROPOSE_OPERATOR_REVIEW_ONLY = "PROPOSE_OPERATOR_REVIEW_ONLY"
@@ -71,6 +76,53 @@ def digest(raw: bytes) -> str:
 
 def canonical_json(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _value_depth(value: Any) -> int:
+    if type(value) is dict:
+        return 1 + max((_value_depth(item) for item in value.values()), default=0)
+    if type(value) in (list, tuple):
+        return 1 + max((_value_depth(item) for item in value), default=0)
+    return 0
+
+
+def validate_observed_bounds(observed: Any) -> None:
+    """Pre-parse bounds for the observed collection (count/depth/bytes)."""
+    if type(observed) is not dict:
+        raise ReconciliationError("observed_not_object")
+    if len(observed) > MAX_OBSERVED_KEYS:
+        raise ReconciliationError("observed_too_many_keys")
+    if any(type(key) is not str for key in observed):
+        raise ReconciliationError("observed_key_not_string")
+    if _value_depth(observed) > MAX_COLLECTION_DEPTH:
+        raise ReconciliationError("observed_too_deep")
+    try:
+        encoded = canonical_json(observed)
+    except (TypeError, ValueError) as exc:
+        raise ReconciliationError("observed_not_serializable") from exc
+    if len(encoded) > MAX_BYTES:
+        raise ReconciliationError("observed_too_large")
+
+
+def validate_receipt_bounds(prior_receipts: Any) -> None:
+    """Pre-traversal bounds for derived receipts (count/depth/bytes)."""
+    if not isinstance(prior_receipts, (list, tuple)):
+        raise ReconciliationError("receipts_not_sequence")
+    if len(prior_receipts) > MAX_RECEIPTS:
+        raise ReconciliationError("too_many_receipts")
+    for item in prior_receipts:
+        if type(item) is not dict:
+            raise ReconciliationError("receipt_not_object")
+        if any(type(key) is not str for key in item):
+            raise ReconciliationError("receipt_key_not_string")
+        if _value_depth(item) > MAX_COLLECTION_DEPTH:
+            raise ReconciliationError("receipt_too_deep")
+    try:
+        encoded = canonical_json(list(prior_receipts))
+    except (TypeError, ValueError) as exc:
+        raise ReconciliationError("receipts_not_serializable") from exc
+    if len(encoded) > MAX_BYTES:
+        raise ReconciliationError("receipts_too_large")
 
 
 @dataclass(frozen=True)
@@ -143,22 +195,54 @@ def validate_checkpoint(checkpoint: Mapping[str, Any]) -> str:
 
 
 def validate_original_waiting(waiting: Mapping[str, Any], checkpoint_sha256: str) -> None:
-    """The original WAITING intent must match the checkpoint digest exactly."""
+    """The original WAITING intent must match the checkpoint digest exactly and
+    carry the same required bounded continuation fields as supervisor.py."""
     if waiting.get("status") != "WAITING" or waiting.get("safe_to_continue") is not True:
         raise ReconciliationError("original_waiting_invalid")
     if waiting.get("checkpoint_sha256") != checkpoint_sha256:
         raise ReconciliationError("original_checkpoint_digest_mismatch")
+    for key in ("reason", "next_action", "progress_key"):
+        value = waiting.get(key)
+        if type(value) is not str or not value.strip() or len(value) > BOUND_STRING_MAX:
+            raise ReconciliationError("original_waiting_" + key + "_invalid")
 
 
-def validate_emergency_pause(paused: Mapping[str, Any], checkpoint_sha256: str) -> None:
-    """Emergency PAUSED must come from the supervisor emergency path and bind
-    the original checkpoint digest."""
+def validate_emergency_pause(paused: Mapping[str, Any]) -> None:
+    """Emergency PAUSED must come from the supervisor emergency path.
+
+    The real artifact contains status/safety/reason/next_action/progress_key/
+    source only; no checkpoint field.  Hash binding is done through the
+    separate trusted ``observed`` evidence, never by rewriting the artifact.
+    """
     if paused.get("status") != "PAUSED" or paused.get("safe_to_continue") is not False:
         raise ReconciliationError("emergency_pause_invalid")
     if paused.get("source") != "supervisor_emergency_checkpoint":
         raise ReconciliationError("emergency_pause_source_invalid")
-    if paused.get("checkpoint_sha256") != checkpoint_sha256:
-        raise ReconciliationError("emergency_checkpoint_digest_mismatch")
+    for key in ("reason", "next_action", "progress_key"):
+        value = paused.get(key)
+        if type(value) is not str or not value.strip() or len(value) > BOUND_STRING_MAX:
+            raise ReconciliationError("emergency_pause_" + key + "_invalid")
+
+
+def validate_original_hash_binding(observed: Mapping[str, Any], checkpoint_sha256: str,
+                                   waiting_sha256: str, pause_sha256: str) -> None:
+    """Bind the three immutable original artifacts via separate trusted evidence.
+
+    The real emergency PAUSED record has no checkpoint field, so binding lives
+    in the collector observation instead of being invented inside artifacts.
+    """
+    binding = observed.get("original_artifact_sha256")
+    if type(binding) is not dict:
+        raise ReconciliationError("original_hash_binding_missing")
+    expected = {
+        "checkpoint": checkpoint_sha256,
+        "waiting": waiting_sha256,
+        "pause": pause_sha256,
+    }
+    for key, value in expected.items():
+        actual = binding.get(key)
+        if type(actual) is not str or not HEX64.fullmatch(actual) or actual != value:
+            raise ReconciliationError("original_hash_binding_" + key + "_mismatch")
 
 
 REQUIRED_OBSERVED_BOOLEANS = (
@@ -237,19 +321,36 @@ def validate_operator_review(operator: Any, current_head: str,
     return expires > now
 
 
-def validate_claim_receipt(receipt: Any, checkpoint_sha256: str) -> None:
-    """A claim receipt must be typed and bound to the original checkpoint."""
+def validate_claim_receipt(receipt: Any, *, checkpoint_sha256: str,
+                           request_key: str | None, incident_id: str | None) -> None:
+    """A crash-window receipt must be a trusted released/no-start proof.
+
+    It has to bind the exact checkpoint raw digest, the incident id and the
+    reconciliation request key, and carry an explicit verified no-start flag.
+    An arbitrary 64-hex placeholder or ``state=consumed`` alone proves nothing.
+    """
     if type(receipt) is not dict:
         raise ReconciliationError("claim_receipt_not_object")
-    if type(receipt.get("claim_id")) is not str or not receipt["claim_id"].strip():
+    claim_id = receipt.get("claim_id")
+    if type(claim_id) is not str or not claim_id.strip() or len(claim_id) > BOUND_STRING_MAX:
         raise ReconciliationError("claim_receipt_id_invalid")
     if receipt.get("checkpoint_sha256") != checkpoint_sha256:
         raise ReconciliationError("claim_receipt_checkpoint_mismatch")
     if receipt.get("state") not in ("released", "consumed"):
         raise ReconciliationError("claim_receipt_state_invalid")
     if type(receipt.get("receipt_sha256")) is not str \
-            or not re.fullmatch(r"[0-9a-f]{64}", receipt["receipt_sha256"]):
+            or not HEX64.fullmatch(receipt["receipt_sha256"]):
         raise ReconciliationError("claim_receipt_hash_invalid")
+    if type(request_key) is not str or not request_key.strip():
+        raise ReconciliationError("claim_receipt_request_unbound")
+    if receipt.get("request_key") != request_key:
+        raise ReconciliationError("claim_receipt_request_mismatch")
+    if type(incident_id) is not str or not incident_id.strip():
+        raise ReconciliationError("claim_receipt_incident_unbound")
+    if receipt.get("incident_id") != incident_id:
+        raise ReconciliationError("claim_receipt_incident_mismatch")
+    if receipt.get("no_start_verified") is not True:
+        raise ReconciliationError("claim_receipt_no_start_unverified")
 
 
 def derive_evidence_digest(
@@ -261,6 +362,7 @@ def derive_evidence_digest(
     crash_window: str | None = None,
 ) -> str:
     """Canonical evidence digest used for idempotent replay receipts."""
+    validate_observed_bounds(observed)
     return digest(canonical_json({
         "checkpoint_sha256": digest(checkpoint_raw),
         "checkpoint_commit": validate_checkpoint(_bounded_json(checkpoint_raw, "checkpoint")),
@@ -288,6 +390,17 @@ def evaluate_incident(
     exact-head, lineage, CI/review, process, lock, capacity and side-effect
     facts listed below.  Missing facts are failures, not defaults.
     """
+    try:
+        validate_observed_bounds(observed)
+    except ReconciliationError as exc:
+        code = (BLOCKED_MISSING_OBSERVED_EVIDENCE
+                if exc.args and exc.args[0] == "observed_not_object"
+                else BLOCKED_MALFORMED_EVIDENCE)
+        return _blocked(code)
+    try:
+        validate_receipt_bounds(prior_receipts)
+    except ReconciliationError:
+        return _blocked(BLOCKED_MALFORMED_EVIDENCE)
     if original_waiting_raw is None:
         return _blocked(BLOCKED_ORIGINAL_WAITING_INVALID)
     try:
@@ -298,14 +411,18 @@ def evaluate_incident(
         return _blocked(BLOCKED_MALFORMED_EVIDENCE)
 
     checkpoint_sha256 = digest(checkpoint_raw)
+    waiting_sha256 = digest(original_waiting_raw)
+    pause_sha256 = digest(emergency_pause_raw)
     try:
         checkpoint_commit = validate_checkpoint(checkpoint)
-        validate_emergency_pause(paused, checkpoint_sha256)
+        validate_emergency_pause(paused)
         validate_original_waiting(waiting, checkpoint_sha256)
     except ReconciliationError:
         return _blocked(BLOCKED_CHECKPOINT_INVALID, checkpoint_sha256=checkpoint_sha256)
     try:
         validate_observed_shape(observed)
+        validate_original_hash_binding(
+            observed, checkpoint_sha256, waiting_sha256, pause_sha256)
     except ReconciliationError:
         return _blocked(BLOCKED_MISSING_OBSERVED_EVIDENCE, checkpoint_sha256=checkpoint_sha256)
 
@@ -378,7 +495,10 @@ def evaluate_incident(
         if crash_window == "after_claim_before_start":
             try:
                 validate_claim_receipt(
-                    observed.get("claim_receipt"), checkpoint_sha256)
+                    observed.get("claim_receipt"),
+                    checkpoint_sha256=checkpoint_sha256,
+                    request_key=request_key,
+                    incident_id=observed.get("incident_id"))
             except ReconciliationError:
                 return _blocked(BLOCKED_CRASH_WINDOW, checkpoint_sha256=checkpoint_sha256,
                                 checkpoint_commit=checkpoint_commit, current_head=current_head)
