@@ -1228,6 +1228,13 @@ def prompt_for_selected_chatgpt_proposal(consumer, issue, prior, binding):
 
 
 def _queue_issue_locked(consumer: dict, issue: dict, records: list[dict], *, proposal_binding=None) -> str:
+    # A future direct host-owned gateway must not bypass _scan_issue's usual
+    # active/blocked claim barrier. Missing/unknown state is also uncertain.
+    if proposal_binding is not None and any(
+        type(record) is not dict or record.get("state") not in TERMINAL_DIRS
+        for record in records
+    ):
+        raise AdmissionDenied("selected-root-existing-claim-requires-reconciliation")
     if any(terminal_unknown_blocks_intake(ROOT, record["task"]) for record in records):
         raise AdmissionDenied("terminal_unknown_requires_operator_reconciliation")
     issue, admission = approved_revision(consumer, issue)

@@ -301,3 +301,23 @@ def test_malformed_claim_state_never_survives_existing_state_reader(intake):
     intake.STATE.write_text(json.dumps(raw))
     with pytest.raises(intake.AdmissionDenied, match="proposal-consumption-row-invalid"):
         intake.load_state()
+
+
+@pytest.mark.parametrize("record_state", [
+    "pending", "running", "blocked", "unknown",
+])
+def test_direct_selected_root_denies_active_or_unknown_existing_claim(
+    intake, monkeypatch, record_state,
+):
+    binding, admission, _, _, _ = inputs()
+    consumer, issue = _queue_setup(intake, monkeypatch, admission)
+    records = [{"state": record_state, "task": {"id": "existing-root"}}]
+    with intake.intake_lock(), pytest.raises(
+        intake.AdmissionDenied,
+        match="selected-root-existing-claim-requires-reconciliation",
+    ):
+        intake._queue_issue_locked(
+            consumer, issue, records, proposal_binding=binding,
+        )
+    assert not intake.STATE.exists()
+    assert not list(intake.PENDING.glob("*.json"))

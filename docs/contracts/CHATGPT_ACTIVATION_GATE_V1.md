@@ -82,3 +82,8 @@ not lexicographically as timestamp strings. Durable claim states use
 strict string types so malformed untrusted data fails closed.
 These changes are covered by negative tests; independent Codex review and
 GitHub formal approval remain separate, unsatisfied release gates.
+
+The selected-root internal queue path also rejects any existing
+`pending`, `running`, `blocked`, missing or unknown attempted episode in
+its supplied scheduler evidence. Host-owned activation must still
+independently verify complete authoritative owner/attempt evidence.
