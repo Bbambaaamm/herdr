@@ -68,3 +68,17 @@ argument in this slice.
 
 These steps are separate: **GitHub proposal ≠ approved root episode ≠
 host admission ≠ actual worker start ≠ completed PR**.
+
+## Security review follow-up (2026-11-25)
+
+An internal transitive review identified two additional requirements:
+(1) An approved, selected proposal must generate a **target-specific** root
+prompt, not the general backlog-drain prompt, or a valid approval could
+produce the wrong economic task. The selected prompt is now deterministically
+limited to the approved operation and issue/PR number; it never copies the
+untrusted proposal objective as an instruction.
+(2) Approval chronology is compared as actual offset-aware UTC instants,
+not lexicographically as timestamp strings. Durable claim states use
+strict string types so malformed untrusted data fails closed.
+These changes are covered by negative tests; independent Codex review and
+GitHub formal approval remain separate, unsatisfied release gates.

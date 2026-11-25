@@ -135,3 +135,21 @@ def test_intake_prepare_binding_uses_existing_approval_helper(monkeypatch):
     proposal_issue["body"] += "\nInjected"
     with pytest.raises(m.AdmissionDenied):
         m.prepare_chatgpt_proposal_binding(repo, 300)
+
+
+def test_timezone_offsets_do_not_reorder_approvals():
+    args = fixture()
+    args["proposal_admission"]["approved_at"] = "2026-11-25T12:00:00+02:00"
+    args["root_admission"]["approved_at"] = "2026-11-25T11:00:00+00:00"
+    # Chronologically valid even though the lexical timestamp order is reversed.
+    assert prepare_admission_binding(**args).root_approval_id == 5400
+    args["root_admission"]["approved_at"] = "2026-11-25T10:00:00+00:00"
+    with pytest.raises(ProposalBindingDenied):
+        prepare_admission_binding(**args)
+
+
+def test_timezone_missing_in_approval_denied():
+    args = fixture()
+    args["proposal_admission"]["approved_at"] = "2026-11-25T12:00:00"
+    with pytest.raises(ProposalBindingDenied, match="approval_time_invalid"):
+        prepare_admission_binding(**args)

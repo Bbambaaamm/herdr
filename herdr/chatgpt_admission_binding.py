@@ -10,6 +10,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from .chatgpt_command import CommandProposal, ROOT_ISSUE, ROOT_REPOSITORY
 
@@ -122,7 +123,16 @@ def prepare_admission_binding(
     }
     if root_admission.get("proposal_selection") != expected_selection:
         raise ProposalBindingDenied("root_approval_selection_missing_or_mismatched")
-    if not proposal_admission["approved_at"] < root_admission["approved_at"]:
+    try:
+        proposal_time = datetime.fromisoformat(
+            proposal_admission["approved_at"].replace("Z", "+00:00"))
+        root_time = datetime.fromisoformat(
+            root_admission["approved_at"].replace("Z", "+00:00"))
+        if proposal_time.tzinfo is None or root_time.tzinfo is None:
+            raise ValueError("timezone required")
+    except ValueError as exc:
+        raise ProposalBindingDenied("approval_time_invalid") from exc
+    if not proposal_time.astimezone(timezone.utc) < root_time.astimezone(timezone.utc):
         raise ProposalBindingDenied("root_approval_must_follow_proposal")
     if consumed_proposals is None:
         raise ProposalBindingDenied("durable_dedup_evidence_required")

@@ -263,3 +263,41 @@ def test_legacy_root_approval_cannot_bind_selected_proposal(intake):
         intake._consume_admission(consumer, issue, task_id, legacy,
                                   proposal_binding=binding)
     assert not intake.STATE.exists()
+
+
+def test_selected_root_prompt_is_exact_target_not_backlog(intake, monkeypatch):
+    binding, admission, _, _, task_id = inputs()
+    consumer, issue = _queue_setup(intake, monkeypatch, admission)
+    with intake.intake_lock():
+        intake._queue_issue_locked(consumer, issue, [], proposal_binding=binding)
+    task = json.loads((intake.PENDING / (task_id + ".json")).read_text())
+    prompt = task["prompt"]
+    assert "ONE EXACTLY SELECTED" in prompt
+    assert "pull_request #253" in prompt
+    assert "https://github.com/Bbambaaamm/herdr/pull/253" in prompt
+    assert binding["proposal_digest"] in prompt
+    assert "Do not choose another backlog issue" in prompt
+    assert "Continue authorized root cycle." not in prompt
+
+
+def test_legacy_root_prompt_stays_unchanged(intake, monkeypatch):
+    _, admission, _, _, task_id = inputs()
+    legacy = {k: v for k, v in admission.items() if k != "proposal_selection"}
+    consumer, issue = _queue_setup(intake, monkeypatch, legacy)
+    with intake.intake_lock():
+        intake._queue_issue_locked(consumer, issue, [])
+    task = json.loads((intake.PENDING / (task_id + ".json")).read_text())
+    assert task["prompt"] == "Continue authorized root cycle."
+
+
+def test_malformed_claim_state_never_survives_existing_state_reader(intake):
+    binding, admission, consumer, issue, task_id = inputs()
+    with intake.intake_lock():
+        intake._consume_admission(consumer, issue, task_id, admission,
+                                  proposal_binding=binding)
+    raw = json.loads(intake.STATE.read_text())
+    receipt = raw["Bbambaaamm/herdr#53"]["proposal_consumptions"][binding["binding_sha256"]]
+    receipt["state"] = ["publication_pending"]
+    intake.STATE.write_text(json.dumps(raw))
+    with pytest.raises(intake.AdmissionDenied, match="proposal-consumption-row-invalid"):
+        intake.load_state()
