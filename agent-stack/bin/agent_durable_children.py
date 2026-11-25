@@ -322,16 +322,18 @@ def publish_exact_child_result(scheduler: DynamicChildScheduler, rec, result_pat
     return rec.result_status
 
 
-def replay_host_scheduler(root: Path, ledger: Path) -> DynamicChildScheduler:
+def replay_host_scheduler(root: Path, ledger: Path, *,
+                          snapshot: bytes | None = None) -> DynamicChildScheduler:
     """Restore host ownership ports from protected canonical reservation intents.
 
     Reading this intent does not issue a grant or start work. Replay verifies
     its full parent/claim bindings against the already reserved private store.
     """
     from herdr.security import InvocationIdentity
-    from herdr.child_ownership import OwnershipRegistry
+    from herdr.child_ownership import OwnershipRegistry, ReadOnlyOwnershipRegistry
     from herdr.ownership_inventory import LegacyOwnershipInventory
-    audit = AuditLog(ledger)
+    from herdr.scheduler import SnapshotAuditLog
+    audit = SnapshotAuditLog(ledger, snapshot) if snapshot is not None else AuditLog(ledger)
     owners = {}
     for event in audit.replay():
         if event.get("event") == "child_ownership_reserved":
@@ -341,14 +343,20 @@ def replay_host_scheduler(root: Path, ledger: Path) -> DynamicChildScheduler:
         raise SchedulerError("multiple ownership parents in one attempt ledger")
     owner = next(iter(owners.values()),None)
     from herdr.ownership_release import HostOwnershipRelease
-    registry = None if owner is None else OwnershipRegistry(root,
-        verify_legacy=LegacyOwnershipInventory(root),verify_release=HostOwnershipRelease(root))
+    registry = None if owner is None else (
+        ReadOnlyOwnershipRegistry(root,
+            verify_legacy=LegacyOwnershipInventory(root),
+            verify_release=HostOwnershipRelease(root))
+        if snapshot is not None else OwnershipRegistry(root,
+            verify_legacy=LegacyOwnershipInventory(root),
+            verify_release=HostOwnershipRelease(root)))
     scheduler = DynamicChildScheduler(audit_log=audit,ownership_registry=registry,ownership_parent=owner)
     scheduler.replay()
     from agent_completion_evidence import child_completion_for_replay
-    authority=child_completion_for_replay(root,scheduler)
-    if authority is not None:
-        scheduler.completion_authority=authority
+    if snapshot is None:
+        authority=child_completion_for_replay(root,scheduler)
+        if authority is not None:
+            scheduler.completion_authority=authority
     if any(rec.ownership is not None and rec.ownership_reservation is None
            for rec in scheduler._tasks.values()):
         raise SchedulerError("declared ownership lacks protected reservation")
@@ -402,7 +410,7 @@ def reconcile_child_results(root: Path, parent_task_id: str, run_token: str) -> 
     if not ledger.is_file():
         return
     try:
-        scheduler = replay_host_scheduler(root,ledger)
+        scheduler = replay_host_scheduler(root, ledger)
         events = scheduler.audit_log.replay()
         parent = scheduler._tasks.get(parent_task_id)
         children = [rec for rec in scheduler._tasks.values()
@@ -497,7 +505,8 @@ def parent_attempt_guard(root: Path, parent_task_id: str, run_token: str, *,
 
 
 
-def observe_durable_child_attempt(root: Path, directory: Path) -> tuple[str, str]:
+def observe_durable_child_attempt(root: Path, directory: Path,
+                                  snapshot: bytes | None = None) -> tuple[str, str]:
     """Read-only projection of the authoritative child scheduler.
 
     A journal's child state and terminality are NEVER reimplemented here.
@@ -512,7 +521,9 @@ def observe_durable_child_attempt(root: Path, directory: Path) -> tuple[str, str
         _require_real_directory(directory)
         if not ledger_required(directory) or not ledger.is_file() or ledger.is_symlink():
             return "UNKNOWN", ""
-        scheduler = replay_host_scheduler(root, ledger)
+        if snapshot is None:
+            return "UNKNOWN", ""  # readonly callers must provide pinned bytes
+        scheduler = replay_host_scheduler(root, ledger, snapshot=snapshot)
         events = scheduler.audit_log.replay()
         parents = [e for e in events if e.get("event") == "submit"
                    and isinstance(e.get("repo"), str)
@@ -533,7 +544,9 @@ def observe_durable_child_attempt(root: Path, directory: Path) -> tuple[str, str
             return "UNKNOWN", repository
         # This invokes authoritative replay, ownership validation and the
         # correct terminal test for pre-delivery failures and cleanup.
-        return ("TERMINAL" if all_children_terminal(root, parent_id, run_token)
+        return ("TERMINAL" if all_children_terminal(
+                    root, parent_id, run_token, snapshot=snapshot,
+                    verified_scheduler=scheduler)
                 else "ACTIVE"), repository
     except (OSError, ValueError, TypeError, KeyError, AttributeError,
             RuntimeError):
@@ -541,7 +554,9 @@ def observe_durable_child_attempt(root: Path, directory: Path) -> tuple[str, str
 
 
 def all_children_terminal(root: Path, parent_task_id: str, run_token: str, *,
-                          lock_held: bool = False) -> bool:
+                          lock_held: bool = False,
+                          snapshot: bytes | None = None,
+                          verified_scheduler=None) -> bool:
     """Fail closed on a missing identity or an incomplete/corrupt existing ledger."""
     if not parent_task_id or not run_token:
         return False
@@ -559,7 +574,8 @@ def all_children_terminal(root: Path, parent_task_id: str, run_token: str, *,
     if not ledger.is_file():
         return lock_held and not os.path.lexists(ledger) and not ledger_required(directory)
     try:
-        scheduler = replay_host_scheduler(root,ledger)
+        scheduler = verified_scheduler or replay_host_scheduler(
+            root, ledger, snapshot=snapshot)
         events = scheduler.audit_log.replay()
         parent = scheduler._tasks.get(parent_task_id)
         if not events or not any(e.get("event") == "submit" and

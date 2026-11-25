@@ -77,3 +77,19 @@ in owner guard, false terminal states, lost orphan child claims, unsafe guard
 imports and non-Herdr consumer starvation. A new lifecycle state requires
 updating the canonical scheduler and its differential test first, then any
 observer. If this standard needs changing, use a separate documented review.
+
+## 7. Read-only ownership observation (mandatory)
+
+- Watchdog observation MUST consume a single bounded immutable scheduler
+  journal snapshot. Validating a path and reopening it later is prohibited.
+- Observation MUST NOT invoke mutating reconciliation, create registry
+  directories, create lock files, change reservations or write any proof.
+  Reconciliation remains exclusively with the host recovery authority.
+- A registry-backed observation MUST use non-mutating verification and bounded
+  shared locks. Any held lock, unbound reservation, changed identity, invalid
+  path, hostile file or authority error returns UNKNOWN; do not wait forever.
+- An outer process deadline MUST bound the entire inventory, not just each
+  file or lock. A timeout blocks Herdr start and permits later consumers to
+  continue. Explicit tests must demonstrate this contract.
+- Never equate green tests with approval. Exact-head independent review and
+  protected-branch authorization remain mandatory.

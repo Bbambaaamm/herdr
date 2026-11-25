@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[2]
 GUARD_PATH = ROOT / "agent-stack" / "bin" / "agent_stack_owner_guard.py"
 ENSURE_PATH = ROOT / "agent-stack" / "bin" / "agent-stack-ensure"
 HERDR_STATE = Path("/home/agentops/.local/state/agent-stack/herdr-development")
+sys.path.insert(0, str(ROOT / "agent-stack" / "bin"))
 
 _counter = 0
 
@@ -1762,7 +1763,7 @@ def test_owner_guard_has_no_parallel_child_journal_state_machine():
     tree = ast.parse(GUARD_PATH.read_text(encoding="utf-8"))
     function = next(node for node in tree.body
                     if isinstance(node, ast.FunctionDef)
-                    and node.name == "_durable_child_ledger_hits")
+                    and node.name == "_durable_child_ledger_hits_local")
     source = ast.get_source_segment(GUARD_PATH.read_text(encoding="utf-8"),
                                     function)
     for invented_state in ('"spawn_child"', '"child_result"',
@@ -1783,7 +1784,7 @@ def test_security_standard_present_and_single_authority_contract():
     child = (ROOT / "agent-stack/bin/agent_durable_children.py").read_text(encoding="utf-8")
     assert "from agent_durable_children import observe_durable_child_attempt" in source
     assert "replay_host_scheduler(root, ledger)" in child
-    assert "all_children_terminal(root, parent_id, run_token)" in child
+    assert "all_children_terminal(" in child and "verified_scheduler=scheduler" in child
 
 
 def test_authoritative_durable_observation_is_read_only(guard, tmp_path):
@@ -1794,10 +1795,113 @@ def test_authoritative_durable_observation_is_read_only(guard, tmp_path):
         str(path.relative_to(host["tasks_root"])): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in host["tasks_root"].rglob("*") if path.is_file()
     }
-    assert observe_durable_child_attempt(host["tasks_root"], directory) == (
+    snapshot = (directory / "scheduler.jsonl").read_bytes()
+    assert observe_durable_child_attempt(host["tasks_root"], directory, snapshot) == (
         "ACTIVE", "Bbambaaamm/herdr")
     after = {
         str(path.relative_to(host["tasks_root"])): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in host["tasks_root"].rglob("*") if path.is_file()
     }
     assert before == after
+
+def test_copilot_watchdog_observation_has_hard_timeout(guard, monkeypatch, tmp_path):
+    def timed_out(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0] if args else "python", 2)
+    monkeypatch.setattr(guard.subprocess, "run", timed_out)
+    with pytest.raises(guard.GuardObservationError) as caught:
+        guard._durable_child_ledger_hits(tmp_path, "Bbambaaamm/herdr")
+    assert caught.value.reason == "durable_observation_timeout"
+
+
+def test_copilot_snapshot_replay_never_reopens_replaced_ledger(tmp_path):
+    from agent_durable_children import replay_host_scheduler
+    from herdr.scheduler import DynamicChildScheduler, AuditLog
+    root = tmp_path / "tasks"
+    directory = root / "durable-children" / ("d" * 64)
+    directory.mkdir(parents=True)
+    ledger = directory / "scheduler.jsonl"
+    scheduler = DynamicChildScheduler(audit_log=AuditLog(ledger))
+    scheduler.register_external_parent_attempt(
+        task_id="parent", run_token="run-1", idempotency_key="key-1",
+        agent_name="agent", pane_id="pane-1", marker="marker",
+        repo="Bbambaaamm/herdr", issue="53", role="writer",
+        tools=("read_file",), permissions=(), policy_profile="default")
+    snapshot = ledger.read_bytes()
+    ledger.unlink()
+    os.mkfifo(ledger)
+    try:
+        replayed = replay_host_scheduler(root, ledger, snapshot=snapshot)
+        assert replayed._tasks["parent"].run_token == "run-1"
+    finally:
+        ledger.unlink()
+
+
+def test_copilot_readonly_registry_never_reconciles_unbound_claim(tmp_path):
+    from herdr.child_ownership import (OwnershipRegistry,
+                                        ReadOnlyOwnershipRegistry, OwnershipError)
+    from herdr.security import InvocationIdentity
+    root = tmp_path / "tasks"
+    root.mkdir(mode=0o700)
+    parent = InvocationIdentity("github:Bbambaaamm/herdr",
+                                "parent-agent", "root-agent",
+                                "parent", "root-task", "run-1", 1)
+    registry = OwnershipRegistry(root)
+    key = registry.reserve(parent, "child", None, read_only=True)
+    child = InvocationIdentity(parent.consumer, "child-agent", parent.agent_id,
+                               parent.task_id, "child", "run-1", 2)
+    state_before = (root / "child-ownership/registry.json").read_bytes()
+    observer = ReadOnlyOwnershipRegistry(root)
+    with pytest.raises(OwnershipError):
+        observer.reconcile_claim(key, parent, "child", None, child, read_only=True)
+    assert (root / "child-ownership/registry.json").read_bytes() == state_before
+
+
+def test_copilot_readonly_registry_lock_timeout_does_not_write(tmp_path):
+    import time
+    from herdr.child_ownership import (OwnershipRegistry,
+                                        ReadOnlyOwnershipRegistry, OwnershipError)
+    root = tmp_path / "tasks"
+    root.mkdir(mode=0o700)
+    registry = OwnershipRegistry(root)
+    lock = root / "child-ownership" / "registry.lock"
+    # Existing registry transaction creates the lock; no synthetic permissions.
+    registry.snapshot()
+    state_before = (root / "child-ownership" / "registry.json")
+    original = state_before.read_bytes()
+    script = ("import os,fcntl,sys,time;"
+              "fd=os.open(sys.argv[1],os.O_RDWR);"
+              "fcntl.flock(fd,fcntl.LOCK_EX);"
+              "print('HELD',flush=True);time.sleep(5)")
+    holder = subprocess.Popen([sys.executable, "-c", script, str(lock)],
+                              stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "HELD"
+        t = time.monotonic()
+        reader = ReadOnlyOwnershipRegistry(root)
+        with pytest.raises(OwnershipError, match="ownership_observation_lock_timeout"):
+            reader.snapshot()
+        assert time.monotonic() - t < 1.2
+    finally:
+        holder.terminate()
+        holder.wait(timeout=3)
+    assert state_before.read_bytes() == original
+
+
+def test_copilot_readonly_registry_valid_claim_does_not_write(tmp_path):
+    from herdr.child_ownership import OwnershipRegistry, ReadOnlyOwnershipRegistry
+    from herdr.security import InvocationIdentity
+    root = tmp_path / "tasks"
+    root.mkdir(mode=0o700)
+    parent = InvocationIdentity("github:Bbambaaamm/herdr", "parent-agent",
+                                "root-agent", "parent", "root-task", "run-1", 1)
+    registry = OwnershipRegistry(root)
+    key = registry.reserve(parent, "child", None, read_only=True)
+    child = InvocationIdentity(parent.consumer, "child-agent", parent.agent_id,
+                               parent.task_id, "child", "run-1", 2)
+    registry.bind_claim(key, child)
+    path = root / "child-ownership" / "registry.json"
+    original = path.read_bytes()
+    reader = ReadOnlyOwnershipRegistry(root)
+    reader.reconcile_claim(key, parent, "child", None, child, read_only=True)
+    assert reader.snapshot()["reservations"][key]["state"] == "claimed"
+    assert path.read_bytes() == original

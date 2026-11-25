@@ -28,6 +28,8 @@ import json
 import os
 import re
 import stat
+import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -296,8 +298,8 @@ def _native_inventory_dir(root: Path, name: str) -> Path:
     return directory
 
 
-def _durable_child_ledger_hits(root: Path, repository: str) -> tuple:
-    """Bounded inventory; terminality belongs to the durable child scheduler."""
+def _durable_child_ledger_hits_local(root: Path, repository: str) -> tuple:
+    """Worker-side bounded inventory; terminality belongs to the scheduler."""
     container = root / "durable-children"
     try:
         mode = container.lstat().st_mode
@@ -343,7 +345,8 @@ def _durable_child_ledger_hits(root: Path, repository: str) -> tuple:
             remaining -= len(raw)
             if remaining < 0:
                 raise GuardObservationError("durable_inventory_oversize")
-            state, observed_repo = observe_durable_child_attempt(root, directory)
+            state, observed_repo = observe_durable_child_attempt(
+                root, directory, snapshot=raw)
             if state == "UNKNOWN":
                 raise GuardObservationError("durable_ledger_unverified")
             if state == "ACTIVE" and observed_repo == repository:
@@ -353,6 +356,38 @@ def _durable_child_ledger_hits(root: Path, repository: str) -> tuple:
         except (OSError, RuntimeError, ValueError, TypeError, ImportError):
             raise GuardObservationError("durable_ledger_unverified") from None
     return tuple(hits)
+
+
+def _durable_child_ledger_hits(root: Path, repository: str) -> tuple:
+    """Isolate the entire replay/registry observation behind a hard deadline.
+
+    The subprocess cannot stall agent-stack-ensure. An unknown result causes
+    Herdr no-start, while other consumers continue to be checked.
+    """
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--observe-durable",
+             str(root), repository],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            timeout=2.0, check=False,
+        )
+        if proc.returncode != 0 or len(proc.stdout) > 131072:
+            raise GuardObservationError("durable_observation_unavailable")
+        data = json.loads(proc.stdout)
+        if not isinstance(data, dict) or set(data) != {"hits"} or not isinstance(data["hits"], list):
+            raise GuardObservationError("durable_observation_unavailable")
+        hits = data["hits"]
+        if (len(hits) > 1024 or any(not isinstance(x, str) or
+                not re.fullmatch(r"durable-children/[0-9a-f]{64}/scheduler\.jsonl", x)
+                for x in hits)):
+            raise GuardObservationError("durable_observation_unavailable")
+        return tuple(hits)
+    except subprocess.TimeoutExpired:
+        raise GuardObservationError("durable_observation_timeout") from None
+    except GuardObservationError:
+        raise
+    except (OSError, ValueError, TypeError):
+        raise GuardObservationError("durable_observation_unavailable") from None
 
 
 def _native_attempt_hits(tasks_root: Path, repository: str) -> tuple:
@@ -1069,3 +1104,18 @@ def plan_agent_start(
     if reservation.replay:
         return "already-reserved"
     return "start"
+
+if __name__ == "__main__":
+    # Private, read-only bounded observer command. Not a task/start authority.
+    if len(sys.argv) != 4 or sys.argv[1] != "--observe-durable":
+        raise SystemExit(2)
+    try:
+        root_arg = Path(sys.argv[2])
+        repository_arg = sys.argv[3]
+        if (not root_arg.is_absolute() or ".." in root_arg.parts
+                or not repository_arg or len(repository_arg) > 256):
+            raise GuardObservationError("durable_observation_arguments")
+        result = _durable_child_ledger_hits_local(root_arg, repository_arg)
+        print(json.dumps({"hits": result}, separators=(",", ":")))
+    except (GuardObservationError, OSError, ValueError, TypeError):
+        raise SystemExit(3)
