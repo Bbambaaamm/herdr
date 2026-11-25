@@ -1139,7 +1139,76 @@ def inspect_chatgpt_proposal(repo: str, number: int) -> dict:
     }
 
 
+def prepare_chatgpt_proposal_binding(repo: str, number: int) -> dict:
+    """Read-only double-approved proposal/root preflight; never publish a task."""
+    from herdr.chatgpt_command import CommandProposal, ProposalDenied, ROOT_REPOSITORY, ROOT_ISSUE
+    from herdr.chatgpt_admission_binding import (
+        prepare_admission_binding, ProposalBindingDenied,
+    )
+    if repo != ROOT_REPOSITORY or type(number) is not int or number == ROOT_ISSUE or not 1 <= number <= 2**31 - 1:
+        raise AdmissionDenied("binding-target-invalid")
+    consumers = load_consumers()
+    matches = [item for item in consumers if item.get("consumer") == "herdr"
+               and item.get("repository") == ROOT_REPOSITORY
+               and item.get("mode") == "root_only" and item.get("root_issue") == ROOT_ISSUE]
+    if len(matches) != 1:
+        raise AdmissionDenied("root-consumer-authority-unavailable")
+    root_consumer = matches[0]
+    authenticated_user()
+    api = f"https://api.github.com/repos/{repo}"
+    repository = fetch_json(api)
+    proposed_issue = fetch_json(f"{api}/issues/{number}")
+    proposal_revision = issue_revision(repo, repository, proposed_issue)
+    if proposed_issue["number"] != number:
+        raise AdmissionDenied("proposal-number-mismatch")
+    try:
+        proposal = CommandProposal.from_github_issue(proposed_issue)
+    except ProposalDenied as exc:
+        raise AdmissionDenied("invalid-chatgpt-proposal") from exc
+    # Reuse existing authenticated maintainer-comment-v1 verification without
+    # permitting the proposal issue into the regular root-only queue.
+    proposal_consumer = {**root_consumer, "mode": "all_open"}
+    fresh_proposal, proposal_admission = approved_revision(proposal_consumer, proposed_issue)
+    if issue_revision(repo, repository, fresh_proposal) != proposal_revision:
+        raise AdmissionDenied("proposal-revision-drift")
+    try:
+        CommandProposal.from_github_issue(fresh_proposal)
+    except ProposalDenied as exc:
+        raise AdmissionDenied("proposal-revision-invalid") from exc
+    root = fetch_json(f"{api}/issues/{ROOT_ISSUE}")
+    root_revision = issue_revision(repo, repository, root)
+    fresh_root, root_admission = approved_revision(root_consumer, root)
+    if issue_revision(repo, repository, fresh_root) != root_revision:
+        raise AdmissionDenied("root-revision-drift")
+    # Stage only: there is no production durable per-proposal consumed ledger.
+    # A live queue binding MUST NOT use this receipt until the next contract
+    # persists such dedup atomically with _consume_admission.
+    try:
+        binding = prepare_admission_binding(
+            proposal=proposal, proposal_issue=number,
+            proposal_issue_id=fresh_proposal["id"],
+            proposal_revision=proposal_revision, proposal_admission=proposal_admission,
+            root_revision=root_revision, root_admission=root_admission,
+            consumed_proposals=set(),
+        )
+    except ProposalBindingDenied as exc:
+        raise AdmissionDenied("proposal-binding-denied") from exc
+    return {
+        "read_only": True, "task_created": False,
+        "execution_authorized": False, "binding": binding.evidence(),
+        "status": "VALIDATED_NOT_ADMITTED",
+        "blocker": "durable_proposal_consumption_and_host_authority_not_implemented",
+    }
+
+
 def main() -> int:
+    if sys.argv[1:2] == ["--prepare-proposal-binding"]:
+        if (len(sys.argv) != 4 or not sys.argv[3].isdigit()
+                or not 1 <= int(sys.argv[3]) <= 2**31 - 1):
+            raise AdmissionDenied("prepare-proposal-binding-arguments-invalid")
+        print(json.dumps(prepare_chatgpt_proposal_binding(sys.argv[2], int(sys.argv[3])),
+                         sort_keys=True))
+        return 0
     if sys.argv[1:2] == ["--inspect-proposal"]:
         if (len(sys.argv) != 4 or not sys.argv[3].isdigit()
                 or not 1 <= int(sys.argv[3]) <= 2**31 - 1):
