@@ -61,3 +61,15 @@ authenticated GitHub transport and requires exact current revision,
 issue identity, updated timestamp, comment count and canonical request.
 A changed proposal fails closed before a binding is returned.
 This is not a substitute for later host-owned admission checks.
+
+## Independent P2: approval freshness at evidence emission
+
+Both proposal and root maintainer approval receipts are checked again
+against the current timezone-aware host clock immediately before returning
+the read-only binding evidence. The root GitHub calls may outlive a proposal
+approval even after its earlier validated read. At or after either
+`expires_at` the helper rejects the receipt with
+`proposal-binding-approval-expired`; unchanged issue revisions do not
+extend approval validity. Negative regression cases cover both individual
+expiration boundaries and a still-valid boundary. This remains an inert
+read-only preflight, not permission to enqueue or launch work.
