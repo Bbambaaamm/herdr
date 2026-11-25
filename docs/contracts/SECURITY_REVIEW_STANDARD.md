@@ -93,3 +93,42 @@ observer. If this standard needs changing, use a separate documented review.
   continue. Explicit tests must demonstrate this contract.
 - Never equate green tests with approval. Exact-head independent review and
   protected-branch authorization remain mandatory.
+
+## 8. Closed transitive read-only audit and release evidence
+
+Every read-only observer review MUST trace transitive authority callbacks, not
+merely the top-level function: owner_guard -> bounded subprocess -> bounded
+snapshot -> scheduler replay -> ReadOnlyOwnershipRegistry ->
+(ReadOnlyLegacyOwnershipInventory, HostOwnershipRelease, namespace_exited)
+-> terminality.
+
+- ReadOnlyOwnershipRegistry.reconcile_claim accepts exactly matching previously
+  claimed or released identity, including a validated immutable tombstone.
+  It never binds an absent identity or changes a state.
+- ReadOnlyLegacyOwnershipInventory must use the EXISTING worker.lock inode
+  without creation, fsync or recovery; absent/contended/invalid lock means
+  UNKNOWN, never silent permission. Nested released-claim checks must also use
+  the read-only registry, never instantiate the writer.
+- HostOwnershipRelease is an evidence-only verifier in this call graph.
+  Future changes to it or any transitive callback MUST undergo a transitive
+  write/lock audit before merging.
+- Tests MUST cover claimed, released and compacted tombstones, missing legacy
+  worker lock, no file creation, altered identity, lock contention and FIFO
+  swaps.
+- A whole-suite timing-sensitive failure outside the changed trust boundary
+  is triaged with exact test, repeated isolated reproductions, changed-file
+  correlation and logs. Do not label it flaky from one success; do not skip it.
+
+## 9. PR review loop closure
+
+1. Before review generate a complete trust-boundary dependency map and
+   invariant-by-fixture matrix.
+2. Preserve every confirmed finding as a negative regression test plus a
+   positive valid-state test.
+3. Batch fixes by authority boundary rather than replying to individual
+   comments with one-off conditions.
+4. Require local contract suites, full CI and canonical manifest on exact HEAD.
+5. Request one exact-head independent review after CI green, triaging findings
+   as confirmed-and-fixed, refuted-with-evidence or new independent bug.
+6. AI COMMENTED is never GitHub APPROVED. Branch protection, host authority,
+   deployment and supervisor activation are separate gates.

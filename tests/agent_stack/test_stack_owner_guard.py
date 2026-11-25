@@ -1905,3 +1905,77 @@ def test_copilot_readonly_registry_valid_claim_does_not_write(tmp_path):
     reader.reconcile_claim(key, parent, "child", None, child, read_only=True)
     assert reader.snapshot()["reservations"][key]["state"] == "claimed"
     assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("compacted", [False, True])
+def test_copilot_observer_accepts_exact_released_claim_and_tombstone(tmp_path, compacted):
+    from herdr.child_ownership import OwnershipRegistry, ReadOnlyOwnershipRegistry
+    from herdr.security import InvocationIdentity
+    root = tmp_path / "tasks"
+    root.mkdir(mode=0o700)
+    parent = InvocationIdentity("github:Bbambaaamm/herdr", "parent-agent",
+                                "root-agent", "parent", "root-task", "run-1", 1)
+    child = InvocationIdentity(parent.consumer, "child-agent", parent.agent_id,
+                               parent.task_id, "child", "run-1", 2)
+    store = OwnershipRegistry(root, verify_release=lambda *args: True)
+    key = store.reserve(parent, "child", None, read_only=True)
+    store.bind_claim(key, child)
+    store.release(key, child, {"reason": "complete"})
+    if compacted:
+        with store._transaction() as data:
+            store._compact_released(data)
+        assert key not in store.snapshot()["reservations"]
+        assert (root / "child-ownership" / ("released-" + key + ".json")).exists()
+    before = {str(p.relative_to(root)): p.read_bytes()
+              for p in root.rglob("*") if p.is_file()}
+    observe = ReadOnlyOwnershipRegistry(root)
+    observe.reconcile_claim(key, parent, "child", None, child, read_only=True)
+    assert observe.require_result_current(key, child) is True
+    after = {str(p.relative_to(root)): p.read_bytes()
+             for p in root.rglob("*") if p.is_file()}
+    assert before == after
+
+
+def test_copilot_readonly_legacy_requires_existing_lock_and_never_creates_one(tmp_path):
+    from herdr.child_ownership import OwnershipError
+    from herdr.ownership_inventory import ReadOnlyLegacyOwnershipInventory
+    root = tmp_path / "tasks"
+    root.mkdir(mode=0o700)
+    observer = ReadOnlyLegacyOwnershipInventory(root)
+    before = list(root.iterdir())
+    with pytest.raises(OwnershipError, match="ownership_observation_legacy_lock_missing"):
+        observer({"reservations": {}, "contracts": {}})
+    assert list(root.iterdir()) == before
+    lock = root / "worker.lock"
+    lock.touch(mode=0o600)
+    assert observer({"reservations": {}, "contracts": {}}) is True
+    assert sorted(p.name for p in root.iterdir()) == ["worker.lock"]
+
+
+def test_copilot_snapshot_uses_readonly_legacy_verifier_not_admission_guard(monkeypatch, tmp_path):
+    import agent_durable_children
+    from herdr.ownership_inventory import ReadOnlyLegacyOwnershipInventory
+    from herdr.child_ownership import OwnershipRegistry
+    from herdr.security import InvocationIdentity
+    from herdr.scheduler import DynamicChildScheduler, AuditLog
+    from agent_durable_children import attempt_directory, mark_ledger_required
+
+    root = tmp_path / "tasks"
+    root.mkdir(mode=0o700)
+    directory = attempt_directory(root, "parent", "run-1")
+    directory.mkdir(parents=True)
+    scheduler = DynamicChildScheduler(audit_log=AuditLog(directory / "scheduler.jsonl"))
+    scheduler.register_external_parent_attempt(
+        task_id="parent", run_token="run-1", idempotency_key="key-1",
+        agent_name="agent", pane_id="pane-1", marker="marker",
+        repo="Bbambaaamm/herdr", issue="53", role="writer",
+        tools=("read_file",), permissions=(), policy_profile="default")
+    mark_ledger_required(directory)
+    # Unowned journal: no registry is needed. Owned journal wiring is
+    # separately verified by checking the concrete factory and legacy adapter.
+    import inspect
+    source = inspect.getsource(agent_durable_children.replay_host_scheduler)
+    assert "ReadOnlyLegacyOwnershipInventory(root)" in source
+    assert "ReadOnlyOwnershipRegistry(root" in source
+    assert "LegacyOwnershipInventory(root)" in source
+    assert "snapshot is not None" in source

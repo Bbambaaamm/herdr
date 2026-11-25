@@ -331,7 +331,8 @@ def replay_host_scheduler(root: Path, ledger: Path, *,
     """
     from herdr.security import InvocationIdentity
     from herdr.child_ownership import OwnershipRegistry, ReadOnlyOwnershipRegistry
-    from herdr.ownership_inventory import LegacyOwnershipInventory
+    from herdr.ownership_inventory import (
+        LegacyOwnershipInventory, ReadOnlyLegacyOwnershipInventory)
     from herdr.scheduler import SnapshotAuditLog
     audit = SnapshotAuditLog(ledger, snapshot) if snapshot is not None else AuditLog(ledger)
     owners = {}
@@ -345,7 +346,7 @@ def replay_host_scheduler(root: Path, ledger: Path, *,
     from herdr.ownership_release import HostOwnershipRelease
     registry = None if owner is None else (
         ReadOnlyOwnershipRegistry(root,
-            verify_legacy=LegacyOwnershipInventory(root),
+            verify_legacy=ReadOnlyLegacyOwnershipInventory(root),
             verify_release=HostOwnershipRelease(root))
         if snapshot is not None else OwnershipRegistry(root,
             verify_legacy=LegacyOwnershipInventory(root),

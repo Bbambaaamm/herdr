@@ -567,7 +567,9 @@ class ReadOnlyOwnershipRegistry(OwnershipRegistry):
         require(key == self.key(parent, task_id), "ownership_replay_reservation")
         with self._transaction() as data:
             row = data["reservations"].get(key)
+            if row is None:
+                row = self.retired_reservation(key)  # validated read-only tombstone
             require(row is not None and all(row.get(k) == v for k, v in expected.items())
                     and row["identity"] == identity.to_json()
-                    and row["state"] == "claimed",
+                    and row["state"] in {"claimed", "released"},
                     "ownership_observation_unreconciled")
