@@ -86,8 +86,14 @@ class CommandProposal:
                 or any(not _text(x, maximum=320) for x in constraints)
                 or len(set(constraints)) != len(constraints)):
             raise ProposalDenied("invalid_constraints")
-        return cls(document["operation"], document["target_kind"],
-                   document["target_number"], document["objective"], tuple(constraints))
+        proposal = cls(document["operation"], document["target_kind"],
+                       document["target_number"], document["objective"], tuple(constraints))
+        # The GitHub renderer escapes markdown backticks as six-byte JSON
+        # Unicode escapes. Accept only requests that remain within the
+        # authenticated issue reader's same MAX_BYTES envelope after rendering.
+        if len(proposal._issue_json().encode("utf-8")) > MAX_BYTES:
+            raise ProposalDenied("rendered_request_too_large")
+        return proposal
 
     def request(self) -> dict[str, Any]:
         return {
@@ -104,15 +110,19 @@ class CommandProposal:
                        separators=(",", ":"), allow_nan=False).encode("utf-8")
         ).hexdigest()
 
+    def _issue_json(self) -> str:
+        request = json.dumps(self.request(), sort_keys=True, ensure_ascii=False,
+                             separators=(",", ":"), allow_nan=False)
+        # Preserve JSON semantics while denying Markdown fence injection.
+        return request.replace(chr(96), chr(92) + "u0060")
+
     def github_issue_proposal(self) -> dict[str, Any]:
         """Return inert issue text; never an admission marker or task submission."""
         title = (f"[Herdr proposal] {self.operation}: "
                  f"{self.target_kind} #{self.target_number} [{self.digest[:12]}]")
-        request = json.dumps(self.request(), sort_keys=True, ensure_ascii=False,
-                             separators=(",", ":"), allow_nan=False)
-        # Preserve valid JSON, but prevent an untrusted objective closing the
-        # Markdown fence and impersonating a trusted maintainer approval.
-        request = request.replace(chr(96), chr(92) + "u0060")
+        request = self._issue_json()
+        if len(request.encode("utf-8")) > MAX_BYTES:
+            raise ProposalDenied("rendered_request_too_large")
         body = (f"{MARKER}\n\n"
                 f"Request SHA-256: `{self.digest}`\n\n"
                 "Status: PROPOSED_ONLY — not approved, queued or executing.\n\n"

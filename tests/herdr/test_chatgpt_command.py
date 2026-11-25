@@ -96,3 +96,15 @@ def test_cli_rejects_symlink(tmp_path):
                              capture_output=True, text=True, timeout=8)
     assert process.returncode == 3
     assert "proposal_denied" in process.stderr
+
+
+def test_rendered_escape_expansion_never_creates_unreadable_proposal():
+    # Exact-head Codex P2: the original parser admitted this 1400-backtick
+    # payload but its escaped issue JSON exceeded MAX_BYTES.
+    with pytest.raises(ProposalDenied, match="rendered_request_too_large"):
+        CommandProposal.parse(request(objective="`" * 1400))
+    # Smaller valid escaped content must round-trip through GitHub issue parser.
+    p = CommandProposal.parse(request(objective="`" * 800))
+    rendered = p.github_issue_proposal()
+    assert p.digest == rendered["request_sha256"]
+    assert len(p._issue_json().encode("utf-8")) <= 8192
