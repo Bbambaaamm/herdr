@@ -316,12 +316,28 @@ def _native_attempt_hits(tasks_root: Path, repository: str) -> tuple:
         for name, task in _native_attempt_entry(_native_inventory_dir(root, folder)):
             if task.get("repo") == repository:
                 hits.append(folder + "/" + name)
+    # Read only known authority fields; prompts, errors and arbitrary JSON
+    # are not trustworthy lifecycle evidence.  Preserve the legacy structured
+    # diagnostics field without searching its free-text values.
+    uncertain_states = frozenset({
+        "delivery_uncertain", "terminal_unknown", "unknown", "uncertain",
+    })
+    blocking_reasons = frozenset({
+        "active_durable_children",
+        "orphaned_running_unknown_delivery",
+        "delivery_uncertain_requires_recovery",
+        "terminal_unknown_delivery",
+        "task_session_cleanup_failed",
+    })
     for name, task in _native_attempt_entry(_native_inventory_dir(root, "blocked")):
-        blob = canonical_json(task).lower()
-        if task.get("repo") == repository and (
-            "uncertain" in blob or "unknown" in blob
-            or task.get("watchdog_blocker") == "active_durable_children"
-        ):
+        if task.get("repo") != repository:
+            continue
+        diagnostic = task.get("diagnostics")
+        legacy_blocker = (diagnostic.get("watchdog_blocker")
+                          if isinstance(diagnostic, dict) else None)
+        if (task.get("attempt_state") in uncertain_states
+                or task.get("watchdog_blocker") in blocking_reasons
+                or legacy_blocker in {"uncertain", "unknown"}):
             hits.append("blocked/" + name)
     return tuple(hits)
 

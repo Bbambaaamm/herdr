@@ -1597,3 +1597,40 @@ def test_copilot_reservation_requires_matching_evidence_generation(guard, tmp_pa
     from dataclasses import replace
     evidence = replace(interactive_evidence(guard), observed_generation="gen-2")
     assert guard.plan_agent_start(evidence, approved) == guard.DECISION_BLOCKED_UNKNOWN
+
+
+@pytest.mark.parametrize("text_field", [
+    "prompt", "last_error", "issue", "description",
+])
+def test_copilot_blocked_free_text_does_not_create_false_attempt(
+    guard, tmp_path, text_field
+):
+    host = make_host(guard, tmp_path, state="RUNNING", uncertain_blocked=[{
+        "id": "terminal-blocked", "repo": "Bbambaaamm/herdr",
+        "attempt_state": "blocked", text_field: "unknown uncertain delivery",
+    }])
+    hits = guard._native_attempt_hits(host["tasks_root"], "Bbambaaamm/herdr")
+    assert hits == ()
+    with held_lock(host["state_dir"] / "supervisor.lock"):
+        decision = _review_decide(guard, host, tmp_path / "audit.jsonl")
+    assert decision.code == guard.DECISION_SKIPPED_SUPERVISOR_OWNED
+
+
+@pytest.mark.parametrize("field,value", [
+    ("attempt_state", "delivery_uncertain"),
+    ("attempt_state", "terminal_unknown"),
+    ("watchdog_blocker", "orphaned_running_unknown_delivery"),
+    ("watchdog_blocker", "delivery_uncertain_requires_recovery"),
+    ("watchdog_blocker", "active_durable_children"),
+])
+def test_copilot_structured_blocked_state_is_durable_attempt(
+    guard, tmp_path, field, value
+):
+    host = make_host(guard, tmp_path, state="RUNNING", uncertain_blocked=[{
+        "id": "held", "repo": "Bbambaaamm/herdr",
+        "prompt": "ordinary work", field: value,
+    }])
+    with held_lock(host["state_dir"] / "supervisor.lock"):
+        decision = _review_decide(guard, host, tmp_path / "audit.jsonl")
+    assert decision.code == guard.DECISION_BLOCKED_ATTEMPT
+    assert decision.evidence.active_attempts == ("blocked/task-0.json",)
