@@ -114,6 +114,7 @@ def test_intake_prepare_binding_uses_existing_approval_helper(monkeypatch):
     monkeypatch.setattr(m, "load_consumers", lambda: [
         {"consumer": "herdr", "repository": repo, "mode": "root_only", "root_issue": 53}])
     monkeypatch.setattr(m, "authenticated_user", lambda: (9, "reader"))
+    monkeypatch.setattr(m, "now", lambda: datetime(2026, 11, 25, 12, 3, tzinfo=timezone.utc))
     monkeypatch.setattr(m, "fetch_json", lambda url: {
         api: repo_row, api + "/issues/300": proposal_issue,
         api + "/issues/53": root_issue,
@@ -126,6 +127,19 @@ def test_intake_prepare_binding_uses_existing_approval_helper(monkeypatch):
     assert result["status"] == "VALIDATED_NOT_ADMITTED"
     assert not result["task_created"] and not result["execution_authorized"]
     assert result["binding"]["proposal_digest"] == args["proposal"].digest
+    # Codex P2: a receipt can expire during the second approval check even
+    # when the proposal and root issue revisions have not changed.
+    monkeypatch.setattr(m, "now", lambda: datetime(2026, 11, 25, 12, 30, tzinfo=timezone.utc))
+    with pytest.raises(m.AdmissionDenied, match="proposal-binding-approval-expired"):
+        m.prepare_chatgpt_proposal_binding(repo, 300)
+    # Recheck root expiry independently, after extending proposal validity.
+    args["proposal_admission"]["expires_at"] = "2026-11-25T13:00:00+00:00"
+    monkeypatch.setattr(m, "now", lambda: datetime(2026, 11, 25, 12, 32, tzinfo=timezone.utc))
+    with pytest.raises(m.AdmissionDenied, match="proposal-binding-approval-expired"):
+        m.prepare_chatgpt_proposal_binding(repo, 300)
+    # Both still valid just before the root expiration.
+    monkeypatch.setattr(m, "now", lambda: datetime(2026, 11, 25, 12, 31, 59, tzinfo=timezone.utc))
+    assert m.prepare_chatgpt_proposal_binding(repo, 300)["status"] == "VALIDATED_NOT_ADMITTED"
     proposal_issue["body"] += "\nInjected"
     with pytest.raises(m.AdmissionDenied):
         m.prepare_chatgpt_proposal_binding(repo, 300)
