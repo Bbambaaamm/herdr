@@ -321,3 +321,45 @@ def test_direct_selected_root_denies_active_or_unknown_existing_claim(
         )
     assert not intake.STATE.exists()
     assert not list(intake.PENDING.glob("*.json"))
+
+
+def test_codex_p2_pending_proposal_without_root_intent_fails_closed(intake):
+    """Codex finding at PR #259: damaged state must not lose quarantine."""
+    binding, admission, consumer, issue, task_id = inputs()
+    with intake.intake_lock():
+        intake._consume_admission(
+            consumer, issue, task_id, admission, proposal_binding=binding)
+    state = json.loads(intake.STATE.read_text())
+    row = state["Bbambaaamm/herdr#53"]
+    del row["admission_intent"]
+    intake.STATE.write_text(json.dumps(state))
+    with pytest.raises(intake.AdmissionDenied,
+                       match="proposal-consumption-pending-without-root-intent"):
+        intake.load_state()
+    newer = dict(admission, approval_id=5401)
+    newer_binding = dict(binding, root_approval_id=5401)
+    unsigned = {k: v for k, v in newer_binding.items() if k != "binding_sha256"}
+    import hashlib
+    newer_binding["binding_sha256"] = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    before = intake.STATE.read_bytes()
+    with intake.intake_lock(), pytest.raises(intake.AdmissionDenied):
+        intake._consume_admission(
+            consumer, issue, "github-herdr-issue-53-approval-5401",
+            newer, proposal_binding=newer_binding)
+    assert intake.STATE.read_bytes() == before
+
+
+def test_all_pending_proposal_claims_block_even_with_old_published_intent(intake):
+    binding, admission, consumer, issue, task_id = inputs()
+    with intake.intake_lock():
+        intake._consume_admission(
+            consumer, issue, task_id, admission, proposal_binding=binding)
+    state = json.loads(intake.STATE.read_text())
+    row = state["Bbambaaamm/herdr#53"]
+    row["admission_intent"]["state"] = "published"
+    intake.STATE.write_text(json.dumps(state))
+    with pytest.raises(intake.AdmissionDenied,
+                       match="proposal-consumption-pending-without-root-intent"):
+        intake.load_state()

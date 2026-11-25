@@ -124,9 +124,17 @@ def load_state() -> dict:
                     or history.get(str(binding["root_approval_id"])) != claim["task_id"]):
                 raise AdmissionDenied("proposal-consumption-history-mismatch")
             intent = row.get("admission_intent")
-            if (intent is not None and intent.get("task_id") == claim["task_id"]
-                    and (claim["state"] != intent["state"]
-                         or intent["content_sha256"] != binding["root_revision"])):
+            # A pending proposal claim is an unresolved publication even if
+            # the root intent was lost from damaged durable state. Never
+            # admit a newer root approval through that crash-window gap.
+            if claim["state"] == "publication_pending":
+                if (intent is None or intent.get("task_id") != claim["task_id"]
+                        or intent["state"] != "publication_pending"
+                        or intent["content_sha256"] != binding["root_revision"]):
+                    raise AdmissionDenied("proposal-consumption-pending-without-root-intent")
+            elif (intent is not None and intent.get("task_id") == claim["task_id"]
+                  and (intent["state"] != "published"
+                       or intent["content_sha256"] != binding["root_revision"])):
                 raise AdmissionDenied("proposal-consumption-intent-mismatch")
         row.setdefault("repo", repo)
         row.setdefault("issue", number)
@@ -772,6 +780,9 @@ def _validate_admission_intent(row, history):
 
 def _requires_admission_reconciliation(row):
     intent = row.get('admission_intent')
+    if any(claim["state"] == "publication_pending"
+           for claim in proposal_consumptions(row).values()):
+        return True
     return isinstance(intent, dict) and intent['state'] == 'publication_pending'
 
 

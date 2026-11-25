@@ -87,3 +87,21 @@ The selected-root internal queue path also rejects any existing
 `pending`, `running`, `blocked`, missing or unknown attempted episode in
 its supplied scheduler evidence. Host-owned activation must still
 independently verify complete authoritative owner/attempt evidence.
+
+## Independent Codex P2: lost root intent quarantine
+
+On reviewed HEAD `6820ea4`, Codex reproduced a damaged state where an
+existing `publication_pending` proposal consumption survives but the
+corresponding root `admission_intent` is removed. Previously `load_state()`
+accepted that row and a subsequent root approval could proceed despite the
+uncertain earlier publication. This was a valid blocking P2.
+
+The state validator now requires every pending proposal claim to have an
+exact matching `publication_pending` root intent (same original task ID and
+root revision). A pending proposal independently forces reconciliation.
+Historical published claims may coexist with the current later root intent.
+Regression tests reproduce missing intent, mismatched state, and denial of
+the next root approval without changing the retained bytes.
+
+This local correction does NOT constitute independent approval.
+An exact-head re-review after the fix is mandatory.
