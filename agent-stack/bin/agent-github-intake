@@ -1470,6 +1470,13 @@ def prepare_chatgpt_proposal_binding(repo: str, number: int) -> dict:
         )
     except ProposalBindingDenied as exc:
         raise AdmissionDenied("proposal-binding-denied") from exc
+    # Even a valid immutable approval receipt can expire during the root
+    # GitHub round trips. Recheck BOTH expirations at the evidence boundary,
+    # not just when each approved_revision() was originally called.
+    receipt_check_at = now()
+    if (receipt_check_at >= _date(proposal_admission["expires_at"])
+            or receipt_check_at >= _date(root_admission["expires_at"])):
+        raise AdmissionDenied("proposal-binding-approval-expired")
     return {
         "read_only": True, "task_created": False,
         "execution_authorized": False, "binding": binding.evidence(),
