@@ -39,9 +39,15 @@ def _load_owner_guard():
     return module
 
 
-if not GUARD_PATH.is_file():
-    raise RuntimeError("owner guard module missing next to agent-stack-ensure")
-owner_guard = _load_owner_guard()
+# Import failures are scoped to Herdr: never abort the independent consumers.
+# No start can proceed when the guard is unavailable.
+DECISION_BLOCKED_UNKNOWN = "BLOCKED_OWNER_UNKNOWN"
+try:
+    if not GUARD_PATH.is_file():
+        raise RuntimeError("owner guard module missing next to agent-stack-ensure")
+    owner_guard = _load_owner_guard()
+except Exception:
+    owner_guard = None
 
 ENV = os.environ.copy()
 ENV["HOME"] = str(HOME)
@@ -125,7 +131,7 @@ def guard_diagnostic(reason):
     safe_codes = {
         "audit_file_invalid", "audit_path_invalid", "audit_write_failed",
         "audit_entry_oversize", "guard_evaluation_failed", "consumer_setup_failed",
-        "consumer_agent_failed", "ensure_log_unavailable",
+        "consumer_agent_failed", "ensure_log_unavailable", "audit_lock_timeout",
     }
     code = reason if isinstance(reason, str) and reason in safe_codes else "guard_observation_failed"
     message = f"Herdr owner guard unavailable ({code}); agent start blocked\n"
@@ -374,6 +380,8 @@ def decide_herdr_agent_start(spec, group):
     first dependency-safe slice. Other consumers keep their previous behavior.
     """
     repository = str(group.get("repository") or "Bbambaaamm/herdr")
+    if owner_guard is None:
+        raise RuntimeError("guard_module_unavailable")
     return owner_guard.decide_herdr_agent_start(
         "Herdr",
         repository,
@@ -391,11 +399,12 @@ def ensure_agent(workspace_id, spec, group=None):
     if group is not None and group.get("label") == "Herdr":
         try:
             decision = decide_herdr_agent_start(spec, group)
-        except (owner_guard.GuardObservationError, OSError, TypeError, ValueError, KeyError) as exc:
-            reason = (exc.reason if isinstance(exc, owner_guard.GuardObservationError)
+        except Exception as exc:
+            reason = (exc.reason if owner_guard is not None
+                      and isinstance(exc, owner_guard.GuardObservationError)
                       else "guard_evaluation_failed")
             guard_diagnostic(reason)
-            return owner_guard.DECISION_BLOCKED_UNKNOWN
+            return DECISION_BLOCKED_UNKNOWN
         if str(decision.code) != owner_guard.DECISION_RESTORED_INTERACTIVE:
             log_guard_block(f"{spec['name']}: {decision.code} ({decision.reason}) "
                             f"owner_guard=no_start")
@@ -437,7 +446,7 @@ def main():
             if group.get("label") != "Herdr":
                 raise
             guard_diagnostic("consumer_setup_failed")
-            blocked.extend((spec["name"], owner_guard.DECISION_BLOCKED_UNKNOWN)
+            blocked.extend((spec["name"], DECISION_BLOCKED_UNKNOWN)
                            for spec in group["agents"])
             continue
         for spec in group["agents"]:
@@ -447,7 +456,7 @@ def main():
                 if group.get("label") != "Herdr":
                     raise
                 guard_diagnostic("consumer_agent_failed")
-                action = owner_guard.DECISION_BLOCKED_UNKNOWN
+                action = DECISION_BLOCKED_UNKNOWN
             if str(action).startswith(("BLOCKED_", "SKIPPED_")):
                 blocked.append((spec["name"], str(action)))
     names = sorted(a.get("name", "") for a in list_agents())

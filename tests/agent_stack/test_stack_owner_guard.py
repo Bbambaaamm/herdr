@@ -916,7 +916,7 @@ def test_review_audit_parent_swap_stays_on_pinned_directory(
 
         def swap_on_lock(fd, operation):
             result = original_flock(fd, operation)
-            if operation == guard.fcntl.LOCK_EX:
+            if operation & guard.fcntl.LOCK_EX:
                 swap()
             return result
 
@@ -1494,3 +1494,57 @@ def test_scope_ensure_has_no_generic_resume_or_checkpoint_writer():
     assert "resume" not in source
     assert "--resume-reviewed" not in source
     assert "checkpoint.json" not in source
+
+# Copilot follow-up: guard initialization and audit locking must not
+# prevent independent consumers from continuing.
+@pytest.mark.parametrize("broken_source", [None, "this is not python!\n",
+                                           "raise RuntimeError('import exploded')\n"])
+def test_guard_import_failure_is_isolated_to_herdr(tmp_path, broken_source, monkeypatch):
+    folder = tmp_path / "agent-stack" / "bin"
+    folder.mkdir(parents=True)
+    fake_ensure = folder / "agent-stack-ensure"
+    fake_ensure.write_bytes(ENSURE_PATH.read_bytes())
+    if broken_source is not None:
+        (folder / "agent_stack_owner_guard.py").write_text(broken_source)
+    ensure = load_module("ensure_broken_guard", fake_ensure)
+    assert ensure.owner_guard is None
+    monkeypatch.setattr(ensure, "healthy_agent_names", lambda: {"majak-hermes"})
+    monkeypatch.setattr(ensure, "log", lambda message: None)
+    assert ensure.ensure_agent("irrelevant", {"name": "herdr-hermes"},
+                               {"label": "Herdr"}) == "BLOCKED_OWNER_UNKNOWN"
+    assert ensure.ensure_agent("irrelevant", {"name": "majak-hermes"},
+                               {"label": "Majak"}) == "healthy"
+
+
+def test_audit_lock_deadline_with_real_other_process(guard, tmp_path):
+    import time
+    audit = tmp_path / "audit.jsonl"
+    sidecar = str(audit) + ".lock"
+    script = ("import fcntl,os,sys,time; "
+              "fd=os.open(sys.argv[1], os.O_RDWR|os.O_CREAT,0o600); "
+              "fcntl.flock(fd,fcntl.LOCK_EX); "
+              "print('LOCKED',flush=True); time.sleep(4)")
+    holder = subprocess.Popen([sys.executable, "-c", script, sidecar],
+                              stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "LOCKED"
+        start = time.monotonic()
+        with pytest.raises(guard.GuardObservationError) as e:
+            _audit_once(guard, audit)
+        elapsed = time.monotonic() - start
+        assert e.value.reason == "audit_lock_timeout"
+        assert 0.4 <= elapsed < 2.0
+    finally:
+        holder.terminate()
+        holder.wait(timeout=3)
+
+
+@pytest.mark.parametrize("state", ["STARTING", "RUNNING", "WAITING"])
+@pytest.mark.parametrize("aux_status", ["MISSING", "UNREADABLE"])
+def test_live_supervisor_needs_readable_auxiliary_fences(guard, state, aux_status):
+    fences = {"supervisor.lock": "HELD", "cycle.lock": "FREE",
+              "bootstrap.lock": aux_status}
+    result = guard.evaluate_ownership(base_evidence(
+        guard, decision_state=state, supervisor_alive=True, fence_states=fences))
+    assert result.code == guard.DECISION_BLOCKED_UNKNOWN
+    assert result.reason == "auxiliary_fence_unavailable"

@@ -28,6 +28,7 @@ import json
 import os
 import re
 import stat
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -69,6 +70,7 @@ UNKNOWN_STATES = frozenset({"ERROR"})
 BOUNDED_BYTES_LIMIT = 131072
 AUDIT_MAX_BYTES = 65536
 AUDIT_ENTRY_MAX_BYTES = 4096
+AUDIT_LOCK_TIMEOUT_SECONDS = 0.5
 
 
 class GuardObservationError(Exception):
@@ -624,6 +626,12 @@ def evaluate_ownership(evidence: OwnerEvidence) -> GuardDecision:
         state = evidence.decision_state
         if supervisor_lock == "MISSING":
             return _decision(DECISION_BLOCKED_UNKNOWN, "supervisor_fence_missing", evidence)
+        if state in SUPERVISED_ACTIVE_STATES | SUPERVISED_WAITING_STATES:
+            # A live ownership assertion needs observable auxiliary fences.
+            # They can legitimately be FREE during certain supervisor phases.
+            if any(fences.get(name) not in {"HELD", "FREE"}
+                   for name in ("cycle.lock", "bootstrap.lock")):
+                return _decision(DECISION_BLOCKED_UNKNOWN, "auxiliary_fence_unavailable", evidence)
         if state in SUPERVISED_ACTIVE_STATES:
             if evidence.supervisor_alive is not True:
                 return _decision(DECISION_BLOCKED_UNKNOWN, "stale_supervisor_identity", evidence)
@@ -768,7 +776,15 @@ def _append_bounded_audit(path: Path, line: bytes) -> None:
                           0o600, dir_fd=directory_fd)
         try:
             _audit_regular(lock_fd)
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            deadline = time.monotonic() + AUDIT_LOCK_TIMEOUT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise GuardObservationError("audit_lock_timeout") from None
+                    time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
             # A prior crash can leave a complete temporary record. The backup
             # retains the previous generation; clear only this bounded temp file.
             try:
