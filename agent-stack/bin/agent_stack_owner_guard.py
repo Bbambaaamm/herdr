@@ -145,20 +145,23 @@ def digest(value: Any) -> str:
 def _bounded_bytes(path: Path, limit: int = BOUNDED_BYTES_LIMIT) -> bytes:
     """Read a regular file without following a final symlink."""
     try:
-        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(str(path), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     except OSError as exc:
         reason = "symlink" if getattr(exc, "errno", None) == errno.ELOOP else "unreadable"
         raise GuardObservationError(reason)
     try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise GuardObservationError("not_regular")
-        if info.st_size > limit:
-            raise GuardObservationError("oversize")
-        data = os.read(fd, limit + 1)
-        if len(data) > limit:
-            raise GuardObservationError("oversize")
-        return data
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise GuardObservationError("not_regular")
+            if info.st_size > limit:
+                raise GuardObservationError("oversize")
+            data = os.read(fd, limit + 1)
+            if len(data) > limit:
+                raise GuardObservationError("oversize")
+            return data
+        except OSError:
+            raise GuardObservationError("unreadable") from None
     finally:
         os.close(fd)
 
@@ -215,12 +218,18 @@ def identity_matches(recorded: object, observed: object) -> bool:
 def lock_state(path: Path) -> str:
     """Return HELD/FREE/MISSING without creating the file."""
     try:
-        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(str(path), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     except FileNotFoundError:
         return "MISSING"
     except OSError:
         return "UNREADABLE"
     try:
+        try:
+            regular = stat.S_ISREG(os.fstat(fd).st_mode)
+        except OSError:
+            return "UNREADABLE"
+        if not regular:
+            return "UNREADABLE"
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -684,6 +693,31 @@ def _audit_regular(fd: int) -> int:
     return info.st_size
 
 
+def _audit_valid_jsonl(fd: int, size: int) -> None:
+    """Reject interrupted or malformed generations before acknowledging an append."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = os.read(fd, remaining)
+        if not chunk:
+            raise GuardObservationError("audit_file_invalid")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    data = b"".join(chunks)
+    if data and not data.endswith(b"\n"):
+        raise GuardObservationError("audit_file_invalid")
+    for line in data.splitlines(keepends=True):
+        if len(line) > AUDIT_ENTRY_MAX_BYTES or not line.endswith(b"\n"):
+            raise GuardObservationError("audit_file_invalid")
+        try:
+            record = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            raise GuardObservationError("audit_file_invalid") from None
+        if not isinstance(record, dict):
+            raise GuardObservationError("audit_file_invalid")
+
+
 def _audit_write_all(fd: int, data: bytes) -> None:
     offset = 0
     while offset < len(data):
@@ -752,7 +786,7 @@ def _append_bounded_audit(path: Path, line: bytes) -> None:
                 except FileNotFoundError:
                     continue
                 try:
-                    _audit_regular(check_fd)
+                    _audit_valid_jsonl(check_fd, _audit_regular(check_fd))
                 finally:
                     os.close(check_fd)
             try:
@@ -770,6 +804,7 @@ def _append_bounded_audit(path: Path, line: bytes) -> None:
                     created = False
             try:
                 size = _audit_regular(fd)
+                _audit_valid_jsonl(fd, size)
                 if size + len(line) <= AUDIT_MAX_BYTES:
                     try:
                         os.lseek(fd, size, os.SEEK_SET)

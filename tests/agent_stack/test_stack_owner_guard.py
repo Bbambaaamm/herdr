@@ -14,6 +14,7 @@ import os
 import errno
 import shutil
 import stat
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -850,6 +851,51 @@ def test_review_audit_failed_write_rolls_back_and_blocks(guard, monkeypatch, tmp
     assert path.read_bytes() == before
 
 
+@pytest.mark.parametrize("generation", ["", ".1"])
+@pytest.mark.parametrize("bad_tail", [b'{"interrupted":', b'{"valid":true}', b'not json\n', b'{}\n' + b'x' * 4097 + b'\n'])
+def test_review_audit_refuses_malformed_existing_generation(
+    guard, tmp_path, generation, bad_tail
+):
+    path = tmp_path / "audit.jsonl"
+    _audit_once(guard, path)
+    original = path.read_bytes()
+    target = Path(str(path) + generation)
+    seeded = original + bad_tail if not generation else b'{"prior":true}\n' + bad_tail
+    target.write_bytes(seeded)
+    with pytest.raises(guard.GuardObservationError, match="audit_file_invalid"):
+        _audit_once(guard, path)
+    assert target.read_bytes() == seeded
+    if generation:
+        assert path.read_bytes() == original
+    assert all(file.stat().st_size <= guard.AUDIT_MAX_BYTES
+               for file in (path, target))
+
+
+def test_review_audit_concurrent_writers_refuse_interrupted_tail(guard, tmp_path):
+    path = tmp_path / "audit.jsonl"
+    _audit_once(guard, path)
+    truncated = path.read_bytes() + b'{"interrupted":'
+    path.write_bytes(truncated)
+    errors = []
+    barrier = threading.Barrier(8)
+
+    def append():
+        barrier.wait()
+        try:
+            _audit_once(guard, path)
+        except guard.GuardObservationError as exc:
+            errors.append(exc.reason)
+
+    threads = [threading.Thread(target=append) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+    assert errors == ["audit_file_invalid"] * 8
+    assert path.read_bytes() == truncated
+
+
 @pytest.mark.parametrize("swap_after_lock", [False, True])
 def test_review_audit_parent_swap_stays_on_pinned_directory(
     guard, monkeypatch, tmp_path, swap_after_lock
@@ -950,6 +996,72 @@ def test_review_audit_recovers_interrupted_rotation(guard, tmp_path):
     assert backup.read_text() == '{"prior":true}\n'
     assert not temporary.exists()
     assert json.loads(path.read_text())["event"] == "BLOCKED_OWNER_UNKNOWN"
+
+
+@pytest.mark.parametrize("site", [
+    "supervisor", "checkpoint", "continuation", "unaccepted", "launch",
+    "policy", "pending", "running", "blocked", "supervisor_lock",
+    "cycle_lock", "bootstrap_lock",
+])
+def test_review_evidence_fifo_does_not_stall_stack_consumers(guard, tmp_path, site):
+    host = make_host(guard, tmp_path / "host", state="PAUSED")
+    paths = {
+        "supervisor": host["state_dir"] / "supervisor.json",
+        "checkpoint": host["job"] / "checkpoint.json",
+        "continuation": host["job"] / "continuation.json",
+        "unaccepted": host["job"] / "unaccepted-continuation.json",
+        "launch": host["job"] / "launch.json",
+        "policy": host["repo_root"] / "configs/consumers/herdr.yaml",
+        "pending": host["tasks_root"] / "pending/task-0.json",
+        "running": host["tasks_root"] / "running/task-0.json",
+        "blocked": host["tasks_root"] / "blocked/task-0.json",
+        "supervisor_lock": host["state_dir"] / "supervisor.lock",
+        "cycle_lock": host["state_dir"] / "cycle.lock",
+        "bootstrap_lock": host["state_dir"] / "bootstrap.lock",
+    }
+    target = paths[site]
+    target.unlink(missing_ok=True)
+    os.mkfifo(target)
+    script = """
+import importlib.machinery, importlib.util, json, sys
+from pathlib import Path
+def load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    loader.exec_module(module)
+    return module
+ensure = load('fifo_ensure', sys.argv[1])
+state, repo, tasks, audit = map(Path, sys.argv[2:])
+collector = ensure.owner_guard.collect_herdr_observation
+ensure.owner_guard.collect_herdr_observation = lambda agent_id, **kw: collector(
+    agent_id, state_dir=state, repo_root=repo, tasks_root=tasks)
+ensure.GUARD_AUDIT_LOG = audit
+ensure.LOG = audit.with_suffix('.log')
+ensure.list_agents = lambda: []
+ensure.list_tabs = lambda: [{'workspace_id': 'w', 'label': 'Codex', 'tab_id': 't'}]
+ensure.list_panes = lambda _: [{'tab_id': 't', 'pane_id': 'p'}]
+starts = []
+def fake_run(args, timeout=30):
+    starts.append(args[args.index('start') + 1])
+    return ensure.subprocess.CompletedProcess(args, 0, stdout='', stderr='')
+ensure.run = fake_run
+spec = lambda name: {'name': name, 'tab': 'Codex', 'kind': 'codex', 'args': []}
+herdr = ensure.ensure_agent('w', spec('herdr-codex'),
+                           {'label': 'Herdr', 'repository': 'Bbambaaamm/herdr'})
+other = ensure.ensure_agent('w', spec('majak-codex'), {'label': 'Majak'})
+print(json.dumps({'herdr': herdr, 'other': other, 'starts': starts}))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(ENSURE_PATH), str(host["state_dir"]),
+         str(host["repo_root"]), str(host["tasks_root"]), str(tmp_path / "audit.jsonl")],
+        capture_output=True, text=True, timeout=5, check=True,
+    )
+    result = json.loads(completed.stdout.splitlines()[-1])
+    assert result["herdr"].startswith("BLOCKED_")
+    assert result["other"] == "restored"
+    assert result["starts"] == ["majak-codex"]
 
 
 def test_review_guard_precedes_healthy_short_circuit(guard, monkeypatch, tmp_path):
