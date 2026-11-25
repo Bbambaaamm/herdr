@@ -117,6 +117,17 @@ def load_state() -> dict:
             raise AdmissionDenied("intake-state-identity-invalid")
         history = used_approvals(row)  # Validate closed/unselected rows too.
         _validate_admission_intent(row, history)
+        claims = proposal_consumptions(row)
+        for claim in claims.values():
+            binding = claim["binding"]
+            if (repo != "Bbambaaamm/herdr" or number != 53
+                    or history.get(str(binding["root_approval_id"])) != claim["task_id"]):
+                raise AdmissionDenied("proposal-consumption-history-mismatch")
+            intent = row.get("admission_intent")
+            if (intent is not None and intent.get("task_id") == claim["task_id"]
+                    and (claim["state"] != intent["state"]
+                         or intent["content_sha256"] != binding["root_revision"])):
+                raise AdmissionDenied("proposal-consumption-intent-mismatch")
         row.setdefault("repo", repo)
         row.setdefault("issue", number)
         normalized[canonical] = row
@@ -619,6 +630,100 @@ def intake_lock():
         os.close(fd)
 
 
+def proposal_consumptions(row):
+    """Read fail-closed durable proposal claims stored in the existing root row."""
+    items = row.get("proposal_consumptions", {})
+    if type(items) is not dict or len(items) > 1024:
+        raise AdmissionDenied("proposal-consumption-history-invalid")
+    result = {}
+    for key, receipt in items.items():
+        if (type(key) is not str or not re.fullmatch(r"[0-9a-f]{64}", key)
+                or type(receipt) is not dict
+                or set(receipt) != {"version", "task_id", "binding", "state"}
+                or type(receipt["version"]) is not int or receipt["version"] != 1
+                or type(receipt["task_id"]) is not str
+                or not re.fullmatch(r"github-herdr-issue-53-approval-[0-9]+", receipt["task_id"])
+                or receipt["state"] not in {"publication_pending", "published"}):
+            raise AdmissionDenied("proposal-consumption-row-invalid")
+        binding = receipt["binding"]
+        if type(binding) is not dict or set(binding) != {
+            "version", "repository", "root_issue", "proposal_issue",
+            "proposal_issue_id", "proposal_digest", "proposal_revision",
+            "proposal_approval_id", "root_approval_id", "root_revision",
+            "operation", "target_kind", "target_number", "binding_sha256",
+        }:
+            raise AdmissionDenied("proposal-consumption-binding-invalid")
+        digest = binding["binding_sha256"]
+        unsigned = {k: v for k, v in binding.items() if k != "binding_sha256"}
+        if (type(digest) is not str or digest != key
+                or digest != hashlib.sha256(json.dumps(
+                    unsigned, sort_keys=True, separators=(",", ":")
+                ).encode()).hexdigest()
+                or binding["repository"] != "Bbambaaamm/herdr"
+                or type(binding["version"]) is not int or binding["version"] != 1
+                or type(binding["root_issue"]) is not int or binding["root_issue"] != 53
+                or type(binding["proposal_issue"]) is not int or binding["proposal_issue"] <= 0
+                or binding["proposal_issue"] == 53
+                or type(binding["proposal_issue_id"]) is not int or binding["proposal_issue_id"] <= 0
+                or type(binding["proposal_approval_id"]) is not int or binding["proposal_approval_id"] <= 0
+                or type(binding["root_approval_id"]) is not int or binding["root_approval_id"] <= 0
+                or receipt["task_id"] != f"github-herdr-issue-53-approval-{binding['root_approval_id']}"
+                or any(type(binding[name]) is not str or not re.fullmatch(r"[0-9a-f]{64}", binding[name])
+                       for name in ("proposal_digest", "proposal_revision", "root_revision"))
+                or type(binding["operation"]) is not str
+                or binding["operation"] not in {"inspect", "implement", "review"}
+                or type(binding["target_kind"]) is not str
+                or binding["target_kind"] not in {"issue", "pull_request"}
+                or type(binding["target_number"]) is not int
+                or not 1 <= binding["target_number"] <= 2**31 - 1):
+            raise AdmissionDenied("proposal-consumption-binding-corrupt")
+        result[key] = receipt
+    # A proposal issue/approval and its digest may never be linked to a
+    # different root episode, even when a newer root approval is available.
+    by_issue = {}
+    by_approval = {}
+    by_content = {}
+    for digest, receipt in result.items():
+        b = receipt["binding"]
+        for index, key in (
+            (by_issue, (b["proposal_issue"], b["proposal_issue_id"])),
+            (by_approval, (b["proposal_issue"], b["proposal_approval_id"])),
+            (by_content, b["proposal_digest"]),
+        ):
+            if key in index and index[key] != digest:
+                raise AdmissionDenied("proposal-consumption-conflicting-claims")
+            index[key] = digest
+    return result
+
+
+def require_proposal_binding_for_root(binding, *, task_id, admission, row):
+    """Validate an already authenticated proposal binding before consumption.
+
+    This verifies only structural/durable correlation; the caller must obtain
+    the binding through the authenticated double-approval preflight, never
+    from a model, issue body or CLI argument.
+    """
+    if (type(binding) is not dict or type(binding.get("binding_sha256")) is not str
+            or not re.fullmatch(r"[0-9a-f]{64}", binding["binding_sha256"])):
+        raise AdmissionDenied("proposal-binding-required")
+    candidate = {"version": 1, "task_id": task_id, "binding": binding,
+                 "state": "publication_pending"}
+    temporary = {"proposal_consumptions": {binding.get("binding_sha256"): candidate}}
+    parsed = proposal_consumptions(temporary)
+    key = next(iter(parsed))
+    if (type(admission) is not dict or binding["root_approval_id"] != admission.get("approval_id")
+            or binding["root_revision"] != admission.get("content_sha256")
+            or row.get("repo", "Bbambaaamm/herdr") != "Bbambaaamm/herdr"):
+        raise AdmissionDenied("proposal-binding-root-mismatch")
+    for existing in proposal_consumptions(row).values():
+        b = existing["binding"]
+        if (b["proposal_issue"] == binding["proposal_issue"]
+                or b["proposal_digest"] == binding["proposal_digest"]
+                or existing["task_id"] == task_id):
+            raise AdmissionDenied("proposal-already-consumed")
+    return key, candidate
+
+
 def _validate_admission_intent(row, history):
     intent = row.get('admission_intent')
     if intent is None and 'admission_intent' not in row:
@@ -639,7 +744,7 @@ def _requires_admission_reconciliation(row):
     return isinstance(intent, dict) and intent['state'] == 'publication_pending'
 
 
-def _consume_admission(consumer, issue, task_id, admission):
+def _consume_admission(consumer, issue, task_id, admission, *, proposal_binding=None):
     if _INTAKE_LOCK_OWNER != os.getpid():
         raise AdmissionDenied('intake-lock-required')
     state = load_state()
@@ -651,6 +756,17 @@ def _consume_admission(consumer, issue, task_id, admission):
     approval_id = str(admission['approval_id'])
     if approval_id in history or len(history) >= 1024:
         raise AdmissionDenied('intake-admission-already-consumed')
+    if proposal_binding is not None:
+        if (consumer.get("consumer") != "herdr"
+                or consumer["repository"] != "Bbambaaamm/herdr" or issue["number"] != 53
+                or consumer.get("mode") != "root_only"):
+            raise AdmissionDenied("proposal-binding-root-only")
+        digest, claim = require_proposal_binding_for_root(
+            proposal_binding, task_id=task_id, admission=admission, row=row)
+        claims = proposal_consumptions(row)
+        if len(claims) >= 1024:
+            raise AdmissionDenied("proposal-consumption-history-full")
+        row["proposal_consumptions"] = {**claims, digest: claim}
     history[approval_id] = task_id
     row.update(repo=consumer['repository'], issue=issue['number'], consumer=consumer['consumer'],
                open=True, seen_at=now().isoformat(), used_approvals=history,
@@ -673,6 +789,13 @@ def _mark_admission_published(consumer, issue, task_id, admission):
                   'content_sha256': admission['content_sha256'], 'state': 'publication_pending'}:
         raise AdmissionDenied('intake-admission-intent-changed')
     row['admission_intent'] = {**intent, 'state': 'published'}
+    claims = proposal_consumptions(row)
+    matched = [key for key, claim in claims.items() if claim["task_id"] == task_id]
+    if matched:
+        if len(matched) != 1 or claims[matched[0]]["state"] != "publication_pending":
+            raise AdmissionDenied("proposal-consumption-publication-conflict")
+        claims[matched[0]] = {**claims[matched[0]], "state": "published"}
+        row["proposal_consumptions"] = claims
     row['scheduler_state'] = 'queued'
     row.pop('blocker', None)
     state[key] = row
@@ -708,6 +831,21 @@ def _merge_durable_admissions(state):
         row['used_approvals'] = history
         if 'admission_intent' in durable:
             row['admission_intent'] = durable['admission_intent']
+        prior_claims = proposal_consumptions(row)
+        durable_claims = proposal_consumptions(durable)
+        for digest, claim in durable_claims.items():
+            if digest in prior_claims and prior_claims[digest] != claim:
+                # Local scan can hold the old publication_pending view while
+                # the durable transaction has already reached published.
+                earlier = prior_claims[digest]
+                if not (earlier["state"] == "publication_pending"
+                        and claim["state"] == "published"
+                        and earlier["binding"] == claim["binding"]
+                        and earlier["task_id"] == claim["task_id"]):
+                    raise AdmissionDenied("proposal-consumption-merge-conflict")
+            prior_claims[digest] = claim
+        if prior_claims:
+            row["proposal_consumptions"] = prior_claims
         state[key] = row
     return state
 
@@ -1010,7 +1148,7 @@ Operating rules:
     raise RuntimeError(f"enabled consumer has no safe prompt contract: {name}")
 
 
-def _queue_issue_locked(consumer: dict, issue: dict, records: list[dict]) -> str:
+def _queue_issue_locked(consumer: dict, issue: dict, records: list[dict], *, proposal_binding=None) -> str:
     if any(terminal_unknown_blocks_intake(ROOT, record["task"]) for record in records):
         raise AdmissionDenied("terminal_unknown_requires_operator_reconciliation")
     issue, admission = approved_revision(consumer, issue)
@@ -1021,9 +1159,13 @@ def _queue_issue_locked(consumer: dict, issue: dict, records: list[dict]) -> str
     if _requires_admission_reconciliation(previous):
         raise AdmissionDenied("intake-admission-reconciliation-required")
     if str(admission["approval_id"]) in history:
+        if proposal_binding is not None:
+            raise AdmissionDenied("root-approval-already-consumed")
         return history[str(admission["approval_id"])]
     if any((record["task"].get("github_admission") or {}).get("approval_id") == admission["approval_id"]
            for record in records):
+        if proposal_binding is not None:
+            raise AdmissionDenied("root-approval-already-observed")
         return task_id
     if len(history) >= 1024:
         raise AdmissionDenied("intake-approval-history-full")
@@ -1051,6 +1193,21 @@ def _queue_issue_locked(consumer: dict, issue: dict, records: list[dict]) -> str
         "attempts": 0,
         "prompt": prompt_for(consumer, issue, prior),
     }
+    if proposal_binding is not None:
+        if (consumer.get("consumer") != "herdr"
+                or consumer["repository"] != "Bbambaaamm/herdr"
+                or consumer.get("mode") != "root_only" or number != 53):
+            raise AdmissionDenied("proposal-binding-root-only")
+        # This is a correlation record, not a new host execution authority.
+        # _consume_admission revalidates it against the same durable state.
+        require_proposal_binding_for_root(
+            proposal_binding, task_id=task_id, admission=admission,
+            row=previous)
+        task["chatgpt_proposal_binding"] = proposal_binding
+    elif consumer["repository"] == "Bbambaaamm/herdr":
+        # Legacy root-only intake is unchanged and keeps its exact issue-53
+        # maintainer approval without an implicit ChatGPT proposal selection.
+        pass
     if consumer["repository"] == "Bbambaaamm/herdr" and consumer.get("mode") != "root_only":
         task["work_contract_version"] = 1
         task["work_budget_version"] = 1
@@ -1068,7 +1225,11 @@ def _queue_issue_locked(consumer: dict, issue: dict, records: list[dict]) -> str
     capacity = disk_headroom_blocker(consumer["repository"], consumer["consumer"])
     if capacity:
         raise CapacityBlocked(capacity)
-    _consume_admission(consumer, issue, task_id, admission)
+    if proposal_binding is None:
+        _consume_admission(consumer, issue, task_id, admission)
+    else:
+        _consume_admission(consumer, issue, task_id, admission,
+                           proposal_binding=proposal_binding)
     # Once consumed, finish local durability; the scan deadline bounds admission/network work.
     publish_task(path, task, admission)
     _mark_admission_published(consumer, issue, task_id, admission)
