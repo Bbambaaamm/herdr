@@ -410,7 +410,7 @@ def scan_remaining():
         raise ScanExpired("intake-scan-deadline")
     return min(GH_TIMEOUT_SECONDS, remaining)
 
-def _retained_admission(path, task_id, admission):
+def _retained_admission(path, task_id, admission, *, proposal_binding=None):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         s = os.fstat(fd)
@@ -429,7 +429,9 @@ def _retained_admission(path, task_id, admission):
                 after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
             raise AdmissionDenied("intake-admission-collision")
         retained = json.loads(b"".join(chunks), object_pairs_hook=_json_object)
-        if not isinstance(retained, dict) or retained.get("id") != task_id or retained.get("github_admission") != admission:
+        if (not isinstance(retained, dict) or retained.get("id") != task_id
+                or retained.get("github_admission") != admission
+                or retained.get("chatgpt_proposal_binding") != proposal_binding):
             raise AdmissionDenied("intake-admission-collision")
     except (ValueError, TypeError) as exc:
         raise AdmissionDenied("intake-admission-collision") from exc
@@ -463,7 +465,8 @@ def publish_task(path, task, admission):
         try:
             _rename_exclusive(directory_fd, Path(temporary).name, path.name)
         except FileExistsError:
-            _retained_admission(path, task["id"], admission)
+            _retained_admission(path, task["id"], admission,
+                                proposal_binding=task.get("chatgpt_proposal_binding"))
         else:
             temporary = None
         os.fsync(directory_fd)  # Also make a verified post-crash collision durable.

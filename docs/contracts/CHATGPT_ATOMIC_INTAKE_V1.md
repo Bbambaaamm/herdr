@@ -75,3 +75,15 @@ intent. A missing or mismatched intent blocks state load and subsequent
 admissions, never allowing a newer root approval. A pending proposal
 independently triggers reconciliation. Regression tests reproduce corrupted
 intents and unchanged state on retry.
+
+## Independent P2: retained queue collision proposal binding
+
+A retained pending task with the correct task ID and root GitHub approval
+but missing/different `chatgpt_proposal_binding` must **never** satisfy
+a bound proposal publication. The existing `publish_task` collision
+verifier now requires exact proposal binding equality (including both
+absent for legacy tasks) before accepting a non-replacing collision.
+Malformed/mismatched retained tasks leave the durable root admission
+and proposal claim in `publication_pending`; later retries are blocked
+pending trusted reconciliation. Negative tests cover missing, changed
+and exact matching retained bindings.
