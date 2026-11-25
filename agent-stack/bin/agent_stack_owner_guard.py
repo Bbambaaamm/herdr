@@ -693,79 +693,119 @@ def _audit_write_all(fd: int, data: bytes) -> None:
         offset += count
 
 
+def _audit_directory_fd(path: Path) -> int:
+    """Pin an existing audit parent without following any ancestor symlink."""
+    if not path.name or ".." in path.parts:
+        raise GuardObservationError("audit_path_invalid")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_fd = os.open("/" if path.is_absolute() else ".", flags)
+    try:
+        parts = path.parent.parts
+        for part in parts[1:] if path.is_absolute() else parts:
+            if part == ".":
+                continue
+            next_fd = os.open(part, flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        return directory_fd
+    except OSError as exc:
+        os.close(directory_fd)
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.ENOENT):
+            raise GuardObservationError("audit_path_invalid") from None
+        raise
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
 def _append_bounded_audit(path: Path, line: bytes) -> None:
     """Two bounded generations, serialized by a stable sidecar lock.
 
     On interrupted rotation the previous generation remains at .1. An
     incomplete append is rolled back to its prior length while holding lock.
     """
-    # Refuse symlinked ancestors as well as symlinked final components.
-    for parent in (path.parent, *path.parent.parents):
-        if parent.is_symlink():
-            raise GuardObservationError("audit_path_invalid")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    lock_path = Path(str(path) + ".lock")
-    backup = Path(str(path) + ".1")
-    temporary = Path(str(path) + ".tmp")
-    lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT | nofollow, 0o600)
+    directory_fd = _audit_directory_fd(path)
+    name = path.name
+    lock_name = name + ".lock"
+    backup_name = name + ".1"
+    temporary_name = name + ".tmp"
     try:
-        _audit_regular(lock_fd)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        # A prior crash can leave a complete temporary record. The backup
-        # retains the previous generation; clear only this bounded temp file.
+        lock_fd = os.open(lock_name, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | os.O_NOFOLLOW,
+                          0o600, dir_fd=directory_fd)
         try:
-            temp_mode = temporary.lstat().st_mode
-        except FileNotFoundError:
-            pass
-        else:
-            if not stat.S_ISREG(temp_mode) or temporary.stat().st_size > AUDIT_ENTRY_MAX_BYTES:
-                raise GuardObservationError("audit_file_invalid")
-            temporary.unlink()
-        for candidate in (path, backup):
+            _audit_regular(lock_fd)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            # A prior crash can leave a complete temporary record. The backup
+            # retains the previous generation; clear only this bounded temp file.
             try:
-                check_fd = os.open(str(candidate), os.O_RDONLY | nofollow)
+                temp_info = os.stat(temporary_name, dir_fd=directory_fd, follow_symlinks=False)
             except FileNotFoundError:
-                continue
-            try:
-                _audit_regular(check_fd)
-            finally:
-                os.close(check_fd)
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | nofollow, 0o600)
-        try:
-            size = _audit_regular(fd)
-            if size + len(line) <= AUDIT_MAX_BYTES:
+                pass
+            else:
+                if not stat.S_ISREG(temp_info.st_mode) or temp_info.st_nlink != 1 or temp_info.st_size > AUDIT_ENTRY_MAX_BYTES:
+                    raise GuardObservationError("audit_file_invalid")
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            for candidate in (name, backup_name):
                 try:
-                    os.lseek(fd, size, os.SEEK_SET)
-                    _audit_write_all(fd, line)
-                    os.fsync(fd)
-                except OSError:
-                    os.ftruncate(fd, size)
-                    raise
-                return
-        finally:
-            os.close(fd)
-        temp_fd = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600)
-        try:
-            _audit_write_all(temp_fd, line)
-            os.fsync(temp_fd)
-        except BaseException:
-            temporary.unlink(missing_ok=True)
-            raise
-        finally:
-            os.close(temp_fd)
-        try:
-            os.replace(path, backup)
-            os.replace(temporary, path)
-            dir_fd = os.open(str(path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow)
+                    check_fd = os.open(candidate, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                                       dir_fd=directory_fd)
+                except FileNotFoundError:
+                    continue
+                try:
+                    _audit_regular(check_fd)
+                finally:
+                    os.close(check_fd)
             try:
-                os.fsync(dir_fd)
+                fd = os.open(name, os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW,
+                             dir_fd=directory_fd)
+                created = False
+            except FileNotFoundError:
+                try:
+                    fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NONBLOCK | os.O_NOFOLLOW,
+                                 0o600, dir_fd=directory_fd)
+                    created = True
+                except FileExistsError:
+                    fd = os.open(name, os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW,
+                                 dir_fd=directory_fd)
+                    created = False
+            try:
+                size = _audit_regular(fd)
+                if size + len(line) <= AUDIT_MAX_BYTES:
+                    try:
+                        os.lseek(fd, size, os.SEEK_SET)
+                        _audit_write_all(fd, line)
+                        os.fsync(fd)
+                        if created:
+                            os.fsync(directory_fd)
+                    except OSError:
+                        os.ftruncate(fd, size)
+                        raise
+                    return
             finally:
-                os.close(dir_fd)
+                os.close(fd)
+            temp_fd = os.open(temporary_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NONBLOCK | os.O_NOFOLLOW,
+                              0o600, dir_fd=directory_fd)
+            try:
+                _audit_write_all(temp_fd, line)
+                os.fsync(temp_fd)
+            except BaseException:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+                raise
+            finally:
+                os.close(temp_fd)
+            try:
+                os.replace(name, backup_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                os.replace(temporary_name, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                os.fsync(directory_fd)
+            finally:
+                try:
+                    os.unlink(temporary_name, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    pass
         finally:
-            temporary.unlink(missing_ok=True)
+            os.close(lock_fd)
     finally:
-        os.close(lock_fd)
+        os.close(directory_fd)
 
 
 def decide_herdr_agent_start(

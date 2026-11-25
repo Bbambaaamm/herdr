@@ -13,6 +13,7 @@ import json
 import os
 import errno
 import shutil
+import stat
 import sys
 import threading
 from pathlib import Path
@@ -847,6 +848,108 @@ def test_review_audit_failed_write_rolls_back_and_blocks(guard, monkeypatch, tmp
     with pytest.raises(guard.GuardObservationError, match="audit_write_failed"):
         _audit_once(guard, path)
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("swap_after_lock", [False, True])
+def test_review_audit_parent_swap_stays_on_pinned_directory(
+    guard, monkeypatch, tmp_path, swap_after_lock
+):
+    parent = tmp_path / "active"
+    parent.mkdir()
+    moved = tmp_path / "moved"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    path = parent / "audit.jsonl"
+
+    def swap():
+        parent.rename(moved)
+        parent.symlink_to(outside, target_is_directory=True)
+
+    if swap_after_lock:
+        original_flock = guard.fcntl.flock
+
+        def swap_on_lock(fd, operation):
+            result = original_flock(fd, operation)
+            if operation == guard.fcntl.LOCK_EX:
+                swap()
+            return result
+
+        monkeypatch.setattr(guard.fcntl, "flock", swap_on_lock)
+    else:
+        original_open = guard.os.open
+
+        def swap_before_lock(file, flags, *args, **kwargs):
+            if file == "audit.jsonl.lock":
+                swap()
+            return original_open(file, flags, *args, **kwargs)
+
+        monkeypatch.setattr(guard.os, "open", swap_before_lock)
+
+    _audit_once(guard, path)
+    assert len((moved / "audit.jsonl").read_text().splitlines()) == 1
+    assert not (outside / "audit.jsonl").exists()
+    assert not (outside / "audit.jsonl.lock").exists()
+
+
+@pytest.mark.parametrize("generation", ["", ".1"])
+def test_review_audit_fifo_refused_without_affecting_other_audit(
+    guard, tmp_path, generation
+):
+    path = tmp_path / "audit.jsonl"
+    os.mkfifo(str(path) + generation)
+    with pytest.raises(guard.GuardObservationError):
+        _audit_once(guard, path)
+    other = tmp_path / "other.jsonl"
+    _audit_once(guard, other, consumer="Other")
+    assert json.loads(other.read_text())["consumer"] == "Other"
+
+
+def test_review_audit_first_append_syncs_directory_and_fails_closed(
+    guard, monkeypatch, tmp_path
+):
+    path = tmp_path / "audit.jsonl"
+    original_fsync = guard.os.fsync
+    synced = []
+
+    def record_fsync(fd):
+        mode = guard.os.fstat(fd).st_mode
+        synced.append("directory" if stat.S_ISDIR(mode) else "file")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(guard.os, "fsync", record_fsync)
+    _audit_once(guard, path)
+    assert synced == ["file", "directory"]
+
+    failing = tmp_path / "failing.jsonl"
+
+    def fail_directory_sync(fd):
+        if stat.S_ISDIR(guard.os.fstat(fd).st_mode):
+            raise OSError(errno.EIO, "directory sync failed")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(guard.os, "fsync", fail_directory_sync)
+    with pytest.raises(guard.GuardObservationError, match="audit_write_failed"):
+        _audit_once(guard, failing)
+    assert failing.read_bytes() == b""
+
+
+def test_review_audit_missing_parent_is_refused(guard, tmp_path):
+    path = tmp_path / "missing" / "audit.jsonl"
+    with pytest.raises(guard.GuardObservationError, match="audit_path_invalid"):
+        _audit_once(guard, path)
+    assert not path.parent.exists()
+
+
+def test_review_audit_recovers_interrupted_rotation(guard, tmp_path):
+    path = tmp_path / "audit.jsonl"
+    backup = tmp_path / "audit.jsonl.1"
+    temporary = tmp_path / "audit.jsonl.tmp"
+    backup.write_text('{"prior":true}\n')
+    temporary.write_text('{"interrupted":true}\n')
+    _audit_once(guard, path)
+    assert backup.read_text() == '{"prior":true}\n'
+    assert not temporary.exists()
+    assert json.loads(path.read_text())["event"] == "BLOCKED_OWNER_UNKNOWN"
 
 
 def test_review_guard_precedes_healthy_short_circuit(guard, monkeypatch, tmp_path):
