@@ -43,8 +43,15 @@ def _deny_nonfinite(_: str) -> None:
 
 
 def _text(value: Any, *, maximum: int) -> bool:
-    return (type(value) is str and 1 <= len(value) <= maximum
-            and value == value.strip()
+    if type(value) is not str or not 1 <= len(value) <= maximum:
+        return False
+    # JSON can contain isolated UTF-16 surrogate escape sequences. They are
+    # valid JSON syntax but not canonical UTF-8 request/issue content.
+    try:
+        value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        return False
+    return (value == value.strip()
             and not any(ord(char) < 32 or ord(char) == 127 for char in value)
             and not re.search(r"[\u202a-\u202e\u2066-\u2069]", value))
 

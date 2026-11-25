@@ -105,3 +105,11 @@ the next root approval without changing the retained bytes.
 
 This local correction does NOT constitute independent approval.
 An exact-head re-review after the fix is mandatory.
+
+## Input canonicalization hardening
+
+JSON permits isolated Unicode surrogate escapes although canonical UTF-8
+GitHub issue text does not. The parser now denies such inputs before SHA-256
+calculation or rendering. A malformed proposal fails closed with
+`invalid_objective` rather than raising an unhandled UnicodeEncodeError.
+The canonical issue and root approval pathways remain unchanged.
