@@ -52,3 +52,12 @@ episode requires all of the following in the **existing** intake/TaskGraph:
 
 Do not add a second queue, switch to direct shell invocation, start a second
 Hermes process, or attempt to use this preflight receipt as a host grant.
+
+## Independent review P2: final proposal reread
+A proposal may be edited, closed or otherwise changed while the root
+#53 approval is being checked. After validating both approvals, the
+read-only preflight now re-reads the original proposal via the same
+authenticated GitHub transport and requires exact current revision,
+issue identity, updated timestamp, comment count and canonical request.
+A changed proposal fails closed before a binding is returned.
+This is not a substitute for later host-owned admission checks.
