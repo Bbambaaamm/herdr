@@ -1654,16 +1654,31 @@ def test_copilot_incomplete_guard_module_is_herdr_only_block(
                                {"label": "LoxxessTechnicalAI"}) == "healthy"
 
 
+def _real_durable_child_fixture(tasks_root, repo="Bbambaaamm/herdr"):
+    # Construct the durable ledger using the same authoritative scheduler API
+    # used by the worker, never by hand-assembling a permissive event list.
+    from herdr.scheduler import AuditLog, DynamicChildScheduler, ChildProposal
+    from agent_durable_children import attempt_directory, mark_ledger_required
+    directory = attempt_directory(tasks_root, "parent", "run-1")
+    directory.mkdir(parents=True, exist_ok=True)
+    scheduler = DynamicChildScheduler(audit_log=AuditLog(directory / "scheduler.jsonl"))
+    scheduler.register_external_parent_attempt(
+        task_id="parent", run_token="run-1", idempotency_key="key-1",
+        agent_name="agent", pane_id="pane-1", marker="marker", repo=repo,
+        issue="53", role="writer", tools=("read_file",), permissions=(),
+        policy_profile="default")
+    mark_ledger_required(directory)
+    child = scheduler.delegate_child(
+        "parent", "run-1", "key",
+        ChildProposal("writer", ("read_file",), "reader",
+                      ("read_file",), child_task="inspect"))
+    lease = scheduler.dispatch(task_ids={child.id})[0]
+    return directory, scheduler, child, lease
+
+
 def test_copilot_orphan_durable_child_ledger_in_decision_and_audit(guard, tmp_path):
     host = make_host(guard, tmp_path, state="RUNNING")
-    directory = host["tasks_root"] / "durable-children" / ("a" * 64)
-    directory.mkdir(parents=True)
-    events = [
-        {"event": "submit", "task_id": "parent", "repo": "Bbambaaamm/herdr"},
-        {"event": "spawn_child", "child_id": "child-1", "parent_id": "parent"},
-    ]
-    (directory / "scheduler.jsonl").write_text(
-        "".join(json.dumps(e) + "\n" for e in events))
+    directory, scheduler, child, lease = _real_durable_child_fixture(host["tasks_root"])
     with held_lock(host["state_dir"] / "supervisor.lock"):
         result = guard.decide_herdr_agent_start(
             "Herdr", "Bbambaaamm/herdr", "herdr-hermes",
@@ -1671,10 +1686,9 @@ def test_copilot_orphan_durable_child_ledger_in_decision_and_audit(guard, tmp_pa
             tasks_root=host["tasks_root"], audit_path=tmp_path / "audit.jsonl")
     assert result.code == guard.DECISION_BLOCKED_ATTEMPT
     assert result.evidence.active_attempts == (
-        "durable-children/" + "a" * 64 + "/scheduler.jsonl",)
+        "durable-children/" + directory.name + "/scheduler.jsonl",)
     audit = json.loads((tmp_path / "audit.jsonl").read_text().splitlines()[-1])
     assert audit["event"] == guard.DECISION_BLOCKED_ATTEMPT
-
 
 @pytest.mark.parametrize("bad", ["truncated", "missing", "symlink"])
 def test_copilot_durable_ledger_corruption_fails_closed(guard, tmp_path, bad):
@@ -1698,15 +1712,92 @@ def test_copilot_durable_ledger_corruption_fails_closed(guard, tmp_path, bad):
 
 
 def test_copilot_completed_durable_child_ledger_not_reported_active(guard, tmp_path):
+    from agent_durable_children import all_children_terminal
     host = make_host(guard, tmp_path, state="RUNNING")
-    directory = host["tasks_root"] / "durable-children" / ("c" * 64)
-    directory.mkdir(parents=True)
-    events = [
-        {"event": "submit", "task_id": "p", "repo": "Bbambaaamm/herdr"},
-        {"event": "spawn_child", "child_id": "c1"},
-        {"event": "child_result", "task_id": "c1", "status": "blocked"},
-        {"event": "child_cleanup_complete", "task_id": "c1"},
-    ]
-    (directory / "scheduler.jsonl").write_text(
-        "".join(json.dumps(e) + "\n" for e in events))
+    directory, scheduler, child, lease = _real_durable_child_fixture(host["tasks_root"])
+    rec = scheduler._tasks[child.id]
+    assert scheduler.bind_pre_delivery_pane(child.id, rec.run_token,
+                                             lease.agent_id, "child-pane", "child-marker")
+    assert scheduler.fail_child_pre_delivery(child.id, rec.run_token,
+                                             lease.agent_id, lease.fencing_token,
+                                             rec.idempotency_key, "sandbox denied",
+                                             cleanup_complete=False)
+    assert guard._native_attempt_hits(host["tasks_root"], "Bbambaaamm/herdr")
+    assert scheduler.mark_child_cleanup_complete(child.id)
+    assert all_children_terminal(host["tasks_root"], "parent", "run-1")
     assert guard._native_attempt_hits(host["tasks_root"], "Bbambaaamm/herdr") == ()
+
+
+def test_copilot_corrupt_identity_and_order_cannot_be_terminal(guard, tmp_path):
+    from agent_durable_children import all_children_terminal
+    host = make_host(guard, tmp_path, state="RUNNING")
+    directory, scheduler, child, lease = _real_durable_child_fixture(host["tasks_root"])
+    ledger = directory / "scheduler.jsonl"
+    lines = ledger.read_text().splitlines()
+    mutated = [json.loads(line) for line in lines]
+    for event in mutated:
+        if event.get("event") == "spawn_child":
+            event["parent_run_token"] = "foreign-run"
+            break
+    ledger.write_text("".join(json.dumps(event) + "\n" for event in mutated))
+    assert not all_children_terminal(host["tasks_root"], "parent", "run-1")
+    # A malformed child identity must never be called terminal: replay can
+    # conservatively retain it as ACTIVE or reject it as UNKNOWN.
+    try:
+        hits = guard._native_attempt_hits(host["tasks_root"], "Bbambaaamm/herdr")
+    except guard.GuardObservationError:
+        pass
+    else:
+        assert hits == ("durable-children/" + directory.name + "/scheduler.jsonl",)
+
+
+def test_copilot_other_repository_durable_child_not_claimed(guard, tmp_path):
+    host = make_host(guard, tmp_path)
+    _real_durable_child_fixture(host["tasks_root"], repo="other/repository")
+    assert guard._native_attempt_hits(host["tasks_root"], "Bbambaaamm/herdr") == ()
+
+
+def test_owner_guard_has_no_parallel_child_journal_state_machine():
+    import ast
+    tree = ast.parse(GUARD_PATH.read_text(encoding="utf-8"))
+    function = next(node for node in tree.body
+                    if isinstance(node, ast.FunctionDef)
+                    and node.name == "_durable_child_ledger_hits")
+    source = ast.get_source_segment(GUARD_PATH.read_text(encoding="utf-8"),
+                                    function)
+    for invented_state in ('"spawn_child"', '"child_result"',
+                           '"child_cleanup_complete"', '"child_pre_delivery_cleanup_complete"'):
+        assert invented_state not in source, "guard must reuse authoritative scheduler replay"
+    assert "observe_durable_child_attempt" in source
+
+
+def test_security_standard_present_and_single_authority_contract():
+    standard = ROOT / "docs/contracts/SECURITY_REVIEW_STANDARD.md"
+    assert standard.is_file()
+    text = standard.read_text(encoding="utf-8")
+    for required in ("One authority per fact", "Differential tests",
+                     "Pre-delivery", "UNKNOWN", "independent exact-head review",
+                     "No merge"):
+        assert required.lower() in text.lower()
+    source = GUARD_PATH.read_text(encoding="utf-8")
+    child = (ROOT / "agent-stack/bin/agent_durable_children.py").read_text(encoding="utf-8")
+    assert "from agent_durable_children import observe_durable_child_attempt" in source
+    assert "replay_host_scheduler(root, ledger)" in child
+    assert "all_children_terminal(root, parent_id, run_token)" in child
+
+
+def test_authoritative_durable_observation_is_read_only(guard, tmp_path):
+    from agent_durable_children import observe_durable_child_attempt
+    host = make_host(guard, tmp_path)
+    directory, scheduler, child, lease = _real_durable_child_fixture(host["tasks_root"])
+    before = {
+        str(path.relative_to(host["tasks_root"])): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in host["tasks_root"].rglob("*") if path.is_file()
+    }
+    assert observe_durable_child_attempt(host["tasks_root"], directory) == (
+        "ACTIVE", "Bbambaaamm/herdr")
+    after = {
+        str(path.relative_to(host["tasks_root"])): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in host["tasks_root"].rglob("*") if path.is_file()
+    }
+    assert before == after

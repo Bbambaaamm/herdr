@@ -496,6 +496,50 @@ def parent_attempt_guard(root: Path, parent_task_id: str, run_token: str, *,
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+
+def observe_durable_child_attempt(root: Path, directory: Path) -> tuple[str, str]:
+    """Read-only projection of the authoritative child scheduler.
+
+    A journal's child state and terminality are NEVER reimplemented here.
+    UNKNOWN is returned for invalid or incomplete evidence, rather than
+    extrapolating a 'finished' state from matching event names.
+    """
+    root, directory = Path(root), Path(directory)
+    ledger = directory / "scheduler.jsonl"
+    try:
+        _require_real_directory(root)
+        _require_real_directory(directory.parent)
+        _require_real_directory(directory)
+        if not ledger_required(directory) or not ledger.is_file() or ledger.is_symlink():
+            return "UNKNOWN", ""
+        scheduler = replay_host_scheduler(root, ledger)
+        events = scheduler.audit_log.replay()
+        parents = [e for e in events if e.get("event") == "submit"
+                   and isinstance(e.get("repo"), str)
+                   and e.get("task_id") in scheduler._tasks
+                   and scheduler._tasks[e["task_id"]].parent_task_id is None]
+        if len(parents) != 1:
+            return "UNKNOWN", ""
+        identity = parents[0]
+        parent_id = identity["task_id"]
+        parent = scheduler._tasks[parent_id]
+        run_token = parent.run_token
+        repository = identity["repo"]
+        if (not isinstance(run_token, str) or not run_token
+                or attempt_directory(root, parent_id, run_token) != directory
+                or parent.repo != repository):
+            return "UNKNOWN", repository
+        if initialization_pending(directory, parent_id, run_token):
+            return "UNKNOWN", repository
+        # This invokes authoritative replay, ownership validation and the
+        # correct terminal test for pre-delivery failures and cleanup.
+        return ("TERMINAL" if all_children_terminal(root, parent_id, run_token)
+                else "ACTIVE"), repository
+    except (OSError, ValueError, TypeError, KeyError, AttributeError,
+            RuntimeError):
+        return "UNKNOWN", ""
+
+
 def all_children_terminal(root: Path, parent_task_id: str, run_token: str, *,
                           lock_held: bool = False) -> bool:
     """Fail closed on a missing identity or an incomplete/corrupt existing ledger."""
