@@ -98,6 +98,7 @@ class OwnerEvidence:
     checkpoint_digest: Optional[str] = None
     sampled_at: Optional[str] = None
     source_digest: Optional[str] = None
+    observed_generation: Optional[str] = None
     # Extended guard facts. The fields above remain the external contract.
     supervised: bool = False
     supervisor_alive: Optional[bool] = None
@@ -129,6 +130,8 @@ class StartReservation:
     observed_generation: str
     replay: bool
     reason: str
+    consumer: Optional[str] = None
+    repository: Optional[str] = None
 
 
 def utcnow_iso() -> str:
@@ -315,7 +318,10 @@ def _native_attempt_hits(tasks_root: Path, repository: str) -> tuple:
                 hits.append(folder + "/" + name)
     for name, task in _native_attempt_entry(_native_inventory_dir(root, "blocked")):
         blob = canonical_json(task).lower()
-        if task.get("repo") == repository and ("uncertain" in blob or "unknown" in blob):
+        if task.get("repo") == repository and (
+            "uncertain" in blob or "unknown" in blob
+            or task.get("watchdog_blocker") == "active_durable_children"
+        ):
             hits.append("blocked/" + name)
     return tuple(hits)
 
@@ -530,6 +536,7 @@ def build_owner_evidence(observation: Mapping[str, Any]) -> OwnerEvidence:
         checkpoint_digest=observation.get("checkpoint_digest"),
         sampled_at=observation.get("sampled_at"),
         source_digest=digest(core),
+        observed_generation=digest(core),
         supervised=supervised,
         supervisor_alive=observation.get("supervisor_alive"),
         expected_profile=observation.get("expected_profile"),
@@ -924,7 +931,8 @@ def reserve_interactive_start(
             reason=reason, decision_digest=request_digest, audit_path=audit_path,
             extra={"observed_generation": generation} if generation else None,
         )
-        return StartReservation(False, code, None, generation, False, reason)
+        return StartReservation(False, code, None, generation, False, reason,
+                                str(consumer), str(repository))
 
     if not consumer or not repository or not generation or not token_input:
         return denied(DECISION_BLOCKED_UNKNOWN, "incomplete_reservation_request")
@@ -956,7 +964,7 @@ def reserve_interactive_start(
                    "reservation_token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest()},
         )
         return StartReservation(True, DECISION_RESTORED_INTERACTIVE, token, generation, replay,
-                                "atomic_reservation_granted")
+                                "atomic_reservation_granted", str(consumer), str(repository))
     reason = str(getattr(result, "reason", "") or "authority_denied")
     return denied(DECISION_BLOCKED_UNKNOWN, "authority_denied:" + reason[:120])
 
@@ -974,6 +982,13 @@ def plan_agent_start(
     if decision.code != DECISION_RESTORED_INTERACTIVE:
         return decision.code
     if reservation is None or not reservation.granted:
+        return DECISION_BLOCKED_UNKNOWN
+    if (reservation.code != DECISION_RESTORED_INTERACTIVE
+            or not reservation.token
+            or reservation.consumer != evidence.consumer
+            or reservation.repository != evidence.repo_identity
+            or not evidence.observed_generation
+            or reservation.observed_generation != evidence.observed_generation):
         return DECISION_BLOCKED_UNKNOWN
     if reservation.replay:
         return "already-reserved"

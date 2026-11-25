@@ -72,6 +72,7 @@ def base_evidence(guard, **over):
         checkpoint_digest="a" * 64,
         sampled_at="2026-11-24T00:00:00+00:00",
         source_digest="b" * 64,
+        observed_generation="gen-1",
         fence="supervisor.lock=FREE;cycle.lock=FREE;bootstrap.lock=FREE",
     )
     values.update(over)
@@ -527,7 +528,7 @@ def test_g6_concurrent_watchdog_runs_grant_one_token(guard, tmp_path):
     def worker():
         barrier.wait()
         results.append(guard.reserve_interactive_start(
-            "OtherConsumer", "org/repo", "gen-1", "owner-token", authority=authority,
+            "Herdr", "Bbambaaamm/herdr", "gen-1", "owner-token", authority=authority,
         ))
 
     threads = [threading.Thread(target=worker) for _ in range(2)]
@@ -547,12 +548,12 @@ def test_g6_concurrent_watchdog_runs_grant_one_token(guard, tmp_path):
 def test_g7_snapshot_to_reserve_generation_race_denies(guard, tmp_path):
     authority = FakeAtomicAuthority(tmp_path / "authority")
     granted = guard.reserve_interactive_start(
-        "OtherConsumer", "org/repo", "gen-1", "owner-token", authority=authority,
+        "Herdr", "Bbambaaamm/herdr", "gen-1", "owner-token", authority=authority,
     )
     assert granted.granted is True
     authority.current_generation = "gen-2"
     raced = guard.reserve_interactive_start(
-        "OtherConsumer", "org/repo", "gen-1", "owner-token", authority=authority,
+        "Herdr", "Bbambaaamm/herdr", "gen-1", "owner-token", authority=authority,
     )
     assert raced.granted is False
     assert guard.plan_agent_start(interactive_evidence(guard), raced) != "start"
@@ -561,10 +562,10 @@ def test_g7_snapshot_to_reserve_generation_race_denies(guard, tmp_path):
 def test_g8_replay_same_request_after_restart_does_not_start_twice(guard, tmp_path):
     authority = FakeAtomicAuthority(tmp_path / "authority")
     first = guard.reserve_interactive_start(
-        "OtherConsumer", "org/repo", "gen-1", "owner-token", authority=authority,
+        "Herdr", "Bbambaaamm/herdr", "gen-1", "owner-token", authority=authority,
     )
     replay = guard.reserve_interactive_start(
-        "OtherConsumer", "org/repo", "gen-1", "owner-token", authority=authority,
+        "Herdr", "Bbambaaamm/herdr", "gen-1", "owner-token", authority=authority,
     )
     assert first.granted and replay.granted
     assert first.token == replay.token
@@ -647,7 +648,7 @@ def test_g10_interactive_clean_authority_starts_once_then_zero(guard, tmp_path):
     decision = guard.evaluate_ownership(evidence)
     assert decision.code == guard.DECISION_RESTORED_INTERACTIVE
     reservation = guard.reserve_interactive_start(
-        "OtherConsumer", "org/repo", "gen-1", "owner-token", authority=authority,
+        "Herdr", "Bbambaaamm/herdr", "gen-1", "owner-token", authority=authority,
     )
     assert reservation.granted is True
     assert guard.plan_agent_start(evidence, reservation, agent_present=False) == "start"
@@ -1548,3 +1549,51 @@ def test_live_supervisor_needs_readable_auxiliary_fences(guard, state, aux_statu
         guard, decision_state=state, supervisor_alive=True, fence_states=fences))
     assert result.code == guard.DECISION_BLOCKED_UNKNOWN
     assert result.reason == "auxiliary_fence_unavailable"
+
+
+def test_copilot_durable_child_blocker_is_visible_in_decision_and_audit(guard, tmp_path):
+    host = make_host(
+        guard, tmp_path, state="RUNNING",
+        uncertain_blocked=[{"id": "parent-child", "repo": "Bbambaaamm/herdr",
+                            "attempt_state": "result_ready",
+                            "watchdog_blocker": "active_durable_children"}])
+    audit = tmp_path / "owner-audit.jsonl"
+    with held_lock(host["state_dir"] / "supervisor.lock"):
+        decision = guard.decide_herdr_agent_start(
+            "Herdr", "Bbambaaamm/herdr", "herdr-hermes",
+            state_dir=host["state_dir"], repo_root=host["repo_root"],
+            tasks_root=host["tasks_root"], audit_path=audit)
+    assert decision.code == guard.DECISION_BLOCKED_ATTEMPT
+    assert "blocked/task-0.json" in decision.evidence.active_attempts
+    record = json.loads(audit.read_text().splitlines()[-1])
+    assert record["event"] == guard.DECISION_BLOCKED_ATTEMPT
+    assert record["reason"] == "durable_active_attempt"
+
+
+@pytest.mark.parametrize("changed", [
+    {"consumer": "OtherConsumer"},
+    {"repository": "other/repository"},
+    {"observed_generation": "gen-old"},
+    {"token": None},
+    {"code": "BLOCKED_OWNER_UNKNOWN"},
+])
+def test_copilot_reservation_requires_exact_identity_generation_token_and_code(
+    guard, tmp_path, changed
+):
+    from dataclasses import replace
+    authority = FakeAtomicAuthority(tmp_path / "authority")
+    evidence = interactive_evidence(guard)
+    approved = guard.reserve_interactive_start(
+        "Herdr", "Bbambaaamm/herdr", "gen-1", "owner-token", authority=authority)
+    assert guard.plan_agent_start(evidence, approved) == "start"
+    mismatched = replace(approved, **changed)
+    assert guard.plan_agent_start(evidence, mismatched) == guard.DECISION_BLOCKED_UNKNOWN
+
+
+def test_copilot_reservation_requires_matching_evidence_generation(guard, tmp_path):
+    authority = FakeAtomicAuthority(tmp_path / "authority")
+    approved = guard.reserve_interactive_start(
+        "Herdr", "Bbambaaamm/herdr", "gen-1", "owner-token", authority=authority)
+    from dataclasses import replace
+    evidence = replace(interactive_evidence(guard), observed_generation="gen-2")
+    assert guard.plan_agent_start(evidence, approved) == guard.DECISION_BLOCKED_UNKNOWN
