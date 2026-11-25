@@ -182,3 +182,23 @@ def test_surrogate_escape_is_denied_before_digest(escaped):
     )
     with pytest.raises(ProposalDenied, match="invalid_objective"):
         CommandProposal.parse(raw)
+def test_rendered_escape_expansion_never_creates_unreadable_proposal():
+    # Exact-head Codex P2: the original parser admitted this 1400-backtick
+    # payload but its escaped issue JSON exceeded MAX_BYTES.
+    with pytest.raises(ProposalDenied, match="rendered_request_too_large"):
+        CommandProposal.parse(request(objective="`" * 1400))
+    # Smaller valid escaped content must round-trip through GitHub issue parser.
+    p = CommandProposal.parse(request(objective="`" * 800))
+    rendered = p.github_issue_proposal()
+    assert p.digest == rendered["request_sha256"]
+    assert len(p._issue_json().encode("utf-8")) <= 8192
+
+
+def test_escaped_proposal_roundtrips_existing_github_reader():
+    proposal = CommandProposal.parse(request(objective="`" * 800))
+    result = proposal.github_issue_proposal()
+    loaded = CommandProposal.from_github_issue({
+        "number": 991, "state": "open",
+        "title": result["title"], "body": result["body"],
+    })
+    assert loaded.digest == proposal.digest
