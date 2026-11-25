@@ -11,6 +11,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import errno
 import shutil
 import sys
 import threading
@@ -745,6 +746,109 @@ def test_review_host_policy_identity_missing_is_blocked(guard, tmp_path):
     assert decision.reason == "host_policy_identity_missing"
 
 
+@pytest.mark.parametrize("damage,reason", [
+    ("repo", "repo_root_missing"),
+    ("policy", "host_policy_missing"),
+    ("invalid_policy", "host_policy_invalid"),
+    ("native_root", "native_tasks_root_missing"),
+    ("native_dir", "native_pending_missing"),
+])
+def test_review_observation_reasons_are_specific_and_safe(guard, tmp_path, damage, reason):
+    host = make_host(guard, tmp_path / "host")
+    policy = host["repo_root"] / "configs" / "consumers" / "herdr.yaml"
+    if damage == "repo":
+        shutil.rmtree(host["repo_root"])
+    elif damage == "policy":
+        policy.unlink()
+    elif damage == "invalid_policy":
+        policy.write_bytes(b"secret-path /private/token\xff")
+    elif damage == "native_root":
+        shutil.rmtree(host["tasks_root"])
+    else:
+        (host["tasks_root"] / "pending").rmdir()
+    decision = _review_decide(guard, host, tmp_path / "audit.jsonl")
+    assert decision.code == guard.DECISION_BLOCKED_UNKNOWN
+    assert decision.reason == "observation_failed:" + reason
+    assert "/private/token" not in (tmp_path / "audit.jsonl").read_text()
+
+
+def test_review_unreadable_policy_has_safe_reason(guard, monkeypatch, tmp_path):
+    host = make_host(guard, tmp_path / "host")
+    original = guard._bounded_bytes
+    def unreadable_policy(path, limit=guard.BOUNDED_BYTES_LIMIT):
+        if Path(path).name == "herdr.yaml":
+            raise guard.GuardObservationError("unreadable")
+        return original(path, limit)
+    monkeypatch.setattr(guard, "_bounded_bytes", unreadable_policy)
+    decision = _review_decide(guard, host, tmp_path / "audit.jsonl")
+    assert decision.code == guard.DECISION_BLOCKED_UNKNOWN
+    assert decision.reason == "observation_failed:host_policy_unreadable"
+
+
+def _audit_once(guard, path, **overrides):
+    values = dict(event="BLOCKED_OWNER_UNKNOWN", actor="watchdog", consumer="Herdr",
+                  operation="agent.start", reason="missing_evidence",
+                  decision_digest="d" * 64, audit_path=path)
+    values.update(overrides)
+    return guard.emit_audit(**values)
+
+
+def test_review_audit_is_bounded_rotated_and_jsonl(guard, tmp_path):
+    path = tmp_path / "audit.jsonl"
+    for index in range(400):
+        _audit_once(guard, path, extra={"observed_generation": str(index)})
+    backup = Path(str(path) + ".1")
+    assert backup.exists()
+    for file in (path, backup):
+        assert file.stat().st_size <= guard.AUDIT_MAX_BYTES
+        assert all(json.loads(line)["event"] == "BLOCKED_OWNER_UNKNOWN"
+                   for line in file.read_text().splitlines())
+    assert json.loads(path.read_text().splitlines()[-1])["observed_generation"] == "399"
+
+
+def test_review_audit_concurrent_writers_preserve_lines(guard, tmp_path):
+    path = tmp_path / "audit.jsonl"
+    threads = [threading.Thread(target=lambda index=i: _audit_once(
+        guard, path, extra={"observed_generation": str(index)})) for i in range(30)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert {record["observed_generation"] for record in records} == {
+        str(index) for index in range(30)}
+
+
+def test_review_audit_rejects_symlink_and_oversized_entry(guard, tmp_path):
+    target = tmp_path / "target"
+    target.write_text("untouched")
+    path = tmp_path / "audit.jsonl"
+    path.symlink_to(target)
+    with pytest.raises(guard.GuardObservationError):
+        _audit_once(guard, path)
+    assert target.read_text() == "untouched"
+    path.unlink()
+    with pytest.raises(guard.GuardObservationError, match="audit_entry_oversize"):
+        _audit_once(guard, path, reason="x" * guard.AUDIT_ENTRY_MAX_BYTES)
+    assert not path.exists()
+
+
+def test_review_audit_failed_write_rolls_back_and_blocks(guard, monkeypatch, tmp_path):
+    path = tmp_path / "audit.jsonl"
+    _audit_once(guard, path)
+    before = path.read_bytes()
+    original = guard.os.write
+    def disk_full(fd, data):
+        if data.startswith(b'{"actor"'):
+            original(fd, data[:8])
+            raise OSError(errno.ENOSPC, "full")
+        return original(fd, data)
+    monkeypatch.setattr(guard.os, "write", disk_full)
+    with pytest.raises(guard.GuardObservationError, match="audit_write_failed"):
+        _audit_once(guard, path)
+    assert path.read_bytes() == before
+
+
 def test_review_guard_precedes_healthy_short_circuit(guard, monkeypatch, tmp_path):
     ensure = load_module("ensure_g11_healthy", ENSURE_PATH)
     ensure.STATE = tmp_path / "state"
@@ -885,8 +989,15 @@ def test_g11_herdr_block_is_isolated_from_other_consumers(guard, monkeypatch, tm
                    if "agent" in call and "start" in call)
 
 
-def test_g11_fake_cli_sandbox_isolates_consumers(guard, tmp_path):
-    """M2: exercise the real subprocess path against a fake Herdr CLI."""
+@pytest.mark.parametrize("scenario,expected", [
+    ("paused", "BLOCKED_RECONCILIATION_REQUIRED"),
+    ("unknown", "BLOCKED_OWNER_UNKNOWN"),
+    ("missing_policy", "BLOCKED_OWNER_UNKNOWN"),
+    ("missing_native_root", "BLOCKED_OWNER_UNKNOWN"),
+    ("missing_native_dir", "BLOCKED_OWNER_UNKNOWN"),
+])
+def test_g11_fake_cli_sandbox_isolates_consumers(guard, tmp_path, scenario, expected):
+    """Real subprocess CLI: no Herdr starts for each uncertain host state."""
     ensure = load_module("ensure_g11_cli", ENSURE_PATH)
     cli = tmp_path / "herdr-fake"
     state_file = tmp_path / "fake-state.json"
@@ -961,8 +1072,17 @@ def test_g11_fake_cli_sandbox_isolates_consumers(guard, tmp_path):
     ensure.ensure_desktop_commander = lambda: None
     ensure.ensure_herdr_server = lambda: None
     ensure.ensure_repo_checkout = lambda *args: None
-    ensure.owner_guard.collect_herdr_observation = (
-        lambda *args, **kwargs: obs_dict(guard, state="PAUSED"))
+    host = make_host(guard, tmp_path / "host", state="ERROR" if scenario == "unknown" else "PAUSED")
+    if scenario == "missing_policy":
+        (host["repo_root"] / "configs" / "consumers" / "herdr.yaml").unlink()
+    elif scenario == "missing_native_root":
+        shutil.rmtree(host["tasks_root"])
+    elif scenario == "missing_native_dir":
+        (host["tasks_root"] / "pending").rmdir()
+    collector = ensure.owner_guard.collect_herdr_observation
+    ensure.owner_guard.collect_herdr_observation = lambda agent_id, **kwargs: collector(
+        agent_id, state_dir=host["state_dir"], repo_root=host["repo_root"],
+        tasks_root=host["tasks_root"])
 
     ensure.main()
     assert (tmp_path / "state").is_dir()
@@ -975,7 +1095,7 @@ def test_g11_fake_cli_sandbox_isolates_consumers(guard, tmp_path):
 
     log_lines = (tmp_path / "ensure.log").read_text(encoding="utf-8").splitlines()
     assert any("=== ensure start ===" in line for line in log_lines)
-    assert any("herdr-codex: BLOCKED_RECONCILIATION_REQUIRED" in line
+    assert any(f"herdr-codex: {expected}" in line
                for line in log_lines)
     assert not any("majak-" in line and ("BLOCKED_" in line or "owner_guard" in line)
                    for line in log_lines)
@@ -986,7 +1106,7 @@ def test_g11_fake_cli_sandbox_isolates_consumers(guard, tmp_path):
     assert audit_records
     assert {record["consumer"] for record in audit_records} == {"Herdr"}
     blocked_events = [record for record in audit_records
-                      if record["event"] == guard.DECISION_BLOCKED_RECONCILIATION]
+                      if record["event"] == expected]
     assert len(blocked_events) >= 2
 
     started = json.loads(state_file.read_text())["started"]
@@ -995,7 +1115,8 @@ def test_g11_fake_cli_sandbox_isolates_consumers(guard, tmp_path):
     assert {"majak-codex", "majak-hermes"} <= set(started)
     start_calls = [json.loads(line) for line in calls_file.read_text().splitlines()
                    if "start" in json.loads(line)]
-    assert all("herdr-" not in call for call in start_calls)
+    assert not [call for call in start_calls if len(call) >= 3 and
+                call[:2] == ["agent", "start"] and call[2].startswith("herdr-")]
 
 
 # --------------------------------------------------------------------------

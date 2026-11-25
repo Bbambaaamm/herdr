@@ -67,6 +67,8 @@ RECONCILIATION_STATES = frozenset({"PAUSED", "HUMAN_BLOCKED", "COMPLETE"})
 UNKNOWN_STATES = frozenset({"ERROR"})
 
 BOUNDED_BYTES_LIMIT = 131072
+AUDIT_MAX_BYTES = 65536
+AUDIT_ENTRY_MAX_BYTES = 4096
 
 
 class GuardObservationError(Exception):
@@ -249,19 +251,34 @@ def _parse_consumer_policy(raw: bytes) -> dict:
 
 def _native_attempt_entry(directory: Path):
     """Yield (name, task) for one inventory directory, failing closed."""
-    for path in sorted(directory.glob("*.json")):
-        if path.is_symlink() or not path.is_file():
-            raise GuardObservationError("native_attempt_entry_invalid")
-        _, task = read_bounded_json(path)
-        yield path.name, task
+    try:
+        with os.scandir(directory) as entries:
+            paths = sorted((Path(entry.path) for entry in entries
+                            if entry.name.endswith(".json")))
+        for path in paths:
+            if path.is_symlink() or not path.is_file():
+                raise GuardObservationError("native_attempt_entry_invalid")
+            try:
+                _, task = read_bounded_json(path)
+            except GuardObservationError as exc:
+                if exc.reason == "unreadable":
+                    raise GuardObservationError("native_inventory_unreadable") from None
+                raise
+            yield path.name, task
+    except OSError:
+        raise GuardObservationError("native_inventory_unreadable") from None
 
 
 def _native_inventory_dir(root: Path, name: str) -> Path:
     directory = root / name
-    if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+    try:
+        mode = directory.lstat().st_mode
+    except FileNotFoundError:
+        raise GuardObservationError("native_" + name + "_missing") from None
+    except OSError:
+        raise GuardObservationError("native_inventory_unreadable") from None
+    if not stat.S_ISDIR(mode):
         raise GuardObservationError("native_" + name + "_invalid")
-    if not directory.is_dir():
-        raise GuardObservationError("native_" + name + "_missing")
     return directory
 
 
@@ -272,10 +289,14 @@ def _native_attempt_hits(tasks_root: Path, repository: str) -> tuple:
     unknown owner evidence and fails closed instead of being skipped.
     """
     root = Path(tasks_root)
-    if root.is_symlink() or (root.exists() and not root.is_dir()):
+    try:
+        mode = root.lstat().st_mode
+    except FileNotFoundError:
+        raise GuardObservationError("native_tasks_root_missing") from None
+    except OSError:
+        raise GuardObservationError("native_inventory_unreadable") from None
+    if not stat.S_ISDIR(mode):
         raise GuardObservationError("native_tasks_root_invalid")
-    if not root.is_dir():
-        raise GuardObservationError("native_tasks_root_missing")
     hits = []
     for folder in ("pending", "running"):
         for name, task in _native_attempt_entry(_native_inventory_dir(root, folder)):
@@ -379,11 +400,32 @@ def collect_herdr_observation(
             max_turns = launch["max_turns"]
         side_children = _live_side_children(launch)
 
+    try:
+        repo_mode = repo_root.lstat().st_mode
+    except FileNotFoundError:
+        raise GuardObservationError("repo_root_missing") from None
+    except OSError:
+        raise GuardObservationError("repo_root_unreadable") from None
+    if not stat.S_ISDIR(repo_mode):
+        raise GuardObservationError("repo_root_invalid")
     config_path = repo_root / "configs" / "consumers" / "herdr.yaml"
-    config_raw = _bounded_bytes(config_path)
-    policy_values = _parse_consumer_policy(config_raw)
+    try:
+        config_raw = _bounded_bytes(config_path)
+    except GuardObservationError as exc:
+        if exc.reason == "unreadable":
+            try:
+                config_path.lstat()
+            except FileNotFoundError:
+                raise GuardObservationError("host_policy_missing") from None
+            except OSError:
+                pass
+        raise GuardObservationError("host_policy_unreadable") from None
+    try:
+        policy_values = _parse_consumer_policy(config_raw)
+    except GuardObservationError:
+        raise GuardObservationError("host_policy_invalid") from None
     if not policy_values:
-        raise GuardObservationError("host_policy_unavailable")
+        raise GuardObservationError("host_policy_invalid")
     policy_hash = hashlib.sha256(config_raw).hexdigest()
 
     active_attempts = _native_attempt_hits(tasks_root, HERDR_REPOSITORY)
@@ -623,14 +665,107 @@ def emit_audit(
             record[key] = extra[key]
     if audit_path is not None:
         path = Path(audit_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n"
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
-            os.write(fd, line.encode("utf-8"))
+            line = (canonical_json(record) + "\n").encode("utf-8")
+            if len(line) > AUDIT_ENTRY_MAX_BYTES:
+                raise GuardObservationError("audit_entry_oversize")
+            _append_bounded_audit(path, line)
+        except GuardObservationError:
+            raise
+        except (OSError, ValueError, TypeError):
+            raise GuardObservationError("audit_write_failed") from None
+    return record
+
+
+def _audit_regular(fd: int) -> int:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > AUDIT_MAX_BYTES:
+        raise GuardObservationError("audit_file_invalid")
+    return info.st_size
+
+
+def _audit_write_all(fd: int, data: bytes) -> None:
+    offset = 0
+    while offset < len(data):
+        count = os.write(fd, data[offset:])
+        if count <= 0:
+            raise OSError(errno.ENOSPC, "audit write incomplete")
+        offset += count
+
+
+def _append_bounded_audit(path: Path, line: bytes) -> None:
+    """Two bounded generations, serialized by a stable sidecar lock.
+
+    On interrupted rotation the previous generation remains at .1. An
+    incomplete append is rolled back to its prior length while holding lock.
+    """
+    # Refuse symlinked ancestors as well as symlinked final components.
+    for parent in (path.parent, *path.parent.parents):
+        if parent.is_symlink():
+            raise GuardObservationError("audit_path_invalid")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    lock_path = Path(str(path) + ".lock")
+    backup = Path(str(path) + ".1")
+    temporary = Path(str(path) + ".tmp")
+    lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT | nofollow, 0o600)
+    try:
+        _audit_regular(lock_fd)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        # A prior crash can leave a complete temporary record. The backup
+        # retains the previous generation; clear only this bounded temp file.
+        try:
+            temp_mode = temporary.lstat().st_mode
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISREG(temp_mode) or temporary.stat().st_size > AUDIT_ENTRY_MAX_BYTES:
+                raise GuardObservationError("audit_file_invalid")
+            temporary.unlink()
+        for candidate in (path, backup):
+            try:
+                check_fd = os.open(str(candidate), os.O_RDONLY | nofollow)
+            except FileNotFoundError:
+                continue
+            try:
+                _audit_regular(check_fd)
+            finally:
+                os.close(check_fd)
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | nofollow, 0o600)
+        try:
+            size = _audit_regular(fd)
+            if size + len(line) <= AUDIT_MAX_BYTES:
+                try:
+                    os.lseek(fd, size, os.SEEK_SET)
+                    _audit_write_all(fd, line)
+                    os.fsync(fd)
+                except OSError:
+                    os.ftruncate(fd, size)
+                    raise
+                return
         finally:
             os.close(fd)
-    return record
+        temp_fd = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600)
+        try:
+            _audit_write_all(temp_fd, line)
+            os.fsync(temp_fd)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+        finally:
+            os.close(temp_fd)
+        try:
+            os.replace(path, backup)
+            os.replace(temporary, path)
+            dir_fd = os.open(str(path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        finally:
+            temporary.unlink(missing_ok=True)
+    finally:
+        os.close(lock_fd)
 
 
 def decide_herdr_agent_start(
