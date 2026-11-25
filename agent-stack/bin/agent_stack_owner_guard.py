@@ -296,6 +296,99 @@ def _native_inventory_dir(root: Path, name: str) -> Path:
     return directory
 
 
+def _durable_child_ledger_hits(root: Path, repository: str) -> tuple:
+    """Independently observe orphan durable-child ledgers, without new authority.
+
+    Unknown, corrupt, oversized or incomplete ledger evidence is rejected.
+    A settled child is considered clear only when its terminal result and
+    cleanup are both journaled; no state is modified during observation.
+    """
+    container = root / "durable-children"
+    try:
+        container_mode = container.lstat().st_mode
+    except FileNotFoundError:
+        return ()  # No durable-child inventory has ever been created.
+    except OSError:
+        raise GuardObservationError("durable_inventory_unreadable") from None
+    if not stat.S_ISDIR(container_mode):
+        raise GuardObservationError("durable_inventory_invalid")
+    try:
+        with os.scandir(container) as entries:
+            dirs = sorted((Path(entry.path) for entry in entries), key=lambda x: x.name)
+    except OSError:
+        raise GuardObservationError("durable_inventory_unreadable") from None
+    if len(dirs) > 1024:
+        raise GuardObservationError("durable_inventory_oversize")
+    # Keep the observation bounded even with many individually bounded logs.
+    remaining_ledger_bytes = 16 * 1024 * 1024
+    hits = []
+    for directory in dirs:
+        if not re.fullmatch(r"[0-9a-f]{64}", directory.name):
+            raise GuardObservationError("durable_attempt_invalid")
+        try:
+            if not stat.S_ISDIR(directory.lstat().st_mode):
+                raise GuardObservationError("durable_attempt_invalid")
+            ledger = directory / "scheduler.jsonl"
+            required = directory / "scheduler.required"
+            initialization = directory / "scheduler.initialization.json"
+            if not (os.path.lexists(ledger) or os.path.lexists(required)
+                    or os.path.lexists(initialization)):
+                continue  # Empty attempt directory with bridge.lock only.
+            if not os.path.lexists(ledger):
+                raise GuardObservationError("durable_ledger_missing")
+            raw = _bounded_bytes(ledger, limit=2 * 1024 * 1024)
+            remaining_ledger_bytes -= len(raw)
+            if remaining_ledger_bytes < 0:
+                raise GuardObservationError("durable_inventory_oversize")
+            if not raw or not raw.endswith(b"\n"):
+                raise GuardObservationError("durable_ledger_invalid")
+            lines = raw.splitlines()
+            if len(lines) > 4096:
+                raise GuardObservationError("durable_ledger_oversize")
+            parent_repo = None
+            spawned = set()
+            finished = set()
+            cleaned = set()
+            for line in lines:
+                if len(line) > BOUNDED_BYTES_LIMIT:
+                    raise GuardObservationError("durable_ledger_oversize")
+                event = json.loads(line)
+                if not isinstance(event, dict) or not isinstance(event.get("event"), str):
+                    raise GuardObservationError("durable_ledger_invalid")
+                kind = event["event"]
+                if kind == "submit":
+                    found_repo = event.get("repo")
+                    if not isinstance(found_repo, str) or (
+                            parent_repo is not None and parent_repo != found_repo):
+                        raise GuardObservationError("durable_ledger_identity_invalid")
+                    parent_repo = found_repo
+                elif kind == "spawn_child":
+                    child_id = event.get("child_id")
+                    if not isinstance(child_id, str) or not child_id or child_id in spawned:
+                        raise GuardObservationError("durable_ledger_invalid")
+                    spawned.add(child_id)
+                elif kind == "child_result":
+                    child_id = event.get("task_id")
+                    if not isinstance(child_id, str) or event.get("status") not in {
+                            "completed", "blocked", "failed"}:
+                        raise GuardObservationError("durable_ledger_invalid")
+                    finished.add(child_id)
+                elif kind in {"child_cleanup_complete", "child_pre_delivery_cleanup_complete"}:
+                    child_id = event.get("task_id")
+                    if not isinstance(child_id, str):
+                        raise GuardObservationError("durable_ledger_invalid")
+                    cleaned.add(child_id)
+            if parent_repo is None or (finished | cleaned) - spawned:
+                raise GuardObservationError("durable_ledger_identity_invalid")
+            if parent_repo == repository and (spawned - (finished & cleaned)):
+                hits.append("durable-children/" + directory.name + "/scheduler.jsonl")
+        except GuardObservationError:
+            raise
+        except (OSError, ValueError, TypeError, UnicodeError):
+            raise GuardObservationError("durable_ledger_invalid") from None
+    return tuple(hits)
+
+
 def _native_attempt_hits(tasks_root: Path, repository: str) -> tuple:
     """Existing durable admission evidence. No new queue, no retry.
 
@@ -339,6 +432,7 @@ def _native_attempt_hits(tasks_root: Path, repository: str) -> tuple:
                 or task.get("watchdog_blocker") in blocking_reasons
                 or legacy_blocker in {"uncertain", "unknown"}):
             hits.append("blocked/" + name)
+    hits.extend(_durable_child_ledger_hits(root, repository))
     return tuple(hits)
 
 

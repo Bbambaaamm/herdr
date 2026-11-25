@@ -36,6 +36,13 @@ def _load_owner_guard():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     loader.exec_module(module)
+    # A syntactically valid but truncated module must fail closed too.
+    if (not isinstance(getattr(module, "GuardObservationError", None), type)
+            or not callable(getattr(module, "decide_herdr_agent_start", None))
+            or not all(isinstance(getattr(module, name, None), str)
+                       for name in ("DECISION_BLOCKED_UNKNOWN",
+                                    "DECISION_RESTORED_INTERACTIVE"))):
+        raise RuntimeError("owner guard API incomplete")
     return module
 
 
@@ -400,8 +407,10 @@ def ensure_agent(workspace_id, spec, group=None):
         try:
             decision = decide_herdr_agent_start(spec, group)
         except Exception as exc:
-            reason = (exc.reason if owner_guard is not None
-                      and isinstance(exc, owner_guard.GuardObservationError)
+            guard_error = (getattr(owner_guard, "GuardObservationError", None)
+                           if owner_guard is not None else None)
+            reason = (exc.reason if isinstance(guard_error, type)
+                      and isinstance(exc, guard_error)
                       else "guard_evaluation_failed")
             guard_diagnostic(reason)
             return DECISION_BLOCKED_UNKNOWN

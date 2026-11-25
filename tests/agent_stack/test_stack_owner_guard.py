@@ -1634,3 +1634,79 @@ def test_copilot_structured_blocked_state_is_durable_attempt(
         decision = _review_decide(guard, host, tmp_path / "audit.jsonl")
     assert decision.code == guard.DECISION_BLOCKED_ATTEMPT
     assert decision.evidence.active_attempts == ("blocked/task-0.json",)
+
+@pytest.mark.parametrize("broken_source", ["", "x = 1\n"])
+def test_copilot_incomplete_guard_module_is_herdr_only_block(
+    tmp_path, monkeypatch, broken_source
+):
+    folder = tmp_path / "agent-stack" / "bin"
+    folder.mkdir(parents=True)
+    fake = folder / "agent-stack-ensure"
+    fake.write_bytes(ENSURE_PATH.read_bytes())
+    (folder / "agent_stack_owner_guard.py").write_text(broken_source)
+    ensure = load_module("ensure_incomplete_module", fake)
+    assert ensure.owner_guard is None
+    monkeypatch.setattr(ensure, "healthy_agent_names", lambda: {"loxxess-hermes"})
+    monkeypatch.setattr(ensure, "log", lambda *args: None)
+    assert ensure.ensure_agent("w", {"name": "herdr-hermes"},
+                               {"label": "Herdr"}) == "BLOCKED_OWNER_UNKNOWN"
+    assert ensure.ensure_agent("w", {"name": "loxxess-hermes"},
+                               {"label": "LoxxessTechnicalAI"}) == "healthy"
+
+
+def test_copilot_orphan_durable_child_ledger_in_decision_and_audit(guard, tmp_path):
+    host = make_host(guard, tmp_path, state="RUNNING")
+    directory = host["tasks_root"] / "durable-children" / ("a" * 64)
+    directory.mkdir(parents=True)
+    events = [
+        {"event": "submit", "task_id": "parent", "repo": "Bbambaaamm/herdr"},
+        {"event": "spawn_child", "child_id": "child-1", "parent_id": "parent"},
+    ]
+    (directory / "scheduler.jsonl").write_text(
+        "".join(json.dumps(e) + "\n" for e in events))
+    with held_lock(host["state_dir"] / "supervisor.lock"):
+        result = guard.decide_herdr_agent_start(
+            "Herdr", "Bbambaaamm/herdr", "herdr-hermes",
+            state_dir=host["state_dir"], repo_root=host["repo_root"],
+            tasks_root=host["tasks_root"], audit_path=tmp_path / "audit.jsonl")
+    assert result.code == guard.DECISION_BLOCKED_ATTEMPT
+    assert result.evidence.active_attempts == (
+        "durable-children/" + "a" * 64 + "/scheduler.jsonl",)
+    audit = json.loads((tmp_path / "audit.jsonl").read_text().splitlines()[-1])
+    assert audit["event"] == guard.DECISION_BLOCKED_ATTEMPT
+
+
+@pytest.mark.parametrize("bad", ["truncated", "missing", "symlink"])
+def test_copilot_durable_ledger_corruption_fails_closed(guard, tmp_path, bad):
+    host = make_host(guard, tmp_path, state="RUNNING")
+    directory = host["tasks_root"] / "durable-children" / ("b" * 64)
+    directory.mkdir(parents=True)
+    ledger = directory / "scheduler.jsonl"
+    (directory / "scheduler.required").touch()
+    if bad == "truncated":
+        ledger.write_text('{"event": "submit"')
+    elif bad == "symlink":
+        ledger.symlink_to(tmp_path / "outside")
+    with held_lock(host["state_dir"] / "supervisor.lock"):
+        result = guard.decide_herdr_agent_start(
+            "Herdr", "Bbambaaamm/herdr", "herdr-hermes",
+            state_dir=host["state_dir"], repo_root=host["repo_root"],
+            tasks_root=host["tasks_root"], audit_path=tmp_path / "audit.jsonl")
+    assert result.code == guard.DECISION_BLOCKED_UNKNOWN
+    assert result.reason.startswith("observation_failed:durable_") or (
+        bad == "symlink" and result.reason == "observation_failed:symlink")
+
+
+def test_copilot_completed_durable_child_ledger_not_reported_active(guard, tmp_path):
+    host = make_host(guard, tmp_path, state="RUNNING")
+    directory = host["tasks_root"] / "durable-children" / ("c" * 64)
+    directory.mkdir(parents=True)
+    events = [
+        {"event": "submit", "task_id": "p", "repo": "Bbambaaamm/herdr"},
+        {"event": "spawn_child", "child_id": "c1"},
+        {"event": "child_result", "task_id": "c1", "status": "blocked"},
+        {"event": "child_cleanup_complete", "task_id": "c1"},
+    ]
+    (directory / "scheduler.jsonl").write_text(
+        "".join(json.dumps(e) + "\n" for e in events))
+    assert guard._native_attempt_hits(host["tasks_root"], "Bbambaaamm/herdr") == ()
