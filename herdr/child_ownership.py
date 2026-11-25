@@ -497,3 +497,79 @@ class OwnershipRegistry:
     def snapshot(self):
         with self._transaction() as data:
             return json.loads(json.dumps(data))
+
+class ReadOnlyOwnershipRegistry(OwnershipRegistry):
+    """Snapshot-only ownership verifier for watchdog observation.
+
+    It NEVER creates directories/locks, modifies reservations, fsyncs or
+    reconciles claims. The transaction takes a bounded shared lock.
+    """
+
+    def __init__(self, root, *, verify_contract=None, verify_release=None,
+                 verify_legacy=None):
+        import os, stat
+        from pathlib import Path
+        self.root = Path(root).absolute()
+        self.verify_contract, self.verify_release = verify_contract, verify_release
+        self.verify_legacy = verify_legacy
+        require(self.root.resolve(strict=True) == self.root, "ownership_symlink_root")
+        info = self.root.lstat()
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+                and not info.st_mode & 0o022, "ownership_host_root")
+        self.directory = self.root / "child-ownership"
+        info = self.directory.lstat()
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+                and stat.S_IMODE(info.st_mode) == 0o700, "ownership_private_directory")
+        self._directory_identity = (info.st_dev, info.st_ino)
+
+    def _transaction(self):
+        import os, fcntl, stat, time
+        from contextlib import contextmanager
+
+        @contextmanager
+        def reader():
+            directory = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            lock = None
+            try:
+                info = os.fstat(directory)
+                require((info.st_dev, info.st_ino) == self._directory_identity
+                        and info.st_uid == os.getuid()
+                        and stat.S_IMODE(info.st_mode) == 0o700,
+                        "ownership_private_directory")
+                lock = os.open("registry.lock", os.O_RDONLY | os.O_NOFOLLOW |
+                               os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=directory)
+                self._private_file(lock)
+                deadline = time.monotonic() + 0.25
+                while True:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise OwnershipError("ownership_observation_lock_timeout")
+                        time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+                yield self._read(directory)  # never writes the returned data
+            finally:
+                if lock is not None:
+                    os.close(lock)
+                os.close(directory)
+        return reader()
+
+    def reconcile_claim(self, key, parent, task_id, ownership, identity, *,
+                        read_only=False):
+        # A pending reservation is NOT silently promoted to CLAIMED by a
+        # read-only observer. Recovery alone may perform that transition.
+        expected = {
+            "parent": parent.to_json(), "task_id": task_id,
+            "ownership": None if ownership is None else ownership.to_json(),
+            "read_only": ownership.read_only if ownership is not None else read_only,
+        }
+        require(key == self.key(parent, task_id), "ownership_replay_reservation")
+        with self._transaction() as data:
+            row = data["reservations"].get(key)
+            if row is None:
+                row = self.retired_reservation(key)  # validated read-only tombstone
+            require(row is not None and all(row.get(k) == v for k, v in expected.items())
+                    and row["identity"] == identity.to_json()
+                    and row["state"] in {"claimed", "released"},
+                    "ownership_observation_unreconciled")

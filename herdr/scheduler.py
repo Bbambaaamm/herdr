@@ -551,6 +551,34 @@ class AuditLog:
         return len(self.replay())
 
 
+class SnapshotAuditLog(AuditLog):
+    """Immutable prevalidated journal snapshot for readonly replay."""
+
+    def __init__(self, path: Path, raw: bytes):
+        super().__init__(path)
+        if not raw or len(raw) > 2 * 1024 * 1024 or not raw.endswith(b"\n"):
+            raise SchedulerError("invalid snapshot journal bounds")
+        def unique(items):
+            result = {}
+            for key, value in items:
+                if key in result:
+                    raise SchedulerError("duplicate journal field")
+                result[key] = value
+            return result
+        try:
+            self._snapshot_events = tuple(json.loads(line, object_pairs_hook=unique)
+                                          for line in raw.splitlines())
+        except (ValueError, UnicodeError):
+            raise SchedulerError("invalid journal snapshot") from None
+        if len(self._snapshot_events) > 4096 or not all(
+                isinstance(event, dict) for event in self._snapshot_events):
+            raise SchedulerError("invalid journal snapshot")
+
+    def replay(self):
+        # No pathname reopens, even if an attacker replaces the source FIFO.
+        return list(self._snapshot_events)
+
+
 # ---------------------------------------------------------------------------
 # TaskRecord — runtime state per node
 # ---------------------------------------------------------------------------

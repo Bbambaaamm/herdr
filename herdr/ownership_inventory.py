@@ -95,8 +95,10 @@ class LegacyOwnershipInventory:
     def _known_claim(self, rec, data):
         row = data["reservations"].get(rec.ownership_reservation)
         if row is None and rec.ownership_reservation:
-            from .child_ownership import OwnershipRegistry
-            row = OwnershipRegistry(self.root).retired_reservation(rec.ownership_reservation)
+            from .child_ownership import (OwnershipRegistry, ReadOnlyOwnershipRegistry)
+            registry_type = (ReadOnlyOwnershipRegistry if isinstance(self, ReadOnlyLegacyOwnershipInventory)
+                             else OwnershipRegistry)
+            row = registry_type(self.root).retired_reservation(rec.ownership_reservation)
         if row is None or rec.ownership is None or row["ownership"] is None or ChildOwnership.from_json(row["ownership"]) != rec.ownership:
             return False
         actual = InvocationIdentity("github:"+rec.repo, rec.agent_id,
@@ -220,3 +222,41 @@ class LegacyOwnershipInventory:
                 os.close(container)
             if root_fd is not None:
                 os.close(root_fd)
+
+class ReadOnlyLegacyOwnershipInventory(LegacyOwnershipInventory):
+    """Fail-closed legacy writer observer with no lock creation or fsync.
+
+    LegacyOwnershipInventory remains the mutating admission/recovery guard.
+    """
+
+    def __call__(self, data):
+        import fcntl
+        root = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        lock = None
+        try:
+            info = os.fstat(root)
+            require(info.st_uid == os.getuid() and not info.st_mode & 0o022
+                    and (info.st_dev, info.st_ino) == self.root_identity,
+                    "ownership_epoch_root")
+            # Missing lock must remain UNKNOWN, not be created by observation.
+            lock = os.open("worker.lock", os.O_RDONLY | os.O_NOFOLLOW |
+                           os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=root)
+            held = os.fstat(lock)
+            require(stat.S_ISREG(held.st_mode) and held.st_uid == os.getuid()
+                    and stat.S_IMODE(held.st_mode) == 0o600 and held.st_nlink == 1,
+                    "ownership_epoch_lock")
+            try:
+                fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise OwnershipError("ownership_legacy_worker_active") from None
+            named = os.stat("worker.lock", dir_fd=root, follow_symlinks=False)
+            require((held.st_dev, held.st_ino) == (named.st_dev, named.st_ino),
+                    "ownership_epoch_lock_changed")
+            self._require_current_parents()
+            return self._scan(data)
+        except FileNotFoundError:
+            raise OwnershipError("ownership_observation_legacy_lock_missing") from None
+        finally:
+            if lock is not None:
+                os.close(lock)
+            os.close(root)
