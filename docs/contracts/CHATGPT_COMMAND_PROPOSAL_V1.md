@@ -48,3 +48,24 @@ are not bypassed.
 - Task identity, fencing, run token, budget and review gates remain canonical.
 - ChatGPT status is grounded in durable evidence, not terminal or model text.
 - No merge, deployment or restart without their separate host authority.
+
+## Phase 2A: existing intake read-only inspection
+
+The existing `agent-github-intake` can inspect one GitHub proposal through
+`--inspect-proposal Bbambaaamm/herdr ISSUE_NUMBER`. It uses only the
+pre-existing authenticated `gh api` GET transport and validates the actual
+GitHub repository/issue revision. `CommandProposal.from_github_issue`
+requires the entire canonical issue title/body to match the deterministic
+renderer, preventing edited/forged markdown and digest mismatches.
+
+The result includes the proposal SHA-256, repository issue revision SHA-256,
+target and operation, plus `PROPOSED_ONLY`,
+`execution_authorized=false`, `task_created=false`. No new authorization
+channel, queue, worker, network listener or GitHub writer was added.
+
+**Still required:** a separate implementation of a host-authorized,
+revision-bound, single-episode proposal-to-root-#53 admission binding.
+This read-only inspection is NOT a replacement for
+`HERDR-ADMISSION-V1`. A proposal issue cannot be submitted as an
+agent task by this command; the existing root-only intake continues
+to admit only issue #53 with valid maintainer acknowledgment.

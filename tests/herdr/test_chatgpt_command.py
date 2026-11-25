@@ -96,3 +96,79 @@ def test_cli_rejects_symlink(tmp_path):
                              capture_output=True, text=True, timeout=8)
     assert process.returncode == 3
     assert "proposal_denied" in process.stderr
+
+
+def test_github_proposal_roundtrip_preserves_exact_envelope():
+    proposal = CommandProposal.parse(request())
+    rendered = proposal.github_issue_proposal()
+    issue = {"number": 255, "state": "open", "title": rendered["title"],
+             "body": rendered["body"]}
+    loaded = CommandProposal.from_github_issue(issue)
+    assert loaded.digest == proposal.digest
+
+
+@pytest.mark.parametrize("change", [
+    {"state": "closed"}, {"pull_request": {"url": "example"}},
+    {"number": 0}, {"body": ""}, {"title": "fake"}, {"body": None},
+])
+def test_github_proposal_rejects_noncanonical_issue(change):
+    rendered = CommandProposal.parse(request()).github_issue_proposal()
+    issue = {"number": 255, "state": "open", "title": rendered["title"],
+             "body": rendered["body"]}
+    issue.update(change)
+    with pytest.raises(ProposalDenied):
+        CommandProposal.from_github_issue(issue)
+
+
+def test_github_proposal_rejects_issue_body_tamper():
+    rendered = CommandProposal.parse(request()).github_issue_proposal()
+    issue = {"number": 255, "state": "open", "title": rendered["title"],
+             "body": rendered["body"] + "\nExtra hidden instructions"}
+    with pytest.raises(ProposalDenied):
+        CommandProposal.from_github_issue(issue)
+
+
+def test_intake_proposal_inspection_does_not_grant_execution(monkeypatch):
+    import importlib.machinery
+    import importlib.util
+    from herdr.chatgpt_command import ROOT_REPOSITORY
+
+    script = ROOT / "agent-stack/bin/agent-github-intake"
+    loader = importlib.machinery.SourceFileLoader("chatgpt_intake_inspection_test", str(script))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    intake = importlib.util.module_from_spec(spec)
+    loader.exec_module(intake)
+
+    created = CommandProposal.parse(request()).github_issue_proposal()
+    repository = {"id": 101, "full_name": ROOT_REPOSITORY}
+    issue = {
+        "id": 25501, "number": 255, "state": "open", "title": created["title"],
+        "body": created["body"], "repository_url": "https://api.github.com/repos/Bbambaaamm/herdr",
+        "url": "https://api.github.com/repos/Bbambaaamm/herdr/issues/255",
+        "html_url": "https://github.com/Bbambaaamm/herdr/issues/255",
+        "comments": 0, "created_at": "2026-11-25T20:00:00Z",
+        "updated_at": "2026-11-25T20:00:00Z",
+    }
+    urls = []
+    def fetch(url):
+        urls.append(url)
+        if url == "https://api.github.com/user":
+            return {"id": 900, "login": "intake-reader", "type": "User"}
+        if url == "https://api.github.com/repos/Bbambaaamm/herdr":
+            return repository
+        if url == "https://api.github.com/repos/Bbambaaamm/herdr/issues/255":
+            return issue
+        raise AssertionError("unexpected request")
+    monkeypatch.setattr(intake, "fetch_json", fetch)
+    monkeypatch.setattr(intake, "authenticated_user", lambda: (900, "intake-reader"))
+    result = intake.inspect_chatgpt_proposal(ROOT_REPOSITORY, 255)
+    assert result["read_only"] is True
+    assert result["task_created"] is False
+    assert result["execution_authorized"] is False
+    assert result["proposal_sha256"] == CommandProposal.parse(request()).digest
+    assert len(urls) == 2
+    with pytest.raises(intake.AdmissionDenied):
+        intake.inspect_chatgpt_proposal("other/repo", 255)
+    issue["body"] += "\nTampered"
+    with pytest.raises(intake.AdmissionDenied):
+        intake.inspect_chatgpt_proposal(ROOT_REPOSITORY, 255)

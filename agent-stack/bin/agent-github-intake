@@ -1107,7 +1107,46 @@ def intervention_blocker(
     return None
 
 
+def inspect_chatgpt_proposal(repo: str, number: int) -> dict:
+    """Read-only GitHub proposal inspection using the existing guarded API."""
+    from herdr.chatgpt_command import (
+        CommandProposal, ProposalDenied, ROOT_REPOSITORY,
+    )
+
+    if (repo != ROOT_REPOSITORY or type(number) is not int
+            or not 1 <= number <= 2**31 - 1):
+        raise AdmissionDenied("proposal-target-not-supported")
+    authenticated_user()
+    api = f"https://api.github.com/repos/{repo}"
+    repository = fetch_json(api)
+    issue = fetch_json(f"{api}/issues/{number}")
+    if issue.get("number") != number:
+        raise AdmissionDenied("proposal-issue-identity-mismatch")
+    revision = issue_revision(repo, repository, issue)
+    try:
+        proposal = CommandProposal.from_github_issue(issue)
+    except ProposalDenied as exc:
+        raise AdmissionDenied("invalid-chatgpt-proposal") from exc
+    return {
+        "read_only": True, "task_created": False,
+        "execution_authorized": False, "status": "PROPOSED_ONLY",
+        "repository": repo, "proposal_issue": number,
+        "root_issue": proposal.request()["root_issue"],
+        "proposal_sha256": proposal.digest, "github_revision_sha256": revision,
+        "target_kind": proposal.target_kind,
+        "target_number": proposal.target_number,
+        "operation": proposal.operation,
+    }
+
+
 def main() -> int:
+    if sys.argv[1:2] == ["--inspect-proposal"]:
+        if (len(sys.argv) != 4 or not sys.argv[3].isdigit()
+                or not 1 <= int(sys.argv[3]) <= 2**31 - 1):
+            raise AdmissionDenied("inspect-proposal-arguments-invalid")
+        print(json.dumps(inspect_chatgpt_proposal(sys.argv[2], int(sys.argv[3])),
+                         sort_keys=True))
+        return 0
     if sys.argv[1:2] == ["--approval-digest"]:
         if len(sys.argv) != 4 or not sys.argv[3].isdigit() or int(sys.argv[3]) <= 0:
             raise AdmissionDenied("approval-digest-arguments-invalid")
