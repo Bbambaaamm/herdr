@@ -67,3 +67,11 @@ Before any activation, demonstrate:
 
 The current code delivers an **atomically durable optional task-claim
 primitive**, not live ChatGPT → Hermes invocation.
+
+## Independent review P2 closure
+
+Pending proposal consumption must have an exact matching pending root
+intent. A missing or mismatched intent blocks state load and subsequent
+admissions, never allowing a newer root approval. A pending proposal
+independently triggers reconciliation. Regression tests reproduce corrupted
+intents and unchanged state on retry.
