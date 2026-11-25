@@ -230,3 +230,52 @@ def test_repeated_content_under_different_issue_fails_closed(intake):
         intake._consume_admission(
             consumer, issue, "github-herdr-issue-53-approval-5401",
             {**admission, "approval_id": 5401}, proposal_binding=new)
+
+
+@pytest.mark.parametrize("retained_binding", ["missing", "changed"])
+def test_codex_p2_retained_queue_collision_requires_exact_proposal_binding(
+    intake, monkeypatch, retained_binding,
+):
+    binding, admission, _, _, task_id = inputs()
+    consumer, issue = _queue_setup(intake, monkeypatch, admission)
+    pending = intake.PENDING / (task_id + ".json")
+    existing = {"id": task_id, "github_admission": admission}
+    if retained_binding == "changed":
+        existing["chatgpt_proposal_binding"] = {**binding, "proposal_issue": 901}
+    pending.write_text(json.dumps(existing))
+    initial_pending = pending.read_bytes()
+    with intake.intake_lock(), pytest.raises(
+        intake.AdmissionDenied, match="intake-admission-collision"
+    ):
+        intake._queue_issue_locked(
+            consumer, issue, [], proposal_binding=binding
+        )
+    assert pending.read_bytes() == initial_pending
+    # Crash window never becomes published even though the task ID matches.
+    row = intake.load_state()["Bbambaaamm/herdr#53"]
+    assert row["admission_intent"]["state"] == "publication_pending"
+    assert row["proposal_consumptions"][binding["binding_sha256"]]["state"] == "publication_pending"
+    with intake.intake_lock(), pytest.raises(intake.AdmissionDenied):
+        intake._queue_issue_locked(
+            consumer, issue, [], proposal_binding=binding
+        )
+
+
+def test_matching_bound_queue_collision_remains_replay_safe(intake, monkeypatch):
+    binding, admission, _, _, task_id = inputs()
+    consumer, issue = _queue_setup(intake, monkeypatch, admission)
+    pending = intake.PENDING / (task_id + ".json")
+    pending.write_text(json.dumps({
+        "id": task_id,
+        "github_admission": admission,
+        "chatgpt_proposal_binding": binding,
+    }))
+    before = pending.read_bytes()
+    with intake.intake_lock():
+        assert intake._queue_issue_locked(
+            consumer, issue, [], proposal_binding=binding
+        ) == task_id
+    assert pending.read_bytes() == before
+    row = intake.load_state()["Bbambaaamm/herdr#53"]
+    assert row["admission_intent"]["state"] == "published"
+    assert row["proposal_consumptions"][binding["binding_sha256"]]["state"] == "published"
