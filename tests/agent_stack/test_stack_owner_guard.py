@@ -1110,6 +1110,116 @@ def test_review_guard_precedes_healthy_short_circuit(guard, monkeypatch, tmp_pat
 # G11: Herdr block does not stop independent consumers
 # --------------------------------------------------------------------------
 
+@pytest.mark.parametrize("fault", ["corrupt_current", "corrupt_backup", "invalid_path",
+                                    "enospc", "malformed_evidence", "herdr_checkout",
+                                    "herdr_agent_failure"])
+def test_g11_main_isolates_herdr_faults_across_all_consumers(
+        guard, monkeypatch, tmp_path, capfd, fault):
+    ensure = load_module("ensure_g11_fault", ENSURE_PATH)
+    monkeypatch.setattr(ensure, "STATE", tmp_path / "state")
+    monkeypatch.setattr(ensure, "LOG", tmp_path / "ensure.log")
+    audit = tmp_path / "audit.jsonl"
+    if fault == "invalid_path":
+        audit = tmp_path / "missing-parent" / "audit.jsonl"
+    monkeypatch.setattr(ensure, "GUARD_AUDIT_LOG", audit)
+    ensure.STATE.mkdir()
+    marker = ensure.STATE / "independent-state.json"
+    marker.write_bytes(b"independent state unchanged\n")
+    boot = tmp_path / "herdr-autostart.log"
+    boot.write_bytes(b"existing boot marker\n")
+    monkeypatch.setattr(ensure, "HERDR_BOOT_LOG", boot)
+    monkeypatch.setattr(ensure, "ensure_desktop_commander", lambda: None)
+    monkeypatch.setattr(ensure, "ensure_herdr_server", lambda: None)
+    visited = []
+
+    def checkout(cwd, repository, repo_url):
+        if fault == "herdr_checkout" and repository == "Bbambaaamm/herdr":
+            raise RuntimeError("private checkout detail must not appear")
+
+    monkeypatch.setattr(ensure, "ensure_repo_checkout", checkout)
+    monkeypatch.setattr(ensure, "ensure_workspace", lambda label, cwd: visited.append(label) or label)
+    monkeypatch.setattr(ensure, "ensure_tabs", lambda *args: None)
+    monkeypatch.setattr(ensure, "list_tabs", lambda: [
+        {"workspace_id": label, "label": tab, "tab_id": label + tab}
+        for label in visited for tab in ("Codex", "Hermes", "Sol", "Astra")])
+    monkeypatch.setattr(ensure, "list_panes", lambda wid: [
+        {"tab_id": wid + tab, "pane_id": wid + tab + "pane"}
+        for tab in ("Codex", "Hermes", "Sol", "Astra")])
+    def observation(*args, **kwargs):
+        value = obs_dict(guard, state="PAUSED")
+        if fault == "malformed_evidence":
+            value["fence_states"] = 7
+        return value
+
+    monkeypatch.setattr(ensure.owner_guard, "collect_herdr_observation", observation)
+    independently_missing = {"majak-codex", "loxxess-hermes", "heating-hermes"}
+    healthy = {s["name"] for g in ensure.DESIRED for s in g["agents"]
+               if g["label"] != "Herdr" and s["name"] not in independently_missing}
+    healthy_before = healthy.copy()
+    start_calls = []
+    monkeypatch.setattr(ensure, "list_agents", lambda: [
+        {"name": name, "interactive_ready": True, "agent_status": "idle"}
+        for name in sorted(healthy)])
+
+    def fake_run(args, timeout=30):
+        if list(args)[:2] == [ensure.HERDR, "agent"] and "start" in args:
+            name = args[args.index("start") + 1]
+            start_calls.append(name)
+            healthy.add(name)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ensure, "run", fake_run)
+    if fault == "herdr_agent_failure":
+        original_ensure_agent = ensure.ensure_agent
+
+        def failed_agent(wid, spec, group):
+            if group["label"] == "Herdr":
+                raise RuntimeError("private agent detail must not appear")
+            return original_ensure_agent(wid, spec, group)
+
+        monkeypatch.setattr(ensure, "ensure_agent", failed_agent)
+    original = b'{"existing":"record"}\n{invalid json}\n'
+    if fault == "corrupt_current":
+        audit.write_bytes(original)
+    elif fault == "corrupt_backup":
+        (tmp_path / "audit.jsonl.1").write_bytes(original)
+    elif fault == "enospc":
+        def full_disk(*args):
+            raise OSError(errno.ENOSPC, "private disk detail")
+        monkeypatch.setattr(ensure.owner_guard, "_append_bounded_audit", full_disk)
+
+    ensure.main()
+
+    assert visited == [g["label"] for g in ensure.DESIRED
+                       if not (fault == "herdr_checkout" and g["label"] == "Herdr")]
+    assert set(start_calls) == independently_missing
+    assert all(not name.startswith("herdr-") for name in start_calls)
+    assert healthy_before <= healthy
+    assert marker.read_bytes() == b"independent state unchanged\n"
+    assert boot.read_bytes() == b"existing boot marker\n"
+    if fault == "corrupt_current":
+        assert audit.read_bytes() == original
+    if fault == "corrupt_backup":
+        assert (tmp_path / "audit.jsonl.1").read_bytes() == original
+    output = capfd.readouterr()
+    assert "private" not in output.out + output.err
+    if fault != "herdr_checkout":
+        assert "Herdr owner guard unavailable" in output.err
+
+
+def test_g11_guard_log_failure_does_not_stop_other_consumers(
+        guard, monkeypatch, tmp_path):
+    ensure = load_module("ensure_g11_log", ENSURE_PATH)
+    group = next(g for g in ensure.DESIRED if g["label"] == "Herdr")
+    spec = group["agents"][0]
+    monkeypatch.setattr(ensure.owner_guard, "collect_herdr_observation",
+                        lambda *a, **k: obs_dict(guard, state="PAUSED"))
+    monkeypatch.setattr(ensure, "GUARD_AUDIT_LOG", tmp_path / "audit.jsonl")
+    monkeypatch.setattr(ensure, "log", lambda message: (_ for _ in ()).throw(
+        OSError(errno.ENOSPC, "full")))
+    assert ensure.ensure_agent("wid", spec, group) == guard.DECISION_BLOCKED_RECONCILIATION
+
+
 def test_g11_herdr_block_is_isolated_from_other_consumers(guard, monkeypatch, tmp_path):
     ensure = load_module("ensure_g11", ENSURE_PATH)
     ensure.DESIRED = [

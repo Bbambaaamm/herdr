@@ -119,6 +119,28 @@ def log(message):
         fh.write(line + "\n")
     print(line, flush=True)
 
+
+def guard_diagnostic(reason):
+    """Report a guard failure without writing to the possibly broken audit log."""
+    safe_codes = {
+        "audit_file_invalid", "audit_path_invalid", "audit_write_failed",
+        "audit_entry_oversize", "guard_evaluation_failed", "consumer_setup_failed",
+        "consumer_agent_failed", "ensure_log_unavailable",
+    }
+    code = reason if isinstance(reason, str) and reason in safe_codes else "guard_observation_failed"
+    message = f"Herdr owner guard unavailable ({code}); agent start blocked\n"
+    try:
+        os.write(2, message.encode("ascii"))
+    except OSError:
+        pass
+
+
+def log_guard_block(message):
+    try:
+        log(message)
+    except OSError:
+        guard_diagnostic("ensure_log_unavailable")
+
 def run(args, timeout=30):
     return subprocess.run(
         [str(x) for x in args],
@@ -367,10 +389,16 @@ def ensure_agent(workspace_id, spec, group=None):
     # Herdr agent.start path (Hermes and Codex). It only skips a start; it
     # never stops an existing healthy process.
     if group is not None and group.get("label") == "Herdr":
-        decision = decide_herdr_agent_start(spec, group)
+        try:
+            decision = decide_herdr_agent_start(spec, group)
+        except (owner_guard.GuardObservationError, OSError, TypeError, ValueError, KeyError) as exc:
+            reason = (exc.reason if isinstance(exc, owner_guard.GuardObservationError)
+                      else "guard_evaluation_failed")
+            guard_diagnostic(reason)
+            return owner_guard.DECISION_BLOCKED_UNKNOWN
         if str(decision.code) != owner_guard.DECISION_RESTORED_INTERACTIVE:
-            log(f"{spec['name']}: {decision.code} ({decision.reason}) "
-                f"owner_guard=no_start")
+            log_guard_block(f"{spec['name']}: {decision.code} ({decision.reason}) "
+                            f"owner_guard=no_start")
             return decision.code
     if spec["name"] in healthy_agent_names():
         log(f"{spec['name']}: healthy")
@@ -400,12 +428,26 @@ def main():
     ensure_herdr_server()
     blocked = []
     for group in DESIRED:
-        if group.get("repository"):
-            ensure_repo_checkout(group["cwd"], group["repository"], group["repo_url"])
-        wid = ensure_workspace(group["label"], group["cwd"])
-        ensure_tabs(wid, group["cwd"], [spec["tab"] for spec in group["agents"]])
+        try:
+            if group.get("repository"):
+                ensure_repo_checkout(group["cwd"], group["repository"], group["repo_url"])
+            wid = ensure_workspace(group["label"], group["cwd"])
+            ensure_tabs(wid, group["cwd"], [spec["tab"] for spec in group["agents"]])
+        except (OSError, RuntimeError, ValueError, KeyError, subprocess.TimeoutExpired):
+            if group.get("label") != "Herdr":
+                raise
+            guard_diagnostic("consumer_setup_failed")
+            blocked.extend((spec["name"], owner_guard.DECISION_BLOCKED_UNKNOWN)
+                           for spec in group["agents"])
+            continue
         for spec in group["agents"]:
-            action = ensure_agent(wid, spec, group)
+            try:
+                action = ensure_agent(wid, spec, group)
+            except (OSError, RuntimeError, ValueError, KeyError, subprocess.TimeoutExpired):
+                if group.get("label") != "Herdr":
+                    raise
+                guard_diagnostic("consumer_agent_failed")
+                action = owner_guard.DECISION_BLOCKED_UNKNOWN
             if str(action).startswith(("BLOCKED_", "SKIPPED_")):
                 blocked.append((spec["name"], str(action)))
     names = sorted(a.get("name", "") for a in list_agents())
