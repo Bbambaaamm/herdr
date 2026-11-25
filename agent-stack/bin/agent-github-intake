@@ -315,12 +315,33 @@ def approved_revision(consumer, issue):
             approval = json.loads(comment["body"][len(APPROVAL_MARKER):], object_pairs_hook=_json_object)
         except (ValueError, TypeError) as exc:
             raise AdmissionDenied("github-approval-invalid") from exc
-        if (not isinstance(approval, dict) or set(approval) != {"action", "repository", "issue_number", "issue_id", "content_sha256", "expires_at"}
+        required_approval_fields = {"action", "repository", "issue_number", "issue_id",
+                                    "content_sha256", "expires_at"}
+        selected = (
+            consumer.get("consumer") == "herdr" and repo == "Bbambaaamm/herdr"
+            and consumer.get("mode") == "root_only" and number == 53
+            and type(approval) is dict and "proposal_selection" in approval
+        )
+        if (not isinstance(approval, dict)
+                or set(approval) != required_approval_fields | ({"proposal_selection"} if selected else set())
                 or approval.get("action") != "approve" or approval.get("repository") != repo
                 or type(approval.get("issue_number")) is not int or approval["issue_number"] != number
                 or type(approval.get("issue_id")) is not int or approval["issue_id"] != current["id"]
                 or approval.get("content_sha256") != digest):
             raise AdmissionDenied("github-approval-scope-mismatch")
+        selection = None
+        if selected:
+            selection = approval["proposal_selection"]
+            if (type(selection) is not dict or set(selection) != {
+                    "issue_number", "issue_id", "digest", "revision"
+                } or type(selection["issue_number"]) is not int
+                or not 1 <= selection["issue_number"] <= 2**31 - 1
+                or selection["issue_number"] == 53
+                or type(selection["issue_id"]) is not int or selection["issue_id"] <= 0
+                or any(type(selection[name]) is not str
+                       or not re.fullmatch("[0-9a-f]{64}", selection[name])
+                       for name in ("digest", "revision"))):
+                raise AdmissionDenied("root-proposal-selection-invalid")
         expires = _date(approval["expires_at"])
         if not now() < expires <= created + timedelta(seconds=MAX_APPROVAL_AGE):
             raise AdmissionDenied("github-approval-expired-or-unbounded")
@@ -330,11 +351,14 @@ def approved_revision(consumer, issue):
         if (issue_revision(repo, repository, fresh) != digest or fresh["updated_at"] != current["updated_at"]
                 or fresh["comments"] != current["comments"]):
             raise AdmissionDenied("github-issue-changed-during-admission")
-        return fresh, {"version": 1, "approval_id": comment["id"], "content_sha256": digest,
-                       "repository_id": repository["id"], "issue_id": fresh["id"],
-                       "approver_user_id": user_id, "approver_login": login,
-                       "approved_at": comment["created_at"], "expires_at": approval["expires_at"],
-                       "issue_updated_at": fresh["updated_at"]}
+        result = {"version": 1, "approval_id": comment["id"], "content_sha256": digest,
+                  "repository_id": repository["id"], "issue_id": fresh["id"],
+                  "approver_user_id": user_id, "approver_login": login,
+                  "approved_at": comment["created_at"], "expires_at": approval["expires_at"],
+                  "issue_updated_at": fresh["updated_at"]}
+        if selected:
+            result["proposal_selection"] = selection
+        return fresh, result
     raise AdmissionDenied("github-maintainer-approval-missing")
 
 
@@ -712,6 +736,12 @@ def require_proposal_binding_for_root(binding, *, task_id, admission, row):
     parsed = proposal_consumptions(temporary)
     key = next(iter(parsed))
     if (type(admission) is not dict or binding["root_approval_id"] != admission.get("approval_id")
+            or admission.get("proposal_selection") != {
+                "issue_number": binding["proposal_issue"],
+                "issue_id": binding["proposal_issue_id"],
+                "digest": binding["proposal_digest"],
+                "revision": binding["proposal_revision"],
+            }
             or binding["root_revision"] != admission.get("content_sha256")
             or row.get("repo", "Bbambaaamm/herdr") != "Bbambaaamm/herdr"):
         raise AdmissionDenied("proposal-binding-root-mismatch")
@@ -756,6 +786,10 @@ def _consume_admission(consumer, issue, task_id, admission, *, proposal_binding=
     approval_id = str(admission['approval_id'])
     if approval_id in history or len(history) >= 1024:
         raise AdmissionDenied('intake-admission-already-consumed')
+    if proposal_binding is None and "proposal_selection" in admission:
+        # Explicit proposal approvals may never be consumed by legacy root
+        # intake without the matching authenticated bound proposal episode.
+        raise AdmissionDenied("root-proposal-selection-requires-binding")
     if proposal_binding is not None:
         if (consumer.get("consumer") != "herdr"
                 or consumer["repository"] != "Bbambaaamm/herdr" or issue["number"] != 53
@@ -1378,9 +1412,17 @@ def main() -> int:
                          sort_keys=True))
         return 0
     if sys.argv[1:2] == ["--approval-digest"]:
-        if len(sys.argv) != 4 or not sys.argv[3].isdigit() or int(sys.argv[3]) <= 0:
+        selected_argument = (
+            len(sys.argv) == 6 and sys.argv[4] == "--select-proposal"
+            and sys.argv[5].isdigit() and 1 <= int(sys.argv[5]) <= 2**31 - 1
+        )
+        if not ((len(sys.argv) == 4 or selected_argument)
+                and sys.argv[3].isdigit() and int(sys.argv[3]) > 0):
             raise AdmissionDenied("approval-digest-arguments-invalid")
         repo, number = sys.argv[2], int(sys.argv[3])
+        if selected_argument and (repo != "Bbambaaamm/herdr" or number != 53
+                                  or int(sys.argv[5]) == 53):
+            raise AdmissionDenied("proposal-selection-root-only")
         consumers = load_consumers()
         selected = [row for row in consumers if row["repository"] == repo
                     and (row["mode"] != "root_only" or row["root_issue"] == number)]
@@ -1396,6 +1438,29 @@ def main() -> int:
         proposed = {"action": "approve", "repository": repo, "issue_number": number,
                     "issue_id": issue["id"], "content_sha256": digest,
                     "expires_at": (now() + timedelta(minutes=30)).isoformat()}
+        if selected_argument:
+            from herdr.chatgpt_command import CommandProposal, ProposalDenied
+            proposal_number = int(sys.argv[5])
+            proposal = fetch_json(f"{api}/issues/{proposal_number}")
+            proposal_revision = issue_revision(repo, repository, proposal)
+            try:
+                parsed = CommandProposal.from_github_issue(proposal)
+            except ProposalDenied as exc:
+                raise AdmissionDenied("invalid-chatgpt-proposal") from exc
+            if proposal["number"] != proposal_number:
+                raise AdmissionDenied("proposal-selection-number-mismatch")
+            # Existing verified maintainer approval on the exact proposal is
+            # mandatory before proposing a selected root approval.
+            proposal_consumer = {**selected[0], "mode": "all_open"}
+            verified, receipt = approved_revision(proposal_consumer, proposal)
+            if issue_revision(repo, repository, verified) != proposal_revision:
+                raise AdmissionDenied("proposal-selection-stale")
+            proposed["proposal_selection"] = {
+                "issue_number": proposal_number,
+                "issue_id": verified["id"],
+                "digest": parsed.digest,
+                "revision": proposal_revision,
+            }
         print(json.dumps({"read_only": True, "task_created": False,
                           "approval_body": APPROVAL_MARKER + json.dumps(proposed, sort_keys=True)}))
         return 0

@@ -139,6 +139,7 @@ def test_merge_durable_claims_does_not_erase_consumption(intake):
 
 def test_legacy_root_approval_still_has_no_proposal_claim(intake):
     _, admission, consumer, issue, task_id = inputs()
+    admission = {k: v for k, v in admission.items() if k != "proposal_selection"}
     with intake.intake_lock():
         intake._consume_admission(consumer, issue, task_id, admission)
         intake._mark_admission_published(consumer, issue, task_id, admission)
@@ -230,3 +231,35 @@ def test_repeated_content_under_different_issue_fails_closed(intake):
         intake._consume_admission(
             consumer, issue, "github-herdr-issue-53-approval-5401",
             {**admission, "approval_id": 5401}, proposal_binding=new)
+
+
+def test_selected_approval_cannot_be_queued_implicitly(intake, monkeypatch):
+    binding, admission, _, _, _ = inputs()
+    consumer, issue = _queue_setup(intake, monkeypatch, admission)
+    before = intake.STATE.exists()
+    with intake.intake_lock(), pytest.raises(intake.AdmissionDenied,
+                                             match="root-proposal-selection-requires-binding"):
+        intake._queue_issue_locked(consumer, issue, [])
+    assert intake.STATE.exists() is before
+    assert list(intake.PENDING.glob("*.json")) == []
+
+
+def test_root_selection_mismatch_never_consumes_state(intake):
+    binding, admission, consumer, issue, task_id = inputs()
+    wrong = copy.deepcopy(admission)
+    wrong["proposal_selection"]["digest"] = "0" * 64
+    with intake.intake_lock(), pytest.raises(intake.AdmissionDenied):
+        intake._consume_admission(consumer, issue, task_id, wrong,
+                                  proposal_binding=binding)
+    assert not intake.STATE.exists()
+    assert not list(intake.PENDING.glob("*.json"))
+
+
+def test_legacy_root_approval_cannot_bind_selected_proposal(intake):
+    binding, admission, consumer, issue, task_id = inputs()
+    legacy = {key: value for key, value in admission.items()
+              if key != "proposal_selection"}
+    with intake.intake_lock(), pytest.raises(intake.AdmissionDenied):
+        intake._consume_admission(consumer, issue, task_id, legacy,
+                                  proposal_binding=binding)
+    assert not intake.STATE.exists()

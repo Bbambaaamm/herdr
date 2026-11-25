@@ -30,11 +30,13 @@ def _hex(value):
 
 def _admission(value, *, issue_number, issue_id, issue_digest):
     """Validate existing maintainer-comment-v1 verified admission receipt."""
-    if type(value) is not dict or set(value) != {
+    required = {
         "version", "approval_id", "content_sha256", "repository_id",
         "issue_id", "approver_user_id", "approver_login", "approved_at",
         "expires_at", "issue_updated_at",
-    }:
+    }
+    keys = set(value) if type(value) is dict else set()
+    if keys not in (required, required | {"proposal_selection"}):
         raise ProposalBindingDenied("admission_receipt_shape")
     if (type(value["version"]) is not int or value["version"] != 1
             or not _positive(value["approval_id"])
@@ -110,6 +112,16 @@ def prepare_admission_binding(
                issue_id=root_id, issue_digest=root_revision)
     if proposal_admission["repository_id"] != root_admission["repository_id"]:
         raise ProposalBindingDenied("repository_identity_mismatch")
+    if "proposal_selection" in proposal_admission:
+        raise ProposalBindingDenied("selection_must_be_root_only")
+    expected_selection = {
+        "issue_number": proposal_issue,
+        "issue_id": proposal_issue_id,
+        "digest": proposal.digest,
+        "revision": proposal_revision,
+    }
+    if root_admission.get("proposal_selection") != expected_selection:
+        raise ProposalBindingDenied("root_approval_selection_missing_or_mismatched")
     if not proposal_admission["approved_at"] < root_admission["approved_at"]:
         raise ProposalBindingDenied("root_approval_must_follow_proposal")
     if consumed_proposals is None:
