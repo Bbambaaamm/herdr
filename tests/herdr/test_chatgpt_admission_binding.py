@@ -129,3 +129,60 @@ def test_intake_prepare_binding_uses_existing_approval_helper(monkeypatch):
     proposal_issue["body"] += "\nInjected"
     with pytest.raises(m.AdmissionDenied):
         m.prepare_chatgpt_proposal_binding(repo, 300)
+
+
+def test_binding_proposal_changed_during_root_validation_denied(monkeypatch):
+    """Independent Codex P2: re-read proposal after all root checks."""
+    import importlib.machinery
+    import importlib.util
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[2] / "agent-stack/bin/agent-github-intake"
+    loader = importlib.machinery.SourceFileLoader("proposal_root_race_test", str(source))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    args = fixture()
+    rendered = args["proposal"].github_issue_proposal()
+    repo = "Bbambaaamm/herdr"
+    api = "https://api.github.com/repos/" + repo
+    def issue(number, ident, title, body):
+        return {"number": number, "id": ident, "state": "open", "title": title,
+                "body": body, "comments": 0, "repository_url": api,
+                "url": f"{api}/issues/{number}",
+                "html_url": f"https://github.com/{repo}/issues/{number}",
+                "created_at": "2026-11-25T10:00:00+00:00",
+                "updated_at": "2026-11-25T10:00:00+00:00"}
+    proposal_issue = issue(300, 3000, rendered["title"], rendered["body"])
+    root_issue = issue(53, 530, "Root", "Root")
+    repository = {"id": 911, "full_name": repo}
+    proposal_sha = mod.issue_revision(repo, repository, proposal_issue)
+    root_sha = mod.issue_revision(repo, repository, root_issue)
+    args["proposal_admission"]["content_sha256"] = proposal_sha
+    args["root_admission"]["content_sha256"] = root_sha
+    monkeypatch.setattr(mod, "load_consumers", lambda: [{
+        "consumer": "herdr", "repository": repo, "mode": "root_only", "root_issue": 53}])
+    monkeypatch.setattr(mod, "authenticated_user", lambda: (9, "reader"))
+    reads = {"proposal": 0}
+    def fetch(url):
+        if url == api:
+            return repository
+        if url == f"{api}/issues/300":
+            reads["proposal"] += 1
+            if reads["proposal"] >= 2:
+                return {**proposal_issue, "state": "closed"}
+            return proposal_issue
+        if url == f"{api}/issues/53":
+            return root_issue
+        raise AssertionError(url)
+    monkeypatch.setattr(mod, "fetch_json", fetch)
+    def approved(consumer, got):
+        if got["number"] == 300:
+            assert consumer["mode"] == "all_open"
+            return proposal_issue, args["proposal_admission"]
+        assert got["number"] == 53 and consumer["mode"] == "root_only"
+        return root_issue, args["root_admission"]
+    monkeypatch.setattr(mod, "approved_revision", approved)
+    with pytest.raises(mod.AdmissionDenied, match="github-issue-incomplete-or-ineligible"):
+        mod.prepare_chatgpt_proposal_binding(repo, 300)
+    assert reads["proposal"] == 2

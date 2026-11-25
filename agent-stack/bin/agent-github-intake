@@ -1180,6 +1180,21 @@ def prepare_chatgpt_proposal_binding(repo: str, number: int) -> dict:
     fresh_root, root_admission = approved_revision(root_consumer, root)
     if issue_revision(repo, repository, fresh_root) != root_revision:
         raise AdmissionDenied("root-revision-drift")
+    # Root approval verification can take several guarded GitHub calls. A
+    # proposal can be closed or edited in that window even after its own
+    # approved_revision() completed. Recheck its eligibility and exact current
+    # revision after the root receipt, before publishing any binding evidence.
+    last_proposal = fetch_json(f"{api}/issues/{number}")
+    if (issue_revision(repo, repository, last_proposal) != proposal_revision
+            or last_proposal.get("id") != fresh_proposal["id"]
+            or last_proposal.get("updated_at") != fresh_proposal["updated_at"]
+            or last_proposal.get("comments") != fresh_proposal["comments"]):
+        raise AdmissionDenied("proposal-changed-after-root-approval")
+    try:
+        if CommandProposal.from_github_issue(last_proposal).digest != proposal.digest:
+            raise AdmissionDenied("proposal-changed-after-root-approval")
+    except ProposalDenied as exc:
+        raise AdmissionDenied("proposal-changed-after-root-approval") from exc
     # Stage only: there is no production durable per-proposal consumed ledger.
     # A live queue binding MUST NOT use this receipt until the next contract
     # persists such dedup atomically with _consume_admission.
