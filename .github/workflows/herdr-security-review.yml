@@ -17,7 +17,6 @@ permissions:
   contents: read
   pull-requests: read
   issues: read
-  statuses: write
 
 concurrency:
   group: security-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number || github.run_id }}
@@ -25,7 +24,7 @@ concurrency:
 
 jobs:
   review:
-    name: Trusted security status publisher
+    name: Read-only advisory security evidence
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: github.repository == 'Bbambaaamm/herdr'

@@ -45,11 +45,19 @@ def snapshot(sha=HEAD):
         "checks": [
             {"id": 100, "name": "Herdr contract", "head_sha": sha,
              "status": "completed", "conclusion": "success",
+             "details_url": "https://github.com/Bbambaaamm/herdr/actions/runs/12345/job/99",
              "app": {"id": 15368}},
             {"id": 200, "name": "GitGuardian Security Checks",
              "head_sha": sha, "status": "completed", "conclusion": "success",
              "app": {"id": 46505}},
         ],
+        "ci_runs": {"12345": {
+            "id": 12345, "workflow_id": gate.CI_WORKFLOW_ID,
+            "path": gate.CI_WORKFLOW, "head_sha": sha,
+            "event": "pull_request", "status": "completed",
+            "conclusion": "success",
+            "repository": {"full_name": gate.REPOSITORY}
+        }},
         "protected_changed": False,
         "threads": {"nodes": [], "has_next_page": False},
         "reviews": [
@@ -80,6 +88,12 @@ def test_verified_exact_head_clean_independent_review_passes():
     (lambda s: s.update(protected_changed=True), "trusted-merge-gate-source-changed"),
     (lambda s: s["checks"][0].update(app={"id": 999}), "required-check-missing"),
     (lambda s: s["checks"][0].update(head_sha=OTHER), "required-check-missing"),
+    (lambda s: s["checks"][0].update(details_url="https://github.com/Bbambaaamm/herdr/actions/runs/999"), "ci-run-untrusted-origin"),
+    (lambda s: s["ci_runs"]["12345"].update(workflow_id=100), "ci-run-untrusted-origin"),
+    (lambda s: s["ci_runs"]["12345"].update(path=".github/workflows/untrusted.yml"), "ci-run-untrusted-origin"),
+    (lambda s: s["ci_runs"]["12345"].update(head_sha=OTHER), "ci-run-untrusted-origin"),
+    (lambda s: s["ci_runs"]["12345"].update(event="workflow_dispatch"), "ci-run-untrusted-origin"),
+    (lambda s: s["checks"][0].update(details_url="https://dashboard.gitguardian.com"), "ci-run-reference-invalid"),
     (lambda s: s["checks"][1].update(conclusion="failure"), "required-check-not-green"),
     (lambda s: s["checks"].append({
         "id": 201, "name": "GitGuardian Security Checks",
@@ -166,7 +180,7 @@ def test_workflow_never_executes_untrusted_checkout():
     assert "pull_request_review_comment:" not in workflow
     assert "persist-credentials: false" in workflow
     assert "ref: main" in workflow
-    assert "statuses: write" in workflow
+    assert "statuses: write" not in workflow
     assert "python3 scripts/herdr_security_review_check.py" in workflow
     assert "pull_request.head.sha" not in workflow
 
@@ -204,20 +218,53 @@ def test_api_rejects_untrusted_paths_without_network():
 
 
 
-def test_status_publisher_sets_pending_before_success():
-    class FakeAPI:
-        def __init__(self):
-            self.posts = []
-        def request(self, path, **kwargs):
-            self.posts.append((path, kwargs.get("payload")))
-            return {}
-    api = FakeAPI()
-    gate.publish(api, HEAD, state="pending", reason="Revalidating")
-    gate.publish(api, HEAD, state="success", reason="Confirmed")
-    assert [payload["state"] for path, payload in api.posts] == [
-        "pending", "success"
-    ]
-    assert all(path.endswith("/statuses/" + HEAD) for path, _ in api.posts)
-    assert all(payload["context"] == gate.CONTEXT for _, payload in api.posts)
-    with pytest.raises(gate.GateDenied, match="status-invalid"):
-        gate.publish(api, HEAD, state="neutral", reason="Cannot bypass")
+
+
+def test_advisory_workflow_has_no_status_write_credentials():
+    workflow = (SOURCE.parents[1] / ".github/workflows/herdr-security-review.yml").read_text()
+    assert "statuses: write" not in workflow
+    assert "statuses: read" not in workflow
+    assert "Trusted security status publisher" not in workflow
+    assert "Read-only advisory security evidence" in workflow
+    assert "pull_request_review:" not in workflow
+    assert "pull_request_review_comment:" not in workflow
+
+
+def test_untrusted_ci_workflow_cannot_supersede_legitimate_ci():
+    s = snapshot()
+    s["checks"].append({
+        "id": 20000, "name": "Herdr contract", "head_sha": HEAD,
+        "status": "completed", "conclusion": "success",
+        "details_url": "https://github.com/Bbambaaamm/herdr/actions/runs/99999",
+        "app": {"id": 15368},
+    })
+    s["ci_runs"]["99999"] = {
+        "id": 99999, "workflow_id": 99999,
+        "path": ".github/workflows/attacker.yml", "head_sha": HEAD,
+        "event": "pull_request", "status": "completed",
+        "conclusion": "success",
+        "repository": {"full_name": gate.REPOSITORY},
+    }
+    with pytest.raises(gate.GateDenied, match="ci-run-untrusted-origin"):
+        gate.check_snapshot(s, sha=HEAD)
+
+
+def test_fork_identity_fails_before_any_publishing():
+    s = snapshot()
+    s["pr"]["head"]["repo"]["full_name"] = "attacker/fork"
+    with pytest.raises(gate.GateDenied, match="pr-identity-changed"):
+        gate.check_snapshot(s, sha=HEAD)
+    assert not hasattr(gate, "publish")
+
+
+def test_review_changes_cannot_leave_stale_success_authorization():
+    s = snapshot()
+    assert gate.check_snapshot(s, sha=HEAD) == HEAD
+    s["reviews"].append({
+        "id": 1000, "state": "CHANGES_REQUESTED",
+        "submitted_at": "2026-11-25T12:20:00Z",
+        "user": {"login": "human", "type": "User"},
+    })
+    with pytest.raises(gate.GateDenied, match="changes-requested-outstanding"):
+        gate.check_snapshot(s, sha=HEAD)
+    assert not hasattr(gate, "publish")

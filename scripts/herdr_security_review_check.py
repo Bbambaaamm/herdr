@@ -18,6 +18,12 @@ from typing import Any
 
 REPOSITORY = "Bbambaaamm/herdr"
 CONTEXT = "Herdr security review"
+CI_WORKFLOW = ".github/workflows/ci.yml"
+CI_WORKFLOW_ID = 367993725
+CI_RUN_URL = re.compile(
+    r"https://github\.com/Bbambaaamm/herdr/actions/runs/([1-9][0-9]*)"
+    r"(?:/job/[1-9][0-9]*)?\Z"
+)
 CODEX = "chatgpt-codex-connector[bot]"
 APPS = {"Herdr contract": 15368, "GitGuardian Security Checks": 46505}
 SUMMARY_HEADER = "<!-- codex-pull-request-review-summary -->"
@@ -141,6 +147,25 @@ def check_snapshot(snapshot: dict, *, sha: str) -> str:
         require(latest.get("status") == "completed"
                 and latest.get("conclusion") == "success",
                 "required-check-not-green-" + name)
+        if name == "Herdr contract":
+            url = latest.get("details_url")
+            require(type(url) is str, "ci-run-reference-invalid")
+            match = CI_RUN_URL.fullmatch(url)
+            require(match is not None, "ci-run-reference-invalid")
+            runs = snapshot.get("ci_runs")
+            require(type(runs) is dict, "ci-run-evidence-missing")
+            run = runs.get(match.group(1))
+            require(type(run) is dict
+                    and type(run.get("id")) is int
+                    and str(run["id"]) == match.group(1)
+                    and run.get("workflow_id") == CI_WORKFLOW_ID
+                    and run.get("path") == CI_WORKFLOW
+                    and run.get("head_sha") == sha
+                    and run.get("event") in ("pull_request", "push")
+                    and run.get("repository", {}).get("full_name") == REPOSITORY
+                    and run.get("status") == "completed"
+                    and run.get("conclusion") == "success",
+                    "ci-run-untrusted-origin")
 
     changed = snapshot["protected_changed"]
     require(changed is False, "trusted-merge-gate-source-changed")
@@ -264,9 +289,21 @@ def build_snapshot(api: GithubAPI, number: int) -> tuple[dict, str]:
                 "protected-source-unavailable")
         if left["sha"] != right["sha"]:
             protected_changed = True
+    # The Actions app ID is shared by ALL GitHub Actions workflows, including
+    # untrusted PR additions. Only the specific trusted CI workflow/run counts.
+    ci_runs = {}
+    for row in checks["check_runs"]:
+        if type(row) is dict and row.get("name") == "Herdr contract":
+            url = row.get("details_url")
+            match = CI_RUN_URL.fullmatch(url) if type(url) is str else None
+            if match is not None:
+                run_id = match.group(1)
+                if run_id not in ci_runs:
+                    ci_runs[run_id] = api.request(f"{repo}/actions/runs/{run_id}")
     data = {
         "pr": pr,
         "checks": checks["check_runs"],
+        "ci_runs": ci_runs,
         "protected_changed": protected_changed,
         "threads": api.graphql_threads(number),
         "reviews": api.request(f"{repo}/pulls/{number}/reviews?per_page=100"),
@@ -276,17 +313,9 @@ def build_snapshot(api: GithubAPI, number: int) -> tuple[dict, str]:
     return data, sha
 
 
-def publish(api: GithubAPI, sha: str, *, state: str, reason: str) -> None:
-    require(type(sha) is str and SHA.fullmatch(sha) is not None, "head-sha-invalid")
-    require(state in {"pending", "success", "failure"}, "status-invalid")
-    api.request(f"/repos/{REPOSITORY}/statuses/{sha}", payload={
-        "state": state,
-        "context": CONTEXT,
-        "description": reason[:140],
-    })
-
 
 def main() -> int:
+    """Read-only advisory check. NEVER issue a GitHub merge authorization."""
     require(os.getenv("GITHUB_REPOSITORY") == REPOSITORY, "repository-invalid")
     require(os.getenv("GITHUB_REF") == "refs/heads/main"
             and os.getenv("GITHUB_EVENT_NAME") in {
@@ -297,26 +326,17 @@ def main() -> int:
             "event-file-invalid")
     number = select_number(parse_json(event_path.read_bytes(), 131072))
     api = GithubAPI(os.environ.get("GITHUB_TOKEN", ""))
-    # Publish PENDING before collecting mutable external evidence. If GitHub
-    # times out or the collector crashes, an old successful context can no
-    # longer be mistaken for this new verification attempt.
-    current = api.request(f"/repos/{REPOSITORY}/pulls/{number}")
-    require(type(current) is dict and type(current.get("head")) is dict,
-            "pr-response-invalid")
-    sha = current["head"].get("sha")
-    require(type(sha) is str and SHA.fullmatch(sha) is not None, "head-sha-invalid")
-    publish(api, sha, state="pending", reason="Fresh independent review evidence is being checked")
     try:
-        snapshot, observed_sha = build_snapshot(api, number)
-        require(observed_sha == sha, "pr-head-changed-during-status-check")
+        snapshot, sha = build_snapshot(api, number)
         check_snapshot(snapshot, sha=sha)
     except (GateDenied, KeyError, TypeError, ValueError, AttributeError) as exc:
         reason = str(exc) if isinstance(exc, GateDenied) else "invalid-github-evidence"
-        publish(api, sha, state="failure", reason=reason)
         print(json.dumps({"pass": False, "pr": number, "reason": reason}))
         return 1
-    publish(api, sha, state="success", reason="Exact-head CI and independent Codex security review passed")
-    print(json.dumps({"pass": True, "pr": number, "head_sha": sha}))
+    print(json.dumps({
+        "pass": True, "advisory_only": True,
+        "authorization_granted": False, "pr": number, "head_sha": sha,
+    }))
     return 0
 
 
