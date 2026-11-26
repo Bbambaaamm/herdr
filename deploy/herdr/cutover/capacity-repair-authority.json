@@ -1,0 +1,62 @@
+{
+  "files": {
+    "/etc/systemd/system/agent-stack-watchdog.service.d/126-capacity-repair.conf": {
+      "uid": 0,
+      "gid": 0,
+      "mode": 420,
+      "sha256": "f5a0e3f8d20a7382a0abaef350f668a9e58c66dd9f622f4888968d194883a530"
+    },
+    "/opt/herdr/operations/capacity-repair-20261123/agent-stack-watchdog": {
+      "uid": 0,
+      "gid": 0,
+      "mode": 365,
+      "sha256": "81ea7d476914c9e2e57b92565fdbe04f200b20db4135d1e0cc8b984e48f6adf9"
+    },
+    "/home/agentops/.local/bin/hermes-maintenance": {
+      "uid": 1001,
+      "gid": 1001,
+      "mode": 511,
+      "link": "/home/agentops/.local/opt/hermes-maintenance-70b9965/agent-stack/bin/hermes-maintenance"
+    },
+    "/home/agentops/.local/bin/agent-github-intake": {
+      "uid": 0,
+      "gid": 0,
+      "mode": 511,
+      "link": "/opt/herdr/operations/terminal-unknown-52b46f478cb0/agent-stack/bin/agent-github-intake"
+    },
+    "/home/agentops/.local/bin/agent-swarm-export": {
+      "uid": 0,
+      "gid": 0,
+      "mode": 511,
+      "link": "/opt/herdr/operations/terminal-unknown-52b46f478cb0/agent-stack/bin/agent-swarm-export"
+    },
+    "/home/agentops/.local/bin/agent-task-dispatcher": {
+      "uid": 0,
+      "gid": 0,
+      "mode": 511,
+      "link": "/opt/herdr/operations/terminal-unknown-52b46f478cb0/agent-stack/bin/agent-task-dispatcher"
+    },
+    "/home/agentops/.local/bin/agent-task-export": {
+      "uid": 0,
+      "gid": 0,
+      "mode": 511,
+      "link": "/opt/herdr/operations/terminal-unknown-52b46f478cb0/agent-stack/bin/agent-task-export"
+    },
+    "/home/agentops/.local/bin/agent-task-worker": {
+      "uid": 0,
+      "gid": 0,
+      "mode": 511,
+      "link": "/opt/herdr/operations/terminal-unknown-52b46f478cb0/agent-stack/bin/agent-task-worker"
+    }
+  },
+  "trees": {
+    "/home/agentops/.local/opt/hermes-maintenance-70b9965": {
+      "entries": 195,
+      "sha256": "a85a47b08b896c9ea4fdaf20cfed7b35a3ce7e051c347edfaceb3555461d5814"
+    },
+    "/opt/herdr/operations/terminal-unknown-52b46f478cb0": {
+      "entries": 456,
+      "sha256": "765294d39907d661747c3cbca236ec4cae2aca5a8190c84e5ecd465831158675"
+    }
+  }
+}
