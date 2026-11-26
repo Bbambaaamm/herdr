@@ -20,6 +20,7 @@ from .context import (ContextBundle, ContextCompiler, ContextPlan, SecretRedacto
                       hash_value, token)
 from .security import InvocationGuard, InvocationIdentity, PolicyDenied, ProviderRequest, SecurityGrant
 from .reasoning_state import ReasoningProjection
+from .usage_telemetry import usage_observation_reference
 
 VERSION = "herdr.prompt.v1"
 MAX_PROMPT = 262144
@@ -712,8 +713,13 @@ class PromptRuntime:
         require(context.stable_prefix["project_map"]["base_sha"] == plan.base_revision,
                 "prompt_context_base_revision")
 
-    def compile(self, plan, *, context, grant, binding, counter, loader, reasoning_projection=None):
+    def compile(self, plan, *, context, grant, binding, counter, loader, reasoning_projection=None,
+                usage_observation=None):
         self._binding(plan, context, grant)
+        try:
+            usage_reference = usage_observation_reference(usage_observation)
+        except TypeError as exc:
+            raise PromptBlocked("prompt_usage_observation_type") from exc
         reasoning = None
         if plan.reasoning_state_binding is not None:
             require(type(plan.reasoning_state_binding) is ReasoningStateBinding, "reasoning_binding_typed")
@@ -851,7 +857,8 @@ class PromptRuntime:
             return render()
         compiled = self.context_compiler.compile(context, executor_id=binding.executor_id,
             counter=counter, loader=loader, renderer="messages", envelope=envelope,
-            input_token_limit=token_limit,allowed_data_classes=tuple(sorted(provider_classes,key=str)))
+            input_token_limit=token_limit,allowed_data_classes=tuple(sorted(provider_classes,key=str)),
+            usage_observation=usage_observation)
         require(isinstance(compiled, ContextBundle), "compiled_context_required")
         wire = envelope(compiled.payload)
         require(fits(wire), "mandatory_prompt_exceeds_budget")
@@ -884,7 +891,8 @@ class PromptRuntime:
                            "input_bytes": len(wire), "tokenizer_input_tokens": counter.measure(wire),
                            "stable_prefix_sha256": digest(stable), "demonstrations_used": len(dynamic["demonstrations"]),
                            "selected": selected, "rejected": rejected, "cache_usage": "UNKNOWN",
-                           "provider_usage": "UNKNOWN", "provider_route_sha256":digest(route.to_json()),
+                           "provider_usage": usage_reference if usage_reference is not None else "UNKNOWN",
+                           "provider_route_sha256":digest(route.to_json()),
                            "provider_region":region, "schema_mode": "native" if native else "validated_fallback",
                            **reasoning_audit})
         return PromptBundle(plan.hash, binding.hash, compiled.hash, canonical(stable), canonical(dynamic),

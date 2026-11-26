@@ -6,19 +6,48 @@ second ledger or scheduler.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 from enum import StrEnum
 import re
-from typing import Any
+from typing import Any, Mapping
 
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _TOKEN = re.compile(r"^[A-Za-z0-9._:/@+-]{1,256}$")
+_EPOCH = re.compile(r"^[0-9]+(\.[0-9]+)?$")
+
+
+def _iso(epoch: float) -> str:
+    """Render a POSIX epoch as a UTC ISO-8601 timestamp with second precision."""
+    from datetime import UTC, datetime
+
+    return datetime.fromtimestamp(epoch, tz=UTC).isoformat()
+
+
+def _epoch(value: str) -> float:
+    """Normalize an ISO-8601 or epoch-seconds reference time to a POSIX float."""
+    if not isinstance(value, str):
+        raise RoutingIntegrationError("reference time must be text")
+    text = value.strip()
+    if _EPOCH.fullmatch(text):
+        return float(text)
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise RoutingIntegrationError("invalid reference timestamp: " + value[:64]) from exc
+    if parsed.tzinfo is None:
+        raise RoutingIntegrationError("reference timestamp must carry a timezone")
+    return parsed.timestamp()
 
 from .routing import (
     FailureKind,
     FailureScope,
+    RetryGuidance,
     ScopeAttestation,
     classify_failure,
+    plan_retry,
 )
 from .scheduler_routing import ManagedExecutionHandoff, ManagedRoute, RoutingIntegrationError
 from .security import InvocationIdentity
@@ -31,6 +60,29 @@ class RecoveryAction(StrEnum):
     TERMINATE = "terminate"
 
 
+def normalize_transition_event(event: Mapping[str, Any]) -> dict[str, Any]:
+    """Canonicalize a durable fallback transition for identity comparison.
+
+    Retry timing (``retry`` and the handoff's ``not_before``) is *derived* from
+    the failure observation and the retry policy; it is not part of the routing
+    decision.  Comparing it would make a policy change look like a different
+    decision and would break replay of pre-timing durable events, so it is
+    dropped before comparison.  Everything that defines the decision — action,
+    identity, failure, scope, counts, digests and the selected route — is kept,
+    so a genuinely different transition still conflicts.
+    """
+    canonical = dict(event)
+    canonical.pop("retry", None)
+    canonical.pop("not_before", None)
+    handoff = canonical.get("handoff")
+    if isinstance(handoff, dict):
+        repaired = dict(handoff)
+        repaired.pop("not_before", None)
+        repaired.pop("waits_for_provider", None)
+        canonical["handoff"] = repaired
+    return canonical
+
+
 @dataclass(frozen=True)
 class ProviderFailureObservation:
     executor_id: str
@@ -40,6 +92,8 @@ class ProviderFailureObservation:
     model_known: bool | None = None
     scope: FailureScope | None = None
     scope_attestation: ScopeAttestation | None = None
+    retry_after: str | None = None
+    reset_at: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.executor_id, str) or not _TOKEN.fullmatch(self.executor_id):
@@ -52,6 +106,10 @@ class ProviderFailureObservation:
             raise RoutingIntegrationError("invalid provider status code")
         if not isinstance(self.message, str):
             raise RoutingIntegrationError("failure message must be text")
+        for name in ("retry_after", "reset_at"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, str):
+                raise RoutingIntegrationError(f"{name} must be text when present")
         object.__setattr__(
             self,
             "scope",
@@ -80,6 +138,7 @@ class FallbackTransition:
     source_decision_sha256: str
     next_decision_sha256: str | None = None
     handoff: ManagedExecutionHandoff | None = None
+    retry: RetryGuidance | None = None
 
     def __post_init__(self) -> None:
         if self.version != 1:
@@ -103,6 +162,10 @@ class FallbackTransition:
             raise RoutingIntegrationError("fallback transition requires a handoff")
         if self.action is not RecoveryAction.FALLBACK and self.handoff is not None:
             raise RoutingIntegrationError("non-fallback transition cannot carry a handoff")
+        if self.retry is not None and not isinstance(self.retry, RetryGuidance):
+            raise RoutingIntegrationError("typed retry guidance required")
+        if self.action is RecoveryAction.FALLBACK and self.retry is None:
+            raise RoutingIntegrationError("fallback transition requires retry guidance")
 
     def audit_event(self) -> dict[str, Any]:
         handoff = None
@@ -115,7 +178,8 @@ class FallbackTransition:
                     "policy_profile", "policy_version", "decision_sha256",
                     "selected_executor", "selected_provider", "selected_model",
                     "registry_hash", "requirement_hash", "parent_scope_hash",
-                    "policy_hash", "budget_allocation_id",
+                    "policy_hash", "budget_allocation_id", "not_before",
+                    "waits_for_provider",
                 )
             }
         return {
@@ -134,7 +198,9 @@ class FallbackTransition:
             "reconciliation_required": self.reconciliation_required,
             "source_decision_sha256": self.source_decision_sha256,
             "next_decision_sha256": self.next_decision_sha256,
+            "not_before": handoff["not_before"] if handoff is not None else None,
             "handoff": handoff,
+            "retry": self.retry.to_json() if self.retry is not None else None,
         }
 
     @classmethod
@@ -147,8 +213,21 @@ class FallbackTransition:
             if not isinstance(handoff_payload, dict):
                 raise RoutingIntegrationError("fallback replay handoff malformed")
             handoff = ManagedExecutionHandoff(**handoff_payload)
+        retry = RetryGuidance.from_json(event["retry"]) if event.get("retry") else None
+        action = RecoveryAction(event["action"])
+        if action is RecoveryAction.FALLBACK and (
+            retry is None
+            or retry.retryable and (handoff is None or handoff.not_before is None)
+        ):
+            # A durable record written before retry timing existed, or one whose
+            # handoff lost its boundary, cannot prove the wait elapsed.  Replay
+            # it as "re-decide required" and refuse dispatch outright instead of
+            # handing the caller an immediately dispatchable fallback.
+            retry = RetryGuidance(False, None, "unknown")
+            if handoff is not None:
+                handoff = replace(handoff, waits_for_provider=True)
         return cls(
-            version=event["version"], action=event["action"], task_id=event["task_id"],
+            version=event["version"], action=action, task_id=event["task_id"],
             run_token=event["run_token"], attempt=event["attempt"],
             fencing_token=event["fencing_token"], failed_executor=event["failed_executor"],
             failure=event["failure"], failure_scope=event["failure_scope"],
@@ -156,6 +235,7 @@ class FallbackTransition:
             reconciliation_required=event["reconciliation_required"],
             source_decision_sha256=event["source_decision_sha256"],
             next_decision_sha256=event.get("next_decision_sha256"), handoff=handoff,
+            retry=retry,
         )
 
 
@@ -249,6 +329,7 @@ def decide_managed_fallback(
     expected_requirement_hash: str,
     fallback_count: int,
     max_fallbacks: int,
+    deadline: str | None = None,
 ) -> FallbackTransition:
     """Classify one offline provider observation and choose one bounded action.
 
@@ -280,6 +361,17 @@ def decide_managed_fallback(
         policy_version=policy_version,
     )
     source_digest = route.decision_sha256
+    now = _epoch(at)
+    task_deadline = _epoch(deadline) if deadline is not None else None
+    guidance = plan_retry(
+        failure=failure,
+        retry_after=observation.retry_after,
+        reset_at=observation.reset_at,
+        at=now,
+        attempt=route.routing_input.attempt + 1,
+        deadline=task_deadline,
+        seed=task_id + ":" + observation.executor_id,
+    )
     if observation.delivery_uncertain:
         transition = FallbackTransition(
             1, RecoveryAction.RECONCILE, task_id, identity.run_token, route.routing_input.attempt,
@@ -309,6 +401,15 @@ def decide_managed_fallback(
             identity.fencing_token, observation.executor_id, failure,
             FailureScope.CANDIDATE_LOCAL, fallback_count, max_fallbacks, False, source_digest,
         )
+    elif not guidance.retryable:
+        # Provider guidance is explicit but the legal wait no longer fits the
+        # task deadline; fail closed instead of retrying unboundedly.
+        transition = FallbackTransition(
+            1, RecoveryAction.TERMINATE, task_id, identity.run_token, route.routing_input.attempt,
+            identity.fencing_token, observation.executor_id, failure,
+            FailureScope.CANDIDATE_LOCAL, fallback_count, max_fallbacks, False, source_digest,
+            None, None, guidance,
+        )
     else:
         next_route = scheduler.select_managed_route(
             task_id,
@@ -328,6 +429,11 @@ def decide_managed_fallback(
             scope_attestations={observation.executor_id: observation.scope_attestation},
             attempt=route.routing_input.attempt + 1,
         )
+        not_before = (
+            _iso(now + guidance.wait_seconds)
+            if guidance.retryable and guidance.wait_seconds is not None
+            else None
+        )
         handoff = scheduler.prepare_managed_execution_handoff(
             next_route,
             identity=identity,
@@ -335,13 +441,15 @@ def decide_managed_fallback(
             requirement=requirement,
             policy=policy,
             budget_gate=budget_gate,
+            not_before=not_before,
+            waits_for_provider=True,
         )
         transition = FallbackTransition(
             1, RecoveryAction.FALLBACK, task_id, identity.run_token,
             next_route.routing_input.attempt, identity.fencing_token,
             observation.executor_id, failure, FailureScope.CANDIDATE_LOCAL,
             fallback_count + 1, max_fallbacks, False, source_digest,
-            next_route.decision_sha256, handoff,
+            next_route.decision_sha256, handoff, guidance,
         )
     event = transition.audit_event()
     try:
@@ -351,11 +459,14 @@ def decide_managed_fallback(
                 "event", "task_id", "run_token", "attempt",
                 "failed_executor", "source_decision_sha256",
             ),
+            normalize=normalize_transition_event,
         )
     except Exception as exc:
         raise RoutingIntegrationError("fallback replay conflict") from exc
     if authoritative_event != event:
         # A concurrent/restarted caller receives only the durable authoritative
-        # result; it cannot publish a newly computed conflicting transition.
+        # result; it cannot publish a newly computed transition.  Derived timing
+        # may differ without being a conflict (handled by the normalizer), but
+        # the durable record still governs.
         return FallbackTransition.from_audit_event(authoritative_event)
     return transition

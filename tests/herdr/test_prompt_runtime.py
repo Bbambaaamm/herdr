@@ -315,9 +315,11 @@ def setup(tmp_path, *, executor="a-runtime", instructions=(), demonstrations=(),
     return runtime, plan, context, grant, binding
 
 
-def compile(data, loader=lambda _: b"unused", *, reasoning_projection=None):
+def compile(data, loader=lambda _: b"unused", *, reasoning_projection=None, usage_observation=None):
     runtime, plan, context, grant, binding = data
     extra = {} if reasoning_projection is None else {"reasoning_projection": reasoning_projection}
+    if usage_observation is not None:
+        extra["usage_observation"] = usage_observation
     return runtime.compile(plan, context=context, grant=grant, binding=binding,
                            counter=counter(binding.executor_id), loader=loader, **extra)
 
@@ -542,6 +544,30 @@ def test_renderer_switch_and_immediate_task_do_not_change_static_prefix(tmp_path
     assert first.stable_prefix == second.stable_prefix
     assert first.plan_sha256 != second.plan_sha256
     assert first.telemetry()["provider_usage"] == second.telemetry()["provider_usage"] == "UNKNOWN"
+
+
+def test_prompt_usage_placeholder_becomes_bounded_observation_reference(tmp_path):
+    from herdr.provider_usage import PricingObservation, observe_usage
+    from herdr.usage_telemetry import usage_observation_reference
+    data = setup(tmp_path)
+    observed = observe_usage(
+        provider="nous", model="meituan/longcat-2.0:free", api_mode="chat_completions",
+        request_id="req-usage-ref",
+        pricing=PricingObservation(pricing_version="pinned-1",
+                                   input_microusd_per_million=1,
+                                   output_microusd_per_million=1),
+        usage={"prompt_tokens": 10, "completion_tokens": 5,
+               "prompt_tokens_details": {"cached_tokens": 2}, "cache_write_tokens": 0},
+    )
+    reference = usage_observation_reference(observed)
+    assert reference is not None
+    bundle = compile(data, usage_observation=observed)
+    assert bundle.telemetry()["provider_usage"] == reference == observed.observation_id
+    assert len(reference) == 64
+    assert json.loads(bundle.context_trace)["provider_usage"] == reference
+    assert compile(data).telemetry()["provider_usage"] == "UNKNOWN"
+    with pytest.raises(PromptBlocked, match="prompt_usage_observation_type"):
+        compile(data, usage_observation="free-text")
 
 
 def test_secret_reference_id_cannot_enter_persisted_prompt_plan(tmp_path):
