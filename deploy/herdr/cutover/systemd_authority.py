@@ -84,7 +84,7 @@ def inventory(root):
     for path in root.rglob("*"):
         need(len(paths) < 1024, "runtime_inventory_limit")
         paths.append(path)
-    directories = {p: stamp(p.lstat()) for p in paths if p.is_dir() and not p.is_symlink()}
+    identities = {p: stamp(p.lstat()) for p in paths}
     rows = {}
     for path in paths:
         row = facts(path)
@@ -96,7 +96,7 @@ def inventory(root):
         need(len(checked) < 1024, "runtime_inventory_limit")
         checked.add(path)
     need(set(paths) == checked
-         and all(stamp(p.lstat()) == value for p, value in directories.items()),
+         and all(stamp(p.lstat()) == value for p, value in identities.items()),
          "runtime_inventory_changed")
     safe_ancestors(root)
     return {"entries": len(rows), "sha256": hashlib.sha256(canonical_json(rows)).hexdigest()}
@@ -143,6 +143,7 @@ class SystemdAuthority:
 
     def approved_dependencies(self):
         descriptor = json.loads((self.api["ROOT"] / "deploy/herdr/cutover/capacity-repair-authority.json").read_bytes())
+        identities = {name: stamp(Path(name).lstat()) for name in descriptor["files"]}
         for name, expected in descriptor["files"].items():
             path = Path(name)
             safe_ancestors(path)
@@ -151,13 +152,18 @@ class SystemdAuthority:
                 need(str(path.resolve(strict=True)) == expected["link"], "capacity_symlink_drift")
         for name, expected in descriptor["trees"].items():
             need(inventory(Path(name)) == expected, "capacity_runtime_tree_drift:" + name)
+        need(all(stamp(Path(name).lstat()) == value for name, value in identities.items()),
+             "capacity_dependency_changed")
         return descriptor
 
     def external_dependencies(self):
         descriptor = json.loads((self.api["ROOT"] / "deploy/herdr/cutover/external-runtime-authority.json").read_bytes())
+        identities = {name: stamp(Path(name).lstat()) for name in descriptor}
         for name, expected in descriptor.items():
             safe_ancestors(Path(name))
             need(facts(Path(name)) == expected, "external_runtime_drift:" + name)
+        need(all(stamp(Path(name).lstat()) == value for name, value in identities.items()),
+             "external_runtime_changed")
         return descriptor
 
     def capture(self, *, allow_capacity=True, allow_fence=False):

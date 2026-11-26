@@ -170,3 +170,23 @@ def test_W06_inventory_detects_added_import_during_hash(tmp_path, monkeypatch):
     monkeypatch.setattr(s, "facts", race)
     with pytest.raises(ReleaseError, match="runtime_inventory_changed"):
         s.inventory(root)
+
+
+def test_W06_inventory_detects_rewrite_of_previously_hashed_file(tmp_path, monkeypatch):
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "first.py").write_text("approved")
+    (root / "second.py").write_text("approved")
+    monkeypatch.setattr(s, "safe_ancestors", lambda _: None)
+    real = s.facts
+    hashed = []
+    def race(path):
+        row = real(path)
+        if path.is_file():
+            if hashed:
+                hashed[0].write_text("tampered")
+            hashed.append(path)
+        return row
+    monkeypatch.setattr(s, "facts", race)
+    with pytest.raises(ReleaseError, match="runtime_inventory_changed"):
+        s.inventory(root)
