@@ -67,8 +67,8 @@ This is offline evidence, not live deployment acceptance.
 
 Before controller edits: same degraded-upgrade/invalid-dependency expectations
 produced **7 failed, 10 deselected, exit 1**, with no setup errors in that retained
-red run. Final new installer suite: **25 passed, exit 0**. Relevant release,
-dashboard, agent-stack and security suite: **1369 passed, 1 skipped, exit 0**.
+red run. Final new installer suite: **30 passed, exit 0**. Relevant release,
+dashboard, agent-stack and security suite: **1374 passed, 1 skipped, exit 0**.
 Repository contract and three skill-package lints passed on Linux. Windows lacks
 fcntl; its lint import failed, so Linux results are authoritative here.
 
@@ -109,11 +109,30 @@ Read CI and independent reviewer evidence at final exact HEAD. An earlier full
 suite started on intermediate source is not acceptance evidence. Self-review is
 not independent approval. Failed web is normalized to inactive on degraded
 rollback; original failure is not deliberately recreated. Timers may subsequently
-refresh restored telemetry. Expired saved data cannot be called healthy: rollback
-readiness fails closed. SIGKILL/power loss requires operator reconciliation under
+refresh restored telemetry. Healthy rollback verifies exact restoration then regenerates previous-release
+telemetry before freshness checks. Failed regeneration still fails closed. SIGKILL/power loss requires operator reconciliation under
 existing deployment/privilege gates; never delete the journal merely to pass.
 
 Staging was only read: no merge, release/tag, deployment, symlink/marker write,
 operational service start/stop/restart, host-policy or Hermes change. Stop before
 merge/deployment; step 3/6 is not authorized. Existing host grants and external
 runtime availability remain separate deployment prerequisites.
+
+
+## Independent review remediation
+
+Independent GitHub Codex review of 20e8689 reported two P1 and two P2 findings.
+All four are addressed with behavioral regressions: snapshot stability ignores
+atime while retaining identity/ownership/size/mtime/ctime checks; readiness uses
+the immutable target package in an isolated namespace and its own web decoder;
+a pinned actual RC12 contract fixture exercises its three-key snapshot; healthy
+rollback regenerates telemetry after exact restoration; legacy bootstrap does
+not require a versioned release marker. Target imports reject existing bytecode,
+verify immutable source ownership, and do not write bytecode or change sys.path.
+
+The first exact-head CI run 45840440470 had 1 failed, 6622 passed, 115 skipped,
+exit 1: the review's atime bug reproduced on the hosted runner. This is repaired;
+new exact-head CI and re-review must be checked. The earlier intermediate
+server-wide run had 7 failures: three superseded release mocks/source checks and
+four unrelated physical SDK/profile environment failures. It is not a final
+acceptance result and no Hermes environment/configuration was changed to mask it.

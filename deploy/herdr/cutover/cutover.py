@@ -5,6 +5,7 @@ from __future__ import annotations
 from argparse import ArgumentParser
 from contextlib import contextmanager
 from functools import wraps
+import importlib
 import hashlib
 import base64
 import json
@@ -19,6 +20,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import types
 
 try:
     import fcntl
@@ -538,9 +540,10 @@ def snapshot_file(path: Path) -> tuple[bytes, int, int, int] | None:
                 break
             data.extend(chunk)
         after = os.fstat(fd)
-        need(len(data) == info.st_size and after == info
-             and after.st_mtime_ns == info.st_mtime_ns
-             and after.st_ctime_ns == info.st_ctime_ns,
+        stable_fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid",
+                         "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+        need(len(data) == info.st_size and all(getattr(after, field) == getattr(info, field)
+                                              for field in stable_fields),
              f"snapshot_changed:{path}")
         return bytes(data), stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid
 
@@ -1257,16 +1260,55 @@ def run_rollback_steps(steps):
     return errors
 
 
+@contextmanager
+def readiness_modules(target: Path):
+    """Load only the selected immutable runtime's closed telemetry contracts.
+
+    Never reuse controller modules for a historical release. A private package
+    namespace keeps target relative imports separate without altering sys.path.
+    """
+    package = target / "agent_platform_dashboard"
+    need(root_owned_readonly(package), "unsafe_readiness_package")
+    need(not any(package.rglob("*.pyc")), "readiness_bytecode_not_allowed")
+    for path in package.rglob("*.py"):
+        need(root_owned_readonly(path) and not path.is_symlink(), "unsafe_readiness_module")
+    alias = f"_herdr_readiness_{os.getpid()}_{time.time_ns()}"
+    namespace = types.ModuleType(alias)
+    namespace.__path__ = [str(package)]
+    sys.modules[alias] = namespace
+    previous_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        yield tuple(importlib.import_module(f"{alias}.{name}") for name in
+                    ("production_contract", "production_sources", "production_io", "production_web"))
+    finally:
+        sys.dont_write_bytecode = previous_bytecode
+        for name in list(sys.modules):
+            if name == alias or name.startswith(alias + "."):
+                del sys.modules[name]
+
+
 def assert_candidate_ready(target: Path, document: dict[str, object] | None) -> None:
+    if target == LEGACY:
+        # The original bootstrap is authenticated by the existing pinned
+        # legacy binary/commit/unit gates, not RELEASE.json or a public marker.
+        need(document is None, "legacy_readiness_document_not_allowed")
+        expected = None
+    else:
+        expected = document if document is not None else read_trusted_public_state(PUBLIC_STATE)
+        need(verify_tree(target)["commit"] == expected["commit"], "readiness_release_mismatch")
+    with readiness_modules(target) as modules:
+        validate_readiness(expected, modules)
+
+
+def validate_readiness(expected, modules) -> None:
     """Validate actual exporter output using the same closed contract as web.
 
     A successful oneshot/export alone is insufficient: export intentionally
     publishes unavailable sources when the bridge fails.
     """
-    from agent_platform_dashboard import production_contract as c
-    from agent_platform_dashboard import production_sources as sources
-    from agent_platform_dashboard.production_io import read, regular
-    from agent_platform_dashboard.production_web import load
+    c, sources, io, web = modules
+    read, regular = io.read, io.regular
 
     need(pwd is not None and grp is not None, "linux_accounts_required")
     uid = pwd.getpwnam("agentops").pw_uid
@@ -1282,23 +1324,23 @@ def assert_candidate_ready(target: Path, document: dict[str, object] | None) -> 
               for profile in c.PROFILES}
     snapshot = c.decode(read(str(SNAPSHOT), c.MAX_BYTES, owner=uid))
     need(0 <= now - snapshot["generated_at"] <= 90, "snapshot_stale")
-    expected = document if document is not None else read_trusted_public_state(PUBLIC_STATE)
-    need(verify_tree(target)["commit"] == expected["commit"], "readiness_release_mismatch")
     for source in snapshot["sources"]:
         if source["kind"] not in {"router", "herdr", "release"}:
             continue
+        if source["kind"] == "release" and expected is None:
+            continue  # The pinned legacy bootstrap predates the release marker.
         need(source["status"] == "available"
              and 0 <= now - source["observed_at"] <= 90,
              f"snapshot_source_unready:{source['profile']}:{source['kind']}")
         if source["kind"] == "herdr":
             need(bool(source["rows"]) and source["rows"] == bridge[source["profile"]],
                  "snapshot_bridge_mismatch")
-        if source["kind"] == "release":
+        if source["kind"] == "release" and expected is not None:
             need(source["rows"] == [{key: expected[key] for key in
                  ("tag", "commit", "config_sha256", "deployed_at")}],
                  "snapshot_release_mismatch")
     # Also validate root-owned web config, credentials, profiles and freshness.
-    application = load(str(WEB_CONFIG))
+    application = web.load(str(WEB_CONFIG))
     need(application.snapshot_path == str(SNAPSHOT), "unexpected_web_snapshot_path")
 
 
@@ -1350,6 +1392,14 @@ def rollback_previous(previous, report, snapshots, units, maintenance):
             need(unit_state("agent-platform-web.service") in {"inactive", "failed"},
                  "rollback_web_not_quiescent")
             if not degraded:
+                # Exact restoration was verified above. Regenerate with the
+                # previous runtime before freshness checks: captured data may
+                # legitimately be older than 90 seconds after a long attempt.
+                run("/usr/bin/systemctl", "reset-failed", "agent-platform-herdr.service",
+                    "agent-platform-export.service")
+                run("/usr/bin/systemctl", "start", "agent-platform-export.service")
+                need(run("/usr/bin/systemctl", "show", "agent-platform-herdr.service",
+                         "--property=Result", "--value") == "success", "rollback_bridge_service_failed")
                 assert_candidate_ready(previous, None)
                 run("/usr/bin/systemctl", "reset-failed", "agent-platform-web.service")
                 run("/usr/bin/systemctl", "start", "agent-platform-web.service")

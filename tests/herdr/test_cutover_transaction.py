@@ -6,6 +6,7 @@ from pathlib import Path
 import signal
 import socket
 from types import SimpleNamespace
+from contextlib import nullcontext
 
 import pytest
 
@@ -235,6 +236,7 @@ def readiness(tmp_path, monkeypatch):
     document = dict(tag="v0.3.0-router-v5-p1d-rc7", commit="b" * 40, config_sha256="c" * 64, deployed_at=now)
     monkeypatch.setattr(c, "verify_tree", lambda _: {"commit": document["commit"]})
     monkeypatch.setattr(web, "load", lambda _: SimpleNamespace(snapshot_path=str(snapshot)))
+    monkeypatch.setattr(c, "readiness_modules", lambda _: nullcontext((contract, sources, io, web)), raising=False)
     agents = [dict(agent=p + "-hermes", status="idle") for p in contract.PROFILES]
     bridge.write_text(json.dumps(dict(version=1, observed_at=now, profiles=list(contract.PROFILES), agents=agents)))
     bridge.chmod(0o640)
@@ -392,3 +394,71 @@ os.kill(os.getpid(),signal.SIGKILL)
     assert result.returncode == -signal.SIGKILL
     assert json.loads(journal.read_text())["previous"] == "/verified/rc6"
     assert journal.stat().st_mode & 0o777 == 0o600
+
+
+def test_snapshot_read_ignores_access_time_updates(tmp_path):
+    path = tmp_path / "unchanged"
+    path.write_bytes(b"unchanged")
+    info = path.stat()
+    os.utime(path, ns=(0, info.st_mtime_ns))
+    assert current.snapshot_file(path)[0] == b"unchanged"
+
+
+def test_healthy_rollback_refreshes_after_exact_restoration(host, monkeypatch):
+    host.failure["candidate"] = True
+    checked = []
+    def ready(target, document):
+        if target == host.previous:
+            # Restored saved bytes may be stale after a long attempt. The old
+            # exporter must have regenerated them before readiness is checked.
+            assert host.c.SNAPSHOT.read_bytes() == b"candidate-snapshot"
+            assert host.c.PUBLIC_STATE.read_bytes() == b"previous-marker"
+            checked.append(target)
+    monkeypatch.setattr(host.c, "assert_candidate_ready", ready)
+    with pytest.raises(ReleaseError, match="rollback_healthy"):
+        host.apply()
+    assert checked == [host.previous]
+
+
+def test_readiness_uses_selected_runtime_modules(tmp_path, monkeypatch):
+    package = tmp_path / "agent_platform_dashboard"
+    package.mkdir()
+    (package / "production_contract.py").write_text("SCHEMA = 'legacy-three-keys'\n")
+    for name in ("production_sources", "production_io", "production_web"):
+        (package / (name + ".py")).write_text("from . import production_contract as c\nSCHEMA = c.SCHEMA\n")
+    monkeypatch.setattr(current, "root_owned_readonly", lambda _: True)
+    with current.readiness_modules(tmp_path) as modules:
+        assert all(module.SCHEMA == "legacy-three-keys" for module in modules)
+        aliases = [module.__name__ for module in modules]
+    assert all(alias not in os.sys.modules for alias in aliases)
+
+
+def test_legacy_readiness_does_not_require_versioned_identity(readiness, monkeypatch):
+    r = readiness
+    target = r.snapshot.parent
+    monkeypatch.setattr(r.c, "LEGACY", target)
+    monkeypatch.setattr(r.c, "verify_tree", lambda _: pytest.fail("legacy is not a versioned tree"))
+    monkeypatch.setattr(r.c, "read_trusted_public_state", lambda _: pytest.fail("legacy marker is optional"))
+    r.c.assert_candidate_ready(target, None)
+
+
+def test_pinned_RC12_snapshot_uses_RC12_decoder_and_web_contract(readiness, monkeypatch):
+    from agent_platform_dashboard import production_sources, production_io
+    r = readiness
+    path = Path(__file__).with_name("fixtures") / "rc12_production_contract.py"
+    spec = importlib.util.spec_from_file_location("rc12_fixture", path)
+    rc12 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rc12)
+    legacy_model = {key: value for key, value in r.model.items() if key != "observability"}
+    r.snapshot.write_bytes(rc12.encode(legacy_model))
+    # The newer controller must reject these bytes. Target decoding must accept.
+    with pytest.raises(ValueError):
+        r.contract.decode(r.snapshot.read_bytes())
+    checked = []
+    def target_web_load(_):
+        checked.append(rc12.decode(r.snapshot.read_bytes()))
+        return SimpleNamespace(snapshot_path=str(r.snapshot))
+    monkeypatch.setattr(r.c, "readiness_modules", lambda _: nullcontext(
+        (rc12, production_sources, production_io, SimpleNamespace(load=target_web_load))))
+    r.check()
+    assert len(checked) == 1 and "observability" not in checked[0]

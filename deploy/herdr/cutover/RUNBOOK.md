@@ -250,8 +250,9 @@ pinned. No RC6 identity or archive is added to its allowlist.
 
 Before starting web, `switch_runtime` requires a successful bridge oneshot,
 the live socket, fresh bridge rows, a bounded schema-valid snapshot, matching
-bridge/release identities, exact telemetry ownership/mode, and the existing web
-configuration/auth validation. Exporter success and an unauthenticated 401 are
+bridge/release identities, exact telemetry ownership/mode, and the selected runtime's own web
+configuration/auth validation (including historical RC12 schema). The legacy
+bootstrap uses its existing pinned identity instead of versioned metadata. Exporter success and an unauthenticated 401 are
 not substitutes for these checks. No readiness sleep is introduced.
 
 For a healthy baseline, apply still exercises a healthy rollback boot. The old
@@ -263,7 +264,8 @@ It is never represented as a successful healthy rollback exercise.
 On candidate failure, both modes quiesce timers, their oneshots, web and watchdog
 before restoring the exact symlink, units, consumer files, marker, bridge and
 snapshot bytes/modes/owners. Restoration errors prevent service reactivation.
-Healthy rollback validates the restored read model before web; degraded rollback
+Healthy rollback verifies exact restoration, regenerates previous-release telemetry,
+then validates its freshness before web; degraded rollback
 leaves web inactive (the original failed state is normalized to inactive rather
 than deliberately reproducing a service failure). Timers may subsequently refresh
 the restored telemetry. Dispatch reopens only after restoration, verification
