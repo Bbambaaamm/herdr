@@ -67,8 +67,8 @@ This is offline evidence, not live deployment acceptance.
 
 Before controller edits: same degraded-upgrade/invalid-dependency expectations
 produced **7 failed, 10 deselected, exit 1**, with no setup errors in that retained
-red run. Final new installer suite: **30 passed, exit 0**. Relevant release,
-dashboard, agent-stack and security suite: **1374 passed, 1 skipped, exit 0**.
+red run. Final new installer suite: **34 passed, exit 0**. Relevant release,
+dashboard, agent-stack and security suite: **1378 passed, 1 skipped, exit 0**.
 Repository contract and three skill-package lints passed on Linux. Windows lacks
 fcntl; its lint import failed, so Linux results are authoritative here.
 
@@ -136,3 +136,11 @@ new exact-head CI and re-review must be checked. The earlier intermediate
 server-wide run had 7 failures: three superseded release mocks/source checks and
 four unrelated physical SDK/profile environment failures. It is not a final
 acceptance result and no Hermes environment/configuration was changed to mask it.
+
+Second independent review of 6b1ecab found a P1 native-extension import precedence
+issue on the pre-manifest legacy path and P2 asynchronous Nginx reload handling.
+The complete target package closure is now checked before import: no symlinks,
+nonregular entries, foreign/writable artifacts, native extensions or bytecode.
+Healthy rollback uses the existing bounded public-401 convergence wait. Three
+malicious-artifact regressions and a real 503-to-401 probe sequence were added.
+The revised focused integration suite passed 1378 tests, 1 skipped, exit 0.

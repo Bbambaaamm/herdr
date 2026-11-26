@@ -6,6 +6,7 @@ from argparse import ArgumentParser
 from contextlib import contextmanager
 from functools import wraps
 import importlib
+import importlib.machinery
 import hashlib
 import base64
 import json
@@ -1268,10 +1269,16 @@ def readiness_modules(target: Path):
     namespace keeps target relative imports separate without altering sys.path.
     """
     package = target / "agent_platform_dashboard"
-    need(root_owned_readonly(package), "unsafe_readiness_package")
-    need(not any(package.rglob("*.pyc")), "readiness_bytecode_not_allowed")
-    for path in package.rglob("*.py"):
-        need(root_owned_readonly(path) and not path.is_symlink(), "unsafe_readiness_module")
+    need(package.is_dir() and not package.is_symlink() and root_owned_readonly(package),
+         "unsafe_readiness_package")
+    # FileFinder prefers native extensions to .py. Check the complete package,
+    # not just Python sources, before allowing any relative import. This also
+    # protects the pre-manifest legacy bootstrap from unvalidated artifacts.
+    forbidden = tuple(importlib.machinery.EXTENSION_SUFFIXES) + (".pyc", ".pyo")
+    for path in package.rglob("*"):
+        need(not path.is_symlink() and (path.is_dir() or path.is_file())
+             and root_owned_readonly(path), "unsafe_readiness_artifact")
+        need(not path.name.endswith(forbidden), "readiness_non_source_import_denied")
     alias = f"_herdr_readiness_{os.getpid()}_{time.time_ns()}"
     namespace = types.ModuleType(alias)
     namespace.__path__ = [str(package)]
@@ -1407,7 +1414,9 @@ def rollback_previous(previous, report, snapshots, units, maintenance):
                 need(unit_state("agent-platform-web.service") == "active", "rollback_web_not_active")
             run("/usr/sbin/nginx", "-t")
             run("/usr/bin/systemctl", "reload", "nginx")
-            public = http_status("https://2.28.67.165/agent-platform/health")
+            public_url = "https://2.28.67.165/agent-platform/health"
+            public = (http_status(public_url) if degraded else
+                      wait_http_status(public_url, "401"))
             need(public in RECOVERY_FAIL_CLOSED_PUBLIC_STATUSES if degraded else public == "401",
                  "rollback_public_boundary_open")
             need(http_status("https://2.28.67.165/") == report["public_root"], "rollback_root_changed")

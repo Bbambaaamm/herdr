@@ -12,6 +12,7 @@ import pytest
 
 from deploy.herdr.cutover import cutover as current
 from herdr.release import ReleaseError
+REAL_WAIT_HTTP_STATUS = current.wait_http_status
 
 
 # Run the same behavioral tests against the unmodified main controller to
@@ -462,3 +463,41 @@ def test_pinned_RC12_snapshot_uses_RC12_decoder_and_web_contract(readiness, monk
         (rc12, production_sources, production_io, SimpleNamespace(load=target_web_load))))
     r.check()
     assert len(checked) == 1 and "observability" not in checked[0]
+
+
+@pytest.mark.parametrize("artifact", ["native", "bytecode", "symlink"])
+def test_historical_import_closure_rejects_non_source_artifacts(tmp_path, monkeypatch, artifact):
+    import importlib.machinery
+    package = tmp_path / "agent_platform_dashboard"
+    package.mkdir()
+    (package / "production_contract.py").write_text("SAFE = True\n")
+    if artifact == "native":
+        (package / ("production_contract" + importlib.machinery.EXTENSION_SUFFIXES[0])).write_bytes(b"never execute")
+    elif artifact == "bytecode":
+        (package / "production_contract.pyc").write_bytes(b"never execute")
+    else:
+        (package / "nested").symlink_to(tmp_path, target_is_directory=True)
+    monkeypatch.setattr(current, "root_owned_readonly", lambda _: True)
+    monkeypatch.setattr(current.importlib, "import_module", lambda _: pytest.fail("must reject before imports"))
+    with pytest.raises(ReleaseError, match="readiness_non_source_import_denied|unsafe_readiness_artifact"):
+        with current.readiness_modules(tmp_path):
+            pytest.fail("unsafe artifact accepted")
+
+
+def test_healthy_rollback_waits_for_public_reload_convergence(host, monkeypatch):
+    host.failure["candidate"] = True
+    original_http = host.c.http_status
+    probes = []
+    def http(url):
+        if (url == "https://2.28.67.165/agent-platform/health"
+                and host.c.CURRENT.resolve() == host.previous
+                and host.c.NGINX_ROUTE.read_bytes() == b"active-route"):
+            probes.append(url)
+            return "503" if len(probes) == 1 else "401"
+        return original_http(url)
+    monkeypatch.setattr(host.c, "http_status", http)
+    monkeypatch.setattr(host.c, "wait_http_status", REAL_WAIT_HTTP_STATUS)
+    monkeypatch.setattr(host.c.time, "sleep", lambda _: None)
+    with pytest.raises(ReleaseError, match="rollback_healthy"):
+        host.apply()
+    assert len(probes) == 2
