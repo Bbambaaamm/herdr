@@ -78,13 +78,15 @@ def safe_ancestors(path):
              and not s.st_mode & 0o022, "unsafe_runtime_ancestor")
 
 
-def inventory(root):
+def inventory(root, *, observations=None):
     safe_ancestors(root)
     paths = [root]
     for path in root.rglob("*"):
         need(len(paths) < 1024, "runtime_inventory_limit")
         paths.append(path)
     identities = {p: stamp(p.lstat()) for p in paths}
+    if observations is not None:
+        observations.update(identities)
     rows = {}
     for path in paths:
         row = facts(path)
@@ -135,11 +137,26 @@ def commands(value):
 
 
 class SystemdAuthority:
-    def __init__(self, api):
+    def __init__(self, api, *, unit_search_roots=None):
         self.api = api
         self.units = api["UNITS"]
         self.unit_dir = api["UNIT_DIR"]
         self.dropin = self.unit_dir / (WATCHDOG + ".d") / CAPACITY_DROPIN
+        self.search_roots = tuple(unit_search_roots) if unit_search_roots is not None else (
+            self.unit_dir, Path("/run/systemd/system"),
+            Path("/usr/local/lib/systemd/system"), Path("/usr/lib/systemd/system"))
+        self.observed = {}
+        self.policy_path = api.get("HOST_POLICY_PATH", Path("/etc/herdr/host-policy.json"))
+
+    def observe(self, path):
+        value = stamp(path.lstat())
+        need(path not in self.observed or self.observed[path] == value, "authority_changed_during_capture")
+        self.observed[path] = value
+        return facts(path)
+
+    def verify_observations(self):
+        need(all(stamp(path.lstat()) == value for path, value in self.observed.items()),
+             "authority_changed_during_capture")
 
     def approved_dependencies(self):
         descriptor = json.loads((self.api["ROOT"] / "deploy/herdr/cutover/capacity-repair-authority.json").read_bytes())
@@ -147,13 +164,14 @@ class SystemdAuthority:
         for name, expected in descriptor["files"].items():
             path = Path(name)
             safe_ancestors(path)
-            need(facts(path) == expected, "capacity_dependency_drift:" + name)
+            need(self.observe(path) == expected, "capacity_dependency_drift:" + name)
             if "link" in expected:
                 need(str(path.resolve(strict=True)) == expected["link"], "capacity_symlink_drift")
         for name, expected in descriptor["trees"].items():
-            need(inventory(Path(name)) == expected, "capacity_runtime_tree_drift:" + name)
+            need(inventory(Path(name), observations=self.observed) == expected, "capacity_runtime_tree_drift:" + name)
         need(all(stamp(Path(name).lstat()) == value for name, value in identities.items()),
              "capacity_dependency_changed")
+        self.verify_observations()
         return descriptor
 
     def external_dependencies(self):
@@ -161,12 +179,14 @@ class SystemdAuthority:
         identities = {name: stamp(Path(name).lstat()) for name in descriptor}
         for name, expected in descriptor.items():
             safe_ancestors(Path(name))
-            need(facts(Path(name)) == expected, "external_runtime_drift:" + name)
+            need(self.observe(Path(name)) == expected, "external_runtime_drift:" + name)
         need(all(stamp(Path(name).lstat()) == value for name, value in identities.items()),
              "external_runtime_changed")
+        self.verify_observations()
         return descriptor
 
     def capture(self, *, allow_capacity=True, allow_fence=False):
+        self.observed = {}
         need(allow_fence or not os.path.lexists(self.api["watchdog_permit_path"]()),
              "orphan_watchdog_start_permit")
         rows, drops = {}, {}
@@ -188,16 +208,16 @@ class SystemdAuthority:
             approved = {}
             if unit in SOURCE_DROPINS:
                 path = self.unit_dir / (unit + ".d") / "sources.conf"
-                row = facts(path)
+                row = self.observe(path)
                 need(row == dict(uid=0, gid=0, mode=0o644, sha256=SOURCE_DROPINS[unit]),
                      "source_dropin_drift:" + unit)
                 approved[str(path)] = row
             if unit == WATCHDOG and capacity:
-                approved[str(self.dropin)] = facts(self.dropin)
+                approved[str(self.dropin)] = self.observe(self.dropin)
             fence = self.api["watchdog_fence_path"]()
             if unit == WATCHDOG and os.path.lexists(fence):
                 need(allow_fence, "unfinished_watchdog_fence")
-                row = facts(fence)
+                row = self.observe(fence)
                 need(row == dict(uid=0, gid=0, mode=0o644,
                     sha256=hashlib.sha256(self.api["watchdog_fence_bytes"]()).hexdigest()),
                     "watchdog_fence_drift")
@@ -211,14 +231,13 @@ class SystemdAuthority:
             for index, char in enumerate(stem):
                 if char == "-":
                     folders.add(stem[:index + 1] + "." + kind + ".d")
-            for prefix in (self.unit_dir, Path("/run/systemd/system"),
-                           Path("/usr/local/lib/systemd/system"), Path("/usr/lib/systemd/system")):
+            for prefix in self.search_roots:
                 for name in folders:
                     folder = prefix / name
                     if not os.path.lexists(folder):
                         continue
                     safe_ancestors(folder)
-                    directory = facts(folder)
+                    directory = self.observe(folder)
                     need(directory.get("directory") is True and directory["uid"] == 0
                          and not directory["mode"] & 0o022, "unsafe_dropin_directory")
                     # systemd only loads *.conf; backups such as sources.conf.tmp
@@ -226,7 +245,7 @@ class SystemdAuthority:
                     need(all(str(p) in approved for p in folder.glob("*.conf")),
                          "unknown_disk_dropin:" + unit)
             base = self.unit_dir / unit
-            need(facts(base)["uid"] == 0 and not base.lstat().st_mode & 0o022,
+            need(self.observe(base)["uid"] == 0 and not base.lstat().st_mode & 0o022,
                  "unsafe_unit_fragment")
             directives = unit_directives(base)
             normalized = {}
@@ -246,15 +265,17 @@ class SystemdAuthority:
             for key in ("EnvironmentFiles", "PassEnvironment", "UnsetEnvironment", "RootDirectory",
                         "RootImage", "PAMName", "ExecSearchPath"):
                 need(not loaded.get(key), "unexpected_effective_property:" + key)
-            normalized["fragment"] = facts(base)
+            normalized["fragment"] = self.observe(base)
             normalized["dropins"] = {k: v for k, v in approved.items() if k != str(fence)}
             rows[unit] = normalized
             drops.update(approved)
-        policy = facts(Path("/etc/herdr/host-policy.json"))
+        policy = self.observe(self.policy_path)
         need(policy["uid"] == 0 and not policy["mode"] & 0o022, "unsafe_host_policy")
+        external = self.external_dependencies()
+        self.verify_observations()
         return dict(version=1, mode="capacity_rc6" if capacity else "standard",
                     units=rows, dependencies=dependencies, host_policy=policy,
-                    external_runtimes=self.external_dependencies())
+                    external_runtimes=external)
 
     def verify(self, authority, *, allow_fence=False):
         need(self.capture(allow_fence=allow_fence) == authority, "effective_systemd_authority_changed")

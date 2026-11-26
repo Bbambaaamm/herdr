@@ -54,14 +54,13 @@ def manager(tmp_path, monkeypatch):
         loaded[unit] = row
     policy = tmp_path / "policy.json"
     policy.write_text('{"schema_version":1}')
-    original_facts = s.facts
-    monkeypatch.setattr(s, "facts", lambda path: original_facts(policy if str(path) == "/etc/herdr/host-policy.json" else path))
     api = dict(UNITS=c.UNITS, UNIT_DIR=units, ROOT=tmp_path, CURRENT=tmp_path,
+               HOST_POLICY_PATH=policy,
                STATE_DIR=tmp_path, verify_tree=lambda _: {"commit": s.RC6},
                watchdog_fence_path=lambda: units / (s.WATCHDOG + ".d") / "264-cutover-transaction.conf",
                watchdog_fence_bytes=lambda: b"fence", watchdog_permit_path=lambda: tmp_path / "permit")
     api["run"] = lambda *args: "\n".join(k + "=" + v for k, v in loaded[args[2]].items())
-    authority = s.SystemdAuthority(api)
+    authority = s.SystemdAuthority(api, unit_search_roots=(units, tmp_path / "run-units", tmp_path / "vendor-units"))
     external_dir = tmp_path / "deploy/herdr/cutover"
     external_dir.mkdir(parents=True)
     (external_dir / "external-runtime-authority.json").write_text("{}")
@@ -156,6 +155,14 @@ def test_W25_pending_global_override(manager):
         manager.authority.capture()
 
 
+def test_W25_pending_vendor_hierarchy_override(manager):
+    folder = manager.tmp / "vendor-units/agent-platform-.service.d"
+    folder.mkdir(parents=True)
+    (folder / "injection.conf").write_text("[Service]\nEnvironment=EVIL=1")
+    with pytest.raises(ReleaseError, match="unknown_disk_dropin"):
+        manager.authority.capture()
+
+
 def test_W06_inventory_detects_added_import_during_hash(tmp_path, monkeypatch):
     root = tmp_path / "tree"
     root.mkdir()
@@ -190,3 +197,37 @@ def test_W06_inventory_detects_rewrite_of_previously_hashed_file(tmp_path, monke
     monkeypatch.setattr(s, "facts", race)
     with pytest.raises(ReleaseError, match="runtime_inventory_changed"):
         s.inventory(root)
+
+
+def test_W06_cross_tree_mutation_is_rejected(manager, monkeypatch):
+    manager.capacity()
+    first = manager.tmp / "first-tree"
+    second = manager.tmp / "second-tree"
+    for tree in (first, second):
+        tree.mkdir()
+        (tree / "safe.py").write_text("approved")
+    descriptor = manager.tmp / "deploy/herdr/cutover/capacity-repair-authority.json"
+    doc = json.loads(descriptor.read_bytes())
+    doc["trees"] = {str(tree): s.inventory(tree) for tree in (first, second)}
+    descriptor.write_bytes(canonical_json(doc))
+    real = s.inventory
+    def race(root, **kwargs):
+        result = real(root, **kwargs)
+        if root == second:
+            (first / "safe.py").write_text("tampered")
+        return result
+    monkeypatch.setattr(s, "inventory", race)
+    with pytest.raises(ReleaseError, match="authority_changed_during_capture"):
+        manager.authority.capture()
+
+
+def test_W07_baseline_drift_during_external_reads_is_rejected(manager, monkeypatch):
+    manager.capacity()
+    real = manager.authority.external_dependencies
+    def race():
+        result = real()
+        manager.authority.dropin.write_text("tampered")
+        return result
+    monkeypatch.setattr(manager.authority, "external_dependencies", race)
+    with pytest.raises(ReleaseError, match="authority_changed_during_capture"):
+        manager.authority.capture()
