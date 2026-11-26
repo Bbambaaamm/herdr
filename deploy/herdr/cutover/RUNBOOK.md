@@ -84,6 +84,60 @@ confirmation-token field. Do not guess a token from a historical example.
 
 ## Authorized normal apply
 
+### Effective systemd authority and the exact #126 RC6 exception
+
+Preflight now checks all six loaded fragments, pending reload/transient state,
+effective ExecStart/ExecStartPre and other execution hooks, Environment/EnvironmentFile,
+WorkingDirectory, User/Group, loaded and on-disk drop-ins. Only the two measured
+read-only `sources.conf` mounts and the exact reviewed RC6
+`126-capacity-repair.conf` are accepted. Their hashes are distinct: the drop-in is
+`f5a0e3f8d20a7382a0abaef350f668a9e58c66dd9f622f4888968d194883a530`,
+while its root-owned watchdog script is
+`81ea7d476914c9e2e57b92565fdbe04f200b20db4135d1e0cc8b984e48f6adf9`.
+The closed measured baseline dependency inventory is in
+`capacity-repair-authority.json`. The separately existing Herdr/Hermes CLI and
+maintenance helper entrypoints are pinned in `external-runtime-authority.json`;
+these are intentional external dependencies, not newly activated consumers,
+models or a claim that the Hermes environment itself becomes part of this release.
+Host-policy bytes are captured and must remain unchanged, including schema-1
+legacy launch selection. Drift, unknown overrides, mutable permissions, changed
+symlinks or changed historical inventory fail closed; no generic override allowlist
+or live repair is inferred. Re-run all admission/capacity gates for actual deployment.
+
+**Do not remove the capacity-repair drop-in manually before apply.** Under the
+existing deployment lock, the controller captures its exact presence, bytes,
+owner/group/mode and effective/dependency authority in journal version 2 and a
+root-only retained `*-baseline-authority.json` backup. The successful deployment
+record binds that backup path and SHA-256. Authority is revalidated before mutation
+and again after writer/watchdog quiescence.
+
+Before removal it installs the root-owned transaction fence
+`agent-stack-watchdog.service.d/264-cutover-transaction.conf`. Its systemd OR
+conditions allow start only if the transaction journal is absent or the protected
+`/run/herdr/watchdog-verified` permit exists. Reboot loses that permit, so retained
+journal + fence prevents an unprotected RC6 start even after power loss. An orphan
+permit or fence blocks preflight; never create/remove either to make admission pass.
+Only the controller grants a permit after exact candidate units/manifest, effective
+configuration, current identity, capacity implementation and telemetry health pass.
+It revokes permission before rollback and on incomplete restoration.
+
+Rollback preserves the fence while restoring current, unit files, exact original
+drop-in and deployment metadata, performs daemon-reload, and verifies the original
+effective configuration and all measured dependencies **before** permitting any
+RC6 watchdog start. RC6's original capacity-protected local maintenance is restored;
+the old standard RC6 maintenance is not silently substituted. Restore/start/cleanup
+failures retain journal and fence, revoke the permit and keep dispatch quiescent.
+Successful promotion or verified restoration removes the fence and permit before
+durably closing the journal. No separate operator watchdog restart is needed.
+
+For SIGKILL/power loss, retain the journal, backup and startup fence. Operator
+reconciliation must restore/verify the saved authority or finish a separately
+approved verified candidate before any start permission. Do not use automatic
+journal replay, delete the journal, manually create a permit, or remove the fence.
+Only closed, reviewed reconciliation can clear these controls. The previous RC8
+artifact remains unchanged; this implementation requires a newly verified release
+and a fresh explicit deployment approval for that release identity.
+
 Only after successful preflight, release verification and explicit deployment
 approval, use the same controller, archive and legacy value:
 

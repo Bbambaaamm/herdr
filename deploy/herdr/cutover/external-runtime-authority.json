@@ -1,0 +1,44 @@
+{
+  "/home/agentops/.local/bin/herdr": {
+    "uid": 1001,
+    "gid": 1001,
+    "mode": 493,
+    "sha256": "2a02fed16beb651ef006e1d43f048f652ca4dc58ad053cd2d44450563d5c54b7"
+  },
+  "/home/agentops/.local/bin/hermes": {
+    "uid": 1001,
+    "gid": 1001,
+    "mode": 493,
+    "sha256": "72d0220feb2f8bc02adfb196fcfe412c766b3ee7fc76da2a82a397794b060e4d"
+  },
+  "/home/agentops/.local/bin/majak": {
+    "uid": 1001,
+    "gid": 1001,
+    "mode": 493,
+    "sha256": "035a1c3c9cbb3350485c195c4d1c2a07f6779f76e284dd38078e8b11b68df4ca"
+  },
+  "/home/agentops/.local/bin/quantlab": {
+    "uid": 1001,
+    "gid": 1001,
+    "mode": 493,
+    "sha256": "cb28220d20dcf194226d20d633d5b101e1a39316fa0b6fb3ce5d2666ca8eb455"
+  },
+  "/home/agentops/.local/bin/agent-codex-usage-export": {
+    "uid": 1001,
+    "gid": 1001,
+    "mode": 493,
+    "sha256": "ef7ad44ba1bbaa095723160d467360a3ec33e95260c7fac0d5fb0082b25b00b6"
+  },
+  "/home/agentops/.local/bin/hermes-offsite-prepare": {
+    "uid": 1001,
+    "gid": 1001,
+    "mode": 448,
+    "sha256": "c454bbd83bb3c3e3c8addcb590234edd4b542f4a33cc2e7cd6f45d9783240bb9"
+  },
+  "/home/agentops/.local/bin/hermes-offsite-sync": {
+    "uid": 1001,
+    "gid": 1001,
+    "mode": 448,
+    "sha256": "f59298e6db258d30b54c98c5639e112408d90cf0c471c6ad42b0976ae42c9206"
+  }
+}

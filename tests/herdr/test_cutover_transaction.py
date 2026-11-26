@@ -34,6 +34,9 @@ def host(tmp_path, monkeypatch):
         monkeypatch.setattr(c, name, path)
     for name in ("CURRENT", "PUBLIC_STATE", "SNAPSHOT", "BRIDGE", "NGINX_ROUTE", "WEB_CONFIG"):
         monkeypatch.setattr(c, name, tmp_path / name, raising=False)
+    (tmp_path / "run").mkdir()
+    monkeypatch.setattr(c, "DEPLOYMENT_LOCK", tmp_path / "run/cutover.lock")
+    monkeypatch.setattr(c, "root_owned_readonly", lambda p: True)
     previous = c.RELEASES / "rc6"
     candidate = c.RELEASES / "rc7"
     previous.mkdir()
@@ -53,6 +56,17 @@ def host(tmp_path, monkeypatch):
     states["agent-platform-export.service"] = "inactive"
     states["agent-platform-herdr.service"] = "inactive"
     report = dict(services=states.copy(), baseline_health="healthy", direct_health="401", public_health="401", public_root="200")
+    from deploy.herdr.cutover.systemd_authority import SystemdAuthority
+    class FixtureAuthority(SystemdAuthority):
+        def capture(self, *, allow_capacity=True, allow_fence=False):
+            capacity = self.dropin.exists()
+            if capacity and not allow_capacity:
+                raise ReleaseError("capacity_override_wrong_baseline")
+            return dict(mode="capacity_rc6" if capacity else "standard", host_policy={})
+    monkeypatch.setattr(c, "SystemdAuthority", FixtureAuthority)
+    def fixture_preflight(*args):
+        report["systemd_authority"] = c.capture_systemd_authority()
+        return report
     events = []
     failure = {"candidate": False, "rollback": False, "interrupt": False}
     original_snapshot = c.snapshot_file
@@ -62,7 +76,9 @@ def host(tmp_path, monkeypatch):
     monkeypatch.setattr(c.os, "chown", lambda *a, **k: None)
     monkeypatch.setattr(c, "pin_archive", lambda path: path)
     monkeypatch.setattr(c, "verify_archive", lambda path: release)
-    monkeypatch.setattr(c, "preflight", lambda *a: report)
+    monkeypatch.setattr(c, "preflight", fixture_preflight)
+    monkeypatch.setattr(c, "verify_candidate_systemd_runtime",
+                        lambda *a: FixtureAuthority(c.__dict__).capture(allow_capacity=False))
     monkeypatch.setattr(c, "install_candidate", lambda *a: candidate)
     def install_units(*a, **k):
         for name in c.UNITS:
@@ -354,6 +370,8 @@ def test_preflight_classifies_only_coherent_baseline(tmp_path, monkeypatch, web,
                             STATE_DIR=tmp_path / "state").items():
         monkeypatch.setattr(c, name, value)
     monkeypatch.setattr(c, "immutable_preflight_controller", lambda: True)
+    monkeypatch.setattr(c, "capture_systemd_authority", lambda: {})
+    monkeypatch.setattr(c, "verify_release_runtime", lambda _: None)
     monkeypatch.setattr(c, "verify_archive", lambda _: release)
     monkeypatch.setattr(c, "verify_tree", lambda path: old if path == previous else release)
     monkeypatch.setattr(c, "consumer_digest", lambda _: old["config_contract_sha256"])
@@ -388,7 +406,7 @@ def write(path,data,mode,*a):
         f.write(data); f.flush(); os.fsync(f.fileno())
     path.chmod(mode)
 c.atomic_write=write
-c.begin_transaction(Path('/verified/rc6'),dict(services={},direct_health='000',public_health='401'),{}, {})
+c.begin_transaction(Path('/verified/rc6'),dict(services={},direct_health='000',public_health='401',systemd_authority={}),{}, {})
 os.kill(os.getpid(),signal.SIGKILL)
 """
     result = subprocess.run([sys.executable, "-c", script, str(journal)])

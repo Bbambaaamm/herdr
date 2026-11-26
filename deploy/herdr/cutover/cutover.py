@@ -48,6 +48,7 @@ from herdr.release import (  # noqa: E402
     verify_archive,
     verify_tree,
 )
+from deploy.herdr.cutover.systemd_authority import SystemdAuthority, verify_release_runtime  # noqa: E402
 
 
 HOST = "quantlab-staging-01"
@@ -852,6 +853,8 @@ def preflight(
              "runtime_not_healthy")
     with tempfile.TemporaryDirectory(prefix="herdr-preflight-") as folder:
         candidate = extract_candidate(archive, Path(folder))
+        if not allow_degraded_rc8:
+            verify_release_runtime(candidate)
         comparison = compare_trees(candidate, LEGACY)
     current = None
     if CURRENT.exists() or CURRENT.is_symlink():
@@ -890,8 +893,10 @@ def preflight(
             need(direct_health in {"000", "502", "503"}
                  and public_health in RECOVERY_FAIL_CLOSED_PUBLIC_STATUSES,
                  "degraded_previous_boundary_not_fail_closed")
+    systemd_authority = capture_systemd_authority()
     return {
         "status": "preflight_ok",
+        "systemd_authority": systemd_authority,
         "release": release,
         "legacy_commit": legacy_commit,
         "legacy_release": str(LEGACY),
@@ -1351,9 +1356,73 @@ def validate_readiness(expected, modules) -> None:
     need(application.snapshot_path == str(SNAPSHOT), "unexpected_web_snapshot_path")
 
 
+def capture_systemd_authority():
+    return SystemdAuthority(globals()).capture()
+
+
+def verify_systemd_authority(authority, *, allow_fence=False):
+    SystemdAuthority(globals()).verify(authority, allow_fence=allow_fence)
+
+
+def watchdog_fence_path():
+    return UNIT_DIR / "agent-stack-watchdog.service.d/264-cutover-transaction.conf"
+
+
+def watchdog_permit_path():
+    return DEPLOYMENT_LOCK.parent / "watchdog-verified"
+
+
+def watchdog_fence_bytes():
+    # Conditions are evaluated by the system manager, not by the service user.
+    # The /run permit disappears on reboot. A retained journal then denies start.
+    return ("[Unit]\nConditionPathExists=|!" + str(STATE_DIR / "transaction.json")
+            + "\nConditionPathExists=|" + str(watchdog_permit_path()) + "\n").encode("ascii")
+
+
+def cleanup_watchdog_fence():
+    remove_regular_file(watchdog_fence_path())
+    remove_regular_file(watchdog_permit_path())
+    run("/usr/bin/systemctl", "daemon-reload")
+
+
+def ensure_watchdog_fence():
+    remove_regular_file(watchdog_permit_path())
+    path = watchdog_fence_path()
+    if not path.parent.exists():
+        path.parent.mkdir(mode=0o755)
+    need(root_owned_readonly(path.parent) and not path.parent.is_symlink(),
+         "unsafe_watchdog_fence_directory")
+    if path.exists() or path.is_symlink():
+        need(not path.is_symlink() and root_owned_readonly(path)
+             and path.read_bytes() == watchdog_fence_bytes(), "unexpected_watchdog_fence")
+    atomic_write(path, watchdog_fence_bytes(), 0o644)
+    run("/usr/bin/systemctl", "daemon-reload")
+
+
+def permit_watchdog_start():
+    need((STATE_DIR / "transaction.json").is_file(), "watchdog_transaction_missing")
+    atomic_write(watchdog_permit_path(), b"verified\n", 0o600)
+
+
+def reconcile_systemd_authority(authority):
+    return SystemdAuthority(globals()).reconcile(authority)
+
+
+def verify_candidate_systemd_runtime(candidate, authority):
+    need(CURRENT.resolve(strict=True) == candidate, "candidate_runtime_release_mismatch")
+    current = SystemdAuthority(globals()).capture(allow_capacity=False, allow_fence=True)
+    need(current["host_policy"] == authority["host_policy"], "host_policy_changed")
+    release = verify_tree(candidate)
+    assert_deployed_coherence(candidate, release)
+    verify_release_runtime(candidate)
+    return current
+
+
 def transaction_snapshots() -> dict[Path, tuple[bytes, int, int, int] | None]:
     paths = [PUBLIC_STATE, BRIDGE, SNAPSHOT, NGINX_ROUTE]
     paths.extend(CONSUMER_DIR / f"{name}.yaml" for name in CONSUMERS)
+    paths.append(UNIT_DIR / "agent-stack-watchdog.service.d/126-capacity-repair.conf")
+    paths.append(watchdog_fence_path())
     return {path: snapshot_file(path) for path in paths}
 
 
@@ -1368,11 +1437,20 @@ def begin_transaction(previous: Path, report: dict, snapshots: dict, units: dict
     files = {str(name): None if value is None else
              [base64.b64encode(value[0]).decode("ascii"), *value[1:]]
              for name, value in {**snapshots, **units}.items()}
-    atomic_write(path, canonical_json({"version": 1, "previous": str(previous),
+    document = {"version": 2, "previous": str(previous),
+                 "systemd_authority": report["systemd_authority"],
                  "baseline_health": report.get("baseline_health", "healthy"),
                  "services": report["services"], "direct_health": report["direct_health"],
                  "public_health": report["public_health"],
-                 "public_root": report.get("public_root"), "files": files}), 0o600)
+                 "public_root": report.get("public_root"), "files": files}
+    backup = STATE_DIR / f"{time.time_ns()}-baseline-authority.json"
+    need(not backup.exists() and not backup.is_symlink(), "authority_backup_exists")
+    backup_bytes = canonical_json(document)
+    atomic_write(backup, backup_bytes, 0o600)
+    need(snapshot_file(backup)[0] == backup_bytes, "authority_backup_verification_failed")
+    report["authority_backup"] = {"path": str(backup), "sha256": sha256(backup_bytes)}
+    document["authority_backup"] = report["authority_backup"]
+    atomic_write(path, canonical_json(document), 0o600)
     return path
 
 
@@ -1380,6 +1458,8 @@ def rollback_previous(previous, report, snapshots, units, maintenance):
     """Restore exact authority before reopening traffic or durable dispatch."""
     degraded = report.get("baseline_health") == "degraded"
     errors = run_rollback_steps([
+        ("revoke_watchdog_permit", lambda: remove_regular_file(watchdog_permit_path())),
+        ("fence_rollback", ensure_watchdog_fence),
         ("quiesce", stop_recovery_units),
         ("stop_web", stop_recovery_web),
     ])
@@ -1388,14 +1468,17 @@ def rollback_previous(previous, report, snapshots, units, maintenance):
             ("restore_units", lambda: restore_units(units)),
             ("restore_current", lambda: atomic_symlink(previous, CURRENT)),
             *[(f"restore:{path.name}", lambda p=path, s=value: restore_file(p, s))
-              for path, value in snapshots.items()],
+              for path, value in snapshots.items() if path != watchdog_fence_path()],
             ("daemon_reload", lambda: run("/usr/bin/systemctl", "daemon-reload")),
         ]))
     if not errors:
         def verify():
             need(CURRENT.resolve(strict=True) == previous, "rollback_current_mismatch")
             for path, value in {**snapshots, **units}.items():
+                if path == watchdog_fence_path():
+                    continue  # Retain the boot fence until restoration is verified.
                 need(snapshot_file(path) == value, f"rollback_file_mismatch:{path.name}")
+            verify_systemd_authority(report["systemd_authority"], allow_fence=True)
             need(unit_state("agent-platform-web.service") in {"inactive", "failed"},
                  "rollback_web_not_quiescent")
             if not degraded:
@@ -1436,6 +1519,7 @@ def rollback_previous(previous, report, snapshots, units, maintenance):
 def switch_runtime(
     target: Path,
     document: dict[str, object] | None,
+    systemd_authority: dict | None = None,
 ) -> None:
     # Durable orchestration remains stopped for every intermediate
     # candidate/rollback transition. Dispatch is re-enabled only after
@@ -1453,6 +1537,12 @@ def switch_runtime(
         write_deployed(document)
 
     run("/usr/bin/systemctl", "daemon-reload")
+
+    if systemd_authority is not None:
+        if document is None:
+            verify_systemd_authority(systemd_authority, allow_fence=True)
+        else:
+            verify_candidate_systemd_runtime(target, systemd_authority)
 
     # candidate -> rollback -> candidate performs several bounded
     # transitions in a short interval. Reset systemd's rate limiter
@@ -1627,6 +1717,7 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
     previous_unit_hashes = snapshot_unit_hashes(unit_snapshots)
     public_state_snapshot = snapshot_file(PUBLIC_STATE)
     baseline_snapshots = transaction_snapshots()
+    verify_systemd_authority(report["systemd_authority"])
     degraded = report.get("baseline_health") == "degraded"
 
     STATE_DIR.mkdir(
@@ -1704,6 +1795,8 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
         # Candidate #1 — verification, watchdog still stopped.
         # --------------------------------------------------------
 
+        reconcile_systemd_authority(report["systemd_authority"])
+
         install_units(
             candidate,
             hashes,
@@ -1715,6 +1808,7 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
         switch_runtime(
             candidate,
             document,
+            report["systemd_authority"],
         )
 
         # --------------------------------------------------------
@@ -1728,7 +1822,7 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
             # The marker must precede export; otherwise the previous runtime
             # publishes the candidate identity during the rollback exercise.
             restore_file(PUBLIC_STATE, public_state_snapshot)
-            switch_runtime(previous, None)
+            switch_runtime(previous, None, report["systemd_authority"])
 
             need(
                 CURRENT.resolve(strict=True) == previous,
@@ -1760,6 +1854,7 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
         switch_runtime(
             candidate,
             document,
+            report["systemd_authority"],
         )
 
         run(
@@ -1790,6 +1885,7 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
                 evidence_archive
             ),
             "archive_path": str(evidence_archive),
+            "baseline_authority_backup": report["authority_backup"],
         }
 
         atomic_write(
@@ -1828,8 +1924,11 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
         # This is intentionally the LAST state-changing runtime step.
         # The watchdog can dispatch only after deployment identity,
         # route and health evidence are durable.
+        verify_candidate_systemd_runtime(candidate, report["systemd_authority"])
+        permit_watchdog_start()
         start_watchdog_service()
         watchdog_stopped = False
+        cleanup_watchdog_fence()
         remove_regular_file(transaction)
 
         return {
@@ -1848,13 +1947,22 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
                 STATE_DIR / f"{document['deployed_at']}-{identifier}.failed-{os.getpid()}.tar.gz")),
         ]))
         if not rollback_errors and report["services"]["agent-stack-watchdog.service"] == "active":
-            rollback_errors.extend(run_rollback_steps([("restore_watchdog", start_watchdog_service)]))
+            rollback_errors.extend(run_rollback_steps([
+                ("verify_watchdog_authority", lambda: verify_systemd_authority(report["systemd_authority"], allow_fence=True)),
+                ("permit_restored_watchdog", permit_watchdog_start),
+            ]))
+            if not rollback_errors:
+                rollback_errors.extend(run_rollback_steps([("restore_watchdog", start_watchdog_service)]))
+        if not rollback_errors:
+            rollback_errors.extend(run_rollback_steps([("cleanup_watchdog_fence", cleanup_watchdog_fence)]))
         if not rollback_errors:
             remove_regular_file(transaction)
         else:
+            rollback_errors.extend(run_rollback_steps([("refence_incomplete_rollback", ensure_watchdog_fence)]))
             # Even an evidence-write failure prevents a completed rollback
             # claim. Retain the journal and quiesce dispatch for reconciliation.
             rollback_errors.extend(run_rollback_steps([
+                ("revoke_incomplete_watchdog_permit", lambda: remove_regular_file(watchdog_permit_path())),
                 ("quiesce_incomplete_rollback", stop_recovery_units),
                 ("fail_closed_route", lambda: atomic_write(NGINX_ROUTE, maintenance, 0o644)),
                 ("nginx_test", lambda: run("/usr/sbin/nginx", "-t")),
