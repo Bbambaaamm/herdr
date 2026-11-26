@@ -28,10 +28,14 @@ def sanitize(data, now, bindings):
     for agent in agents:
         # Raw Herdr envelope can contain cwd/title. Drop those before publishing.
         c.need(type(agent) is dict and type(agent.get('name')) in (str, type(None)))
-        if agent['name'] not in bindings:
+        # An entry without a usable name is not a configured binding: skip it.
+        # A configured binding that disappears still fails closed below because
+        # rows must cover every binding exactly.
+        name = agent.get('name')
+        if type(name) is not str or name not in bindings:
             continue
-        c.need(agent.get('pane_id') == bindings[agent['name']]['pane_id'])
-        item = dict(agent=agent['name'], status=agent.get('agent_status'))
+        c.need(agent.get('pane_id') == bindings[name]['pane_id'])
+        item = dict(agent=name, status=agent.get('agent_status'))
         c.row('herdr', item)
         rows.append(item)
     c.need(len(rows) == len({r['agent'] for r in rows}) == len(bindings))
