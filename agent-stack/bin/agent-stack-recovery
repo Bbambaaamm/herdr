@@ -909,9 +909,76 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Existing recovery with explicit administrative UNKNOWN.")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--inspect-terminal-unknown", metavar="TASK_ID")
+    modes.add_argument("--inspect-legacy-unknown", metavar="TASK_ID",
+                       help="read-only pinned review; never retires a legacy task")
+    modes.add_argument("--retire-legacy-unknown", metavar="TASK_ID",
+                       help="explicit host-approved one-shot retirement of pinned legacy UNKNOWN")
+    modes.add_argument("--check-legacy-retirement", metavar="TASK_ID",
+                       help="read-only full preflight of explicit legacy retirement decision")
+    modes.add_argument("--verify-legacy-activation", metavar="TASK_ID",
+                       help="read-only verification of independent root-owned activation")
     modes.add_argument("--apply-terminal-unknown", metavar="TASK_ID")
     modes.add_argument("--retire-terminal-unknown", metavar="TASK_ID")
     args = parser.parse_args([] if argv is None else argv)
+    if args.inspect_legacy_unknown:
+        from herdr import recovery_unknown
+        from herdr.legacy_unknown_review import OriginalEvidence, TASK_ID, inspect
+        try:
+            if args.inspect_legacy_unknown != TASK_ID:
+                raise EvidenceError("legacy_unknown_not_pinned")
+            root = ROOT
+            task, _ = recovery_unknown.snapshot(root / "blocked" / (TASK_ID + ".json"),
+                                                maximum=1048576)
+            result, _ = recovery_unknown.snapshot(root / "results" / (TASK_ID + ".json"),
+                                                  maximum=1048576)
+            worker_log, _ = recovery_unknown.snapshot(root / "logs" / (TASK_ID + ".worker.log"),
+                                                      maximum=1048576)
+            report = inspect(OriginalEvidence(task, result, worker_log))
+            print(json.dumps(report, sort_keys=True))
+            return 0
+        except (EvidenceError, OSError, ValueError, TypeError):
+            print(json.dumps({"status": "blocked",
+                              "reason": "legacy_unknown_inspection_preconditions_unmet",
+                              "activation_performed": False}))
+            return 1
+    if args.verify_legacy_activation:
+        from herdr import legacy_unknown_retirement
+        from herdr import recovery_unknown
+        try:
+            if args.verify_legacy_activation != legacy_unknown_retirement.TASK_ID:
+                raise EvidenceError("legacy_activation_wrong_incident")
+            raw, _ = recovery_unknown.snapshot(
+                ROOT / "blocked" / (legacy_unknown_retirement.TASK_ID + ".json"),
+                maximum=1048576)
+            task = recovery_unknown._json(raw)
+            if not legacy_unknown_retirement.retired(ROOT, task):
+                raise EvidenceError("legacy_activation_not_verified")
+            print(json.dumps({"status": "legacy_unknown_retired_verified",
+                              "task_id": legacy_unknown_retirement.TASK_ID,
+                              "task_outcome": "UNKNOWN", "accounting": "preserved_unknown",
+                              "activation_performed": False}, sort_keys=True))
+            return 0
+        except (EvidenceError, OSError, ValueError, KeyError, TypeError):
+            print(json.dumps({"status": "blocked",
+                              "reason": "legacy_activation_not_verified",
+                              "activation_performed": False}))
+            return 1
+    if args.retire_legacy_unknown or args.check_legacy_retirement:
+        from herdr import legacy_unknown_retirement
+        try:
+            target = args.retire_legacy_unknown or args.check_legacy_retirement
+            if target != legacy_unknown_retirement.TASK_ID:
+                raise EvidenceError("legacy_retirement_wrong_incident")
+            report = legacy_unknown_retirement.apply(
+                ROOT, active_workers=active_worker_tasks,
+                dry_run=bool(args.check_legacy_retirement))
+            print(json.dumps(report, sort_keys=True))
+            return 0
+        except (EvidenceError, OSError, ValueError, KeyError, TypeError):
+            print(json.dumps({"status": "blocked",
+                              "reason": "legacy_retirement_preconditions_unmet",
+                              "activation_performed": False}))
+            return 1
     if (args.inspect_terminal_unknown or args.apply_terminal_unknown
             or args.retire_terminal_unknown):
         from herdr import recovery_unknown
