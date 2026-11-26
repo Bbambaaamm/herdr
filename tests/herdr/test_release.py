@@ -883,9 +883,12 @@ def test_switch_runtime_keeps_watchdog_quiescent(
     tmp_path,
 ):
     events = []
+    monkeypatch.setattr(cutover, "assert_candidate_ready", lambda *a: None)
 
     def fake_run(*args, check=True):
         events.append(("run", *args))
+        if args[:2] == ("/usr/bin/systemctl", "show"):
+            return "success"
         if (
             len(args) >= 3
             and args[0] == "/usr/bin/systemctl"
@@ -956,9 +959,12 @@ def test_switch_runtime_resets_rate_limit_and_starts_herdr_once_via_export(
     tmp_path,
 ):
     events = []
+    monkeypatch.setattr(cutover, "assert_candidate_ready", lambda *a: None)
 
     def fake_run(*args, check=True):
         events.append(("run", *args))
+        if args[:2] == ("/usr/bin/systemctl", "show"):
+            return "success"
 
         if args[:2] == (
             "/usr/bin/systemctl",
@@ -1167,7 +1173,7 @@ def test_apply_keeps_watchdog_quiescent_during_rollback_exercise():
     assert "run_rollback_steps(" in apply_source
     assert "rollback_incomplete:" in apply_source
     assert "fail_closed_route" in apply_source
-    assert '"restore_current"' in apply_source
+    assert "rollback_previous(" in apply_source
 
     # switch_runtime itself never restarts durable dispatch.
     switch_source = source.split(

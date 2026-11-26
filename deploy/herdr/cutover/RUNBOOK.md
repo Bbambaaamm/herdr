@@ -234,3 +234,52 @@ held from authorization through success or rollback.
 
 After a successful recovery promotion, the normal cutover path is authoritative
 again for subsequent releases.
+
+## Baseline-aware normal cutover (step 2/6, #262)
+
+Normal `preflight` now distinguishes a healthy baseline from a versioned release
+with failed/inactive web. A degraded baseline is eligible only after the existing
+immutable controller, manifest, external binary, marker, unit, consumer and Nginx
+checks pass; the Herdr socket must be live, telemetry timers/watchdog active,
+there must be no durable worker, and the HTTP boundaries must be fail-closed.
+An unsafe or inconsistent baseline remains rejected. This is not authorization
+to deploy or to change a host grant, Hermes configuration, or provider.
+
+The existing exact RC8-to-RC12 `recovery-*` authorization remains separate and
+pinned. No RC6 identity or archive is added to its allowlist.
+
+Before starting web, `switch_runtime` requires a successful bridge oneshot,
+the live socket, fresh bridge rows, a bounded schema-valid snapshot, matching
+bridge/release identities, exact telemetry ownership/mode, and the existing web
+configuration/auth validation. Exporter success and an unauthenticated 401 are
+not substitutes for these checks. No readiness sleep is introduced.
+
+For a healthy baseline, apply still exercises a healthy rollback boot. The old
+deployment marker is now restored **before** exporting old-release telemetry.
+For a degraded baseline the broken web boot is skipped and recorded explicitly
+as `rollback_exercised=false`, `rollback_mode=skipped_known_degraded_previous`.
+It is never represented as a successful healthy rollback exercise.
+
+On candidate failure, both modes quiesce timers, their oneshots, web and watchdog
+before restoring the exact symlink, units, consumer files, marker, bridge and
+snapshot bytes/modes/owners. Restoration errors prevent service reactivation.
+Healthy rollback validates the restored read model before web; degraded rollback
+leaves web inactive (the original failed state is normalized to inactive rather
+than deliberately reproducing a service failure). Timers may subsequently refresh
+the restored telemetry. Dispatch reopens only after restoration, verification
+and failed-evidence preservation. Error outcomes distinguish `rollback_healthy`,
+`rollback_degraded` and `rollback_incomplete`; the failed upgrade still exits 78.
+
+The existing deployment lock spans the entire operation. Before mutable changes,
+a root-only, fsynced `/var/lib/herdr/deployments/transaction.json` captures the
+baseline authority and health/service observations. SIGTERM/interrupt uses the
+same rollback path. SIGKILL/power loss cannot execute rollback: the retained
+journal blocks **both** normal and RC8 recovery preflight before archive use.
+An operator must reconcile its captured files against the actual current state
+under the existing deployment/privilege gates; do not delete the journal merely
+to make preflight pass. No automatic dispatch, retry, grant or new recovery
+authority is created. Successful apply or verified rollback removes it durably.
+
+Offline regression matrix and incident evidence are recorded in
+`docs/evidence/CUTOVER_STEP2_2026-11-26.md`. Running tests does not deploy a
+release. Merge, release and host verification remain separate approval gates.

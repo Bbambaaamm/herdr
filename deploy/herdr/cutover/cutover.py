@@ -6,8 +6,10 @@ from argparse import ArgumentParser
 from contextlib import contextmanager
 from functools import wraps
 import hashlib
+import base64
 import json
 import os
+import signal
 from pathlib import Path
 import shutil
 import socket
@@ -25,8 +27,10 @@ except ImportError:  # pragma: no cover - production cutover is Linux-only
 
 try:
     import grp
+    import pwd
 except ImportError:  # pragma: no cover - production cutover is Linux-only
     grp = None
+    pwd = None
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
@@ -89,6 +93,8 @@ RECOVERY_TARGET_ARCHIVE_SHA256 = (
     "0f4fa8a24de0c367008532acb6319487d0da1948f458ee8d036910720ecb7b0f"
 )
 SNAPSHOT = Path("/var/lib/agent-platform/snapshot.json")
+BRIDGE = Path("/var/lib/agent-platform-herdr/herdr.json")
+WEB_CONFIG = Path("/etc/agent-platform/web.json")
 HERDR_SOCKET = Path("/home/agentops/.config/herdr/herdr.sock")
 RECOVERY_ROUTER_DATABASES = {
     "majak": Path("/home/agentops/.hermes/profiles/majak/model-router/router.db"),
@@ -521,17 +527,22 @@ def atomic_write(path: Path, data: bytes, mode: int, uid: int = 0, gid: int = 0)
 def snapshot_file(path: Path) -> tuple[bytes, int, int, int] | None:
     if not path.exists() and not path.is_symlink():
         return None
-    info = os.lstat(path)
-    need(
-        stat.S_ISREG(info.st_mode) and not path.is_symlink(),
-        f"unsafe_snapshot_file:{path}",
-    )
-    return (
-        path.read_bytes(),
-        stat.S_IMODE(info.st_mode),
-        info.st_uid,
-        info.st_gid,
-    )
+    from agent_platform_dashboard.production_io import regular
+    with regular(str(path)) as (fd, info):
+        need(info.st_nlink == 1 and info.st_size <= 131072,
+             f"unsafe_snapshot_file:{path}")
+        data = bytearray()
+        while len(data) <= 131072:
+            chunk = os.read(fd, min(8192, 131073 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        after = os.fstat(fd)
+        need(len(data) == info.st_size and after == info
+             and after.st_mtime_ns == info.st_mtime_ns
+             and after.st_ctime_ns == info.st_ctime_ns,
+             f"snapshot_changed:{path}")
+        return bytes(data), stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid
 
 
 def restore_file(
@@ -790,6 +801,9 @@ def preflight(
         immutable_preflight_controller(),
         "preflight_root_required_or_controller_not_immutable",
     )
+    need(not (STATE_DIR / "transaction.json").exists()
+         and not (STATE_DIR / "transaction.json").is_symlink(),
+         "unfinished_deployment_requires_operator_reconciliation")
     release = verify_archive(archive)
     need((ROOT / "RELEASE.json").is_file(), "cutover_tool_release_missing")
     controller_release = verify_tree(ROOT)
@@ -827,7 +841,7 @@ def preflight(
         allow_degraded_rc8,
     )
     if not recovery_mode:
-        need(statuses["agent-platform-web.service"] == "active"
+        need(statuses["agent-platform-web.service"] in {"active", "failed", "inactive"}
              and statuses["agent-platform-export.timer"] == "active"
              and statuses["agent-platform-herdr.timer"] == "active"
              and statuses["agent-stack-watchdog.service"] == "active",
@@ -851,9 +865,27 @@ def preflight(
             "recovery_public_boundary_not_fail_closed",
         )
     else:
-        direct_health = http_status("http://127.0.0.1:3010/agent-platform/health")
+        try:
+            direct_health = http_status("http://127.0.0.1:3010/agent-platform/health")
+        except subprocess.CalledProcessError as error:
+            need(statuses["agent-platform-web.service"] != "active"
+                 and error.returncode == 7, "direct_health_probe_failed")
+            direct_health = "000"
         public_health = http_status("https://2.28.67.165/agent-platform/health")
-        need(direct_health == "401" and public_health == "401", "auth_boundary_regressed")
+        if statuses["agent-platform-web.service"] == "active":
+            need(direct_health == "401" and public_health == "401", "auth_boundary_regressed")
+        else:
+            # Only availability may be degraded. Immutable identity, marker,
+            # unit, route, consumer and worker gates still apply.
+            need(current is not None and Path(current).parent == RELEASES,
+                 "degraded_previous_requires_versioned_release")
+            previous_release = verify_tree(Path(current))
+            assert_deployed_coherence(Path(current), previous_release)
+            need(live_unix_socket(HERDR_SOCKET), "degraded_previous_bridge_socket_unavailable")
+            assert_no_active_durable_worker()
+            need(direct_health in {"000", "502", "503"}
+                 and public_health in RECOVERY_FAIL_CLOSED_PUBLIC_STATUSES,
+                 "degraded_previous_boundary_not_fail_closed")
     return {
         "status": "preflight_ok",
         "release": release,
@@ -866,6 +898,7 @@ def preflight(
         "public_health": public_health,
         "public_root": http_status("https://2.28.67.165/"),
         "recovery_mode": "rc8_router_overflow" if recovery_mode else None,
+        "baseline_health": "degraded" if statuses["agent-platform-web.service"] != "active" else "healthy",
     }
 
 
@@ -1202,6 +1235,11 @@ def remove_regular_file(path: Path) -> None:
         return
     need(path.is_file() and not path.is_symlink(), f"unsafe_remove_file:{path}")
     path.unlink()
+    parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
 
 
 def run_rollback_steps(steps):
@@ -1216,6 +1254,123 @@ def run_rollback_steps(steps):
                 f"{name}:{type(exc).__name__}:{exc}"
             )
 
+    return errors
+
+
+def assert_candidate_ready(target: Path, document: dict[str, object] | None) -> None:
+    """Validate actual exporter output using the same closed contract as web.
+
+    A successful oneshot/export alone is insufficient: export intentionally
+    publishes unavailable sources when the bridge fails.
+    """
+    from agent_platform_dashboard import production_contract as c
+    from agent_platform_dashboard import production_sources as sources
+    from agent_platform_dashboard.production_io import read, regular
+    from agent_platform_dashboard.production_web import load
+
+    need(pwd is not None and grp is not None, "linux_accounts_required")
+    uid = pwd.getpwnam("agentops").pw_uid
+    gid = grp.getgrnam("agent-platform-read").gr_gid
+    need(live_unix_socket(HERDR_SOCKET), "bridge_socket_unavailable")
+    for path in (BRIDGE, SNAPSHOT):
+        with regular(str(path)) as (_, info):
+            need(info.st_uid == uid and info.st_gid == gid
+                 and stat.S_IMODE(info.st_mode) == 0o640,
+                 f"unsafe_readiness_file:{path.name}")
+    now = int(time.time())
+    bridge = {profile: sources.herdr(str(BRIDGE), profile, now)[0]
+              for profile in c.PROFILES}
+    snapshot = c.decode(read(str(SNAPSHOT), c.MAX_BYTES, owner=uid))
+    need(0 <= now - snapshot["generated_at"] <= 90, "snapshot_stale")
+    expected = document if document is not None else read_trusted_public_state(PUBLIC_STATE)
+    need(verify_tree(target)["commit"] == expected["commit"], "readiness_release_mismatch")
+    for source in snapshot["sources"]:
+        if source["kind"] not in {"router", "herdr", "release"}:
+            continue
+        need(source["status"] == "available"
+             and 0 <= now - source["observed_at"] <= 90,
+             f"snapshot_source_unready:{source['profile']}:{source['kind']}")
+        if source["kind"] == "herdr":
+            need(bool(source["rows"]) and source["rows"] == bridge[source["profile"]],
+                 "snapshot_bridge_mismatch")
+        if source["kind"] == "release":
+            need(source["rows"] == [{key: expected[key] for key in
+                 ("tag", "commit", "config_sha256", "deployed_at")}],
+                 "snapshot_release_mismatch")
+    # Also validate root-owned web config, credentials, profiles and freshness.
+    application = load(str(WEB_CONFIG))
+    need(application.snapshot_path == str(SNAPSHOT), "unexpected_web_snapshot_path")
+
+
+def transaction_snapshots() -> dict[Path, tuple[bytes, int, int, int] | None]:
+    paths = [PUBLIC_STATE, BRIDGE, SNAPSHOT, NGINX_ROUTE]
+    paths.extend(CONSUMER_DIR / f"{name}.yaml" for name in CONSUMERS)
+    return {path: snapshot_file(path) for path in paths}
+
+
+def begin_transaction(previous: Path, report: dict, snapshots: dict, units: dict) -> Path:
+    """Retain root-only baseline evidence across SIGKILL or host interruption.
+
+    An unresolved transaction is never replayed automatically. Preflight blocks
+    a second apply until an operator reconciles these exact captured bytes.
+    """
+    path = STATE_DIR / "transaction.json"
+    need(not path.exists() and not path.is_symlink(), "unfinished_deployment_requires_operator_reconciliation")
+    files = {str(name): None if value is None else
+             [base64.b64encode(value[0]).decode("ascii"), *value[1:]]
+             for name, value in {**snapshots, **units}.items()}
+    atomic_write(path, canonical_json({"version": 1, "previous": str(previous),
+                 "baseline_health": report.get("baseline_health", "healthy"),
+                 "services": report["services"], "direct_health": report["direct_health"],
+                 "public_health": report["public_health"],
+                 "public_root": report.get("public_root"), "files": files}), 0o600)
+    return path
+
+
+def rollback_previous(previous, report, snapshots, units, maintenance):
+    """Restore exact authority before reopening traffic or durable dispatch."""
+    degraded = report.get("baseline_health") == "degraded"
+    errors = run_rollback_steps([
+        ("quiesce", stop_recovery_units),
+        ("stop_web", stop_recovery_web),
+    ])
+    if not errors:
+        errors.extend(run_rollback_steps([
+            ("restore_units", lambda: restore_units(units)),
+            ("restore_current", lambda: atomic_symlink(previous, CURRENT)),
+            *[(f"restore:{path.name}", lambda p=path, s=value: restore_file(p, s))
+              for path, value in snapshots.items()],
+            ("daemon_reload", lambda: run("/usr/bin/systemctl", "daemon-reload")),
+        ]))
+    if not errors:
+        def verify():
+            need(CURRENT.resolve(strict=True) == previous, "rollback_current_mismatch")
+            for path, value in {**snapshots, **units}.items():
+                need(snapshot_file(path) == value, f"rollback_file_mismatch:{path.name}")
+            need(unit_state("agent-platform-web.service") in {"inactive", "failed"},
+                 "rollback_web_not_quiescent")
+            if not degraded:
+                assert_candidate_ready(previous, None)
+                run("/usr/bin/systemctl", "reset-failed", "agent-platform-web.service")
+                run("/usr/bin/systemctl", "start", "agent-platform-web.service")
+                wait_http_status("http://127.0.0.1:3010/agent-platform/health", "401")
+                need(unit_state("agent-platform-web.service") == "active", "rollback_web_not_active")
+            run("/usr/sbin/nginx", "-t")
+            run("/usr/bin/systemctl", "reload", "nginx")
+            public = http_status("https://2.28.67.165/agent-platform/health")
+            need(public in RECOVERY_FAIL_CLOSED_PUBLIC_STATUSES if degraded else public == "401",
+                 "rollback_public_boundary_open")
+            need(http_status("https://2.28.67.165/") == report["public_root"], "rollback_root_changed")
+        errors.extend(run_rollback_steps([("verify_rollback", verify)]))
+    if not errors:
+        errors.extend(run_rollback_steps([("restore_timers", start_telemetry_timers)]))
+    if errors:
+        errors.extend(run_rollback_steps([
+            ("quiesce_incomplete_rollback", stop_recovery_units),
+            ("fail_closed_route", lambda: atomic_write(NGINX_ROUTE, maintenance, 0o644)),
+            ("nginx_test", lambda: run("/usr/sbin/nginx", "-t")),
+            ("nginx_reload", lambda: run("/usr/bin/systemctl", "reload", "nginx")),
+        ]))
     return errors
 
 
@@ -1256,6 +1411,11 @@ def switch_runtime(
         "start",
         "agent-platform-export.service",
     )
+    # Wants=/After= do not propagate a failed bridge to the exporter. Check
+    # both the producer result and its newly generated contract-bound bytes.
+    need(run("/usr/bin/systemctl", "show", "agent-platform-herdr.service",
+             "--property=Result", "--value") == "success", "bridge_service_failed")
+    assert_candidate_ready(target, document)
     run(
         "/usr/bin/systemctl",
         "start",
@@ -1377,7 +1537,7 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
     need(CURRENT.is_symlink(), "current_is_not_symlink")
     previous = CURRENT.resolve(strict=True)
     need(previous == LEGACY or previous.parent == RELEASES, "unexpected_previous_release")
-    config_digest = install_consumers(candidate, release["config_contract_sha256"])
+    config_digest = release["config_contract_sha256"]
     hashes = expected_hashes(candidate / "deploy" / "herdr" / "cutover" /
                              "legacy-quantlab-staging-01.sha256")
     active_route = NGINX_ROUTE.read_bytes()
@@ -1407,6 +1567,8 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
     unit_snapshots = snapshot_units()
     previous_unit_hashes = snapshot_unit_hashes(unit_snapshots)
     public_state_snapshot = snapshot_file(PUBLIC_STATE)
+    baseline_snapshots = transaction_snapshots()
+    degraded = report.get("baseline_health") == "degraded"
 
     STATE_DIR.mkdir(
         parents=True,
@@ -1415,6 +1577,7 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
     )
 
     for directory in (STATE_DIR.parent, STATE_DIR):
+        need(not directory.is_symlink(), "unsafe_state_directory")
         info = directory.stat()
         need(
             info.st_uid == 0
@@ -1436,8 +1599,16 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
     timers_stopped = False
     watchdog_stopped = False
     evidence_moved = False
+    transaction = begin_transaction(previous, report, baseline_snapshots, unit_snapshots)
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def interrupted(_number, _frame):
+        raise KeyboardInterrupt("deployment_interrupted")
+
+    signal.signal(signal.SIGTERM, interrupted)
 
     try:
+        install_consumers(candidate, config_digest)
         atomic_write(
             NGINX_ROUTE,
             maintenance,
@@ -1458,12 +1629,7 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
             "public_root_changed",
         )
 
-        run(
-            "/usr/bin/systemctl",
-            "stop",
-            "agent-platform-export.timer",
-            "agent-platform-herdr.timer",
-        )
+        stop_recovery_units()
         timers_stopped = True
 
         run(
@@ -1498,34 +1664,29 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
         # the previous release services.
         # --------------------------------------------------------
 
-        restore_units(unit_snapshots)
+        if not degraded:
+            restore_units(unit_snapshots)
+            # The marker must precede export; otherwise the previous runtime
+            # publishes the candidate identity during the rollback exercise.
+            restore_file(PUBLIC_STATE, public_state_snapshot)
+            switch_runtime(previous, None)
 
-        switch_runtime(
-            previous,
-            None,
-        )
-
-        restore_file(
-            PUBLIC_STATE,
-            public_state_snapshot,
-        )
-
-        need(
-            CURRENT.resolve(strict=True) == previous,
-            "rollback_current_mismatch",
-        )
-
-        for path, digest in previous_unit_hashes.items():
             need(
-                digest_file(path) == digest,
-                f"rollback_unit_mismatch:{path.name}",
+                CURRENT.resolve(strict=True) == previous,
+                "rollback_current_mismatch",
             )
 
-        need(
-            http_status("https://2.28.67.165/")
-            == root_status,
-            "rollback_root_changed",
-        )
+            for path, digest in previous_unit_hashes.items():
+                need(
+                    digest_file(path) == digest,
+                    f"rollback_unit_mismatch:{path.name}",
+                )
+
+            need(
+                http_status("https://2.28.67.165/")
+                == root_status,
+                "rollback_root_changed",
+            )
 
         # --------------------------------------------------------
         # Final candidate promotion — still NO durable dispatch.
@@ -1562,7 +1723,9 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
             **document,
             "release_path": str(candidate),
             "previous_path": str(previous),
-            "rollback_exercised": True,
+            "rollback_exercised": not degraded,
+            "rollback_mode": "skipped_known_degraded_previous" if degraded else "healthy_boot_exercised",
+            "baseline_health": report.get("baseline_health", "healthy"),
             "public_root_status": root_status,
             "archive_sha256": digest_file(
                 evidence_archive
@@ -1608,6 +1771,7 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
         # route and health evidence are durable.
         start_watchdog_service()
         watchdog_stopped = False
+        remove_regular_file(transaction)
 
         return {
             "status": "success",
@@ -1616,360 +1780,34 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
         }
 
     except BaseException as original_error:
-        # Durable execution stays quiescent for the whole recovery.
-        run(
-            "/usr/bin/systemctl",
-            "stop",
-            "agent-stack-watchdog.service",
-            check=False,
-        )
-        watchdog_stopped = True
-
-        rollback_steps = [
-            (
-                "restore_units",
-                lambda: restore_units(unit_snapshots),
-            ),
-        ]
-
-        if switched:
-            rollback_steps.append(
-                (
-                    "restore_current",
-                    lambda: atomic_symlink(
-                        previous,
-                        CURRENT,
-                    ),
-                )
-            )
-
-        rollback_steps.extend(
-            [
-                (
-                    "restore_public_state",
-                    lambda: restore_file(
-                        PUBLIC_STATE,
-                        public_state_snapshot,
-                    ),
-                ),
-                (
-                    "daemon_reload",
-                    lambda: run(
-                        "/usr/bin/systemctl",
-                        "daemon-reload",
-                    ),
-                ),
-                (
-                    "reset_previous_rate_limits",
-                    lambda: run(
-                        "/usr/bin/systemctl",
-                        "reset-failed",
-                        "agent-platform-herdr.service",
-                        "agent-platform-export.service",
-                        "agent-platform-web.service",
-                    ),
-                ),
-                (
-                    "start_previous_export",
-                    lambda: run(
-                        "/usr/bin/systemctl",
-                        "start",
-                        "agent-platform-export.service",
-                    ),
-                ),
-                (
-                    "start_previous_web",
-                    lambda: run(
-                        "/usr/bin/systemctl",
-                        "start",
-                        "agent-platform-web.service",
-                    ),
-                ),
-            ]
-        )
-
-        if timers_stopped:
-            rollback_steps.append(
-                (
-                    "restart_timers",
-                    lambda: run(
-                        "/usr/bin/systemctl",
-                        "start",
-                        "agent-platform-herdr.timer",
-                        "agent-platform-export.timer",
-                    ),
-                )
-            )
-
-        rollback_steps.extend(
-            [
-                (
-                    "local_health",
-                    lambda: wait_http_status(
-                        "http://127.0.0.1:3010/"
-                        "agent-platform/health",
-                        "401",
-                    ),
-                ),
-                (
-                    "restore_nginx_route",
-                    lambda: atomic_write(
-                        NGINX_ROUTE,
-                        active_route,
-                        0o644,
-                    ),
-                ),
-                (
-                    "nginx_config_test",
-                    lambda: run(
-                        "/usr/sbin/nginx",
-                        "-t",
-                    ),
-                ),
-                (
-                    "nginx_reload",
-                    lambda: run(
-                        "/usr/bin/systemctl",
-                        "reload",
-                        "nginx",
-                    ),
-                ),
-                (
-                    "public_health",
-                    lambda: wait_http_status(
-                        "https://2.28.67.165/"
-                        "agent-platform/health",
-                        "401",
-                    ),
-                ),
-            ]
-        )
-
-        rollback_errors = run_rollback_steps(
-            rollback_steps
-        )
-
-        def verify_rollback():
-            need(
-                CURRENT.is_symlink()
-                and CURRENT.resolve(strict=True)
-                == previous,
-                "rollback_current_mismatch",
-            )
-
-            for path, digest in previous_unit_hashes.items():
-                need(
-                    digest_file(path) == digest,
-                    f"rollback_unit_mismatch:{path.name}",
-                )
-
-            need(
-                snapshot_file(PUBLIC_STATE)
-                == public_state_snapshot,
-                "rollback_public_state_mismatch",
-            )
-
-            need(
-                digest_file(NGINX_ROUTE)
-                == sha256(active_route),
-                "rollback_nginx_route_mismatch",
-            )
-
-            need(
-                run(
-                    "/usr/bin/systemctl",
-                    "is-active",
-                    "agent-platform-web.service",
-                )
-                == "active",
-                "rollback_web_not_active",
-            )
-
-            for timer in (
-                "agent-platform-herdr.timer",
-                "agent-platform-export.timer",
-            ):
-                need(
-                    run(
-                        "/usr/bin/systemctl",
-                        "is-active",
-                        timer,
-                    )
-                    == "active",
-                    f"rollback_timer_not_active:{timer}",
-                )
-
-            need(
-                http_status(
-                    "http://127.0.0.1:3010/"
-                    "agent-platform/health"
-                )
-                == "401",
-                "rollback_local_health_failed",
-            )
-
-            need(
-                http_status(
-                    "https://2.28.67.165/"
-                    "agent-platform/health"
-                )
-                == "401",
-                "rollback_public_health_failed",
-            )
-
-            need(
-                http_status("https://2.28.67.165/")
-                == root_status,
-                "rollback_root_changed",
-            )
-
-        rollback_errors.extend(
-            run_rollback_steps(
-                [
-                    (
-                        "verify_rollback",
-                        verify_rollback,
-                    )
-                ]
-            )
-        )
-
-        def remove_success_state():
-            try:
-                state_path.unlink()
-            except FileNotFoundError:
-                pass
-
-        rollback_errors.extend(
-            run_rollback_steps(
-                [
-                    (
-                        "remove_success_state",
-                        remove_success_state,
-                    )
-                ]
-            )
-        )
-
-        def preserve_failed_archive():
-            source = (
-                evidence_archive
-                if evidence_moved
-                else archive
-            )
-
-            if not source.exists():
-                return
-
-            failed_archive = (
-                STATE_DIR
-                / (
-                    f"{document['deployed_at']}-"
-                    f"{identifier}.failed.tar.gz"
-                )
-            )
-
-            if failed_archive.exists():
-                failed_archive = (
-                    STATE_DIR
-                    / (
-                        f"{document['deployed_at']}-"
-                        f"{identifier}.failed-"
-                        f"{os.getpid()}.tar.gz"
-                    )
-                )
-
-            os.replace(
-                source,
-                failed_archive,
-            )
-
-        rollback_errors.extend(
-            run_rollback_steps(
-                [
-                    (
-                        "preserve_failed_archive",
-                        preserve_failed_archive,
-                    )
-                ]
-            )
-        )
-
-        if rollback_errors:
-            # Recovery is not proven coherent. Keep the public Agent
-            # Platform route fail-closed and never reopen dispatch.
-            fail_closed_errors = run_rollback_steps(
-                [
-                    (
-                        "fail_closed_route",
-                        lambda: atomic_write(
-                            NGINX_ROUTE,
-                            maintenance,
-                            0o644,
-                        ),
-                    ),
-                    (
-                        "fail_closed_nginx_test",
-                        lambda: run(
-                            "/usr/sbin/nginx",
-                            "-t",
-                        ),
-                    ),
-                    (
-                        "fail_closed_nginx_reload",
-                        lambda: run(
-                            "/usr/bin/systemctl",
-                            "reload",
-                            "nginx",
-                        ),
-                    ),
-                ]
-            )
-
-            run(
-                "/usr/bin/systemctl",
-                "stop",
-                "agent-stack-watchdog.service",
-                check=False,
-            )
-
-            raise ReleaseError(
-                "deployment_failed:"
-                f"{type(original_error).__name__}:"
-                f"{original_error};"
-                "rollback_incomplete:"
-                + "|".join(
-                    rollback_errors
-                    + fail_closed_errors
-                )
-            ) from original_error
-
-        watchdog_errors = run_rollback_steps(
-            [
-                (
-                    "start_watchdog",
-                    start_watchdog_service,
-                )
-            ]
-        )
-
-        if watchdog_errors:
-            run(
-                "/usr/bin/systemctl",
-                "stop",
-                "agent-stack-watchdog.service",
-                check=False,
-            )
-
-            raise ReleaseError(
-                "deployment_failed:"
-                f"{type(original_error).__name__}:"
-                f"{original_error};"
-                "rollback_watchdog_incomplete:"
-                + "|".join(watchdog_errors)
-            ) from original_error
-
-        raise
+        rollback_errors = rollback_previous(
+            previous, report, baseline_snapshots, unit_snapshots, maintenance)
+        rollback_errors.extend(run_rollback_steps([
+            ("remove_success_state", lambda: remove_regular_file(state_path)),
+            ("preserve_failed_archive", lambda: os.replace(
+                evidence_archive if evidence_moved else archive,
+                STATE_DIR / f"{document['deployed_at']}-{identifier}.failed-{os.getpid()}.tar.gz")),
+        ]))
+        if not rollback_errors and report["services"]["agent-stack-watchdog.service"] == "active":
+            rollback_errors.extend(run_rollback_steps([("restore_watchdog", start_watchdog_service)]))
+        if not rollback_errors:
+            remove_regular_file(transaction)
+        else:
+            # Even an evidence-write failure prevents a completed rollback
+            # claim. Retain the journal and quiesce dispatch for reconciliation.
+            rollback_errors.extend(run_rollback_steps([
+                ("quiesce_incomplete_rollback", stop_recovery_units),
+                ("fail_closed_route", lambda: atomic_write(NGINX_ROUTE, maintenance, 0o644)),
+                ("nginx_test", lambda: run("/usr/sbin/nginx", "-t")),
+                ("nginx_reload", lambda: run("/usr/bin/systemctl", "reload", "nginx")),
+            ]))
+        outcome = "rollback_degraded:previous_restored_web_inactive" if degraded else "rollback_healthy"
+        raise ReleaseError(
+            f"deployment_failed:{type(original_error).__name__}:{original_error};"
+            + ("rollback_incomplete:" + "|".join(rollback_errors) if rollback_errors else outcome)
+        ) from original_error
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 @serialized_deployment
