@@ -95,6 +95,31 @@ class CommandProposal:
             raise ProposalDenied("rendered_request_too_large")
         return proposal
 
+    @classmethod
+    def from_github_issue(cls, issue: dict[str, Any]) -> "CommandProposal":
+        """Verify the entire canonical proposal body, never infer authorization."""
+        if (type(issue) is not dict or issue.get("state") != "open"
+                or "pull_request" in issue or type(issue.get("number")) is not int
+                or issue["number"] <= 0
+                or type(issue.get("title")) is not str
+                or type(issue.get("body")) is not str
+                or len(issue["body"].encode("utf-8")) > 16384):
+            raise ProposalDenied("invalid_proposal_issue")
+        body = issue["body"]
+        marker = chr(96) * 3 + "json\n"
+        tail = "\n" + chr(96) * 3 + "\n\n"
+        try:
+            json_part = body.split(marker, 1)[1].split(tail, 1)[0]
+        except IndexError as exc:
+            raise ProposalDenied("missing_proposal_envelope") from exc
+        if len(json_part.encode("utf-8")) > MAX_BYTES:
+            raise ProposalDenied("invalid_proposal_size")
+        proposal = cls.parse(json_part.encode("utf-8"))
+        expected = proposal.github_issue_proposal()
+        if issue["title"] != expected["title"] or body != expected["body"]:
+            raise ProposalDenied("proposal_changed_or_noncanonical")
+        return proposal
+
     def request(self) -> dict[str, Any]:
         return {
             "version": VERSION, "repository": ROOT_REPOSITORY, "root_issue": ROOT_ISSUE,
