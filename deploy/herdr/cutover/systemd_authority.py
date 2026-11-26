@@ -146,6 +146,7 @@ class SystemdAuthority:
             self.unit_dir, Path("/run/systemd/system"),
             Path("/usr/local/lib/systemd/system"), Path("/usr/lib/systemd/system"))
         self.observed = {}
+        self.absent = set()
         self.policy_path = api.get("HOST_POLICY_PATH", Path("/etc/herdr/host-policy.json"))
 
     def observe(self, path):
@@ -157,6 +158,8 @@ class SystemdAuthority:
     def verify_observations(self):
         need(all(stamp(path.lstat()) == value for path, value in self.observed.items()),
              "authority_changed_during_capture")
+        need(all(not os.path.lexists(path) for path in self.absent),
+             "authority_appeared_during_capture")
 
     def approved_dependencies(self):
         descriptor = json.loads((self.api["ROOT"] / "deploy/herdr/cutover/capacity-repair-authority.json").read_bytes())
@@ -187,8 +190,13 @@ class SystemdAuthority:
 
     def capture(self, *, allow_capacity=True, allow_fence=False):
         self.observed = {}
-        need(allow_fence or not os.path.lexists(self.api["watchdog_permit_path"]()),
+        self.absent = set()
+        permit = self.api["watchdog_permit_path"]()
+        present = os.path.lexists(permit)
+        need(allow_fence or not present,
              "orphan_watchdog_start_permit")
+        if not present:
+            self.absent.add(permit)
         rows, drops = {}, {}
         capacity = os.path.lexists(self.dropin)
         if capacity:
@@ -235,6 +243,7 @@ class SystemdAuthority:
                 for name in folders:
                     folder = prefix / name
                     if not os.path.lexists(folder):
+                        self.absent.add(folder)
                         continue
                     safe_ancestors(folder)
                     directory = self.observe(folder)

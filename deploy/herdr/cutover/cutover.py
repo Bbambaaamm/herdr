@@ -1936,6 +1936,7 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
         start_watchdog_service()
         watchdog_stopped = False
         cleanup_watchdog_fence()
+        verify_candidate_systemd_runtime(candidate, report["systemd_authority"])
         remove_regular_file(transaction)
 
         return {
@@ -1961,7 +1962,10 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
             if not rollback_errors:
                 rollback_errors.extend(run_rollback_steps([("restore_watchdog", start_watchdog_service)]))
         if not rollback_errors:
-            rollback_errors.extend(run_rollback_steps([("cleanup_watchdog_fence", cleanup_watchdog_fence)]))
+            rollback_errors.extend(run_rollback_steps([
+                ("cleanup_watchdog_fence", cleanup_watchdog_fence),
+                ("verify_after_fence_cleanup", lambda: verify_systemd_authority(report["systemd_authority"])),
+            ]))
         if not rollback_errors:
             remove_regular_file(transaction)
         else:

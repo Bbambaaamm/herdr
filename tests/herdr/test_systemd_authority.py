@@ -231,3 +231,16 @@ def test_W07_baseline_drift_during_external_reads_is_rejected(manager, monkeypat
     monkeypatch.setattr(manager.authority, "external_dependencies", race)
     with pytest.raises(ReleaseError, match="authority_changed_during_capture"):
         manager.authority.capture()
+
+
+def test_W25_absent_dropin_directory_created_late_is_rejected(manager, monkeypatch):
+    real = manager.authority.external_dependencies
+    def race():
+        result = real()
+        directory = manager.units / (s.WATCHDOG + ".d")
+        directory.mkdir()
+        (directory / "unknown.conf").write_text("[Service]\nEnvironment=EVIL=1")
+        return result
+    monkeypatch.setattr(manager.authority, "external_dependencies", race)
+    with pytest.raises(ReleaseError, match="authority_appeared_during_capture"):
+        manager.authority.capture()
