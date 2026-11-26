@@ -139,6 +139,7 @@ def test_merge_durable_claims_does_not_erase_consumption(intake):
 
 def test_legacy_root_approval_still_has_no_proposal_claim(intake):
     _, admission, consumer, issue, task_id = inputs()
+    admission = {k: v for k, v in admission.items() if k != "proposal_selection"}
     with intake.intake_lock():
         intake._consume_admission(consumer, issue, task_id, admission)
         intake._mark_admission_published(consumer, issue, task_id, admission)
@@ -232,6 +233,136 @@ def test_repeated_content_under_different_issue_fails_closed(intake):
             {**admission, "approval_id": 5401}, proposal_binding=new)
 
 
+def test_selected_approval_cannot_be_queued_implicitly(intake, monkeypatch):
+    binding, admission, _, _, _ = inputs()
+    consumer, issue = _queue_setup(intake, monkeypatch, admission)
+    before = intake.STATE.exists()
+    with intake.intake_lock(), pytest.raises(intake.AdmissionDenied,
+                                             match="root-proposal-selection-requires-binding"):
+        intake._queue_issue_locked(consumer, issue, [])
+    assert intake.STATE.exists() is before
+    assert list(intake.PENDING.glob("*.json")) == []
+
+
+def test_root_selection_mismatch_never_consumes_state(intake):
+    binding, admission, consumer, issue, task_id = inputs()
+    wrong = copy.deepcopy(admission)
+    wrong["proposal_selection"]["digest"] = "0" * 64
+    with intake.intake_lock(), pytest.raises(intake.AdmissionDenied):
+        intake._consume_admission(consumer, issue, task_id, wrong,
+                                  proposal_binding=binding)
+    assert not intake.STATE.exists()
+    assert not list(intake.PENDING.glob("*.json"))
+
+
+def test_legacy_root_approval_cannot_bind_selected_proposal(intake):
+    binding, admission, consumer, issue, task_id = inputs()
+    legacy = {key: value for key, value in admission.items()
+              if key != "proposal_selection"}
+    with intake.intake_lock(), pytest.raises(intake.AdmissionDenied):
+        intake._consume_admission(consumer, issue, task_id, legacy,
+                                  proposal_binding=binding)
+    assert not intake.STATE.exists()
+
+
+def test_selected_root_prompt_is_exact_target_not_backlog(intake, monkeypatch):
+    binding, admission, _, _, task_id = inputs()
+    consumer, issue = _queue_setup(intake, monkeypatch, admission)
+    with intake.intake_lock():
+        intake._queue_issue_locked(consumer, issue, [], proposal_binding=binding)
+    task = json.loads((intake.PENDING / (task_id + ".json")).read_text())
+    prompt = task["prompt"]
+    assert "ONE EXACTLY SELECTED" in prompt
+    assert "pull_request #253" in prompt
+    assert "https://github.com/Bbambaaamm/herdr/pull/253" in prompt
+    assert binding["proposal_digest"] in prompt
+    assert "Do not choose another backlog issue" in prompt
+    assert "Continue authorized root cycle." not in prompt
+
+
+def test_legacy_root_prompt_stays_unchanged(intake, monkeypatch):
+    _, admission, _, _, task_id = inputs()
+    legacy = {k: v for k, v in admission.items() if k != "proposal_selection"}
+    consumer, issue = _queue_setup(intake, monkeypatch, legacy)
+    with intake.intake_lock():
+        intake._queue_issue_locked(consumer, issue, [])
+    task = json.loads((intake.PENDING / (task_id + ".json")).read_text())
+    assert task["prompt"] == "Continue authorized root cycle."
+
+
+def test_malformed_claim_state_never_survives_existing_state_reader(intake):
+    binding, admission, consumer, issue, task_id = inputs()
+    with intake.intake_lock():
+        intake._consume_admission(consumer, issue, task_id, admission,
+                                  proposal_binding=binding)
+    raw = json.loads(intake.STATE.read_text())
+    receipt = raw["Bbambaaamm/herdr#53"]["proposal_consumptions"][binding["binding_sha256"]]
+    receipt["state"] = ["publication_pending"]
+    intake.STATE.write_text(json.dumps(raw))
+    with pytest.raises(intake.AdmissionDenied, match="proposal-consumption-row-invalid"):
+        intake.load_state()
+
+
+@pytest.mark.parametrize("record_state", [
+    "pending", "running", "blocked", "unknown",
+])
+def test_direct_selected_root_denies_active_or_unknown_existing_claim(
+    intake, monkeypatch, record_state,
+):
+    binding, admission, _, _, _ = inputs()
+    consumer, issue = _queue_setup(intake, monkeypatch, admission)
+    records = [{"state": record_state, "task": {"id": "existing-root"}}]
+    with intake.intake_lock(), pytest.raises(
+        intake.AdmissionDenied,
+        match="selected-root-existing-claim-requires-reconciliation",
+    ):
+        intake._queue_issue_locked(
+            consumer, issue, records, proposal_binding=binding,
+        )
+    assert not intake.STATE.exists()
+    assert not list(intake.PENDING.glob("*.json"))
+
+
+def test_codex_p2_pending_proposal_without_root_intent_fails_closed(intake):
+    """Codex finding at PR #259: damaged state must not lose quarantine."""
+    binding, admission, consumer, issue, task_id = inputs()
+    with intake.intake_lock():
+        intake._consume_admission(
+            consumer, issue, task_id, admission, proposal_binding=binding)
+    state = json.loads(intake.STATE.read_text())
+    row = state["Bbambaaamm/herdr#53"]
+    del row["admission_intent"]
+    intake.STATE.write_text(json.dumps(state))
+    with pytest.raises(intake.AdmissionDenied,
+                       match="proposal-consumption-pending-without-root-intent"):
+        intake.load_state()
+    newer = dict(admission, approval_id=5401)
+    newer_binding = dict(binding, root_approval_id=5401)
+    unsigned = {k: v for k, v in newer_binding.items() if k != "binding_sha256"}
+    import hashlib
+    newer_binding["binding_sha256"] = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    before = intake.STATE.read_bytes()
+    with intake.intake_lock(), pytest.raises(intake.AdmissionDenied):
+        intake._consume_admission(
+            consumer, issue, "github-herdr-issue-53-approval-5401",
+            newer, proposal_binding=newer_binding)
+    assert intake.STATE.read_bytes() == before
+
+
+def test_all_pending_proposal_claims_block_even_with_old_published_intent(intake):
+    binding, admission, consumer, issue, task_id = inputs()
+    with intake.intake_lock():
+        intake._consume_admission(
+            consumer, issue, task_id, admission, proposal_binding=binding)
+    state = json.loads(intake.STATE.read_text())
+    row = state["Bbambaaamm/herdr#53"]
+    row["admission_intent"]["state"] = "published"
+    intake.STATE.write_text(json.dumps(state))
+    with pytest.raises(intake.AdmissionDenied,
+                       match="proposal-consumption-pending-without-root-intent"):
+        intake.load_state()
 @pytest.mark.parametrize("retained_binding", ["missing", "changed"])
 def test_codex_p2_retained_queue_collision_requires_exact_proposal_binding(
     intake, monkeypatch, retained_binding,

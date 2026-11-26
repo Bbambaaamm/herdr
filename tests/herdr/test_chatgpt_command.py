@@ -172,6 +172,16 @@ def test_intake_proposal_inspection_does_not_grant_execution(monkeypatch):
     issue["body"] += "\nTampered"
     with pytest.raises(intake.AdmissionDenied):
         intake.inspect_chatgpt_proposal(ROOT_REPOSITORY, 255)
+
+
+@pytest.mark.parametrize("escaped", ["\\ud800", "\\udfff"])
+def test_surrogate_escape_is_denied_before_digest(escaped):
+    raw = request().replace(
+        b'"objective": "Fix native release read-only path"',
+        ('"objective": "' + escaped + '"').encode("ascii"),
+    )
+    with pytest.raises(ProposalDenied, match="invalid_objective"):
+        CommandProposal.parse(raw)
 def test_rendered_escape_expansion_never_creates_unreadable_proposal():
     # Exact-head Codex P2: the original parser admitted this 1400-backtick
     # payload but its escaped issue JSON exceeded MAX_BYTES.

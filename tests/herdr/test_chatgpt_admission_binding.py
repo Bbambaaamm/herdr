@@ -25,10 +25,15 @@ def fixture():
             "expires_at": (time + timedelta(minutes=30)).isoformat(),
             "issue_updated_at": (time - timedelta(minutes=1)).isoformat(),
         }
+    root = receipt(530, 5400, "b" * 64, early + timedelta(minutes=2))
+    root["proposal_selection"] = {
+        "issue_number": 300, "issue_id": 3000,
+        "digest": proposal.digest, "revision": "a" * 64,
+    }
     return dict(
         proposal=proposal, proposal_issue=300, proposal_issue_id=3000,
         proposal_revision="a" * 64, proposal_admission=receipt(3000, 3100, "a" * 64, early),
-        root_revision="b" * 64, root_admission=receipt(530, 5400, "b" * 64, early + timedelta(minutes=2)),
+        root_revision="b" * 64, root_admission=root,
         consumed_proposals=set(),
     )
 
@@ -111,6 +116,7 @@ def test_intake_prepare_binding_uses_existing_approval_helper(monkeypatch):
     repo_row = {"id": 911, "full_name": repo}
     args["proposal_admission"]["content_sha256"] = m.issue_revision(repo, repo_row, proposal_issue)
     args["root_admission"]["content_sha256"] = m.issue_revision(repo, repo_row, root_issue)
+    args["root_admission"]["proposal_selection"]["revision"] = args["proposal_admission"]["content_sha256"]
     monkeypatch.setattr(m, "load_consumers", lambda: [
         {"consumer": "herdr", "repository": repo, "mode": "root_only", "root_issue": 53}])
     monkeypatch.setattr(m, "authenticated_user", lambda: (9, "reader"))
@@ -145,6 +151,22 @@ def test_intake_prepare_binding_uses_existing_approval_helper(monkeypatch):
         m.prepare_chatgpt_proposal_binding(repo, 300)
 
 
+def test_timezone_offsets_do_not_reorder_approvals():
+    args = fixture()
+    args["proposal_admission"]["approved_at"] = "2026-11-25T12:00:00+02:00"
+    args["root_admission"]["approved_at"] = "2026-11-25T11:00:00+00:00"
+    # Chronologically valid even though the lexical timestamp order is reversed.
+    assert prepare_admission_binding(**args).root_approval_id == 5400
+    args["root_admission"]["approved_at"] = "2026-11-25T10:00:00+00:00"
+    with pytest.raises(ProposalBindingDenied):
+        prepare_admission_binding(**args)
+
+
+def test_timezone_missing_in_approval_denied():
+    args = fixture()
+    args["proposal_admission"]["approved_at"] = "2026-11-25T12:00:00"
+    with pytest.raises(ProposalBindingDenied, match="approval_time_invalid"):
+        prepare_admission_binding(**args)
 def test_binding_proposal_changed_during_root_validation_denied(monkeypatch):
     """Independent Codex P2: re-read proposal after all root checks."""
     import importlib.machinery
