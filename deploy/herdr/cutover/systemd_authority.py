@@ -253,8 +253,8 @@ class SystemdAuthority:
     def verify(self, authority, *, allow_fence=False):
         need(self.capture(allow_fence=allow_fence) == authority, "effective_systemd_authority_changed")
 
-    def reconcile(self, authority):
-        self.verify(authority)
+    def reconcile(self, authority, *, fenced=False):
+        self.verify(authority, allow_fence=fenced)
         self.api["ensure_watchdog_fence"]()
         self.verify(authority, allow_fence=True)
         if authority["mode"] == "capacity_rc6":

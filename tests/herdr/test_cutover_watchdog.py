@@ -150,6 +150,25 @@ def test_W26_healthy_exercise_retains_standard_authority(host):
     assert not host.c.watchdog_fence_path().exists()
 
 
+def test_W26_healthy_capacity_exercise_restores_then_reconciles(host, monkeypatch):
+    dropin, original = baseline_override(host)
+    ready = host.c.assert_candidate_ready
+    checked = []
+    def verify(target, document):
+        if target == host.previous:
+            assert host.c.snapshot_file(dropin) == original
+            assert not host.c.watchdog_permit_path().exists()
+            checked.append(target)
+        else:
+            assert not dropin.exists()
+        ready(target, document)
+    monkeypatch.setattr(host.c, "assert_candidate_ready", verify)
+    result = host.apply()
+    assert result["status"] == "success" and result["rollback_exercised"]
+    assert checked == [host.previous]
+    assert not dropin.exists()
+
+
 def test_W07_candidate_unit_drift_cannot_validate_itself(host, monkeypatch):
     c = host.c
     c.CURRENT.unlink()

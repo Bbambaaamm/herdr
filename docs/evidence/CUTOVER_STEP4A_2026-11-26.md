@@ -90,6 +90,10 @@ this document does not claim them in advance.
 Independent read-only review found the missing reboot startup fence, insufficient
 candidate-unit binding, dependency directory membership race, stale-permit and
 incomplete-rollback permit lifecycle, retained-backup and cleanup error handling.
+Exact-HEAD review also reproduced the healthy RC6 + capacity-override exercise:
+the override must be restored before the previous-runtime check and reconciled
+again before final promotion. A dedicated W26 real-file regression covers both
+the restored baseline and final override absence.
 Actual systemd-analyze condition tests confirm OR-condition semantics without
 touching services. Final exact-HEAD independent acceptance is still required.
 

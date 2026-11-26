@@ -1404,8 +1404,8 @@ def permit_watchdog_start():
     atomic_write(watchdog_permit_path(), b"verified\n", 0o600)
 
 
-def reconcile_systemd_authority(authority):
-    return SystemdAuthority(globals()).reconcile(authority)
+def reconcile_systemd_authority(authority, *, fenced=False):
+    return SystemdAuthority(globals()).reconcile(authority, fenced=fenced)
 
 
 def verify_candidate_systemd_runtime(candidate, authority):
@@ -1819,6 +1819,8 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
 
         if not degraded:
             restore_units(unit_snapshots)
+            dropin = UNIT_DIR / "agent-stack-watchdog.service.d/126-capacity-repair.conf"
+            restore_file(dropin, baseline_snapshots[dropin])
             # The marker must precede export; otherwise the previous runtime
             # publishes the candidate identity during the rollback exercise.
             restore_file(PUBLIC_STATE, public_state_snapshot)
@@ -1844,6 +1846,10 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
         # --------------------------------------------------------
         # Final candidate promotion — still NO durable dispatch.
         # --------------------------------------------------------
+
+        if not degraded:
+            assert_no_active_durable_worker()
+            reconcile_systemd_authority(report["systemd_authority"], fenced=True)
 
         install_units(
             candidate,
