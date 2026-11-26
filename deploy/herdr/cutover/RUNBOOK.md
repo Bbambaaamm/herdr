@@ -1,98 +1,151 @@
 # Versioned Herdr runtime cutover
 
-This procedure migrates the existing Agent Platform services from the legacy
-`/opt/agent-platform/release` directory to an immutable, tagged Herdr release.
-It does not enable a consumer, add a tool or permission, change router state, or
-alter QuantLab execution. The external `herdr 0.9.1` binary remains the pinned
-dependency recorded by version, size, and SHA-256.
+This procedure supports initial migration from `/opt/agent-platform/release` and
+upgrades between immutable versioned Herdr releases. Runtime promotion does not
+activate a consumer, add permission, change host-policy, select a model, enable
+provider calls or alter QuantLab execution. The external `herdr 0.9.1` binary
+remains the dependency pinned by version, size and SHA-256.
 
 ## Release gate
 
-Use only an annotated tag whose `Release bundle` workflow completed successfully.
-Download that workflow's archive and adjacent `.sha256` artifact. Verify the
-download locally, then copy both files to a new mode-0700 directory owned by the
-operator on `quantlab-staging-01`. Never build a production archive from floating
-`main`, an untagged commit, or `v0.1.0-bootstrap`.
+Use only an annotated tag with a successful official `Release bundle` workflow.
+Download its archive and adjacent `.sha256` artifact and verify them before any
+host preparation. Never substitute an archive built from floating main, an
+untagged worktree or `v0.1.0-bootstrap`.
 
-The bundle is deterministic and contains a closed production payload, three
-validated consumer policy overlays, `RELEASE.json`, and `MANIFEST.sha256`. It does
-not contain secrets, credentials, databases, logs, prompts, raw queries, or the
-external Herdr binary.
+The deterministic bundle contains the closed production payload, **five** validated
+consumer policy overlays (Heating, Herdr, LOXXESS, Majak and QuantLab),
+`RELEASE.json` and `MANIFEST.sha256`. It excludes secrets, credentials, databases,
+logs, prompts, raw queries and the external Herdr binary. Consumer activation,
+model/provider admission and deployment approval remain separate gates.
 
-## Read-only preflight
+## Normal baseline classification
 
-The preflight reads the root-owned deployed-release marker and exact installed unit
-bytes. It therefore runs only as root from an immutable, root-owned controller tree
-under `/opt/herdr/releases/<tag>-<sha12>` or
-`/var/lib/herdr/incoming/<private-stage>`. This does not grant `agentops`
-general sudo access and is not a deployment operation.
+| Baseline | Required behavior |
+|---|---|
+| Healthy | Web active, direct/public unauthenticated health 401 and existing integrity/service gates pass. Apply exercises a healthy previous-release boot before final promotion. |
+| Degraded but eligible | Versioned current release with failed/inactive web; exact release tree, public marker, units and consumer identity coherent; live Herdr socket; active telemetry timers/watchdog; no durable worker; direct health unavailable (connection refused/000, 502 or 503) and public boundary fail-closed (401, 502 or 503). Apply skips the known-broken previous web boot and records that fact. |
+| Unsafe/inconsistent | Reject missing or mismatched identity/manifest/marker, drifted units/configuration, wrong owner/mode, unavailable socket, unsafe boundary, active durable worker, or unfinished transaction journal. Web failure alone is not permission to ignore these checks. |
 
-First copy the verified archive and its adjacent `.sha256` into a fresh private
-staging directory owned by root, extract it without a mutable user-controlled
-source, and verify the archive. Then run the reviewed cutover program with isolated
-Python flags:
+The pre-manifest legacy directory is supported only through the existing pinned
+legacy commit/binary/unit gates. It is not a generic degraded baseline and must
+not be given invented versioned metadata.
+
+## Controller placement and arguments
+
+Preflight reads root-owned deployed metadata and installed unit bytes. It must
+run as root from an immutable, manifest-valid controller. `ROOT.parent` must be
+**exactly** `/opt/herdr/releases` or `/var/lib/herdr/incoming`, and ROOT's basename
+must be `<tag>-<commit12>` as required by `verify_tree`. Do not add another directory
+between an approved prefix and the extracted release root. For a not-yet-installed
+normal candidate, prepare this exact layout through the separately authorized
+operator path:
+
+- controller: `/var/lib/herdr/incoming/<tag>-<commit12>/`;
+- input archive: `/var/lib/herdr/incoming/<private-archive-stage>/REVIEWED.tar.gz`;
+- archive stage root-owned mode 0700; all controller ancestors/source artifacts
+  root-owned, not group/other writable, without unsafe symlinks/import artifacts.
+
+The controller must be the same release as the normal candidate. Running it from
+`/home`, `/tmp` or a mutable worktree is rejected. Preparing these protected paths
+requires separate host authorization; the source/release workflow does not do it.
+
+`--expected-legacy-commit` always refers to the value in
+`/opt/agent-platform/release/DEPLOYED_GIT_SHA`, even when current points to RC6 or
+another versioned release. It is **not** the current versioned release commit.
+Versioned current identity is verified separately against its tree, installed
+units and trusted public marker. Read and verify the legacy value before use;
+do not replace it with the RC6, candidate or main SHA.
+
+## Read-only normal preflight
+
+After archive verification and authorized immutable-controller preparation:
 
 ```sh
-sudo /usr/bin/python3 -I -B deploy/herdr/cutover/cutover.py preflight \
-  --archive /var/lib/herdr/incoming/<private-stage>/REVIEWED.tar.gz \
-  --expected-legacy-commit <verified-current-legacy-sha>
+sudo /usr/bin/python3 -I -B \
+  /var/lib/herdr/incoming/<tag>-<commit12>/deploy/herdr/cutover/cutover.py preflight \
+  --archive /var/lib/herdr/incoming/<private-archive-stage>/REVIEWED.tar.gz \
+  --expected-legacy-commit <verified-legacy-DEPLOYED_GIT_SHA>
 ```
 
-The controller verifies that the executable tree is root-owned, non-writable by
-group/other, and located only in an approved immutable prefix before reading any
-protected state. Preflight is read-only: it verifies the annotated release metadata
-and every bundle hash, consumer schemas, external binary, exact legacy commit,
-known unit/Nginx hashes, service state, current authentication boundary, and a
-content-only diff between the legacy and candidate runtime. It emits no source
-contents or secrets. Any mismatch, permission error, symlink change, or metadata
-TOCTOU is a hard stop. Running from `/home`, `/tmp`, or a mutable worktree is
-rejected.
+Placeholders must be replaced with the verified artifact paths and legacy value.
+Preflight does not switch releases, change services, policy or configuration. It
+verifies the controller and archive, consumer schemas, external binary, pinned
+legacy identity, unit/Nginx hashes, current baseline classification, authentication
+boundary and content-only legacy/candidate comparison. Temporary extraction is
+bounded; no source contents or secrets are emitted. Any integrity/ownership/TOCTOU
+failure is a hard stop.
 
-## Single privileged step
+Require `status=preflight_ok`, expected `release.tag`, full `release.commit`,
+`current` and `baseline_health`. Derive the apply confirmation **only after this
+successful actual preflight** from its `release.tag` plus `-` plus the first twelve
+characters of its `release.commit`; the implementation does not emit a separate
+confirmation-token field. Do not guess a token from a historical example.
 
-After preflight and the release workflow are green, run exactly one privileged
-command. The confirmation is the release tag plus the first twelve commit
-characters printed by preflight:
+## Authorized normal apply
+
+Only after successful preflight, release verification and explicit deployment
+approval, use the same controller, archive and legacy value:
 
 ```sh
-sudo /usr/bin/python3 -I -B deploy/herdr/cutover/cutover.py apply \
-  --archive /home/quantadmin/herdr-cutover/REVIEWED.tar.gz \
-  --expected-legacy-commit 41179635c8654a60c5d9234acccb6e91b2028b72 \
-  --confirm vX.Y.Z-rc.N-0123456789ab
+sudo /usr/bin/python3 -I -B \
+  /var/lib/herdr/incoming/<tag>-<commit12>/deploy/herdr/cutover/cutover.py apply \
+  --archive /var/lib/herdr/incoming/<private-archive-stage>/REVIEWED.tar.gz \
+  --expected-legacy-commit <verified-legacy-DEPLOYED_GIT_SHA> \
+  --confirm <confirmation-derived-from-successful-actual-preflight>
 ```
 
-The apply operation:
+Apply holds the existing root-only deployment lock, repeats preflight, installs
+an immutable candidate, captures exact prior authority and a root-only fsynced
+transaction journal, and installs policy overlays only if absent or byte-identical.
+It reserves dashboard traffic with maintenance 503 and quiesces timers, their
+oneshots and watchdog; an active durable worker blocks promotion.
 
-1. repeats the full preflight as root;
-2. installs an immutable `/opt/herdr/releases/<tag>-<sha12>` directory;
-3. installs the exact policy overlays under `/etc/herdr/consumers` only when absent,
-   refusing any mismatch on repeat;
-4. changes the Agent Platform services and the durable agent-stack watchdog
-   to execute through `/opt/herdr/current`, with dispatcher/worker/recovery/
-   maintenance helpers resolved from that same immutable release;
-5. reserves the public dashboard paths with the fail-closed maintenance fragment;
-6. stops the durable watchdog, refuses promotion while any
-   `agent-task-worker` remains active, and keeps durable dispatch quiescent through
-   candidate verification and rollback exercise, snapshotting and restoring
-   the exact previous systemd unit bytes and deployed-release marker;
-7. atomically switches `current`, publishes only bounded tag/SHA/config metadata,
-   and verifies the internal health boundary and Herdr sandbox;
-8. switches back to the previous release, restores and verifies the exact
-   previous systemd units and deployed-release marker, then promotes the candidate
-   again—exercising rollback of both web/export and durable orchestration before
-   public activation; the durable watchdog remains stopped throughout all
-   intermediate transitions;
-9. restores the exact authenticated Nginx route and proves the QuantLab root status
-   and unauthenticated `401` boundary are unchanged.
+Before **every candidate web start**, require successful bridge oneshot, live
+socket, fresh bridge rows and snapshot, closed target-specific schema, matching
+release/bridge data, exact telemetry ownership/mode, and the target web config/auth
+checks. The entire historical import closure must be safe; exporter exit zero or
+an unauthenticated 401 alone is insufficient. Readiness is checked, not assumed
+from a fixed delay.
 
-An `already_deployed` result is accepted only when the current symlink,
-all candidate systemd units, installed consumer policy digest, and bounded
-`deployed-release.json` identify the same immutable release.
+Healthy baselines exercise the previous web boot: restore previous units and
+marker **before** exporting previous-release telemetry, validate it, then promote
+the candidate again. Degraded baselines skip that broken web exercise and record
+`rollback_exercised=false`, `rollback_mode=skipped_known_degraded_previous`.
+They must never claim an exercised healthy rollback. Final public health/current
+identity and durable evidence precede stable watchdog takeover. An
+`already_deployed` result requires coherent current symlink, all units, installed
+consumer digest and public marker, not just an existing release directory.
 
-Any failure atomically returns `current` to the prior release, restarts the same
-services, and restores the exact prior Nginx fragment. The route remains fail-closed
-during the operation. No database, credential, consumer state, shared vhost, or
-legacy release is deleted.
+## Failure, rollback and interruption
+
+On candidate failure, quiesce timers/oneshots, web and watchdog before restoring
+exact previous symlink, units, consumer files, marker, bridge and snapshot
+bytes/modes/owners. Verify restoration before reactivation. Healthy rollback then
+regenerates previous-release telemetry, validates freshness, starts web and waits
+for public 401/Nginx convergence. Degraded rollback leaves web inactive instead of
+recreating a failed service; it verifies the fail-closed boundary. Timers may
+refresh restored telemetry after verification. Dispatch reopens only after
+restoration, verification and failed-archive preservation succeed.
+
+Outcomes distinguish successful promotion, `rollback_healthy`, `rollback_degraded`
+and `rollback_incomplete`. A failed upgrade still exits 78. Incomplete rollback
+retains maintenance/quiescence and the journal for operator intervention; a failed
+restore never grants permission to continue service activation. No database,
+credential, consumer state, shared vhost or legacy release is deleted.
+
+SIGTERM/interrupt takes the same rollback path. SIGKILL or power loss cannot run
+cleanup: `/var/lib/herdr/deployments/transaction.json` remains and blocks both
+normal and historical RC8 preflight before archive validation. Reconcile its
+captured authority against actual host state under the existing privileged
+operator/deployment gates. Never remove it merely to make retry pass. No automatic
+journal replay, policy expansion, provider activation or retry authority is added.
+Successful apply or verified rollback removes the journal durably.
+
+The T01–T15 matrix and offline evidence are in
+`docs/evidence/CUTOVER_STEP2_2026-11-26.md`. Offline verification is not a live
+staging deployment. QuantLab stays PAPER-only; Heating actuation stays disabled;
+all other consumer invariants and separate activation gates remain authoritative.
 
 ## Heating repository-only consumer activation
 
@@ -143,10 +196,12 @@ consumer invariants unchanged. QuantLab remains PAPER-only; Heating actuation st
 disabled; Maják provenance rules remain authoritative.
 
 
-## Degraded RC8 recovery
+## Historical exact RC8 recovery — never use for RC6
 
-The normal `apply` path remains strict and requires a healthy authenticated
-previous runtime plus an exercised healthy rollback boot.
+This separate mode is restricted to the exact RC8-to-RC12 identities below.
+For RC6 and other eligible versioned baselines, use normal `preflight`/`apply`
+with the healthy/degraded classification described above. A failed RC6 web does
+not authorize `recovery-preflight` or `recovery-apply`.
 
 A separate `recovery-preflight` / `recovery-apply` path exists only for the
 one known staging recovery state where exact RC8
