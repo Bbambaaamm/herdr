@@ -1628,7 +1628,8 @@ def watchdog_runtime_state() -> tuple[str, str, int, int]:
 
 
 def start_watchdog_service() -> None:
-    run("/usr/bin/systemctl", "daemon-reload")
+    # All callers reload and verify authority before authorizing this start.
+    # Reloading here would activate pending configuration after that check.
     run(
         "/usr/bin/systemctl",
         "start",
@@ -2090,6 +2091,10 @@ def recovery_apply(
         need(CURRENT.resolve(strict=True) == candidate,
              "final_current_mismatch")
         atomic_write(state_path, canonical_json(state), 0o600)
+        recovered = SystemdAuthority(globals()).capture(allow_capacity=False)
+        need(recovered["host_policy"] == report["systemd_authority"]["host_policy"],
+             "host_policy_changed")
+        assert_deployed_coherence(candidate, release)
         start_watchdog_service()
         return {
             "status": "success",

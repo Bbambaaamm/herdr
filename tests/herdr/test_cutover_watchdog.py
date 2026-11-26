@@ -13,6 +13,7 @@ from herdr.release import ReleaseError
 from deploy.herdr.cutover import cutover as current
 
 REAL_VERIFY_CANDIDATE = current.verify_candidate_systemd_runtime
+REAL_START_WATCHDOG = current.start_watchdog_service
 
 
 def test_W22_candidate_watchdog_never_uses_baseline_dropin(host, monkeypatch):
@@ -188,6 +189,15 @@ def test_W23_candidate_requires_full_reviewed_maintenance(tmp_path, monkeypatch)
     (binary / "agent-stack-watchdog").write_bytes(b"unreviewed")
     with pytest.raises(ReleaseError, match="candidate_capacity_contract_drift"):
         authority.verify_release_runtime(tmp_path)
+
+
+def test_W07_no_config_reload_after_watchdog_start_authorization(host, monkeypatch):
+    host.events.clear()
+    monkeypatch.setattr(host.c, "watchdog_runtime_state", lambda: ("active", "running", 123, 0))
+    monkeypatch.setattr(host.c.time, "sleep", lambda _: None)
+    REAL_START_WATCHDOG()
+    assert ("/usr/bin/systemctl", "start", "agent-stack-watchdog.service") in host.events
+    assert ("/usr/bin/systemctl", "daemon-reload") not in host.events
 
 
 @pytest.mark.skipif(not shutil.which("systemd-analyze"), reason="systemd condition evaluator unavailable")
