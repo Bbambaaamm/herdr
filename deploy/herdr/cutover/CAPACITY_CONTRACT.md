@@ -97,7 +97,11 @@ then checks actual extraction allocation and the full transaction plan. Apply
 performs fresh preflight under its existing deployment lock, compares topology
 and recomputes free bytes, inodes, backup growth and memory before preparation,
 pinning, candidate install, journal writing and initial runtime mutation.
-Topology comparison excludes changing free-space values. Failure before journal
+Topology comparison excludes changing free-space values. Creating the initial
+`current -> LEGACY` link is not interpreted as a mount
+change: the effective previous path is LEGACY from the first plan, including
+its rollback role and safety margin, and remains the same at later checkpoints.
+Actual mount identity changes still reject. Failure before journal
 does not imply absence of prepared files; existing preparation evidence remains.
 Rollback does not demand a new full host floor before restoring reserved authority.
 

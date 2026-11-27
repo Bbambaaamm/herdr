@@ -128,6 +128,28 @@ def test_C15_mount_drift(model):
     with pytest.raises(ReleaseError,match='mount_topology_drift'):model.run(expected=old)
 
 
+def test_initial_legacy_bootstrap_keeps_capacity_checkpoint_topology(model,monkeypatch,tmp_path):
+    from deploy.herdr.cutover import cutover as c
+    legacy=tmp_path/'legacy';legacy.mkdir()
+    (legacy/'retained-source').write_bytes(b'legacy rollback material')
+    current=tmp_path/'current'
+    for key,path in {**model.api,'LEGACY':legacy,'CURRENT':current}.items():
+        monkeypatch.setattr(c,key,path)
+    report=dict(current=None,candidate_allocation_bytes=5971968)
+    before=c.capacity_checkpoint(model.archive,report)
+    assert str(legacy) in next(d for d in before['filesystems'] if 'rollback' in d['roles'])['paths']
+    report['transaction_contract']=dict(capacity=before)
+    # This is the actual first-migration bootstrap performed by apply().
+    current.symlink_to(legacy)
+    after=c.capacity_checkpoint(model.archive,report)
+    assert before['topology']==after['topology']
+    assert before['filesystems']==after['filesystems']
+    assert (legacy/'retained-source').read_bytes()==b'legacy rollback material'
+    model.config['mount_offset']+=1
+    with pytest.raises(ReleaseError,match='mount_topology_drift'):
+        c.capacity_checkpoint(model.archive,report)
+
+
 @pytest.mark.parametrize('case',['C18','C19','C20','C21','C23','C24','C25','C26','C32'])
 def test_bounds_and_lifecycle(model,case):
     if case=='C18':

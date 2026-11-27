@@ -229,17 +229,27 @@ def backup_peak():
     return 3*size+GIB
 
 
+def effective_previous(api):
+    """Keep the same predecessor role before/after the legacy bootstrap link."""
+    previous = api.get('CAPACITY_PREVIOUS')
+    if previous is not None:
+        return previous
+    current = api.get('CURRENT')
+    if current is not None and (current.exists() or current.is_symlink()):
+        require(current.is_symlink(), 'current_not_symlink')
+        return current.resolve(strict=True)
+    return api.get('LEGACY')
+
+
 def rollback_margin(api):
     """Retain the prior explicitly approved RC6-sized planning margin.
 
     The existing tree is already charged in statvfs. This is a named additional
     safety margin, never a claim that the tree must be copied or deleted.
     """
-    current = api.get('CURRENT')
-    previous = api.get('CAPACITY_PREVIOUS')
-    if previous is None and (current is None or not current.is_symlink()):
+    previous = effective_previous(api)
+    if previous is None:
         return 0
-    previous = previous or current.resolve(strict=True)
     require(previous == api.get('LEGACY') or previous.parent == api['RELEASES'],
             'rollback_path')
     total = previous.lstat().st_blocks*512
@@ -271,10 +281,9 @@ def plan(api, archive, candidate_allocation, reserve, *, phase='transaction', ex
     if phase == 'transaction':
         roles.update(host=HOST, state=api['STATE_DIR'], incoming=api['INCOMING_DIR'],
                      release=api['RELEASES'], backup=BACKUPS, offsite=OFFSITE)
-        previous = api.get('CAPACITY_PREVIOUS')
-        current = api.get('CURRENT')
-        if previous is not None or current is not None and current.is_symlink():
-            roles['rollback'] = previous or current.resolve(strict=True)
+        previous = effective_previous(api)
+        if previous is not None:
+            roles['rollback'] = previous
         for name in ('PUBLIC_STATE','BRIDGE','SNAPSHOT','NGINX_ROUTE','CONSUMER_DIR','UNIT_DIR'):
             if name in api:
                 roles['runtime_'+name] = (api[name] if name.endswith('_DIR') else api[name].parent)
