@@ -45,11 +45,29 @@ from herdr.release import (  # noqa: E402
     consumer_digest,
     extract_archive,
     sha256,
-    verify_archive,
+    verify_archive as _verify_archive,
     verify_tree,
 )
 from deploy.herdr.cutover.systemd_authority import SystemdAuthority, verify_release_runtime  # noqa: E402
 from deploy.herdr.cutover import transaction_contract as transactions  # noqa: E402
+from deploy.herdr.cutover import filesystem_capacity as filesystem_capacity  # noqa: E402
+
+
+def verify_archive(archive):
+    # verify_archive itself extracts. Admission must precede that first write,
+    # not merely the later explicit comparison extraction in preflight.
+    transactions.capacity(globals(), archive, phase='temporary')
+    return _verify_archive(archive, temporary_parent=filesystem_capacity.TEMP)
+
+
+def capacity_checkpoint(archive, report):
+    prior = report.get('transaction_contract', {}).get('capacity', {})
+    api = dict(globals())
+    if report.get('current'):
+        api['CAPACITY_PREVIOUS'] = Path(report['current'])
+    return transactions.capacity(api, archive,
+        report.get('candidate_allocation_bytes', 256*1024**2),
+        expected=prior.get('topology'))
 
 
 HOST = "quantlab-staging-01"
@@ -855,13 +873,17 @@ def preflight(
              and statuses["agent-platform-herdr.timer"] == "active"
              and statuses["agent-stack-watchdog.service"] == "active",
              "runtime_not_healthy")
-    with tempfile.TemporaryDirectory(prefix="herdr-preflight-") as folder:
+    temporary_capacity = transactions.capacity(globals(), archive, phase='temporary')
+    with tempfile.TemporaryDirectory(prefix="herdr-preflight-", dir=filesystem_capacity.TEMP) as folder:
         candidate = extract_candidate(archive, Path(folder))
         if not allow_degraded_rc8:
             verify_release_runtime(candidate)
         comparison = compare_trees(candidate, LEGACY)
         allocation = sum(max(4096, ((p.lstat().st_size + 4095) // 4096) * 4096)
                          for p in (candidate, *candidate.rglob("*")))
+        require_temporary = temporary_capacity['filesystems'][0]
+        need(allocation <= require_temporary['maximum_concurrent_bytes'],
+             'temporary_allocation_exceeded')
     current = None
     if CURRENT.exists() or CURRENT.is_symlink():
         need(CURRENT.is_symlink(), "current_is_not_symlink")
@@ -945,6 +967,52 @@ def install_candidate(archive: Path, release: dict[str, object]) -> Path:
         return target
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+
+
+def retain_archive(source: Path, target: Path) -> None:
+    """Bounded evidence transfer, including separate incoming/state filesystems.
+
+    Keep the pinned source until a durable destination is published. Only the
+    private newly-created temporary file is removed on failure.
+    """
+    need(not target.exists() and not target.is_symlink(), 'archive_evidence_exists')
+    if source.lstat().st_dev == target.parent.stat().st_dev:
+        os.replace(source, target)
+        return
+    source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    temporary = None
+    copied_digest = hashlib.sha256()
+    try:
+        before = os.fstat(source_fd)
+        need(stat.S_ISREG(before.st_mode) and before.st_uid == 0
+             and before.st_nlink == 1 and not before.st_mode & 0o022
+             and 0 < before.st_size <= 64*1024**2, 'unsafe_evidence_archive')
+        fd, name = tempfile.mkstemp(prefix='.archive-', dir=target.parent)
+        temporary = Path(name)
+        with os.fdopen(fd, 'wb') as output:
+            remaining = before.st_size
+            while remaining:
+                chunk = os.read(source_fd, min(65536, remaining))
+                need(bool(chunk), 'evidence_archive_short_read')
+                output.write(chunk); copied_digest.update(chunk); remaining -= len(chunk)
+            need(not os.read(source_fd, 1), 'evidence_archive_grew')
+            output.flush()
+            os.fchmod(output.fileno(), stat.S_IMODE(before.st_mode))
+            os.fsync(output.fileno())
+        need(transactions.stamp(before) == transactions.stamp(os.fstat(source_fd))
+             == transactions.stamp(source.lstat()), 'evidence_archive_changed')
+        need(digest_file(temporary) == copied_digest.hexdigest(), 'evidence_archive_readback')
+        os.replace(temporary, target); temporary = None
+        directory_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        source.unlink()
+    finally:
+        os.close(source_fd)
+        if temporary is not None:
+            temporary.unlink()
 
 
 def install_consumers(release_root: Path, expected_digest: str) -> str:
@@ -1436,7 +1504,7 @@ def transaction_snapshots() -> dict[Path, tuple[bytes, int, int, int] | None]:
     return {path: snapshot_file(path) for path in paths}
 
 
-def begin_transaction(previous: Path, report: dict, snapshots: dict, units: dict) -> Path:
+def begin_transaction(previous: Path, report: dict, snapshots: dict, units: dict, *, archive=None) -> Path:
     """Retain root-only baseline evidence across SIGKILL or host interruption.
 
     An unresolved transaction is never replayed automatically. Preflight blocks
@@ -1451,10 +1519,8 @@ def begin_transaction(previous: Path, report: dict, snapshots: dict, units: dict
         previous, report, snapshots, units, backup)
     # Repeat after fresh snapshots under the apply lock, before any runtime
     # mutation. Preflight is an observation, never a transferable guarantee.
-    reserve = transactions.RESERVE_BYTES
-    space = os.statvfs(STATE_DIR)
-    need(space.f_bavail * space.f_frsize >= 10*1024**3 + 128*1024**2 + reserve,
-         "transaction_capacity_insufficient")
+    need(archive is not None, 'transaction_capacity_archive_required')
+    capacity_checkpoint(archive, report)
     atomic_write(backup, backup_bytes, 0o600)
     need(contract.read(backup, expected_sha256=sha256(backup_bytes)) == document,
          "authority_backup_verification_failed")
@@ -1701,6 +1767,7 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
     approved_release = verify_archive(archive)
     need(confirmation == f"{approved_release['tag']}-{approved_release['commit'][:12]}",
          "confirmation_mismatch")
+    capacity_checkpoint(archive, report)
     # Record preparation separately from committed deployment metadata. A
     # failed pre-journal attempt can leave an immutable candidate/pinned copy;
     # these are retained and never interpreted as activation or auto-deleted.
@@ -1713,6 +1780,7 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
                        source_sha256=digest_file(archive),
                        release=report.get("release"), previous=str(CURRENT.resolve()))
     write_evidence(preparation_path, preparation)
+    capacity_checkpoint(archive, report)
     archive = pin_archive(archive)
     preparation.update(status="archive_pinned", pinned_archive=str(archive))
     write_evidence(preparation_path, preparation)
@@ -1721,6 +1789,7 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
     identifier = f"{release['tag']}-{release['commit'][:12]}"
     need(confirmation == identifier, "confirmation_mismatch")
     need(report.get("release", release) == release, "release_changed_after_preflight")
+    capacity_checkpoint(archive, report)
     candidate = install_candidate(archive, release)
     preparation.update(status="candidate_prepared", candidate=str(candidate), release=release)
     write_evidence(preparation_path, preparation)
@@ -1811,8 +1880,8 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
     timers_stopped = False
     watchdog_stopped = False
     evidence_moved = False
-    transactions.capacity(globals(), archive, report.get("candidate_allocation_bytes", 256*1024**2))
-    transaction = begin_transaction(previous, report, baseline_snapshots, unit_snapshots)
+    capacity_checkpoint(archive, report)
+    transaction = begin_transaction(previous, report, baseline_snapshots, unit_snapshots, archive=archive)
     previous_sigterm = signal.getsignal(signal.SIGTERM)
 
     def interrupted(_number, _frame):
@@ -1821,6 +1890,7 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
     signal.signal(signal.SIGTERM, interrupted)
 
     try:
+        capacity_checkpoint(archive, report)
         install_consumers(candidate, config_digest)
         atomic_write(
             NGINX_ROUTE,
@@ -1936,7 +2006,7 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
 
         # Preserve immutable deployment evidence before reopening
         # durable dispatch.
-        os.replace(
+        retain_archive(
             archive,
             evidence_archive,
         )
@@ -2008,7 +2078,7 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
             previous, report, baseline_snapshots, unit_snapshots, maintenance)
         rollback_errors.extend(run_rollback_steps([
             ("remove_success_state", lambda: remove_regular_file(state_path)),
-            ("preserve_failed_archive", lambda: os.replace(
+            ("preserve_failed_archive", lambda: retain_archive(
                 evidence_archive if evidence_moved else archive,
                 STATE_DIR / f"{document['deployed_at']}-{identifier}.failed-{os.getpid()}.tar.gz")),
         ]))
@@ -2059,10 +2129,6 @@ def recovery_apply(
     deliberately leaves the public Agent Platform route in maintenance mode.
     """
     need(os.geteuid() == 0, "root_required")
-    archive = pin_archive(archive)
-    release = verify_archive(archive)
-    identifier = f"{release['tag']}-{release['commit'][:12]}"
-    need(confirmation == identifier, "confirmation_mismatch")
     report = preflight(
         archive,
         expected_legacy_commit,
@@ -2070,6 +2136,12 @@ def recovery_apply(
     )
     need(report.get("recovery_mode") == "rc8_router_overflow",
          "recovery_mode_not_authorized")
+    capacity_checkpoint(archive, report)
+    archive = pin_archive(archive)
+    release = verify_archive(archive)
+    identifier = f"{release['tag']}-{release['commit'][:12]}"
+    need(confirmation == identifier, "confirmation_mismatch")
+    capacity_checkpoint(archive, report)
     candidate = install_candidate(archive, release)
     need(CURRENT.is_symlink(), "current_is_not_symlink")
     previous = CURRENT.resolve(strict=True)
@@ -2128,7 +2200,7 @@ def recovery_apply(
 
         start_telemetry_timers()
 
-        os.replace(archive, evidence_archive)
+        retain_archive(archive, evidence_archive)
         evidence_moved = True
         state = {
             **document,
@@ -2238,7 +2310,7 @@ def recovery_apply(
                     f"{document['deployed_at']}-{identifier}.failed-"
                     f"{os.getpid()}.tar.gz"
                 )
-            os.replace(source, failed_archive)
+            retain_archive(source, failed_archive)
         except BaseException as archive_error:
             errors.append(
                 "preserve_failed_archive:"

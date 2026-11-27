@@ -230,7 +230,7 @@ def test_B22_large_sigterm_rollback(host):
 def test_B24_B25_prejournal_failure_and_safe_retry(host, monkeypatch):
     realistic(host)
     original = host.c.begin_transaction
-    monkeypatch.setattr(host.c, 'begin_transaction', lambda *args: (_ for _ in ()).throw(ReleaseError('before_journal')))
+    monkeypatch.setattr(host.c, 'begin_transaction', lambda *args, **kwargs: (_ for _ in ()).throw(ReleaseError('before_journal')))
     with pytest.raises(ReleaseError, match='before_journal'):
         host.apply()
     assert not (host.c.STATE_DIR / 'transaction.json').exists()

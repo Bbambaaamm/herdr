@@ -94,6 +94,8 @@ def host(tmp_path, monkeypatch):
     monkeypatch.setattr(c.os, "chown", lambda *a, **k: None)
     monkeypatch.setattr(c.os, "statvfs", lambda p: SimpleNamespace(
         f_bavail=100 * 1024**3 // 4096, f_frsize=4096, f_favail=1000000))
+    from capacity_fixture import install
+    install(monkeypatch, tmp_path)
     if hasattr(c, "transactions"):
         # Only emulate the root OS boundary; aggregate bytes, limits, hashes,
         # schemas and readback remain the real implementation.
@@ -121,7 +123,7 @@ def host(tmp_path, monkeypatch):
     def owned_stat(path, *a, **k):
         info = real_stat(path, *a, **k)
         if path in (c.STATE_DIR, c.STATE_DIR.parent):
-            return SimpleNamespace(st_uid=0, st_mode=0o40700)
+            return SimpleNamespace(st_uid=0, st_mode=0o40700, st_dev=info.st_dev)
         return info
     monkeypatch.setattr(Path, "stat", owned_stat)
 
@@ -411,6 +413,8 @@ def test_preflight_classifies_only_coherent_baseline(tmp_path, monkeypatch, web,
     monkeypatch.setattr(c.os, "statvfs", lambda p: SimpleNamespace(
         f_bavail=100 * 1024**3 // 4096, f_frsize=4096, f_favail=1000000))
     (tmp_path / "archive").write_bytes(b"fixture")
+    from capacity_fixture import install
+    install(monkeypatch, tmp_path)
     (tmp_path / "nginx").write_bytes(b"authenticated-route")
     monkeypatch.setattr(c.transactions, "ROOT_UID", os.getuid())
     monkeypatch.setattr(c, "verify_release_runtime", lambda _: None)

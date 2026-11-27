@@ -134,6 +134,8 @@ def rehearsal(tmp_path, monkeypatch, manager):
     monkeypatch.setattr(os, 'geteuid', lambda: 0)
     monkeypatch.setenv('SUDO_UID', '0')
     monkeypatch.setattr(os, 'statvfs', lambda p: SimpleNamespace(f_bavail=100*1024**3//4096, f_frsize=4096, f_favail=1000000))
+    from capacity_fixture import install
+    install(monkeypatch, root)
     monkeypatch.setattr(c, 'root_owned_readonly', lambda p: p in root.parents or not p.stat().st_mode & 0o022)
     monkeypatch.setattr(c.transactions, 'aggregate_ancestors', lambda p: None)
     monkeypatch.setattr(c.socket, 'gethostname', lambda: c.HOST)
@@ -250,6 +252,10 @@ def rehearsal(tmp_path, monkeypatch, manager):
 def test_B29_complete_isolated_deployment(rehearsal, fail_candidate):
     r = rehearsal
     preflight = c.preflight(r.archive,'fixture-legacy')
+    domains = preflight['transaction_contract']['capacity']['filesystems']
+    assert len({d['identity'] for d in domains}) == 2
+    assert next(d for d in domains if d['type']=='tmpfs')['required_bytes'] < 4061155328
+    assert next(d for d in domains if 'host' in d['roles'])['reserves']['host_policy'] >= 12*1024**3
     assert preflight['transaction_contract']['status']=='verified'
     assert preflight['transaction_contract']['authority_backup_serialized_bytes']>131072
     assert preflight['systemd_authority']['mode']=='capacity_rc6'
@@ -272,6 +278,27 @@ def test_B29_complete_isolated_deployment(rehearsal, fail_candidate):
     assert not c.watchdog_permit_path().exists()
     assert list(c.STATE_DIR.glob('*-baseline-authority.json'))
     assert list(c.STATE_DIR.glob('*-preparation.json'))
+
+
+def test_C24_C25_real_existing_candidate_after_prejournal_failure(rehearsal,monkeypatch):
+    r=rehearsal
+    report=c.preflight(r.archive,'fixture-legacy')
+    confirmation=report['release']['tag']+'-'+report['release']['commit'][:12]
+    original=c.begin_transaction
+    def fail(*a,**kw):raise release.ReleaseError('isolated_before_journal')
+    monkeypatch.setattr(c,'begin_transaction',fail)
+    with pytest.raises(release.ReleaseError,match='isolated_before_journal'):
+        c.apply(r.archive,'fixture-legacy',confirmation)
+    target=c.RELEASES/confirmation
+    assert release.verify_tree(target)==r.release
+    assert c.CURRENT.resolve()==r.previous
+    assert not (c.STATE_DIR/'transaction.json').exists()
+    assert list(c.STATE_DIR.glob('*-preparation.json'))
+    retained=list(c.INCOMING_DIR.glob('release-*.tar.gz'))
+    assert retained
+    monkeypatch.setattr(c,'begin_transaction',original)
+    assert c.apply(r.archive,'fixture-legacy',confirmation)['status']=='success'
+    assert all(p.exists() for p in retained)
 
 
 def test_B30_historical_recovery_real_preflight_and_apply(rehearsal, monkeypatch):
