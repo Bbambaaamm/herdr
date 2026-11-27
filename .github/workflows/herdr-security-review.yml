@@ -1,0 +1,40 @@
+name: Herdr Security Review Gate
+
+# Source-only: workflow source is default protected branch, NOT PR code.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review, edited]
+  issue_comment:
+    types: [created, edited, deleted]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Existing open PR to recheck"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+concurrency:
+  group: security-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Read-only advisory security evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.repository == 'Bbambaaamm/herdr'
+    steps:
+      - name: Checkout ONLY trusted default branch source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Evaluate current GitHub evidence without PR code execution
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/herdr_security_review_check.py
