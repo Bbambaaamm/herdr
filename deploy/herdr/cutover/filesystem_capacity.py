@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 
 from herdr.release import DEFAULT_ARCHIVE_LIMITS, ReleaseError
 
@@ -90,6 +91,46 @@ def directory(path):
         os.close(fd)
 
 
+class _Dqblk(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_uint64) for name in (
+        'bhard', 'bsoft', 'space', 'ihard', 'isoft', 'inodes', 'btime', 'itime'
+    )] + [('valid', ctypes.c_uint32)]
+
+
+def _read_quota(fd, kind, identity):
+    """Read one Linux if_dqblk from the already pinned filesystem."""
+    require(sys.platform == 'linux' and os.uname().machine == 'x86_64',
+            'quota_architecture_unsupported')
+    require(sys.byteorder == 'little' and ctypes.sizeof(ctypes.c_void_p) == 8
+            and ctypes.sizeof(ctypes.c_long) == 8 and ctypes.sizeof(ctypes.c_int) == 4
+            and ctypes.sizeof(_Dqblk) == 72 and ctypes.alignment(_Dqblk) == 8
+            and all(getattr(_Dqblk, name).offset == i * 8
+                    for i, (name, _) in enumerate(_Dqblk._fields_)), 'quota_abi_unsupported')
+    require(0 <= fd <= 0x7fffffff, 'quota_invalid_descriptor')
+    require(kind in (0, 1) and 0 <= identity <= 0xffffffff, 'quota_invalid_argument')
+    libc = ctypes.CDLL(None, use_errno=True)
+    args = [ctypes.c_int(fd), ctypes.c_uint(0x80000700 | kind), ctypes.c_uint(identity)]
+    value = _Dqblk()
+    wrapper = getattr(libc, 'quotactl_fd', None)
+    if wrapper is not None:
+        wrapper.argtypes = [ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(_Dqblk)]
+        wrapper.restype = ctypes.c_int
+        result = wrapper(*args, ctypes.byref(value))
+    else:
+        syscall = getattr(libc, 'syscall', None)
+        require(syscall is not None, 'quota_syscall_unavailable')
+        syscall.argtypes = [ctypes.c_long]  # fixed argument of variadic libc syscall
+        syscall.restype = ctypes.c_long
+        # arch/x86/entry/syscalls/syscall_64.tbl, native LP64 (exclude x32).
+        result = syscall(443, *args, ctypes.byref(value))
+    if result != 0:
+        error = ctypes.get_errno()
+        reason = errno.errorcode.get(error, 'UNKNOWN')
+        raise ReleaseError(f'quota_query_failed:{reason}:{error}')
+    require(value.valid & 15 == 15, 'quota_fields_unverified')
+    return value
+
+
 def quota_headroom(fd, row, available, inodes):
     """Read-only Linux quota query; enabled but unreadable quotas are NO-GO.
 
@@ -106,21 +147,9 @@ def quota_headroom(fd, row, available, inodes):
         kinds.append((1, (0, 982, 1001)))
     if not kinds:
         return available, inodes, 'not_enabled'
-    libc = ctypes.CDLL(None, use_errno=True)
-    query = getattr(libc, 'quotactl_fd', None)
-    require(query is not None, 'quota_query_unavailable')
-    class Dqblk(ctypes.Structure):
-        _fields_ = [(n, ctypes.c_uint64) for n in (
-            'bhard','bsoft','space','ihard','isoft','inodes','btime','itime')]
-        _fields_.append(('valid', ctypes.c_uint32))
-    query.argtypes = [ctypes.c_int, ctypes.c_uint, ctypes.c_int, ctypes.c_void_p]
-    query.restype = ctypes.c_int
     for kind, identities in kinds:
         for identity in identities:
-            value = Dqblk()
-            result = query(fd, 0x80000700 | kind, identity, ctypes.byref(value))
-            require(result == 0, 'quota_query_failed')
-            require(value.valid & 15 == 15, 'quota_fields_unverified')
+            value = _read_quota(fd, kind, identity)
             for limit in (value.bhard, value.bsoft):
                 if limit:
                     available = min(available, max(0, limit*1024-value.space))

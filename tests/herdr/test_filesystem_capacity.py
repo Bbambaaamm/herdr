@@ -199,11 +199,11 @@ def test_C31_enabled_quota_requires_valid_observation(monkeypatch,result,valid):
     monkeypatch.setattr(f.ctypes,'CDLL',lambda *a,**kw:SimpleNamespace(quotactl_fd=Query()))
     row=dict(options='rw',super_options='usrquota')
     if result==0 and valid==15:
-        available,inodes,status=f.quota_headroom(-1,row,20*G,1000000)
+        available,inodes,status=f.quota_headroom(7,row,20*G,1000000)
         assert (available,inodes,status)==(1047552,90,'verified')
     else:
         with pytest.raises(ReleaseError,match='quota_'):
-            f.quota_headroom(-1,row,20*G,1000000)
+            f.quota_headroom(7,row,20*G,1000000)
 
 
 def test_temporary_memory_includes_verification_working_set(model):
