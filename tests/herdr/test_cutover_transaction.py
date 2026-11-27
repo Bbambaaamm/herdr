@@ -50,6 +50,8 @@ def host(tmp_path, monkeypatch):
     c.BRIDGE.write_bytes(b"previous-bridge")
     for name in c.UNITS:
         (c.UNIT_DIR / name).write_bytes(b"previous-unit")
+    for name in c.CONSUMERS:
+        (c.CONSUMER_DIR / (name+'.yaml')).write_bytes(b'previous-consumer')
     release = {"tag": "rc7", "commit": "b" * 40,
                "config_contract_sha256": "c" * 64, "payload_manifest_sha256": "d" * 64}
     states = {name: "active" for name in c.UNITS}
@@ -57,12 +59,28 @@ def host(tmp_path, monkeypatch):
     states["agent-platform-herdr.service"] = "inactive"
     report = dict(services=states.copy(), baseline_health="healthy", direct_health="401", public_health="401", public_root="200")
     from deploy.herdr.cutover.systemd_authority import SystemdAuthority
+    external_dir = tmp_path / "external"
+    external_dir.mkdir()
+    for name in ("herdr", "hermes", "majak", "quantlab", "agent-codex-usage-export",
+                 "hermes-offsite-prepare", "hermes-offsite-sync"):
+        (external_dir / name).write_bytes(b"isolated external fixture: " + name.encode())
+    policy = tmp_path / "host-policy.json"
+    policy.write_text('{"schema_version":1}')
     class FixtureAuthority(SystemdAuthority):
         def capture(self, *, allow_capacity=True, allow_fence=False):
             capacity = self.dropin.exists()
             if capacity and not allow_capacity:
                 raise ReleaseError("capacity_override_wrong_baseline")
-            return dict(mode="capacity_rc6" if capacity else "standard", host_policy={})
+            from deploy.herdr.cutover.systemd_authority import COMMANDS
+            def facts(p):
+                return dict(uid=os.getuid(),gid=os.getgid(),mode=0o644,sha256=c.sha256(p.read_bytes()))
+            rows = {name: {**{key:[] for key in COMMANDS}, 'Environment':[],
+                          'WorkingDirectory':str(previous),'User':'agentops','Group':'agentops',
+                          'fragment':facts(c.UNIT_DIR/name),'dropins':{}} for name in c.UNITS}
+            return dict(version=1, mode="capacity_rc6" if capacity else "standard", units=rows,
+                        dependencies={'files':{str(self.dropin):facts(self.dropin)},'trees':{}} if capacity else None,
+                        host_policy=facts(policy),
+                        external_runtimes={str(p):facts(p) for p in external_dir.iterdir()})
     monkeypatch.setattr(c, "SystemdAuthority", FixtureAuthority)
     def fixture_preflight(*args):
         report["systemd_authority"] = c.capture_systemd_authority()
@@ -74,6 +92,14 @@ def host(tmp_path, monkeypatch):
     # the OS boundary; preserve bytes/modes and exercise real controller I/O.
     monkeypatch.setattr(c.os, "geteuid", lambda: 0)
     monkeypatch.setattr(c.os, "chown", lambda *a, **k: None)
+    monkeypatch.setattr(c.os, "statvfs", lambda p: SimpleNamespace(
+        f_bavail=100 * 1024**3 // 4096, f_frsize=4096, f_favail=1000000))
+    if hasattr(c, "transactions"):
+        # Only emulate the root OS boundary; aggregate bytes, limits, hashes,
+        # schemas and readback remain the real implementation.
+        monkeypatch.setattr(c.transactions, "ROOT_UID", os.getuid())
+        monkeypatch.setattr(c.transactions, "ROOT_GID", os.getgid())
+        monkeypatch.setattr(c.transactions, "aggregate_ancestors", lambda p: None)
     monkeypatch.setattr(c, "pin_archive", lambda path: path)
     monkeypatch.setattr(c, "verify_archive", lambda path: release)
     monkeypatch.setattr(c, "preflight", fixture_preflight)
@@ -367,10 +393,26 @@ def test_preflight_classifies_only_coherent_baseline(tmp_path, monkeypatch, web,
     marker.write_text(json.dumps(document))
     for name, value in dict(ROOT=root, LEGACY=legacy, RELEASES=releases, CURRENT=link,
                             PUBLIC_STATE=marker, CONSUMER_DIR=consumers, UNIT_DIR=units,
-                            STATE_DIR=tmp_path / "state").items():
+                            STATE_DIR=tmp_path / "state", INCOMING_DIR=tmp_path / "incoming",
+                            BRIDGE=tmp_path / "bridge", SNAPSHOT=tmp_path / "snapshot",
+                            NGINX_ROUTE=tmp_path / "nginx").items():
         monkeypatch.setattr(c, name, value)
     monkeypatch.setattr(c, "immutable_preflight_controller", lambda: True)
-    monkeypatch.setattr(c, "capture_systemd_authority", lambda: {})
+    def fixture_authority():
+        from deploy.herdr.cutover.systemd_authority import COMMANDS
+        facts = dict(uid=os.getuid(),gid=os.getgid(),mode=0o644,sha256='a'*64)
+        rows = {name: {**{key:[] for key in COMMANDS},'Environment':[], 'WorkingDirectory':'/',
+                       'User':'agentops','Group':'agentops','fragment':facts,'dropins':{}} for name in c.UNITS}
+        return dict(version=1,mode='standard',host_policy=facts,dependencies=None,units=rows,
+                    external_runtimes={'/fixture/'+name:facts for name in (
+                        'herdr','hermes','majak','quantlab','agent-codex-usage-export',
+                        'hermes-offsite-prepare','hermes-offsite-sync')})
+    monkeypatch.setattr(c, "capture_systemd_authority", fixture_authority)
+    monkeypatch.setattr(c.os, "statvfs", lambda p: SimpleNamespace(
+        f_bavail=100 * 1024**3 // 4096, f_frsize=4096, f_favail=1000000))
+    (tmp_path / "archive").write_bytes(b"fixture")
+    (tmp_path / "nginx").write_bytes(b"authenticated-route")
+    monkeypatch.setattr(c.transactions, "ROOT_UID", os.getuid())
     monkeypatch.setattr(c, "verify_release_runtime", lambda _: None)
     monkeypatch.setattr(c, "verify_archive", lambda _: release)
     monkeypatch.setattr(c, "verify_tree", lambda path: old if path == previous else release)
@@ -393,26 +435,21 @@ def test_preflight_classifies_only_coherent_baseline(tmp_path, monkeypatch, web,
         assert c.preflight(tmp_path / "archive", "legacy")["baseline_health"] == expected
 
 
-def test_T11_sigkill_retains_durable_journal(tmp_path):
-    import subprocess
-    import sys
-    journal = tmp_path / "transaction.json"
-    script = """import os,signal,sys
-from pathlib import Path
-from deploy.herdr.cutover import cutover as c
-c.STATE_DIR=Path(sys.argv[1]).parent
-def write(path,data,mode,*a):
-    with path.open('wb') as f:
-        f.write(data); f.flush(); os.fsync(f.fileno())
-    path.chmod(mode)
-c.atomic_write=write
-c.begin_transaction(Path('/verified/rc6'),dict(services={},direct_health='000',public_health='401',systemd_authority={}),{}, {})
-os.kill(os.getpid(),signal.SIGKILL)
-"""
-    result = subprocess.run([sys.executable, "-c", script, str(journal)])
-    assert result.returncode == -signal.SIGKILL
-    assert json.loads(journal.read_text())["previous"] == "/verified/rc6"
+def test_T11_sigkill_retains_durable_journal(host, monkeypatch):
+    journal = host.c.STATE_DIR / "transaction.json"
+    def interrupted(*args):
+        os.kill(os.getpid(), signal.SIGKILL)
+    monkeypatch.setattr(host.c, "switch_runtime", interrupted)
+    pid = os.fork()
+    if pid == 0:
+        host.apply()
+        os._exit(99)
+    _, status = os.waitpid(pid, 0)
+    assert os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL
+    assert json.loads(journal.read_text())["previous"] == str(host.previous)
     assert journal.stat().st_mode & 0o777 == 0o600
+    assert host.c.watchdog_fence_path().is_file()
+    assert not host.c.watchdog_permit_path().exists()
 
 
 def test_snapshot_read_ignores_access_time_updates(tmp_path):

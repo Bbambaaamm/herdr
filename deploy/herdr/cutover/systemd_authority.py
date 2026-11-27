@@ -105,8 +105,9 @@ def inventory(root, *, observations=None):
 
 
 def unit_directives(path):
+    from deploy.herdr.cutover.transaction_contract import bounded_read, FILE_MAX
     result, section = {}, ""
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in bounded_read(path, FILE_MAX)[0].decode("utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith(("#", ";")):
             continue

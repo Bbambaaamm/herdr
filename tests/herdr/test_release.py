@@ -767,10 +767,10 @@ def test_recovery_apply_is_explicit_and_never_claims_rollback_exercise():
     )
     assert "stop_recovery_units()" in success
     assert success.index(public_probe) < success.index(
-        "atomic_write(state_path, canonical_json(state), 0o600)"
+        "write_evidence(state_path, state)"
     )
     assert success.index(
-        "atomic_write(state_path, canonical_json(state), 0o600)"
+        "write_evidence(state_path, state)"
     ) < success.index("start_watchdog_service()")
     quiescence = '("quiesce_recovery_units", stop_recovery_units)'
     assert quiescence in rollback
