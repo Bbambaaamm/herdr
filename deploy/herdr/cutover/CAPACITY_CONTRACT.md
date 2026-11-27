@@ -165,3 +165,24 @@ remain NOT_RUN. The original inode readings (disk3696238, tmpfs987076) exceed
 32768. These numerical model PASS results neither authorize deployment nor
 claim a new artifact size: any future approved release needs fresh sizing and
 its own protected v2 preflight. RC10 itself remains unchanged and un-deployed.
+
+### Native quota reader compatibility
+
+Active quotas require native Linux x86-64 LP64, little endian, a pinned mount
+descriptor, and the 72-byte Linux if_dqblk layout (eight 64-bit fields and a
+32-bit validity mask at offset 64). The reader uses the library entry point
+when exported, otherwise libc syscall with the native x86-64 table entry 443.
+It accepts only QCMD(Q_GETQUOTA, USRQUOTA or GRPQUOTA). A failed query is
+terminal, including permission failures. Other architectures and x32 fail
+closed. Disabled quotas require no native call.
+
+Admission uses the minimum filesystem and quota headroom across every required
+identity. Block limits use 1024-byte units, current space is bytes. Each valid
+zero limit is unrestricted. Clamp negative remaining capacity to zero. Both
+hard and soft limits bind immediately, including during or after grace.
+Only validity bits for limits and usage are necessary for this conservative
+policy. A time extension cannot grant additional admission.
+
+References: [Linux quota UAPI](https://github.com/torvalds/linux/blob/v6.12/include/uapi/linux/quota.h),
+[x86 syscall table](https://github.com/torvalds/linux/blob/v6.12/arch/x86/entry/syscalls/syscall_64.tbl),
+[Q_GETQUOTA](https://man7.org/linux/man-pages/man2/q_getquota.2const.html).

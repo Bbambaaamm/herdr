@@ -248,8 +248,29 @@ def rehearsal(tmp_path, monkeypatch, manager):
                 p.chmod(0o700)
 
 
+@pytest.fixture
+def active_quota_kernel(rehearsal, monkeypatch):
+    """Keep planner/reader real, adapt only filesystem observations and native call."""
+    from deploy.herdr.cutover import filesystem_capacity as f
+    from test_quota_reader import Query
+    query = Query(True, {'valid': 63})
+    monkeypatch.setattr(f.ctypes, 'CDLL', lambda *a, **kw: SimpleNamespace(syscall=query))
+    observe = f.observe
+
+    def observed(path, table):
+        row = observe(path, table)
+        if row['type'] == 'tmpfs':
+            row['super_options'] = 'rw,usrquota,grpquota'
+            row['available_bytes'], row['free_inodes'], row['quota'] = f.quota_headroom(
+                7, row, row['available_bytes'], row['free_inodes'])
+        return row
+
+    monkeypatch.setattr(f, 'observe', observed)
+    return query
+
+
 @pytest.mark.parametrize('fail_candidate',[False,True],ids=['B29_promotion','B29_rollback'])
-def test_B29_complete_isolated_deployment(rehearsal, fail_candidate):
+def test_B29_complete_isolated_deployment(rehearsal, fail_candidate, active_quota_kernel):
     r = rehearsal
     preflight = c.preflight(r.archive,'fixture-legacy')
     domains = preflight['transaction_contract']['capacity']['filesystems']
@@ -278,6 +299,23 @@ def test_B29_complete_isolated_deployment(rehearsal, fail_candidate):
     assert not c.watchdog_permit_path().exists()
     assert list(c.STATE_DIR.glob('*-baseline-authority.json'))
     assert list(c.STATE_DIR.glob('*-preparation.json'))
+    assert set(active_quota_kernel.calls) == {(0,0), (0,1001), (1,0), (1,982), (1,1001)}
+
+
+@pytest.mark.parametrize('deny', [True, False])
+def test_Q30_quota_changes_before_apply(rehearsal, active_quota_kernel, deny):
+    import errno
+    r = rehearsal
+    report = c.preflight(r.archive, 'fixture-legacy')
+    confirmation = report['release']['tag'] + '-' + report['release']['commit'][:12]
+    if deny:
+        active_quota_kernel.failure = (1, 982, errno.EPERM)
+    else:
+        active_quota_kernel.values.update(bhard=1, space=1024)
+    with pytest.raises(release.ReleaseError, match='capacity'):
+        c.apply(r.archive, 'fixture-legacy', confirmation)
+    assert c.CURRENT.resolve() == r.previous
+    assert not (c.STATE_DIR/'transaction.json').exists()
 
 
 def test_C24_C25_real_existing_candidate_after_prejournal_failure(rehearsal,monkeypatch):

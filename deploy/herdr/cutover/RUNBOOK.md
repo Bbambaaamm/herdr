@@ -407,3 +407,13 @@ held from authorization through success or rollback.
 
 After a successful recovery promotion, the normal cutover path is authoritative
 again for subsequent releases.
+
+### Before preparing a controller on a quota-enabled host
+
+Verify the official archive identity. Use a verified reader on an open
+descriptor for each relevant mount to check all configured user and group
+identities. Record the minimum byte and inode headroom privately. An own-user
+observation alone leaves protected quota admission pending. Stop on any
+unverified query and preserve the reported errno. Recheck all filesystem and
+memory domains, backup peak and bootstrap allocations before creating input
+files. The normal preflight and apply each perform their own admission.
