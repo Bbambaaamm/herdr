@@ -25,8 +25,8 @@ immutable releases, controller, original artifact and rollback material remain.
 | Immutable controller | approved incoming child | bounded payload; <=8194 objects | existing before preflight; retained; operator bootstrap needs its own pre-write admission |
 | Archive/manifest verification | fixed `/tmp` | <=256 MiB data +8194 destination blocks | private TemporaryDirectory; verified sequentially, no overlap with next verification; bounded extractor owns cleanup |
 | Comparison extraction | fixed `/tmp` | same bound; <=8194 objects | follows archive verification; actual 4-KiB allocation checked against bound; removed before final report |
-| Pinned archive | incoming | archive size rounded; 1 | preparation through activation/rollback; source survives failed copying |
-| Candidate installation | releases / `.staging-*` | measured 4-KiB metric <=320 MiB, adjusted per object for larger blocks | staging promoted by rename; failed staging cleanup; valid existing candidate verified, never deleted by admission |
+| Pinned archive | incoming | archive size rounded; 1 | admitted before pinning; after pinning it is existing usage, not another future copy; source survives failed copying |
+| Candidate installation | releases / `.staging-*` | measured 4-KiB metric <=320 MiB, adjusted per object for larger blocks | staging promoted by rename; failed staging cleanup; exact valid existing candidate verified and excluded from future writes, never deleted by admission |
 | Candidate safety | releases | two additional candidate allocations | explicit prior approved conservative margin; not a claim three copies are always created |
 | Existing RC6 / legacy | verified previous path | measured blocks, bounded <=8194 objects | retained; already charged to free space; one additional tree-sized margin preserves prior conservative plan |
 | Authority backup / systemd authority | deployment state | backup3238168; six-unit authority262144 inside it | retained v2 root-only document; hash and restore plan checked on readback |
@@ -34,7 +34,7 @@ immutable releases, controller, original artifact and rollback material remain.
 | Atomic backup/journal/evidence siblings | deployment state | unchanged13558880 aggregate reserve, 64-object accounting | includes two document pairs, evidence524288 and65536 block slack; larger blocks get extra per-object overhead |
 | Bridge, dashboard snapshot, marker | their actual mutable parents | snapshots131072 each, marker4096 | bounded publishers and atomic restore; separate runtime domains receive full conservative restore reserve |
 | Consumers / units / Nginx / fence | their actual parents | exactly17 captured paths; per-file131072 except marker | writes/rollback after journal; same root reservation deduped per domain; no orphan controls removed by planner |
-| Success / failed archive evidence | deployment state | archive-size bound; 1 | incoming/state rename when shared; otherwise bounded copy, source stability, digest readback, mode preservation, fsync and publication before source removal |
+| Success / failed archive evidence | deployment state | archive-size bound; 1 | incoming/state rename when shared; otherwise bounded copy, source stability, digest readback, mode preservation, fsync and publication before source removal; post-publication failure reuses this verified state copy during rollback, leaving original pinned source retained |
 | Hermes local backup | `/home/agentops/backups/hermes` | peak policy below; bounded4096 inventory | independent maintenance may run concurrently; planner observes, never starts backup |
 | Offsite plain + encrypted backup | `/home/agentops/backups/hermes-offsite` | same full peak on separate domain conservatively | both coexist during encryption, plaintext then removed by existing maintenance; admission does not change retention |
 | Recovery temporary files / evidence | same fixed temp, incoming, release and state roles | same archive and transaction bounds | exact RC8-to-RC12 authorization remains; no new replay/recovery authority |
@@ -120,9 +120,44 @@ Original T/W/B and #126 tests remain required. Cross-device retention additional
 tests corruption refusal with source/evidence preserved and successful400-mode
 publication. Original production capture/serialization/restore functions remain.
 
+The Worker filesystem exposed an additional pre-existing W06 race: an
+approved-to-tampered same-size write retained identical nanosecond mtime/ctime
+within one filesystem timestamp tick. Inventory/cross-tree capture had relied
+on timestamp rechecks alone after content hashing. Bounded no-follow content
+facts are now rechecked at inventory closure and capture closure, alongside
+all existing inode/metadata/absence checks. Deterministic coarse-timestamp
+regressions preserve W06's original refusal expectation; no SDK/credential
+protection or immutable runtime authority is relaxed.
+
 These are isolated tests using actual files/controller functions and safe OS,
 systemd, HTTP, topology and memory adapters. A modeled bind or memory budget is
 not a physical mount/cgroup acceptance. Physical split-mount/systemd staging
 acceptance is NOT_RUN until separately authorized deployment. The recorded
 staging disk/tmpfs figures are a model input, not a fresh protected preflight;
 quota and current memory observations must pass on the actual approved host.
+
+## Recorded staging model (not a live admission)
+
+Using the recorded official RC10 archive1507591 B, 4-KiB candidate5971968 B,
+rollback margin5623808 B, newest backup483026315 B and shared persistent
+device2049 / separate tmpfs42 gives:
+
+| Domain | Recorded available | Required bytes | Remaining | Inodes required |
+|---|---:|---:|---:|---:|
+| Persistent disk | 13608820736 | 13596114944 | 12705792 | 32768 |
+| `/tmp` tmpfs | 2932469760 | 369106944 | 2563362816 | 32768 |
+
+Disk requirement is host policy13555990528 + simultaneous future writes22556672
++ two-candidate safety11943936 + rollback safety5623808. The future writes are
+two block-rounded archive copies1511424 each, one candidate5971968 and the
+block-rounded unchanged transaction reserve13561856. Block rounding adds10642 B
+to the older conservative scalar plan; safeguards are not reduced.
+
+Tmpfs physical/cgroup budget is691777920 B. A supplementary unprivileged
+staging reading observed MemAvailable3897458688 B, but that does **not** attest
+the future quantadmin controller's enclosing cgroup limits or its quota queries.
+Modeled memory/quota adapter assumptions are explicit; protected live checks
+remain NOT_RUN. The original inode readings (disk3696238, tmpfs987076) exceed
+32768. These numerical model PASS results neither authorize deployment nor
+claim a new artifact size: any future approved release needs fresh sizing and
+its own protected v2 preflight. RC10 itself remains unchanged and un-deployed.

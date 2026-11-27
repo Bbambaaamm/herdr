@@ -78,7 +78,7 @@ def safe_ancestors(path):
              and not s.st_mode & 0o022, "unsafe_runtime_ancestor")
 
 
-def inventory(root, *, observations=None):
+def inventory(root, *, observations=None, content_observations=None):
     safe_ancestors(root)
     paths = [root]
     for path in root.rglob("*"):
@@ -93,12 +93,21 @@ def inventory(root, *, observations=None):
         # The two explicitly approved historical source trees have no symlinks.
         need("link" not in row and not row["mode"] & 0o022, "unsafe_runtime_tree")
         rows[path.relative_to(root).as_posix()] = row
+        if content_observations is not None:
+            content_observations[path] = row
     checked = {root}
     for path in root.rglob("*"):
         need(len(checked) < 1024, "runtime_inventory_limit")
         checked.add(path)
     need(set(paths) == checked
          and all(stamp(p.lstat()) == value for p, value in identities.items()),
+         "runtime_inventory_changed")
+    # Coarse filesystem timestamp ticks can hide a same-size rewrite between
+    # two lstat calls. Re-read bounded content, not only inode timestamps, when
+    # closing the inventory. This does not authorize later runtime mutation.
+    need(all(facts(p) == rows[p.relative_to(root).as_posix()] for p in paths),
+         "runtime_inventory_changed")
+    need(all(stamp(p.lstat()) == value for p, value in identities.items()),
          "runtime_inventory_changed")
     safe_ancestors(root)
     return {"entries": len(rows), "sha256": hashlib.sha256(canonical_json(rows)).hexdigest()}
@@ -147,6 +156,7 @@ class SystemdAuthority:
             self.unit_dir, Path("/run/systemd/system"),
             Path("/usr/local/lib/systemd/system"), Path("/usr/lib/systemd/system"))
         self.observed = {}
+        self.contents = {}
         self.absent = set()
         self.policy_path = api.get("HOST_POLICY_PATH", Path("/etc/herdr/host-policy.json"))
 
@@ -154,9 +164,15 @@ class SystemdAuthority:
         value = stamp(path.lstat())
         need(path not in self.observed or self.observed[path] == value, "authority_changed_during_capture")
         self.observed[path] = value
-        return facts(path)
+        row = facts(path)
+        need(path not in self.contents or self.contents[path] == row,
+             "authority_changed_during_capture")
+        self.contents[path] = row
+        return row
 
     def verify_observations(self):
+        need(all(facts(path) == value for path, value in self.contents.items()),
+             "authority_changed_during_capture")
         need(all(stamp(path.lstat()) == value for path, value in self.observed.items()),
              "authority_changed_during_capture")
         need(all(not os.path.lexists(path) for path in self.absent),
@@ -172,7 +188,9 @@ class SystemdAuthority:
             if "link" in expected:
                 need(str(path.resolve(strict=True)) == expected["link"], "capacity_symlink_drift")
         for name, expected in descriptor["trees"].items():
-            need(inventory(Path(name), observations=self.observed) == expected, "capacity_runtime_tree_drift:" + name)
+            need(inventory(Path(name), observations=self.observed,
+                           content_observations=self.contents) == expected,
+                 "capacity_runtime_tree_drift:" + name)
         need(all(stamp(Path(name).lstat()) == value for name, value in identities.items()),
              "capacity_dependency_changed")
         self.verify_observations()
@@ -191,6 +209,7 @@ class SystemdAuthority:
 
     def capture(self, *, allow_capacity=True, allow_fence=False):
         self.observed = {}
+        self.contents = {}
         self.absent = set()
         permit = self.api["watchdog_permit_path"]()
         present = os.path.lexists(permit)

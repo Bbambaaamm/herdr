@@ -296,9 +296,33 @@ def test_C24_C25_real_existing_candidate_after_prejournal_failure(rehearsal,monk
     assert list(c.STATE_DIR.glob('*-preparation.json'))
     retained=list(c.INCOMING_DIR.glob('release-*.tar.gz'))
     assert retained
+    reused=c.preflight(r.archive,'fixture-legacy')['transaction_contract']['capacity']
+    assert next(a for d in reused['filesystems'] for a in d['allocations']
+                if a['name']=='candidate_installation')['bytes']==0
     monkeypatch.setattr(c,'begin_transaction',original)
     assert c.apply(r.archive,'fixture-legacy',confirmation)['status']=='success'
     assert all(p.exists() for p in retained)
+
+
+def test_C29_postpublication_failure_reuses_state_copy(rehearsal,monkeypatch):
+    r=rehearsal;report=c.preflight(r.archive,'fixture-legacy')
+    confirmation=report['release']['tag']+'-'+report['release']['commit'][:12]
+    retain=c.retain_archive;calls=[]
+    def published_failure(source,target):
+        calls.append((source,target))
+        if len(calls)==1:
+            shutil.copyfile(source,target)
+            target.chmod(0o400)
+            raise c.ArchivePublicationError(target,OSError('isolated after publication'))
+        return retain(source,target)
+    monkeypatch.setattr(c,'retain_archive',published_failure)
+    with pytest.raises(release.ReleaseError,match='rollback_degraded'):
+        c.apply(r.archive,'fixture-legacy',confirmation)
+    assert calls[1][0]==calls[0][1]
+    assert len(list(c.STATE_DIR.glob('*.tar.gz')))==1
+    assert list(c.INCOMING_DIR.glob('release-*.tar.gz'))
+    assert c.CURRENT.resolve()==r.previous
+    assert not (c.STATE_DIR/'transaction.json').exists()
 
 
 def test_B30_historical_recovery_real_preflight_and_apply(rehearsal, monkeypatch):

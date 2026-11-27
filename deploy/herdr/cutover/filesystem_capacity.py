@@ -320,14 +320,31 @@ def plan(api, archive, candidate_allocation, reserve, *, phase='transaction', ex
     allocation('temporary','bounded_extraction',temp_bytes,objects,['verification'])
     td['reserves']['temporary_margin'] = TEMP_MARGIN
     peak = backup_peak() if phase == 'transaction' else 0
+    existing = []
     if phase == 'transaction':
-        allocation('incoming','pinned_archive',info.st_size,1,['preparation','activation','rollback'])
+        pinned = api.get('CAPACITY_PINNED') is True
+        allocation('incoming','pinned_archive',0 if pinned else info.st_size,0 if pinned else 1,
+                   ['preparation','activation','rollback'])
         allocation('state','retained_archive',info.st_size,1,['activation','rollback'])
         release_block = domains[role_domain['release']]['block_bytes']
         # preflight's allocation metric is a 4-KiB envelope. Destination blocks
         # may be larger; bound every object rather than rounding the total once.
         destination_allocation = candidate_allocation + max(0,release_block-4096)*objects
-        allocation('release','candidate_installation',destination_allocation,objects,
+        candidate_needed = True
+        release = api.get('CAPACITY_RELEASE')
+        if release:
+            target = api['RELEASES']/(release['tag']+'-'+release['commit'][:12])
+            require(target.parent == api['RELEASES'], 'candidate_path')
+            if target.exists() or target.is_symlink():
+                s = target.lstat()
+                require(stat.S_ISDIR(s.st_mode) and s.st_uid == 0
+                        and not s.st_mode & 0o022, 'existing_candidate_authority')
+                require(api['verify_tree'](target) == release, 'existing_candidate_identity')
+                candidate_needed = False
+                existing.append(dict(path=str(target),accounting='already_in_measured_usage',
+                                     identity='verified_existing_candidate'))
+        allocation('release','candidate_installation',destination_allocation if candidate_needed else 0,
+                   objects if candidate_needed else 0,
                    ['preparation','activation','rollback'])
         domains[role_domain['release']]['reserves']['approved_candidate_safety'] = 2*destination_allocation
         state_block = domains[role_domain['state']]['block_bytes']
@@ -358,7 +375,7 @@ def plan(api, archive, candidate_allocation, reserve, *, phase='transaction', ex
     report = dict(schema_version=2, status='verified', phase=phase,
                   transaction_reserve_bytes=reserve, backup_preparation_peak_bytes=peak,
                   topology=identity, filesystems=list(domains.values()))
-    report['existing_artifacts'] = [dict(path=str(archive),bytes=info.st_size,
+    report['existing_artifacts'] = [*existing,dict(path=str(archive),bytes=info.st_size,
         allocation_bytes=info.st_blocks*512,accounting='already_in_measured_usage')]
     tmpfs_domains = [d for d in domains.values() if d['type'] == 'tmpfs']
     # All tmpfs mounts consume a common physical/cgroup memory budget. Count

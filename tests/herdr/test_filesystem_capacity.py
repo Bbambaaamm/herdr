@@ -277,8 +277,8 @@ def test_C26_verifier_rejects_before_first_extraction(model,monkeypatch):
 
 
 @pytest.mark.skipif(os.name!='posix',reason='Linux stable descriptors and fsync')
-@pytest.mark.parametrize('corrupt',[False,True])
-def test_cross_filesystem_evidence_transfer(tmp_path,monkeypatch,corrupt):
+@pytest.mark.parametrize('fault',['none','readback','directory_fsync','unlink'])
+def test_cross_filesystem_evidence_transfer(tmp_path,monkeypatch,fault):
     from deploy.herdr.cutover import cutover as c
     source=tmp_path/'source.tar.gz';source.write_bytes(b'original evidence');source.chmod(0o400)
     target=tmp_path/'state'/'retained.tar.gz';target.parent.mkdir()
@@ -293,13 +293,37 @@ def test_cross_filesystem_evidence_transfer(tmp_path,monkeypatch,corrupt):
         s=real_fstat(fd)
         return SourceInfo(s) if os.readlink('/proc/self/fd/'+str(fd))==str(source) else s
     monkeypatch.setattr(Path,'lstat',lstat);monkeypatch.setattr(os,'fstat',fstat)
-    if corrupt:
+    if fault=='readback':
         monkeypatch.setattr(c,'digest_file',lambda p:'0'*64)
         with pytest.raises(ReleaseError,match='evidence_archive_readback'):c.retain_archive(source,target)
         assert source.read_bytes()==b'original evidence' and not target.exists()
+    elif fault in ('directory_fsync','unlink'):
+        if fault=='directory_fsync':
+            real_sync=os.fsync
+            def sync(fd):
+                if __import__('stat').S_ISDIR(os.fstat(fd).st_mode):raise OSError('isolated fsync fault')
+                real_sync(fd)
+            monkeypatch.setattr(os,'fsync',sync)
+        else:
+            real_unlink=Path.unlink
+            def unlink(p,*args,**kwargs):
+                if p==source:raise OSError('isolated unlink fault')
+                return real_unlink(p,*args,**kwargs)
+            monkeypatch.setattr(Path,'unlink',unlink)
+        with pytest.raises(c.ArchivePublicationError) as exc:c.retain_archive(source,target)
+        assert exc.value.published_archive==target
+        assert target.read_bytes()==source.read_bytes()==b'original evidence'
     else:
         c.retain_archive(source,target)
         assert not source.exists() and target.read_bytes()==b'original evidence'
         assert target.stat().st_mode&0o777==0o400
     assert not list(target.parent.glob('.archive-*'))
+
+
+def test_existing_pinned_archive_is_not_a_future_copy(model):
+    before=model.run()
+    model.api['CAPACITY_PINNED']=True
+    after=model.run()
+    row=lambda r:next(a for d in r['filesystems'] for a in d['allocations'] if a['name']=='pinned_archive')
+    assert row(before)['bytes']>0 and row(after)['bytes']==0
 
