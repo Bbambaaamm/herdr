@@ -1525,7 +1525,7 @@ def transaction_snapshots() -> dict[Path, tuple[bytes, int, int, int] | None]:
     return {path: snapshot_file(path) for path in paths}
 
 
-def begin_transaction(previous: Path, report: dict, snapshots: dict, units: dict, *, archive=None) -> Path:
+def begin_transaction(previous: Path, report: dict, snapshots: dict, units: dict) -> Path:
     """Retain root-only baseline evidence across SIGKILL or host interruption.
 
     An unresolved transaction is never replayed automatically. Preflight blocks
@@ -1540,8 +1540,9 @@ def begin_transaction(previous: Path, report: dict, snapshots: dict, units: dict
         previous, report, snapshots, units, backup)
     # Repeat after fresh snapshots under the apply lock, before any runtime
     # mutation. Preflight is an observation, never a transferable guarantee.
-    need(archive is not None, 'transaction_capacity_archive_required')
-    capacity_checkpoint(archive, report)
+    pinned = report.get('capacity_pinned_archive')
+    need(type(pinned) is str and Path(pinned).is_absolute(), 'transaction_capacity_archive_required')
+    capacity_checkpoint(Path(pinned), report)
     atomic_write(backup, backup_bytes, 0o600)
     need(contract.read(backup, expected_sha256=sha256(backup_bytes)) == document,
          "authority_backup_verification_failed")
@@ -1904,7 +1905,7 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
     watchdog_stopped = False
     evidence_moved = False
     capacity_checkpoint(archive, report)
-    transaction = begin_transaction(previous, report, baseline_snapshots, unit_snapshots, archive=archive)
+    transaction = begin_transaction(previous, report, baseline_snapshots, unit_snapshots)
     previous_sigterm = signal.getsignal(signal.SIGTERM)
 
     def interrupted(_number, _frame):
