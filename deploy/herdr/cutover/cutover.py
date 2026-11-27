@@ -49,6 +49,7 @@ from herdr.release import (  # noqa: E402
     verify_tree,
 )
 from deploy.herdr.cutover.systemd_authority import SystemdAuthority, verify_release_runtime  # noqa: E402
+from deploy.herdr.cutover import transaction_contract as transactions  # noqa: E402
 
 
 HOST = "quantlab-staging-01"
@@ -197,9 +198,18 @@ def serialized_deployment(operation):
 def digest_file(path: Path) -> str:
     need(path.is_file() and not path.is_symlink(), f"unsafe_file:{path}")
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1
+             and 0 <= before.st_size <= 64*1024**2, "unsafe_digest_file")
+        total = 0
+        while chunk := stream.read(min(65536, before.st_size + 1 - total)):
+            total += len(chunk)
+            need(total <= before.st_size, "digest_file_grew")
             digest.update(chunk)
+        need(total == before.st_size and transactions.stamp(os.fstat(stream.fileno()))
+             == transactions.stamp(before), "digest_file_changed")
     return digest.hexdigest()
 
 
@@ -208,7 +218,8 @@ def pin_archive(source: Path) -> Path:
     info = os.lstat(source)
     sudo_uid = int(os.environ.get("SUDO_UID", "-1"))
     need(stat.S_ISREG(info.st_mode) and not info.st_mode & 0o022
-         and info.st_uid in (0, sudo_uid) and 0 < info.st_size <= 64 * 1024 * 1024,
+         and info.st_nlink == 1 and info.st_uid in (0, sudo_uid)
+         and 0 < info.st_size <= 64 * 1024 * 1024,
          "unsafe_release_archive")
     base = INCOMING_DIR.parent
     base_existed = base.exists()
@@ -227,13 +238,21 @@ def pin_archive(source: Path) -> Path:
     target_fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
     try:
         pinned = os.fstat(source_fd)
-        need((pinned.st_dev, pinned.st_ino, pinned.st_size) ==
-             (info.st_dev, info.st_ino, info.st_size), "release_archive_changed")
+        need(transactions.stamp(pinned) == transactions.stamp(info), "release_archive_changed")
         with os.fdopen(source_fd, "rb", closefd=False) as input_stream, \
              os.fdopen(target_fd, "wb", closefd=False) as output_stream:
-            shutil.copyfileobj(input_stream, output_stream, 1024 * 1024)
+            remaining = info.st_size
+            while remaining:
+                chunk = input_stream.read(min(1024 * 1024, remaining))
+                need(bool(chunk), "release_archive_short_read")
+                output_stream.write(chunk)
+                remaining -= len(chunk)
+            need(not input_stream.read(1), "release_archive_grew")
             output_stream.flush()
             os.fsync(output_stream.fileno())
+        need(transactions.stamp(os.fstat(source_fd)) == transactions.stamp(info)
+             and transactions.stamp(os.lstat(source)) == transactions.stamp(info),
+             "release_archive_changed")
         os.chown(target, 0, 0, follow_symlinks=False)
         os.chmod(target, 0o400, follow_symlinks=False)
         need(target.stat().st_size == info.st_size, "pinned_archive_size_mismatch")
@@ -531,23 +550,8 @@ def atomic_write(path: Path, data: bytes, mode: int, uid: int = 0, gid: int = 0)
 def snapshot_file(path: Path) -> tuple[bytes, int, int, int] | None:
     if not path.exists() and not path.is_symlink():
         return None
-    from agent_platform_dashboard.production_io import regular
-    with regular(str(path)) as (fd, info):
-        need(info.st_nlink == 1 and info.st_size <= 131072,
-             f"unsafe_snapshot_file:{path}")
-        data = bytearray()
-        while len(data) <= 131072:
-            chunk = os.read(fd, min(8192, 131073 - len(data)))
-            if not chunk:
-                break
-            data.extend(chunk)
-        after = os.fstat(fd)
-        stable_fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid",
-                         "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
-        need(len(data) == info.st_size and all(getattr(after, field) == getattr(info, field)
-                                              for field in stable_fields),
-             f"snapshot_changed:{path}")
-        return bytes(data), stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid
+    maximum = transactions.MARKER_MAX if path == PUBLIC_STATE else transactions.FILE_MAX
+    return transactions.bounded_read(path, maximum)
 
 
 def restore_file(
@@ -856,6 +860,8 @@ def preflight(
         if not allow_degraded_rc8:
             verify_release_runtime(candidate)
         comparison = compare_trees(candidate, LEGACY)
+        allocation = sum(max(4096, ((p.lstat().st_size + 4095) // 4096) * 4096)
+                         for p in (candidate, *candidate.rglob("*")))
     current = None
     if CURRENT.exists() or CURRENT.is_symlink():
         need(CURRENT.is_symlink(), "current_is_not_symlink")
@@ -894,7 +900,7 @@ def preflight(
                  and public_health in RECOVERY_FAIL_CLOSED_PUBLIC_STATUSES,
                  "degraded_previous_boundary_not_fail_closed")
     systemd_authority = capture_systemd_authority()
-    return {
+    report = {
         "status": "preflight_ok",
         "systemd_authority": systemd_authority,
         "release": release,
@@ -902,6 +908,7 @@ def preflight(
         "legacy_release": str(LEGACY),
         "current": current,
         "runtime_diff": comparison,
+        "candidate_allocation_bytes": allocation,
         "services": statuses,
         "direct_health": direct_health,
         "public_health": public_health,
@@ -909,6 +916,9 @@ def preflight(
         "recovery_mode": "rc8_router_overflow" if recovery_mode else None,
         "baseline_health": "degraded" if statuses["agent-platform-web.service"] != "active" else "healthy",
     }
+    report["transaction_contract"] = verify_transaction_preparation(
+        Path(current) if current else LEGACY, report, archive, allocation)
+    return report
 
 
 def install_candidate(archive: Path, release: dict[str, object]) -> Path:
@@ -1434,34 +1444,64 @@ def begin_transaction(previous: Path, report: dict, snapshots: dict, units: dict
     """
     path = STATE_DIR / "transaction.json"
     need(not path.exists() and not path.is_symlink(), "unfinished_deployment_requires_operator_reconciliation")
-    files = {str(name): None if value is None else
-             [base64.b64encode(value[0]).decode("ascii"), *value[1:]]
-             for name, value in {**snapshots, **units}.items()}
-    document = {"version": 2, "previous": str(previous),
-                 "systemd_authority": report["systemd_authority"],
-                 "baseline_health": report.get("baseline_health", "healthy"),
-                 "services": report["services"], "direct_health": report["direct_health"],
-                 "public_health": report["public_health"],
-                 "public_root": report.get("public_root"), "files": files}
     backup = STATE_DIR / f"{time.time_ns()}-baseline-authority.json"
     need(not backup.exists() and not backup.is_symlink(), "authority_backup_exists")
-    backup_bytes = canonical_json(document)
+    contract = transactions.Contract(globals())
+    document, backup_bytes, journal, journal_bytes = contract.plan(
+        previous, report, snapshots, units, backup)
+    # Repeat after fresh snapshots under the apply lock, before any runtime
+    # mutation. Preflight is an observation, never a transferable guarantee.
+    reserve = transactions.RESERVE_BYTES
+    space = os.statvfs(STATE_DIR)
+    need(space.f_bavail * space.f_frsize >= 10*1024**3 + 128*1024**2 + reserve,
+         "transaction_capacity_insufficient")
     atomic_write(backup, backup_bytes, 0o600)
-    need(snapshot_file(backup)[0] == backup_bytes, "authority_backup_verification_failed")
-    report["authority_backup"] = {"path": str(backup), "sha256": sha256(backup_bytes)}
-    document["authority_backup"] = report["authority_backup"]
-    atomic_write(path, canonical_json(document), 0o600)
+    need(contract.read(backup, expected_sha256=sha256(backup_bytes)) == document,
+         "authority_backup_verification_failed")
+    report["authority_backup"] = journal["authority_backup"]
+    atomic_write(path, journal_bytes, 0o600)
+    need(contract.read(path, journal=True) == journal, "journal_verification_failed")
     return path
+
+
+def verify_transaction_preparation(previous, report, archive, allocation):
+    """Actual capture/serialization/restore validation; no persistent writes."""
+    snapshots, units = transaction_snapshots(), snapshot_units()
+    backup = STATE_DIR / "9999999999999999999-baseline-authority.json"
+    _, raw, _, journal = transactions.Contract(globals()).plan(
+        previous, report, snapshots, units, backup)
+    capacity = transactions.capacity(globals(), archive, allocation)
+    return dict(status="verified", authority_backup_serialized_bytes=len(raw),
+                authority_backup_maximum_bytes=transactions.BACKUP_MAX,
+                journal_serialized_bytes=len(journal), journal_maximum_bytes=transactions.JOURNAL_MAX,
+                capacity=capacity)
+
+
+def write_evidence(path, document):
+    raw = canonical_json(document)
+    need(type(document) is dict and len(raw) <= transactions.EVIDENCE_MAX, "evidence_size_or_type")
+    need(transactions.decode(raw, transactions.EVIDENCE_MAX) == document, "evidence_serialization")
+    atomic_write(path, raw, 0o600)
+    need(transactions.bounded_read(path, transactions.EVIDENCE_MAX, aggregate=True)[0] == raw,
+         "evidence_readback_failed")
 
 
 def rollback_previous(previous, report, snapshots, units, maintenance):
     """Restore exact authority before reopening traffic or durable dispatch."""
     degraded = report.get("baseline_health") == "degraded"
+    def validate_retained_authority():
+        ref = report['authority_backup']
+        contract = transactions.Contract(globals())
+        journal = contract.read(STATE_DIR / 'transaction.json', journal=True)
+        need(journal['authority_backup'] == ref, "rollback_journal_reference_mismatch")
+        document = contract.read(Path(ref['path']), expected_sha256=ref['sha256'])
+        need(contract.validate(document) == {**snapshots, **units}, "rollback_backup_snapshot_mismatch")
     errors = run_rollback_steps([
         ("revoke_watchdog_permit", lambda: remove_regular_file(watchdog_permit_path())),
         ("fence_rollback", ensure_watchdog_fence),
         ("quiesce", stop_recovery_units),
         ("stop_web", stop_recovery_web),
+        ("validate_retained_authority", validate_retained_authority),
     ])
     if not errors:
         errors.extend(run_rollback_steps([
@@ -1657,12 +1697,33 @@ def start_watchdog_service() -> None:
 @serialized_deployment
 def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict[str, object]:
     need(os.geteuid() == 0, "root_required")
+    report = preflight(archive, expected_legacy_commit)
+    approved_release = verify_archive(archive)
+    need(confirmation == f"{approved_release['tag']}-{approved_release['commit'][:12]}",
+         "confirmation_mismatch")
+    # Record preparation separately from committed deployment metadata. A
+    # failed pre-journal attempt can leave an immutable candidate/pinned copy;
+    # these are retained and never interpreted as activation or auto-deleted.
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for directory in (STATE_DIR.parent, STATE_DIR):
+        need(not directory.is_symlink() and directory.stat().st_uid == 0
+             and not directory.stat().st_mode & 0o077, "unsafe_state_directory")
+    preparation_path = STATE_DIR / f"{time.time_ns()}-preparation.json"
+    preparation = dict(version=1, status="preparing", source_archive=str(archive),
+                       source_sha256=digest_file(archive),
+                       release=report.get("release"), previous=str(CURRENT.resolve()))
+    write_evidence(preparation_path, preparation)
     archive = pin_archive(archive)
+    preparation.update(status="archive_pinned", pinned_archive=str(archive))
+    write_evidence(preparation_path, preparation)
     release = verify_archive(archive)
+    need(release == approved_release, "release_changed_during_pinning")
     identifier = f"{release['tag']}-{release['commit'][:12]}"
     need(confirmation == identifier, "confirmation_mismatch")
-    report = preflight(archive, expected_legacy_commit)
+    need(report.get("release", release) == release, "release_changed_after_preflight")
     candidate = install_candidate(archive, release)
+    preparation.update(status="candidate_prepared", candidate=str(candidate), release=release)
+    write_evidence(preparation_path, preparation)
 
     if CURRENT.is_symlink() and CURRENT.resolve(strict=True) == candidate:
         # Fail closed unless every mutable production authority proves
@@ -1750,6 +1811,7 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
     timers_stopped = False
     watchdog_stopped = False
     evidence_moved = False
+    transactions.capacity(globals(), archive, report.get("candidate_allocation_bytes", 256*1024**2))
     transaction = begin_transaction(previous, report, baseline_snapshots, unit_snapshots)
     previous_sigterm = signal.getsignal(signal.SIGTERM)
 
@@ -1895,11 +1957,7 @@ def apply(archive: Path, expected_legacy_commit: str, confirmation: str) -> dict
             "baseline_authority_backup": report["authority_backup"],
         }
 
-        atomic_write(
-            state_path,
-            canonical_json(state),
-            0o600,
-        )
+        write_evidence(state_path, state)
 
         # Restore public traffic and prove the final candidate before
         # allowing maintenance/dispatcher to run.
@@ -2094,7 +2152,7 @@ def recovery_apply(
              "public_root_changed")
         need(CURRENT.resolve(strict=True) == candidate,
              "final_current_mismatch")
-        atomic_write(state_path, canonical_json(state), 0o600)
+        write_evidence(state_path, state)
         recovered = SystemdAuthority(globals()).capture(allow_capacity=False)
         need(recovered["host_policy"] == report["systemd_authority"]["host_policy"],
              "host_policy_changed")

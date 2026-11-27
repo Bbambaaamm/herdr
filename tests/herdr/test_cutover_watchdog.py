@@ -179,7 +179,7 @@ def test_W07_candidate_unit_drift_cannot_validate_itself(host, monkeypatch):
         raise ReleaseError("already_deployed_unit_mismatch")
     monkeypatch.setattr(c, "assert_deployed_coherence", reject)
     with pytest.raises(ReleaseError, match="already_deployed_unit_mismatch"):
-        REAL_VERIFY_CANDIDATE(host.candidate, {"host_policy": {}})
+        REAL_VERIFY_CANDIDATE(host.candidate, {"host_policy": c.capture_systemd_authority()["host_policy"]})
 
 
 def test_W23_candidate_requires_full_reviewed_maintenance(tmp_path, monkeypatch):

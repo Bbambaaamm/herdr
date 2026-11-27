@@ -59,6 +59,44 @@ do not replace it with the RC6, candidate or main SHA.
 
 ## Read-only normal preflight
 
+### Transaction size admission (step 4B / #266)
+
+RC9's successful preflight did not prove that its aggregate authority backup
+could be read back. RC9 must not be retried or patched in place. Future approved
+release controllers use the shared v2 transaction contract described in
+[SIZE_CONTRACT.md](SIZE_CONTRACT.md). Preflight now captures the actual baseline
+files, builds and validates the complete backup and journal, verifies the restore
+plan and filesystem admission, and returns numeric `transaction_contract` fields:
+`status=verified`, `authority_backup_serialized_bytes`,
+`authority_backup_maximum_bytes`, `journal_serialized_bytes`,
+`journal_maximum_bytes`, and `capacity.transaction_reserve_bytes` /
+`capacity.required_bytes`. No captured file content is returned.
+
+Require this verification in addition to the original identity, authority and
+operational gates. The fixed transaction reserve is now **13,558,880 B**, not
+8 MiB. Archive/candidate temporary allocations and the existing #126 floor,
+start guard, newest-backup peak and safety reserve are additional admission
+requirements. Do not present cached backup READY as a fresh measurement.
+
+Apply repeats this same planning under the deployment lock before preparation,
+recaptures the baseline before journal creation and verifies both persisted v2
+documents before runtime changes. An over-limit snapshot or authority is a
+NO-GO; never truncate telemetry, relax ownership, edit the immutable controller,
+or delete evidence to force a pass.
+
+`*-preparation.json` records source digest, pinned archive and candidate paths.
+Its existence, an installed candidate directory, or a baseline backup without a
+journal does not prove activation. Preserve these on pre-transaction failure;
+inspect current/marker/services/journal/fence/permit before a separately
+authorized retry. Existing candidates are integrity-checked before reuse. No
+unknown retained artifact is automatically deleted.
+
+Rollback verifies the persisted journal/backup hash and full document binding
+before restoration. A mismatch retains journal/fence, revokes the permit and
+keeps maintenance/quiescence. Use the bounded reader and validated restore-plan
+API described in SIZE_CONTRACT.md for authorized operator reconciliation;
+there is no automatic replay or schema upgrade of retained v2 evidence.
+
 After archive verification and authorized immutable-controller preparation:
 
 ```sh
