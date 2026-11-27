@@ -138,12 +138,20 @@ def quota_headroom(fd, row, available, inodes):
     writes. Group bounds are conservative; no quota capability is changed.
     """
     options = set((row['options']+','+row['super_options']).split(','))
-    if options & {'prjquota', 'pquota'}:
+    names = {option.partition('=')[0] for option in options}
+    if names & {'prjquota', 'pquota', 'pqnoenforce'}:
         require(False, 'project_quota_unverified')
+    user = {'usrquota', 'uquota', 'quota', 'usrjquota', 'uqnoenforce', 'qnoenforce'}
+    group = {'grpquota', 'gquota', 'grpjquota', 'gqnoenforce'}
+    markers = {name for name in names if 'quota' in name or 'qnoenforce' in name
+               or name == 'jqfmt'}
+    require(not (markers - user - group - {'noquota', 'jqfmt'}), 'quota_options_unverified')
+    require('jqfmt' not in names or bool(names & {'usrjquota', 'grpjquota'}),
+            'quota_options_unverified')
     kinds = []
-    if options & {'usrquota', 'uquota', 'quota'}:
+    if names & user:
         kinds.append((0, (0, 1001)))
-    if options & {'grpquota', 'gquota'}:
+    if names & group:
         kinds.append((1, (0, 982, 1001)))
     if not kinds:
         return available, inodes, 'not_enabled'

@@ -101,3 +101,17 @@ def test_disabled_and_unknown_project(monkeypatch):
     with pytest.raises(ReleaseError, match='project_quota_unverified'):
         run(monkeypatch, q, 'prjquota')
     assert not q.calls
+
+
+@pytest.mark.parametrize('opts', ['usrjquota=a,grpjquota=b,jqfmt=vfsv1',
+                                  'uqnoenforce,gqnoenforce'])
+def test_accounted_identities(monkeypatch, opts):
+    q = Query(True, {'valid': 63})
+    assert run(monkeypatch, q, opts)[-1] == 'verified'
+    assert len(q.calls) == 5
+
+
+@pytest.mark.parametrize('opts', ['pqnoenforce', 'jqfmt=vfsv1', 'unknownquota'])
+def test_unknown_quota_authority(monkeypatch, opts):
+    with pytest.raises(ReleaseError, match='quota_'):
+        run(monkeypatch, Query(True, {}), opts)
