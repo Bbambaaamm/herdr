@@ -199,7 +199,11 @@ def test_W06_inventory_detects_rewrite_of_previously_hashed_file(tmp_path, monke
         s.inventory(root)
 
 
-def test_W06_cross_tree_mutation_is_rejected(manager, monkeypatch):
+@pytest.mark.parametrize('coarse',[False,True])
+def test_W06_cross_tree_mutation_is_rejected(manager, monkeypatch,coarse):
+    if coarse:
+        original_stamp=s.stamp
+        monkeypatch.setattr(s,'stamp',lambda value:(*original_stamp(value)[:-2],0,0))
     manager.capacity()
     first = manager.tmp / "first-tree"
     second = manager.tmp / "second-tree"
@@ -219,6 +223,23 @@ def test_W06_cross_tree_mutation_is_rejected(manager, monkeypatch):
     monkeypatch.setattr(s, "inventory", race)
     with pytest.raises(ReleaseError, match="authority_changed_during_capture"):
         manager.authority.capture()
+
+
+def test_W06_same_size_rewrite_with_coarse_timestamps(tmp_path,monkeypatch):
+    root=tmp_path/'coarse-tree';root.mkdir()
+    for name in ('first.py','second.py'):(root/name).write_text('approved')
+    monkeypatch.setattr(s,'safe_ancestors',lambda _:None)
+    original_stamp=s.stamp
+    monkeypatch.setattr(s,'stamp',lambda value:(*original_stamp(value)[:-2],0,0))
+    original=s.facts;seen=[]
+    def mutate(path):
+        row=original(path)
+        if path.is_file():
+            if seen:seen[0].write_text('tampered')
+            seen.append(path)
+        return row
+    monkeypatch.setattr(s,'facts',mutate)
+    with pytest.raises(ReleaseError,match='runtime_inventory_changed'):s.inventory(root)
 
 
 def test_W07_baseline_drift_during_external_reads_is_rejected(manager, monkeypatch):

@@ -545,9 +545,9 @@ def verify_tree(root: Path) -> dict[str, object]:
     return release
 
 
-def verify_archive(path: Path) -> dict[str, object]:
+def verify_archive(path: Path, *, temporary_parent: Path | None = None) -> dict[str, object]:
     _need(path.is_file() and not path.is_symlink(), "release_archive_invalid")
-    with tempfile.TemporaryDirectory(prefix="herdr-verify-") as folder:
+    with tempfile.TemporaryDirectory(prefix="herdr-verify-", dir=temporary_parent) as folder:
         destination = Path(folder)
         extract_archive(path, destination)
         roots = list(destination.iterdir())

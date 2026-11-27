@@ -58,16 +58,25 @@ Transaction reserve is
 This covers retained documents plus atomic siblings, evidence and filesystem
 block slack. The previous 8-MiB allowance does **not** cover the new worst case.
 Existing retained artifacts are already reflected in measured free space; none
-is deleted to pass admission. The planner reserves two compressed copies and
-three candidate allocations, retaining at least 12 GiB free, and additionally
-checks 10-GiB floor +128-MiB start guard + actual newest-backup peak
-`3*max(512MiB,newest ZIP size)+1GiB` + preparation allowance. It observes every
-affected filesystem and requires >=32768 free inodes. No maintenance, cleanup
-or paid call is invoked by these observations.
+is deleted to pass admission. The single filesystem-aware planner assigns
+archive, candidate, transaction and runtime reservations to their actual
+capacity domains. The host root retains `max(12GiB,10GiB+128MiB+backup_peak)`;
+backup peak remains `3*max(512MiB,newest ZIP size)+1GiB`. Separate backup and
+offsite domains additionally retain their physical preparation peak. Bind
+mounts sharing proven device/fsid space are not counted as independent disks.
+The previously approved two-archive / three-candidate conservative envelope
+and additional rollback-tree-sized safety margin remain explicit. Existing
+source/controller/rollback artifacts are already in measured usage; safety
+margins are distinguished from future writes. See [CAPACITY_CONTRACT.md](CAPACITY_CONTRACT.md).
 
-Live candidate allocation is measured from bounded temporary extraction with
-4-KiB rounding and directory overhead; the maximum admitted allocation is
-320 MiB. Apply repeats shared preflight under the deployment lock before pinning
+Temporary admission precedes even archive verification's extraction, using
+the bounded extractor's 256-MiB raw and 8194-object ceilings plus destination
+block overhead and 64-MiB safety margin. Tmpfs additionally needs verified
+physical/cgroup memory headroom. Live candidate allocation is measured from
+bounded temporary extraction with 4-KiB rounding and directory overhead;
+larger destination blocks receive a per-object adjustment. The maximum
+admitted 4-KiB candidate metric remains 320 MiB. Apply repeats shared preflight
+under the deployment lock before pinning
 or candidate installation, then checks fresh capture, serialization, reserve
 and readback before runtime mutation. Telemetry growth between preflight and
 apply is not grandfathered in.

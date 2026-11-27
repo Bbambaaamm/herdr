@@ -303,28 +303,8 @@ class Contract:
         return document, raw, journal, journal_raw
 
 
-def capacity(api, archive, candidate_allocation=256*1024**2):
+def capacity(api, archive, candidate_allocation=256*1024**2, *, phase='transaction', expected=None):
     """Same reserve for planning/apply; observe only, never run maintenance."""
-    size = archive.lstat().st_size
-    need(0 < size <= 64*1024**2, 'archive_size')
-    need(type(candidate_allocation) is int and 0 <= candidate_allocation <= 320*1024**2,
-         'candidate_allocation')
-    backups = Path('/home/agentops/backups/hermes')
-    candidates = []
-    for p in backups.glob('hermes-backup-auto-*.zip'):
-        need(len(candidates) < 4096, 'backup_inventory_limit')
-        candidates.append(p)
-    newest = max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None
-    peak = max(512*1024**2, newest.stat().st_size if newest else 0)*3 + 1024**3
-    extra = 2*size + 3*candidate_allocation + RESERVE_BYTES
-    required = max(12*1024**3 + extra, 10*1024**3 + 128*1024**2 + peak + extra)
-    observations = []
-    for path in (api['STATE_DIR'], api['INCOMING_DIR'], api['RELEASES'], Path('/tmp'), backups):
-        while not path.exists():
-            path = path.parent
-        v = os.statvfs(path)
-        available = v.f_bavail*v.f_frsize
-        need(available >= required and v.f_favail >= 32768, 'capacity_insufficient')
-        observations.append(dict(available_bytes=available, free_inodes=v.f_favail))
-    return dict(required_bytes=required, transaction_reserve_bytes=RESERVE_BYTES,
-                backup_preparation_peak_bytes=peak, observations=observations)
+    from deploy.herdr.cutover.filesystem_capacity import plan
+    return plan(api, archive, candidate_allocation, RESERVE_BYTES,
+                phase=phase, expected=expected)

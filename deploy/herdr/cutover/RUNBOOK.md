@@ -72,6 +72,32 @@ plan and filesystem admission, and returns numeric `transaction_contract` fields
 `journal_maximum_bytes`, and `capacity.transaction_reserve_bytes` /
 `capacity.required_bytes`. No captured file content is returned.
 
+### Filesystem capacity report v2 (#269)
+
+Require `transaction_contract.capacity.schema_version=2` and `status=verified`.
+Evaluate **every** `filesystems` row: `status=PASS`, sufficient bytes/inodes,
+verified topology and, for tmpfs, sufficient `memory` headroom. The legacy
+scalar `required_bytes` is retained only for display compatibility; comparing
+each filesystem's free space with that scalar is incorrect. Each observation
+now includes its own `required_bytes` and capacity-domain `identity`.
+
+See [CAPACITY_CONTRACT.md](CAPACITY_CONTRACT.md) for allocation lifetimes,
+mount/quota/cgroup gates and C01–C32 coverage. The fixed `/tmp` authority is
+used by the guarded verifier and explicit comparison extraction; TMPDIR is
+not a deployment storage selector. A rejected admission includes safe JSON
+after `transaction_capacity_insufficient:` identifying failed paths/roles,
+domain, requirements and deficits. Unverified mounts/quotas/memory are NO-GO,
+not permission to remount, override environment or lower policy.
+
+During operator preparation, the official bounded extractor and immutable
+controller bootstrap must still be admitted **before** extraction/publication
+on the actual incoming domain, including the root #126 policy and the maximum
+bounded payload allocation, then actual allocation checked after extraction.
+The normal runtime planner does not claim that a previously prepared controller
+or transport ZIP is a new future allocation. Do not reuse an old scalar
+operator wrapper as proof for split filesystems. New protected preparation
+commands require a separately approved exact release and its verified planner.
+
 Require this verification in addition to the original identity, authority and
 operational gates. The fixed transaction reserve is now **13,558,880 B**, not
 8 MiB. Archive/candidate temporary allocations and the existing #126 floor,
