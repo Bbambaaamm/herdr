@@ -9,6 +9,9 @@ import pytest
 from test_cutover_transaction import host
 from herdr.release import ReleaseError
 from deploy.herdr.cutover import transaction_contract as t
+from deploy.herdr.cutover import cutover as runtime
+
+REAL_PIN_ARCHIVE = runtime.pin_archive
 
 
 def realistic(host):
@@ -306,3 +309,29 @@ def test_corrupt_journal_at_rollback_retains_fence(host, monkeypatch):
     assert host.c.watchdog_fence_path().exists()
     assert not host.c.watchdog_permit_path().exists()
     assert host.states['agent-stack-watchdog.service']=='inactive'
+
+
+def test_archive_replaced_with_fifo_does_not_block(host, monkeypatch):
+    from types import SimpleNamespace
+    incoming = host.c.STATE_DIR.parent/'incoming'
+    monkeypatch.setattr(host.c,'INCOMING_DIR',incoming)
+    monkeypatch.setenv('SUDO_UID',str(os.getuid()))
+    real_stat = Path.stat
+    def owned(path,*args,**kwargs):
+        value = real_stat(path,*args,**kwargs)
+        return SimpleNamespace(st_uid=0,st_mode=0o40700) if path==incoming else value
+    monkeypatch.setattr(Path,'stat',owned)
+    real_open = os.open
+    replaced = []
+    def race(path,flags,*args,**kwargs):
+        if Path(path)==host.archive and not replaced:
+            replaced.append(True)
+            host.archive.unlink()
+            os.mkfifo(host.archive,0o600)
+            # Fail immediately on an old reader rather than hanging the test.
+            assert flags & os.O_NONBLOCK, 'root open could block on substituted FIFO'
+        return real_open(path,flags,*args,**kwargs)
+    monkeypatch.setattr(os,'open',race)
+    with pytest.raises(ReleaseError,match='release_archive_changed'):
+        REAL_PIN_ARCHIVE(host.archive)
+    assert replaced and not list(incoming.glob('release-*.tar.gz'))

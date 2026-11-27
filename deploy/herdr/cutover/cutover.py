@@ -234,7 +234,7 @@ def pin_archive(source: Path) -> Path:
         need(directory_info.st_uid == 0 and not directory_info.st_mode & 0o077,
              "unsafe_incoming_directory")
     target = INCOMING_DIR / f"release-{os.getpid()}-{time.time_ns()}.tar.gz"
-    source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
     target_fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
     try:
         pinned = os.fstat(source_fd)
