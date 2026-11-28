@@ -16,7 +16,7 @@ from tests.herdr.test_work_contract_host import factory_fixture
 from tests.herdr.test_work_planning import artifact
 from tests.herdr.test_work_cycle import seal
 
-def configured(tmp_path, monkeypatch, *, budget=None):
+def configured(tmp_path, monkeypatch, *, budget=None, routing_metadata=None):
     raw, unused, unused_grant = approved_config(tmp_path, monkeypatch)
     factory, root, old_plan, grant, old_log = factory_fixture(tmp_path/"actual")
     task = {"id": grant.identity.task_id, "run_token": grant.identity.run_token,
@@ -36,6 +36,7 @@ def configured(tmp_path, monkeypatch, *, budget=None):
     definition = json.loads(json.dumps(plan.to_json()))
     for key in ("version", "identity", "spec_sha256", "grant_sha256", "environment_sha256"): definition.pop(key)
     definition.update(discovery_files=["result.py"], planning=planning)
+    if routing_metadata is not None: definition["managed_routing"] = routing_metadata
     if budget is not None:definition["budget"]=deepcopy(budget)
     raw["templates"] = {grant.identity.consumer: grant.to_json()}
     raw["work_contracts"] = {"version": 1, "environment": asdict(factory.environment),
@@ -84,3 +85,10 @@ def test_material_missing_intent_has_stable_typed_code_before_work(tmp_path):
 
 def test_planning_integer_is_bounded_before_serialization():
     with pytest.raises(WorkContractError, match="integer"): bounded({"value": 10**10000})
+
+
+def test_managed_host_metadata_is_not_an_argument_to_the_execution_plan(tmp_path, monkeypatch):
+    _, _, work, cycle, _, _ = configured(tmp_path, monkeypatch, routing_metadata={"version": 1})
+    assert cycle.phase is WorkPhase.WORK
+    assert "managed_routing" in work.host_admission["definition"]
+    assert "managed_routing" not in cycle.plan.to_json()

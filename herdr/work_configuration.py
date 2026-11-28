@@ -326,6 +326,14 @@ def reviewed_root_model_arguments(factory, private_snapshot):
             "reviewed root requires sealed empty SDK fallback policy")
     budget = definition.get("budget")
     quotes = budget.get("model_quotes") if isinstance(budget, dict) else None
+    if "managed_routing" in definition:
+        handoff = getattr(factory, "issued_work_route", None)
+        require(handoff is not None and isinstance(quotes, list), "issued managed route required")
+        matches = [q for q in quotes if q.get("provider") == handoff.selected_provider
+                   and q.get("model") == handoff.selected_model]
+        require(len(matches) == 1 and matches[0] in factory.budget_quotes.values(),
+                "selected managed route requires exact approved quote")
+        return ["--model", handoff.selected_model]
     require(isinstance(quotes, list) and len(quotes) == 1 and isinstance(quotes[0], dict),
             "reviewed root requires singleton exact model quote")
     quote = quotes[0]
@@ -681,7 +689,7 @@ def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG
                 "host fills actual planning identity and discovery")
         planning.update(version=1, identity=identity.to_json(), spec_sha256=spec_sha256,
                         base_sha=definition["base_sha"], discovery=discovery.to_json())
-        data = {key: value for key, value in definition.items() if key not in {'discovery_files', 'planning', 'hygiene', 'budget', 'reviewed_graph', 'managed_children', 'completion_base'}}
+        data = {key: value for key, value in definition.items() if key not in {'discovery_files', 'planning', 'hygiene', 'budget', 'reviewed_graph', 'managed_children', 'managed_routing', 'completion_base'}}
         data["mode"] = WorkMode(data["mode"])
         data["files"] = tuple(FileScope(**item) for item in data["files"])
         data["checks"] = tuple(ValidationCheck(**item) for item in data["checks"])

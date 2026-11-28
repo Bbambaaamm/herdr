@@ -547,9 +547,8 @@ def execute_host_model(owner, header, body, *, perform=None):
         allocation = factory.allocations.get(digest(identity.to_json()))
         require(allocation is not None, "host model allocation unavailable")
         authority = factory.budget_authority
-        managed = getattr(factory, "managed_work_route", None)
-        if managed is not None:
-            managed(identity, grant.hash, provider="nous", model=payload.get("model"))
+        from .managed_work_routing import authorize_managed_effect
+        managed = authorize_managed_effect(factory, identity, grant.hash, "nous", payload.get("model"))
         quote = factory.budget_quotes.get(("nous", payload.get("model"), "chat_completions", ENDPOINT))
         require(quote is not None and quote["model"].endswith(":free")
                 and quote["max_cost_microusd"] == 0
@@ -578,6 +577,10 @@ def execute_host_model(owner, header, body, *, perform=None):
         binding = {"version": 1, "identity": identity.to_json(), "grant_sha256": grant.hash,
                    "plan_sha256": cycle.plan.hash, "operation_id": header["operation_id"],
                    "request_id": header["request_id"], "body_sha256": header["body_sha256"]}
+        if managed is not None:
+            binding["decision_sha256"] = managed.decision_sha256
+            binding["allocation_id"] = managed.budget_allocation_id
+            binding["quote_sha256"] = digest(quote)
         offline = _case_host()
         in_case_unit = _case_unit()
         require(offline == in_case_unit,

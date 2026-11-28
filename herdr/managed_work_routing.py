@@ -1,9 +1,12 @@
 """Router v5 admission for the existing authenticated ordinary work launcher."""
 import json
+from dataclasses import fields
 from datetime import datetime, timezone
 
 from .capability import CapabilityRegistry, CapabilityRequirement, CapabilityScope, RuntimeStateSnapshot
-from .evidence import binding, digest
+from .evidence import EvidenceMissing, binding, digest
+from .routing import RoutingDecision
+from .scheduler_routing import ManagedRoute, RoutingInput
 from .scheduler import AuditLog, DynamicChildScheduler
 from .work_cycle import require
 from .work_planning import closed
@@ -52,19 +55,35 @@ def bind_managed_work_route(factory, task, launch, parent):
 
     with parent_attempt_guard(root, identity.task_id, identity.run_token):
         scheduler = read_scheduler()
-        route = scheduler.select_managed_route(identity.task_id, registry=registry,
-            requirement=requirement, policy=scope, runtime_state=observations,
-            at=datetime.now(timezone.utc).isoformat(), policy_version=route_policy["policy_version"],
-            budget_gate=factory.budget_authority, budget_allocation_id=allocation.allocation_id,
-            identity=identity, expected_registry_hash=route_policy["registry_hash"],
-            expected_requirement_hash=route_policy["requirement_hash"], attempt=route_attempt)
+        key = digest({"managed_route": attempt_binding})
+        store = factory.result_authority.store
+        try:
+            original_record = store.read("plan", key)
+        except EvidenceMissing:
+            original_record = None
+        if original_record is None:
+            route = scheduler.select_managed_route(identity.task_id, registry=registry,
+                requirement=requirement, policy=scope, runtime_state=observations,
+                at=datetime.now(timezone.utc).isoformat(), policy_version=route_policy["policy_version"],
+                budget_gate=factory.budget_authority, budget_allocation_id=allocation.allocation_id,
+                identity=identity, expected_registry_hash=route_policy["registry_hash"],
+                expected_requirement_hash=route_policy["requirement_hash"], attempt=route_attempt)
+        else:
+            event = original_record["routing"]
+            route = ManagedRoute(RoutingInput(**{f.name: event[f.name] for f in fields(RoutingInput)}),
+                                 RoutingDecision.from_json(event["decision"]))
+            require(route.routing_input.attempt == route_attempt
+                    and route.routing_input.budget_allocation_id == allocation.allocation_id,
+                    "retained managed routing attempt changed")
         issued = handoff_for(scheduler, route)
-        require(issued.selected_model == policy["model"] and issued.selected_provider in grant.scope.providers
+        require(issued.selected_provider in grant.scope.providers
                 and tuple(grant.scope.executors) == (issued.selected_executor,),
                 "managed route differs from sealed launch")
-        factory.result_authority.store.publish("plan", digest({"managed_route": attempt_binding}),
-            {"identity": attempt_binding, "role": parent.graph.nodes[0].role, "grant_sha256": grant.hash,
-             "graph_sha256": parent.graph_sha256, "routing": route.audit_event()})
+        receipt = {"identity": attempt_binding, "role": parent.graph.nodes[0].role, "grant_sha256": grant.hash,
+                   "graph_sha256": parent.graph_sha256, "routing": route.audit_event()}
+        if original_record is None:
+            store.publish("plan", key, receipt)
+        require(store.read("plan", key) == receipt, "managed decision receipt changed")
 
     def authorize(caller, grant_sha256, *, provider=None, model=None):
         require(caller == identity and grant_sha256 == grant.hash, "managed route grant mismatch")
@@ -78,6 +97,7 @@ def bind_managed_work_route(factory, task, launch, parent):
             require(original == factory.host_admission and binding(task) == attempt_binding
                     and factory.allocations.get(digest(identity.to_json())) == allocation,
                     "managed work admission changed")
+            require(store.read("plan", key) == receipt, "managed decision receipt changed")
             current = handoff_for(read_scheduler(), route)
             at = datetime.now(timezone.utc).isoformat()
             require(current == issued and any(row.executor_id == issued.selected_executor
@@ -87,4 +107,16 @@ def bind_managed_work_route(factory, task, launch, parent):
             return current
 
     factory.managed_work_route = authorize
+    factory.issued_work_route = issued
+
+
+def authorize_managed_effect(factory, identity, grant_sha256, provider, model):
+    definition = getattr(factory, "host_admission", {}).get("definition", {})
+    if "managed_routing" not in definition:
+        return None
+    authorize = getattr(factory, "managed_work_route", None)
+    require(callable(authorize), "managed route unavailable for this attempt")
+    require(isinstance(provider, str) and provider and isinstance(model, str) and model,
+            "exact managed model and provider required")
+    return authorize(identity, grant_sha256, provider=provider, model=model)
 
