@@ -422,8 +422,12 @@ def build_execution_handoff(
         raise RoutingIntegrationError("handoff consumer is not bound to scheduler record")
     if record.run_token is None or identity.run_token != record.run_token:
         raise RoutingIntegrationError("handoff run token is not bound to scheduler record")
-    fence = record.lease.fencing_token if record.lease is not None else record.fencing_token
-    if fence is None or identity.fencing_token != fence:
+    lease = record.lease
+    if (record.state is not LifecycleState.RUNNING or lease is None
+            or lease.task_id != identity.task_id or lease.agent_id != record.agent_id
+            or not scheduler.clock() < lease.lease_until):
+        raise RoutingIntegrationError("handoff requires an active scheduler lease")
+    if identity.fencing_token != lease.fencing_token:
         raise RoutingIntegrationError("handoff fencing token is not bound to scheduler record")
     if record.parent_task_id != identity.parent_task_id or record.parent_agent_id != identity.parent_agent_id:
         raise RoutingIntegrationError("handoff parent identity is not bound to scheduler record")
