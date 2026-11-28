@@ -150,7 +150,9 @@ def _validate_budget_snapshot(
     # informational here; treating any unrelated stop as global would deny
     # otherwise eligible routes and would create a second budget authority.
     if snapshot.get("unknown_measurements"):
-        raise RoutingIntegrationError("unknown budget measurement blocks routing")
+        bounded_host_time = getattr(budget_gate, "only_charged_host_time_unknown", None)
+        if not callable(bounded_host_time) or bounded_host_time(allocation_id, snapshot) is not True:
+            raise RoutingIntegrationError("unknown budget measurement blocks routing")
     return snapshot, digest(dict(snapshot))
 
 

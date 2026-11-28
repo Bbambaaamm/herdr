@@ -10,7 +10,9 @@ from herdr.evidence import EvidenceStore, digest
 from herdr.managed_work_routing import authorize_managed_effect, bind_managed_work_route
 from herdr.work_cycle import WorkContractError
 from tests.agent_stack.test_canonical_parent_binding import children, descriptor, binding
-from tests.herdr.test_scheduler_routing import ALLOCATION, route_kwargs, task_node
+from tests.herdr.test_scheduler_routing import route_kwargs, task_node
+from tests.herdr.test_work_budget import allocation, authority
+from herdr.work_budget import reserve_host_phase_overhead
 
 
 def test_canonical_work_route_is_issued_and_revalidated_for_same_attempt(tmp_path, monkeypatch):
@@ -33,9 +35,15 @@ def test_canonical_work_route_is_issued_and_revalidated_for_same_attempt(tmp_pat
     definition = {"managed_routing": {"registry":args["registry"].snapshot.to_json(),
         "scope":args["policy"].to_json(), "requirement":args["requirement"].to_json(),
         "runtime_state":[replace(row, observed_at=now).to_json() for row in args["runtime_state"]]}}
+    approved = replace(allocation(max_work_ms=300000, max_elapsed_ms=300000), consumer=identity.consumer)
+    budget, _, _ = authority(tmp_path / "budget", approved)
+    reserve_host_phase_overhead(budget, approved, SimpleNamespace(identity=identity, hash="e"*64), "baseline")
+    snapshot = budget.snapshot(approved.allocation_id)
+    assert snapshot["unknown_measurements"] == ["work_ms"]
+    assert snapshot["charged_upper_bounds"]["work_ms"] == 120000
     factory = SimpleNamespace(task_store_root=tmp_path, host_admission={"definition":definition},
-        host_configuration_path=tmp_path / "policy", budget_authority=args["budget_gate"],
-        allocations={digest(identity.to_json()):SimpleNamespace(allocation_id=ALLOCATION)},
+        host_configuration_path=tmp_path / "policy", budget_authority=budget,
+        allocations={digest(identity.to_json()):approved},
         result_authority=SimpleNamespace(store=EvidenceStore(tmp_path / "evidence")))
     monkeypatch.setattr("herdr.work_configuration._original_work_admission",
                         lambda *_: (None, factory.host_admission))

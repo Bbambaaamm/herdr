@@ -103,7 +103,10 @@ def model_effect(factory,identity,grant_sha256,action,payload):
         authority=factory.budget_authority
         if action in {"ceiling", "start"}:
             from .managed_work_routing import authorize_managed_effect
-            authorize_managed_effect(factory, identity, grant_sha256, payload.get("provider"), payload.get("model"))
+            route = authorize_managed_effect(factory, identity, grant_sha256, payload.get("provider"), payload.get("model"))
+            if route is not None:
+                from .scheduler_routing import _validate_budget_snapshot
+                _validate_budget_snapshot(authority, route.budget_allocation_id)
         if action=="ceiling":
             require(cycle.phase is WorkPhase.WORK,"model implementation has ended")
             closed(payload,("provider","model","api_mode","base_url"),"physical SDK quote route")

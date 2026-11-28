@@ -1019,6 +1019,30 @@ class WorkBudgetAuthority:
             require(found is not None,"durable budget reference missing")
             return found
 
+    def only_charged_host_time_unknown(self, allocation_id, snapshot):
+        """Recognize the retained offline baseline charge, preserving its full time ceiling."""
+        with self._serialized():
+            if self.snapshot(allocation_id) != snapshot or snapshot["unknown_measurements"] != ["work_ms"]:
+                return False
+            state = self._state()
+            for row in state["operations"].values():
+                state_allocation = row["allocation_id"]
+                if state_allocation != allocation_id:
+                    # Include exactly the same descendants as the cumulative snapshot.
+                    if allocation_id not in self._ancestors(state, state_allocation):
+                        continue
+                usage = row["usage"]
+                if usage is None:
+                    return False
+                if all(usage[name] is not None for name in _RESOURCES):
+                    continue
+                if not (row["operation_kind"] == "host-overhead" and row["provider"] == "offline-host"
+                        and row["started"] and usage["work_ms"] is None
+                        and row["demand"] == asdict(Demand(120000, 0, 0, 0))
+                        and all(usage[name] == 0 for name in ("model_calls", "tokens", "cost_microusd"))):
+                    return False
+            return True
+
     def snapshot(self,allocation_id):
         sha(allocation_id)
         with self._serialized():
