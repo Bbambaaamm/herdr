@@ -429,7 +429,12 @@ def build_execution_handoff(
         raise RoutingIntegrationError("handoff requires an active scheduler lease")
     if identity.fencing_token != lease.fencing_token:
         raise RoutingIntegrationError("handoff fencing token is not bound to scheduler record")
-    if record.parent_task_id != identity.parent_task_id or record.parent_agent_id != identity.parent_agent_id:
+    if record.canonical_parent is not None:
+        # An ordinary root has no DAG parent. Its host execution lineage is
+        # sealed separately in the scheduler's replay-validated admission.
+        if record.canonical_parent["admission"]["identity"] != identity.to_json():
+            raise RoutingIntegrationError("handoff canonical execution identity mismatch")
+    elif record.parent_task_id != identity.parent_task_id or record.parent_agent_id != identity.parent_agent_id:
         raise RoutingIntegrationError("handoff parent identity is not bound to scheduler record")
     if record.agent_id is None or identity.agent_id != record.agent_id:
         raise RoutingIntegrationError("handoff agent identity is not bound to scheduler record")

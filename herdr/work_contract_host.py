@@ -306,11 +306,12 @@ class HostWorkContractFactory:
 
 class WorkInvocationGuard(InvocationGuard):
     """Install in the same physical executor using an authenticated host port."""
-    def __init__(self,grant,*,work_authority,**kwargs):
+    def __init__(self,grant,*,work_authority,managed_route_source=None,**kwargs):
         require(callable(work_authority),"host work phase authority required")
         super().__init__(grant,**kwargs)
         self.work_authority=work_authority
         self._host_result=contextvars.ContextVar("herdr-host-result",default=None)
+        self._managed_route_source = managed_route_source
         self._routing_handoff = None
 
     def bind_routing_handoff(self, handoff):
@@ -331,6 +332,10 @@ class WorkInvocationGuard(InvocationGuard):
         self._routing_handoff = handoff
 
     def authorize_routing_model(self, provider, model, at=None):
+        if not isinstance(model, str) or not model or not isinstance(provider, str) or not provider:
+            raise PolicyDenied("routing_handoff_model_mismatch")
+        if self._managed_route_source is not None:
+            self.bind_routing_handoff(self._managed_route_source(self.grant.identity, self.grant.hash))
         handoff = self._routing_handoff
         if handoff is None:
             raise PolicyDenied("routing_handoff_missing")

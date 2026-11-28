@@ -625,7 +625,7 @@ def build_root_work_factory(root, task, *, configuration_path=HOST_POLICY_CONFIG
     names = {"spec_version", "policy_version", "base_sha", "files", "criteria", "checks",
              "budget_reference", "mode", "baseline_omission_reason", "phases", "prerequisite_commits",
              "purpose", "baseline_policy", "discovery_files", "planning"}
-    closed(definition, (names | ({"hygiene"} if "hygiene" in definition else set()) | ({"budget"} if "budget" in definition else set()) | ({"reviewed_graph"} if "reviewed_graph" in definition else set()) | ({"managed_children"} if "managed_children" in definition else set())) | ({"completion_base"} if "completion_base" in definition else set()), "approved work definition")
+    closed(definition, (names | ({"hygiene"} if "hygiene" in definition else set()) | ({"budget"} if "budget" in definition else set()) | ({"reviewed_graph"} if "reviewed_graph" in definition else set()) | ({"managed_children"} if "managed_children" in definition else set())) | ({"completion_base"} if "completion_base" in definition else set()) | ({"managed_routing"} if "managed_routing" in definition else set()), "approved work definition")
     hygiene = None
     if "hygiene" in definition:
         from .work_hygiene import LocalCommitPolicy

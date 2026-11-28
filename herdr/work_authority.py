@@ -66,6 +66,19 @@ class WorkAuthorityClient:
             raise PolicyDenied("work_authority_unavailable") from exc
         return True
 
+    def fetch_managed_route(self, identity, grant_sha256):
+        from .scheduler_routing import ManagedExecutionHandoff
+        request = {"op": "work-routing", "identity": identity.to_json(), "grant_sha256": grant_sha256}
+        try:
+            reply = _work_response(canonical(request) + b"\n", max_bytes=8192)
+            require(len(reply) <= 8192 and reply.endswith(b"\n"), "invalid route response")
+            data = json.loads(reply)
+            require(set(data) == {"grant_sha256", "handoff"} and data["grant_sha256"] == grant_sha256,
+                    "managed routing response grant mismatch")
+            return ManagedExecutionHandoff(**data["handoff"])
+        except (OSError, TypeError, ValueError, WorkContractError) as exc:
+            raise PolicyDenied("managed_routing_authority_unavailable") from exc
+
     def effect(self,identity,grant_sha256,action,payload):
         from .evidence import EvidenceError
         try:
@@ -316,6 +329,24 @@ def _dispatch_work_connection(owner, connection):
             owner.launch.mount.verify_mounted(pid, owner.launch.sealed)
             require_work_time()
             connection.sendall(b"observation-ok\n")
+        elif request.get("op") == "work-routing":
+            from dataclasses import asdict
+            from types import MethodType
+            from .work_contract_host import HostWorkContractFactory
+            require(set(request) == {"op", "identity", "grant_sha256"}, "closed routing request required")
+            budget = getattr(owner, "work_budget", None)
+            require(type(budget) is MethodType and type(budget.__self__) is HostWorkContractFactory
+                    and budget.__func__ is HostWorkContractFactory.budget_effect, "managed host factory required")
+            authorize = getattr(budget.__self__, "managed_work_route", None)
+            require(callable(authorize), "managed route unavailable")
+            operation = "work-routing"
+            handoff = authorize(*authenticated_binding)
+            response = canonical({"grant_sha256": owner.launch.grant.hash, "handoff": asdict(handoff)}) + b"\n"
+            require(len(response) <= 8192 and inspect_peer(pid) == peer and owner.launch.grant.is_active(),
+                    "routing authority or peer changed")
+            owner.launch.mount.verify_mounted(pid, owner.launch.sealed)
+            require_work_time()
+            connection.sendall(response)
         elif request.get("op") == "work-model":
             from .host_model_transport import MAX_BODY, MAX_RESPONSE, execute_host_model
             import re

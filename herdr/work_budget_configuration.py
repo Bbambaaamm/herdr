@@ -101,6 +101,9 @@ def model_effect(factory,identity,grant_sha256,action,payload):
         allocation=factory.allocations.get(digest(identity.to_json()))
         require(allocation is not None,"model work budget unavailable")
         authority=factory.budget_authority
+        managed = getattr(factory, "managed_work_route", None)
+        if managed is not None and action in {"ceiling", "start"}:
+            managed(identity, grant_sha256, provider=payload["provider"], model=payload["model"])
         if action=="ceiling":
             require(cycle.phase is WorkPhase.WORK,"model implementation has ended")
             closed(payload,("provider","model","api_mode","base_url"),"physical SDK quote route")

@@ -547,6 +547,9 @@ def execute_host_model(owner, header, body, *, perform=None):
         allocation = factory.allocations.get(digest(identity.to_json()))
         require(allocation is not None, "host model allocation unavailable")
         authority = factory.budget_authority
+        managed = getattr(factory, "managed_work_route", None)
+        if managed is not None:
+            managed(identity, grant.hash, provider="nous", model=payload.get("model"))
         quote = factory.budget_quotes.get(("nous", payload.get("model"), "chat_completions", ENDPOINT))
         require(quote is not None and quote["model"].endswith(":free")
                 and quote["max_cost_microusd"] == 0
