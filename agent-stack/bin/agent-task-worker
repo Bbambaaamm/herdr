@@ -1070,7 +1070,7 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         private_snapshot = require_approved_profile_binding(factory, launch, profile)
         from herdr.work_configuration import reviewed_root_model_arguments
         managed_root = work_factory is not None and "managed_routing" in work_factory.host_admission["definition"]
-        root_model_args = None if managed_root else reviewed_root_model_arguments(work_factory, private_snapshot)
+        initial_model_args = None if managed_root else reviewed_root_model_arguments(work_factory, private_snapshot)
         # Approved profile was refreshed/validated *before* it was sealed by
         # the trusted host factory. A late refresh here would leave the sealed
         # snapshot stale; retain legacy preflight only for legacy launches.
@@ -1211,8 +1211,6 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
             bind_root_handoff(work_factory, task, launch, cycle)
             from herdr.managed_work_routing import bind_managed_work_route
             bind_managed_work_route(work_factory, task, launch, parent)
-            if managed_root:
-                root_model_args = reviewed_root_model_arguments(work_factory, private_snapshot)
             launch.mount.bootstrap.work_authority = work_factory.authorize_invocation
             launch.mount.bootstrap.work_verify = work_factory.verify_request
             launch.mount.bootstrap.work_budget = work_factory.budget_effect
@@ -1227,8 +1225,9 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
             persist_execution_session(task)
             return True
         launch.set_continuation_sink(publish_continuation)
-        if root_model_args is None:
-            raise RuntimeError("managed_route_not_issued")
+        root_model_args = reviewed_root_model_arguments(work_factory, private_snapshot)
+        if initial_model_args is not None and initial_model_args != root_model_args:
+            raise RuntimeError("task_original_root_model_changed")
         launch.arm_bootstrap()
         agent_start_attempted = True
         session["agent_start_attempted"] = True
