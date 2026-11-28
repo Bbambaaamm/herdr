@@ -144,6 +144,32 @@ def model_effect(factory,identity,grant_sha256,action,payload):
         record=authority.reconcile(payload["operation_id"])
         require(record["started"] and record["identity"]==identity.to_json()
                 and record["plan_sha256"]==cycle.plan.hash,"returned effect binding changed")
+        if "managed_routing" in getattr(factory, "host_admission", {}).get("definition", {}):
+            # A client 'returned' message cannot settle an unobserved or ambiguous dispatch.
+            from .host_model_transport import _read_private
+            operation = payload["operation_id"]
+            retained = _read_private(factory.storage / "model-transport" / (operation + ".response.json"))
+            link = retained["binding"]
+            require(link["operation_id"] == operation and link["identity"] == identity.to_json()
+                    and link["grant_sha256"] == grant_sha256 and link["plan_sha256"] == cycle.plan.hash
+                    and link["allocation_id"] == allocation.allocation_id, "managed usage binding changed")
+            metering = retained.get("metering")
+            if not metering:
+                return {"settled": False, "unknown_measurements": ["work_ms", "tokens", "cost_microusd"]}
+            obs = metering["observation"]
+            require(obs["request_id"] == operation, "managed usage operation changed")
+            buckets = [obs[name] for name in ("input_tokens", "output_tokens",
+                                             "cache_read_tokens", "cache_write_tokens")]
+            tokens = sum(buckets) if all(type(x) is int for x in buckets) else None
+            cost = obs["actual_cost_microusd"]
+            if metering["source"] == "isolated_fixture" and tokens is not None:
+                # The isolated runner owns its own synthetic ledger. This records
+                # simulated spend only; the observation never reports a provider bill.
+                cost = 0
+            usage = Usage(metering["elapsed_ms"], 1, tokens, cost, digest(retained))
+            authority.settle(operation, usage)
+            return {"settled": True, "unknown_measurements": [
+                key for key in ("work_ms", "tokens", "cost_microusd") if getattr(usage, key) is None]}
         if record["usage"] is not None:
             return {"settled":True,"unknown_measurements":["work_ms","tokens","cost_microusd"]}
         # SDK transport return is observable; provider billing/token usage is not

@@ -64,3 +64,55 @@ def test_canonical_work_route_is_issued_and_revalidated_for_same_attempt(tmp_pat
     with pytest.raises(WorkContractError, match="no longer owns"):
         authorize_managed_effect(factory, identity, grant.hash, "a", "logical-spec")
 
+
+
+def test_two_fixture_operations_and_ambiguous_third_keep_separate_original_reservations(tmp_path):
+    import threading
+    from herdr import host_model_transport as transport
+    from herdr.work_budget_configuration import model_effect
+    from herdr.work_cycle import WorkPhase
+    from tests.herdr.test_work_budget import identity as budget_identity
+
+    caller = budget_identity()
+    approved = allocation(max_tokens=20000)
+    budget, _, _ = authority(tmp_path / "budget", approved)
+    cycle = SimpleNamespace(phase=WorkPhase.WORK, plan=SimpleNamespace(hash="b"*64, grant_sha256="d"*64))
+    selected = SimpleNamespace(budget_allocation_id=approved.allocation_id)
+    model = "synthetic:free"
+    endpoint = transport.ENDPOINT
+    route = {"provider":"nous", "model":model, "api_mode":"chat_completions", "base_url":endpoint}
+    quote = dict(route, max_tokens=2000, max_work_ms=100, max_output_tokens=100,
+                 max_request_bytes=1900, max_cost_microusd=0)
+    factory = SimpleNamespace(_lock=threading.RLock(), _refresh=lambda _: (cycle, None),
+        allocations={digest(caller.to_json()):approved}, budget_authority=budget,
+        managed_work_route=lambda *a, **kw:selected, storage=tmp_path,
+        host_admission={"definition":{"managed_routing":{}}},
+        budget_quotes={("nous",model,"chat_completions",endpoint):quote})
+    response_dir = tmp_path / "model-transport"
+    response_dir.mkdir(mode=0o700)
+    operations = []
+    def effect(action, payload):
+        return model_effect(factory, caller, cycle.plan.grant_sha256, action, payload)
+    for index in range(3):
+        request = dict(route, request_id="request-"+str(index), request_sha256=digest(index),
+                       request_bytes=72, output_tokens=8)
+        op = effect("start",request)["operation_id"]
+        operations.append(op)
+        if index == 2:
+            break
+        link = dict(operation_id=op, identity=caller.to_json(), grant_sha256=cycle.plan.grant_sha256,
+                    plan_sha256=cycle.plan.hash, allocation_id=approved.allocation_id)
+        answer = {"kind":"http_response", "http_status":200, "body":{"model":model, "usage":{
+            "prompt_tokens":4, "completion_tokens":3, "total_tokens":7,
+            "prompt_tokens_details":{"cached_tokens":1}, "cache_write_tokens":0}}}
+        meter = transport._managed_usage(answer, link, model, 1, 5, offline=True)
+        assert meter["observation"]["actual_cost_microusd"] is None
+        transport._write_once(response_dir / (op+".response.json"), {"binding":link,"result":answer,"metering":meter})
+        assert effect("returned", {"operation_id":op}) == {"settled":True,"unknown_measurements":[]}
+        assert budget.reconcile(op)["usage"]["tokens"] == 7
+    assert len(set(operations)) == 3
+    with pytest.raises(FileNotFoundError):
+        effect("returned", {"operation_id":operations[-1]})
+    with pytest.raises(WorkContractError, match="uncertain model effect"):
+        effect("start", dict(request, request_id="no-redispatch"))
+    assert budget.reconcile(operations[-1])["usage"] is None

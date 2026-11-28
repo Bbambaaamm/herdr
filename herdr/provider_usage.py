@@ -575,43 +575,11 @@ def _estimate(observation: UsageObservation) -> int | None:
     return (numerator + 999_999) // 1_000_000
 
 
-def observe_usage(
-    *,
-    provider: str,
-    model: str,
-    api_mode: ApiMode | str,
-    request_id: str,
-    attempt_index: int = 0,
-    delivery: DeliveryOutcome | str = DeliveryOutcome.DELIVERED,
-    usage: Mapping[str, Any] | None = None,
-    pricing: PricingObservation | None = None,
-    actual_cost_microusd: int | None = None,
-    cost_unknown_reason: CostUnknownReason | str | None = None,
-    unknown_reasons: Iterable[str] = (),
-    notes: Iterable[str] = (),
-    non_billable: bool = False,
-    non_billable_route: str | None = None,
-    reported_sha256: str | None = None,
-) -> UsageObservation:
-    """Normalize one provider response into the closed observation contract.
-
-    ``usage`` is the raw provider payload (or ``None`` when the provider reported
-    nothing).  Nothing is inferred from prefixes, hashes or prior requests: a
-    missing field stays ``None`` and produces an explicit unknown reason.
-
-    No verified non-billable route authority is available in this adapter. A
-    caller-supplied flag or route label cannot turn an unknown charge into zero.
-    """
-    if type(non_billable) is not bool or non_billable or non_billable_route is not None:
-        raise UsageFieldError("non-billable route authority is unavailable")
-    if cost_unknown_reason == CostUnknownReason.NON_BILLABLE:
-        raise UsageFieldError("non-billable route authority is unavailable")
-    mode = ApiMode(api_mode)
-    outcome = DeliveryOutcome(delivery)
-    reasons = list(unknown_reasons)
-    raw = usage if type(usage) is dict else None
-    if raw is None:
-        raw = {}
+def reported_token_buckets(mode, raw):
+    """Normalize reported counters independently of price and settlement evidence."""
+    mode = ApiMode(mode)
+    raw = raw if type(raw) is dict else {}
+    reasons = []
     shape = {ApiMode.CHAT_COMPLETIONS: _CHAT_SHAPE, ApiMode.ANTHROPIC_MESSAGES: _ANTHROPIC_SHAPE,
              ApiMode.CODEX_RESPONSES: _CODEX_SHAPE}[mode]
     buckets: dict[str, int | None] = {}
@@ -670,6 +638,50 @@ def observe_usage(
         elif not cache_known:
             if UnknownReason.PROVIDER_OMITTED.value not in reasons:
                 reasons.append(UnknownReason.PROVIDER_OMITTED.value)
+    if UnknownReason.PROVIDER_MALFORMED.value in reasons:
+        buckets = {name: None for name in TOKEN_FIELDS}
+    return buckets, tuple(reasons)
+
+
+def observe_usage(
+    *,
+    provider: str,
+    model: str,
+    api_mode: ApiMode | str,
+    request_id: str,
+    attempt_index: int = 0,
+    delivery: DeliveryOutcome | str = DeliveryOutcome.DELIVERED,
+    usage: Mapping[str, Any] | None = None,
+    pricing: PricingObservation | None = None,
+    actual_cost_microusd: int | None = None,
+    cost_unknown_reason: CostUnknownReason | str | None = None,
+    unknown_reasons: Iterable[str] = (),
+    notes: Iterable[str] = (),
+    non_billable: bool = False,
+    non_billable_route: str | None = None,
+    reported_sha256: str | None = None,
+) -> UsageObservation:
+    """Normalize one provider response into the closed observation contract.
+
+    ``usage`` is the raw provider payload (or ``None`` when the provider reported
+    nothing).  Nothing is inferred from prefixes, hashes or prior requests: a
+    missing field stays ``None`` and produces an explicit unknown reason.
+
+    No verified non-billable route authority is available in this adapter. A
+    caller-supplied flag or route label cannot turn an unknown charge into zero.
+    """
+    if type(non_billable) is not bool or non_billable or non_billable_route is not None:
+        raise UsageFieldError("non-billable route authority is unavailable")
+    if cost_unknown_reason == CostUnknownReason.NON_BILLABLE:
+        raise UsageFieldError("non-billable route authority is unavailable")
+    mode = ApiMode(api_mode)
+    outcome = DeliveryOutcome(delivery)
+    reasons = list(unknown_reasons)
+    raw = usage if type(usage) is dict else None
+    if raw is None:
+        raw = {}
+    buckets, counter_reasons = reported_token_buckets(mode, raw)
+    reasons.extend(reason for reason in counter_reasons if reason not in reasons)
     if raw:
         reported_sha256 = digest(raw)
 
