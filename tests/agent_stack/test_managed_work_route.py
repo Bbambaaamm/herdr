@@ -113,6 +113,13 @@ def test_two_fixture_operations_and_ambiguous_third_keep_separate_original_reser
     assert len(set(operations)) == 3
     with pytest.raises(FileNotFoundError):
         effect("returned", {"operation_id":operations[-1]})
+    # Delivered HTTPS data can confirm tokens while the actual charge remains unknown.
+    link = dict(link, operation_id=operations[-1])
+    meter = transport._managed_usage(answer, link, model, 1, 5, offline=False)
+    transport._write_once(response_dir / (operations[-1]+".response.json"),
+        {"binding":link,"result":answer,"metering":meter})
+    assert effect("returned", {"operation_id":operations[-1]}) == {
+        "settled":False,"unknown_measurements":["cost_microusd"]}
     with pytest.raises(WorkContractError, match="uncertain model effect"):
         effect("start", dict(request, request_id="no-redispatch"))
     assert budget.reconcile(operations[-1])["usage"] is None

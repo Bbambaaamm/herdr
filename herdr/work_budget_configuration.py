@@ -166,10 +166,14 @@ def model_effect(factory,identity,grant_sha256,action,payload):
                 # The isolated runner owns its own synthetic ledger. This records
                 # simulated spend only; the observation never reports a provider bill.
                 cost = 0
+            unknown = [key for key, value in (("tokens", tokens), ("cost_microusd", cost)) if value is None]
+            if unknown:
+                # The immutable response already retains measured counters. Keep the
+                # original reservation open for a future trusted per-operation bill.
+                return {"settled": False, "unknown_measurements": unknown}
             usage = Usage(metering["elapsed_ms"], 1, tokens, cost, digest(retained))
             authority.settle(operation, usage)
-            return {"settled": True, "unknown_measurements": [
-                key for key in ("work_ms", "tokens", "cost_microusd") if getattr(usage, key) is None]}
+            return {"settled": True, "unknown_measurements": []}
         if record["usage"] is not None:
             return {"settled":True,"unknown_measurements":["work_ms","tokens","cost_microusd"]}
         # SDK transport return is observable; provider billing/token usage is not
