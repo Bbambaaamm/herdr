@@ -150,7 +150,9 @@ def _validate_budget_snapshot(
     # informational here; treating any unrelated stop as global would deny
     # otherwise eligible routes and would create a second budget authority.
     if snapshot.get("unknown_measurements"):
-        raise RoutingIntegrationError("unknown budget measurement blocks routing")
+        bounded_host_time = getattr(budget_gate, "only_charged_host_time_unknown", None)
+        if not callable(bounded_host_time) or bounded_host_time(allocation_id, snapshot) is not True:
+            raise RoutingIntegrationError("unknown budget measurement blocks routing")
     return snapshot, digest(dict(snapshot))
 
 
@@ -422,10 +424,19 @@ def build_execution_handoff(
         raise RoutingIntegrationError("handoff consumer is not bound to scheduler record")
     if record.run_token is None or identity.run_token != record.run_token:
         raise RoutingIntegrationError("handoff run token is not bound to scheduler record")
-    fence = record.lease.fencing_token if record.lease is not None else record.fencing_token
-    if fence is None or identity.fencing_token != fence:
+    lease = record.lease
+    if (record.state is not LifecycleState.RUNNING or lease is None
+            or lease.task_id != identity.task_id or lease.agent_id != record.agent_id
+            or not scheduler.clock() < lease.lease_until):
+        raise RoutingIntegrationError("handoff requires an active scheduler lease")
+    if identity.fencing_token != lease.fencing_token:
         raise RoutingIntegrationError("handoff fencing token is not bound to scheduler record")
-    if record.parent_task_id != identity.parent_task_id or record.parent_agent_id != identity.parent_agent_id:
+    if record.canonical_parent is not None:
+        # An ordinary root has no DAG parent. Its host execution lineage is
+        # sealed separately in the scheduler's replay-validated admission.
+        if record.canonical_parent["admission"]["identity"] != identity.to_json():
+            raise RoutingIntegrationError("handoff canonical execution identity mismatch")
+    elif record.parent_task_id != identity.parent_task_id or record.parent_agent_id != identity.parent_agent_id:
         raise RoutingIntegrationError("handoff parent identity is not bound to scheduler record")
     if record.agent_id is None or identity.agent_id != record.agent_id:
         raise RoutingIntegrationError("handoff agent identity is not bound to scheduler record")

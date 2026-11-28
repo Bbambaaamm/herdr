@@ -156,9 +156,10 @@ def test_same_process_guard_precedes_hermes_main(monkeypatch, tmp_path, profile_
     monkeypatch.setitem(sys.modules, 'hermes_cli', fake_pkg)
     monkeypatch.setitem(sys.modules, 'hermes_cli.main', fake_main)
     from herdr import work_contract_host, work_authority
-    def fixture_work_guard(grant, *, work_authority):
+    def fixture_work_guard(grant, *, work_authority, managed_route_source):
         from herdr.work_authority import WorkAuthorityClient
         assert isinstance(work_authority, WorkAuthorityClient)
+        assert managed_route_source == work_authority.fetch_managed_route
         return grant
     monkeypatch.setattr(work_contract_host, 'WorkInvocationGuard', fixture_work_guard)
     monkeypatch.setattr(security, 'load_policy_bundle',

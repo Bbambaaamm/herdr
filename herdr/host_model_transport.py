@@ -502,6 +502,22 @@ def _perform_fixture(factory, identity, grant, payload, operation_id):
         os.close(lock)
 
 
+def _managed_usage(answer, binding, model, attempt, elapsed_ms, *, offline):
+    """Only the host transport observes a response. Never derive a bill from a quote."""
+    from .provider_usage import reported_token_buckets
+    if answer.get("kind") != "http_response" or not 200 <= answer["http_status"] < 300:
+        return None
+    body = answer.get("body")
+    if not isinstance(body, dict) or body.get("model") != model:
+        return None
+    buckets, reasons = reported_token_buckets("chat_completions", body.get("usage"))
+    observation = {"request_id": binding["operation_id"], "provider": "nous", "model": model,
+                   "attempt": attempt, "unknown_reasons": list(reasons), "actual_cost_microusd": None,
+                   **{name + "_tokens": value for name, value in buckets.items()}}
+    return {"source": "isolated_fixture" if offline else "host_https",
+            "elapsed_ms": elapsed_ms, "observation": observation}
+
+
 def execute_host_model(owner, header, body, *, perform=None):
     """Host-only operation; never trust a route/key chosen by the SDK peer."""
     from types import MethodType, SimpleNamespace
@@ -547,6 +563,8 @@ def execute_host_model(owner, header, body, *, perform=None):
         allocation = factory.allocations.get(digest(identity.to_json()))
         require(allocation is not None, "host model allocation unavailable")
         authority = factory.budget_authority
+        from .managed_work_routing import authorize_managed_effect
+        managed = authorize_managed_effect(factory, identity, grant.hash, "nous", payload.get("model"))
         quote = factory.budget_quotes.get(("nous", payload.get("model"), "chat_completions", ENDPOINT))
         require(quote is not None and quote["model"].endswith(":free")
                 and quote["max_cost_microusd"] == 0
@@ -575,6 +593,10 @@ def execute_host_model(owner, header, body, *, perform=None):
         binding = {"version": 1, "identity": identity.to_json(), "grant_sha256": grant.hash,
                    "plan_sha256": cycle.plan.hash, "operation_id": header["operation_id"],
                    "request_id": header["request_id"], "body_sha256": header["body_sha256"]}
+        if managed is not None:
+            binding["decision_sha256"] = managed.decision_sha256
+            binding["allocation_id"] = managed.budget_allocation_id
+            binding["quote_sha256"] = digest(quote)
         offline = _case_host()
         in_case_unit = _case_unit()
         require(offline == in_case_unit,
@@ -612,11 +634,17 @@ def execute_host_model(owner, header, body, *, perform=None):
         cycle._record("model_transport_intent", grant_sha256=grant.hash,
             operation_id=header["operation_id"], body_sha256=header["body_sha256"])
         # No URL or authentication comes from the peer. The fixed child performs one request.
+        started_ns = time.monotonic_ns()
         answer = (_perform_fixture(factory, identity, grant, payload,
                                    header["operation_id"]) if offline else
                   (perform or _perform_http)(credential, payload, seconds))
         encoded = canonical(answer)
         require(len(encoded) <= MAX_RESPONSE, "bounded host model response required")
-        _write_once(result, {"binding": binding, "result": answer})
+        retained = {"binding": binding, "result": answer}
+        if managed is not None:
+            elapsed_ms = (time.monotonic_ns() - started_ns + 999999) // 1000000
+            retained["metering"] = _managed_usage(answer, binding, managed.selected_model,
+                managed.attempt, elapsed_ms, offline=offline)
+        _write_once(result, retained)
         _record_receipt(cycle, grant, header["operation_id"], answer)
         return answer

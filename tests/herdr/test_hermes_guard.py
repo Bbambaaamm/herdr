@@ -529,6 +529,7 @@ def test_skip_flags_direct_registry_alias_and_bridge_are_guarded(monkeypatch):
             parent_task_id="parent-task", task_id="task", run_token="run",
             fencing_token=1,
         )
+        policy._managed_route_source = None
         policy._routing_handoff = None
         policy.bind_routing_handoff = types.MethodType(WorkInvocationGuard.bind_routing_handoff, policy)
         policy.authorize_routing_model = types.MethodType(

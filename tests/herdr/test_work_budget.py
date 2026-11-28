@@ -851,3 +851,24 @@ def test_repeated_internal_overquote_reactivates_stop_and_cold_replay(tmp_path):
     assert sum(row.get("event")=="work_budget_stop_reactivated" for row in log.replay())==1
     with pytest.raises(BudgetBlocked,match="stopped"):reserve(cold,alloc,"after-second-overquote")
     assert cold.reconcile(first)["usage"]["tokens"]==cold.reconcile(second)["usage"]["tokens"]==150
+
+
+@pytest.mark.parametrize("outcome", ["unresolved", "unknown_time", "unknown_price"])
+def test_unmeasured_model_effect_is_distinct_from_retained_offline_overhead(tmp_path, outcome):
+    from types import SimpleNamespace
+    from herdr.work_budget import reserve_host_phase_overhead
+    from herdr.scheduler_routing import _validate_budget_snapshot, RoutingIntegrationError
+
+    auth, alloc, _ = authority(tmp_path, allocation(max_work_ms=300000, max_elapsed_ms=300000))
+    plan = SimpleNamespace(identity=identity(), hash=h("plan"))
+    reserve_host_phase_overhead(auth, alloc, plan, "baseline")
+    original = auth.snapshot(alloc.allocation_id)
+    assert auth.only_charged_host_time_unknown(alloc.allocation_id, original)
+    operation = reserve(auth, alloc)
+    assert auth.claim_start(operation)
+    if outcome != "unresolved":
+        settle(auth, operation, **({"work_ms": None} if outcome == "unknown_time" else {"cost_microusd": None}))
+    with pytest.raises(RoutingIntegrationError, match="unknown budget measurement"):
+        _validate_budget_snapshot(auth, alloc.allocation_id)
+    assert not auth.only_charged_host_time_unknown(alloc.allocation_id, original)
+    assert auth.snapshot(alloc.allocation_id)["charged_upper_bounds"]["work_ms"] >= 120000

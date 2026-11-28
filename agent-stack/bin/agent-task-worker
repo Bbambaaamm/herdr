@@ -1069,7 +1069,8 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
         profile = _task_hermes_profile(task)
         private_snapshot = require_approved_profile_binding(factory, launch, profile)
         from herdr.work_configuration import reviewed_root_model_arguments
-        root_model_args = reviewed_root_model_arguments(work_factory, private_snapshot)
+        managed_root = work_factory is not None and "managed_routing" in work_factory.host_admission["definition"]
+        initial_model_args = None if managed_root else reviewed_root_model_arguments(work_factory, private_snapshot)
         # Approved profile was refreshed/validated *before* it was sealed by
         # the trusted host factory. A late refresh here would leave the sealed
         # snapshot stale; retain legacy preflight only for legacy launches.
@@ -1199,7 +1200,7 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
             from herdr.evidence import binding, digest
             preflight_handoff(work_factory, launch, store_for(ROOT,task).read("plan",digest(binding(task))))
             from herdr.work_configuration import bind_reviewed_parent
-            bind_reviewed_parent(work_factory, task, launch)
+            parent = bind_reviewed_parent(work_factory, task, launch)
             cycle = work_factory.prepare(identity=identity, workspace=Path(workspace),
                                          grant=launch.grant, spec_sha256=spec_digest(task))
             task["work_contract"] = {"version":1,"plan_sha256":cycle.plan.hash,
@@ -1208,6 +1209,8 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
             HOST_WORK_CYCLES[(task["id"],task["run_token"])] = cycle
             from herdr.work_configuration import bind_root_handoff
             bind_root_handoff(work_factory, task, launch, cycle)
+            from herdr.managed_work_routing import bind_managed_work_route
+            bind_managed_work_route(work_factory, task, launch, parent)
             launch.mount.bootstrap.work_authority = work_factory.authorize_invocation
             launch.mount.bootstrap.work_verify = work_factory.verify_request
             launch.mount.bootstrap.work_budget = work_factory.budget_effect
@@ -1222,6 +1225,9 @@ def create_task_session(task: dict, *, policy_launch_factory=None) -> dict:
             persist_execution_session(task)
             return True
         launch.set_continuation_sink(publish_continuation)
+        root_model_args = reviewed_root_model_arguments(work_factory, private_snapshot)
+        if initial_model_args is not None and initial_model_args != root_model_args:
+            raise RuntimeError("task_original_root_model_changed")
         launch.arm_bootstrap()
         agent_start_attempted = True
         session["agent_start_attempted"] = True

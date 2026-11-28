@@ -356,3 +356,23 @@ def test_shadow_fails_closed_when_callback_attempts_economic_operation(tmp_path,
     assert result.provider_calls == 1
     assert provider_calls == [True]
     assert all(event.get("status") != "PASS" for event in result.events)
+
+
+@pytest.mark.parametrize("condition", ["expired", "absent"])
+def test_handoff_issuance_requires_live_scheduler_lease(tmp_path, condition):
+    from herdr.scheduler_routing import RoutingIntegrationError, build_execution_handoff
+
+    scheduler, route, identity, kwargs = _scheduled(tmp_path)
+    record = scheduler.record_for(identity.task_id)
+    if condition == "expired":
+        deadline = record.lease.lease_until
+        scheduler.clock = lambda: deadline
+    else:
+        record.lease = None
+
+    with pytest.raises(RoutingIntegrationError, match="active scheduler lease"):
+        build_execution_handoff(
+            scheduler=scheduler, route=route, identity=identity,
+            registry=kwargs["registry"], requirement=kwargs["requirement"],
+            policy=kwargs["policy"], budget_gate=kwargs["budget_gate"],
+        )
